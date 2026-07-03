@@ -87,6 +87,7 @@ from scripts.manifest.eliza1_manifest import (  # noqa: E402
     LineageEntry,
     build_manifest,
     canonical_source_repo_error,
+    read_gguf_architecture,
     required_voice_artifacts_for_tier,
     text_context_for_manifest,
 )
@@ -340,6 +341,32 @@ def _unique_preserving_order(values: Sequence[str]) -> tuple[str, ...]:
         out.append(value)
         seen.add(value)
     return tuple(out)
+
+
+def _validate_text_architecture(paths: Sequence[Path], bundle_dir: Path) -> None:
+    errors: list[str] = []
+    for path in paths:
+        if path.suffix != ".gguf":
+            continue
+        rel = path.relative_to(bundle_dir).as_posix()
+        architecture = read_gguf_architecture(path)
+        if architecture is None:
+            errors.append(
+                f"{rel}: unable to read GGUF general.architecture; active "
+                "Eliza-1 release text weights must prove Gemma-4 provenance"
+            )
+        elif not architecture.lower().startswith("gemma"):
+            errors.append(
+                f"{rel}: general.architecture={architecture!r}; active "
+                "Eliza-1 release text weights must be Gemma-4, not a Qwen or "
+                "other stand-in"
+            )
+    if errors:
+        raise OrchestratorError(
+            "bundle layout: text provenance invalid:\n  - "
+            + "\n  - ".join(errors),
+            EXIT_BUNDLE_LAYOUT_FAIL,
+        )
 
 
 def _required_quantization_sidecar_names_for_tier(tier: str) -> tuple[str, ...]:
@@ -883,11 +910,13 @@ def validate_bundle_layout(ctx: PublishContext) -> dict[str, list[Path]]:
             )
         out[sub] = sorted(p for p in d.rglob("*") if p.is_file())
 
-    if not out["text"]:
+    text_ggufs = [path for path in out["text"] if path.suffix == ".gguf"]
+    if not text_ggufs:
         raise OrchestratorError(
             "bundle layout: text/ must contain at least one .gguf",
             EXIT_BUNDLE_LAYOUT_FAIL,
         )
+    _validate_text_architecture(text_ggufs, bundle)
     if not out["tts"]:
         raise OrchestratorError(
             "bundle layout: tts/ must contain at least one .gguf",

@@ -62,6 +62,31 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _u32(value: int) -> bytes:
+    return value.to_bytes(4, "little")
+
+
+def _u64(value: int) -> bytes:
+    return value.to_bytes(8, "little")
+
+
+def _gguf_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return _u64(len(encoded)) + encoded
+
+
+def _gguf_header(*, architecture: str = "gemma4") -> bytes:
+    return (
+        b"GGUF"
+        + _u32(3)
+        + _u64(0)
+        + _u64(1)
+        + _gguf_string("general.architecture")
+        + _u32(8)
+        + _gguf_string(architecture)
+    )
+
+
 def _passing_eval_blob(tier: str = "4b") -> dict[str, Any]:
     """Eval blob whose results pass every 4b gate.
 
@@ -105,8 +130,8 @@ def _build_fixture_bundle(
     bundle = tmp_path / f"bundle-{tier}"
 
     # Weight files — content irrelevant; sha256 is the contract.
-    _write(bundle / "text" / f"eliza-1-{tier}-128k.gguf", b"\x00text-128k\x00")
-    _write(bundle / "text" / f"eliza-1-{tier}-256k.gguf", b"\x00text-256k\x00")
+    _write(bundle / "text" / f"eliza-1-{tier}-128k.gguf", _gguf_header())
+    _write(bundle / "text" / f"eliza-1-{tier}-256k.gguf", _gguf_header())
     _write(bundle / "tts" / "omnivoice-base-Q4_K_M.gguf", b"\x00tts\x00")
     _write(bundle / "tts" / "omnivoice-tokenizer-Q4_K_M.gguf", b"\x00tts-tok\x00")
     _write(
@@ -701,6 +726,20 @@ def test_layout_rejects_empty_mtp_dir_on_mtp_enabled_tier(tmp_path: Path) -> Non
 
     assert exc.value.exit_code == EXIT_BUNDLE_LAYOUT_FAIL
     assert "mtp/ must contain at least one .gguf" in str(exc.value)
+
+
+def test_layout_rejects_non_gemma_text_architecture(tmp_path: Path) -> None:
+    bundle = _build_fixture_bundle(tmp_path)
+    (bundle / "text" / "eliza-1-4b-256k.gguf").write_bytes(
+        _gguf_header(architecture="qwen35")
+    )
+
+    with pytest.raises(OrchestratorError) as exc:
+        validate_bundle_layout(_ctx("4b", bundle))
+
+    assert exc.value.exit_code == EXIT_BUNDLE_LAYOUT_FAIL
+    assert "general.architecture='qwen35'" in str(exc.value)
+    assert "Gemma-4" in str(exc.value)
 
 
 def test_dry_run_succeeds_on_fixture(tmp_path: Path, caplog) -> None:
