@@ -69,6 +69,7 @@ def _complete_model_paths() -> list[str]:
     for tier, tier_plan in build_plan().items():
         paths.append(f"bundles/{tier}/eliza-1.manifest.json")
         paths.extend(f"bundles/{tier}/{rel}" for rel in tier_plan.required_files)
+        paths.extend(f"bundles/{tier}/{rel}" for rel in QUANTIZATION_SIDECARS)
         paths.extend(
             f"bundles/{tier}/{target.evidence_path}"
             for target in tier_plan.required_platform_evidence
@@ -262,6 +263,68 @@ def _text_fetcher(
         return payloads[url]
 
     return fetch
+
+
+def _u32(value: int) -> bytes:
+    return value.to_bytes(4, "little")
+
+
+def _u64(value: int) -> bytes:
+    return value.to_bytes(8, "little")
+
+
+def _gguf_string(value: str) -> bytes:
+    raw = value.encode("utf-8")
+    return _u64(len(raw)) + raw
+
+
+def _gguf_header(architecture: str) -> bytes:
+    return (
+        b"GGUF"
+        + _u32(3)
+        + _u64(0)
+        + _u64(1)
+        + _gguf_string("general.architecture")
+        + _u32(8)
+        + _gguf_string(architecture)
+    )
+
+
+def _binary_fetcher(
+    *,
+    architectures: Mapping[str, str] | None = None,
+):
+    architecture_by_path = dict(architectures or {})
+    payloads: dict[str, bytes] = {}
+    for tier in ELIZA_1_TIERS:
+        for rel in build_plan()[tier].required_files:
+            if not rel.startswith("text/") or not rel.endswith(".gguf"):
+                continue
+            repo_path = f"bundles/{tier}/{rel}"
+            url = f"https://huggingface.co/elizaos/eliza-1/resolve/main/{repo_path}"
+            payloads[url] = _gguf_header(architecture_by_path.get(repo_path, "gemma4"))
+
+    def fetch(url: str) -> bytes:
+        return payloads[url]
+
+    return fetch
+
+
+def _catalog_text(
+    *,
+    statuses: Mapping[str, str] | None = None,
+) -> str:
+    entries = statuses or {}
+    body = "\n".join(f'  "{tier_id}": "{status}",' for tier_id, status in entries.items())
+    return "\n".join(
+        [
+            "export const ELIZA_1_TIER_PUBLISH_STATUS: Readonly<",
+            '  Partial<Record<Eliza1TierId, "published" | "pending">>',
+            "> = {",
+            body,
+            "};",
+        ]
+    )
 
 
 def _passing_model_readme() -> str:
@@ -819,7 +882,12 @@ def _passing_model_manifest(tier: str) -> str:
 
 
 def test_complete_hf_release_audit_passes() -> None:
-    report = audit_hf_release(fetch_json=_fetcher(), fetch_text=_text_fetcher())
+    report = audit_hf_release(
+        fetch_json=_fetcher(),
+        fetch_text=_text_fetcher(),
+        fetch_binary=_binary_fetcher(),
+        catalog_text=_catalog_text(),
+    )
     assert report.ok, report.render()
     checked_tiers = {
         check["name"].split(" ", 1)[0]
@@ -827,6 +895,51 @@ def test_complete_hf_release_audit_passes() -> None:
         if check["name"].endswith("required release files present")
     }
     assert checked_tiers == set(ELIZA_1_TIERS)
+    architecture_tiers = {
+        check["name"].split(" ", 1)[0]
+        for check in report.checks
+        if check["name"].endswith("text GGUF architecture passed")
+    }
+    assert architecture_tiers == set(ELIZA_1_TIERS)
+    assert any(
+        check["name"] == "catalog Eliza-1 publish status passed" and check["ok"]
+        for check in report.checks
+    )
+
+
+def test_hf_release_audit_blocks_qwen_text_gguf_architecture() -> None:
+    bad_path = "bundles/9b/text/eliza-1-9b-128k.gguf"
+    report = audit_hf_release(
+        fetch_json=_fetcher(),
+        fetch_text=_text_fetcher(),
+        fetch_binary=_binary_fetcher(architectures={bad_path: "qwen35"}),
+    )
+
+    assert not report.ok
+    failed = [check for check in report.checks if not check["ok"]]
+    assert any(
+        check["name"] == "9b text GGUF architecture passed"
+        and "text/eliza-1-9b-128k.gguf: general.architecture=qwen35" in check["detail"]
+        and "expected gemma*" in check["detail"]
+        for check in failed
+    )
+
+
+def test_hf_release_audit_blocks_pending_catalog_publish_status() -> None:
+    report = audit_hf_release(
+        fetch_json=_fetcher(),
+        fetch_text=_text_fetcher(),
+        fetch_binary=_binary_fetcher(),
+        catalog_text=_catalog_text(statuses={"eliza-1-27b": "pending"}),
+    )
+
+    assert not report.ok
+    failed = [check for check in report.checks if not check["ok"]]
+    assert any(
+        check["name"] == "catalog Eliza-1 publish status passed"
+        and "eliza-1-27b: pending (expected published)" in check["detail"]
+        for check in failed
+    )
 
 
 def test_hf_release_audit_blocks_removed_27b_1m_model_artifacts() -> None:

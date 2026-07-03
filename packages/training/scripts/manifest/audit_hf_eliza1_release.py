@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Audit the public Hugging Face Eliza-1 release surface without downloads.
+"""Audit the public Hugging Face Eliza-1 release surface without full downloads.
 
-This is a metadata-only gate for the long Eliza-1 release checklist. It uses
-the Hub API file lists and Dataset Viewer split metadata, so it can run on a
-developer laptop without pulling GGUFs, safetensors, or parquet shards.
+This is a lightweight gate for the long Eliza-1 release checklist. It uses the
+Hub API file lists, Dataset Viewer split metadata, and tiny GGUF header range
+reads, so it can run on a developer laptop without pulling full GGUFs,
+safetensors, or parquet shards.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 try:
@@ -187,6 +189,18 @@ _CONTEXT_LABEL_RE = re.compile(r"^(\d+)([km])$", re.IGNORECASE)
 
 JsonFetcher = Callable[[str], Mapping[str, Any]]
 TextFetcher = Callable[[str], str]
+BinaryFetcher = Callable[[str], bytes]
+
+
+def _default_catalog_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[4]
+        / "packages"
+        / "shared"
+        / "src"
+        / "local-inference"
+        / "catalog.ts"
+    )
 
 
 @dataclass
@@ -241,6 +255,10 @@ class AuditReport:
                 by_category.setdefault("quantizationEvidence", []).append(item)
             elif name.endswith("manifest eval gates passed"):
                 by_category["manifestEvalGates"].append(item)
+            elif name.endswith("text GGUF architecture passed"):
+                by_category.setdefault("textArchitecture", []).append(item)
+            elif name == "catalog Eliza-1 publish status passed":
+                by_category.setdefault("catalogPublishStatus", []).append(item)
             elif name.startswith("model README"):
                 by_category.setdefault("modelCard", []).append(item)
             elif name.startswith("native upstream review"):
@@ -322,6 +340,30 @@ def hub_fetch_text(url: str) -> str:
         raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
 
 
+def _default_catalog_text() -> str | None:
+    try:
+        return _default_catalog_path().read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def hub_fetch_binary_range(url: str, *, max_bytes: int = 1 << 20) -> bytes:
+    headers = {
+        "Accept": "application/octet-stream",
+        "Range": f"bytes=0-{max_bytes - 1}",
+    }
+    token = _token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read(max_bytes)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:240]
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
+
+
 def _repo_api_url(template: str, repo: str) -> str:
     safe = "/" if "{repo}" in template.split("?", 1)[0] else ""
     return template.format(repo=urllib.parse.quote(repo, safe=safe))
@@ -379,6 +421,160 @@ def _raw_model_url(repo: str, path: str) -> str:
         + "/raw/main/"
         + urllib.parse.quote(path, safe="/")
     )
+
+
+def _resolve_model_url(repo: str, path: str) -> str:
+    return (
+        "https://huggingface.co/"
+        + urllib.parse.quote(repo, safe="/")
+        + "/resolve/main/"
+        + urllib.parse.quote(path, safe="/")
+    )
+
+
+class _GgufCursor:
+    def __init__(self, buf: bytes) -> None:
+        self.buf = buf
+        self.offset = 0
+
+    def _take(self, n: int) -> bytes:
+        end = self.offset + n
+        if end > len(self.buf):
+            raise ValueError("truncated GGUF header")
+        chunk = self.buf[self.offset:end]
+        self.offset = end
+        return chunk
+
+    def u32(self) -> int:
+        return int.from_bytes(self._take(4), "little")
+
+    def u64(self) -> int:
+        return int.from_bytes(self._take(8), "little")
+
+    def string(self) -> str:
+        length = self.u64()
+        return self._take(length).decode("utf-8")
+
+    def skip(self, n: int) -> None:
+        self._take(n)
+
+
+_GGUF_MAGIC = b"GGUF"
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+_GGUF_SCALAR_WIDTHS = {
+    0: 1,
+    1: 1,
+    2: 2,
+    3: 2,
+    4: 4,
+    5: 4,
+    6: 4,
+    7: 1,
+    10: 8,
+    11: 8,
+    12: 8,
+}
+
+
+def _skip_gguf_value(cursor: _GgufCursor, value_type: int) -> None:
+    width = _GGUF_SCALAR_WIDTHS.get(value_type)
+    if width is not None:
+        cursor.skip(width)
+        return
+    if value_type == _GGUF_TYPE_STRING:
+        cursor.skip(cursor.u64())
+        return
+    if value_type == _GGUF_TYPE_ARRAY:
+        elem_type = cursor.u32()
+        count = cursor.u64()
+        elem_width = _GGUF_SCALAR_WIDTHS.get(elem_type)
+        if elem_width is not None:
+            cursor.skip(elem_width * count)
+            return
+        for _ in range(count):
+            _skip_gguf_value(cursor, elem_type)
+        return
+    raise ValueError(f"unsupported GGUF metadata type {value_type}")
+
+
+def _read_gguf_architecture(header: bytes) -> str | None:
+    try:
+        cursor = _GgufCursor(header)
+        if cursor._take(4) != _GGUF_MAGIC:
+            return None
+        cursor.u32()  # version
+        cursor.u64()  # tensor_count
+        kv_count = cursor.u64()
+        for _ in range(kv_count):
+            key = cursor.string()
+            value_type = cursor.u32()
+            if key == "general.architecture":
+                return cursor.string() if value_type == _GGUF_TYPE_STRING else None
+            _skip_gguf_value(cursor, value_type)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return None
+
+
+def _manifest_text_architecture_blockers(
+    manifest: Mapping[str, Any],
+    *,
+    prefix: str,
+    model_repo: str,
+    model_paths: set[str],
+    fetch_binary: BinaryFetcher,
+) -> list[str]:
+    files = manifest.get("files")
+    if not isinstance(files, Mapping):
+        return ["missing manifest files block"]
+    text_entries = files.get("text")
+    if not isinstance(text_entries, list):
+        return ["missing files.text block"]
+
+    blockers: list[str] = []
+    for entry in text_entries:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):
+            continue
+        rel = entry["path"]
+        if not rel.endswith(".gguf"):
+            continue
+        repo_path = f"{prefix}{rel}"
+        if repo_path not in model_paths:
+            blockers.append(f"{rel}: missing from Hub")
+            continue
+        try:
+            header = fetch_binary(_resolve_model_url(model_repo, repo_path))
+        except RuntimeError as exc:
+            blockers.append(f"{rel}: {exc}")
+            continue
+        arch = _read_gguf_architecture(header)
+        if arch is None:
+            blockers.append(f"{rel}: general.architecture missing or unreadable")
+        elif not arch.lower().startswith("gemma"):
+            blockers.append(f"{rel}: general.architecture={arch} (expected gemma*)")
+    return blockers
+
+
+def _catalog_publish_status_blockers(catalog_text: str) -> list[str]:
+    match = re.search(
+        r"ELIZA_1_TIER_PUBLISH_STATUS[\s\S]*?=\s*{(?P<body>[\s\S]*?)}\s*;",
+        catalog_text,
+    )
+    if not match:
+        return ["ELIZA_1_TIER_PUBLISH_STATUS: missing"]
+    body = match.group("body")
+    blockers: list[str] = []
+    for tier in ELIZA_1_TIERS:
+        tier_id = f"eliza-1-{tier}"
+        status_match = re.search(
+            rf"['\"]{re.escape(tier_id)}['\"]\s*:\s*['\"](?P<status>published|pending)['\"]",
+            body,
+        )
+        status = status_match.group("status") if status_match else "published"
+        if status != "published":
+            blockers.append(f"{tier_id}: {status} (expected published)")
+    return blockers
 
 
 def _manifest_backend_blockers(manifest: Mapping[str, Any], supported: tuple[str, ...]) -> list[str]:
@@ -1423,9 +1619,15 @@ def audit_hf_release(
     dataset_repo: str = DEFAULT_DATASET_REPO,
     fetch_json: JsonFetcher = hub_fetch_json,
     fetch_text: TextFetcher = hub_fetch_text,
+    fetch_binary: BinaryFetcher | None = None,
+    catalog_text: str | None = None,
 ) -> AuditReport:
     report = AuditReport(model_repo=model_repo, dataset_repo=dataset_repo)
     plan = build_plan()
+    if fetch_binary is None and fetch_json is hub_fetch_json and fetch_text is hub_fetch_text:
+        fetch_binary = hub_fetch_binary_range
+    if catalog_text is None and fetch_json is hub_fetch_json and fetch_text is hub_fetch_text:
+        catalog_text = _default_catalog_text()
 
     model_payload = fetch_json(_repo_api_url(MODEL_API, model_repo))
     model_paths = _sibling_paths(model_payload)
@@ -1640,6 +1842,20 @@ def audit_hf_release(
             not text_context_blockers,
             ", ".join(text_context_blockers[:8]) + (f" (+{len(text_context_blockers) - 8} more)" if len(text_context_blockers) > 8 else ""),
         )
+        if fetch_binary is not None:
+            text_architecture_blockers = _manifest_text_architecture_blockers(
+                manifest,
+                prefix=prefix,
+                model_repo=model_repo,
+                model_paths=model_paths,
+                fetch_binary=fetch_binary,
+            )
+            report.check(
+                f"{tier} text GGUF architecture passed",
+                not text_architecture_blockers,
+                ", ".join(text_architecture_blockers[:8])
+                + (f" (+{len(text_architecture_blockers) - 8} more)" if len(text_architecture_blockers) > 8 else ""),
+            )
         manifest_required_file_blockers = _manifest_required_file_blockers(
             manifest,
             required_files=plan[tier].required_files,
@@ -1741,6 +1957,15 @@ def audit_hf_release(
             f"{tier} manifest eval gates passed",
             not eval_blockers,
             ", ".join(eval_blockers[:8]) + (f" (+{len(eval_blockers) - 8} more)" if len(eval_blockers) > 8 else ""),
+            )
+
+    if catalog_text is not None:
+        catalog_status_blockers = _catalog_publish_status_blockers(catalog_text)
+        report.check(
+            "catalog Eliza-1 publish status passed",
+            not catalog_status_blockers,
+            ", ".join(catalog_status_blockers[:8])
+            + (f" (+{len(catalog_status_blockers) - 8} more)" if len(catalog_status_blockers) > 8 else ""),
         )
 
     legacy_model_paths = sorted(

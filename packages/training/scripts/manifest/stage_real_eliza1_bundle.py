@@ -59,6 +59,7 @@ try:
         KernelVerification,
         LineageEntry,
         build_manifest,
+        read_gguf_architecture,
         text_context_for_manifest,
         validate_manifest,
         write_manifest,
@@ -83,6 +84,7 @@ except ImportError:  # pragma: no cover - direct script execution path
         KernelVerification,
         LineageEntry,
         build_manifest,
+        read_gguf_architecture,
         text_context_for_manifest,
         validate_manifest,
         write_manifest,
@@ -286,6 +288,25 @@ def _read_drafter_target_checkpoint_sha256(drafter_path: Path) -> str | None:
         return str(field.parts[field.data[0]].tobytes().decode("utf-8"))
     except Exception:
         return None
+
+
+def text_architecture_for_manifest(path: Path) -> str | None:
+    return read_gguf_architecture(path)
+
+
+def _require_gemma_text_architecture(text_gguf: Path) -> str:
+    arch = text_architecture_for_manifest(text_gguf)
+    if arch is None:
+        raise SystemExit(
+            f"{text_gguf}: unable to read GGUF general.architecture; refusing "
+            "to stage Eliza-1 release weights without byte-level text provenance"
+        )
+    if not arch.lower().startswith("gemma"):
+        raise SystemExit(
+            f"{text_gguf}: general.architecture={arch!r}; active Eliza-1 "
+            "release text weights must be Gemma-4, not a Qwen or other stand-in"
+        )
+    return arch
 
 
 def _publish_blocking_reasons(
@@ -1060,6 +1081,7 @@ def stage_real_bundle(args: argparse.Namespace) -> dict[str, Any]:
             f"{RETIRED_QWEN_EMBEDDING_FILE}"
         )
 
+    text_architecture = _require_gemma_text_architecture(text_gguf)
     text_substituted = bool(args.text_substituted)
     drafter_stamp_only = bool(args.drafter_stamp_only)
     reasons = _publish_blocking_reasons(
@@ -1269,6 +1291,7 @@ def stage_real_bundle(args: argparse.Namespace) -> dict[str, Any]:
                 "repo": args.text_lineage_repo,
                 "revision": args.text_lineage_rev,
                 "quant": TEXT_QUANT_BY_TIER[tier],
+                "architecture": text_architecture,
                 "substituted": text_substituted,
                 "note": args.text_lineage_note,
             },
@@ -1321,6 +1344,7 @@ def stage_real_bundle(args: argparse.Namespace) -> dict[str, Any]:
         "repoEvidence": str(repo_evidence),
         "publishEligible": False,
         "defaultEligible": False,
+        "textArchitecture": text_architecture,
         "staged": [asdict(it) for it in staged],
         "removedStaleTextVariants": stale_text_variants,
         "manifestValidation": {

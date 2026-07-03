@@ -387,6 +387,36 @@ def _read_gguf_int_value(fh: BinaryIO, value_type: int) -> int | None:
     return None
 
 
+def read_gguf_string_metadata(path: Path, key: str) -> str | None:
+    """Return a string GGUF metadata value, if the header is readable."""
+
+    try:
+        with path.open("rb") as fh:
+            if _read_exact(fh, 4) != b"GGUF":
+                return None
+            _version = _read_u32(fh)
+            _tensor_count = _read_u64(fh)
+            metadata_count = _read_u64(fh)
+            if metadata_count > 1_000_000:
+                return None
+            for _ in range(metadata_count):
+                metadata_key = _read_gguf_string(fh)
+                value_type = _read_u32(fh)
+                if metadata_key == key:
+                    if value_type != 8:  # string
+                        _skip_gguf_value(fh, value_type)
+                        return None
+                    return _read_gguf_string(fh)
+                _skip_gguf_value(fh, value_type)
+    except Exception:
+        return None
+    return None
+
+
+def read_gguf_architecture(path: Path) -> str | None:
+    return read_gguf_string_metadata(path, "general.architecture")
+
+
 def read_gguf_context_length(path: Path) -> int | None:
     """Return the declared GGUF training/native context length, if readable.
 

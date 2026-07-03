@@ -84,6 +84,7 @@ def test_stage_real_bundle_offline_layout(tmp_path: Path, monkeypatch) -> None:
             else None
         ),
     )
+    monkeypatch.setattr(stage, "text_architecture_for_manifest", lambda path: "gemma4")
     bundle = tmp_path / "eliza-1-2b.bundle"
     bundle.mkdir(parents=True)
     _seed_assets(bundle)
@@ -107,6 +108,7 @@ def test_stage_real_bundle_offline_layout(tmp_path: Path, monkeypatch) -> None:
     # The bundle records real weights but is not publish-ready yet.
     assert report["manifestValidation"]["localNonPublishableOk"] is True
     assert report["manifestValidation"]["publishReadyOk"] is False
+    assert report["textArchitecture"] == "gemma4"
 
     manifest = json.loads((bundle / "eliza-1.manifest.json").read_text())
     assert manifest["id"] == "eliza-1-2b"
@@ -149,6 +151,30 @@ def test_stage_real_bundle_offline_layout(tmp_path: Path, monkeypatch) -> None:
         assert set(side["kernel_manifest"]) == {
             "kernel_target", "block_layout_version", "codebook_hash", "per_block_tolerance"
         }
+
+
+def test_stage_real_bundle_rejects_non_gemma_text_architecture(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(stage, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(stage, "text_architecture_for_manifest", lambda path: "qwen35")
+    bundle = tmp_path / "eliza-1-9b.bundle"
+    recipes = _seed_recipes(tmp_path / "recipes")
+    text_gguf = _write(tmp_path / "src" / "text.gguf", b"text-weights")
+    drafter_gguf = _write(tmp_path / "src" / "drafter.gguf", b"drafter-weights")
+    vision_gguf = _write(tmp_path / "src" / "vision.gguf", b"vision-weights")
+    args = argparse.Namespace(
+        tier="9b", bundle_dir=bundle, text_gguf=text_gguf, drafter_gguf=drafter_gguf,
+        recipes_dir=recipes, vision_gguf=vision_gguf,
+        text_lineage_repo="google/gemma-4-12B", text_lineage_rev="feedface",
+        text_lineage_note="", text_substituted=False, drafter_stamp_only=False,
+        skip_assets=True, skip_wakeword=True, link_mode="copy",
+        version="1.0.0-staged.1", generated_at="2026-05-11T00:00:00Z", force=False,
+    )
+
+    with pytest.raises(SystemExit, match="general\\.architecture='qwen35'.*Gemma-4"):
+        stage.stage_real_bundle(args)
 
 
 def test_stage_real_bundle_rejects_retired_qwen_embedding_artifact(

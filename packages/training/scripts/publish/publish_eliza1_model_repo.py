@@ -138,6 +138,43 @@ def _manifest_weight_paths(manifest: dict[str, Any]) -> list[str]:
     )
 
 
+def _text_architecture_errors(bundle_dir: Path, manifest: dict[str, Any]) -> list[str]:
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return []
+    text_entries = files.get("text")
+    if not isinstance(text_entries, list):
+        return []
+
+    errors: list[str] = []
+    for entry in text_entries:
+        if not isinstance(entry, dict):
+            continue
+        rel = entry.get("path")
+        if not isinstance(rel, str):
+            continue
+        try:
+            target = _safe_bundle_child(bundle_dir, rel)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if not target.is_file():
+            continue
+        architecture = M.read_gguf_architecture(target)
+        if architecture is None:
+            errors.append(
+                f"{rel}: unable to read GGUF general.architecture; active "
+                "Eliza-1 release text weights must prove Gemma-4 provenance"
+            )
+        elif not architecture.lower().startswith("gemma"):
+            errors.append(
+                f"{rel}: general.architecture={architecture!r}; active "
+                "Eliza-1 release text weights must be Gemma-4, not a Qwen or "
+                "other stand-in"
+            )
+    return errors
+
+
 def _release_blocking_reasons(evidence: dict[str, Any]) -> list[str]:
     reasons = evidence.get("publishBlockingReasons")
     if not isinstance(reasons, list):
@@ -532,6 +569,7 @@ def plan_bundle(
                         f"sha256 mismatch for {rel}: manifest={expected_sha} actual={got_sha}"
                     )
         errors.extend(_manifest_sha_errors(manifest))
+        errors.extend(_text_architecture_errors(bundle_dir, manifest))
         voice_warnings = _voice_policy_warnings(tier, manifest)
         if strict_voice_policy:
             errors.extend(voice_warnings)

@@ -18,6 +18,31 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _u32(value: int) -> bytes:
+    return value.to_bytes(4, "little")
+
+
+def _u64(value: int) -> bytes:
+    return value.to_bytes(8, "little")
+
+
+def _gguf_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return _u64(len(encoded)) + encoded
+
+
+def _gguf_header(*, architecture: str = "gemma4") -> bytes:
+    return (
+        b"GGUF"
+        + _u32(3)
+        + _u64(0)
+        + _u64(1)
+        + _gguf_string("general.architecture")
+        + _u32(8)
+        + _gguf_string(architecture)
+    )
+
+
 def _write_checksums(bundle: Path) -> None:
     sums = bundle / "checksums" / "SHA256SUMS"
     sums.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +69,11 @@ def _write_bundle(
 ) -> Path:
     bundle = root / f"eliza-1-{tier}.bundle"
     files: dict[str, bytes] = {
-        rel: f"payload:{rel}".encode("utf-8")
+        rel: (
+            _gguf_header(architecture="gemma4")
+            if rel.startswith("text/")
+            else f"payload:{rel}".encode("utf-8")
+        )
         for rel in P.required_files_for_tier(tier)
     }
     if voice_paths is not None:
@@ -169,6 +198,26 @@ def test_plan_bundle_reports_manifest_sha_mismatch(tmp_path: Path):
 
     assert plan.uploadable is False
     assert any("sha256 mismatch for mtp/drafter-2b.gguf" in e for e in plan.errors)
+
+
+def test_plan_bundle_blocks_non_gemma_text_architecture(tmp_path: Path):
+    bundle = _write_bundle(tmp_path, "9b")
+    manifest_path = bundle / "eliza-1.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    text_entry = manifest["files"]["text"][0]
+    text_path = bundle / text_entry["path"]
+    text_path.write_bytes(_gguf_header(architecture="qwen35"))
+    text_entry["sha256"] = _sha(text_path.read_bytes())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_checksums(bundle)
+
+    plan = P.plan_bundle(tmp_path, "9b")
+
+    assert plan.uploadable is False
+    assert any(
+        "general.architecture='qwen35'" in error and "Gemma-4" in error
+        for error in plan.errors
+    )
 
 
 def test_publishable_bundle_files_exclude_source_artifacts(tmp_path: Path):
