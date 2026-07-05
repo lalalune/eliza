@@ -21,15 +21,28 @@ import {
 } from "@elizaos/core";
 import { parseClampedFloat, parsePositiveInteger } from "@elizaos/shared";
 import {
+  actorCanManageAgentDocuments,
+  actorCanManageOwnerDocuments,
+  asRecord,
+  asUuid,
+  canMutateDocumentMemory,
+  canReadDocumentMemory,
+  type DocumentFilter,
+  documentScopedEntityId,
+  matchesDocumentFilter,
+  parseDocumentScope,
+  type RouteActor,
+  routeActorAddedByRole,
+  trimString,
+} from "@elizaos/agent/api/document-access";
+import {
   getDocumentDeleteability,
   getDocumentEditability,
   getDocumentProvenance,
   getDocumentTitleFromMetadata,
-  getDocumentVisibilityScope,
   presentDocument,
 } from "./document-presenter.js";
 import {
-  type DocumentAddedByRole,
   type DocumentSearchMode,
   type DocumentsServiceLike,
   type DocumentVisibilityScope,
@@ -54,44 +67,6 @@ const FRAGMENT_BATCH_SIZE = 500;
 const DOCUMENT_UPLOAD_MAX_BODY_BYTES = 32 * 1_048_576; // 32 MB
 const MAX_BULK_DOCUMENTS = 100;
 
-const DOCUMENT_SCOPE_VALUES = new Set<DocumentVisibilityScope>([
-  "global",
-  "owner-private",
-  "user-private",
-  "agent-private",
-]);
-
-type DocumentFilter = {
-  scope?: DocumentVisibilityScope;
-  scopedToEntityId?: UUID;
-  query?: string;
-  addedBy?: UUID;
-  timeRangeStart?: number;
-  timeRangeEnd?: number;
-  tags?: string[];
-  /** First-class source-room filter (#13593). */
-  roomId?: UUID;
-  /**
-   * Media-format facet (#13593): image | audio | video | pdf | text |
-   * transcript | file. Matched against `metadata.mediaFormat` or the
-   * `media-format:<format>` tag, so both explicitly-tagged records and
-   * mime-derived ones compose.
-   */
-  mediaFormat?: string;
-};
-
-/** Namespaced tag prefix carrying the media-format facet on knowledge records. */
-const MEDIA_FORMAT_TAG_PREFIX = "media-format:";
-
-type DocumentReadableMemory = {
-  id?: UUID;
-  agentId?: UUID;
-  entityId?: UUID;
-  createdAt?: number;
-  content?: { text?: string };
-  metadata?: unknown;
-};
-
 type DocumentUploadBody = {
   content: string;
   filename: string;
@@ -102,14 +77,6 @@ type DocumentUploadBody = {
   entityId?: string;
   scope?: string;
   scopedToEntityId?: string;
-};
-
-type RouteActorRole = "OWNER" | "USER" | "AGENT" | "RUNTIME";
-
-type RouteActor = {
-  entityId: UUID;
-  role: RouteActorRole;
-  ownerEntityId?: UUID;
 };
 
 function isTextBackedContentType(
@@ -136,23 +103,6 @@ function isTextBackedContentType(
     lowerFilename.endsWith(".csv") ||
     lowerFilename.endsWith(".tsv")
   );
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function trimString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : undefined;
-}
-
-function asUuid(value: unknown): UUID | undefined {
-  const trimmed = trimString(value);
-  return trimmed ? (trimmed as UUID) : undefined;
 }
 
 function getOwnerEntityId(runtime: AgentRuntime | null): UUID | undefined {
@@ -184,28 +134,6 @@ function resolveRouteActor(
     return { entityId, role: "OWNER", ownerEntityId };
   }
   return { entityId, role: "USER", ownerEntityId };
-}
-
-function routeActorAddedByRole(actor: RouteActor): DocumentAddedByRole {
-  return actor.role;
-}
-
-function actorCanManageOwnerDocuments(actor: RouteActor): boolean {
-  return actor.role === "OWNER" || actor.role === "RUNTIME";
-}
-
-function actorCanManageAgentDocuments(actor: RouteActor): boolean {
-  return (
-    actor.role === "OWNER" || actor.role === "AGENT" || actor.role === "RUNTIME"
-  );
-}
-
-function parseDocumentScope(
-  value: unknown,
-): DocumentVisibilityScope | undefined {
-  return DOCUMENT_SCOPE_VALUES.has(value as DocumentVisibilityScope)
-    ? (value as DocumentVisibilityScope)
-    : undefined;
 }
 
 function parseSearchMode(value: unknown): DocumentSearchMode | undefined {
@@ -349,158 +277,6 @@ function isDocumentMemory(memory: Memory, agentId: UUID): boolean {
     metadata?.type === "custom" ||
     (typeof metadata?.documentId === "string" &&
       metadata.documentId === memory.id)
-  );
-}
-
-function matchesDocumentFilter(
-  memory: DocumentReadableMemory,
-  filters: DocumentFilter,
-): boolean {
-  const metadata = asRecord(memory.metadata);
-  if (filters.scope && getDocumentVisibilityScope(metadata) !== filters.scope) {
-    return false;
-  }
-  if (
-    filters.scopedToEntityId &&
-    documentScopedEntityId(memory) !== filters.scopedToEntityId
-  ) {
-    return false;
-  }
-  if (filters.addedBy && metadata?.addedBy !== filters.addedBy) {
-    return false;
-  }
-  const documentTags = Array.isArray(metadata?.tags)
-    ? metadata.tags.filter(
-        (value): value is string => typeof value === "string",
-      )
-    : [];
-  if (filters.tags && filters.tags.length > 0) {
-    if (!filters.tags.every((tag) => documentTags.includes(tag))) {
-      return false;
-    }
-  }
-  if (filters.roomId && documentRoomId(metadata) !== filters.roomId) {
-    return false;
-  }
-  if (
-    filters.mediaFormat &&
-    documentMediaFormat(metadata, documentTags) !== filters.mediaFormat
-  ) {
-    return false;
-  }
-
-  const timestamp =
-    typeof metadata?.timestamp === "number"
-      ? metadata.timestamp
-      : typeof metadata?.addedAt === "number"
-        ? metadata.addedAt
-        : typeof memory.createdAt === "number"
-          ? memory.createdAt
-          : undefined;
-  if (
-    typeof filters.timeRangeStart === "number" &&
-    (typeof timestamp !== "number" || timestamp < filters.timeRangeStart)
-  ) {
-    return false;
-  }
-  if (
-    typeof filters.timeRangeEnd === "number" &&
-    (typeof timestamp !== "number" || timestamp > filters.timeRangeEnd)
-  ) {
-    return false;
-  }
-  if (filters.query) {
-    const query = filters.query.toLowerCase();
-    const haystack = [
-      memory.content?.text,
-      getDocumentTitleFromMetadata(metadata, memory.content?.text),
-      metadata?.title,
-      metadata?.filename,
-      metadata?.originalFilename,
-      metadata?.source,
-      metadata?.url,
-    ]
-      .filter((value): value is string => typeof value === "string")
-      .join("\n")
-      .toLowerCase();
-    if (!haystack.includes(query)) return false;
-  }
-  return true;
-}
-
-function documentScopedEntityId(
-  memory: DocumentReadableMemory,
-): UUID | undefined {
-  const metadata = asRecord(memory.metadata);
-  return (
-    asUuid(metadata?.scopedToEntityId) ??
-    asUuid(metadata?.addedBy) ??
-    asUuid(memory.entityId)
-  );
-}
-
-/** Source-room id recorded on a knowledge record (#13593), if any. */
-function documentRoomId(
-  metadata: Record<string, unknown> | undefined,
-): UUID | undefined {
-  return asUuid(metadata?.roomId);
-}
-
-/**
- * Media-format facet for a knowledge record (#13593). Prefer an explicit
- * `metadata.mediaFormat`; fall back to the `media-format:<format>` tag so
- * records tagged by the ingest pipeline (or backfill) still match without a
- * dedicated column.
- */
-function documentMediaFormat(
-  metadata: Record<string, unknown> | undefined,
-  tags: string[],
-): string | undefined {
-  const explicit = trimString(metadata?.mediaFormat)?.toLowerCase();
-  if (explicit) return explicit;
-  const tagged = tags.find((tag) => tag.startsWith(MEDIA_FORMAT_TAG_PREFIX));
-  return tagged ? tagged.slice(MEDIA_FORMAT_TAG_PREFIX.length) : undefined;
-}
-
-function canReadDocumentMemory(
-  memory: DocumentReadableMemory,
-  actor: RouteActor,
-  filters: DocumentFilter = {},
-): boolean {
-  const metadata = asRecord(memory.metadata);
-  const scope = getDocumentVisibilityScope(metadata);
-
-  if (scope === "global") return true;
-  if (scope === "owner-private") return actorCanManageOwnerDocuments(actor);
-  if (scope === "agent-private") return actorCanManageAgentDocuments(actor);
-
-  const scopedEntityId = documentScopedEntityId(memory);
-  if (!scopedEntityId) return false;
-
-  if (actor.role === "AGENT" || actor.role === "RUNTIME") return true;
-  if (actor.role === "OWNER") {
-    return filters.scopedToEntityId
-      ? scopedEntityId === filters.scopedToEntityId
-      : scopedEntityId === actor.entityId;
-  }
-  return scopedEntityId === actor.entityId;
-}
-
-function canMutateDocumentMemory(memory: Memory, actor: RouteActor): boolean {
-  const metadata = asRecord(memory.metadata);
-  const scope = getDocumentVisibilityScope(metadata);
-
-  if (scope === "global" || scope === "owner-private") {
-    return actorCanManageOwnerDocuments(actor);
-  }
-  if (scope === "agent-private") {
-    return actorCanManageAgentDocuments(actor);
-  }
-
-  const scopedEntityId = documentScopedEntityId(memory);
-  return (
-    actorCanManageAgentDocuments(actor) ||
-    (Boolean(scopedEntityId) && scopedEntityId === actor.entityId)
   );
 }
 
