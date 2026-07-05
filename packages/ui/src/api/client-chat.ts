@@ -89,6 +89,8 @@ type DocumentListOptions = {
   timeRangeStart?: string;
   timeRangeEnd?: string;
   tags?: string[];
+  roomId?: string;
+  mediaFormat?: string;
 };
 
 type DocumentUploadRequest = {
@@ -109,6 +111,8 @@ type DocumentUrlUploadOptions = {
   scopedToEntityId?: string;
 };
 
+type DocumentSearchMode = "hybrid" | "vector" | "keyword";
+
 type DocumentSearchOptions = {
   threshold?: number;
   limit?: number;
@@ -119,6 +123,9 @@ type DocumentSearchOptions = {
   timeRangeStart?: string;
   timeRangeEnd?: string;
   tags?: string[];
+  roomId?: string;
+  mediaFormat?: string;
+  searchMode?: DocumentSearchMode;
 };
 
 type InboxMessagesOptions = {
@@ -232,6 +239,8 @@ function appendDocumentFilterParams(
   setTruthyStringParam(params, "addedBy", options?.addedBy);
   setTruthyStringParam(params, "timeRangeStart", options?.timeRangeStart);
   setTruthyStringParam(params, "timeRangeEnd", options?.timeRangeEnd);
+  setTruthyStringParam(params, "roomId", options?.roomId);
+  setTruthyStringParam(params, "mediaFormat", options?.mediaFormat);
   appendTagsParam(params, options?.tags);
 }
 
@@ -254,6 +263,7 @@ function buildDocumentSearchParams(
   setDefinedNumberParam(params, "threshold", options?.threshold);
   setDefinedNumberParam(params, "limit", options?.limit);
   setTruthyStringParam(params, "query", options?.query);
+  setTruthyStringParam(params, "searchMode", options?.searchMode);
   appendDocumentFilterParams(params, options);
   return params;
 }
