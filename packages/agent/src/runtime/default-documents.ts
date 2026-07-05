@@ -51,6 +51,44 @@ export const ELIZA_CLOUD_BASICS_TEXT =
 export const ELIZA_CLOUD_MONETIZATION_TEXT =
   "Eliza and Eliza can help builders make money with Cloud apps: create monetized apps, set inference markup and app-credit purchase share, send payment requests through Stripe/OxaPay app credits or x402 crypto payments, track whether requests were paid, route payment results back into the initiating conversation, earn from affiliate and creator revenue-share flows, and request admin-reviewed elizaOS token payouts on Base, BSC, Ethereum, or Solana. Paid actions require explicit user confirmation.";
 
+/**
+ * Help fold-in (#13377 / #13595 slice 3): the former standalone Help view's Q&A
+ * is seeded as `help`-tagged default knowledge so asking for help in chat
+ * retrieves it through normal knowledge search (SEARCH_KNOWLEDGE / the hub's
+ * `help` tag filter) instead of a bespoke Help screen. Each entry stays short
+ * (2-4 sentences), jargon-light, and mirrors the plain-language answers a new
+ * user actually asks. The `help` tag is what the retired `/help` deep-link
+ * redirect filters on.
+ */
+export const HELP_KNOWLEDGE_TAG = "help";
+
+export const HELP_GETTING_STARTED_TEXT =
+  "Eliza is your personal AI agent. It chats with you by text or voice, can run on your own device or in the cloud, and can do real work: answer questions, manage tasks, use connected apps, and control its own screens. You drive all of it through one chat that floats over every view. To get started, just say hi in the chat and tell it what you want, or take the built-in tour from Help. The glowing pill at the bottom is that always-available chat: click it to open, and it stays with you as you move between screens.";
+
+export const HELP_CHAT_NAVIGATION_TEXT =
+  "The chat floats over every screen. Open or close it with the pill at the bottom, and it keeps your conversation as you switch views. You can move around the app just by talking to it: ask to open Settings, Skills, Documents, or any view and Eliza navigates there for you. You can also click the navigation to switch screens manually. To reach Settings, ask for it in chat or open it from the menu.";
+
+export const HELP_AI_MODELS_TEXT =
+  "You choose which AI model powers Eliza in Settings under the AI model section. Eliza can use a hosted cloud model or run a model on your own device for fully offline, local inference. If you are unsure which to pick, a hosted model is the easiest to start with and a local model is best when you want everything to stay on your machine. You can switch at any time.";
+
+export const HELP_PRIVACY_TEXT =
+  "Your data can stay local. Eliza can run on your own device with your conversations and knowledge stored locally, use a cloud backend when you opt in, or connect to a remote server you point it at. Local keeps everything on your machine; cloud adds managed hosting and app features; remote connects to a server you control. You decide which mode to use, and paid or third-party actions always ask for your confirmation first.";
+
+export const HELP_VOICE_TEXT =
+  "You can talk to Eliza by voice as well as text. Turn voice on and pick a voice in Settings, then use the microphone in the chat to speak. If voice is not working, check that your browser or device has microphone permission, that a voice is selected, and that your audio output is not muted.";
+
+export const HELP_CONNECTORS_TEXT =
+  "Connectors link Eliza to outside apps like Discord, Telegram, and Slack so it can send and receive messages there. You add and manage them from the connectors area: pick the app, follow the connect flow to authorize it, and Eliza can then operate in that app. Each connector is opt-in and can be disconnected at any time.";
+
+export const HELP_ELIZA_CLOUD_TEXT =
+  "Eliza Cloud is the managed backend and app platform for Eliza. It lets builders create and manage apps, route chat and media through the cloud, monetize app usage, and deploy server-side containers. You do not have to use Cloud to use Eliza, but logging in to Cloud unlocks the app platform and cloud-hosted features. To log in, use the Cloud login flow from Settings or when an app prompts you.";
+
+export const HELP_WHAT_ELIZA_CAN_DO_TEXT =
+  "Eliza can answer questions, manage tasks and reminders, search and use your knowledge and documents, control the app's own screens, run recurring workflows on a schedule, and act inside connected apps. Skills are add-on capabilities you can enable to give it new abilities. The Launcher is where you start apps and tools. Just ask in chat and Eliza will use whatever it needs to help.";
+
+export const HELP_TROUBLESHOOTING_TEXT =
+  "If Eliza is not responding, check that a model is selected and reachable in Settings and that your connection is up, then try sending your message again. Slow startup usually means a model or backend is still loading; give it a moment on first launch. To start fresh you can reset from Settings. You can replay the interactive tutorial any time from Help.";
+
 export const DEFAULT_DOCUMENTS: readonly DefaultDocumentDefinition[] = [
   {
     key: "eliza-overview",
@@ -99,6 +137,88 @@ export const DEFAULT_DOCUMENTS: readonly DefaultDocumentDefinition[] = [
         text: ELIZA_CLOUD_MONETIZATION_TEXT,
       },
     ],
+  },
+  // Help fold-in (#13377): former Help view content as help-tagged knowledge.
+  {
+    key: "help-getting-started",
+    version: 1,
+    filename: "help-getting-started.txt",
+    contentType: "text/plain",
+    text: HELP_GETTING_STARTED_TEXT,
+    fragments: [{ text: HELP_GETTING_STARTED_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Getting started" },
+  },
+  {
+    key: "help-chat-navigation",
+    version: 1,
+    filename: "help-chat-navigation.txt",
+    contentType: "text/plain",
+    text: HELP_CHAT_NAVIGATION_TEXT,
+    fragments: [{ text: HELP_CHAT_NAVIGATION_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Chat & navigation" },
+  },
+  {
+    key: "help-ai-models",
+    version: 1,
+    filename: "help-ai-models.txt",
+    contentType: "text/plain",
+    text: HELP_AI_MODELS_TEXT,
+    fragments: [{ text: HELP_AI_MODELS_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "AI models" },
+  },
+  {
+    key: "help-privacy-data",
+    version: 1,
+    filename: "help-privacy-data.txt",
+    contentType: "text/plain",
+    text: HELP_PRIVACY_TEXT,
+    fragments: [{ text: HELP_PRIVACY_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Privacy & data" },
+  },
+  {
+    key: "help-voice",
+    version: 1,
+    filename: "help-voice.txt",
+    contentType: "text/plain",
+    text: HELP_VOICE_TEXT,
+    fragments: [{ text: HELP_VOICE_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Voice" },
+  },
+  {
+    key: "help-connectors",
+    version: 1,
+    filename: "help-connectors.txt",
+    contentType: "text/plain",
+    text: HELP_CONNECTORS_TEXT,
+    fragments: [{ text: HELP_CONNECTORS_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Connecting apps" },
+  },
+  {
+    key: "help-eliza-cloud",
+    version: 1,
+    filename: "help-eliza-cloud.txt",
+    contentType: "text/plain",
+    text: HELP_ELIZA_CLOUD_TEXT,
+    fragments: [{ text: HELP_ELIZA_CLOUD_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Eliza Cloud" },
+  },
+  {
+    key: "help-what-eliza-can-do",
+    version: 1,
+    filename: "help-what-eliza-can-do.txt",
+    contentType: "text/plain",
+    text: HELP_WHAT_ELIZA_CAN_DO_TEXT,
+    fragments: [{ text: HELP_WHAT_ELIZA_CAN_DO_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "What Eliza can do" },
+  },
+  {
+    key: "help-troubleshooting",
+    version: 1,
+    filename: "help-troubleshooting.txt",
+    contentType: "text/plain",
+    text: HELP_TROUBLESHOOTING_TEXT,
+    fragments: [{ text: HELP_TROUBLESHOOTING_TEXT }],
+    metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Troubleshooting" },
   },
 ];
 
