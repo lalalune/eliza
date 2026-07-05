@@ -67,6 +67,7 @@ export interface TrajectoryListOptions {
 	endDate?: string;
 	search?: string;
 	scenarioId?: string;
+	traceId?: string;
 	batchId?: string;
 	isTrainingData?: boolean;
 }
