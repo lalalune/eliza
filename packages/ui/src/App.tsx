@@ -59,7 +59,7 @@ import { ActionBanner } from "./components/shell/ActionBanner";
 import { AssistantOverlay } from "./components/shell/AssistantOverlay";
 import { BugReportModal } from "./components/shell/BugReportModal";
 import { ChatSurface } from "./components/shell/ChatSurface";
-import { CloudHandoffBanner } from "./components/shell/CloudHandoffBanner";
+import { BootRecoveryConductorMount } from "./first-run/use-boot-recovery-conductor";
 import { ConnectionFailedBanner } from "./components/shell/ConnectionFailedBanner";
 import { ConnectionLostOverlay } from "./components/shell/ConnectionLostOverlay";
 import { ContinuousChatOverlay } from "./components/shell/ContinuousChatOverlay";
@@ -2316,6 +2316,7 @@ export function App() {
           <ChatOverlayShell />
           <FirstRunConductorMount />
           <ModelStatusConductorMount />
+          <BootRecoveryConductorMount />
         </ShellControllerProvider>
         <BugReportModal />
       </BugReportProvider>
@@ -2497,7 +2498,6 @@ export function App() {
             <ConnectionFailedBanner />
             <SystemWarningBanner />
             <ActionBanner />
-            <CloudHandoffBanner />
             {shellContent}
           </div>
         </div>
@@ -2546,6 +2546,11 @@ export function App() {
             downloading/loading/missing/errored it seeds ONE live status turn
             with cancel / switch-to-cloud / retry controls. Renders null. */}
         <ModelStatusConductorMount />
+        {/* In-chat boot-recovery card (headless) — a stalled boot or a failed
+            dedicated-agent handoff seeds ONE live turn with re-log-in /
+            try-again / retry-setup controls; the transcript is the only boot
+            status surface (no floating banner). Renders null. */}
+        <BootRecoveryConductorMount />
         {/* Interactive tutorial: a persistent spotlight overlay that survives
             navigation (it sends the user to Settings, back home, …). Renders
             only when the tutorial is active (launched from the home Tutorial

@@ -28,6 +28,7 @@ import {
   isMobileLocalAgentIpcBase,
   persistMobileRuntimeModeForServerTarget,
 } from "../first-run/mobile-runtime-mode";
+import { tryHandleBootRecoveryAction } from "../first-run/boot-recovery-channel";
 import { tryHandleModelAction } from "../first-run/model-action-channel";
 import {
   activeServerKindToFirstRunRuntimeTarget,
@@ -1189,6 +1190,9 @@ function AppProviderInner({
       // to cloud / retry / download) are consumed by the model-status conductor
       // and NEVER reach the server — regardless of onboarding state.
       if (tryHandleModelAction(text)) return Promise.resolve();
+      // Same contract for the in-chat boot-recovery card's `__boot_recovery__:`
+      // controls (re-log in / try again / retry setup).
+      if (tryHandleBootRecoveryAction(text)) return Promise.resolve();
       switch (classifyActionMessage(text, firstRunComplete === true)) {
         case "first-run": {
           const handled = tryHandleFirstRunAction(text);

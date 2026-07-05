@@ -870,15 +870,17 @@ export async function expectChatFirstOnboarding(page: Page): Promise<Locator> {
 }
 
 /**
- * Assert the overlay AUTO-COLLAPSED on the completion edge: the moment
- * firstRunComplete flips, the sheet drops from the pinned FULL detent to the
- * composer-only resting state (revealing the home), and the composer unlocks.
+ * Assert the overlay settled on the completion edge: the moment
+ * firstRunComplete flips, the sheet springs from the pinned FULL detent down
+ * to the HALF detent (home revealed behind the top half, conversation still in
+ * hand), and the composer unlocks.
  */
-export async function expectOnboardingAutoCollapse(page: Page): Promise<void> {
-  const overlay = page.getByTestId("continuous-chat-overlay");
-  await expect(overlay).not.toHaveAttribute("data-open", "true", {
-    timeout: 30_000,
-  });
+export async function expectOnboardingSettleToHalf(page: Page): Promise<void> {
+  await expect(page.getByTestId("chat-sheet")).toHaveAttribute(
+    "data-detent",
+    "half",
+    { timeout: 30_000 },
+  );
   await expect(page.getByTestId("chat-composer-textarea")).toBeEnabled({
     timeout: 15_000,
   });
@@ -986,12 +988,13 @@ export async function completeOnboardingToHome(
   // 3) Provisioning posts first-run, then the conductor offers the tutorial.
   await pickTutorial(page, click, tutorial);
 
-  // 4) Landing is the HOME: the sheet auto-collapses on the completion edge
-  // (revealing the home) and the floating chat overlay stays present with a
-  // now-unlocked composer; the home widget host renders its seeded cards.
+  // 4) Landing is the HOME: the sheet settles to the HALF detent on the
+  // completion edge (revealing the home behind the top half) and the floating
+  // chat overlay stays present with a now-unlocked composer; the home widget
+  // host renders its seeded cards.
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
-  await expectOnboardingAutoCollapse(page);
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
@@ -1042,12 +1045,12 @@ export async function completeCloudOnboardingToHome(
   await expect(agentChoice).toBeVisible({ timeout: 30_000 });
   await click(agentChoice);
 
-  // 4) Binding done → tutorial offered → land on the home (sheet auto-collapses).
+  // 4) Binding done → tutorial offered → land on the home (sheet settles to half).
   await pickTutorial(page, click, tutorial);
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
-  await expectOnboardingAutoCollapse(page);
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
@@ -1104,17 +1107,17 @@ export async function expectCloudOnlySignInOnboarding(
 
 /** Post-completion contract shared by every cloud-only path: the real gate
  *  flipped at provisioning success (no tutorial/accent gate), the wrap-up turn
- *  is informational, the sheet auto-collapsed, and first-run persisted once. */
+ *  is informational, the sheet settled to HALF, and first-run persisted once. */
 async function expectCloudOnlyCompletion(
   page: Page,
   state: OnboardingRouteState,
 ): Promise<{ surface: Locator }> {
-  // Completion fires at provisioning success and collapses the sheet in the
-  // same commit — the wrap-up transcript turn is immediately hidden (and may
-  // unmount), so the completion contract is asserted on the durable surfaces:
-  // the collapse itself, the onboarded home, the absent tutorial gate, and the
-  // exactly-once POST. The wrap-up copy is covered by the conductor unit suite.
-  await expectOnboardingAutoCollapse(page);
+  // Completion fires at provisioning success and drops the sheet to the HALF
+  // detent in the same commit. The completion contract is asserted on the
+  // durable surfaces: the settle itself, the onboarded home, the absent
+  // tutorial gate, and the exactly-once POST. The wrap-up copy is covered by
+  // the conductor unit suite.
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId(TUTORIAL_CHOICE("start"))).toHaveCount(0);
   await expect(page.getByTestId(TUTORIAL_CHOICE("skip"))).toHaveCount(0);
@@ -1196,7 +1199,7 @@ export async function completeCloudInferenceOnboardingToHome(
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
-  await expectOnboardingAutoCollapse(page);
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
@@ -1245,7 +1248,7 @@ export async function completeOtherProviderSettingsHandoff(
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
-  await expectOnboardingAutoCollapse(page);
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
@@ -1288,8 +1291,8 @@ export async function connectRemoteFirstRunToHome(
   const surface = page.getByTestId("home-launcher-surface");
   await expect(surface).toBeVisible({ timeout: 60_000 });
   await expect(surface).toHaveAttribute("data-page", "home");
-  // Remote adoption flips firstRunComplete too — same auto-collapse edge.
-  await expectOnboardingAutoCollapse(page);
+  // Remote adoption flips firstRunComplete too — same settle-to-half edge.
+  await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
