@@ -3319,6 +3319,7 @@ async function handleRequest(
       json,
       error,
       broadcastWs: state.broadcastWs ?? undefined,
+      broadcastWsToClientId: state.broadcastWsToClientId ?? undefined,
       runtime: state.runtime,
     })
   ) {

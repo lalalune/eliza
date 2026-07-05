@@ -48,6 +48,12 @@ export interface ActiveViewContext {
    */
   elements?: readonly ActiveViewElement[];
   /**
+   * WebSocket client id for the shell that most recently reported this active
+   * view's mounted element snapshot. Mutating frontend interactions target this
+   * owner so multiple shells cannot all execute one agent action.
+   */
+  clientId?: string;
+  /**
    * ISO timestamp of the most recent switch INTO this view, and who drove it.
    * Carried from the navigate route so Stage-1 can acknowledge a just-happened
    * switch (#8788). Absent when the view was not freshly switched.
@@ -93,9 +99,14 @@ export function clearActiveViewContext(): void {
 export function setActiveViewElements(
   viewId: string,
   elements: readonly ActiveViewElement[],
+  clientId?: string | null,
 ): boolean {
   if (!activeView || activeView.viewId !== viewId) return false;
-  activeView = { ...activeView, elements };
+  activeView = {
+    ...activeView,
+    elements,
+    ...(clientId ? { clientId } : {}),
+  };
   return true;
 }
 

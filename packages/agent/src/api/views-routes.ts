@@ -59,6 +59,7 @@ import {
   detectClientPlatform,
   isDynamicLoadingAllowed,
 } from "./platform-detect.ts";
+import { normalizeWsClientId } from "./server-helpers-auth.ts";
 import type { ViewRegistryEntry } from "./view-registry-types.ts";
 import {
   findHeroOnDisk,
@@ -227,6 +228,8 @@ export interface ViewsRouteContext
   developerMode?: boolean;
   /** Broadcast an arbitrary payload to all connected WebSocket clients. */
   broadcastWs?: (payload: object) => void;
+  /** Broadcast a payload only to WebSocket clients bound to one client id. */
+  broadcastWsToClientId?: (clientId: string, payload: object) => number;
   /** Agent runtime — used by the semantic search endpoint. */
   runtime?: IAgentRuntime | null;
 }
@@ -890,7 +893,8 @@ export async function handleViewsRoutes(
       () => null,
     );
     const elements = normalizeActiveViewElements(body?.elements);
-    const accepted = setActiveViewElements(id, elements);
+    const clientId = resolveViewInteractClientId(req, body);
+    const accepted = setActiveViewElements(id, elements, clientId);
     json(res, { ok: true, viewId: id, accepted, count: elements.length });
     return true;
   }
@@ -950,13 +954,11 @@ export async function handleViewsRoutes(
       `[ViewsRoutes] Activate element "${elementId}" on view "${id}"`,
     );
 
-    const dispatch = await dispatchViewInteract(
-      entry,
-      id,
-      capability,
-      params,
-      ctx.broadcastWs,
-    );
+    const dispatch = await dispatchViewInteract(entry, id, capability, params, {
+      broadcastWs: ctx.broadcastWs,
+      broadcastWsToClientId: ctx.broadcastWsToClientId,
+      clientId: resolveTargetViewClientId(id, req, body),
+    });
 
     json(res, {
       ok: dispatch.success,
@@ -1093,16 +1095,46 @@ export async function handleViewsRoutes(
 
     // Register the pending slot before broadcasting — avoids a race where the
     // frontend responds before we start waiting.
-    const resultPromise = pendingInteractRequests.waitFor(requestId, timeoutMs);
-
-    ctx.broadcastWs?.({
+    const targetClientId = resolveTargetViewClientId(id, req, body);
+    const frame = {
       type: "view:interact",
       viewId: id,
       viewType: entry.viewType,
       capability,
       params,
       requestId,
-    });
+    };
+
+    if (!targetClientId) {
+      json(res, {
+        requestId,
+        success: false,
+        error:
+          "Missing client id for frontend view interaction. Provide X-ElizaOS-Client-Id or clientId.",
+      });
+      return true;
+    }
+
+    if (typeof ctx.broadcastWsToClientId !== "function") {
+      json(res, {
+        requestId,
+        success: false,
+        error: "Targeted view interaction delivery is unavailable.",
+      });
+      return true;
+    }
+
+    // Register the pending slot before sending — avoids a race where the
+    // frontend responds before we start waiting.
+    const resultPromise = pendingInteractRequests.waitFor(requestId, timeoutMs);
+    const delivered = ctx.broadcastWsToClientId(targetClientId, frame);
+    if (delivered <= 0) {
+      pendingInteractRequests.resolve(requestId, {
+        requestId,
+        success: false,
+        error: `No connected view client "${targetClientId}" is available for "${id}".`,
+      });
+    }
 
     try {
       const result = await resultPromise;
@@ -1139,6 +1171,12 @@ interface ViewInteractDispatchResult {
   error?: string;
 }
 
+interface ViewInteractTransport {
+  broadcastWs?: (payload: object) => void;
+  broadcastWsToClientId?: (clientId: string, payload: object) => number;
+  clientId?: string | null;
+}
+
 /**
  * Dispatch a capability to a view, reusing the established interact semantics:
  * a `serverInteract` handler when the view declares one, else a frontend
@@ -1151,7 +1189,7 @@ async function dispatchViewInteract(
   viewId: string,
   capability: string,
   params: Record<string, unknown>,
-  broadcastWs?: (payload: object) => void,
+  transport: ViewInteractTransport,
   timeoutMs = 5_000,
 ): Promise<ViewInteractDispatchResult> {
   const requestId = randomUUID();
@@ -1159,7 +1197,7 @@ async function dispatchViewInteract(
   if (typeof entry.serverInteract === "function") {
     try {
       const result = await entry.serverInteract(capability, params);
-      broadcastWs?.({
+      transport.broadcastWs?.({
         type: "view:event",
         viewEventType: `view:${viewId}:updated`,
         payload: { viewId, capability },
@@ -1178,8 +1216,24 @@ async function dispatchViewInteract(
     }
   }
 
+  if (!transport.clientId) {
+    return {
+      requestId,
+      success: false,
+      error:
+        "Missing client id for frontend view interaction. Provide X-ElizaOS-Client-Id or clientId.",
+    };
+  }
+  if (typeof transport.broadcastWsToClientId !== "function") {
+    return {
+      requestId,
+      success: false,
+      error: "Targeted view interaction delivery is unavailable.",
+    };
+  }
+
   const resultPromise = pendingInteractRequests.waitFor(requestId, timeoutMs);
-  broadcastWs?.({
+  const delivered = transport.broadcastWsToClientId(transport.clientId, {
     type: "view:interact",
     viewId,
     viewType: entry.viewType,
@@ -1187,6 +1241,13 @@ async function dispatchViewInteract(
     params,
     requestId,
   });
+  if (delivered <= 0) {
+    pendingInteractRequests.resolve(requestId, {
+      requestId,
+      success: false,
+      error: `No connected view client "${transport.clientId}" is available for "${viewId}".`,
+    });
+  }
   try {
     const result = (await resultPromise) as ViewInteractResult;
     return {
@@ -1206,6 +1267,35 @@ async function dispatchViewInteract(
       error: `View "${viewId}" did not respond to capability "${capability}" within ${timeoutMs}ms`,
     };
   }
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | null {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
+function resolveViewInteractClientId(
+  req: Pick<http.IncomingMessage, "headers">,
+  body: Record<string, unknown> | null | undefined,
+): string | null {
+  return (
+    normalizeWsClientId(firstHeaderValue(req.headers["x-elizaos-client-id"])) ??
+    normalizeWsClientId(firstHeaderValue(req.headers["x-eliza-client-id"])) ??
+    normalizeWsClientId(body?.clientId)
+  );
+}
+
+function resolveTargetViewClientId(
+  viewId: string,
+  req: Pick<http.IncomingMessage, "headers">,
+  body: Record<string, unknown> | null | undefined,
+): string | null {
+  const explicit = resolveViewInteractClientId(req, body);
+  const active = getActiveViewContext();
+  const mountedOwner =
+    active?.viewId === viewId ? (active.clientId ?? null) : null;
+  if (!mountedOwner) return explicit;
+  return !explicit || explicit === mountedOwner ? mountedOwner : null;
 }
 
 function resultSuccess(result: unknown): boolean {
