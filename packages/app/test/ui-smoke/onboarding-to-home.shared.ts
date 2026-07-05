@@ -1139,15 +1139,25 @@ async function expectCloudOnlyCompletion(
  */
 export async function completeCloudOnlyOnboardingToHome(
   page: Page,
-  click: (locator: Locator) => Promise<void>,
   opts: { state: OnboardingRouteState },
 ): Promise<{ surface: Locator }> {
   await expectCloudOnlySignInOnboarding(page);
 
   // The session token lands as the login flow the tap launches completes
   // (mocked at the storage boundary — same token the poll mock returns).
+  // Seeding it also arms the conductor's 500ms token poll, which can win the
+  // race and complete onboarding BEFORE the tap lands — the button then sits
+  // in a settling sheet and never reads "stable". Bound the click and let the
+  // completion assertions carry the contract either way.
   await setStewardSession(page, { token: CLOUD_AUTH_TOKEN });
-  await click(page.getByTestId(RUNTIME_CHOICE("cloud")));
+  try {
+    await page
+      .getByTestId(RUNTIME_CHOICE("cloud"))
+      .first()
+      .click({ timeout: 8_000 });
+  } catch {
+    // The token poll already completed onboarding — nothing left to tap.
+  }
 
   return expectCloudOnlyCompletion(page, opts.state);
 }

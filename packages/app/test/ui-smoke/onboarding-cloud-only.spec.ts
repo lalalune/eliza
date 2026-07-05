@@ -14,7 +14,7 @@
  */
 import { rm } from "node:fs/promises";
 import path from "node:path";
-import { expect, type Locator, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import {
   expectNoPageDiagnostics,
   installPageDiagnosticsGuard,
@@ -37,8 +37,6 @@ const SCREENSHOT_DIR = path.join(
   "onboarding-cloud-only",
 );
 const screenshot = makeScreenshotter(SCREENSHOT_DIR);
-
-const desktopClick = (locator: Locator) => locator.click();
 
 test.describe("cloud-only onboarding (production default)", () => {
   test.beforeEach(({ page }) => {
@@ -64,11 +62,9 @@ test.describe("cloud-only onboarding (production default)", () => {
     await expectCloudOnlySignInOnboarding(page);
     await screenshot(page, "cloud-only-sign-in-greeting");
 
-    const { surface } = await completeCloudOnlyOnboardingToHome(
-      page,
-      desktopClick,
-      { state },
-    );
+    const { surface } = await completeCloudOnlyOnboardingToHome(page, {
+      state,
+    });
     await settleHomeEntrance(page);
     await screenshot(page, "cloud-only-home");
     expect(await surface.getAttribute("data-page")).toBe("home");
