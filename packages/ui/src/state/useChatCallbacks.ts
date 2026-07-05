@@ -462,7 +462,6 @@ export interface UseChatCallbacksDeps {
   ) => void;
 
   // Backend connection
-  setBackendDisconnectedBannerDismissed: (v: boolean) => void;
   resetBackendConnection: () => void;
 
   // Loaders
@@ -576,7 +575,6 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
     pendingRestartReasons,
     setPendingRestart,
     setPendingRestartReasons,
-    setBackendDisconnectedBannerDismissed,
     resetBackendConnection,
     loadConversations,
     loadConversationMessages,
@@ -834,7 +832,6 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
     pendingRestartReasons,
     setPendingRestart,
     setPendingRestartReasons,
-    setBackendDisconnectedBannerDismissed,
     resetBackendConnection,
     loadConversations,
     loadPlugins,

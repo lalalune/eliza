@@ -55,12 +55,9 @@ import { CustomActionsPanel } from "./components/custom-actions/CustomActionsPan
 import { AppsPageView } from "./components/pages/AppsPageView";
 import { TutorialOverlay } from "./components/pages/tutorial/TutorialOverlay";
 import { PermissionPrimingOverlay } from "./components/permissions/PermissionPrimingOverlay";
-import { ActionBanner } from "./components/shell/ActionBanner";
 import { AssistantOverlay } from "./components/shell/AssistantOverlay";
 import { BugReportModal } from "./components/shell/BugReportModal";
 import { ChatSurface } from "./components/shell/ChatSurface";
-import { BootRecoveryConductorMount } from "./first-run/use-boot-recovery-conductor";
-import { ConnectionFailedBanner } from "./components/shell/ConnectionFailedBanner";
 import { ConnectionLostOverlay } from "./components/shell/ConnectionLostOverlay";
 import { ContinuousChatOverlay } from "./components/shell/ContinuousChatOverlay";
 import { HomeLauncherSurface } from "./components/shell/HomeLauncherSurface";
@@ -91,6 +88,7 @@ import {
 } from "./events";
 import { adoptRemoteAgentFirstRun } from "./first-run/adopt-remote-first-run";
 import { persistMobileRuntimeModeForServerTarget } from "./first-run/mobile-runtime-mode";
+import { BootRecoveryConductorMount } from "./first-run/use-boot-recovery-conductor";
 import { FirstRunConductorMount } from "./first-run/use-first-run-conductor";
 import { ModelStatusConductorMount } from "./first-run/use-model-status-conductor";
 import { BugReportProvider, useBugReportState, useContextMenu } from "./hooks";
@@ -2495,9 +2493,7 @@ export function App() {
             />
           ) : null}
           <div className="relative z-10 flex min-h-0 w-full flex-1 flex-col">
-            <ConnectionFailedBanner />
             <SystemWarningBanner />
-            <ActionBanner />
             {shellContent}
           </div>
         </div>
