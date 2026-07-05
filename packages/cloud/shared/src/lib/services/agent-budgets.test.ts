@@ -29,8 +29,9 @@ let txUpdateValues: Record<string, unknown>[] = [];
 let txInsertValues: Record<string, unknown>[] = [];
 let dbUpdateValues: Record<string, unknown>[] = [];
 
+const reconcileMock = mock(async () => undefined);
 const reserveMock = mock(async () => ({
-  reconcile: mock(async () => undefined),
+  reconcile: reconcileMock,
 }));
 
 const loggerMock = {
@@ -153,6 +154,7 @@ beforeEach(() => {
   txUpdateValues = [];
   txInsertValues = [];
   dbUpdateValues = [];
+  reconcileMock.mockClear();
   reserveMock.mockClear();
   loggerMock.debug.mockClear();
   loggerMock.error.mockClear();
@@ -202,6 +204,33 @@ describe("agentBudgetService numeric DB parsing", () => {
     expect(result.reason).toBe("Daily limit reached. Remaining today: $0.0000");
   });
 
+  test("checkBudget computes daily remaining from reset state after expired daily reset", async () => {
+    readBudget = baseBudget({
+      allocated_budget: "12.5000",
+      spent_budget: "2.2500",
+      daily_limit: "5.0000",
+      daily_spent: "9.0000",
+      daily_reset_at: new Date("2026-07-03T00:00:00.000Z"),
+    });
+
+    const result = await agentBudgetService.checkBudget(AGENT_ID, 0.25);
+
+    expect(result).toEqual({
+      canProceed: true,
+      availableBudget: 10.25,
+      dailyRemaining: 5,
+      isPaused: false,
+    });
+    expect(dbUpdateValues).toHaveLength(1);
+    expect(dbUpdateValues[0]).toEqual(
+      expect.objectContaining({
+        daily_spent: "0.0000",
+        daily_reset_at: expect.any(Date),
+        updated_at: expect.any(Date),
+      }),
+    );
+  });
+
   test("checkBudget rejects invalid optional DB daily limits instead of ignoring them", async () => {
     readBudget = baseBudget({ daily_limit: "not-money" });
 
@@ -235,6 +264,40 @@ describe("agentBudgetService numeric DB parsing", () => {
     expect(loggerMock.error).toHaveBeenCalledWith(
       "[AgentBudgets] Invalid budget numeric value",
       expect.objectContaining({ agentId: AGENT_ID, field: "spent_budget", value: "" }),
+    );
+  });
+
+  test("allocateBudget refunds org-credit reservations when locked budget data is invalid", async () => {
+    lockedBudget = baseBudget({ allocated_budget: "not-money" });
+
+    const result = await agentBudgetService.allocateBudget({
+      agentId: AGENT_ID,
+      amount: 2,
+      fromOrgCredits: true,
+      description: "manual allocation",
+    });
+
+    expect(result).toEqual({
+      success: false,
+      newBalance: 0,
+      error: "Invalid budget data",
+    });
+    expect(reserveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        organizationId: ORG_ID,
+        amount: 2,
+      }),
+    );
+    expect(reconcileMock).toHaveBeenCalledWith(0);
+    expect(txUpdateValues).toEqual([]);
+    expect(txInsertValues).toEqual([]);
+    expect(loggerMock.error).toHaveBeenCalledWith(
+      "[AgentBudgets] Invalid budget numeric value",
+      expect.objectContaining({
+        agentId: AGENT_ID,
+        field: "allocated_budget",
+        value: "not-money",
+      }),
     );
   });
 

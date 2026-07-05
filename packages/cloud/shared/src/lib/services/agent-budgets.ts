@@ -199,9 +199,10 @@ class AgentBudgetService {
       return this.invalidBudgetCheckResult(agentId, parsed.error);
     }
 
-    const { allocated, spent, dailyLimit, dailySpent } = parsed;
+    const { allocated, spent, dailyLimit } = parsed;
+    const dailyState = await this.maybeResetDailySpent(budget, parsed.dailySpent);
     const available = allocated.minus(spent);
-    const dailyRemaining = dailyLimit ? dailyLimit.minus(dailySpent).toNumber() : null;
+    const dailyRemaining = dailyLimit ? dailyLimit.minus(dailyState.dailySpent).toNumber() : null;
 
     // Check if paused
     if (budget.is_paused) {
@@ -213,9 +214,6 @@ class AgentBudgetService {
         reason: budget.pause_reason || "Agent budget is paused",
       };
     }
-
-    // Reset daily spent if needed
-    await this.maybeResetDailySpent(budget);
 
     // Check daily limit if set
     if (dailyRemaining !== null) {
@@ -579,9 +577,10 @@ class AgentBudgetService {
         };
       });
 
-      // Reconcile the reservation after successful transaction
+      // Reconcile only after a successful allocation; a non-throwing transaction
+      // can still reject corrupt locked budget state and must refund the reserve.
       if (reservation) {
-        await reservation.reconcile(amount);
+        await reservation.reconcile(result.success ? amount : 0);
       }
 
       return result;
@@ -1032,18 +1031,24 @@ class AgentBudgetService {
     };
   }
 
-  private async maybeResetDailySpent(budget: AgentBudget): Promise<void> {
+  private async maybeResetDailySpent(
+    budget: AgentBudget,
+    dailySpent: Decimal,
+  ): Promise<{ dailySpent: Decimal; dailyResetAt: Date | null }> {
     const now = new Date();
     if (budget.daily_reset_at && now >= budget.daily_reset_at) {
+      const dailyResetAt = this.getNextDailyReset();
       await dbWrite
         .update(agentBudgets)
         .set({
           daily_spent: "0.0000",
-          daily_reset_at: this.getNextDailyReset(),
+          daily_reset_at: dailyResetAt,
           updated_at: now,
         })
         .where(eq(agentBudgets.id, budget.id));
+      return { dailySpent: new Decimal(0), dailyResetAt };
     }
+    return { dailySpent, dailyResetAt: budget.daily_reset_at };
   }
 
   private async sendLowBudgetAlert(agentId: string, balance: number): Promise<boolean> {
