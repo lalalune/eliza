@@ -488,6 +488,7 @@ async function loadPersistedTrajectoriesForExport(
     endDate: options.endDate,
     search: options.search,
     scenarioId: options.scenarioId,
+    traceId: options.traceId,
     batchId: options.batchId,
   });
   if (options.trajectoryIds && options.trajectoryIds.length > 0) {

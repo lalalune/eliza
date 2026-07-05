@@ -22,6 +22,10 @@ interface MockLogger {
     offset?: number;
     traceId?: string;
   }) => Promise<unknown>;
+  exportTrajectories?: (options: {
+    format: "json";
+    traceId?: string;
+  }) => Promise<unknown>;
   isEnabled: () => boolean;
   setEnabled: (v: boolean) => void;
   llmCalls: unknown[];
@@ -37,6 +41,12 @@ function sqlText(value: unknown): string {
   return chunks
     .flatMap((chunk) => (Array.isArray(chunk.value) ? chunk.value : []))
     .join("");
+}
+
+function hasTraceFilter(execute: ReturnType<typeof vi.fn>, traceId: string) {
+  return execute.mock.calls.some(([query]) =>
+    sqlText(query).includes(`trace_id = '${traceId}'`),
+  );
 }
 
 function makeRuntime() {
@@ -112,10 +122,17 @@ describe("installDatabaseTrajectoryLogger (capture bridge)", () => {
     await installDatabaseTrajectoryLogger(runtime);
     await logger.listTrajectories?.({ traceId: "trace-1", limit: 10 });
 
-    expect(
-      execute.mock.calls.some(([query]) =>
-        sqlText(query).includes("trace_id = 'trace-1'"),
-      ),
-    ).toBe(true);
+    expect(hasTraceFilter(execute, "trace-1")).toBe(true);
+  });
+
+  it("applies traceId filters to the compatibility export reader", async () => {
+    const { runtime, logger, execute } = makeRuntime();
+
+    await installDatabaseTrajectoryLogger(runtime);
+    execute.mockClear();
+
+    await logger.exportTrajectories?.({ format: "json", traceId: "trace-1" });
+
+    expect(hasTraceFilter(execute, "trace-1")).toBe(true);
   });
 });
