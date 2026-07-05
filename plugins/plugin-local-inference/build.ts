@@ -32,6 +32,7 @@ const external = await externalsFromPackageJson("./package.json", {
 	// binding; bun:* covers the desktop bun:ffi loader.
 	extra: [
 		"@elizaos/agent",
+		"@elizaos/plugin-aosp-local-inference",
 		"llama-cpp-capacitor",
 		"@reflink/reflink",
 		"ws",

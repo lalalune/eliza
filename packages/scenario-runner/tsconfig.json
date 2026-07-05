@@ -74,6 +74,10 @@
       ],
       "@elizaos/plugin-worker-runtime/*": ["../plugin-worker-runtime/src/*"],
       "@elizaos/plugin-commands": ["../../plugins/plugin-commands/index.ts"],
+      "@elizaos/plugin-facewear": [
+        "../../plugins/plugin-facewear/src/index.ts"
+      ],
+      "@elizaos/plugin-facewear/*": ["../../plugins/plugin-facewear/src/*"],
       "@elizaos/plugin-native-filesystem": [
         "../../plugins/plugin-native-filesystem/src/index.ts"
       ],
@@ -101,7 +105,6 @@
       "@elizaos/plugin-workflow": [
         "../../plugins/plugin-workflow/src/index.ts"
       ],
-      "@elizaos/plugin-xr": ["../../plugins/plugin-xr/src/index.ts"],
       "@elizaos/capacitor-appblocker": [
         "../../plugins/plugin-native-appblocker/src/index.ts"
       ],

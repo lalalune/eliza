@@ -42,6 +42,8 @@
 			"@elizaos/app-core/services/vault-mirror": [
 				"../../packages/app-core/src/services/vault-mirror.ts"
 			],
+			"@elizaos/auth": ["../../packages/auth/src/index.ts"],
+			"@elizaos/auth/*": ["../../packages/auth/src/*"],
 			"@elizaos/core": ["../../packages/core/src/index.node.ts"],
 			"@elizaos/logger": ["../../packages/logger/src/index.ts"],
 			"@elizaos/shared": ["../../packages/shared/src/index.ts"],

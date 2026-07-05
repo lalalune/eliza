@@ -27,6 +27,7 @@ import agentSkillsPlugin from "@elizaos/plugin-agent-skills";
 import appControlPlugin from "@elizaos/plugin-app-control";
 import codingToolsPlugin from "@elizaos/plugin-coding-tools";
 import commandsPlugin from "@elizaos/plugin-commands";
+import facewearPlugin from "@elizaos/plugin-facewear";
 import githubPlugin from "@elizaos/plugin-github";
 import gitPathologyPlugin from "@elizaos/plugin-gitpathologist";
 import localInferencePlugin from "@elizaos/plugin-local-inference";
@@ -36,7 +37,6 @@ import streamingPlugin from "@elizaos/plugin-streaming";
 import todosPlugin from "@elizaos/plugin-todos";
 import videoPlugin from "@elizaos/plugin-video";
 import workflowPlugin from "@elizaos/plugin-workflow";
-import xrPlugin from "@elizaos/plugin-xr";
 import type { ScenarioTurn } from "@elizaos/scenario-runner/schema";
 import { describe, expect, it } from "vitest";
 import mcpPlugin from "../../../../plugins/plugin-mcp/src/index.ts";
@@ -61,7 +61,7 @@ const IMPORTED_CORE_PLUGINS: Record<string, Plugin> = {
   "@elizaos/plugin-gitpathologist": gitPathologyPlugin,
   "@elizaos/plugin-todos": todosPlugin,
   "@elizaos/plugin-streaming": streamingPlugin,
-  "@elizaos/plugin-xr": xrPlugin,
+  "@elizaos/plugin-facewear": facewearPlugin,
   "@elizaos/plugin-mcp": mcpPlugin,
   "@elizaos/plugin-workflow": workflowPlugin,
   "@elizaos/plugin-github": githubPlugin,
@@ -109,7 +109,7 @@ const CORE_ACTION_SURFACE: Record<string, readonly string[]> = {
   "@elizaos/plugin-gitpathologist": ["GIT_PATHOLOGY"],
   "@elizaos/plugin-todos": ["TODO"],
   "@elizaos/plugin-streaming": ["STREAM"],
-  "@elizaos/plugin-xr": [
+  "@elizaos/plugin-facewear": [
     "XR_CLOSE_VIEW",
     "XR_LIST_VIEWS",
     "XR_OPEN_VIEW",

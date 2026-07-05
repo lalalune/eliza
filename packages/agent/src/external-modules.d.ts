@@ -1,4 +1,147 @@
 declare module "@elizaos/plugin-agent-orchestrator";
+declare module "@elizaos/plugin-app-manager" {
+  import type {
+    InstallProgressLike,
+    PluginManagerLike,
+  } from "@elizaos/agent/services/plugin-manager-types";
+  import type { IAgentRuntime, RouteRequestMeta } from "@elizaos/core";
+  import { Service } from "@elizaos/core";
+  import type {
+    AppLaunchResult,
+    AppRunSummary,
+    AppStopResult,
+    RouteHelpers,
+  } from "@elizaos/shared";
+
+  export type AppsRouteActorRole = "OWNER" | "ADMIN" | "USER" | "GUEST";
+
+  export interface FavoriteAppsStore {
+    read: () => string[];
+    write: (apps: string[]) => string[];
+  }
+
+  export interface DirectInstallResult {
+    success: boolean;
+    pluginName: string;
+    version: string;
+    installPath: string;
+    requiresRestart: boolean;
+    error?: string;
+  }
+
+  export type DirectInstallPlugin = (
+    pluginName: string,
+    onProgress?: (progress: InstallProgressLike) => void,
+    requestedVersion?: string,
+  ) => Promise<DirectInstallResult>;
+
+  export interface AppManagerLike {
+    listAvailable: (pluginManager: PluginManagerLike) => Promise<unknown>;
+    search: (
+      pluginManager: PluginManagerLike,
+      query: string,
+      limit?: number,
+    ) => Promise<unknown>;
+    listInstalled: (pluginManager: PluginManagerLike) => Promise<unknown>;
+    listRuns: (runtime?: IAgentRuntime | null) => Promise<unknown>;
+    getRun: (runId: string, runtime?: IAgentRuntime | null) => Promise<unknown>;
+    attachRun: (
+      runId: string,
+      runtime?: IAgentRuntime | null,
+    ) => Promise<unknown>;
+    detachRun: (runId: string) => Promise<unknown>;
+    launch: (
+      pluginManager: PluginManagerLike,
+      name: string,
+      onProgress?: (progress: InstallProgressLike) => void,
+      runtime?: unknown | null,
+      installPluginDirect?: DirectInstallPlugin,
+    ) => Promise<AppLaunchResult>;
+    stop: (
+      pluginManager: PluginManagerLike,
+      name: string,
+      runId?: string,
+      runtime?: IAgentRuntime | null,
+    ) => Promise<AppStopResult>;
+    recordHeartbeat: (runId: string) => unknown;
+    startStaleRunSweeper: (getRuntime: () => IAgentRuntime | null) => void;
+    getInfo: (
+      pluginManager: PluginManagerLike,
+      name: string,
+    ) => Promise<unknown>;
+  }
+
+  export interface AppsRouteContext
+    extends RouteRequestMeta,
+      Pick<RouteHelpers, "readJsonBody" | "json" | "error"> {
+    url: URL;
+    appManager: AppManagerLike;
+    getPluginManager: () => PluginManagerLike;
+    parseBoundedLimit: (rawLimit: string | null, fallback?: number) => number;
+    runtime: unknown | null;
+    favoriteApps?: FavoriteAppsStore;
+    installPluginDirect?: DirectInstallPlugin;
+    actorRole?: AppsRouteActorRole | null;
+  }
+
+  export function handleAppsRoutes(ctx: AppsRouteContext): Promise<boolean>;
+  export class AppManager implements AppManagerLike {
+    listAvailable: AppManagerLike["listAvailable"];
+    search: AppManagerLike["search"];
+    listInstalled: AppManagerLike["listInstalled"];
+    listRuns: AppManagerLike["listRuns"];
+    getRun: AppManagerLike["getRun"];
+    attachRun: AppManagerLike["attachRun"];
+    detachRun: AppManagerLike["detachRun"];
+    launch: AppManagerLike["launch"];
+    stop: AppManagerLike["stop"];
+    recordHeartbeat: AppManagerLike["recordHeartbeat"];
+    startStaleRunSweeper: AppManagerLike["startStaleRunSweeper"];
+    getInfo: AppManagerLike["getInfo"];
+  }
+  export function readAppRunStore(stateDir?: string): AppRunSummary[];
+  export function resolveAppRunStoreFilePath(stateDir?: string): string;
+  export function resolveLegacyAppRunStoreFilePath(stateDir?: string): string;
+  export function writeAppRunStore(
+    runs: AppRunSummary[],
+    stateDir?: string,
+  ): AppRunSummary[];
+  export class AppSessionService extends Service {
+    static serviceType: string;
+    getRuns(): AppRunSummary[];
+  }
+}
+declare module "@elizaos/plugin-aosp-local-inference" {
+  import type { AgentRuntime } from "@elizaos/core";
+
+  export function ensureAospLocalInferenceHandlers(
+    runtime: AgentRuntime,
+  ): Promise<boolean>;
+  export function buildAospLoadModelArgs(
+    role: "chat" | "embedding",
+    modelPath: string,
+  ): unknown;
+  export function activateAospLocalInferenceModel(args: {
+    modelId: string;
+    modelPath: string;
+    loadArgs: unknown;
+  }): Promise<unknown>;
+  export function clearAospLocalInferenceModel(): Promise<unknown>;
+}
+declare module "@elizaos/plugin-coding-tools";
+declare module "@elizaos/plugin-elizacloud/host-routes" {
+  export type CloudBillingRouteState = Record<string, unknown>;
+  export type CloudCompatRouteState = Record<string, unknown>;
+  export type CloudRelayRouteState = Record<string, unknown>;
+  export type CloudRouteState = Record<string, unknown>;
+  export class CloudManager {
+    [key: string]: unknown;
+  }
+  export function handleCloudBillingRoute(...args: unknown[]): Promise<boolean>;
+  export function handleCloudCompatRoute(...args: unknown[]): Promise<boolean>;
+  export function handleCloudRelayRoute(...args: unknown[]): Promise<boolean>;
+  export function handleCloudRoute(...args: unknown[]): Promise<boolean>;
+}
 declare module "@elizaos/plugin-capacitor-bridge" {
   import type { Server } from "node:http";
   import type { AgentRuntime, MobileDeviceBridgeStatus } from "@elizaos/core";
@@ -850,7 +993,6 @@ declare module "@elizaos/ui" {
   export const App: ComponentType<AnyValue>;
   export const AppProvider: ComponentType<AnyValue>;
   export const AppWindowRenderer: ComponentType<AnyValue>;
-  export const EmbeddedAppViewer: ComponentType<AnyValue>;
   export const Button: ComponentType<AnyValue>;
   export const CharacterEditor: ComponentType<AnyValue>;
   export const COMMAND_PALETTE_EVENT: string;
