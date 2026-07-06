@@ -7,6 +7,7 @@
 import type { IAgentRuntime } from "@elizaos/core";
 import type { ChannelRegistry } from "../channels/index.js";
 import { getConnectorRegistry } from "../connectors/registry.js";
+import type { ChannelConnectionState } from "./questions.js";
 import { setRuntimeChannelInspector } from "./questions.js";
 
 export function installFirstRunChannelInspector(
@@ -17,21 +18,32 @@ export function installFirstRunChannelInspector(
     isRegistered(channel) {
       return channelRegistry.get(channel) !== null;
     },
-    async isConnected(channel) {
-      if (channel === "in_app") {
-        return true;
-      }
+    async connectionState(channel): Promise<ChannelConnectionState> {
       const contribution = channelRegistry.get(channel);
-      const connectorKind = contribution?.connectorKind ?? channel;
+      if (contribution && !contribution.connectorKind) {
+        return "connected";
+      }
+      const connectorKind = contribution?.connectorKind;
       if (!connectorKind) {
-        return false;
+        return "unknown";
       }
       const connector = getConnectorRegistry(runtime)?.get(connectorKind);
       if (!connector) {
-        return false;
+        return "unknown";
       }
-      const status = await connector.status();
-      return status.state === "ok";
+      try {
+        const status = await connector.status();
+        if (status.state === "ok") return "connected";
+        if (status.state === "disconnected") return "disconnected";
+        return "unknown";
+      } catch (error) {
+        // error-policy:J7 first-run validation must surface probe failures without killing onboarding.
+        runtime.reportError("FirstRunChannelInspector.status", error, {
+          channel,
+          connectorKind,
+        });
+        return "unknown";
+      }
     },
   });
 }
