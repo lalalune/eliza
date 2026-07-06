@@ -547,9 +547,8 @@ export const InlinePluginConfig = memo(function InlinePluginConfig({
           declares more than one setup mode. A single-mode connector shows no
           switch (nothing to choose). */}
       {modes.length > 1 && (
-        <div
-          className="flex flex-wrap items-center gap-1.5 px-3 pt-3"
-          role="group"
+        <fieldset
+          className="m-0 flex min-w-0 flex-wrap items-center gap-1.5 border-0 px-3 pt-3"
           aria-label={t("messagecontent.SetupModeLabel", {
             defaultValue: "Setup method",
           })}
@@ -578,7 +577,7 @@ export const InlinePluginConfig = memo(function InlinePluginConfig({
               </button>
             );
           })}
-        </div>
+        </fieldset>
       )}
 
       {/* OAuth sign-in — shown for a cloud/OAuth-shaped mode instead of the env

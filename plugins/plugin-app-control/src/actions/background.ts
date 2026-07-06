@@ -314,6 +314,8 @@ function extractGeneratePrompt(text: string): string {
 
 const USER_CATALOG_REFERENCE_RE =
 	/\b(my|mine|saved|generated|created|uploaded|custom|yours?)\b/i;
+const GENERIC_CATALOG_REFERENCE_RE =
+	/^(?:show\s+)?(?:backgrounds?|wallpapers?|options?|choices?|settings|picker)$/i;
 
 function cleanUserCatalogReference(value: string): string | null {
 	const cleaned = value
@@ -324,6 +326,7 @@ function cleanUserCatalogReference(value: string): string | null {
 		)
 		.replace(/\s+/g, " ")
 		.trim();
+	if (GENERIC_CATALOG_REFERENCE_RE.test(cleaned)) return null;
 	return cleaned.length >= 2 ? cleaned : null;
 }
 
