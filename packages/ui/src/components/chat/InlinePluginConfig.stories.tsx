@@ -15,6 +15,7 @@ import type { PluginParamDef } from "@elizaos/shared";
 import type { Decorator, Meta, StoryObj } from "@storybook/react";
 import type { PluginInfo } from "../../api/client-types-config";
 import { assert, waitForTestId } from "../../storybook/home-widget-decorator";
+import type { MockAppOptions } from "../../storybook/mock-providers";
 import { MockAppProvider } from "../../storybook/mock-providers";
 import { InlinePluginConfig } from "./MessageContent";
 
@@ -63,7 +64,7 @@ function telegram(over: Partial<PluginInfo> = {}): PluginInfo {
 }
 
 /** Install a window.fetch that answers `/api/plugins` with the fixture. */
-function withPlugins(plugin: PluginInfo): Decorator {
+function withPlugins(plugin: PluginInfo, appValue?: MockAppOptions): Decorator {
   return (Story) => {
     const originalFetch = window.fetch;
     window.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
@@ -86,7 +87,7 @@ function withPlugins(plugin: PluginInfo): Decorator {
       window.fetch = originalFetch;
     }, 4_000);
     return (
-      <MockAppProvider>
+      <MockAppProvider value={appValue}>
         <div className="max-w-xl">
           <Story />
         </div>
@@ -132,6 +133,36 @@ export const FreshSetup: Story = {
         'input[data-config-key="TELEGRAM_API_ROOT"]',
       ) === null,
       "optional field stays behind the Advanced disclosure",
+    );
+  },
+};
+
+/**
+ * Cloud connected: Telegram exposes its Cloud Gateway option alongside the
+ * Bot Token and Personal Account modes, proving the chat widget uses the same
+ * connector-mode registry as Settings instead of a one-off card switch.
+ */
+export const CloudGatewayModes: Story = {
+  decorators: [withPlugins(telegram(), { elizaCloudConnected: true })],
+  play: async ({ canvasElement }) => {
+    await waitForTestId(canvasElement, "inline-plugin-config-body");
+    assert(
+      canvasElement.querySelector(
+        '[data-testid="inline-plugin-config-mode-cloud-bot"]',
+      ) !== null,
+      "cloud gateway mode is visible when Eliza Cloud is connected",
+    );
+    assert(
+      canvasElement.querySelector(
+        '[data-testid="inline-plugin-config-mode-bot"]',
+      ) !== null,
+      "bot-token fallback mode remains visible",
+    );
+    assert(
+      canvasElement.querySelector(
+        '[data-testid="inline-plugin-config-mode-account"]',
+      ) !== null,
+      "personal-account local mode remains visible",
     );
   },
 };
