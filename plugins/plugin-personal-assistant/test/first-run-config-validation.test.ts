@@ -208,7 +208,7 @@ describe("first-run config validation", () => {
     expect(result?.length).toBe(5);
   });
 
-  it("validateChannel falls back to in_app + warning for unconnected channels", async () => {
+  it("validateChannel falls back to in_app + warning for unverifiable channels", async () => {
     const runtime = createMinimalRuntimeStub();
     const result = await validateChannel("telegram", runtime);
     expect(result.fallbackToInApp).toBe(true);
@@ -218,7 +218,7 @@ describe("first-run config validation", () => {
   it("validateChannel passes a connected channel through cleanly", async () => {
     setChannelInspector({
       isRegistered: () => true,
-      isConnected: () => true,
+      connectionState: async () => "connected",
     });
     const runtime = createMinimalRuntimeStub();
     const result = await validateChannel("telegram", runtime);
@@ -240,6 +240,7 @@ describe("first-run config validation", () => {
     await expect(validateChannel("telegram", runtime)).resolves.toEqual({
       channel: "telegram",
       registered: true,
+      connection: "connected",
       connected: true,
       fallbackToInApp: false,
     });
@@ -271,6 +272,7 @@ describe("first-run config validation", () => {
     ).resolves.toEqual({
       channel: "telegram",
       registered: true,
+      connection: "connected",
       connected: true,
       fallbackToInApp: false,
     });
@@ -279,6 +281,7 @@ describe("first-run config validation", () => {
     ).resolves.toMatchObject({
       channel: "telegram",
       registered: true,
+      connection: "unknown",
       connected: false,
       fallbackToInApp: true,
     });
