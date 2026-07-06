@@ -920,6 +920,8 @@ describe("useShellController — voice capture routing", () => {
     });
     expect(createVoiceCaptureMock).toHaveBeenCalledTimes(1);
 
+    act(() => fireFinalTranscript("what time is it?"));
+
     // The turn ends (capture stops) → after the 250ms debounce the loop re-opens.
     await act(async () => {
       captureHandles[0]?.stop();
@@ -928,6 +930,28 @@ describe("useShellController — voice capture routing", () => {
       await vi.advanceTimersByTimeAsync(300);
     });
     expect(createVoiceCaptureMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hands-free closes instead of re-opening after pure silence", async () => {
+    const { result } = renderHook(() => useShellController());
+    await act(async () => {
+      result.current.toggleHandsFree();
+    });
+    expect(result.current.handsFree).toBe(true);
+    expect(createVoiceCaptureMock).toHaveBeenCalledTimes(1);
+
+    // A clean stop with no final transcript is the initial-silence path: no
+    // empty chat turn is fabricated and the hot mic does not re-open forever.
+    await act(async () => {
+      captureHandles[0]?.stop();
+    });
+    expect(result.current.handsFree).toBe(false);
+    expect(appMock.value.sendChatText).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(createVoiceCaptureMock).toHaveBeenCalledTimes(1);
   });
 
   it("#5: a typed draft pauses the always-on loop; clearing it (send) resumes", async () => {
@@ -1355,6 +1379,27 @@ describe("useShellController — mic capture-failure notice", () => {
     expect(tone).toBe("error");
     // Recording state is cleaned up (not stuck "on").
     expect(result.current.recording).toBe(false);
+  });
+
+  it("turns off hands-free after a capture-start failure", async () => {
+    const denied = new Error("Permission denied");
+    denied.name = "NotAllowedError";
+    installRejectingCapture(denied);
+
+    const { result } = renderHook(() => useShellController());
+    await act(async () => {
+      result.current.toggleHandsFree();
+    });
+    expect(createVoiceCaptureMock).toHaveBeenCalledTimes(1);
+
+    await flushCaptureStart();
+
+    expect(result.current.recording).toBe(false);
+    expect(result.current.handsFree).toBe(false);
+    expect(
+      window.localStorage.getItem("eliza:voice:continuous-chat-mode"),
+    ).not.toBe("always-on");
+    expect(createVoiceCaptureMock).toHaveBeenCalledTimes(1);
   });
 
   it("distinguishes a missing device (NotFoundError) from a denial", async () => {

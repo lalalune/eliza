@@ -75,6 +75,7 @@ ELIZA_VOICE_OPENWAKEWORD_REPORT=.github/issue-evidence/9958-openwakeword/report.
 | Cell | Existing runner | Evidence |
 | --- | --- | --- |
 | `web.fake-mic.roundtrip` | `packages/app` Playwright `voice-realaudio.spec.ts` with Chromium fake audio capture | real browser getUserMedia/WAV encode/client ASR post, local-inference Web Audio TTS start, START_TRANSCRIPTION barge-in disconnect, and second real WAV drain |
+| `web.live-railway.roundtrip` | `packages/app` Playwright `voice-realaudio.spec.ts --grep @live-railway` | live fake-device mic capture through cloud STT, live agent turn, `/api/tts/cloud` playback, console/network logs, and screenshot attachments when `ELIZA_VOICE_LIVE_RAILWAY=1` plus a live LLM key are present |
 | `web.fake-mic.transcript-roundtrip` | `packages/app` Playwright `transcript-realaudio.spec.ts` | capture -> transcript record -> player -> chat attachment, plus agent-action START/STOP parity with the slash/button path |
 | `web.workbench.respond-no-respond` | headful workbench Playwright scenario | chime-in should-respond/should-not-respond UI behavior |
 | `linux.fused-acoustic.workbench-real` | `plugins/plugin-local-inference voice:workbench --real` | fused ASR, diarization, VAD, Kokoro TTS, noisy and multi-speaker workbench report |
@@ -98,6 +99,7 @@ developer laptop:
 
 | Gate | Meaning |
 | --- | --- |
+| `ELIZA_VOICE_LIVE_RAILWAY=1` + `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | current runner has the live Railway voice services reachable and a real LLM provider key for the web cloud voice round-trip |
 | `ELIZA_VOICE_MACOS_ELECTROBUN_READY=1` | current macOS runner has a built Electrobun app, loopback mic/audio capture, and permission grants |
 | `ELIZA_VOICE_WINDOWS_ELECTROBUN_READY=1` | current Windows runner has a built Electrobun app, loopback mic/audio capture, and permission grants |
 | `ELIZA_VOICE_DESKTOP_API_BASE` | real app-core API base used by packaged desktop voice self-test; required for macOS/Windows Electrobun live cells |

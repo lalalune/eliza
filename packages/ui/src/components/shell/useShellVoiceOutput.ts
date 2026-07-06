@@ -7,6 +7,7 @@ import * as React from "react";
 import type { ConversationMessage } from "../../api/client-types-chat";
 import { useVoiceChat } from "../../hooks/useVoiceChat";
 import { useVoiceConfig } from "../../voice/useVoiceConfig";
+import type { VoiceTtsError } from "../../voice/voice-chat-types";
 
 /** `useVoiceChat` requires a transcript sink; the overlay owns input elsewhere. */
 const NOOP_TRANSCRIPT = (): void => {};
@@ -42,6 +43,8 @@ export interface ShellVoiceOutput {
   needsAudioUnlock: boolean;
   /** Resume the audio context in response to a user gesture (enable sound). */
   unlockAudio: () => void;
+  /** Fail-closed TTS error from the configured voice engine, if any. */
+  ttsError: VoiceTtsError | null;
 }
 
 export interface ShellVoiceOutputOptions {
@@ -88,6 +91,7 @@ export function useShellVoiceOutput(
     isSpeaking,
     needsAudioUnlock,
     unlockAudio,
+    ttsError,
   } = useVoiceChat({
     voiceConfig,
     cloudConnected,
@@ -181,5 +185,6 @@ export function useShellVoiceOutput(
     // coalesce to keep this hook's (and ShellController's) non-optional contract.
     needsAudioUnlock: needsAudioUnlock ?? false,
     unlockAudio: unlockAudio ?? (() => {}),
+    ttsError: ttsError ?? null,
   };
 }

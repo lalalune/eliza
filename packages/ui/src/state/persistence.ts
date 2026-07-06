@@ -1042,6 +1042,8 @@ export function saveWakeWordEnabled(value: boolean): void {
 const VAD_AUTO_STOP_KEY = "eliza:voice:vad-auto-stop";
 
 export interface VadAutoStopValue {
+  /** Initial no-speech window (ms) before an empty turn closes cleanly. */
+  initialSilenceMs?: number;
   /** Trailing silence (ms) that ends a turn in local-ASR capture. */
   silenceMs: number;
   /** RMS amplitude (0–1) above which audio is treated as speech. */
@@ -1049,6 +1051,7 @@ export interface VadAutoStopValue {
 }
 
 const DEFAULT_VAD_AUTO_STOP: VadAutoStopValue = {
+  initialSilenceMs: DEFAULT_LOCAL_ASR_AUTO_STOP.initialSilenceMs,
   silenceMs: DEFAULT_LOCAL_ASR_AUTO_STOP.silenceMs,
   speechRmsThreshold: DEFAULT_LOCAL_ASR_AUTO_STOP.speechRmsThreshold,
 };
@@ -1059,6 +1062,11 @@ export function loadVadAutoStop(): VadAutoStopValue {
     if (!raw) return DEFAULT_VAD_AUTO_STOP;
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return {
+      initialSilenceMs:
+        typeof parsed.initialSilenceMs === "number" &&
+        Number.isFinite(parsed.initialSilenceMs)
+          ? parsed.initialSilenceMs
+          : DEFAULT_VAD_AUTO_STOP.initialSilenceMs,
       silenceMs:
         typeof parsed.silenceMs === "number" &&
         Number.isFinite(parsed.silenceMs)

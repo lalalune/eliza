@@ -47,6 +47,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1927,6 +1928,7 @@ function LpPositionsPanel({
 }
 
 export function InventoryAppView() {
+  const walletShellRef = useRef<HTMLElement | null>(null);
   const {
     walletEnabled,
     walletAddresses,
@@ -1972,6 +1974,7 @@ export function InventoryAppView() {
   );
   const [marketOverview, setMarketOverview] =
     useState<WalletMarketOverviewResponse | null>(null);
+  const [walletShellTop, setWalletShellTop] = useState(0);
   const initialLoadRef = useRef(false);
   const tradingProfileRequestRef = useRef(0);
   const marketOverviewRequestRef = useRef(0);
@@ -2055,6 +2058,33 @@ export function InventoryAppView() {
   useEffect(() => {
     void loadTradingProfile();
   }, [loadTradingProfile]);
+
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+    const updateShellTop = () => {
+      const top = Math.max(
+        0,
+        Math.ceil(walletShellRef.current?.getBoundingClientRect().top ?? 0),
+      );
+      setWalletShellTop((current) => (current === top ? current : top));
+    };
+    updateShellTop();
+    window.addEventListener("resize", updateShellTop);
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(updateShellTop)
+        : null;
+    if (walletShellRef.current) {
+      resizeObserver?.observe(walletShellRef.current);
+      if (walletShellRef.current.parentElement) {
+        resizeObserver?.observe(walletShellRef.current.parentElement);
+      }
+    }
+    return () => {
+      window.removeEventListener("resize", updateShellTop);
+      resizeObserver?.disconnect();
+    };
+  }, []);
 
   // No manual refresh control: keep balances, NFTs, trading profile, and
   // market data fresh with a quiet background poll while the view is mounted.
@@ -2151,8 +2181,14 @@ export function InventoryAppView() {
 
   return (
     <main
+      ref={walletShellRef}
       data-testid="wallet-shell"
-      className="h-full min-h-0 w-full overflow-y-auto bg-bg"
+      className="min-h-0 overflow-y-auto bg-bg"
+      style={{
+        height: `max(0px, calc(100dvh - ${walletShellTop}px - var(--eliza-continuous-chat-clearance, 5.25rem) - 1rem))`,
+        width:
+          "calc(100dvw - var(--eliza-continuous-chat-side-clearance, 0px))",
+      }}
     >
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-5 pt-6 pb-12">
         {walletError ? (

@@ -171,6 +171,13 @@ function isNativeTalkModeCaptureAvailable(): boolean {
   );
 }
 
+function isEmptyCaptureError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("No microphone audio was captured")
+  );
+}
+
 async function resolveBackendKind(
   preferred: AsrProvider | "browser" | undefined,
 ): Promise<VoiceCaptureBackend> {
@@ -464,6 +471,10 @@ export function createVoiceCapture(
         }
         setState("stopped");
       } catch (err) {
+        if (isEmptyCaptureError(err)) {
+          setState("stopped");
+          return;
+        }
         // error-policy:J1 stop/transcribe boundary — the failure renders the
         // voice error state and still propagates to the caller. Cloud STT
         // failures surface here (fail-loud): no silent downgrade to browser STT.

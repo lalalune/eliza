@@ -72,6 +72,28 @@ describe("local ASR capture", () => {
     });
   });
 
+  it("auto-stops after initial silence without buffering an empty turn", () => {
+    const detect = createLocalAsrAutoStopDetector(
+      {
+        startGraceMs: 100,
+        initialSilenceMs: 500,
+        speechPeakThreshold: 0.01,
+      },
+      0,
+    );
+    if (!detect) throw new Error("auto-stop detector was not created");
+
+    const silence = new Float32Array([0, 0, 0]);
+    expect(detect(silence, 120)).toEqual({
+      shouldBuffer: false,
+      shouldStop: false,
+    });
+    expect(detect(silence, 520)).toEqual({
+      shouldBuffer: false,
+      shouldStop: true,
+    });
+  });
+
   it("suppresses quiet echo while the TTS echo gate is active (#12256 layer 1)", () => {
     // Gate always on: the 4x multiplier lifts the RMS bar 0.003→0.012 and the
     // peak bar 0.012→0.048. The echo below (rms ~0.0077, peak 0.008) is above

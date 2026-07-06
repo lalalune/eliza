@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evidence Review</title>
+<style>
+  :root { color-scheme: dark; --bg:#101010; --panel:#171717; --panel2:#202020; --line:#313131; --txt:#eeeeee; --muted:#a1a1a1; --accent:#ff6a00; --warn:#f59e0b; --bad:#ef4444; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { padding:24px 28px 14px; border-bottom:1px solid var(--line); background:#0d0d0d; position:sticky; top:0; z-index:10; }
+  h1 { margin:0 0 6px; font-size:22px; letter-spacing:0; }
+  .subtitle { color:var(--muted); margin:0 0 14px; }
+  .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .stat { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:6px 10px; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  input, select { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-height:36px; }
+  input { min-width:260px; flex:1; }
+  main { padding:20px 28px 48px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; min-width:0; }
+  .media { background:#090909; min-height:150px; display:flex; align-items:center; justify-content:center; border-bottom:1px solid var(--line); }
+  .media img { width:100%; height:230px; object-fit:contain; display:block; }
+  .media video { width:100%; max-height:280px; display:block; }
+  .media pre { width:100%; max-height:230px; overflow:auto; margin:0; padding:12px; white-space:pre-wrap; color:#d7d7d7; }
+  .thumb-button { all:unset; display:block; width:100%; cursor:zoom-in; }
+  .body { padding:12px; }
+  .row { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .pill { border-radius:999px; padding:2px 8px; font-size:11px; font-weight:700; text-transform:uppercase; color:#111; }
+  .pill.ok { background:var(--ok); }
+  .pill.warn { background:var(--warn); }
+  .pill.bad { background:var(--bad); color:#fff; }
+  .pill.info { background:#b4b4b4; }
+  .source { color:var(--muted); font-size:12px; }
+  h2 { font-size:15px; line-height:1.25; margin:0 0 6px; overflow-wrap:anywhere; }
+  .path, .meta { color:var(--muted); margin:0 0 8px; overflow-wrap:anywhere; }
+  .metrics { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:6px; margin:10px 0; }
+  .metrics div { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:6px; min-width:0; }
+  dt { color:var(--muted); font-size:10px; text-transform:uppercase; }
+  dd { margin:0; font-weight:700; }
+  .swatches { display:flex; gap:5px; margin:8px 0; }
+  .swatches span { width:22px; height:22px; border-radius:4px; border:1px solid rgba(255,255,255,.18); }
+  .issues { color:#ffd08a; }
+  .ocr { color:#d5d5d5; max-height:90px; overflow:auto; }
+  .open-link { color:var(--accent); text-decoration:none; font-weight:700; }
+  #lightbox { display:none; position:fixed; inset:0; background:rgba(0,0,0,.92); z-index:99; align-items:center; justify-content:center; padding:34px; }
+  #lightbox.open { display:flex; }
+  #lightbox img { max-width:94vw; max-height:86vh; border-radius:8px; box-shadow:0 14px 70px rgba(0,0,0,.75); }
+  #lightbox button { position:fixed; top:18px; right:22px; background:var(--panel2); border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:7px 11px; cursor:pointer; }
+  #caption { position:fixed; bottom:18px; left:24px; right:24px; text-align:center; color:var(--muted); overflow-wrap:anywhere; }
+  @media (max-width: 720px) { header, main { padding-left:14px; padding-right:14px; } .grid { grid-template-columns:1fr; } .metrics { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Evidence Review</h1>
+  <p class="subtitle">Generated 2026-07-06T08:03:33.925Z from .github/issue-evidence. OCR: auto available (tesseract.js package).</p>
+  <div class="stats">
+    <span class="stat">17 artifacts</span>
+    <span class="stat">6 screenshots</span>
+    <span class="stat">5 videos</span>
+    <span class="stat">0 logs</span>
+    <span class="stat">0 trajectories</span>
+    <span class="stat">0 need review</span>
+  </div>
+  <div class="toolbar">
+    <input id="search" type="search" placeholder="Search path, source, OCR, preview text">
+    <select id="type"><option value="">All types</option><option>image</option><option>report</option><option>video</option><option>viewer</option></select>
+    <select id="source"><option value="">All sources</option><option>other</option></select>
+  </div>
+</header>
+<main><div id="grid" class="grid"><article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-barge-in-finished.png other pp
+needs attention
+[b transcript 2026-0
++ |skeiza b&gt; ">
+    <div class="media"><button class="thumb-button" data-img="../14371-barge-in-finished.png" data-caption=".github/issue-evidence/14371-barge-in-finished.png"><img loading="lazy" src="../14371-barge-in-finished.png" alt=".github/issue-evidence/14371-barge-in-finished.png"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-barge-in-finished.png</h2>
+      <p class="path">.github/issue-evidence/14371-barge-in-finished.png</p>
+      <p class="meta">557.9 KB | 2026-07-06T08:03:21.881Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>74</dd></div>
+              <div><dt>Dominant</dt><dd>21.4%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>48.2%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#e0a090 21.4%" style="background:#e0a090"></span><span title="#f0b090 9.0%" style="background:#f0b090"></span><span title="#f0b080 8.8%" style="background:#f0b080"></span><span title="#d0a090 8.2%" style="background:#d0a090"></span><span title="#c09090 7.7%" style="background:#c09090"></span><span title="#201010 7.0%" style="background:#201010"></span><span title="#d09090 6.4%" style="background:#d09090"></span><span title="#e0a080 5.9%" style="background:#e0a080"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - pp
+Needs attention
+[B Transcript 2026-0
++ |skEiza B&gt;</p>
+      <a class="open-link" href="../14371-barge-in-finished.png">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="video" data-source="other" data-search=".github/issue-evidence/14371-barge-in.webm other  ">
+    <div class="media"><video controls preload="metadata" src="../14371-barge-in.webm"></video></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">video</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-barge-in.webm</h2>
+      <p class="path">.github/issue-evidence/14371-barge-in.webm</p>
+      <p class="meta">176.0 KB | 2026-07-06T08:03:21.888Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-barge-in.webm">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-cloud-tts-drop-error-state.jpg other bn rag
+4 cloud voice unavailable
++ askeliza [] ">
+    <div class="media"><button class="thumb-button" data-img="../14371-cloud-tts-drop-error-state.jpg" data-caption=".github/issue-evidence/14371-cloud-tts-drop-error-state.jpg"><img loading="lazy" src="../14371-cloud-tts-drop-error-state.jpg" alt=".github/issue-evidence/14371-cloud-tts-drop-error-state.jpg"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-cloud-tts-drop-error-state.jpg</h2>
+      <p class="path">.github/issue-evidence/14371-cloud-tts-drop-error-state.jpg</p>
+      <p class="meta">42.1 KB | 2026-07-06T08:03:22.022Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>103</dd></div>
+              <div><dt>Dominant</dt><dd>19.0%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>49.8%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#f0b090 19.0%" style="background:#f0b090"></span><span title="#ffb090 15.8%" style="background:#ffb090"></span><span title="#e0a090 13.3%" style="background:#e0a090"></span><span title="#d0a090 9.9%" style="background:#d0a090"></span><span title="#f0a090 8.1%" style="background:#f0a090"></span><span title="#ffc090 7.4%" style="background:#ffc090"></span><span title="#f0b0a0 4.7%" style="background:#f0b0a0"></span><span title="#f0c0a0 3.3%" style="background:#f0c0a0"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - Bn rag
+4 cloud voice unavailable
++ AskEliza []</p>
+      <a class="open-link" href="../14371-cloud-tts-drop-error-state.jpg">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-cloud-tts-recovered.jpg other gand rag ">
+    <div class="media"><button class="thumb-button" data-img="../14371-cloud-tts-recovered.jpg" data-caption=".github/issue-evidence/14371-cloud-tts-recovered.jpg"><img loading="lazy" src="../14371-cloud-tts-recovered.jpg" alt=".github/issue-evidence/14371-cloud-tts-recovered.jpg"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-cloud-tts-recovered.jpg</h2>
+      <p class="path">.github/issue-evidence/14371-cloud-tts-recovered.jpg</p>
+      <p class="meta">39.7 KB | 2026-07-06T08:03:22.033Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>73</dd></div>
+              <div><dt>Dominant</dt><dd>19.9%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>52.4%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#f0b090 19.9%" style="background:#f0b090"></span><span title="#ffb090 16.0%" style="background:#ffb090"></span><span title="#e0a090 13.5%" style="background:#e0a090"></span><span title="#d0a090 10.1%" style="background:#d0a090"></span><span title="#ffc090 8.0%" style="background:#ffc090"></span><span title="#f0a090 8.0%" style="background:#f0a090"></span><span title="#f0b0a0 6.3%" style="background:#f0b0a0"></span><span title="#f0c0a0 3.5%" style="background:#f0c0a0"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - Gand rag</p>
+      <a class="open-link" href="../14371-cloud-tts-recovered.jpg">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="video" data-source="other" data-search=".github/issue-evidence/14371-cloud-tts-recovery.webm other  ">
+    <div class="media"><video controls preload="metadata" src="../14371-cloud-tts-recovery.webm"></video></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">video</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-cloud-tts-recovery.webm</h2>
+      <p class="path">.github/issue-evidence/14371-cloud-tts-recovery.webm</p>
+      <p class="meta">172.4 KB | 2026-07-06T08:03:22.041Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-cloud-tts-recovery.webm">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-initial-silence-clean-stop.jpg other gand rag
++ askeliza o
+9 ">
+    <div class="media"><button class="thumb-button" data-img="../14371-initial-silence-clean-stop.jpg" data-caption=".github/issue-evidence/14371-initial-silence-clean-stop.jpg"><img loading="lazy" src="../14371-initial-silence-clean-stop.jpg" alt=".github/issue-evidence/14371-initial-silence-clean-stop.jpg"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-initial-silence-clean-stop.jpg</h2>
+      <p class="path">.github/issue-evidence/14371-initial-silence-clean-stop.jpg</p>
+      <p class="meta">39.5 KB | 2026-07-06T08:03:21.987Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>71</dd></div>
+              <div><dt>Dominant</dt><dd>19.9%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>52.2%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#f0b090 19.9%" style="background:#f0b090"></span><span title="#ffb090 16.0%" style="background:#ffb090"></span><span title="#e0a090 13.5%" style="background:#e0a090"></span><span title="#d0a090 10.1%" style="background:#d0a090"></span><span title="#ffc090 8.0%" style="background:#ffc090"></span><span title="#f0a090 8.0%" style="background:#f0a090"></span><span title="#f0b0a0 6.3%" style="background:#f0b0a0"></span><span title="#f0c0a0 3.5%" style="background:#f0c0a0"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - Gand rag
++ AskEliza o
+9</p>
+      <a class="open-link" href="../14371-initial-silence-clean-stop.jpg">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="video" data-source="other" data-search=".github/issue-evidence/14371-initial-silence.webm other  ">
+    <div class="media"><video controls preload="metadata" src="../14371-initial-silence.webm"></video></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">video</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-initial-silence.webm</h2>
+      <p class="path">.github/issue-evidence/14371-initial-silence.webm</p>
+      <p class="meta">77.7 KB | 2026-07-06T08:03:22.002Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-initial-silence.webm">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-mic-denied-error-state.jpg other a-0)\9
+ound rag
+‘swipe for apps. pull chatup. x
+microphone access was denied. enable microphone
+permission in your browser or system settings to use
++ askeliza voice. o ">
+    <div class="media"><button class="thumb-button" data-img="../14371-mic-denied-error-state.jpg" data-caption=".github/issue-evidence/14371-mic-denied-error-state.jpg"><img loading="lazy" src="../14371-mic-denied-error-state.jpg" alt=".github/issue-evidence/14371-mic-denied-error-state.jpg"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-mic-denied-error-state.jpg</h2>
+      <p class="path">.github/issue-evidence/14371-mic-denied-error-state.jpg</p>
+      <p class="meta">46.3 KB | 2026-07-06T08:03:21.937Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>95</dd></div>
+              <div><dt>Dominant</dt><dd>19.7%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>51.1%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#f0b090 19.7%" style="background:#f0b090"></span><span title="#ffb090 16.0%" style="background:#ffb090"></span><span title="#e0a090 13.4%" style="background:#e0a090"></span><span title="#d0a090 10.0%" style="background:#d0a090"></span><span title="#ffc090 8.0%" style="background:#ffc090"></span><span title="#f0a090 8.0%" style="background:#f0a090"></span><span title="#f0b0a0 5.9%" style="background:#f0b0a0"></span><span title="#f0c0a0 3.5%" style="background:#f0c0a0"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - A-0)\9
+ound rag
+‘Swipe for apps. Pull chatup. x
+Microphone access was denied. Enable microphone
+permission in your browser or system settings to use
++ AskEliza voice. o</p>
+      <a class="open-link" href="../14371-mic-denied-error-state.jpg">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="video" data-source="other" data-search=".github/issue-evidence/14371-mic-denied.webm other  ">
+    <div class="media"><video controls preload="metadata" src="../14371-mic-denied.webm"></video></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">video</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-mic-denied.webm</h2>
+      <p class="path">.github/issue-evidence/14371-mic-denied.webm</p>
+      <p class="meta">70.1 KB | 2026-07-06T08:03:21.967Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-mic-denied.webm">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="viewer" data-source="other" data-search=".github/issue-evidence/14371-review/index.html other &lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;title&gt;evidence review&lt;/title&gt;
+&lt;style&gt;
+  :root { color-scheme: dark; --bg:#101010; --panel:#171717; --panel2:#202020; --line:#313131; --txt:#eeeeee; --muted:#a1a1a1; --accent:#ff6a00; --warn:#f59e0b; --bad:#ef4444; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.45 ui-sans-serif, system-ui, -apple-system, segoe ui, sans-serif; }
+  header { padding:24px 28px 14px; border-bottom:1px solid var(--line); background:#0d0d0d; position:sticky; top:0; z-index:10; }
+  h1 { margin:0 0 6px; font-size:22px; letter-spacing:0; }
+  .subtitle { color:var(--muted); margin:0 0 14px; }
+  .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .stat { border:1px solid var(--line); background:v ">
+    <div class="media"><pre>&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;title&gt;Evidence Review&lt;/title&gt;
+&lt;style&gt;
+  :root { color-scheme: dark; --bg:#101010; --panel:#171717; --panel2:#202020; --line:#313131; --txt:#eeeeee; --muted:#a1a1a1; --accent:#ff6a00; --warn:#f59e0b; --bad:#ef4444; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { padding:24px 28px 14px; border-bottom:1px solid var(--line); background:#0d0d0d; position:sticky; top:0; z-index:10; }
+  h1 { margin:0 0 6px; font-size:22px; letter-spacing:0; }
+  .subtitle { color:var(--muted); margin:0 0 14px; }
+  .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .stat { border:1px solid var(--line); background:v</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill info">viewer</span>
+        <span class="source">other</span>
+      </div>
+      <h2>index.html</h2>
+      <p class="path">.github/issue-evidence/14371-review/index.html</p>
+      <p class="meta">39.4 KB | 2026-07-06T07:51:41.266Z</p>
+
+
+
+
+      <a class="open-link" href="index.html">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="report" data-source="other" data-search=".github/issue-evidence/14371-review/manifest.json other {
+  &quot;generatedat&quot;: &quot;2026-07-06t07:49:28.678z&quot;,
+  &quot;reporoot&quot;: &quot;/users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371&quot;,
+  &quot;outputdir&quot;: &quot;/users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371/.github/issue-evidence/14371-review&quot;,
+  &quot;scandirs&quot;: [&quot;.github/issue-evidence&quot;],
+  &quot;ocr&quot;: {
+    &quot;mode&quot;: &quot;auto&quot;,
+    &quot;engine&quot;: &quot;tesseract.js package&quot;,
+    &quot;available&quot;: true,
+    &quot;ok&quot;: 6,
+    &quot;failures&quot;: 0
+  },
+  &quot;artifacts&quot;: [
+    {
+      &quot;id&quot;: &quot;1&quot;,
+      &quot;type&quot;: &quot;image&quot;,
+      &quot;source&quot;: &quot;other&quot;,
+      &quot;path&quot;: &quot;.github/issue-evidence/14371-barge-in-finished.png&quot;,
+      &quot;href&quot;: &quot;../14371-barge-in-finished.png&quot;,
+      &quot;bytes&quot;: 601721,
+      &quot;mtime&quot;: &quot;2026-07-06t07:49:14.194z&quot;,
+      &quot;ocr&quot;: {
+        &quot;status&quot;: &quot;ok&quot;,
+        &quot;engine&quot;: &quot;tesseract.js package&quot;,
+        &quot;text&quot;: &quot;3: 4 7 (e)\n(j weather\ntap to enable\nmonday, july 6 tio\n92 todos\nl ">
+    <div class="media"><pre>{
+  &quot;generatedAt&quot;: &quot;2026-07-06T07:49:28.678Z&quot;,
+  &quot;repoRoot&quot;: &quot;/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371&quot;,
+  &quot;outputDir&quot;: &quot;/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371/.github/issue-evidence/14371-review&quot;,
+  &quot;scanDirs&quot;: [&quot;.github/issue-evidence&quot;],
+  &quot;ocr&quot;: {
+    &quot;mode&quot;: &quot;auto&quot;,
+    &quot;engine&quot;: &quot;tesseract.js package&quot;,
+    &quot;available&quot;: true,
+    &quot;ok&quot;: 6,
+    &quot;failures&quot;: 0
+  },
+  &quot;artifacts&quot;: [
+    {
+      &quot;id&quot;: &quot;1&quot;,
+      &quot;type&quot;: &quot;image&quot;,
+      &quot;source&quot;: &quot;other&quot;,
+      &quot;path&quot;: &quot;.github/issue-evidence/14371-barge-in-finished.png&quot;,
+      &quot;href&quot;: &quot;../14371-barge-in-finished.png&quot;,
+      &quot;bytes&quot;: 601721,
+      &quot;mtime&quot;: &quot;2026-07-06T07:49:14.194Z&quot;,
+      &quot;ocr&quot;: {
+        &quot;status&quot;: &quot;ok&quot;,
+        &quot;engine&quot;: &quot;tesseract.js package&quot;,
+        &quot;text&quot;: &quot;3: 4 7 (e)\n(J Weather\nTap to enable\nMonday, July 6 tio\n92 Todos\nL</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">report</span>
+        <span class="source">other</span>
+      </div>
+      <h2>manifest.json</h2>
+      <p class="path">.github/issue-evidence/14371-review/manifest.json</p>
+      <p class="meta">22.1 KB | 2026-07-06T07:51:41.268Z</p>
+
+
+
+
+      <a class="open-link" href="manifest.json">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="viewer" data-source="other" data-search=".github/issue-evidence/14371-voice-matrix/index.html other &lt;!doctype html&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;title&gt;voice live matrix&lt;/title&gt;
+&lt;style&gt;
+body{font-family:system-ui,-apple-system,segoe ui,sans-serif;margin:24px;background:#fafafa;color:#151515}
+table{width:100%;border-collapse:collapse;background:white}
+th,td{border:1px solid #ddd;padding:8px;vertical-align:top;white-space:pre-wrap}
+th{background:#f1f1f1;text-align:left}
+.pass td:nth-child(2){color:#116b2d;font-weight:700}
+.fail td:nth-child(2){color:#9a1b1b;font-weight:700}
+.skip td:nth-child(2),.pending td:nth-child(2){color:#7a5b00;font-weight:700}
+code{font-size:12px}
+&lt;/style&gt;
+&lt;h1&gt;voice live matrix&lt;/h1&gt;
+&lt;p&gt;generated 2026-07-06t07:04:58.600z on darwin arm64 (shaws-macbook-pro.local).&lt;/p&gt;
+&lt;p&gt;pass 0 · fail 0 · pending 0 · skip 1&lt;/p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;cell&lt;/th&gt;&lt;th&gt;status&lt;/th&gt;&lt;th&gt;platform&lt;/th&gt;&lt;th&gt;class&lt;/th&gt;&lt;th&gt;dimensions&lt;/th&gt;&lt;th&gt;probe / result&lt;/th&gt;&lt;th&gt;command&lt;/th&gt;&lt;th&gt;evidence&lt;/th&gt;&lt;/tr&gt;&lt;/thea ">
+    <div class="media"><pre>&lt;!doctype html&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;title&gt;Voice Live Matrix&lt;/title&gt;
+&lt;style&gt;
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;background:#fafafa;color:#151515}
+table{width:100%;border-collapse:collapse;background:white}
+th,td{border:1px solid #ddd;padding:8px;vertical-align:top;white-space:pre-wrap}
+th{background:#f1f1f1;text-align:left}
+.pass td:nth-child(2){color:#116b2d;font-weight:700}
+.fail td:nth-child(2){color:#9a1b1b;font-weight:700}
+.skip td:nth-child(2),.pending td:nth-child(2){color:#7a5b00;font-weight:700}
+code{font-size:12px}
+&lt;/style&gt;
+&lt;h1&gt;Voice Live Matrix&lt;/h1&gt;
+&lt;p&gt;Generated 2026-07-06T07:04:58.600Z on darwin arm64 (Shaws-MacBook-Pro.local).&lt;/p&gt;
+&lt;p&gt;Pass 0 · Fail 0 · Pending 0 · Skip 1&lt;/p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Cell&lt;/th&gt;&lt;th&gt;Status&lt;/th&gt;&lt;th&gt;Platform&lt;/th&gt;&lt;th&gt;Class&lt;/th&gt;&lt;th&gt;Dimensions&lt;/th&gt;&lt;th&gt;Probe / Result&lt;/th&gt;&lt;th&gt;Command&lt;/th&gt;&lt;th&gt;Evidence&lt;/th&gt;&lt;/tr&gt;&lt;/thea</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill info">viewer</span>
+        <span class="source">other</span>
+      </div>
+      <h2>index.html</h2>
+      <p class="path">.github/issue-evidence/14371-voice-matrix/index.html</p>
+      <p class="meta">1.5 KB | 2026-07-06T07:51:41.269Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-voice-matrix/index.html">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="report" data-source="other" data-search=".github/issue-evidence/14371-voice-matrix/voice-matrix.json other {
+  &quot;schema&quot;: &quot;eliza_voice_live_matrix_v1&quot;,
+  &quot;issue&quot;: 9958,
+  &quot;generatedat&quot;: &quot;2026-07-06t07:04:58.600z&quot;,
+  &quot;mode&quot;: &quot;probe&quot;,
+  &quot;dimensions&quot;: {
+    &quot;platform&quot;: [
+      &quot;web&quot;,
+      &quot;linux&quot;,
+      &quot;macos-electrobun&quot;,
+      &quot;windows-electrobun&quot;,
+      &quot;ios&quot;,
+      &quot;android&quot;
+    ],
+    &quot;transcriptionstate&quot;: [&quot;off&quot;, &quot;on&quot;],
+    &quot;chimein&quot;: [&quot;should-respond&quot;, &quot;should-not-respond&quot;],
+    &quot;wakewordcontext&quot;: [
+      &quot;idle-wake&quot;,
+      &quot;already-listening-wake-inert&quot;,
+      &quot;mid-transcription-wake&quot;
+    ],
+    &quot;noiserejection&quot;: [
+      &quot;quiet&quot;,
+      &quot;noisy-reverberant&quot;,
+      &quot;echo-self-voice&quot;,
+      &quot;overlapping-speech&quot;
+    ],
+    &quot;voices&quot;: [&quot;owner&quot;, &quot;enrolled-contact&quot;, &quot;unknown&quot;, &quot;multi-speaker&quot;]
+  },
+  &quot;selection&quot;: {
+    &quot;platformfilters&quot;: [&quot;web.live-railway.roundtrip&quot;],
+    &quot;matched&quot;: 1,
+    &quot;error&quot;: null
+  },
+  &quot;host&quot;: {
+    &quot;platform&quot;: &quot;darwin&quot;,
+    &quot;arch&quot;: &quot;arm64&quot;,
+    &quot;hostname&quot;: &quot;shaws-macboo ">
+    <div class="media"><pre>{
+  &quot;schema&quot;: &quot;eliza_voice_live_matrix_v1&quot;,
+  &quot;issue&quot;: 9958,
+  &quot;generatedAt&quot;: &quot;2026-07-06T07:04:58.600Z&quot;,
+  &quot;mode&quot;: &quot;probe&quot;,
+  &quot;dimensions&quot;: {
+    &quot;platform&quot;: [
+      &quot;web&quot;,
+      &quot;linux&quot;,
+      &quot;macos-electrobun&quot;,
+      &quot;windows-electrobun&quot;,
+      &quot;ios&quot;,
+      &quot;android&quot;
+    ],
+    &quot;transcriptionState&quot;: [&quot;off&quot;, &quot;on&quot;],
+    &quot;chimeIn&quot;: [&quot;should-respond&quot;, &quot;should-not-respond&quot;],
+    &quot;wakewordContext&quot;: [
+      &quot;idle-wake&quot;,
+      &quot;already-listening-wake-inert&quot;,
+      &quot;mid-transcription-wake&quot;
+    ],
+    &quot;noiseRejection&quot;: [
+      &quot;quiet&quot;,
+      &quot;noisy-reverberant&quot;,
+      &quot;echo-self-voice&quot;,
+      &quot;overlapping-speech&quot;
+    ],
+    &quot;voices&quot;: [&quot;owner&quot;, &quot;enrolled-contact&quot;, &quot;unknown&quot;, &quot;multi-speaker&quot;]
+  },
+  &quot;selection&quot;: {
+    &quot;platformFilters&quot;: [&quot;web.live-railway.roundtrip&quot;],
+    &quot;matched&quot;: 1,
+    &quot;error&quot;: null
+  },
+  &quot;host&quot;: {
+    &quot;platform&quot;: &quot;darwin&quot;,
+    &quot;arch&quot;: &quot;arm64&quot;,
+    &quot;hostname&quot;: &quot;Shaws-MacBoo</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">report</span>
+        <span class="source">other</span>
+      </div>
+      <h2>voice-matrix.json</h2>
+      <p class="path">.github/issue-evidence/14371-voice-matrix/voice-matrix.json</p>
+      <p class="meta">2.1 KB | 2026-07-06T07:51:41.275Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-voice-matrix/voice-matrix.json">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="report" data-source="other" data-search=".github/issue-evidence/14371-voice-matrix/voice-matrix.md other # voice live matrix
+
+generated: 2026-07-06t07:04:58.600z
+host: darwin arm64 (shaws-macbook-pro.local)
+
+| cell | status | platform | class | probe / result | command |
+|---|---:|---|---|---|---|
+| `web.live-railway.roundtrip` | skip | web | live-cloud-voice-roundtrip | set eliza_voice_live_railway=1 on a runner with live railway voice services | `bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts --grep @live-railway` |
+
+## summary
+
+- pass: 0
+- fail: 0
+- pending: 0
+- skip: 1
+
+hardware-unavailable cells are explicit `skip` rows. they are not evidence of platform coverage.
+ ">
+    <div class="media"><pre># Voice Live Matrix
+
+Generated: 2026-07-06T07:04:58.600Z
+Host: darwin arm64 (Shaws-MacBook-Pro.local)
+
+| Cell | Status | Platform | Class | Probe / Result | Command |
+|---|---:|---|---|---|---|
+| `web.live-railway.roundtrip` | skip | web | live-cloud-voice-roundtrip | set ELIZA_VOICE_LIVE_RAILWAY=1 on a runner with live Railway voice services | `bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts --grep @live-railway` |
+
+## Summary
+
+- Pass: 0
+- Fail: 0
+- Pending: 0
+- Skip: 1
+
+Hardware-unavailable cells are explicit `skip` rows. They are not evidence of platform coverage.
+</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">report</span>
+        <span class="source">other</span>
+      </div>
+      <h2>voice-matrix.md</h2>
+      <p class="path">.github/issue-evidence/14371-voice-matrix/voice-matrix.md</p>
+      <p class="meta">600 B | 2026-07-06T07:51:41.276Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-voice-matrix/voice-matrix.md">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="report" data-source="other" data-search=".github/issue-evidence/14371-voice-realaudio-review.md other # issue #14371 voice real-audio evidence
+
+generated on 2026-07-06 from the `chromium-voice-mic` playwright lane.
+
+## automated checks
+
+- `bun run --cwd packages/ui test -- src/voice/local-asr-capture.test.ts src/state/persistence-vad-auto-stop.test.ts src/voice/voice-capture-factory.test.ts src/components/shell/useshellvoiceoutput.test.tsx src/components/shell/__tests__/useshellcontroller.test.tsx`
+  - 5 files, 93 tests passed.
+- `bun run --cwd packages/ui test -- src/components/shell/continuouschatoverlay.test.tsx`
+  - 1 file, 156 tests passed.
+- `e2e_record=1 bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts`
+  - 5 tests passed.
+  - 1 test skipped: live railway voice round-trip requires `eliza_voice_live_railway=1` plus a live llm key.
+- `bun run --cwd packages/app test:e2e test/ui-smoke/all-views-aesthetic-audit.spec.ts --project=audit-app --grep &quot;builtin-(inve ">
+    <div class="media"><pre># Issue #14371 Voice Real-Audio Evidence
+
+Generated on 2026-07-06 from the `chromium-voice-mic` Playwright lane.
+
+## Automated Checks
+
+- `bun run --cwd packages/ui test -- src/voice/local-asr-capture.test.ts src/state/persistence-vad-auto-stop.test.ts src/voice/voice-capture-factory.test.ts src/components/shell/useShellVoiceOutput.test.tsx src/components/shell/__tests__/useShellController.test.tsx`
+  - 5 files, 93 tests passed.
+- `bun run --cwd packages/ui test -- src/components/shell/ContinuousChatOverlay.test.tsx`
+  - 1 file, 156 tests passed.
+- `E2E_RECORD=1 bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts`
+  - 5 tests passed.
+  - 1 test skipped: live Railway voice round-trip requires `ELIZA_VOICE_LIVE_RAILWAY=1` plus a live LLM key.
+- `bun run --cwd packages/app test:e2e test/ui-smoke/all-views-aesthetic-audit.spec.ts --project=audit-app --grep &quot;builtin-(inve</pre></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">report</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-voice-realaudio-review.md</h2>
+      <p class="path">.github/issue-evidence/14371-voice-realaudio-review.md</p>
+      <p class="meta">3.9 KB | 2026-07-06T07:51:41.277Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-voice-realaudio-review.md">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="image" data-source="other" data-search=".github/issue-evidence/14371-web-roundtrip-selftest.png other voice self-test
+platforn=web - ttsroute=/api/tts/cloud - phrase=&quot;what time is it&quot;
+overall: pass
+[pass] asr (4620ms)
+[pass] send (30ms)
+[pass] tts (32ms)
+{
+&quot;schemaversion' 1,
+“overall: ‘pass’,
+“platform”: ‘web’,
+&quot;mode: ‘mic-capture’,
+“ttsroute”: */api/tts/cloud’,
+“expectedphrase”: ‘what time is it’,
+“transcript”: ‘what time is it’,
+reply”: it is exactly noon in the real audio barge in test. | am still speaking this long local inference response so the user can interrupt me with the microphone’,
+&quot;sendbackend: remote-provider’,
+&quot;startedat': &quot;2026-07-06t08:02:29.0927,
+“finishedat’: 2026-07-06t08:02:33.774z,
+“stages”
+{
+&quot;stage&quot;: &quot;ast&quot;,
+status’: ‘pass’,
+&quot;durationms': 4620,
+&quot;detail: {
+“mode: ‘mic-capture’,
+“transcript” &quot;what time is it),
+“expectedphrase’: ‘what time is it,
+“wer. 0, ">
+    <div class="media"><button class="thumb-button" data-img="../14371-web-roundtrip-selftest.png" data-caption=".github/issue-evidence/14371-web-roundtrip-selftest.png"><img loading="lazy" src="../14371-web-roundtrip-selftest.png" alt=".github/issue-evidence/14371-web-roundtrip-selftest.png"></button></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">image</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-web-roundtrip-selftest.png</h2>
+      <p class="path">.github/issue-evidence/14371-web-roundtrip-selftest.png</p>
+      <p class="meta">78.1 KB | 2026-07-06T08:03:21.867Z</p>
+      <dl class="metrics">
+              <div><dt>Size</dt><dd>120x68</dd></div>
+              <div><dt>Colors</dt><dd>32</dd></div>
+              <div><dt>Dominant</dt><dd>86.9%</dd></div>
+              <div><dt>Blue</dt><dd>0.0%</dd></div>
+              <div><dt>Orange</dt><dd>0.6%</dd></div>
+            </dl>
+      <div class="swatches"><span title="#101010 86.9%" style="background:#101010"></span><span title="#303030 4.9%" style="background:#303030"></span><span title="#202020 3.5%" style="background:#202020"></span><span title="#404040 2.2%" style="background:#404040"></span><span title="#505050 0.5%" style="background:#505050"></span><span title="#000000 0.4%" style="background:#000000"></span><span title="#103020 0.3%" style="background:#103020"></span><span title="#302010 0.2%" style="background:#302010"></span></div>
+
+      <p class="ocr"><strong>OCR:</strong> ok - Voice self-test
+platforn=web - ttsRoute=/api/tts/cloud - phrase=&quot;what time is it&quot;
+overall: pass
+[pass] asr (4620ms)
+[pass] send (30ms)
+[pass] tts (32ms)
+{
+&quot;schemaversion' 1,
+“overall: ‘pass’,
+“platform”: ‘web’,
+&quot;mode: ‘mic-capture’,
+“ttsRoute”: */api/tts/cloud’,
+“expectedPhrase”: ‘what time is it’,
+“transcript”: ‘what time is it’,
+reply”: It is exactly noon in the real audio barge in test. | am still speaking this long local inference response so the user can interrupt me with the microphone’,
+&quot;sendBackend: remote-provider’,
+&quot;startedAt': &quot;2026-07-06T08:02:29.0927,
+“finishedAt’: 2026-07-06T08:02:33.774Z,
+“stages”
+{
+&quot;stage&quot;: &quot;ast&quot;,
+status’: ‘pass’,
+&quot;durationMs': 4620,
+&quot;detail: {
+“mode: ‘mic-capture’,
+“transcript” &quot;what time is it),
+“expectedPhrase’: ‘what time is it,
+“wer. 0,</p>
+      <a class="open-link" href="../14371-web-roundtrip-selftest.png">Open artifact</a>
+    </div>
+  </article>
+<article class="card" data-type="video" data-source="other" data-search=".github/issue-evidence/14371-web-roundtrip-selftest.webm other  ">
+    <div class="media"><video controls preload="metadata" src="../14371-web-roundtrip-selftest.webm"></video></div>
+    <div class="body">
+      <div class="row">
+        <span class="pill ok">video</span>
+        <span class="source">other</span>
+      </div>
+      <h2>14371-web-roundtrip-selftest.webm</h2>
+      <p class="path">.github/issue-evidence/14371-web-roundtrip-selftest.webm</p>
+      <p class="meta">110.9 KB | 2026-07-06T08:03:21.875Z</p>
+
+
+
+
+      <a class="open-link" href="../14371-web-roundtrip-selftest.webm">Open artifact</a>
+    </div>
+  </article></div></main>
+<div id="lightbox"><button id="close">Close</button><img id="large" alt=""><div id="caption"></div></div>
+<script>
+  const search = document.getElementById("search");
+  const type = document.getElementById("type");
+  const source = document.getElementById("source");
+  const cards = [...document.querySelectorAll(".card")];
+  function applyFilters() {
+    const q = search.value.trim().toLowerCase();
+    const t = type.value;
+    const s = source.value;
+    for (const card of cards) {
+      const ok = (!q || card.dataset.search.includes(q)) && (!t || card.dataset.type === t) && (!s || card.dataset.source === s);
+      card.style.display = ok ? "" : "none";
+    }
+  }
+  search.addEventListener("input", applyFilters);
+  type.addEventListener("change", applyFilters);
+  source.addEventListener("change", applyFilters);
+  const lb = document.getElementById("lightbox");
+  const large = document.getElementById("large");
+  const caption = document.getElementById("caption");
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-img]");
+    if (!button) return;
+    large.src = button.dataset.img;
+    caption.textContent = button.dataset.caption || "";
+    lb.classList.add("open");
+  });
+  document.getElementById("close").addEventListener("click", () => lb.classList.remove("open"));
+  lb.addEventListener("click", (event) => { if (event.target === lb) lb.classList.remove("open"); });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape") lb.classList.remove("open"); });
+</script>
+</body>
+</html>

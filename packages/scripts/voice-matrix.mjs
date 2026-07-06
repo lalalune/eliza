@@ -71,6 +71,32 @@ const CELLS = [
     probe: "web",
   },
   {
+    id: "web.live-railway.roundtrip",
+    title: "Web fake-device mic -> Railway STT -> live agent -> Railway TTS",
+    platform: "web",
+    dimensions: {
+      transcriptionState: "off",
+      chimeIn: "should-respond",
+      wakewordContext: "idle-wake",
+      noiseRejection: "quiet",
+      voices: "owner",
+    },
+    class: "live-cloud-voice-roundtrip",
+    command: [
+      "bun",
+      "run",
+      "--cwd",
+      "packages/app",
+      "test:e2e",
+      "test/ui-smoke/voice-realaudio.spec.ts",
+      "--grep",
+      "@live-railway",
+    ],
+    env: UI_SMOKE_MATRIX_ENV,
+    evidence: ["packages/app/test-results", "e2e-recordings/app/test-results"],
+    probe: "webLiveRailway",
+  },
+  {
     id: "web.fake-mic.transcript-roundtrip",
     title:
       "Web fake-device transcript capture -> record -> player -> chat attachment + voice-control bridge parity",
@@ -659,6 +685,29 @@ function probeCell(cell) {
       return {
         available: true,
         reason: "Chromium fake-device mic lane is host-runnable",
+      };
+    case "webLiveRailway":
+      if (process.env.ELIZA_VOICE_LIVE_RAILWAY !== "1") {
+        return {
+          available: false,
+          reason:
+            "set ELIZA_VOICE_LIVE_RAILWAY=1 on a runner with live Railway voice services",
+        };
+      }
+      if (
+        !process.env.OPENAI_API_KEY?.trim() &&
+        !process.env.OPENROUTER_API_KEY?.trim() &&
+        !process.env.ANTHROPIC_API_KEY?.trim()
+      ) {
+        return {
+          available: false,
+          reason:
+            "set OPENAI_API_KEY, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY for the live agent turn",
+        };
+      }
+      return {
+        available: true,
+        reason: "live Railway voice services and a live LLM key are configured",
       };
     case "linuxFused":
       if (process.platform !== "linux")

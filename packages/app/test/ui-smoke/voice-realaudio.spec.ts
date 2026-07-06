@@ -6,12 +6,14 @@
  * path: a user PRESSES the mic button -> getUserMedia opens the (fake) device
  * -> startLocalAsrRecorder records + WAV-encodes the injected audio -> POST
  * /api/asr/local-inference -> real SSE reply -> real TTS fetch + decodeAudioData.
- * The ASR/agent/TTS BACKENDS are mocked (not provisioned in CI); the AUDIO IN
- * and every client step are real. No human, no microphone.
+ * The keyless lane mocks ASR/agent/TTS backends where credentials are required,
+ * but keeps AUDIO IN and every client step real. The @live-railway lane is
+ * opt-in and runs without those backend mocks against the real cloud stack.
  *
  *   bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts
  */
-import { expect, type Page, test } from "@playwright/test";
+import { writeFile } from "node:fs/promises";
+import { expect, type Page, type TestInfo, test } from "@playwright/test";
 import {
   installDefaultAppRoutes,
   openAppPath,
@@ -21,6 +23,12 @@ import {
 const EXPECTED_PHRASE = "what time is it";
 const CHAT_CONVERSATION_ID = "voice-realaudio-convo";
 const CHAT_ROOM_ID = "voice-realaudio-room";
+const LIVE_RAILWAY_ENABLED = process.env.ELIZA_VOICE_LIVE_RAILWAY === "1";
+const HAS_LIVE_LLM_KEY = Boolean(
+  process.env.OPENAI_API_KEY?.trim() ||
+    process.env.OPENROUTER_API_KEY?.trim() ||
+    process.env.ANTHROPIC_API_KEY?.trim(),
+);
 const SPOKEN_REPLY =
   "It is exactly noon in the real audio barge in test. I am still speaking this long local inference response so the user can interrupt me with the microphone.";
 
@@ -64,7 +72,9 @@ function tinyWav(seconds = 0.2, sampleRate = 16000): Buffer {
   return Buffer.concat([h, pcm]);
 }
 
-function appConfigWithLocalVoice(): Record<string, unknown> {
+function appConfigWithVoice(
+  tts: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     meta: { firstRunComplete: true },
     agents: {
@@ -81,15 +91,15 @@ function appConfigWithLocalVoice(): Record<string, unknown> {
       },
     },
     messages: {
-      tts: {
-        provider: "local-inference",
-        asr: { provider: "local-inference" },
-      },
+      tts,
     },
   };
 }
 
-async function installLocalVoiceConfig(page: Page): Promise<void> {
+async function installVoiceConfig(
+  page: Page,
+  tts: Record<string, unknown>,
+): Promise<void> {
   await page.unroute("**/api/status").catch(() => {});
   await page.route("**/api/status**", async (route) => {
     if (route.request().method() !== "GET") {
@@ -117,8 +127,30 @@ async function installLocalVoiceConfig(page: Page): Promise<void> {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(appConfigWithLocalVoice()),
+      body: JSON.stringify(appConfigWithVoice(tts)),
     });
+  });
+}
+
+async function installLocalVoiceConfig(page: Page): Promise<void> {
+  await installVoiceConfig(page, {
+    provider: "local-inference",
+    asr: { provider: "local-inference" },
+  });
+}
+
+async function installCloudTtsVoiceConfig(page: Page): Promise<void> {
+  await installVoiceConfig(page, {
+    provider: "elevenlabs",
+    mode: "cloud",
+    elevenlabs: {
+      voiceId: "21m00Tcm4TlvDq8ikWAM",
+      modelId: "eleven_turbo_v2_5",
+      stability: 0.5,
+      similarityBoost: 0.75,
+      speed: 1,
+    },
+    asr: { provider: "local-inference" },
   });
 }
 
@@ -204,6 +236,125 @@ async function installAudioSourceProbe(page: Page): Promise<void> {
 
     patch(w.AudioContext);
     patch(w.webkitAudioContext);
+  });
+}
+
+async function installDeniedMicrophone(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const denied = new DOMException("Permission denied", "NotAllowedError");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: () => Promise.reject(denied),
+      },
+    });
+  });
+}
+
+async function installSilentAudioCapture(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "eliza:voice:vad-auto-stop",
+      JSON.stringify({
+        initialSilenceMs: 650,
+        silenceMs: 200,
+        speechRmsThreshold: 0.003,
+      }),
+    );
+
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop() {} }],
+        }),
+      },
+    });
+
+    class SilentAudioContext {
+      state = "running";
+      sampleRate = 16000;
+      destination = {};
+      private processors = new Set<{ disconnect: () => void }>();
+
+      resume() {
+        return Promise.resolve();
+      }
+
+      close() {
+        for (const processor of this.processors) processor.disconnect();
+        this.processors.clear();
+        return Promise.resolve();
+      }
+
+      createMediaStreamSource() {
+        return {
+          connect() {},
+          disconnect() {},
+        };
+      }
+
+      createAnalyser() {
+        return {
+          fftSize: 256,
+          smoothingTimeConstant: 0.8,
+          connect() {},
+          disconnect() {},
+          getFloatTimeDomainData(data: Float32Array) {
+            data.fill(0);
+          },
+        };
+      }
+
+      createScriptProcessor(frameSize: number) {
+        const frame = new Float32Array(frameSize);
+        const node: {
+          onaudioprocess:
+            | ((event: {
+                inputBuffer: {
+                  length: number;
+                  numberOfChannels: number;
+                  getChannelData: () => Float32Array;
+                };
+              }) => void)
+            | null;
+          timer: number | null;
+          connect: () => void;
+          disconnect: () => void;
+        } = {
+          onaudioprocess: null,
+          timer: null,
+          connect: () => {
+            if (node.timer !== null) return;
+            node.timer = window.setInterval(() => {
+              node.onaudioprocess?.({
+                inputBuffer: {
+                  length: frameSize,
+                  numberOfChannels: 1,
+                  getChannelData: () => frame,
+                },
+              });
+            }, 25);
+          },
+          disconnect: () => {
+            if (node.timer === null) return;
+            window.clearInterval(node.timer);
+            node.timer = null;
+          },
+        };
+        this.processors.add(node);
+        return node;
+      }
+    }
+
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: SilentAudioContext,
+    });
+    Object.defineProperty(window, "webkitAudioContext", {
+      configurable: true,
+      value: SilentAudioContext,
+    });
   });
 }
 
@@ -413,7 +564,54 @@ async function installVoiceBackendMocks(page: Page): Promise<void> {
   }
 }
 
-test.beforeEach(async ({ page }) => {
+async function attachScreenshot(
+  page: Page,
+  testInfo: TestInfo,
+  name: string,
+): Promise<void> {
+  const path = testInfo.outputPath(name);
+  const body = await page.screenshot({
+    fullPage: true,
+    type: "jpeg",
+    quality: 82,
+  });
+  await writeFile(path, body);
+  await testInfo.attach(name, {
+    path,
+    contentType: "image/jpeg",
+  });
+}
+
+async function completeHandsFreeVoiceTurn(page: Page): Promise<void> {
+  const mic = page.getByTestId("chat-composer-mic");
+  await expect(mic).toHaveAttribute("aria-label", "talk", {
+    timeout: 15_000,
+  });
+  await mic.click();
+  await expect(mic).toHaveAttribute("aria-label", "end conversation", {
+    timeout: 15_000,
+  });
+  await page.waitForTimeout(1500);
+  await mic.click();
+}
+
+async function completeHandsFreeVoiceTurnAndWaitForStream(
+  page: Page,
+): Promise<void> {
+  const streamResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      response
+        .url()
+        .includes(`/api/conversations/${CHAT_CONVERSATION_ID}/messages/stream`),
+    { timeout: 25_000 },
+  );
+  await completeHandsFreeVoiceTurn(page);
+  await streamResponse;
+}
+
+test.beforeEach(async ({ page }, testInfo) => {
+  if (testInfo.title.includes("@live-railway")) return;
   await seedAppStorage(page);
   await installDefaultAppRoutes(page);
   await installVoiceBackendMocks(page);
@@ -573,4 +771,196 @@ test("REAL audio: transcription start during spoken local TTS barges in and sile
     })
     .toBeGreaterThanOrEqual(2);
   expect(Math.min(...asrPosts)).toBeGreaterThan(1000);
+});
+
+test("mic permission denied renders a visible error notice and posts no phantom capture", async ({
+  page,
+}, testInfo) => {
+  await installLocalVoiceConfig(page);
+  await installDeniedMicrophone(page);
+
+  let asrPosted = 0;
+  page.on("request", (req) => {
+    if (
+      req.method() === "POST" &&
+      req.url().includes("/api/asr/local-inference") &&
+      !req.url().includes("/status")
+    ) {
+      asrPosted += 1;
+    }
+  });
+
+  await openAppPath(page, "/chat");
+  const mic = page.getByTestId("chat-composer-mic");
+  await expect(mic).toHaveAttribute("aria-label", "talk", {
+    timeout: 15_000,
+  });
+  await mic.click();
+
+  const notice = page.getByTestId("action-notice");
+  await expect(notice).toBeVisible({ timeout: 10_000 });
+  await expect(notice).toContainText(/microphone access was denied/i);
+  await expect(mic).toHaveAttribute("aria-label", "talk", {
+    timeout: 10_000,
+  });
+  expect(asrPosted).toBe(0);
+
+  await attachScreenshot(page, testInfo, "mic-denied-error-state.jpg");
+});
+
+test("initial silence auto-stops cleanly and sends no empty message", async ({
+  page,
+}, testInfo) => {
+  await installLocalVoiceConfig(page);
+  await installSilentAudioCapture(page);
+
+  let asrPosted = 0;
+  let streamPosted = 0;
+  page.on("request", (req) => {
+    if (
+      req.method() === "POST" &&
+      req.url().includes("/api/asr/local-inference") &&
+      !req.url().includes("/status")
+    ) {
+      asrPosted += 1;
+    }
+    if (
+      req.method() === "POST" &&
+      req
+        .url()
+        .includes(`/api/conversations/${CHAT_CONVERSATION_ID}/messages/stream`)
+    ) {
+      streamPosted += 1;
+    }
+  });
+
+  await openAppPath(page, "/chat");
+  const mic = page.getByTestId("chat-composer-mic");
+  await expect(mic).toHaveAttribute("aria-label", "talk", {
+    timeout: 15_000,
+  });
+  await mic.click();
+  await expect(mic).toHaveAttribute("aria-label", "end conversation", {
+    timeout: 15_000,
+  });
+  await expect
+    .poll(() => mic.getAttribute("aria-label"), {
+      timeout: 10_000,
+      message: "initial silence should close the hot mic instead of hanging",
+    })
+    .toBe("talk");
+
+  expect(asrPosted).toBe(0);
+  expect(streamPosted).toBe(0);
+  await expect(page.getByText(EXPECTED_PHRASE)).toHaveCount(0);
+
+  await attachScreenshot(page, testInfo, "initial-silence-clean-stop.jpg");
+});
+
+test("cloud TTS transport failure shows an error state and the next voice turn recovers", async ({
+  page,
+}, testInfo) => {
+  await installCloudTtsVoiceConfig(page);
+  await installAudioSourceProbe(page);
+
+  let cloudTtsCalls = 0;
+  let forceCloudFailure = true;
+  await page.route("**/api/tts/cloud", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    cloudTtsCalls += 1;
+    if (forceCloudFailure) {
+      await route.abort("failed");
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "audio/wav" },
+      body: tinyWav(0.4),
+    });
+  });
+  await page.route("**/api/tts/elevenlabs", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    await route.fulfill({
+      status: 502,
+      contentType: "text/plain",
+      body: "direct ElevenLabs fallback unavailable during transport-drop test",
+    });
+  });
+
+  await openAppPath(page, "/chat");
+
+  await completeHandsFreeVoiceTurnAndWaitForStream(page);
+  const ttsError = page.getByTestId("chat-voice-tts-error");
+  await expect(ttsError).toBeVisible({ timeout: 20_000 });
+  await expect(ttsError).toContainText(/cloud voice unavailable/i);
+  await attachScreenshot(page, testInfo, "cloud-tts-drop-error-state.jpg");
+
+  forceCloudFailure = false;
+  await completeHandsFreeVoiceTurnAndWaitForStream(page);
+  await expect
+    .poll(async () => (await readAudioProbe(page)).starts, {
+      timeout: 25_000,
+      message: "second voice turn should recover and start Web Audio playback",
+    })
+    .toBeGreaterThan(0);
+  await expect(page.getByTestId("chat-voice-tts-error")).toHaveCount(0);
+  expect(cloudTtsCalls).toBeGreaterThanOrEqual(2);
+
+  await attachScreenshot(page, testInfo, "cloud-tts-recovered.jpg");
+});
+
+test("LIVE Railway web voice round-trip through cloud STT, live agent, and cloud TTS @live-railway", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    !LIVE_RAILWAY_ENABLED,
+    "set ELIZA_VOICE_LIVE_RAILWAY=1 to run the live Railway voice lane",
+  );
+  test.skip(
+    !HAS_LIVE_LLM_KEY,
+    "set a live LLM provider key so the agent turn is not served by a proxy",
+  );
+
+  const consoleRows: string[] = [];
+  const networkRows: string[] = [];
+  page.on("console", (msg) => {
+    consoleRows.push(`${msg.type()}: ${msg.text()}`);
+  });
+  page.on("response", (response) => {
+    const url = response.url();
+    if (
+      url.includes("/api/asr/") ||
+      url.includes("/api/tts/") ||
+      url.includes("/messages/stream")
+    ) {
+      networkRows.push(`${response.status()} ${url}`);
+    }
+  });
+
+  await openAppPath(page, "/chat");
+  await completeHandsFreeVoiceTurn(page);
+
+  await expect
+    .poll(
+      async () => page.evaluate(() => window.__voicePlaybackStarted === true),
+      {
+        timeout: 60_000,
+        message: "live cloud TTS should decode and start audible playback",
+      },
+    )
+    .toBe(true);
+
+  await expect(page.getByText(/what time is it/i).first()).toBeVisible({
+    timeout: 30_000,
+  });
+
+  await testInfo.attach("live-railway-console.log", {
+    body: consoleRows.join("\n"),
+    contentType: "text/plain",
+  });
+  await testInfo.attach("live-railway-network.log", {
+    body: networkRows.join("\n"),
+    contentType: "text/plain",
+  });
+  await attachScreenshot(page, testInfo, "live-railway-roundtrip.jpg");
 });

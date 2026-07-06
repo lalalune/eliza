@@ -54,6 +54,7 @@ import {
   type VoiceCaptureHandle,
   type VoiceCaptureState,
 } from "../../voice/voice-capture-factory";
+import type { VoiceTtsError } from "../../voice/voice-chat-types";
 import { buildVoiceTurnSignal } from "../../voice/voice-turn-signal";
 import { matchWakeName } from "../../voice/wake-name-match";
 import { useHomeModelStatus } from "../local-inference/useHomeModelStatus";
@@ -152,6 +153,8 @@ export interface ShellController {
   needsAudioUnlock: boolean;
   /** Resume audio output in response to a user gesture (enable sound). */
   unlockAudio: () => void;
+  /** Fail-closed TTS error from the configured voice engine, if any. */
+  ttsError?: VoiceTtsError | null;
   /** True while the hands-free voice conversation loop is active — the mic
    *  re-opens automatically after each spoken reply. Toggled by a tap on the mic. */
   handsFree: boolean;
@@ -767,6 +770,7 @@ export function useShellController(): ShellController {
       // Transcription mode wants a VERBATIM long-form transcript, so (like
       // dictation) it bypasses the echo/disfluency end-of-turn aggregator —
       // every final is sent as-is (after exit-phrase detection).
+      let hadFinalTranscript = false;
       const aggregator =
         intent === "dictate" || intent === "transcription"
           ? null
@@ -835,6 +839,7 @@ export function useShellController(): ShellController {
             setTranscript("");
             return;
           }
+          hadFinalTranscript = true;
           if (intent === "transcription") {
             // Long-form record-only. Run exit detection on every final.
             if (isTranscriptionExitPhrase(text)) {
@@ -945,6 +950,20 @@ export function useShellController(): ShellController {
             ) {
               turnCarryoverRef.current = aggregator.pending;
             }
+            if (
+              state === "stopped" &&
+              !explicitStopRef.current &&
+              !hadFinalTranscript
+            ) {
+              // Pure initial silence is a designed empty turn: close the hot mic
+              // instead of re-opening hands-free forever and never fabricate an
+              // empty chat message.
+              setHandsFree(false);
+              handsFreeRef.current = false;
+              if (loadContinuousChatMode() === "always-on") {
+                saveContinuousChatMode("off");
+              }
+            }
             explicitStopRef.current = false;
             aggregator?.reset();
             setAnalyser(null);
@@ -966,6 +985,14 @@ export function useShellController(): ShellController {
           captureRef.current = null;
           setAnalyser(null);
           setRecording(false);
+          if (
+            handsFreeRef.current ||
+            loadContinuousChatMode() === "always-on"
+          ) {
+            setHandsFree(false);
+            handsFreeRef.current = false;
+            saveContinuousChatMode(priorContinuousModeRef.current);
+          }
           // Mic permission denial / capture failure was previously swallowed —
           // the user tapped the mic and nothing happened with no feedback.
           // Surface a clear, actionable notice through the shell's toast channel
@@ -1170,6 +1197,7 @@ export function useShellController(): ShellController {
       // "vad-gated" choice survives) and stop the mic + any in-flight reply.
       saveContinuousChatMode(priorContinuousModeRef.current);
       setHandsFree(false);
+      handsFreeRef.current = false;
       if (captureRef.current) stopCapture();
       voiceOutput.stopSpeaking();
     } else {
@@ -1179,6 +1207,7 @@ export function useShellController(): ShellController {
       if (prior !== "always-on") priorContinuousModeRef.current = prior;
       saveContinuousChatMode("always-on");
       setHandsFree(true);
+      handsFreeRef.current = true;
       setIsOpen(true);
       voiceOutput.unlockAudio();
       // Voice is gated while a reply is in flight: open the mic now only if
@@ -1452,6 +1481,7 @@ export function useShellController(): ShellController {
     toggleAgentVoiceMute: voiceOutput.toggleAgentVoiceMute,
     needsAudioUnlock: voiceOutput.needsAudioUnlock,
     unlockAudio: voiceOutput.unlockAudio,
+    ttsError: voiceOutput.ttsError,
     clearConversation,
     openSettings,
     navigateHome,

@@ -127,6 +127,7 @@ export function ShellOverlays({
                 ? "bg-ok text-white"
                 : "bg-accent text-accent-fg"
           }`}
+          data-testid="action-notice"
           role="status"
           aria-live="polite"
           aria-busy={actionNotice.busy ? true : undefined}

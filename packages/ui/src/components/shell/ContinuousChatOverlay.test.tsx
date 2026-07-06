@@ -225,6 +225,25 @@ describe("ContinuousChatOverlay", () => {
     expect(screen.queryByLabelText("send")).toBeNull();
   });
 
+  it("renders voice output failures as an inline alert", () => {
+    render(
+      <ContinuousChatOverlay
+        controller={makeController({
+          ttsError: {
+            engine: "elevenlabs",
+            message: "transport failed",
+            atMs: 123,
+          },
+        })}
+      />,
+    );
+
+    const alert = screen.getByTestId("chat-voice-tts-error");
+    expect(alert.textContent).toContain("Cloud voice unavailable");
+    expect(alert.getAttribute("data-engine")).toBe("elevenlabs");
+    expect(alert.getAttribute("title")).toBe("transport failed");
+  });
+
   it("swaps mic → send once the user types (ChatGPT-style)", () => {
     render(<ContinuousChatOverlay controller={makeController()} />);
     fireEvent.change(screen.getByLabelText("message"), {
@@ -489,6 +508,56 @@ describe("ContinuousChatOverlay", () => {
     expect(overlay.style.paddingBottom).toBe(
       "calc(var(--eliza-mobile-nav-offset, 0px) + max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) + 0.625rem)",
     );
+  });
+
+  it("publishes clearance for the full resting overlay footprint", () => {
+    const originalResizeObserver = globalThis.ResizeObserver;
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect");
+    class TestResizeObserver {
+      observe = vi.fn();
+      disconnect = vi.fn();
+    }
+
+    try {
+      vi.stubGlobal("ResizeObserver", TestResizeObserver);
+      rectSpy.mockImplementation(function mockOverlayRect(this: HTMLElement) {
+        const testId = this.getAttribute("data-testid");
+        const height =
+          testId === "continuous-chat-overlay"
+            ? 104
+            : testId === "chat-sheet"
+              ? 72
+              : 0;
+        return {
+          width: 320,
+          height,
+          x: 0,
+          y: 0,
+          top: 0,
+          right: 320,
+          bottom: height,
+          left: 0,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+      document.documentElement.style.removeProperty(
+        "--eliza-continuous-chat-clearance",
+      );
+
+      render(<ContinuousChatOverlay controller={makeController()} />);
+
+      expect(
+        document.documentElement.style.getPropertyValue(
+          "--eliza-continuous-chat-clearance",
+        ),
+      ).toBe("104px");
+    } finally {
+      rectSpy.mockRestore();
+      vi.stubGlobal("ResizeObserver", originalResizeObserver);
+      document.documentElement.style.removeProperty(
+        "--eliza-continuous-chat-clearance",
+      );
+    }
   });
 
   it("publishes side clearance for the compact short-landscape composer", () => {

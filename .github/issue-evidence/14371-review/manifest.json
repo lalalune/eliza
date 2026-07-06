@@ -1,0 +1,528 @@
+{
+  "generatedAt": "2026-07-06T08:03:33.925Z",
+  "repoRoot": "/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371",
+  "outputDir": "/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371/.github/issue-evidence/14371-review",
+  "scanDirs": [".github/issue-evidence"],
+  "ocr": {
+    "mode": "auto",
+    "engine": "tesseract.js package",
+    "available": true,
+    "ok": 6,
+    "failures": 0
+  },
+  "artifacts": [
+    {
+      "id": "1",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-barge-in-finished.png",
+      "href": "../14371-barge-in-finished.png",
+      "bytes": 571326,
+      "mtime": "2026-07-06T08:03:21.881Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "pp\nNeeds attention\n[B Transcript 2026-0\n+ |skEiza B>"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 74,
+        "dominantRatio": 0.21409313725490195,
+        "dominantColors": [
+          {
+            "hex": "#e0a090",
+            "count": 1747,
+            "ratio": 0.21409313725490195
+          },
+          {
+            "hex": "#f0b090",
+            "count": 732,
+            "ratio": 0.08970588235294118
+          },
+          {
+            "hex": "#f0b080",
+            "count": 715,
+            "ratio": 0.08762254901960784
+          },
+          {
+            "hex": "#d0a090",
+            "count": 673,
+            "ratio": 0.08247549019607843
+          },
+          {
+            "hex": "#c09090",
+            "count": 625,
+            "ratio": 0.07659313725490197
+          },
+          {
+            "hex": "#201010",
+            "count": 575,
+            "ratio": 0.0704656862745098
+          },
+          {
+            "hex": "#d09090",
+            "count": 521,
+            "ratio": 0.06384803921568627
+          },
+          {
+            "hex": "#e0a080",
+            "count": 483,
+            "ratio": 0.05919117647058823
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.4818627450980392,
+        "redRatio": 0.01838235294117647,
+        "averageLuminance": 152,
+        "issues": []
+      }
+    },
+    {
+      "id": "2",
+      "type": "video",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-barge-in.webm",
+      "href": "../14371-barge-in.webm",
+      "bytes": 180179,
+      "mtime": "2026-07-06T08:03:21.888Z"
+    },
+    {
+      "id": "3",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-cloud-tts-drop-error-state.jpg",
+      "href": "../14371-cloud-tts-drop-error-state.jpg",
+      "bytes": 43151,
+      "mtime": "2026-07-06T08:03:22.022Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "Bn rag\n4 cloud voice unavailable\n+ AskEliza []"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 103,
+        "dominantRatio": 0.19019607843137254,
+        "dominantColors": [
+          {
+            "hex": "#f0b090",
+            "count": 1552,
+            "ratio": 0.19019607843137254
+          },
+          {
+            "hex": "#ffb090",
+            "count": 1292,
+            "ratio": 0.15833333333333333
+          },
+          {
+            "hex": "#e0a090",
+            "count": 1087,
+            "ratio": 0.1332107843137255
+          },
+          {
+            "hex": "#d0a090",
+            "count": 807,
+            "ratio": 0.09889705882352941
+          },
+          {
+            "hex": "#f0a090",
+            "count": 664,
+            "ratio": 0.08137254901960785
+          },
+          {
+            "hex": "#ffc090",
+            "count": 601,
+            "ratio": 0.07365196078431373
+          },
+          {
+            "hex": "#f0b0a0",
+            "count": 385,
+            "ratio": 0.04718137254901961
+          },
+          {
+            "hex": "#f0c0a0",
+            "count": 269,
+            "ratio": 0.032965686274509805
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.49779411764705883,
+        "redRatio": 0.11691176470588235,
+        "averageLuminance": 172,
+        "issues": []
+      }
+    },
+    {
+      "id": "4",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-cloud-tts-recovered.jpg",
+      "href": "../14371-cloud-tts-recovered.jpg",
+      "bytes": 40626,
+      "mtime": "2026-07-06T08:03:22.033Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "Gand rag"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 73,
+        "dominantRatio": 0.19901960784313724,
+        "dominantColors": [
+          {
+            "hex": "#f0b090",
+            "count": 1624,
+            "ratio": 0.19901960784313724
+          },
+          {
+            "hex": "#ffb090",
+            "count": 1306,
+            "ratio": 0.16004901960784312
+          },
+          {
+            "hex": "#e0a090",
+            "count": 1104,
+            "ratio": 0.13529411764705881
+          },
+          {
+            "hex": "#d0a090",
+            "count": 821,
+            "ratio": 0.10061274509803922
+          },
+          {
+            "hex": "#ffc090",
+            "count": 650,
+            "ratio": 0.07965686274509803
+          },
+          {
+            "hex": "#f0a090",
+            "count": 649,
+            "ratio": 0.07953431372549019
+          },
+          {
+            "hex": "#f0b0a0",
+            "count": 516,
+            "ratio": 0.06323529411764706
+          },
+          {
+            "hex": "#f0c0a0",
+            "count": 284,
+            "ratio": 0.03480392156862745
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.5235294117647059,
+        "redRatio": 0.08308823529411764,
+        "averageLuminance": 176,
+        "issues": []
+      }
+    },
+    {
+      "id": "5",
+      "type": "video",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-cloud-tts-recovery.webm",
+      "href": "../14371-cloud-tts-recovery.webm",
+      "bytes": 176521,
+      "mtime": "2026-07-06T08:03:22.041Z"
+    },
+    {
+      "id": "6",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-initial-silence-clean-stop.jpg",
+      "href": "../14371-initial-silence-clean-stop.jpg",
+      "bytes": 40403,
+      "mtime": "2026-07-06T08:03:21.987Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "Gand rag\n+ AskEliza o\n9"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 71,
+        "dominantRatio": 0.1993872549019608,
+        "dominantColors": [
+          {
+            "hex": "#f0b090",
+            "count": 1627,
+            "ratio": 0.1993872549019608
+          },
+          {
+            "hex": "#ffb090",
+            "count": 1306,
+            "ratio": 0.16004901960784312
+          },
+          {
+            "hex": "#e0a090",
+            "count": 1103,
+            "ratio": 0.13517156862745097
+          },
+          {
+            "hex": "#d0a090",
+            "count": 821,
+            "ratio": 0.10061274509803922
+          },
+          {
+            "hex": "#ffc090",
+            "count": 650,
+            "ratio": 0.07965686274509803
+          },
+          {
+            "hex": "#f0a090",
+            "count": 649,
+            "ratio": 0.07953431372549019
+          },
+          {
+            "hex": "#f0b0a0",
+            "count": 516,
+            "ratio": 0.06323529411764706
+          },
+          {
+            "hex": "#f0c0a0",
+            "count": 284,
+            "ratio": 0.03480392156862745
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.5220588235294118,
+        "redRatio": 0.08308823529411764,
+        "averageLuminance": 176,
+        "issues": []
+      }
+    },
+    {
+      "id": "7",
+      "type": "video",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-initial-silence.webm",
+      "href": "../14371-initial-silence.webm",
+      "bytes": 79575,
+      "mtime": "2026-07-06T08:03:22.002Z"
+    },
+    {
+      "id": "8",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-mic-denied-error-state.jpg",
+      "href": "../14371-mic-denied-error-state.jpg",
+      "bytes": 47447,
+      "mtime": "2026-07-06T08:03:21.937Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "A-0)\\9\nound rag\n‘Swipe for apps. Pull chatup. x\nMicrophone access was denied. Enable microphone\npermission in your browser or system settings to use\n+ AskEliza voice. o"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 95,
+        "dominantRatio": 0.19669117647058823,
+        "dominantColors": [
+          {
+            "hex": "#f0b090",
+            "count": 1605,
+            "ratio": 0.19669117647058823
+          },
+          {
+            "hex": "#ffb090",
+            "count": 1308,
+            "ratio": 0.16029411764705884
+          },
+          {
+            "hex": "#e0a090",
+            "count": 1092,
+            "ratio": 0.1338235294117647
+          },
+          {
+            "hex": "#d0a090",
+            "count": 813,
+            "ratio": 0.09963235294117648
+          },
+          {
+            "hex": "#ffc090",
+            "count": 654,
+            "ratio": 0.08014705882352942
+          },
+          {
+            "hex": "#f0a090",
+            "count": 651,
+            "ratio": 0.07977941176470588
+          },
+          {
+            "hex": "#f0b0a0",
+            "count": 483,
+            "ratio": 0.05919117647058823
+          },
+          {
+            "hex": "#f0c0a0",
+            "count": 284,
+            "ratio": 0.03480392156862745
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.5111519607843137,
+        "redRatio": 0.12426470588235294,
+        "averageLuminance": 177,
+        "issues": []
+      }
+    },
+    {
+      "id": "9",
+      "type": "video",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-mic-denied.webm",
+      "href": "../14371-mic-denied.webm",
+      "bytes": 71798,
+      "mtime": "2026-07-06T08:03:21.967Z"
+    },
+    {
+      "id": "10",
+      "type": "viewer",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-review/index.html",
+      "href": "index.html",
+      "bytes": 40368,
+      "mtime": "2026-07-06T07:51:41.266Z",
+      "preview": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Evidence Review</title>\n<style>\n  :root { color-scheme: dark; --bg:#101010; --panel:#171717; --panel2:#202020; --line:#313131; --txt:#eeeeee; --muted:#a1a1a1; --accent:#ff6a00; --warn:#f59e0b; --bad:#ef4444; --ok:#22c55e; }\n  * { box-sizing: border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }\n  header { padding:24px 28px 14px; border-bottom:1px solid var(--line); background:#0d0d0d; position:sticky; top:0; z-index:10; }\n  h1 { margin:0 0 6px; font-size:22px; letter-spacing:0; }\n  .subtitle { color:var(--muted); margin:0 0 14px; }\n  .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }\n  .stat { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:6px 10px; }\n  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }\n  input, select { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-height:36px; }\n  input { min-width:260px;"
+    },
+    {
+      "id": "11",
+      "type": "report",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-review/manifest.json",
+      "href": "manifest.json",
+      "bytes": 22624,
+      "mtime": "2026-07-06T07:51:41.268Z",
+      "preview": "{\n  \"generatedAt\": \"2026-07-06T07:49:28.678Z\",\n  \"repoRoot\": \"/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371\",\n  \"outputDir\": \"/Users/shawwalters/eliza-workspace/milady/eliza/.codex-worktrees/voice-realaudio-14371/.github/issue-evidence/14371-review\",\n  \"scanDirs\": [\".github/issue-evidence\"],\n  \"ocr\": {\n    \"mode\": \"auto\",\n    \"engine\": \"tesseract.js package\",\n    \"available\": true,\n    \"ok\": 6,\n    \"failures\": 0\n  },\n  \"artifacts\": [\n    {\n      \"id\": \"1\",\n      \"type\": \"image\",\n      \"source\": \"other\",\n      \"path\": \".github/issue-evidence/14371-barge-in-finished.png\",\n      \"href\": \"../14371-barge-in-finished.png\",\n      \"bytes\": 601721,\n      \"mtime\": \"2026-07-06T07:49:14.194Z\",\n      \"ocr\": {\n        \"status\": \"ok\",\n        \"engine\": \"tesseract.js package\",\n        \"text\": \"3: 4 7 (e)\\n(J Weather\\nTap to enable\\nMonday, July 6 tio\\n92 Todos\\nLearn conversational Spanish >\\na\\n[B Transoript 2026-0\\n[ u-smoe x J\\n+ |skEiza >\"\n      },\n      \"image\": {\n        \"width\": 120,\n        \"height\": 68,\n        \"sampledPixels\": 8160,\n        \"colorBuckets\": 59,\n        \"dominantRatio\": 0.21850490196078431,\n        \"dominantColors\": [\n          {\n  "
+    },
+    {
+      "id": "12",
+      "type": "viewer",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-voice-matrix/index.html",
+      "href": "../14371-voice-matrix/index.html",
+      "bytes": 1514,
+      "mtime": "2026-07-06T07:51:41.269Z",
+      "preview": "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Voice Live Matrix</title>\n<style>\nbody{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;background:#fafafa;color:#151515}\ntable{width:100%;border-collapse:collapse;background:white}\nth,td{border:1px solid #ddd;padding:8px;vertical-align:top;white-space:pre-wrap}\nth{background:#f1f1f1;text-align:left}\n.pass td:nth-child(2){color:#116b2d;font-weight:700}\n.fail td:nth-child(2){color:#9a1b1b;font-weight:700}\n.skip td:nth-child(2),.pending td:nth-child(2){color:#7a5b00;font-weight:700}\ncode{font-size:12px}\n</style>\n<h1>Voice Live Matrix</h1>\n<p>Generated 2026-07-06T07:04:58.600Z on darwin arm64 (Shaws-MacBook-Pro.local).</p>\n<p>Pass 0 · Fail 0 · Pending 0 · Skip 1</p>\n<table><thead><tr><th>Cell</th><th>Status</th><th>Platform</th><th>Class</th><th>Dimensions</th><th>Probe / Result</th><th>Command</th><th>Evidence</th></tr></thead><tbody><tr class=\"skip\"><td><code>web.live-railway.roundtrip</code><br>Web fake-device mic -&gt; Railway STT -&gt; live agent -&gt; Railway TTS</td><td>skip</td><td>web</td><td>live-cloud-voice-roundtrip</td><td>transcriptionState=off\nchimeIn=should-respond\nwakewordContext=idle-wake\nnoiseRejection"
+    },
+    {
+      "id": "13",
+      "type": "report",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-voice-matrix/voice-matrix.json",
+      "href": "../14371-voice-matrix/voice-matrix.json",
+      "bytes": 2170,
+      "mtime": "2026-07-06T07:51:41.275Z",
+      "preview": "{\n  \"schema\": \"eliza_voice_live_matrix_v1\",\n  \"issue\": 9958,\n  \"generatedAt\": \"2026-07-06T07:04:58.600Z\",\n  \"mode\": \"probe\",\n  \"dimensions\": {\n    \"platform\": [\n      \"web\",\n      \"linux\",\n      \"macos-electrobun\",\n      \"windows-electrobun\",\n      \"ios\",\n      \"android\"\n    ],\n    \"transcriptionState\": [\"off\", \"on\"],\n    \"chimeIn\": [\"should-respond\", \"should-not-respond\"],\n    \"wakewordContext\": [\n      \"idle-wake\",\n      \"already-listening-wake-inert\",\n      \"mid-transcription-wake\"\n    ],\n    \"noiseRejection\": [\n      \"quiet\",\n      \"noisy-reverberant\",\n      \"echo-self-voice\",\n      \"overlapping-speech\"\n    ],\n    \"voices\": [\"owner\", \"enrolled-contact\", \"unknown\", \"multi-speaker\"]\n  },\n  \"selection\": {\n    \"platformFilters\": [\"web.live-railway.roundtrip\"],\n    \"matched\": 1,\n    \"error\": null\n  },\n  \"host\": {\n    \"platform\": \"darwin\",\n    \"arch\": \"arm64\",\n    \"hostname\": \"Shaws-MacBook-Pro.local\",\n    \"runnerOs\": null,\n    \"runnerArch\": null\n  },\n  \"summary\": {\n    \"pass\": 0,\n    \"fail\": 0,\n    \"pending\": 0,\n    \"skip\": 1\n  },\n  \"cells\": [\n    {\n      \"id\": \"web.live-railway.roundtrip\",\n      \"title\": \"Web fake-device mic -> Railway STT -> live agent -> Railway TTS\",\n      \"plat"
+    },
+    {
+      "id": "14",
+      "type": "report",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-voice-matrix/voice-matrix.md",
+      "href": "../14371-voice-matrix/voice-matrix.md",
+      "bytes": 600,
+      "mtime": "2026-07-06T07:51:41.276Z",
+      "preview": "# Voice Live Matrix\n\nGenerated: 2026-07-06T07:04:58.600Z\nHost: darwin arm64 (Shaws-MacBook-Pro.local)\n\n| Cell | Status | Platform | Class | Probe / Result | Command |\n|---|---:|---|---|---|---|\n| `web.live-railway.roundtrip` | skip | web | live-cloud-voice-roundtrip | set ELIZA_VOICE_LIVE_RAILWAY=1 on a runner with live Railway voice services | `bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts --grep @live-railway` |\n\n## Summary\n\n- Pass: 0\n- Fail: 0\n- Pending: 0\n- Skip: 1\n\nHardware-unavailable cells are explicit `skip` rows. They are not evidence of platform coverage.\n"
+    },
+    {
+      "id": "15",
+      "type": "report",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-voice-realaudio-review.md",
+      "href": "../14371-voice-realaudio-review.md",
+      "bytes": 3982,
+      "mtime": "2026-07-06T07:51:41.277Z",
+      "preview": "# Issue #14371 Voice Real-Audio Evidence\n\nGenerated on 2026-07-06 from the `chromium-voice-mic` Playwright lane.\n\n## Automated Checks\n\n- `bun run --cwd packages/ui test -- src/voice/local-asr-capture.test.ts src/state/persistence-vad-auto-stop.test.ts src/voice/voice-capture-factory.test.ts src/components/shell/useShellVoiceOutput.test.tsx src/components/shell/__tests__/useShellController.test.tsx`\n  - 5 files, 93 tests passed.\n- `bun run --cwd packages/ui test -- src/components/shell/ContinuousChatOverlay.test.tsx`\n  - 1 file, 156 tests passed.\n- `E2E_RECORD=1 bun run --cwd packages/app test:e2e test/ui-smoke/voice-realaudio.spec.ts`\n  - 5 tests passed.\n  - 1 test skipped: live Railway voice round-trip requires `ELIZA_VOICE_LIVE_RAILWAY=1` plus a live LLM key.\n- `bun run --cwd packages/app test:e2e test/ui-smoke/all-views-aesthetic-audit.spec.ts --project=audit-app --grep \"builtin-(inventory|fine-tuning|background)|plugin-(model-tester|wallet|training)-gui\"`\n  - 24 viewport findings: `broken=0`, `needs-work=0`, `needs-eyeball=0`, `good=24`.\n- `bun run --cwd packages/app audit:app`\n  - 365 Playwright checks passed.\n  - Computed verdicts: `broken=0`, `needs-work=0`, `needs-eyeball=2"
+    },
+    {
+      "id": "16",
+      "type": "image",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-web-roundtrip-selftest.png",
+      "href": "../14371-web-roundtrip-selftest.png",
+      "bytes": 79954,
+      "mtime": "2026-07-06T08:03:21.867Z",
+      "ocr": {
+        "status": "ok",
+        "engine": "tesseract.js package",
+        "text": "Voice self-test\nplatforn=web - ttsRoute=/api/tts/cloud - phrase=\"what time is it\"\noverall: pass\n[pass] asr (4620ms)\n[pass] send (30ms)\n[pass] tts (32ms)\n{\n\"schemaversion' 1,\n“overall: ‘pass’,\n“platform”: ‘web’,\n\"mode: ‘mic-capture’,\n“ttsRoute”: */api/tts/cloud’,\n“expectedPhrase”: ‘what time is it’,\n“transcript”: ‘what time is it’,\nreply”: It is exactly noon in the real audio barge in test. | am still speaking this long local inference response so the user can interrupt me with the microphone’,\n\"sendBackend: remote-provider’,\n\"startedAt': \"2026-07-06T08:02:29.0927,\n“finishedAt’: 2026-07-06T08:02:33.774Z,\n“stages”\n{\n\"stage\": \"ast\",\nstatus’: ‘pass’,\n\"durationMs': 4620,\n\"detail: {\n“mode: ‘mic-capture’,\n“transcript” \"what time is it),\n“expectedPhrase’: ‘what time is it,\n“wer. 0,"
+      },
+      "image": {
+        "width": 120,
+        "height": 68,
+        "sampledPixels": 8160,
+        "colorBuckets": 32,
+        "dominantRatio": 0.86875,
+        "dominantColors": [
+          {
+            "hex": "#101010",
+            "count": 7089,
+            "ratio": 0.86875
+          },
+          {
+            "hex": "#303030",
+            "count": 396,
+            "ratio": 0.04852941176470588
+          },
+          {
+            "hex": "#202020",
+            "count": 288,
+            "ratio": 0.03529411764705882
+          },
+          {
+            "hex": "#404040",
+            "count": 180,
+            "ratio": 0.022058823529411766
+          },
+          {
+            "hex": "#505050",
+            "count": 37,
+            "ratio": 0.0045343137254901964
+          },
+          {
+            "hex": "#000000",
+            "count": 29,
+            "ratio": 0.003553921568627451
+          },
+          {
+            "hex": "#103020",
+            "count": 23,
+            "ratio": 0.002818627450980392
+          },
+          {
+            "hex": "#302010",
+            "count": 14,
+            "ratio": 0.001715686274509804
+          }
+        ],
+        "blueRatio": 0,
+        "orangeRatio": 0.006372549019607843,
+        "redRatio": 0,
+        "averageLuminance": 21,
+        "issues": []
+      }
+    },
+    {
+      "id": "17",
+      "type": "video",
+      "source": "other",
+      "path": ".github/issue-evidence/14371-web-roundtrip-selftest.webm",
+      "href": "../14371-web-roundtrip-selftest.webm",
+      "bytes": 113556,
+      "mtime": "2026-07-06T08:03:21.875Z"
+    }
+  ]
+}

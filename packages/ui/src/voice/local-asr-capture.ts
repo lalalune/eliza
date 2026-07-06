@@ -19,6 +19,7 @@ export interface LocalAsrRecorder {
 
 export interface LocalAsrAutoStopOptions {
   startGraceMs?: number;
+  initialSilenceMs?: number;
   minSpeechMs?: number;
   silenceMs?: number;
   maxSpeechMs?: number;
@@ -40,6 +41,7 @@ export interface LocalAsrRecorderOptions {
 /** Fully-resolved auto-stop config (every {@link LocalAsrAutoStopOptions} field set). */
 export interface LocalAsrAutoStopConfig {
   startGraceMs: number;
+  initialSilenceMs: number;
   minSpeechMs: number;
   silenceMs: number;
   maxSpeechMs: number;
@@ -138,6 +140,7 @@ export const POST_TTS_ECHO_THRESHOLD_MULTIPLIER = 4;
 
 export const DEFAULT_LOCAL_ASR_AUTO_STOP: LocalAsrAutoStopConfig = {
   startGraceMs: 250,
+  initialSilenceMs: 10_000,
   minSpeechMs: 180,
   silenceMs: 900,
   maxSpeechMs: 12_000,
@@ -196,6 +199,10 @@ export function createLocalAsrAutoStopDetector(
     }
 
     if (firstSpeechAtMs === null || lastSpeechAtMs === null) {
+      if (elapsedMs >= config.initialSilenceMs) {
+        stopped = true;
+        return { shouldBuffer: false, shouldStop: true };
+      }
       return { shouldBuffer: false, shouldStop: false };
     }
 

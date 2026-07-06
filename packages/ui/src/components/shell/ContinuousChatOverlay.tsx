@@ -4,6 +4,7 @@
  */
 import { transcriptPlainText } from "@elizaos/shared/transcripts";
 import {
+  AlertTriangle,
   ArrowDown,
   FileText,
   Film,
@@ -914,6 +915,7 @@ export function ContinuousChatOverlay({
     setComposerHasDraft,
     needsAudioUnlock,
     unlockAudio,
+    ttsError,
     openSettings,
     navigateHome,
     currentTab,
@@ -925,6 +927,14 @@ export function ContinuousChatOverlay({
   // True once the server has reported no LLM/model provider is configured (a
   // `no_provider` assistant turn). Defaulted for minimal mock controllers.
   const noProviderConfigured = controller.noProviderConfigured ?? false;
+  const ttsErrorText =
+    ttsError?.engine === "local-inference"
+      ? "On-device voice unavailable"
+      : ttsError?.engine === "elevenlabs"
+        ? "Cloud voice unavailable"
+        : ttsError
+          ? "Voice unavailable"
+          : null;
   // Local text-model readiness (#12178 WI-4). While it `blocksSend`, the
   // composer stays usable and the in-chat model-status card carries progress +
   // cancel/switch controls; the placeholder tells the user they can keep typing.
@@ -1374,11 +1384,15 @@ export function ContinuousChatOverlay({
       return;
     }
     const panel = getPanelElement();
+    const overlay = overlayRef.current;
     const root = document.documentElement;
     if (sheetOpen) return; // Keep the last resting value while the sheet is open.
-    if (!panel) return;
+    if (!panel || !overlay) return;
     const publish = () => {
-      const h = panel.getBoundingClientRect().height;
+      const h = Math.max(
+        panel.getBoundingClientRect().height,
+        overlay.getBoundingClientRect().height,
+      );
       if (h > 0)
         root.style.setProperty(
           "--eliza-continuous-chat-clearance",
@@ -4509,6 +4523,23 @@ export function ContinuousChatOverlay({
                   target={chatReplyTarget}
                   onCancel={() => setChatReplyTarget(null)}
                 />
+              </div>
+            ) : null}
+            {ttsErrorText ? (
+              <div className="relative z-10 shrink-0 px-3 pt-2">
+                <div
+                  role="alert"
+                  data-testid="chat-voice-tts-error"
+                  data-engine={ttsError?.engine}
+                  title={ttsError?.message}
+                  className={cn(
+                    "flex items-center gap-2 rounded-sm border border-destructive/70 bg-destructive px-3 py-2 text-xs font-medium text-destructive-foreground shadow-lg",
+                    WALLPAPER_FLOAT_SHADOW,
+                  )}
+                >
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                  <span className="min-w-0 truncate">{ttsErrorText}</span>
+                </div>
               </div>
             ) : null}
             {/* Pending image attachments + any read error, just above the input. */}
