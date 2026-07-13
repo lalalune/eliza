@@ -1,0 +1,21 @@
+/**
+ * Static provider that confirms the scaffolded plugin is loaded in the runtime
+ * context.
+ */
+
+import type { IAgentRuntime, Memory, Provider, State } from "@elizaos/core";
+
+const PLUGIN_NAME = "proof-surface";
+
+export const infoProvider: Provider = {
+  name: "proof-surface_INFO",
+  description: `Static info provider for the ${PLUGIN_NAME} plugin.`,
+  get: async (
+    _runtime: IAgentRuntime,
+    _message: Memory,
+    _state: State | undefined,
+  ) => {
+    const text = `[${PLUGIN_NAME}] active`;
+    return { text, values: { pluginName: PLUGIN_NAME }, data: {} };
+  },
+};
