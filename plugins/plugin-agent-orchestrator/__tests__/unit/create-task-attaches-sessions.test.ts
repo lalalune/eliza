@@ -6,20 +6,22 @@
  * token usage instead of `0/0`.
  *
  * Pinned surfaces:
- *   1. Happy path — one attachSession call per spawned session, with the
+ *   1. Ordinary happy path — one attachSession call per spawned session, with the
  *      minted taskId, matching sessionId/agentType/workdir, the per-part label
  *      the create action assembled, and the session's REAL post-run status.
- *      For a single-turn create, `runPromptAndClose` / `runPromptViaSmithers`
- *      have already stopped the session before the thread is minted, so the
- *      status attach receives is terminal (`stopped`), NOT the stale `ready`
- *      snapshot captured at spawn time.
- *   2. Attach failure is soft — attachSession throwing is logged, but the
+ *      For an ordinary single-turn create, `runPromptAndClose` /
+ *      `runPromptViaSmithers` stop the session before the thread is minted, so
+ *      the attached status is terminal (`stopped`), not the stale spawn snapshot.
+ *   2. A locked app-verification retry contract owns its completed session and
+ *      keeps it `ready` for corrective turns; the attached status must preserve
+ *      that live ownership instead of fabricating a terminal state.
+ *   3. Attach failure is soft — attachSession throwing is logged, but the
  *      action still returns `success: true` with the widget block (same
  *      policy as thread-mint failure).
- *   3. Thread-mint failure path is clean — when createTask throws, the
+ *   4. Thread-mint failure path is clean — when createTask throws, the
  *      action does NOT try to attach (there's no taskId), and the widget
  *      block is omitted while the ACP sessions still ran.
- *   4. Real end-to-end sequence — driving the create action against a stateful
+ *   5. Real end-to-end sequence — driving the create action against a stateful
  *      ACP mock (spawn → prompt → stop) and a REAL OrchestratorTaskService,
  *      the minted task is NOT falsely promoted to `active` and its
  *      `activeSessionCount` stays 0, because every attached session is already
@@ -227,6 +229,59 @@ describe("TASKS:create attaches spawned sessions to the minted task thread", () 
     // The per-part label the create action assigned rides through.
     expect(typeof input.label).toBe("string");
     expect((input.label as string).length).toBeGreaterThan(0);
+  });
+
+  it("keeps a validator-owned session ready and attaches its live status", async () => {
+    const acp = statefulAcp();
+    const createTask = vi.fn(async () => ({
+      id: THREAD_ID,
+      title: "Build verified view",
+    }));
+    const attachSession = vi.fn(async () => true);
+    const runtime = runtimeWithServices({
+      acp,
+      taskService: { createTask, attachSession },
+    });
+    const workdir = os.tmpdir();
+
+    const result = await createTaskAction.handler(
+      runtime,
+      memory({}),
+      state,
+      {
+        parameters: {
+          action: "create",
+          task: "build the verified view",
+          workdir,
+          lockWorkdir: true,
+          validator: {
+            service: "app-verification",
+            method: "verifyPlugin",
+            params: { workdir, pluginName: "plugin-proof" },
+          },
+          maxRetries: 2,
+          onVerificationFail: "retry",
+        },
+      },
+      callback(),
+    );
+
+    expect(result?.success).toBe(true);
+    expect(acp.stopSession).not.toHaveBeenCalled();
+    expect(acp.spawnSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          keepAliveAfterComplete: true,
+          maxRetries: 2,
+          onVerificationFail: "retry",
+        }),
+      }),
+    );
+    expect(attachSession).toHaveBeenCalledTimes(1);
+    expect(attachSession.mock.calls[0]?.[1]).toMatchObject({
+      status: "ready",
+      workdir,
+    });
   });
 
   it("still returns success (with the widget) when attachSession throws", async () => {
