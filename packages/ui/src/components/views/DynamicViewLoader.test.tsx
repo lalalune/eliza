@@ -1,10 +1,9 @@
-// @vitest-environment jsdom
-//
-// DynamicViewLoader: the same-origin bundle-URL gate (the RCE guard), that the
-// test-only import hook is stripped from minified production builds, and the
-// runtime load/cache/error behavior. The origin gate and the production-strip
-// check compile the REAL DynamicViewLoader.tsx source with esbuild rather than
-// asserting against a mock.
+/**
+ * Exercises dynamic view origin enforcement, host externals, and runtime
+ * lifecycle behavior against the real loader implementation.
+ *
+ * @vitest-environment jsdom
+ */
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -102,6 +101,16 @@ describe("host-external importer resolution (factory hostImport)", () => {
   it("still resolves a framework module from the trunk map", async () => {
     const react = await resolveHostExternal("react");
     expect(typeof react.useState).toBe("function");
+  });
+
+  it("provides structured runtime errors to plugin view bundles", async () => {
+    const core = await resolveHostExternal("@elizaos/core");
+    expect(typeof core.ElizaError).toBe("function");
+  });
+
+  it("provides the authenticated fetch helper to plugin view bundles", async () => {
+    const api = await resolveHostExternal("@elizaos/ui/api/csrf-client");
+    expect(typeof api.fetchWithCsrf).toBe("function");
   });
 
   it("throws for an unknown specifier that is neither framework nor registered", async () => {

@@ -513,8 +513,8 @@ async function importUiBridgeCompat(): Promise<Record<string, unknown>> {
 }
 
 // Framework + host modules the shell always provides to every view bundle:
-// react, three, `@elizaos/ui/*`, the `@elizaos/app-core` view compat surface,
-// `@elizaos/shared`, and the native capacitor bridges. This map is
+// react, three, `@elizaos/core`, `@elizaos/ui/*`, the `@elizaos/app-core` view
+// compat surface, `@elizaos/shared`, and the native capacitor bridges. This map is
 // FRAMEWORK-ONLY — it must never list a plugin-specific specifier. A plugin (or
 // a build-variant entrypoint) contributes its own specifiers through
 // `registerHostExternalImporter` so adding a host-external plugin never edits
@@ -523,6 +523,7 @@ const HOST_EXTERNAL_IMPORTERS: Record<string, HostExternalImporter> = {
   "@elizaos/app-core": importAppCoreViewCompat,
   "@elizaos/app-core/browser": importAppCoreViewCompat,
   "@elizaos/app-core/ui-compat": importAppCoreViewCompat,
+  "@elizaos/core": () => import("@elizaos/core"),
   "@elizaos/capacitor-contacts": () =>
     importHostExternal("@elizaos/capacitor-contacts"),
   "@elizaos/capacitor-messages": () =>
@@ -538,6 +539,7 @@ const HOST_EXTERNAL_IMPORTERS: Record<string, HostExternalImporter> = {
   "@elizaos/ui/agent-surface": async () => AgentSurfaceHost,
   "@elizaos/ui/app-navigate-view": importUiAppNavigateViewCompat,
   "@elizaos/ui/api": () => import("../../api/index.ts"),
+  "@elizaos/ui/api/csrf-client": () => import("../../api/csrf-client.ts"),
   "@elizaos/ui/bridge": importUiBridgeCompat,
   "@elizaos/ui/components": importUiComponentsCompat,
   "@elizaos/ui/config": () => import("../../config/index.ts"),

@@ -1,4 +1,9 @@
-// @vitest-environment jsdom
+/**
+ * Exercises pause/resume conversation synchronization and missed-view recovery
+ * against real hook timing with deterministic client boundaries.
+ *
+ * @vitest-environment jsdom
+ */
 
 import { cleanup, renderHook } from "@testing-library/react";
 import type { MutableRefObject } from "react";
@@ -31,10 +36,15 @@ const mocks = vi.hoisted(() => ({
     fetch: vi.fn(async () => ({ ok: true })),
     getBaseUrl: vi.fn(() => "http://127.0.0.1:31337"),
   },
+  recoverMissedCurrentView: vi.fn(async () => false),
 }));
 
 vi.mock("../api", () => ({
   client: mocks.client,
+}));
+
+vi.mock("../view-action-handoff", () => ({
+  recoverMissedCurrentView: mocks.recoverMissedCurrentView,
 }));
 
 function makeMessages(...ms: ConversationMessage[]): ConversationMessage[] {
@@ -106,6 +116,7 @@ describe("useAppLifecycleEvents", () => {
     mocks.client.resetConnection.mockClear();
     mocks.client.fetch.mockClear();
     mocks.client.getBaseUrl.mockReturnValue("http://127.0.0.1:31337");
+    mocks.recoverMissedCurrentView.mockClear();
     window.localStorage.clear();
   });
 
@@ -131,6 +142,7 @@ describe("useAppLifecycleEvents", () => {
     expect(mocks.client.resetConnection).toHaveBeenCalledTimes(1);
     expect(loadConversationMessages).toHaveBeenCalledTimes(1);
     expect(loadConversationMessages).toHaveBeenCalledWith("conv-42");
+    expect(mocks.recoverMissedCurrentView).toHaveBeenCalledTimes(1);
   });
 
   it("debounces rapid fg/bg flips into a single reconnect + refetch", () => {
@@ -168,6 +180,7 @@ describe("useAppLifecycleEvents", () => {
 
     expect(mocks.client.resetConnection).not.toHaveBeenCalled();
     expect(loadConversationMessages).not.toHaveBeenCalled();
+    expect(mocks.recoverMissedCurrentView).not.toHaveBeenCalled();
   });
 
   it("coalesces a visibilitychange resume + bfcache pageshow in the same tick into one run", () => {
