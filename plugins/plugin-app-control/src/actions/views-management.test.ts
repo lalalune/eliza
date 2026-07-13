@@ -188,8 +188,13 @@ function createRepoFixture() {
 		repoRoot,
 		"packages/elizaos/templates/min-plugin",
 	);
+	const projectTemplateDir = path.join(
+		repoRoot,
+		"packages/elizaos/templates/min-project",
+	);
 	const pluginsDir = path.join(repoRoot, "plugins");
 	mkdirSync(path.join(templateDir, "src"), { recursive: true });
+	mkdirSync(path.join(projectTemplateDir, "src"), { recursive: true });
 	mkdirSync(pluginsDir, { recursive: true });
 	writeFileSync(
 		path.join(templateDir, "package.json"),
@@ -212,6 +217,17 @@ function createRepoFixture() {
 			},
 			include: ["src/**/*.ts", "tests/**/*.ts"],
 		}),
+	);
+	writeFileSync(
+		path.join(projectTemplateDir, "package.json"),
+		JSON.stringify({
+			name: "__APP_NAME__",
+			displayName: "__APP_DISPLAY_NAME__",
+		}),
+	);
+	writeFileSync(
+		path.join(projectTemplateDir, "src/index.ts"),
+		"export const name = '__APP_NAME__';\nexport const displayName = '__APP_DISPLAY_NAME__';\n",
 	);
 	return {
 		repoRoot,
@@ -3263,6 +3279,87 @@ describe("view management actions", () => {
 						profile: "full",
 					},
 				},
+			});
+		} finally {
+			repo.cleanup();
+		}
+	});
+
+	it("scaffolds a new APP in a real temp workspace and dispatches its locked verification contract", async () => {
+		const repo = createRepoFixture();
+		try {
+			const { runtime, codingHandler } = createRuntime({
+				modelText: "name: proof-app\ndisplayName: Proof App",
+			});
+			const callback = vi.fn();
+			const appClient = {
+				listInstalledApps: vi.fn(async () => []),
+			};
+
+			const result = await runCreate({
+				runtime: runtime as never,
+				client: appClient as never,
+				message: message(
+					"Build a proof app with an editable status card",
+					"origin-create-room",
+				) as never,
+				callback,
+				repoRoot: repo.repoRoot,
+			});
+
+			const workdir = path.join(repo.repoRoot, "eliza/apps/app-proof-app");
+			expect(result.success).toBe(true);
+			expect(result.values).toMatchObject({
+				mode: "create",
+				subMode: "new",
+				name: "proof-app",
+				displayName: "Proof App",
+				workdir,
+				taskSessionId: "task-session-1",
+			});
+			expect(
+				JSON.parse(readFileSync(path.join(workdir, "package.json"), "utf8")),
+			).toEqual({ name: "proof-app", displayName: "Proof App" });
+			const scaffoldSource = readFileSync(
+				path.join(workdir, "src/index.ts"),
+				"utf8",
+			);
+			expect(scaffoldSource).toContain("export const name = 'proof-app'");
+			expect(scaffoldSource).toContain(
+				"export const displayName = 'Proof App'",
+			);
+
+			expect(codingHandler).toHaveBeenCalledTimes(1);
+			expect(codingHandler.mock.calls[0][1]).toMatchObject({
+				roomId: "origin-create-room",
+			});
+			const handlerOptions = codingHandler.mock.calls[0][3] as {
+				parameters: Record<string, unknown>;
+			};
+			expect(handlerOptions.parameters).toMatchObject({
+				label: "create-app:proof-app",
+				workdir,
+				lockWorkdir: true,
+				keepAliveAfterComplete: true,
+				maxRetries: 2,
+				onVerificationFail: "retry",
+				validator: {
+					service: "app-verification",
+					method: "verifyApp",
+					params: {
+						workdir,
+						appName: "proof-app",
+						profile: "full",
+					},
+				},
+				metadata: {
+					originRoomId: "origin-create-room",
+					parentTrajectoryStepId: "parent-step-1",
+					trajectoryLinkSource: "plugin-app-control:app-create",
+				},
+			});
+			expect(callback).toHaveBeenCalledWith({
+				text: expect.stringContaining("Started app create task for Proof App"),
 			});
 		} finally {
 			repo.cleanup();
