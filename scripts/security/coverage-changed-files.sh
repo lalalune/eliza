@@ -42,14 +42,28 @@ is_excluded_test() {
   return 1
 }
 
+# These files are executable test/build infrastructure, but they cannot emit
+# meaningful unit LCOV: the Playwright entrypoints run as child processes in the
+# dedicated UI-smoke lane, while each view Vite config is exercised by the build
+# and package-local config contracts. Keep this list narrower than `scripts/**`
+# or generic `vite.config.*` so adjacent runtime helpers remain enforced.
+is_excluded_source() {
+  case "$1" in
+    packages/app-core/scripts/playwright-ui-live-stack.ts|packages/app-core/scripts/playwright-ui-smoke-api-stub.mjs) return 0 ;;
+    */vite.config.views.ts|*/vite.config.views.js|*/vite.config.views.mts|*/vite.config.views.mjs|*/vite.config.views.cts|*/vite.config.views.cjs) return 0 ;;
+  esac
+  return 1
+}
+
 changed_source() {
   {
     git diff --name-only --diff-filter=ACMRT "$MERGE_BASE" "$HEAD" -- \
       '*.ts' '*.tsx' '*.js' '*.jsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
-      | grep -vE '(^|/)(__tests__|__e2e__|test|tests|generated)/|([.-]e2e|[.]generated|[.]test|[.]spec|[.]stories)[.](ts|tsx|js|jsx|mjs|cjs|mts|cts)$|(^|/)(vite|vitest)([.][^./]+)?[.]config([.][^.]+)?[.](ts|js|mts|mjs|cts|cjs)$|(^|/)scripts/playwright[^/]*[.](ts|js|mts|mjs|cts|cjs)$' || true
+      | grep -vE '(^|/)(__tests__|__e2e__|test|tests|generated)/|([.-]e2e|[.]generated|[.]test|[.]spec|[.]stories)[.](ts|tsx|js|jsx|mjs|cjs|mts|cts)$|(^|/)vitest([.][^./]+)?[.]config([.][^.]+)?[.](ts|js|mts|mjs|cts|cjs)$' || true
   } \
     | while IFS= read -r file; do
         [ -f "$file" ] || continue
+        is_excluded_source "$file" && continue
         grep -Fxq "$file" "$NODE_SELF_TEST_MANIFEST" && continue
         echo "$file"
       done \

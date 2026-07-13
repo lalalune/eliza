@@ -91,4 +91,23 @@ describe("TASKS:stop_agent", () => {
       )?.error,
     ).toBe("boom");
   });
+
+  it("treats an empty session list as a successful no-op", async () => {
+    const svc = serviceMock({
+      listSessions: vi.fn(async () => []),
+    });
+    const cb = callback();
+
+    const result = await stopAgentAction.handler(
+      runtimeWith(svc),
+      memory(),
+      state,
+      stopOptions,
+      cb,
+    );
+
+    expect(result).toEqual({ success: true, text: "No sessions to stop" });
+    expect(svc.stopSession).not.toHaveBeenCalled();
+    expect(cb).toHaveBeenCalledWith({ text: "No sessions to stop" });
+  });
 });
