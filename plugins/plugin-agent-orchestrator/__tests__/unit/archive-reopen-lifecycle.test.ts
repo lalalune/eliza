@@ -117,4 +117,31 @@ describe("TASKS archive/reopen lifecycle (#11028)", () => {
     );
     expect(result?.error).toBe("UNSUPPORTED_OPERATION");
   });
+
+  it("surfaces a lifecycle store failure as an observable structured result", async () => {
+    const svc = taskServiceMock();
+    svc.archiveTask.mockRejectedValueOnce(new Error("archive store offline"));
+    const cb = callback();
+
+    const result = await archiveCodingTaskAction.handler(
+      runtimeWith(svc),
+      memory({}),
+      state,
+      opts({ action: "archive", taskId: "t1" }),
+      cb,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "LIFECYCLE_FAILED",
+      data: {
+        actionName: "TASKS:archive",
+        reason: "lifecycle_failed",
+        taskId: "t1",
+      },
+    });
+    expect(cb).toHaveBeenCalledWith({
+      text: "Failed to archive coding task t1: archive store offline",
+    });
+  });
 });
