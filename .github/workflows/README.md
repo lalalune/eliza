@@ -12,7 +12,7 @@ This directory contains GitHub Actions workflows for the elizaOS project (v2.0.0
 | `scenario-pr.yml` | PR to main/develop, manual | Secret-free deterministic scenario/browser E2E gate |
 | `scenario-matrix.yml` | Develop/manual opt-in | Real-service scenario matrix; not a PR gate |
 | `pr.yaml` | PR opened/edited | PR title validation |
-| `release.yaml` | Push to main, Release | NPM beta/production package releases |
+| `release.yaml` | Manual, reusable call | Exact-SHA transactional npm + GitHub release |
 | `claude.yml` | @claude mentions | Interactive Claude assistance |
 | `claude-code-review.yml` | PR opened | Automated code review |
 | `claude-security-review.yml` | PR opened | Security-focused review |
@@ -32,14 +32,21 @@ CI, or create GitHub Release entries.
 
 ### NPM Beta/Production Packages (`release.yaml`)
 
-Publishes TypeScript/JavaScript packages to NPM.
+Publishes one explicitly prepared, immutable TypeScript/JavaScript package
+cohort to npm, verifies the entire cohort, then creates the exact Git tag and
+GitHub Release. A tag push or an existing GitHub Release never starts npm
+publication.
 
 **Triggers:**
 
-- Push to `main` → Beta release (`@beta` tag)
-- GitHub Release created → Production release (`@latest` tag)
+- Explicit reusable-workflow call with `source_sha`, `version`, and `channel`
+- Manual dispatch with the same required identity
+- Optional `candidate_run_id` resumes a prior candidate artifact without
+  rebuilding or repacking it
 
-**Packages:** All `@elizaos/*` packages in the monorepo
+**Packages:** The reviewed allowlist in
+`packages/scripts/release-cohort.json`, including its complete runtime
+workspace dependency closure.
 
 ## Test Workflows
 
@@ -225,22 +232,21 @@ Manual workflow for generating JSDoc documentation.
 
 ## Manual Release Process
 
-### 1. Create a GitHub Release
+1. Prepare a clean commit whose allowlisted manifests already contain the
+   exact release version, public access metadata, and published internal semver
+   ranges.
+2. Dispatch `release.yaml` with that commit's full SHA, the same exact semver,
+   and either `beta` or `latest`. Beta requires prerelease semver; latest
+   requires stable semver.
+3. If a run is interrupted after candidate creation, dispatch with the same
+   identity and the original `candidate_run_id`. The workflow downloads and
+   verifies the recorded tarballs instead of rebuilding them.
+4. Review the finalized candidate artifact. Its state must show npm staging,
+   full integrity verification, public-channel promotion, exact tag
+   publication, and GitHub Release readback in order.
 
-1. Go to Releases → Create new release
-2. Create a new tag: `v2.0.0` (follows semver)
-3. Add release notes
-4. Publish release
-
-### 2. Automated Publishing
-
-The release will trigger:
-
-- `release.yaml` → NPM packages
-
-### 3. Manual publishing
-
-Use `bunx lerna publish` from the repo root when automation is not sufficient (see `release.yaml`).
+Do not create the tag or GitHub Release first, and do not use Lerna/manual npm
+publication as a recovery path. A retry resumes only exact recorded integrity.
 
 ## Setting Up Secrets
 
@@ -266,9 +272,11 @@ Turbo caching is GitHub-native (`.github/actions/turbo-cache-github` via
 
 ## Package dependencies
 
-The legacy `release.yaml` path delegates its implicit package set to Lerna. The
-immutable candidate contract below instead requires an explicit cohort and
-records its dependency order before any registry mutation.
+`release.yaml` never discovers its publish set from Lerna. The allowlist in
+`packages/scripts/release-cohort.json` is explicit and source-reviewed; the
+candidate resolver proves every runtime workspace dependency is present and
+orders the cohort before any registry mutation. A private, missing, wrong-
+version, or incompatible runtime target fails candidate creation.
 
 ### Immutable npm candidate primitives
 
@@ -298,19 +306,25 @@ the plan, verifies the full cohort, promotes the requested channel, and removes
 the staging tags. The normalized registry and resolved Git push destination are
 recorded before their first external mutation, so an interrupted run cannot be
 resumed against a different target. Only HTTP 404 is absence; auth, throttling,
-transport, server, redirect, and parse failures abort. Git publication uses an
-atomic push of the explicit branch and tag refs, never `--follow-tags`, and
-requires the inspected remote branch SHA. Candidate state writes use an
-exclusive owner lock; a dead local owner or an expired cross-runner lease is
-recoverable without treating a live writer as stale. `v2.0.3-beta.8`, `.9`, and
-`.10` are permanently reserved.
+transport, server, redirect, and parse failures abort. A credential-free final
+read verifies every version, public channel, and removed candidate tag again
+before Git advances. Git publication uses explicitly named refs, never
+`--follow-tags`, and binds the resolved push destination before mutation.
+The credential-bearing jobs execute release tooling checked out from
+`github.workflow_sha`; the candidate source is a separate checkout used only as
+verified data and as the exact Git repository for the final tag. Selecting a
+different source SHA therefore cannot replace the script that receives the npm
+or GitHub token. Candidate state writes use an exclusive owner lock; a dead
+local owner or an expired cross-runner lease is recoverable without treating a
+live writer as stale.
 
-The current `release.yaml` cannot consume this candidate atomically until its
-implicit Lerna package set is replaced by a maintainer-approved allowlist and
-its uncommitted manifest rewrites become a clean candidate commit. Keep that
-orchestration change together with the release state-machine refactor; a
-preflight-only insertion would validate different bytes than the ones Lerna
-publishes.
+Finalization pushes only `refs/tags/v<exact-version>`; it never pushes a branch,
+uses `--follow-tags`, rebases, or resolves conflicts automatically. A matching
+remote tag is an idempotent retry and a conflicting tag fails. The GitHub
+Release is then created or read back with the candidate's exact tag and
+prerelease identity. One fixed workflow concurrency group serializes all
+versions and channels. `v2.0.3-beta.8`, `.9`, and `.10` are permanently
+reserved.
 
 ## Troubleshooting
 
