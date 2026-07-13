@@ -3299,6 +3299,8 @@ describe("runV5MessageRuntimeStage1", () => {
 				handler: vi.fn(async () => ({
 					success: true,
 					text: "",
+					values: { mode: "show", viewId: "coding-tasks" },
+					data: { taskId: "task-1" },
 					continueChain: false,
 				})),
 			},
@@ -3314,6 +3316,21 @@ describe("runV5MessageRuntimeStage1", () => {
 		expect(result.kind).toBe("planned_reply");
 		if (result.kind === "planned_reply") {
 			expect(result.result.responseContent?.text).toBe("On it.");
+			expect(result.result.actionResults).toEqual([
+				{
+					success: true,
+					text: "",
+					values: { mode: "show", viewId: "coding-tasks" },
+					data: {
+						actionName: "TASKS_SPAWN_AGENT",
+						taskId: "task-1",
+					},
+					continueChain: false,
+				},
+			]);
+			expect(result.result.state.data.actionResults).toEqual(
+				result.result.actionResults,
+			);
 		}
 	});
 
@@ -3363,6 +3380,20 @@ describe("runV5MessageRuntimeStage1", () => {
 		if (result.kind === "planned_reply") {
 			expect(result.result.responseContent).toBeNull();
 			expect(result.result.responseMessages).toEqual([]);
+			expect(result.result.actionResults).toEqual([
+				{
+					success: true,
+					text: "",
+					data: {
+						actionName: "SILENT_ACTION",
+						suppressPlannerReply: true,
+					},
+					continueChain: false,
+				},
+			]);
+			expect(result.result.state.data.actionResults).toEqual(
+				result.result.actionResults,
+			);
 		}
 	});
 

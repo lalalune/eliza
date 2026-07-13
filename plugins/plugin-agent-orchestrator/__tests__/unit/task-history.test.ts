@@ -219,4 +219,31 @@ describe("TASKS:history", () => {
     expect(result?.text).not.toContain("session-c");
     expect(result?.data?.sessionIds).toEqual(["session-a"]);
   });
+
+  it("surfaces durable history failures without fabricating an empty result", async () => {
+    const taskService = {
+      listTasks: vi.fn(async () => {
+        throw new Error("task store unavailable");
+      }),
+    };
+    const cb = callback();
+
+    const result = await taskHistoryAction.handler(
+      runtimeWithServices({ taskService }),
+      memory({ text: "show task history" }),
+      state,
+      { parameters: { action: "history" } },
+      cb,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "TASK_HISTORY_FAILED",
+      text: "task store unavailable",
+      data: { actionName: "TASKS:history" },
+    });
+    expect(cb).toHaveBeenCalledWith({
+      text: "Failed to read task history: task store unavailable",
+    });
+  });
 });
