@@ -112,4 +112,26 @@ describe("TASKS:send", () => {
       )?.error,
     ).toBe("NO_SESSION");
   });
+
+  it("translates a send failure into a structured result and user-facing callback", async () => {
+    const cb = callback();
+    const svc = serviceMock({
+      sendToSession: vi.fn(async () => {
+        throw new Error("transport closed");
+      }),
+    });
+
+    const result = await sendToAgentAction.handler(
+      runtimeWith(svc),
+      memory({ sessionId: "abcdef123456", input: "continue" }),
+      state,
+      { parameters: { action: "send" } },
+      cb,
+    );
+
+    expect(result).toMatchObject({ success: false, error: "transport closed" });
+    expect(cb).toHaveBeenCalledWith({
+      text: "Failed to send to agent: transport closed",
+    });
+  });
 });
