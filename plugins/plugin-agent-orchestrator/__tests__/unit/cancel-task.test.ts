@@ -92,4 +92,29 @@ describe("TASKS:cancel", () => {
       )?.error,
     ).toBe("boom");
   });
+
+  it("finds a task by session label and preserves the requested thread id", async () => {
+    const svc = serviceMock();
+    const result = await cancelTaskAction.handler(
+      runtimeWith(svc),
+      memory(),
+      state,
+      {
+        parameters: {
+          action: "cancel",
+          search: "demo",
+          threadId: "thread-42",
+        },
+      },
+      callback(),
+    );
+
+    expect(svc.cancelSession).toHaveBeenCalledWith("abcdef123456");
+    expect(result?.data).toEqual({
+      threadId: "thread-42",
+      sessionId: "abcdef123456",
+      stoppedSessions: ["abcdef123456"],
+      status: "canceled",
+    });
+  });
 });
