@@ -198,6 +198,36 @@ try {
   );
   write(
     dir,
+    "plugins/plugin-demo/vite.config.views.ts",
+    "export default { build: { lib: true } };\n",
+  );
+  write(
+    dir,
+    "packages/app-core/scripts/playwright-ui-live-stack.ts",
+    "export async function startUiSmokeStack() {}\n",
+  );
+  write(
+    dir,
+    "packages/app-core/scripts/playwright-ui-smoke-api-stub.mjs",
+    "export function startUiSmokeStub() {}\n",
+  );
+  write(
+    dir,
+    "plugins/plugin-demo/vite.config.runtime.ts",
+    "export const runtimeConfig = true;\n",
+  );
+  write(
+    dir,
+    "packages/app-core/scripts/playwright-ui-live-stack-helper.ts",
+    "export const helper = true;\n",
+  );
+  write(
+    dir,
+    "packages/app-core/scripts/playwright-ui-smoke-api-stub-helper.mjs",
+    "export const helper = true;\n",
+  );
+  write(
+    dir,
     "packages/demo/src/feature.test.ts",
     "import { test } from 'vitest';\ntest('f', () => {});\n",
   );
@@ -334,6 +364,35 @@ try {
       !out.files.includes("plugins/plugin-demo/vitest.config.ts"),
       `vitest config leaked into changed source: ${out.files.join(",")}`,
     );
+  });
+
+  assertCase(
+    "dedicated view-build and Playwright harness entrypoints are not LCOV targets",
+    () => {
+      for (const infrastructurePath of [
+        "plugins/plugin-demo/vite.config.views.ts",
+        "packages/app-core/scripts/playwright-ui-live-stack.ts",
+        "packages/app-core/scripts/playwright-ui-smoke-api-stub.mjs",
+      ]) {
+        assert.ok(
+          !out.files.includes(infrastructurePath),
+          `dedicated infrastructure leaked into changed source: ${infrastructurePath}`,
+        );
+      }
+    },
+  );
+
+  assertCase("adjacent executable helpers remain LCOV-enforced", () => {
+    for (const runtimePath of [
+      "plugins/plugin-demo/vite.config.runtime.ts",
+      "packages/app-core/scripts/playwright-ui-live-stack-helper.ts",
+      "packages/app-core/scripts/playwright-ui-smoke-api-stub-helper.mjs",
+    ]) {
+      assert.ok(
+        out.files.includes(runtimePath),
+        `runtime helper escaped changed-source enforcement: ${runtimePath}`,
+      );
+    }
   });
 
   assertCase("generated modules are not LCOV-enforced source", () => {

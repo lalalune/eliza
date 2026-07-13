@@ -2,7 +2,7 @@
  * Verifies TASKS:list_agents.
  * Deterministic unit test of pure helpers; no runtime, no live model.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 // LIST_AGENTS is `TASKS { action: "list_agents" }`.
 import { listAgentsAction } from "../../src/actions/tasks.js";
 import {
@@ -49,5 +49,35 @@ describe("TASKS:list_agents", () => {
         )
       )?.error,
     ).toBe("SERVICE_UNAVAILABLE");
+  });
+
+  it("returns an explicit empty inventory with the preferred backend", async () => {
+    const svc = serviceMock({
+      listSessions: vi.fn(async () => []),
+      resolveAgentType: vi.fn(async () => "opencode"),
+    });
+    const cb = callback();
+
+    const result = await listAgentsAction.handler(
+      runtimeWith(svc),
+      memory(),
+      state,
+      listOptions,
+      cb,
+    );
+
+    expect(result?.success).toBe(true);
+    expect(result?.data).toEqual({
+      sessions: [],
+      tasks: [],
+      pendingConfirmations: 0,
+      preferredTaskAgent: {
+        id: "opencode",
+        reason: "acpx default agent",
+      },
+    });
+    expect(cb).toHaveBeenCalledWith({
+      text: expect.stringContaining("No active task agents"),
+    });
   });
 });
