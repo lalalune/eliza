@@ -2181,6 +2181,10 @@ function createDemoTaskDetail(overrides = {}) {
     activeSessionCount: 0,
     latestSessionId: null,
     latestSessionLabel: null,
+    latestSessionModel: null,
+    latestAccountProviderId: null,
+    latestAccountId: null,
+    latestAccountLabel: null,
     latestWorkdir: null,
     latestRepo: null,
     latestActivityAt: null,
@@ -2194,6 +2198,7 @@ function createDemoTaskDetail(overrides = {}) {
     roomId: null,
     taskRoomId: null,
     worldId: null,
+    projectId: null,
     ownerUserId: null,
     parentTaskId: null,
     acceptanceCriteria: ["Task appears in rail", "Message posts"],
@@ -2227,6 +2232,10 @@ function summarizeDemoTask(detail) {
     activeSessionCount: detail.activeSessionCount,
     latestSessionId: detail.latestSessionId,
     latestSessionLabel: detail.latestSessionLabel,
+    latestSessionModel: detail.latestSessionModel,
+    latestAccountProviderId: detail.latestAccountProviderId,
+    latestAccountId: detail.latestAccountId,
+    latestAccountLabel: detail.latestAccountLabel,
     latestWorkdir: detail.latestWorkdir,
     latestRepo: detail.latestRepo,
     latestActivityAt: detail.latestActivityAt,
@@ -2236,6 +2245,8 @@ function summarizeDemoTask(detail) {
     updatedAt: detail.updatedAt,
     closedAt: detail.closedAt,
     archivedAt: detail.archivedAt,
+    projectId: detail.projectId,
+    parentTaskId: detail.parentTaskId,
   };
 }
 
