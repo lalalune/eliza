@@ -226,6 +226,22 @@ describe("TASKS submit_workspace (real service, real git, bare remote)", () => {
     ).toBe("");
   });
 
+  it("uses the most recently registered workspace when no id is supplied", async () => {
+    const { remoteUrl, work } = makeRepoPair();
+    const runtime = makeRuntime(tempDir("submit-base-"));
+    const service = await startService(runtime);
+    registerWorkspace(service, work, remoteUrl);
+
+    const { result, replies } = await runSubmit(runtime, { skipPR: true });
+
+    expect(result).toMatchObject({
+      success: true,
+      text: "No changes to commit",
+      data: { workspaceId: "ws-submit-1" },
+    });
+    expect(replies).toContain("No changes to commit in this workspace.");
+  });
+
   it("commits and pushes dirty changes to the bare remote (skipPR)", async () => {
     const { bare, remoteUrl, work } = makeRepoPair();
     const runtime = makeRuntime(tempDir("submit-base-"));

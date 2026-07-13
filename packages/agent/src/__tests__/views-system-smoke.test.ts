@@ -19,9 +19,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import type { Plugin } from "@elizaos/core";
 import { SHELL_NAVIGATE_VIEW_WS_EVENT } from "@elizaos/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  bindPluginPackageDirectory,
   generateViewHeroSvg,
   getBundleDiskPath,
   getFrameDiskPath,
@@ -41,6 +43,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SMOKE_PLUGIN = "views-smoke-plugin";
+const BOUND_DIRECTORY_PLUGIN = "views-bound-directory-smoke-plugin";
 const SMOKE_VIEW = {
   id: "smoke.main",
   label: "Smoke View",
@@ -110,6 +113,7 @@ beforeEach(() => {
 
 afterEach(() => {
   unregisterPluginViews(SMOKE_PLUGIN);
+  unregisterPluginViews(BOUND_DIRECTORY_PLUGIN);
   clearCurrentViewState();
   vi.restoreAllMocks();
 });
@@ -119,6 +123,74 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("stage 1: plugin declares views → registry populated", () => {
+  it("keeps a directory-loaded plugin bound to its real rebuilt view assets by object identity", async () => {
+    const pluginDir = await mkdtemp(
+      path.join(os.tmpdir(), "eliza-bound-view-plugin-"),
+    );
+    const bundlePath = path.join(pluginDir, "dist", "views", "bundle.js");
+    const heroPath = path.join(pluginDir, "assets", "hero.webp");
+    await mkdir(path.dirname(bundlePath), { recursive: true });
+    await mkdir(path.dirname(heroPath), { recursive: true });
+    await writeFile(
+      bundlePath,
+      "export function BoundDirectoryView(){ return 'version-one'; }\n",
+    );
+    await writeFile(heroPath, Buffer.from("real-webp-hero"));
+    const plugin: Plugin = {
+      name: BOUND_DIRECTORY_PLUGIN,
+      description: "A real on-disk view plugin fixture.",
+      views: [
+        {
+          id: "smoke.bound-directory",
+          label: "Bound Directory View",
+          bundlePath: "dist/views/bundle.js",
+          heroImagePath: "assets/hero.webp",
+        },
+      ],
+    };
+
+    try {
+      bindPluginPackageDirectory(plugin, path.join(pluginDir, "."));
+      await registerPluginViews(plugin);
+
+      const initial = getView("smoke.bound-directory");
+      expect(initial).toMatchObject({
+        pluginDir: path.resolve(pluginDir),
+        available: true,
+        hasHeroImage: true,
+        bundleSize: expect.any(Number),
+      });
+      if (!initial) throw new Error("Expected bound directory view");
+      expect(getBundleDiskPath(initial)).toBe(bundlePath);
+      expect(initial.bundleHash).toMatch(/^[a-f0-9]{12}$/);
+      expect(initial.bundleUrlVersioned).toContain(`v=${initial.bundleHash}`);
+      const initialHash = initial.bundleHash;
+
+      await writeFile(
+        bundlePath,
+        "export function BoundDirectoryView(){ return 'version-two-rebuilt'; }\n",
+      );
+      await registerPluginViews(plugin);
+
+      const rebuilt = getView("smoke.bound-directory");
+      expect(rebuilt?.pluginDir).toBe(path.resolve(pluginDir));
+      expect(rebuilt?.available).toBe(true);
+      expect(rebuilt?.bundleHash).not.toBe(initialHash);
+
+      const unboundClone: Plugin = {
+        ...plugin,
+        views: plugin.views ? [...plugin.views] : [],
+      };
+      await registerPluginViews(unboundClone);
+      const unbound = getView("smoke.bound-directory");
+      expect(unbound?.pluginDir).toBeUndefined();
+      expect(unbound?.available).toBe(false);
+    } finally {
+      unregisterPluginViews(BOUND_DIRECTORY_PLUGIN);
+      await rm(pluginDir, { recursive: true, force: true });
+    }
+  });
+
   it("registerPluginViews stores the view entry keyed by id", async () => {
     await registerPluginViews(
       {

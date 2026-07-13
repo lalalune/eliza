@@ -260,6 +260,33 @@ describe("TASKS control pause/resume symmetry (#11216 follow-up)", () => {
     });
   });
 
+  it("surfaces a durable resume failure instead of sending to the ACP session", async () => {
+    const { acp, runtime, taskService, taskId } = await harness();
+    acp.live = [liveSession("live-resume-failure")];
+    vi.spyOn(taskService, "resumeTask").mockRejectedValueOnce(
+      new Error("task store offline"),
+    );
+
+    const result = await control(runtime, {
+      action: "control",
+      controlAction: "resume",
+      taskId,
+      instruction: "continue after recovery",
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "LIFECYCLE_FAILED",
+      data: {
+        actionName: "TASKS:control",
+        reason: "lifecycle_failed",
+        taskId,
+      },
+    });
+    expect(result?.text).toContain("task store offline");
+    expect(acp.sent).toEqual([]);
+  });
+
   it("resume without a taskId keeps the plain ACP-send fallback (no durable task touched)", async () => {
     const { acp, runtime, taskService } = await harness();
     const resumeSpy = vi.spyOn(taskService, "resumeTask");
