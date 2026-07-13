@@ -136,4 +136,31 @@ describe("TASKS:provision_workspace", () => {
       parentWorkspaceId: "parent-1",
     });
   });
+
+  it("rejects repositories outside the supported hosting boundary", async () => {
+    const service = workspaceServiceMock();
+    const cb = callback();
+
+    const result = await provisionWorkspaceAction.handler(
+      runtimeWith(service),
+      memory({}),
+      state,
+      {
+        parameters: {
+          action: "provision_workspace",
+          repo: "https://example.invalid/owner/repo.git",
+        },
+      },
+      cb,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "INVALID_REPO_DOMAIN",
+    });
+    expect(service.provisionWorkspace).not.toHaveBeenCalled();
+    expect(cb).toHaveBeenCalledWith({
+      text: "Repository URL must be from github.com, gitlab.com, or bitbucket.org.",
+    });
+  });
 });
