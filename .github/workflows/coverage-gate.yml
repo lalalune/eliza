@@ -6,10 +6,10 @@ name: coverage-gate
 # must appear in LCOV and clear the line-coverage floor. A source-aware
 # classifier strips TypeScript-only syntax before excluding modules with no
 # runtime code; declarations and deleted files are not targets. LCOV LF:0 never
-# proves type-only status. Source covered only by e2e/live lanes still needs a
-# focused unit test in this gate. Docs-only PRs run only the dependency-free
-# classifier so this required context always reaches a terminal success without
-# spending workspace-install or test time.
+# proves type-only status. Product source covered only by e2e/live lanes still
+# needs a focused unit test in this gate. Docs-only PRs run only the
+# dependency-free classifier so this required context always reaches a terminal
+# success without spending workspace-install or test time.
 # Standalone Node self-tests are excluded only when listed in the manifest that
 # the Develop PR Test Integrity job executes on every PR.
 # A test-only PR (changed tests, no changed source) executes its changed tests —
@@ -21,7 +21,10 @@ name: coverage-gate
 # (packages/test/vitest/default.config.ts, sourced from coverage-policy.mjs) and
 # apply on a `--coverage` run. This changed-files gate is the second layer: it
 # enforces a per-changed-file floor (`threshold` below), set to a ratchetable 50%
-# — raise it toward the long-term 70% target as suites fill in. See issue #9943
+# — raise it toward the long-term 70% target as suites fill in. Dedicated
+# Playwright entrypoints and view-bundle build configs are classified as test or
+# build infrastructure only when narrowly matched and independently exercised;
+# adjacent executable helpers remain product-source targets. See issue #9943
 # (the umbrella) and #10104 for the broader test-gating audit.
 
 on:
