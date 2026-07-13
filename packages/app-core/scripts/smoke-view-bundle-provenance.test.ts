@@ -106,6 +106,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function responseRecord(
+  response: Response,
+): Promise<Record<string, unknown>> {
+  const value: unknown = await response.json();
+  if (!isRecord(value)) {
+    throw new Error(`expected JSON object from ${response.url}`);
+  }
+  return value;
+}
+
 describe("smoke view bundle provenance over HTTP (#15791)", () => {
   it("advertises canonical view capability objects", async () => {
     const bundleRoot = await emptyBundleRoot();
@@ -135,6 +145,69 @@ describe("smoke view bundle provenance over HTTP (#15791)", () => {
         expect(String(capability.description).trim()).not.toBe("");
       }
     }
+  });
+
+  it("preserves required orchestrator task identity fields across detail, summary, and fork responses", async () => {
+    const bundleRoot = await emptyBundleRoot();
+    const { child, port } = await bootStub({
+      ELIZA_UI_SMOKE_DEMO_ORCHESTRATOR: "1",
+      ELIZA_UI_SMOKE_VIEW_BUNDLE_ROOT: bundleRoot,
+    });
+    running = child;
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const taskUrl = `${baseUrl}/api/orchestrator/tasks/smoke-task-1`;
+
+    const initialResponse = await fetch(taskUrl);
+    expect(initialResponse.status).toBe(200);
+    const initial = await responseRecord(initialResponse);
+    for (const field of [
+      "latestSessionModel",
+      "latestAccountProviderId",
+      "latestAccountId",
+      "latestAccountLabel",
+      "projectId",
+      "parentTaskId",
+    ]) {
+      expect(initial).toHaveProperty(field, null);
+    }
+
+    const identity = {
+      latestSessionModel: "gpt-5-codex",
+      latestAccountProviderId: "openai",
+      latestAccountId: "account-primary",
+      latestAccountLabel: "Primary Codex",
+      projectId: "project-view-workflow",
+      parentTaskId: "parent-task",
+    };
+    const patchResponse = await fetch(taskUrl, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(identity),
+    });
+    expect(patchResponse.status).toBe(200);
+    expect(await responseRecord(patchResponse)).toMatchObject(identity);
+
+    const listResponse = await fetch(`${baseUrl}/api/orchestrator/tasks`);
+    expect(listResponse.status).toBe(200);
+    const list = await responseRecord(listResponse);
+    if (!Array.isArray(list.tasks)) {
+      throw new Error("demo orchestrator task list must contain tasks");
+    }
+    const summary = list.tasks.find(
+      (candidate): candidate is Record<string, unknown> =>
+        isRecord(candidate) && candidate.id === "smoke-task-1",
+    );
+    expect(summary).toMatchObject(identity);
+
+    const forkResponse = await fetch(`${taskUrl}/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Forked view workflow" }),
+    });
+    expect(forkResponse.status).toBe(200);
+    const fork = await responseRecord(forkResponse);
+    expect(fork.parentTaskId).toBe("smoke-task-1");
+    expect(fork.projectId).toBe(identity.projectId);
   });
 
   it("audit mode returns an observable failure, never a fabricated bundle", async () => {
