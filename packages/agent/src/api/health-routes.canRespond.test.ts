@@ -2,7 +2,7 @@
 import type { AgentRuntime } from "@elizaos/core";
 import { ModelType } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
-import { computeCanRespond } from "./health-routes";
+import { computeCanRespond, summarizeServiceHealth } from "./health-routes";
 
 /**
  * computeCanRespond is the single source of truth for "first-turn capability
@@ -40,5 +40,46 @@ describe("computeCanRespond", () => {
     expect(
       computeCanRespond(makeRuntime({ hasTextHandler: true }), "running"),
     ).toBe(true);
+  });
+});
+
+describe("summarizeServiceHealth", () => {
+  it("separates registered, in-flight, and failed services for boot probes", () => {
+    const runtime = {
+      getServiceHealth: () => ({
+        database: { status: "registered", instances: 1, hasPromise: true },
+        scheduler: { status: "registering", instances: 0, hasPromise: true },
+        inbox_migration: {
+          status: "failed",
+          instances: 0,
+          hasPromise: false,
+        },
+        optional_unknown: {
+          status: "unknown",
+          instances: 0,
+          hasPromise: false,
+        },
+      }),
+    } as unknown as AgentRuntime;
+
+    expect(summarizeServiceHealth(runtime)).toEqual({
+      status: "failed",
+      registered: 1,
+      pending: 1,
+      failed: 1,
+      pendingServices: ["scheduler"],
+      failures: ["inbox_migration"],
+    });
+  });
+
+  it("returns an explicit zero summary before the runtime exists", () => {
+    expect(summarizeServiceHealth(null)).toEqual({
+      status: "unavailable",
+      registered: null,
+      pending: null,
+      failed: null,
+      pendingServices: null,
+      failures: null,
+    });
   });
 });

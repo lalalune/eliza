@@ -86,6 +86,10 @@ type RuntimeServicePromiseHandler = {
 	reject: (error: Error) => void;
 };
 
+type RuntimeServiceStartOutcome =
+	| { service: Service; error?: never }
+	| { service: null; error?: Error };
+
 type RuntimeModelHandlerRecord = {
 	handler: (
 		runtime: unknown,
@@ -135,13 +139,14 @@ type RuntimePrivateState = {
 		ServiceTypeName,
 		RuntimeServiceRegistrationStatus
 	>;
+	servicePluginNames: WeakMap<RuntimeServiceClass, string>;
 	sendHandlers: Map<string, RuntimeSendHandler>;
 	models: Map<string, RuntimeModelHandlerRecord[]>;
 	_runServiceStart?: (
 		key: ServiceTypeName,
 		serviceType: string,
 		serviceDef: RuntimeServiceClass,
-	) => Promise<Service | null>;
+	) => Promise<RuntimeServiceStartOutcome>;
 	registerSendHandler?: (source: string, handler: RuntimeSendHandler) => void;
 };
 
@@ -602,6 +607,7 @@ async function stopOwnedServices(
 				await ownedClass.stopRuntime(runtime);
 			}
 			serviceClassOwners.delete(ownedClass);
+			privateState.servicePluginNames.delete(ownedClass);
 		}
 
 		const remainingClasses = currentClasses.filter(
@@ -1013,6 +1019,10 @@ export function installRuntimePluginLifecycle(runtime: IAgentRuntime): void {
 		const nextClasses = privateState.serviceTypes.get(serviceType) ?? [];
 		for (const registeredClass of nextClasses.slice(serviceTypesBefore)) {
 			serviceClassOwners.set(registeredClass, capture.ownership.pluginName);
+			privateState.servicePluginNames.set(
+				registeredClass,
+				capture.ownership.pluginName,
+			);
 			pushUniqueService(capture.ownership.services, {
 				serviceType,
 				serviceClass: registeredClass,

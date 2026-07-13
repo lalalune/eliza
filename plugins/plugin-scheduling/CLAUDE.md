@@ -39,12 +39,18 @@ runtime surface that makes them work standalone:
   warn-once ports, an `ELIZA_PLATFORM`-driven host-capability predicate) runs
   when no host injects production deps — so the runner works on a stock mobile
   boot.
+  When a host injects production deps after a fallback runner was constructed,
+  the service invalidates that fallback cache so the next lookup rebuilds
+  against the host's authoritative store and dispatcher.
 - **The generic REST surface** at `/api/lifeops/scheduled-tasks`
   (`routes/scheduled-tasks.ts` + `routes/plugin-routes.ts`), registered via the
   plugin's `routes:` array on every platform (path unchanged for the UI).
 - **The default-pack seed registry** (`scheduled-task/seed-registry.ts`):
-  consumers register packs via `registerDefaultTaskPack`; a boot seeder
-  materializes them seed-once. This plugin ships ZERO packs.
+  consumers register packs via `registerDefaultTaskPack`;
+  `ScheduledTaskSeedService` waits for runner readiness and materializes them
+  seed-once. The plugin's generic fallback pack is used only when no consumer
+  host/pack exists; a host that registers later explicitly re-seeds after its
+  production deps and pack are both installed.
 - The spine→reminders ports (`ReminderTickHook` + read ports): reminders
   REGISTER a tick-hook into the spine so `@elizaos/plugin-scheduling` never
   imports `@elizaos/plugin-reminders` (dependency points inward).

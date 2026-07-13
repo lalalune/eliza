@@ -152,6 +152,10 @@ export function registerScheduledTaskRunnerDeps(
     return;
   }
   depsProvidersByRuntime.set(runtime, provider);
+  const service = runtime.getService(SERVICE_TYPE);
+  if (service instanceof ScheduledTaskRunnerService) {
+    service.adoptInjectedDeps();
+  }
 }
 
 export function getScheduledTaskRunnerDeps(
@@ -466,6 +470,15 @@ export class ScheduledTaskRunnerService extends Service {
       "ScheduledTaskRunnerService started",
     );
     return new ScheduledTaskRunnerService(runtime);
+  }
+
+  /**
+   * Drop runners constructed from fallback deps when a host first injects its
+   * production provider. Runtime consumers resolve the handle per operation,
+   * so the next lookup rebuilds against the authoritative store/dispatcher.
+   */
+  adoptInjectedDeps(): void {
+    this.runners.clear();
   }
 
   getRunner(opts: GetScheduledTaskRunnerOptions): ScheduledTaskRunnerHandle {

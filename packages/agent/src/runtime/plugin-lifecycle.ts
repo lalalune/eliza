@@ -19,6 +19,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   AgentContext,
   AgentRuntime,
+  JsonValue,
   Plugin,
   PluginEventRegistration,
   PluginModelRegistration,
@@ -87,6 +88,10 @@ type RuntimeServicePromiseHandler = {
   reject: (error: Error) => void;
 };
 
+type RuntimeServiceStartOutcome =
+  | { service: Service; error?: never }
+  | { service: null; error?: Error };
+
 type RuntimeModelHandlerRecord = {
   handler: RuntimeModelRegistration["handler"];
   provider: string;
@@ -128,13 +133,14 @@ type RuntimePrivateState = {
     ServiceTypeName,
     RuntimeServiceRegistrationStatus
   >;
+  servicePluginNames: WeakMap<RuntimeServiceClass, string>;
   sendHandlers: Map<string, RuntimeSendHandler>;
   models: Map<string, RuntimeModelHandlerRecord[]>;
   _runServiceStart?: (
     key: ServiceTypeName,
     serviceType: string,
     serviceDef: RuntimeServiceClass,
-  ) => Promise<Service | null>;
+  ) => Promise<RuntimeServiceStartOutcome>;
   registerSendHandler?: (source: string, handler: RuntimeSendHandler) => void;
 };
 
@@ -143,6 +149,7 @@ const pluginRegistrationContext =
 const pluginServiceStartContext =
   new AsyncLocalStorage<RuntimePluginServiceStartCapture>();
 const serviceClassOwners = new WeakMap<RuntimeServiceClass, string>();
+const pluginMigrationQueues = new WeakMap<object, Promise<void>>();
 
 function getRuntimePrivateState(runtime: AgentRuntime): RuntimePrivateState {
   return runtime as AgentRuntime & RuntimePrivateState;
@@ -359,6 +366,7 @@ async function stopOwnedServices(
         await ownedClass.stopRuntime(runtime);
       }
       serviceClassOwners.delete(ownedClass);
+      privateState.servicePluginNames.delete(ownedClass);
     }
 
     const remainingClasses = currentClasses.filter(
@@ -617,25 +625,10 @@ async function migratePluginSchemasIfReady(
   if (!adapter || typeof adapter.runPluginMigrations !== "function") {
     return;
   }
+  const runPluginMigrations = adapter.runPluginMigrations.bind(adapter);
 
   if (typeof adapter.isReady === "function") {
-    let ready = false;
-    try {
-      ready = await adapter.isReady();
-    } catch (error) {
-      runtime.logger.debug(
-        {
-          src: "plugin-lifecycle",
-          agentId: runtime.agentId,
-          plugin: plugin.name,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        "Skipping plugin schema migration because database readiness check failed",
-      );
-      return;
-    }
-
-    if (!ready) {
+    if (!(await adapter.isReady())) {
       runtime.logger.debug(
         {
           src: "plugin-lifecycle",
@@ -648,7 +641,41 @@ async function migratePluginSchemasIfReady(
     }
   }
 
-  await runtime.runPluginMigrations();
+  const normalizedSchema: Record<string, JsonValue> = {};
+  for (const [key, value] of Object.entries(plugin.schema)) {
+    if (
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean" ||
+      value === null ||
+      (typeof value === "object" && value !== null)
+    ) {
+      normalizedSchema[key] = value as JsonValue;
+    }
+  }
+
+  const isProduction = process.env.NODE_ENV === "production";
+  const previous = pluginMigrationQueues.get(adapter);
+  // error-policy:J5 the registering caller awaits and observes its own
+  // migration failure; a follower only waits for that adapter's queue slot.
+  const readyForTurn = previous
+    ? previous.catch(() => undefined)
+    : Promise.resolve();
+  const turn = readyForTurn.then(() =>
+    runPluginMigrations([{ name: plugin.name, schema: normalizedSchema }], {
+      verbose: !isProduction,
+      force: process.env.ELIZA_ALLOW_DESTRUCTIVE_MIGRATIONS === "true",
+      dryRun: false,
+    }),
+  );
+  pluginMigrationQueues.set(adapter, turn);
+  try {
+    await turn;
+  } finally {
+    if (pluginMigrationQueues.get(adapter) === turn) {
+      pluginMigrationQueues.delete(adapter);
+    }
+  }
 }
 
 /**
@@ -703,7 +730,14 @@ function installPluginViewSync(runtime: RuntimeWithPluginLifecycle): void {
   const baseRegisterPlugin = runtime.registerPlugin.bind(runtime);
   const baseUnloadPlugin = runtime.unloadPlugin?.bind(runtime);
   runtime.registerPlugin = (async (plugin: Plugin) => {
-    await baseRegisterPlugin(plugin);
+    const wasAlreadyRegistered = runtime.plugins.some(
+      (registered) => registered.name === plugin.name,
+    );
+    if (wasAlreadyRegistered) {
+      await baseRegisterPlugin(plugin);
+      return;
+    }
+    let registeredHere = false;
     try {
       // #12087 Item 1: gate this plugin's sensitive providers (SECRETS_STATUS,
       // walletPortfolio, shellHistory, …) at the moment it registers, not via a
@@ -714,13 +748,20 @@ function installPluginViewSync(runtime: RuntimeWithPluginLifecycle): void {
       // ungated providers. provider gating is idempotent, so boot plugins already
       // covered by the boot pass are unaffected.
       applyPluginRoleGating([plugin]);
+      // A late plugin's services start as soon as base registration reaches its
+      // service declarations. Materialize its schema first so Service.start can
+      // never race DDL on an already-initialized runtime.
       await migratePluginSchemasIfReady(runtime, plugin);
+      await baseRegisterPlugin(plugin);
+      registeredHere =
+        !wasAlreadyRegistered &&
+        runtime.plugins.some((registered) => registered.name === plugin.name);
       await registerPluginViews(plugin);
       registerViewScopedActions(runtime, plugin.name, plugin.views ?? []);
     } catch (error) {
       unregisterPluginViews(plugin.name);
       unregisterViewScopedActions(runtime, plugin.name);
-      if (baseUnloadPlugin) {
+      if (baseUnloadPlugin && registeredHere) {
         await baseUnloadPlugin(plugin.name);
       }
       throw error;
@@ -909,6 +950,10 @@ export function installRuntimePluginLifecycle(runtime: AgentRuntime): void {
     const nextClasses = privateState.serviceTypes.get(serviceType) ?? [];
     for (const registeredClass of nextClasses.slice(serviceTypesBefore)) {
       serviceClassOwners.set(registeredClass, capture.ownership.pluginName);
+      privateState.servicePluginNames.set(
+        registeredClass,
+        capture.ownership.pluginName,
+      );
       pushUniqueService(capture.ownership.services, {
         serviceType,
         serviceClass: registeredClass,
@@ -960,6 +1005,10 @@ export function installRuntimePluginLifecycle(runtime: AgentRuntime): void {
   }
 
   runtime.registerPlugin = (async (plugin: Plugin) => {
+    if (runtime.plugins.some((registered) => registered.name === plugin.name)) {
+      await originalRegisterPlugin(plugin);
+      return;
+    }
     const pluginsBefore = new Set(runtime.plugins);
     const routesBefore = new Set(runtime.routes);
     const capture: RuntimePluginRegistrationCapture = {
@@ -968,6 +1017,7 @@ export function installRuntimePluginLifecycle(runtime: AgentRuntime): void {
     };
 
     try {
+      await migratePluginSchemasIfReady(runtime, plugin);
       await pluginRegistrationContext.run(capture, async () => {
         await originalRegisterPlugin(plugin);
       });
@@ -977,7 +1027,6 @@ export function installRuntimePluginLifecycle(runtime: AgentRuntime): void {
         pluginsBefore,
         routesBefore,
       );
-      await migratePluginSchemasIfReady(runtime, plugin);
       if (
         capture.ownership.registeredPlugin ||
         capture.ownership.actions.length > 0 ||

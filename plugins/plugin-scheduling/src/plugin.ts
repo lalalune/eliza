@@ -7,21 +7,11 @@
  * runner. Each runtime keeps one runner service, one injected deps set, and one
  * scheduled-task REST route.
  */
-import { type IAgentRuntime, logger, type Plugin } from "@elizaos/core";
+import type { Plugin } from "@elizaos/core";
 import { buildSchedulingRoutes } from "./routes/plugin-routes.js";
 import { schedulingDbSchema } from "./scheduled-task/db-schema.js";
-import { buildFallbackDefaultPack } from "./scheduled-task/default-pack.js";
-
-import {
-  getScheduledTaskRunner,
-  getScheduledTaskRunnerDeps,
-  ScheduledTaskRunnerService,
-} from "./scheduled-task/runner-service.js";
-import {
-  getDefaultTaskPacks,
-  registerDefaultTaskPack,
-  seedRegisteredTaskPacks,
-} from "./scheduled-task/seed-registry.js";
+import { ScheduledTaskRunnerService } from "./scheduled-task/runner-service.js";
+import { ScheduledTaskSeedService } from "./scheduled-task/seed-service.js";
 
 export const schedulingPlugin: Plugin = {
   name: "@elizaos/plugin-scheduling",
@@ -29,7 +19,7 @@ export const schedulingPlugin: Plugin = {
     "Scheduling spine: the always-loaded ScheduledTask runtime primitive — runner host, REST surface, durable store, and default-pack seed registry. Owner/channel deps are injected by a host plugin; built-in defaults run when no host is present.",
   dependencies: ["@elizaos/plugin-sql"],
   schema: schedulingDbSchema,
-  services: [ScheduledTaskRunnerService],
+  services: [ScheduledTaskRunnerService, ScheduledTaskSeedService],
   routes: buildSchedulingRoutes(),
   views: [
     {
@@ -55,44 +45,4 @@ export const schedulingPlugin: Plugin = {
       desktopTabEnabled: false,
     },
   ],
-  init: async (_config: Record<string, string>, runtime: IAgentRuntime) => {
-    // Seed registered default-task packs once init has finished so the runner
-    // service (and any consumer's injected deps + packs) are registered before
-    // the seed runs. Failures are non-fatal to plugin load.
-    void runtime.initPromise
-      .then(async () => {
-        try {
-          await runtime.getServiceLoadPromise(
-            ScheduledTaskRunnerService.serviceType,
-          );
-          // Register the built-in fallback pack only when no consumer host has
-          // injected deps (e.g. a stock mobile boot without
-          // @elizaos/plugin-personal-assistant). When a host is present it owns
-          // the domain content; `seedRegisteredTaskPacks` would also drop a
-          // fallback pack via its consumer-pack gate, but skipping registration
-          // here keeps the registry honest and avoids seeding generic defaults
-          // alongside a host's richer pack.
-          const hasConsumerHost = getScheduledTaskRunnerDeps(runtime) !== null;
-          const alreadyRegistered = getDefaultTaskPacks(runtime).length > 0;
-          if (!hasConsumerHost && !alreadyRegistered) {
-            registerDefaultTaskPack(
-              runtime,
-              buildFallbackDefaultPack({ agentId: runtime.agentId }),
-            );
-          }
-          const runner = getScheduledTaskRunner(runtime, {
-            agentId: runtime.agentId,
-          });
-          await seedRegisteredTaskPacks(runtime, runner);
-        } catch (error) {
-          logger.warn(
-            { src: "scheduling:boot-seed", agentId: runtime.agentId, error },
-            "[scheduling] Default-pack boot seed failed; tasks can still be scheduled at runtime.",
-          );
-        }
-      })
-      .catch(() => {
-        /* initPromise rejection is surfaced elsewhere */
-      });
-  },
 };

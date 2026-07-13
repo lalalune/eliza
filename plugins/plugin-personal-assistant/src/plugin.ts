@@ -50,6 +50,7 @@ import {
 import { inboxPlugin } from "@elizaos/plugin-inbox/plugin";
 import { remindersPlugin } from "@elizaos/plugin-reminders";
 import { remoteDesktopPlugin } from "@elizaos/plugin-remote-desktop";
+import { ScheduledTaskSeedService } from "@elizaos/plugin-scheduling";
 import { XDmAdapter } from "@elizaos/plugin-x/lifeops-message-adapter";
 import type {
   IPermissionsRegistry,
@@ -1068,6 +1069,57 @@ const rawPersonalAssistantPlugin: Plugin = {
       // out — see src/default-packs/spine-registration.ts for the upgrade
       // story.
       registerDefaultPackCatalog(runtime);
+      // Scheduling may have completed its standalone fallback boot before PA
+      // registered. Re-seed after the production deps and consumer catalog are
+      // both present; the runner host rebuilds any fallback-backed cache entry.
+      // When the scheduling dependency has not registered yet, its later
+      // service start observes this catalog and performs the initial seed.
+      const schedulingIsRegistered = runtime.plugins.some(
+        (plugin) => plugin.name === "@elizaos/plugin-scheduling",
+      );
+      const seedServiceIsRegistered = runtime.hasService(
+        ScheduledTaskSeedService.serviceType,
+      );
+      if (schedulingIsRegistered && !seedServiceIsRegistered) {
+        throw new Error(
+          "@elizaos/plugin-scheduling is registered without its seed service",
+        );
+      }
+      const activeSeedService = runtime.getService(
+        ScheduledTaskSeedService.serviceType,
+      );
+      if (activeSeedService) {
+        if (!(activeSeedService instanceof ScheduledTaskSeedService)) {
+          throw new Error(
+            "Scheduled-task seed service resolved to an unexpected implementation",
+          );
+        }
+        await activeSeedService.seed();
+      } else if (seedServiceIsRegistered) {
+        // A pre-init service cannot be awaited from plugin init: service start
+        // waits on initPromise, which resolves only after every plugin init
+        // returns. The post-init continuation is the lifecycle boundary for
+        // this valid ordering; failures remain agent-visible through reportError.
+        void runtime.initPromise
+          .then(async () => {
+            const seedService = await runtime.getServiceLoadPromise(
+              ScheduledTaskSeedService.serviceType,
+            );
+            if (!(seedService instanceof ScheduledTaskSeedService)) {
+              throw new Error(
+                "Scheduled-task seed service resolved to an unexpected implementation",
+              );
+            }
+            await seedService.seed();
+          })
+          .catch((error) => {
+            // error-policy:J1 post-init plugin lifecycle boundary reports the
+            // detached seed failure after the pre-init deadlock is avoided.
+            runtime.reportError("LifeOps.scheduledTaskSeed", error, {
+              plugin: "@elizaos/plugin-personal-assistant",
+            });
+          });
+      }
       // Seed the first-run defaults pack idempotently on EVERY boot — not
       // gated behind first-run completion — so devices that predate the pack
       // still receive the paused weekly-review starter + default routines.

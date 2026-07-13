@@ -122,6 +122,10 @@ export {
   seedRegisteredTaskPacks,
 } from "./seed-registry.js";
 export {
+  SCHEDULED_TASK_SEED_SERVICE_TYPE,
+  ScheduledTaskSeedService,
+} from "./seed-service.js";
+export {
   createInMemoryScheduledTaskLogStore,
   createStateLogger,
   type ScheduledTaskLogStore,

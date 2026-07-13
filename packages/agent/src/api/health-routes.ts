@@ -2,7 +2,8 @@
  * Health, status, and runtime-introspection routes for the local agent server:
  * `GET /api/status` (agent state, active model, uptime, cloud-connection and
  * pending-restart summary), `GET /api/health` (subsystem readiness — runtime,
- * plugins loaded/failed, swarm coordinator, connector statuses), and
+ * plugins loaded/failed, service lifecycle state, swarm coordinator, connector
+ * statuses), and
  * `GET /api/runtime` (deep, memoized reflective snapshot of the runtime object
  * graph for the debug UI).
  *
@@ -470,6 +471,79 @@ export function computeCanRespond(
   }
 }
 
+export type ServiceHealthSummary =
+  | {
+      status: "unavailable";
+      registered: null;
+      pending: null;
+      failed: null;
+      pendingServices: null;
+      failures: null;
+    }
+  | {
+      status: "healthy" | "starting" | "failed";
+      registered: number;
+      pending: number;
+      failed: number;
+      pendingServices: string[];
+      failures: string[];
+    };
+
+/** Summarize concrete runtime service state for machine-readable boot probes. */
+export function summarizeServiceHealth(
+  runtime: AgentRuntime | null,
+): ServiceHealthSummary {
+  if (!runtime) {
+    return {
+      status: "unavailable",
+      registered: null,
+      pending: null,
+      failed: null,
+      pendingServices: null,
+      failures: null,
+    };
+  }
+
+  const summary: Extract<
+    ServiceHealthSummary,
+    { status: "healthy" | "starting" | "failed" }
+  > = {
+    status: "healthy",
+    registered: 0,
+    pending: 0,
+    failed: 0,
+    pendingServices: [],
+    failures: [],
+  };
+
+  for (const [serviceType, health] of Object.entries(
+    runtime.getServiceHealth(),
+  )) {
+    if (health.status === "registered") {
+      summary.registered += 1;
+      continue;
+    }
+    if (health.status === "failed") {
+      summary.failed += 1;
+      summary.failures.push(serviceType);
+      continue;
+    }
+    if (health.status === "pending" || health.status === "registering") {
+      summary.pending += 1;
+      summary.pendingServices.push(serviceType);
+    }
+  }
+  summary.failures.sort();
+  summary.pendingServices.sort();
+  summary.status =
+    summary.failed > 0
+      ? "failed"
+      : summary.pending > 0
+        ? "starting"
+        : "healthy";
+  return summary;
+}
+
 /**
  * Handle health / status / runtime introspection routes.
  * Returns `true` if the request was handled.
@@ -561,6 +635,7 @@ export async function handleHealthRoutes(
       ? runtime.plugins.length
       : state.plugins.filter((p) => p.enabled || p.isActive).length;
     const failedPluginCount = state.plugins.filter((p) => p.loadError).length;
+    const services = summarizeServiceHealth(runtime);
 
     let coordinatorStatus: "ok" | "not_wired" = "not_wired";
     try {
@@ -587,7 +662,10 @@ export async function handleHealthRoutes(
     }
 
     const ready =
-      state.agentState !== "starting" && state.agentState !== "restarting";
+      runtime !== null &&
+      services.status !== "failed" &&
+      state.agentState !== "starting" &&
+      state.agentState !== "restarting";
 
     json(res, {
       ready,
@@ -598,6 +676,7 @@ export async function handleHealthRoutes(
         loaded: loadedPluginCount,
         failed: failedPluginCount,
       },
+      services,
       coordinator: coordinatorStatus,
       connectors,
       uptime,
