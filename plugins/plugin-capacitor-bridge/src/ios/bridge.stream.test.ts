@@ -89,6 +89,50 @@ function decodeChunk(frame: StreamEmitFrame): Record<string, unknown> {
 }
 
 describe("iOS bridge — streamConversationMessageResponse", () => {
+	it("replays an identical cached turn without invoking generation again", async () => {
+		let generationCalls = 0;
+		const runtime = createStreamingRuntime(["should not run"]);
+		const originalHandleMessage = runtime.messageService?.handleMessage;
+		if (!originalHandleMessage) throw new Error("message service is required");
+		runtime.messageService.handleMessage = async (...args) => {
+			generationCalls += 1;
+			return originalHandleMessage(...args);
+		};
+		const backend = makeBackendWithConversation(runtime);
+		const conversation = backend.conversations.get(CONVERSATION_ID);
+		if (!conversation) throw new Error("conversation fixture is required");
+		conversation.lastUserText = "same question";
+		conversation.lastAssistantText = "cached answer";
+		conversation.lastAgentName = "Cached Eliza";
+		const { frames, emit } = collector();
+
+		await streamConversationMessageResponse(
+			backend,
+			CONVERSATION_ID,
+			{ text: "same question" },
+			"stream-cache",
+			emit,
+		);
+
+		expect(generationCalls).toBe(0);
+		const chunks = frames
+			.filter((frame) => frame.kind === "chunk")
+			.map(decodeChunk);
+		expect(chunks).toContainEqual({
+			type: "token",
+			text: "cached answer",
+			fullText: "cached answer",
+		});
+		expect(chunks).toContainEqual(
+			expect.objectContaining({
+				type: "done",
+				fullText: "cached answer",
+				agentName: "Cached Eliza",
+				completed: true,
+			}),
+		);
+	});
+
 	it("emits response → one chunk per token (running fullText) → complete", async () => {
 		const runtime = createStreamingRuntime(["Hello", " there", " friend"]);
 		const backend = makeBackendWithConversation(runtime);
