@@ -32,6 +32,9 @@ const bridgeMock = vi.hoisted(() => ({
 
 const firstRunBootstrapMock = vi.hoisted(() => ({
   detectExistingFirstRunConnection: vi.fn(async () => null),
+  // Desktop origin is not a Cloud control-plane host, so the existing-install
+  // probe runs exactly as before (#16242 gates only the Cloud web app).
+  shouldProbeExistingLocalInstall: vi.fn(() => true),
 }));
 
 vi.mock("../bridge", () => bridgeMock);

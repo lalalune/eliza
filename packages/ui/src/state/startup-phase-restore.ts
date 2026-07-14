@@ -53,7 +53,10 @@ import {
   isElizaCloudControlPlaneAgentlessBase,
 } from "../utils/cloud-agent-base";
 import { getElizaApiBase } from "../utils/eliza-globals";
-import { detectExistingFirstRunConnection } from "./first-run-bootstrap";
+import {
+  detectExistingFirstRunConnection,
+  shouldProbeExistingLocalInstall,
+} from "./first-run-bootstrap";
 import {
   clearPersistedActiveServer,
   hydratePersistedFirstRunCompleteFromNativeStore,
@@ -689,9 +692,16 @@ export async function runRestoringSession(
 
   // Probe the API when there is evidence of a prior install, or when no
   // persisted server exists (covers headless/VPS setups where config was
-  // set via files without going through UI firstRun).
+  // set via files without going through UI firstRun). Skipped on a bare Eliza
+  // Cloud control-plane origin, where the same-origin API is auth-gated and the
+  // probe would only 401 during fresh onboarding (#16242).
+  const probeOrigin =
+    typeof window !== "undefined" ? window.location.origin : null;
   const probed =
-    !forceFreshFirstRun && !persistedActiveServer && !isDevUiPort()
+    !forceFreshFirstRun &&
+    !persistedActiveServer &&
+    !isDevUiPort() &&
+    shouldProbeExistingLocalInstall(probeOrigin)
       ? await detectExistingFirstRunConnection({
           client,
           timeoutMs: isDesktop
