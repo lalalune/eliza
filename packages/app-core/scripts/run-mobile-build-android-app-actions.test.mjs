@@ -142,9 +142,9 @@ test("Android voice string resource sync backfills white-label targets without r
       path.join(targetResDir, "values", "strings.xml"),
       `<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Milady</string>
-    <string name="title_activity_main">Milady</string>
-    <string name="custom_url_scheme">milady</string>
+    <string name="app_name">Acme</string>
+    <string name="title_activity_main">Acme</string>
+    <string name="custom_url_scheme">acme</string>
 </resources>
 `,
       "utf8",
@@ -161,9 +161,9 @@ test("Android voice string resource sync backfills white-label targets without r
       "utf8",
     );
 
-    assert.match(once, /<string name="app_name">Milady<\/string>/);
-    assert.match(once, /<string name="title_activity_main">Milady<\/string>/);
-    assert.match(once, /<string name="custom_url_scheme">milady<\/string>/);
+    assert.match(once, /<string name="app_name">Acme<\/string>/);
+    assert.match(once, /<string name="title_activity_main">Acme<\/string>/);
+    assert.match(once, /<string name="custom_url_scheme">acme<\/string>/);
     assert.match(once, /<string name="eliza_ime_label">/);
     assert.match(once, /<string name="eliza_ime_prompt">/);
     assert.equal(twice, once);

@@ -9,7 +9,7 @@
  * (`resolveAliasedEnvValue` / the `runtime-env` resolvers) so a white-label
  * distribution's `<PREFIX>_*` variable resolves WITHOUT materializing the
  * `ELIZA_*` mirror in `process.env`. A raw `process.env.ELIZA_STATE_DIR` read
- * bypasses that reader: it only sees the canonical key, so a `MILADY_STATE_DIR`
+ * bypasses that reader: it only sees the canonical key, so an `ACME_STATE_DIR`
  * that was never mirrored silently reads as unset. The migration removes the
  * existing raw reads over time; this guard stops NEW ones from regrowing.
  *
