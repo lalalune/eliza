@@ -1,6 +1,6 @@
 /**
  * Proves the P2 boot-critical env reads migrated to the alias-aware reader in
- * #13422 keep the security contract: a branded `MILADY_<KEY>` resolves through
+ * #13422 keep the security contract: a branded `ACME_<KEY>` resolves through
  * the real migrated call sites, the canonical `ELIZA_<KEY>` still wins when both
  * are set, and resolution never materializes the `ELIZA_` mirror on
  * `process.env` (the property the issue exists to guarantee — see
@@ -32,10 +32,10 @@ import type { PlatformSecureStore } from "./security/platform-secure-store.ts";
 import { loadStewardCredentials } from "./services/steward-credentials.ts";
 import { createDesktopStewardSidecar } from "./services/steward-sidecar.ts";
 
-const BRAND = "MILADY";
+const BRAND = "ACME";
 
 // The exact P2 partition keys migrated in #13422, paired with the branded
-// prefix a Milady deployment sets. Resolution must never write the ELIZA_ side.
+// prefix an Acme deployment sets. Resolution must never write the ELIZA_ side.
 const ALIAS_PAIRS: Array<readonly [string, string]> = [
   [`${BRAND}_STATE_DIR`, "ELIZA_STATE_DIR"],
   [`${BRAND}_NAMESPACE`, "ELIZA_NAMESPACE"],
@@ -59,7 +59,7 @@ const savedEnv: Record<string, string | undefined> = {};
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "milady-13422-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acme-13422-"));
   tempDirs.push(dir);
   return dir;
 }
@@ -82,7 +82,7 @@ beforeEach(() => {
     delete process.env[key];
   }
   // Pin the alias table on the immutable BootConfig, exactly as the branded app
-  // boot does — this is what makes MILADY_* resolvable without the env mirror.
+  // boot does — this is what makes ACME_* resolvable without the env mirror.
   setBootConfig({ ...savedConfig, envAliases: ALIAS_PAIRS });
 });
 
@@ -102,13 +102,13 @@ afterEach(() => {
 });
 
 describe("agent-vault-id state dir (ELIZA_STATE_DIR + ELIZA_NAMESPACE)", () => {
-  it("derives the canonical state dir from a branded MILADY_STATE_DIR without the mirror", () => {
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+  it("derives the canonical state dir from a branded ACME_STATE_DIR without the mirror", () => {
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
     // resolveCanonicalStateDir path.resolve()s the dir, so on Windows the POSIX
-    // literal canonicalizes to a drive-anchored path (D:\var\milady\state).
+    // literal canonicalizes to a drive-anchored path (D:\var\acme\state).
     // Assert against the same resolution so the check is platform-portable.
-    const expected = path.resolve("/var/milady/state");
+    const expected = path.resolve("/var/acme/state");
     expect(resolveCanonicalStateDir()).toBe(expected);
     // The vault id is a deterministic hash of that resolved dir — proves the
     // branded value actually flowed into the keychain namespace.
@@ -119,17 +119,17 @@ describe("agent-vault-id state dir (ELIZA_STATE_DIR + ELIZA_NAMESPACE)", () => {
 
   it("prefers the canonical ELIZA_STATE_DIR over the branded alias", () => {
     process.env.ELIZA_STATE_DIR = "/var/eliza/state";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
     expect(resolveCanonicalStateDir()).toBe(path.resolve("/var/eliza/state"));
   });
 
-  it("derives the state dir from a branded MILADY_NAMESPACE", () => {
+  it("derives the state dir from a branded ACME_NAMESPACE", () => {
     const xdg = makeTempDir();
     process.env.XDG_STATE_HOME = xdg;
-    process.env.MILADY_NAMESPACE = "miladybrand";
+    process.env.ACME_NAMESPACE = "acmebrand";
 
-    expect(resolveCanonicalStateDir()).toBe(path.join(xdg, "miladybrand"));
+    expect(resolveCanonicalStateDir()).toBe(path.join(xdg, "acmebrand"));
     expect(process.env.ELIZA_NAMESPACE).toBeUndefined();
   });
 });
@@ -140,13 +140,13 @@ describe("steward sidecar data dir (ELIZA_NAMESPACE)", () => {
   const dataDirOf = (sidecar: unknown): string =>
     (sidecar as { config: { dataDir: string } }).config.dataDir;
 
-  it("builds the sidecar data dir from a branded MILADY_NAMESPACE", () => {
+  it("builds the sidecar data dir from a branded ACME_NAMESPACE", () => {
     const xdg = makeTempDir();
     process.env.XDG_STATE_HOME = xdg;
-    process.env.MILADY_NAMESPACE = "miladybrand";
+    process.env.ACME_NAMESPACE = "acmebrand";
 
     const sidecar = createDesktopStewardSidecar();
-    expect(dataDirOf(sidecar)).toBe(path.join(xdg, "miladybrand", "steward"));
+    expect(dataDirOf(sidecar)).toBe(path.join(xdg, "acmebrand", "steward"));
     expect(process.env.ELIZA_NAMESPACE).toBeUndefined();
   });
 
@@ -154,7 +154,7 @@ describe("steward sidecar data dir (ELIZA_NAMESPACE)", () => {
     const xdg = makeTempDir();
     process.env.XDG_STATE_HOME = xdg;
     process.env.ELIZA_NAMESPACE = "elizabrand";
-    process.env.MILADY_NAMESPACE = "miladybrand";
+    process.env.ACME_NAMESPACE = "acmebrand";
 
     const sidecar = createDesktopStewardSidecar();
     expect(dataDirOf(sidecar)).toBe(path.join(xdg, "elizabrand", "steward"));
@@ -166,26 +166,26 @@ describe("steward credentials load (ELIZA_STATE_DIR)", () => {
     fs.writeFileSync(
       path.join(dir, "steward-credentials.json"),
       JSON.stringify({
-        apiUrl: "https://steward.milady.test",
-        tenantId: "tenant-milady",
-        agentId: "agent-milady",
+        apiUrl: "https://steward.acme.test",
+        tenantId: "tenant-acme",
+        agentId: "agent-acme",
       }),
     );
   }
 
-  it("reads persisted credentials from a branded MILADY_STATE_DIR", async () => {
+  it("reads persisted credentials from a branded ACME_STATE_DIR", async () => {
     const dir = makeTempDir();
     writeCredentials(dir);
-    process.env.MILADY_STATE_DIR = dir;
+    process.env.ACME_STATE_DIR = dir;
 
     const creds = await loadStewardCredentials({
       secureStore: unavailableSecureStore,
     });
 
     expect(creds).not.toBeNull();
-    expect(creds?.apiUrl).toBe("https://steward.milady.test");
-    expect(creds?.tenantId).toBe("tenant-milady");
-    expect(creds?.agentId).toBe("agent-milady");
+    expect(creds?.apiUrl).toBe("https://steward.acme.test");
+    expect(creds?.tenantId).toBe("tenant-acme");
+    expect(creds?.agentId).toBe("agent-acme");
     expect(process.env.ELIZA_STATE_DIR).toBeUndefined();
   });
 
@@ -193,7 +193,7 @@ describe("steward credentials load (ELIZA_STATE_DIR)", () => {
     const branded = makeTempDir();
     writeCredentials(branded);
     const canonicalEmpty = makeTempDir(); // no credentials file here
-    process.env.MILADY_STATE_DIR = branded;
+    process.env.ACME_STATE_DIR = branded;
     process.env.ELIZA_STATE_DIR = canonicalEmpty;
 
     // ELIZA_ wins, so the load looks in the empty dir and finds nothing.
@@ -207,9 +207,9 @@ describe("steward credentials load (ELIZA_STATE_DIR)", () => {
 describe("edge-TTS disable check (ELIZA_DISABLE_EDGE_TTS)", () => {
   const config: TextToSpeechProviderConfig = {};
 
-  it("honors a branded MILADY_DISABLE_EDGE_TTS", () => {
+  it("honors a branded ACME_DISABLE_EDGE_TTS", () => {
     for (const token of ["1", "true", "yes"]) {
-      process.env.MILADY_DISABLE_EDGE_TTS = token;
+      process.env.ACME_DISABLE_EDGE_TTS = token;
       expect(isTextToSpeechProviderDisabled(config)).toBe(true);
     }
   });
@@ -223,7 +223,7 @@ describe("edge-TTS disable check (ELIZA_DISABLE_EDGE_TTS)", () => {
   it("prefers the canonical ELIZA_DISABLE_EDGE_TTS over the branded alias", () => {
     // Canonical "0" wins over branded "1": the feature stays enabled.
     process.env.ELIZA_DISABLE_EDGE_TTS = "0";
-    process.env.MILADY_DISABLE_EDGE_TTS = "1";
+    process.env.ACME_DISABLE_EDGE_TTS = "1";
     expect(isTextToSpeechProviderDisabled(config)).toBe(false);
   });
 });
@@ -232,20 +232,20 @@ describe("startEliza boot decision reads (ELIZA_AGENT_ORCHESTRATOR + ELIZA_API_P
   // startEliza boots the whole runtime, so assert the exact alias-aware
   // expressions its migrated lines evaluate (eliza.ts orchestrator gate + api
   // port branch), against the real shared resolvers those lines call.
-  it("resolves the orchestrator gate from a branded MILADY_AGENT_ORCHESTRATOR", () => {
-    process.env.MILADY_AGENT_ORCHESTRATOR = "0";
+  it("resolves the orchestrator gate from a branded ACME_AGENT_ORCHESTRATOR", () => {
+    process.env.ACME_AGENT_ORCHESTRATOR = "0";
     expect(readAliasedEnv("ELIZA_AGENT_ORCHESTRATOR")?.toLowerCase()).toBe("0");
     expect(process.env.ELIZA_AGENT_ORCHESTRATOR).toBeUndefined();
   });
 
   it("prefers the canonical ELIZA_AGENT_ORCHESTRATOR over the branded alias", () => {
     process.env.ELIZA_AGENT_ORCHESTRATOR = "1";
-    process.env.MILADY_AGENT_ORCHESTRATOR = "0";
+    process.env.ACME_AGENT_ORCHESTRATOR = "0";
     expect(readAliasedEnv("ELIZA_AGENT_ORCHESTRATOR")?.toLowerCase()).toBe("1");
   });
 
-  it("selects the desktop port when a branded MILADY_API_PORT is set", () => {
-    process.env.MILADY_API_PORT = "7777";
+  it("selects the desktop port when a branded ACME_API_PORT is set", () => {
+    process.env.ACME_API_PORT = "7777";
     // The migrated branch condition (alias-aware) and the resolver it calls.
     expect(Boolean(readAliasedEnv("ELIZA_API_PORT"))).toBe(true);
     expect(resolveDesktopApiPort(process.env)).toBe(7777);
@@ -259,7 +259,7 @@ describe("startEliza boot decision reads (ELIZA_AGENT_ORCHESTRATOR + ELIZA_API_P
 
   it("prefers the canonical ELIZA_API_PORT over the branded alias", () => {
     process.env.ELIZA_API_PORT = "8888";
-    process.env.MILADY_API_PORT = "7777";
+    process.env.ACME_API_PORT = "7777";
     expect(resolveDesktopApiPort(process.env)).toBe(8888);
   });
 });
