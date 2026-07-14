@@ -10,6 +10,7 @@
  */
 import { useEffect } from "react";
 import { OPEN_NOTIFICATION_CENTER_EVENT } from "../../events";
+import { useProtectedAgentProbesEnabled } from "../../hooks/useProtectedAgentProbesEnabled";
 import { useAppSelector } from "../../state";
 import {
   initNotifications,
@@ -20,9 +21,14 @@ import { goHome } from "../../state/shell-surface-store";
 
 export function NotificationsShellBoot(): null {
   const setTab = useAppSelector((s) => s.setTab);
+  // The store hydrates the inbox from the protected GET /api/notifications; hold
+  // its boot until probes are allowed so fresh Cloud onboarding fires no 401
+  // (#16242). Idempotent + re-armed when the gate opens post-sign-in.
+  const probesEnabled = useProtectedAgentProbesEnabled();
 
   // Idempotent store boot — the store guards against re-init.
   useEffect(() => {
+    if (!probesEnabled) return;
     initNotifications();
     // Native-only, gated on granted permission, guarded against double-register.
     // The token POST is what makes the server's APNs/FCM stack a live pipeline.
@@ -35,7 +41,7 @@ export function NotificationsShellBoot(): null {
     } catch {
       // `import.meta.env` unavailable (non-Vite host) — treat as non-dev.
     }
-  }, []);
+  }, [probesEnabled]);
 
   // Route every "open notifications" entry point to the dashboard: the combined
   // Home/Launcher route on its Home half, where the notification widget lives.
