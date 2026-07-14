@@ -43,12 +43,15 @@ function stripTypeScriptSyntaxPreservingComments(source) {
   return source;
 }
 
+const SEMANTIC_COMMENT_DIRECTIVE =
+  /(?:@vite-ignore\b|webpack(?:ChunkName|Mode|Prefetch|Preload|Ignore|FetchPriority|Exports|Include|Exclude)\s*:|(?:c8|istanbul|v8)\s+ignore\b|node:coverage\s+(?:ignore|disable|enable)\b|@ts-(?:check|nocheck|ignore|expect-error)\b|@jsx(?:Frag|ImportSource|Runtime)?\b|\/\/\/\s*<(?:reference|amd-module|amd-dependency)\b|[#@]__(?:PURE|NO_SIDE_EFFECTS|INLINE|NOINLINE)__\b|[#@]\s*source(?:Mapping)?URL\s*=)/i;
+
 /**
- * Captures every comment-like delimiter with a whitespace-insensitive source
- * anchor. False positives inside literals only widen coverage enforcement;
- * importantly, tooling directives can never disappear from the proof.
+ * Captures comments that alter compiler, bundler, optimizer, or coverage-tool
+ * behavior. Ordinary prose is absent so documentation-only edits remain
+ * runtime-equivalent; anchors retain directive placement relative to code.
  */
-function commentSensitiveRecords(source) {
+function semanticCommentRecords(source) {
   const stripped = stripTypeScriptSyntaxPreservingComments(source);
   const commentLike = /\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g;
   const records = [];
@@ -57,11 +60,29 @@ function commentSensitiveRecords(source) {
   for (const match of stripped.matchAll(commentLike)) {
     const index = match.index ?? 0;
     anchor += stripped.slice(cursor, index).replace(/\s/g, "").length;
-    records.push([anchor, match[0]]);
-    anchor += match[0].replace(/\s/g, "").length;
+    if (SEMANTIC_COMMENT_DIRECTIVE.test(match[0])) {
+      records.push([anchor, match[0]]);
+    }
     cursor = index + match[0].length;
   }
   return records;
+}
+
+/** Stable fingerprint of syntax erased by Node's position-preserving strip. */
+function erasedTypeSignature(source) {
+  const stripped = stripTypeScriptSyntaxPreservingComments(source);
+  let signature = "";
+  for (let index = 0; index < source.length; index++) {
+    if (source[index] !== stripped[index] && !/\s/.test(source[index])) {
+      signature += source[index];
+    }
+  }
+  return signature;
+}
+
+/** Any transformed `@` fail-widens an actual erased-type change. */
+function transformedRuntimeContainsAtSign(source) {
+  return runtimeSource(source).includes("@");
 }
 
 /** V8 emits no line records for a module made entirely of re-export facades. */
@@ -77,24 +98,25 @@ export function sourceRetainsRuntimeCode(source) {
   return emittedSource.length > 0 && !isPureReExportFacade(emittedSource);
 }
 
-/** Returns true unless emitted JavaScript and comment-sensitive tokens match. */
+/** Returns true unless emitted JavaScript and semantic compile inputs match. */
 export function sourceChangesRuntimeCode(baseSource, headSource) {
-  // Type annotations can alter emitted decorator metadata under repository
-  // tsconfigs even when Node's transform output is otherwise identical.
-  if (
-    baseSource !== headSource &&
-    (baseSource.includes("@") || headSource.includes("@"))
-  ) {
-    return true;
-  }
   const emittedHead = runtimeSource(headSource);
   if (emittedHead.length === 0 || isPureReExportFacade(emittedHead)) {
     return false;
   }
   if (runtimeSource(baseSource) !== emittedHead) return true;
+  if (
+    JSON.stringify(semanticCommentRecords(baseSource)) !==
+    JSON.stringify(semanticCommentRecords(headSource))
+  ) {
+    return true;
+  }
+  // Type annotations can alter emitted decorator metadata under repository
+  // tsconfigs even when Node's transform output is otherwise identical.
   return (
-    JSON.stringify(commentSensitiveRecords(baseSource)) !==
-    JSON.stringify(commentSensitiveRecords(headSource))
+    erasedTypeSignature(baseSource) !== erasedTypeSignature(headSource) &&
+    (transformedRuntimeContainsAtSign(baseSource) ||
+      transformedRuntimeContainsAtSign(headSource))
   );
 }
 
