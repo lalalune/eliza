@@ -2,11 +2,11 @@
  * Consolidated regression test that the whole brand-env surface resolves for a
  * non-ELIZA prefix through the alias-aware reader WITHOUT materializing the
  * `ELIZA_*` mirror (#13422). Unlike the per-slice tests that hand-author alias
- * pairs, this drives the REAL table from `buildBrandEnvAliases("MILADY")` (the
+ * pairs, this drives the REAL table from `buildBrandEnvAliases("ACME")` (the
  * single source of truth) end to end — state dir, API token, ports, CORS/host
  * allow-lists, bind host, expose-port flag, and the mobile-platform flag — so a
  * suffix renamed in `brand-env-aliases.ts` that broke any consumer is caught
- * here. Deterministic; sets a MILADY_* env record and asserts no ELIZA_* key is
+ * here. Deterministic; sets an ACME_* env record and asserts no ELIZA_* key is
  * ever written. Pairs with the static `alias-read-guard.mjs` that forbids new
  * raw reads bypassing this reader.
  */
@@ -27,23 +27,23 @@ import {
 } from "./boot-config";
 import { buildBrandEnvAliases } from "./brand-env-aliases";
 
-const ALIASES = buildBrandEnvAliases("MILADY");
+const ALIASES = buildBrandEnvAliases("ACME");
 
-/** A full MILADY_* deployment env — the canonical ELIZA_* keys are all absent. */
-function miladyEnv(): Record<string, string | undefined> {
+/** A full ACME_* deployment env — the canonical ELIZA_* keys are all absent. */
+function acmeEnv(): Record<string, string | undefined> {
   return {
-    MILADY_STATE_DIR: "/home/milady/.local/state/milady",
-    MILADY_API_TOKEN: "milady-secret-token",
-    MILADY_API_BIND: "0.0.0.0",
-    MILADY_API_EXPOSE_PORT: "true",
-    MILADY_PORT: "4666",
-    MILADY_API_PORT: "4555",
-    MILADY_UI_PORT: "4777",
-    MILADY_ALLOWED_ORIGINS: " https://milady.example, http://localhost:2138 ",
-    MILADY_ALLOWED_HOSTS: " milady.example,localhost ",
-    MILADY_ALLOW_NULL_ORIGIN: "true",
-    MILADY_DISABLE_AUTO_API_TOKEN: "1",
-    MILADY_PLATFORM: "android",
+    ACME_STATE_DIR: "/home/acme/.local/state/acme",
+    ACME_API_TOKEN: "acme-secret-token",
+    ACME_API_BIND: "0.0.0.0",
+    ACME_API_EXPOSE_PORT: "true",
+    ACME_PORT: "4666",
+    ACME_API_PORT: "4555",
+    ACME_UI_PORT: "4777",
+    ACME_ALLOWED_ORIGINS: " https://acme.example, http://localhost:2138 ",
+    ACME_ALLOWED_HOSTS: " acme.example,localhost ",
+    ACME_ALLOW_NULL_ORIGIN: "true",
+    ACME_DISABLE_AUTO_API_TOKEN: "1",
+    ACME_PLATFORM: "android",
   };
 }
 
@@ -51,12 +51,12 @@ function elizaMirrorKeys(env: Record<string, string | undefined>): string[] {
   return Object.keys(env).filter((key) => key.startsWith("ELIZA_"));
 }
 
-describe("brand-env resolution for a MILADY_* prefix (no ELIZA_* mirror)", () => {
+describe("brand-env resolution for an ACME_* prefix (no ELIZA_* mirror)", () => {
   const savedConfig = getBootConfig();
 
   beforeEach(() => {
     // runtime-env resolvers read the alias table from the boot config; pin it to
-    // the real MILADY table so they resolve the branded keys.
+    // the real ACME table so they resolve the branded keys.
     setBootConfig({ ...savedConfig, envAliases: ALIASES });
   });
 
@@ -65,24 +65,24 @@ describe("brand-env resolution for a MILADY_* prefix (no ELIZA_* mirror)", () =>
   });
 
   it("resolves the state dir via the reader from the branded key", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     expect(resolveAliasedEnvValue("ELIZA_STATE_DIR", ALIASES, env)).toBe(
-      "/home/milady/.local/state/milady",
+      "/home/acme/.local/state/acme",
     );
     expect(env).not.toHaveProperty("ELIZA_STATE_DIR");
   });
 
   it("resolves the API token via the reader and the security config", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     expect(resolveAliasedEnvValue("ELIZA_API_TOKEN", ALIASES, env)).toBe(
-      "milady-secret-token",
+      "acme-secret-token",
     );
-    expect(resolveApiSecurityConfig(env).token).toBe("milady-secret-token");
+    expect(resolveApiSecurityConfig(env).token).toBe("acme-secret-token");
     expect(env).not.toHaveProperty("ELIZA_API_TOKEN");
   });
 
   it("resolves the ports from the branded keys", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     expect(resolveRuntimePorts(env)).toEqual({
       serverOnlyPort: 4666,
       desktopApiPort: 4555,
@@ -90,18 +90,18 @@ describe("brand-env resolution for a MILADY_* prefix (no ELIZA_* mirror)", () =>
     });
     expect(resolveDesktopApiPortPreference(env)).toMatchObject({
       port: 4555,
-      winningKey: "MILADY_API_PORT",
+      winningKey: "ACME_API_PORT",
     });
   });
 
   it("resolves CORS/allowed origins, hosts, and bind host from the branded keys", () => {
-    const config = resolveApiSecurityConfig(miladyEnv());
+    const config = resolveApiSecurityConfig(acmeEnv());
     expect(config.bindHost).toBe("0.0.0.0");
     expect(config.allowedOrigins).toEqual([
-      "https://milady.example",
+      "https://acme.example",
       "http://localhost:2138",
     ]);
-    expect(config.allowedHosts).toEqual(["milady.example", "localhost"]);
+    expect(config.allowedHosts).toEqual(["acme.example", "localhost"]);
     expect(config.allowNullOrigin).toBe(true);
     expect(config.disableAutoApiToken).toBe(true);
     expect(config.isWildcardBind).toBe(true);
@@ -109,18 +109,18 @@ describe("brand-env resolution for a MILADY_* prefix (no ELIZA_* mirror)", () =>
   });
 
   it("resolves the expose-port flag from the branded key", () => {
-    expect(resolveApiExposePort(miladyEnv())).toBe(true);
+    expect(resolveApiExposePort(acmeEnv())).toBe(true);
   });
 
   it("resolves the mobile-platform flag from the branded key", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     expect(isMobilePlatform(env)).toBe(true);
     expect(isAndroidMobile(env)).toBe(true);
     expect(resolvePlatform(env)).toBe("android");
   });
 
   it("never materializes any ELIZA_* mirror while resolving the whole surface", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     const before = { ...env };
 
     resolveAliasedEnvValue("ELIZA_STATE_DIR", ALIASES, env);
@@ -138,7 +138,7 @@ describe("brand-env resolution for a MILADY_* prefix (no ELIZA_* mirror)", () =>
   });
 
   it("prefers an explicit canonical ELIZA_* value over the branded alias", () => {
-    const env = miladyEnv();
+    const env = acmeEnv();
     env.ELIZA_API_TOKEN = "canonical-wins";
     // A deployment that sets BOTH still gets the canonical value — the branded
     // alias never suppresses a present ELIZA_* value.
