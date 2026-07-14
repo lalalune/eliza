@@ -21,19 +21,19 @@
  * Usage:
  *   node scripts/training-harvest/build-manifest.mjs [--out <path>]
  */
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { listPackages } from "../../packages/scripts/lib/workspaces.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const PACKAGES = path.join(REPO_ROOT, "packages");
 
-function arg(name, fallback) {
-  const i = process.argv.indexOf(name);
-  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+function arg(argv, name, fallback) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
 }
 
 /** Recursively count files matching a suffix under a dir. */
@@ -168,31 +168,60 @@ function scenarioFamily() {
   };
 }
 
-function benchmarkFamily() {
-  let adapters = [];
-  let rawList = "";
-  try {
-    rawList = execFileSync(
-      "python3",
-      ["-m", "benchmarks.orchestrator", "list-benchmarks"],
-      { cwd: PACKAGES, encoding: "utf8", timeout: 120000 },
-    );
-  } catch (err) {
-    // list-benchmarks exits non-zero when there are "uncovered" benchmark
-    // directories, but still prints the full adapter list to stdout. Use it.
-    rawList = (err && err.stdout ? String(err.stdout) : "") || "";
-  }
+/**
+ * Parse orchestrator list output into portable manifest rows. Consumers run the
+ * commands from a fresh checkout, so persisted working directories are always
+ * relative to the repository root rather than the builder host's filesystem.
+ *
+ * @param {string} rawList
+ * @param {string} [repoRoot]
+ * @returns {Array<{ id: string, dir: string, cwd: string }>}
+ */
+export function parseBenchmarkAdapters(rawList, repoRoot = REPO_ROOT) {
+  const adapters = [];
   for (const line of rawList.split("\n")) {
-    const m = line.match(/^-\s+(\S+)\s+dir=(\S+)\s+cwd=(.+)$/);
-    if (m) {
-      const cwd = path.relative(REPO_ROOT, m[3].trim()) || ".";
-      adapters.push({ id: m[1], dir: m[2], cwd });
-    }
+    const match = line.match(/^-\s+(\S+)\s+dir=(\S+)\s+cwd=(.+)$/);
+    if (!match) continue;
+    const cwd = path.relative(repoRoot, match[3].trim()) || ".";
+    adapters.push({ id: match[1], dir: match[2], cwd });
   }
-  if (adapters.length === 0)
-    adapters = [
-      { error: "orchestrator list-benchmarks produced no parseable adapters" },
-    ];
+  return adapters;
+}
+
+function discoverBenchmarkAdapters() {
+  const result = spawnSync(
+    "python3",
+    ["-m", "benchmarks.orchestrator", "list-benchmarks"],
+    {
+      cwd: PACKAGES,
+      encoding: "utf8",
+      timeout: 120000,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.error) throw result.error;
+  // Exit 2 means the complete inventory is followed by uncovered directories;
+  // the declared total below proves stdout was not a partial failed command.
+  if (result.status !== 0 && result.status !== 2) {
+    throw new Error(
+      `benchmark orchestrator exited with status ${String(result.status)}: ${result.stderr}`,
+    );
+  }
+  const adapters = parseBenchmarkAdapters(result.stdout);
+  const declaredTotal = result.stdout.match(/^Total adapters:\s+(\d+)$/m);
+  if (!declaredTotal || adapters.length !== Number(declaredTotal[1])) {
+    throw new Error(
+      `benchmark orchestrator returned ${adapters.length} adapters without a matching declared total ` +
+        `(status ${String(result.status)}, stdout ${result.stdout.length} bytes, stderr: ${result.stderr})`,
+    );
+  }
+  return adapters;
+}
+
+function benchmarkFamily(adapters) {
+  if (!Array.isArray(adapters) || adapters.length === 0) {
+    throw new Error("benchmark manifest requires at least one adapter");
+  }
   return {
     kind: "benchmark",
     emitsTrajectory: "wiring-needed",
@@ -208,7 +237,7 @@ function benchmarkFamily() {
       "The ~25 eliza-adapter-routed benchmarks boot a real AgentRuntime (serves /api/benchmark/message). Set ELIZA_SAVE_TRAJECTORIES=1 + ELIZA_TRAJECTORY_DIR=<dir> on the adapter runtime, then run packages/scenario-runner native-export over <dir> to convert RecordedTrajectory JSON → eliza_native_v1. Non-eliza-adapter benchmarks (standard/*, python-only) do NOT boot the runtime and cannot emit native trajectories.",
     providerSeam:
       "orchestrator --provider cli maps to ELIZA_CHAT_VIA_CLI=codex for eliza-adapter benchmarks; verify per-adapter provider plumbing before Stage 2.",
-    adapterCount: adapters.filter((a) => a.id).length,
+    adapterCount: adapters.length,
     adapters,
   };
 }
@@ -250,51 +279,79 @@ function e2eFamily() {
   };
 }
 
-const manifest = {
-  schema: "gpt55_harvest_manifest",
-  schemaVersion: 1,
-  generatedAt: new Date().toISOString(),
-  repoRoot: ".",
-  goal: "Run every elizaOS scenario+benchmark+e2e through gpt-5.5 (Codex subscription), harvest correct eliza_native_v1 trajectories, GEPA-repair failures, fine-tune on Nebius.",
-  provider: {
-    mechanism:
-      "ELIZA_CHAT_VIA_CLI CLI-subscription backend (packages/core/src/testing/live-provider.ts selectCliProvider)",
-    backend: "codex",
-    model: "gpt-5.5",
-    modelOverrideEnv: "ELIZA_CLI_CODEX_MODEL",
-    plugin: "@elizaos/plugin-cli-inference",
-    credentialsPath:
-      "~/.codex/auth.json (ChatGPT-OAuth; eliza never sees the token)",
-    env: { ELIZA_CHAT_VIA_CLI: "codex", ELIZA_CLI_CODEX_MODEL: "gpt-5.5" },
-    note: "Stage-1 leg S1 proves ONE real scenario through this seam live. The driver consumes S1's proven provider env verbatim.",
-  },
-  trajectoryFormat: {
-    name: "eliza_native_v1",
-    definedIn:
-      "packages/core/src/services/trajectory-types.ts (ElizaNativeTrajectoryRow)",
-    contract: "packages/training/docs/dataset/CANONICAL_RECORD.md",
-    converter:
-      "packages/scenario-runner/src/native-export.ts (exportScenarioNativeJsonl)",
-    trainingPrep:
-      "packages/training/scripts/prepare_eliza1_trajectory_dataset.py",
-  },
-  families: {
-    scenario: scenarioFamily(),
-    benchmark: benchmarkFamily(),
-    e2e: e2eFamily(),
-  },
-};
+/** Build a fresh inventory of every trajectory-producing corpus family. */
+export function buildManifest({
+  benchmarkAdapters = discoverBenchmarkAdapters(),
+} = {}) {
+  return {
+    schema: "gpt55_harvest_manifest",
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    repoRoot: ".",
+    goal: "Run every elizaOS scenario+benchmark+e2e through gpt-5.5 (Codex subscription), harvest correct eliza_native_v1 trajectories, GEPA-repair failures, fine-tune on Nebius.",
+    provider: {
+      mechanism:
+        "ELIZA_CHAT_VIA_CLI CLI-subscription backend (packages/core/src/testing/live-provider.ts selectCliProvider)",
+      backend: "codex",
+      model: "gpt-5.5",
+      modelOverrideEnv: "ELIZA_CLI_CODEX_MODEL",
+      plugin: "@elizaos/plugin-cli-inference",
+      credentialsPath:
+        "~/.codex/auth.json (ChatGPT-OAuth; eliza never sees the token)",
+      env: {
+        ELIZA_CHAT_VIA_CLI: "codex",
+        ELIZA_CLI_CODEX_MODEL: "gpt-5.5",
+      },
+      note: "Stage-1 leg S1 proves ONE real scenario through this seam live. The driver consumes S1's proven provider env verbatim.",
+    },
+    trajectoryFormat: {
+      name: "eliza_native_v1",
+      definedIn:
+        "packages/core/src/services/trajectory-types.ts (ElizaNativeTrajectoryRow)",
+      contract: "packages/training/docs/dataset/CANONICAL_RECORD.md",
+      converter:
+        "packages/scenario-runner/src/native-export.ts (exportScenarioNativeJsonl)",
+      trainingPrep:
+        "packages/training/scripts/prepare_eliza1_trajectory_dataset.py",
+    },
+    families: {
+      scenario: scenarioFamily(),
+      benchmark: benchmarkFamily(benchmarkAdapters),
+      e2e: e2eFamily(),
+    },
+  };
+}
 
-const outPath = arg("--out", path.join(__dirname, "manifest.json"));
-writeFileSync(outPath, JSON.stringify(manifest, null, 2));
+/** Write the corpus manifest requested by the command-line caller. */
+export function main(argv = process.argv.slice(2), options) {
+  const manifest = buildManifest(options);
+  const outPath = arg(argv, "--out", path.join(__dirname, "manifest.json"));
+  writeFileSync(outPath, JSON.stringify(manifest, null, 2));
 
-const s = manifest.families.scenario;
-const sBase = s.items.reduce((a, i) => a + i.baseScenarios, 0);
-const sExp = s.items.reduce((a, i) => a + i.expandedScenarios, 0);
-const sFiles = s.items.reduce((a, i) => a + i.scenarioFiles, 0);
-process.stdout.write(
-  `manifest → ${outPath}\n` +
-    `scenario family: ${s.items.length} dirs, ${sFiles} files, ${sBase} base scenarios, ${sExp} expanded\n` +
-    `benchmark family: ${manifest.families.benchmark.adapterCount} adapters\n` +
-    `e2e family: ${manifest.families.e2e.liveLaneCount} live lanes\n`,
-);
+  const scenario = manifest.families.scenario;
+  const baseScenarios = scenario.items.reduce(
+    (total, item) => total + item.baseScenarios,
+    0,
+  );
+  const expandedScenarios = scenario.items.reduce(
+    (total, item) => total + item.expandedScenarios,
+    0,
+  );
+  const scenarioFiles = scenario.items.reduce(
+    (total, item) => total + item.scenarioFiles,
+    0,
+  );
+  process.stdout.write(
+    `manifest → ${outPath}\n` +
+      `scenario family: ${scenario.items.length} dirs, ${scenarioFiles} files, ${baseScenarios} base scenarios, ${expandedScenarios} expanded\n` +
+      `benchmark family: ${manifest.families.benchmark.adapterCount} adapters\n` +
+      `e2e family: ${manifest.families.e2e.liveLaneCount} live lanes\n`,
+  );
+
+  return { manifest, outPath };
+}
+
+const entrypoint = process.argv[1]
+  ? pathToFileURL(path.resolve(process.argv[1])).href
+  : undefined;
+if (import.meta.url === entrypoint) main();
