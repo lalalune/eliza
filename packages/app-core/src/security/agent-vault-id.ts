@@ -20,7 +20,7 @@ export const ELIZA_AGENT_VAULT_SERVICE = "ai.elizaos.agent.vault";
 
 // Inlined state-dir resolution (rather than core's composition helper) that
 // reads via the alias-aware `readAliasedEnv`, so a branded prefix (e.g.
-// `MILADY_STATE_DIR`) resolves the same vault id from the alias table, with no
+// `ACME_STATE_DIR`) resolves the same vault id from the alias table, with no
 // `process.env` mirror involved.
 function resolveStateDir(): string {
   const explicit = readAliasedEnv("ELIZA_STATE_DIR");
