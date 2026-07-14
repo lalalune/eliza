@@ -91,6 +91,11 @@ try {
   );
   write(
     dir,
+    "packages/demo/src/prose-only.ts",
+    "/** Resolves the canonical value. */\n/* c8 ignore next */\nexport const proseStable = 1;\n",
+  );
+  write(
+    dir,
     "packages/demo/src/vite-directive.ts",
     'export const load = () => import("./module");\n',
   );
@@ -127,6 +132,11 @@ try {
     dir,
     "packages/demo/src/runtime-changed.ts",
     "export const changed: number = 2;\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/prose-only.ts",
+    "/** Resolves the canonical value for every Eliza agent runtime. */\n/* c8 ignore next */\nexport const proseStable = 1;\n",
   );
   write(
     dir,
@@ -439,6 +449,7 @@ try {
 
   assertCase("runtime-equivalent source changes are not LCOV-enforced", () => {
     assert.ok(!out.files.includes("packages/demo/src/runtime-equivalent.ts"));
+    assert.ok(!out.files.includes("packages/demo/src/prose-only.ts"));
     assert.ok(
       out.files.includes("packages/demo/src/runtime-changed.ts"),
       `runtime change missing from changed source: ${out.files.join(",")}`,
