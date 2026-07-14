@@ -174,7 +174,6 @@ type AgentModule = {
 	dispatchRoute: DispatchRoute;
 };
 
-const IOS_BRIDGE_DEFAULT_ENV_PREFIX = "MILADY";
 const IOS_BRIDGE_BRAND_ENV_SUFFIXES = [
 	"STATE_DIR",
 	"NAMESPACE",
@@ -1978,7 +1977,7 @@ function installIosBridgeEnvAliases(): void {
 }
 
 function resolveIosBridgeEnvAliases(): ReturnType<typeof buildBrandEnvAliases> {
-	const prefixes = new Set<string>([IOS_BRIDGE_DEFAULT_ENV_PREFIX]);
+	const prefixes = new Set<string>();
 	for (const key of Object.keys(process.env)) {
 		for (const suffix of IOS_BRIDGE_BRAND_ENV_SUFFIXES) {
 			const marker = `_${suffix}`;

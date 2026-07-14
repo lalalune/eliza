@@ -184,7 +184,10 @@ function benchmarkFamily() {
   }
   for (const line of rawList.split("\n")) {
     const m = line.match(/^-\s+(\S+)\s+dir=(\S+)\s+cwd=(.+)$/);
-    if (m) adapters.push({ id: m[1], dir: m[2], cwd: m[3].trim() });
+    if (m) {
+      const cwd = path.relative(REPO_ROOT, m[3].trim()) || ".";
+      adapters.push({ id: m[1], dir: m[2], cwd });
+    }
   }
   if (adapters.length === 0)
     adapters = [
@@ -251,7 +254,7 @@ const manifest = {
   schema: "gpt55_harvest_manifest",
   schemaVersion: 1,
   generatedAt: new Date().toISOString(),
-  repoRoot: REPO_ROOT,
+  repoRoot: ".",
   goal: "Run every elizaOS scenario+benchmark+e2e through gpt-5.5 (Codex subscription), harvest correct eliza_native_v1 trajectories, GEPA-repair failures, fine-tune on Nebius.",
   provider: {
     mechanism:
