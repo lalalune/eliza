@@ -29,7 +29,7 @@ const IOS_AUTH_CALLBACK_DELAY_MS = Number.parseInt(
 // checkout is nested inside a consumer monorepo that wraps it as `eliza/`,
 // `resolveRepoRootFromImportMeta` (by design for consumer wrappers) walks up
 // to the OUTER repo, so `resolveMainAppDir` audits the consumer's manifest
-// and fires the consumer's URL scheme (e.g. `milady://auth/callback`) instead
+// and fires the consumer's URL scheme (e.g. `acme://auth/callback`) instead
 // of this repo's `ai.elizaos.app` / `elizaos://`. Mirror the Android build
 // lane's `ELIZA_MOBILE_REPO_ROOT` pin (run-mobile-build.mjs) and add an
 // explicit `--app-dir` override so each repo's `test:sim:auth:*` lane
