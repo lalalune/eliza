@@ -1744,7 +1744,7 @@ export async function startEliza(
     // renderer's hardcoded API base; honor it when present. CLI/server-only
     // mode (no ELIZA_API_PORT) keeps the legacy `resolveServerOnlyPort`
     // default (2138) so this change is transparent for non-desktop users.
-    // The presence check is alias-aware so a branded `MILADY_API_PORT` also
+    // The presence check is alias-aware so a branded `ACME_API_PORT` also
     // selects the desktop port without relying on the process.env mirror.
     const apiPort = readAliasedEnv("ELIZA_API_PORT")
       ? resolveDesktopApiPort(process.env)
