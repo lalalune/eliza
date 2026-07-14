@@ -779,12 +779,14 @@ describe("buildModelMetadata (RUNTIME_MODEL_CONTEXT self-report)", () => {
     claudeLarge: process.env.ELIZA_CLI_CLAUDE_MODEL,
     claudePlanner: process.env.ELIZA_CLI_CLAUDE_PLANNER_MODEL,
     codexLarge: process.env.ELIZA_CLI_CODEX_MODEL,
+    codexPlanner: process.env.ELIZA_CLI_CODEX_PLANNER_MODEL,
   };
   afterEach(() => {
     process.env.ELIZA_PLANNER_NATIVE_TOOLS = prev.planner ?? "";
     process.env.ELIZA_CLI_CLAUDE_MODEL = prev.claudeLarge ?? "";
     process.env.ELIZA_CLI_CLAUDE_PLANNER_MODEL = prev.claudePlanner ?? "";
     process.env.ELIZA_CLI_CODEX_MODEL = prev.codexLarge ?? "";
+    process.env.ELIZA_CLI_CODEX_PLANNER_MODEL = prev.codexPlanner ?? "";
   });
 
   it("is undefined when the plugin is inert", () => {
