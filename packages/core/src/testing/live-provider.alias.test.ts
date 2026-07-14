@@ -1,7 +1,7 @@
 /**
  * Proves the live-provider on-disk cloud-key resolution reads ELIZA_NAMESPACE and
  * ELIZA_CONFIG_PATH through the alias-aware reader (#13422), so a non-eliza brand
- * prefix (MILADY_*) resolves, the canonical ELIZA_* key wins, a blank canonical
+ * prefix (ACME_*) resolves, the canonical ELIZA_* key wins, a blank canonical
  * value is treated as unset, and the reader never mirror-writes an ELIZA_* key.
  * Deterministic: drives the real selectLiveProvider() cloud branch against a
  * temp config file, mutating and restoring process.env / the boot-config alias
@@ -14,10 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { peekAmbientSingleton, setAmbientSingleton } from "../ambient-context";
 
 const BOOT_CONFIG_KEY = Symbol.for("elizaos.app.boot-config");
-const MILADY_ALIASES = [
-	["MILADY_NAMESPACE", "ELIZA_NAMESPACE"],
-	["MILADY_CONFIG_PATH", "ELIZA_CONFIG_PATH"],
-	["MILADY_STATE_DIR", "ELIZA_STATE_DIR"],
+const ACME_ALIASES = [
+	["ACME_NAMESPACE", "ELIZA_NAMESPACE"],
+	["ACME_CONFIG_PATH", "ELIZA_CONFIG_PATH"],
+	["ACME_STATE_DIR", "ELIZA_STATE_DIR"],
 ] as const;
 
 // Any of these routes selectLiveProvider away from the on-disk cloud-key branch;
@@ -33,9 +33,9 @@ const CLEARED_KEYS = [
 	"ELIZAOS_CLOUD_API_KEY",
 	"ELIZA_CLOUD_API_KEY",
 	"ELIZA_CHAT_VIA_CLI",
-	"MILADY_NAMESPACE",
-	"MILADY_CONFIG_PATH",
-	"MILADY_STATE_DIR",
+	"ACME_NAMESPACE",
+	"ACME_CONFIG_PATH",
+	"ACME_STATE_DIR",
 	"ELIZA_NAMESPACE",
 	"ELIZA_CONFIG_PATH",
 	"ELIZA_STATE_DIR",
@@ -67,7 +67,7 @@ describe("live-provider alias-aware config resolution (#13422)", () => {
 		for (const key of CLEARED_KEYS) delete process.env[key];
 		priorBootConfig = peekAmbientSingleton(BOOT_CONFIG_KEY);
 		setAmbientSingleton(BOOT_CONFIG_KEY, {
-			current: { envAliases: MILADY_ALIASES },
+			current: { envAliases: ACME_ALIASES },
 		});
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "live-provider-alias-"));
 	});
@@ -82,48 +82,45 @@ describe("live-provider alias-aware config resolution (#13422)", () => {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it("resolves MILADY_NAMESPACE via the reader to derive the config path", async () => {
+	it("resolves ACME_NAMESPACE via the reader to derive the config path", async () => {
 		// No CONFIG_PATH set: the path is derived from the namespace, so this
-		// exercises resolveAliasedEnvValue("ELIZA_NAMESPACE") picking up MILADY_.
+		// exercises resolveAliasedEnvValue("ELIZA_NAMESPACE") picking up ACME_.
 		// os.homedir() reads $HOME on POSIX but %USERPROFILE% on Windows — set
 		// both so the redirect works on every CI platform.
 		process.env.HOME = tmpDir;
 		process.env.USERPROFILE = tmpDir;
-		process.env.MILADY_NAMESPACE = "miladytest";
-		writeConfig(
-			path.join(tmpDir, ".miladytest", "miladytest.json"),
-			"milady-ns-key",
-		);
+		process.env.ACME_NAMESPACE = "acmetest";
+		writeConfig(path.join(tmpDir, ".acmetest", "acmetest.json"), "acme-ns-key");
 
 		const selectLiveProvider = await freshSelectLiveProvider();
 		const provider = selectLiveProvider();
 
 		expect(provider?.name).toBe("openai");
-		expect(provider?.apiKey).toBe("milady-ns-key");
+		expect(provider?.apiKey).toBe("acme-ns-key");
 		expect(provider?.baseUrl).toContain("elizacloud.ai");
 		// Additive read only — no ELIZA_* mirror written.
 		expect(process.env.ELIZA_NAMESPACE).toBeUndefined();
 	});
 
-	it("resolves MILADY_CONFIG_PATH via the reader (explicit path)", async () => {
-		const file = path.join(tmpDir, "milady.json");
-		writeConfig(file, "milady-path-key");
-		process.env.MILADY_CONFIG_PATH = file;
+	it("resolves ACME_CONFIG_PATH via the reader (explicit path)", async () => {
+		const file = path.join(tmpDir, "acme.json");
+		writeConfig(file, "acme-path-key");
+		process.env.ACME_CONFIG_PATH = file;
 
 		const selectLiveProvider = await freshSelectLiveProvider();
 		const provider = selectLiveProvider();
 
-		expect(provider?.apiKey).toBe("milady-path-key");
+		expect(provider?.apiKey).toBe("acme-path-key");
 		expect(process.env.ELIZA_CONFIG_PATH).toBeUndefined();
 	});
 
-	it("prefers the canonical ELIZA_CONFIG_PATH over the MILADY_ alias", async () => {
+	it("prefers the canonical ELIZA_CONFIG_PATH over the ACME_ alias", async () => {
 		const elizaFile = path.join(tmpDir, "eliza.json");
-		const miladyFile = path.join(tmpDir, "milady.json");
+		const acmeFile = path.join(tmpDir, "acme.json");
 		writeConfig(elizaFile, "eliza-key");
-		writeConfig(miladyFile, "milady-key");
+		writeConfig(acmeFile, "acme-key");
 		process.env.ELIZA_CONFIG_PATH = elizaFile;
-		process.env.MILADY_CONFIG_PATH = miladyFile;
+		process.env.ACME_CONFIG_PATH = acmeFile;
 
 		const selectLiveProvider = await freshSelectLiveProvider();
 		const provider = selectLiveProvider();
@@ -131,23 +128,23 @@ describe("live-provider alias-aware config resolution (#13422)", () => {
 		expect(provider?.apiKey).toBe("eliza-key");
 	});
 
-	it("treats a blank canonical ELIZA_CONFIG_PATH as unset and falls through to MILADY_", async () => {
-		const miladyFile = path.join(tmpDir, "milady.json");
-		writeConfig(miladyFile, "milady-key");
+	it("treats a blank canonical ELIZA_CONFIG_PATH as unset and falls through to ACME_", async () => {
+		const acmeFile = path.join(tmpDir, "acme.json");
+		writeConfig(acmeFile, "acme-key");
 		process.env.ELIZA_CONFIG_PATH = "   ";
-		process.env.MILADY_CONFIG_PATH = miladyFile;
+		process.env.ACME_CONFIG_PATH = acmeFile;
 
 		const selectLiveProvider = await freshSelectLiveProvider();
 		const provider = selectLiveProvider();
 
-		expect(provider?.apiKey).toBe("milady-key");
+		expect(provider?.apiKey).toBe("acme-key");
 	});
 
-	it("does not mirror-write ELIZA_* keys while resolving MILADY_ aliases", async () => {
-		const file = path.join(tmpDir, "milady.json");
-		writeConfig(file, "milady-key");
-		process.env.MILADY_NAMESPACE = "miladytest";
-		process.env.MILADY_CONFIG_PATH = file;
+	it("does not mirror-write ELIZA_* keys while resolving ACME_ aliases", async () => {
+		const file = path.join(tmpDir, "acme.json");
+		writeConfig(file, "acme-key");
+		process.env.ACME_NAMESPACE = "acmetest";
+		process.env.ACME_CONFIG_PATH = file;
 		const before = { ...process.env };
 
 		const selectLiveProvider = await freshSelectLiveProvider();
