@@ -180,6 +180,12 @@ export default defineConfig({
   test: {
     ...baseConfig.test,
     environment: "node",
+    coverage: {
+      ...baseConfig.test?.coverage,
+      // This executable CLI exposes pure seed/validation helpers to its src test;
+      // keep it in that test's LCOV despite living outside the default src glob.
+      include: ["src/**/*.ts", "scripts/lifeops-gepa-seed.ts"],
+    },
     include: [
       "test/**/*.test.ts",
       "src/**/*.test.ts",
