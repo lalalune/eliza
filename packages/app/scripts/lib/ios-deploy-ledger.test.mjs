@@ -3,13 +3,13 @@
  * renderer-freshness compare (issue #14337). Exercises the real read/write/
  * update round-trip against a temp JSONL file and the pure stamp comparison
  * against fresh/stale manifest fixtures — no device, no simulator. Runs in the
- * packages/app vitest suite (`bun run --cwd packages/app test`, root
- * test:client lane).
+ * package's Bun script-test phase (`bun run --cwd packages/app test`, root
+ * test:client lane), which also emits script coverage in the changed-file gate.
  */
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   appendDeployRecord,
   buildDeployRecord,
