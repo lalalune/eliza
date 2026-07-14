@@ -1,6 +1,6 @@
 /**
  * Proves #13422: the eliza-1 bench model-dir mirror resolves a NON-ELIZA brand
- * prefix (MILADY_STATE_DIR / MILADY_NAMESPACE) through the boot-config alias
+ * prefix (ACME_STATE_DIR / ACME_NAMESPACE) through the boot-config alias
  * table via core's non-mutating reader — canonical ELIZA_ wins, empty is unset,
  * and no ELIZA_ mirror is written. Real function + real resolver, no mocks; only
  * the boot-config global slot and process.env are saved/restored per case.
@@ -16,16 +16,16 @@ type Slot = Record<PropertyKey, unknown>;
 
 // A NON-ELIZA prefix is the security-relevant fixture; an ELIZA->ELIZA
 // self-mirror would prove nothing about brand-alias resolution.
-const MILADY_ALIASES = [
-  ["MILADY_STATE_DIR", "ELIZA_STATE_DIR"],
-  ["MILADY_NAMESPACE", "ELIZA_NAMESPACE"],
+const ACME_ALIASES = [
+  ["ACME_STATE_DIR", "ELIZA_STATE_DIR"],
+  ["ACME_NAMESPACE", "ELIZA_NAMESPACE"],
 ] as const;
 
 describe("benchElizaModelsDir resolves a branded prefix without the sync mirror (#13422)", () => {
   const tracked = [
-    "MILADY_STATE_DIR",
+    "ACME_STATE_DIR",
     "ELIZA_STATE_DIR",
-    "MILADY_NAMESPACE",
+    "ACME_NAMESPACE",
     "ELIZA_NAMESPACE",
   ];
   const savedEnv: Record<string, string | undefined> = {};
@@ -42,7 +42,7 @@ describe("benchElizaModelsDir resolves a branded prefix without the sync mirror 
     }
     // Install the alias table exactly as the branded app boot does; this is what
     // makes the resolver's default alias source resolve branded keys.
-    slot[STORE_KEY] = { current: { envAliases: MILADY_ALIASES } };
+    slot[STORE_KEY] = { current: { envAliases: ACME_ALIASES } };
   });
 
   afterEach(() => {
@@ -57,12 +57,12 @@ describe("benchElizaModelsDir resolves a branded prefix without the sync mirror 
     }
   });
 
-  it("derives the models dir from a branded MILADY_STATE_DIR with zero mirror writes", () => {
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+  it("derives the models dir from a branded ACME_STATE_DIR with zero mirror writes", () => {
+    process.env.ACME_STATE_DIR = "/var/acme/state";
     const before = { ...process.env };
 
     expect(benchElizaModelsDir()).toBe(
-      path.join("/var/milady/state", "local-inference", "models"),
+      path.join("/var/acme/state", "local-inference", "models"),
     );
 
     // The migrated read must not materialize the ELIZA_ target.
@@ -72,21 +72,21 @@ describe("benchElizaModelsDir resolves a branded prefix without the sync mirror 
 
   it("prefers a canonical ELIZA_STATE_DIR over the branded alias", () => {
     process.env.ELIZA_STATE_DIR = "/var/eliza/state";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
     expect(benchElizaModelsDir()).toBe(
       path.join("/var/eliza/state", "local-inference", "models"),
     );
   });
 
-  it("resolves a branded MILADY_NAMESPACE for the homedir fallback", () => {
-    process.env.MILADY_NAMESPACE = "brandns";
+  it("resolves a branded ACME_NAMESPACE for the homedir fallback", () => {
+    process.env.ACME_NAMESPACE = "brandns";
     expect(benchElizaModelsDir()).toBe(
       path.join(homedir(), ".brandns", "local-inference", "models"),
     );
   });
 
   it("treats an empty/whitespace value as unset (empty-is-unset)", () => {
-    process.env.MILADY_STATE_DIR = "   ";
+    process.env.ACME_STATE_DIR = "   ";
     process.env.ELIZA_STATE_DIR = "";
     expect(benchElizaModelsDir()).toBe(
       path.join(homedir(), ".eliza", "local-inference", "models"),
@@ -95,9 +95,9 @@ describe("benchElizaModelsDir resolves a branded prefix without the sync mirror 
 
   it("a blank canonical ELIZA_STATE_DIR does not shadow a present branded alias", () => {
     process.env.ELIZA_STATE_DIR = "";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
     expect(benchElizaModelsDir()).toBe(
-      path.join("/var/milady/state", "local-inference", "models"),
+      path.join("/var/acme/state", "local-inference", "models"),
     );
   });
 });
