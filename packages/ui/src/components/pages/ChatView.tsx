@@ -201,7 +201,6 @@ export function ChatView({
     handleChatStop: s.handleChatStop,
     interruptActiveChatPipeline: s.interruptActiveChatPipeline,
     handleChatEdit: s.handleChatEdit,
-    handleChatDelete: s.handleChatDelete,
     elizaCloudConnected: s.elizaCloudConnected,
     elizaCloudVoiceProxyAvailable: s.elizaCloudVoiceProxyAvailable,
     elizaCloudHasPersistedKey: s.elizaCloudHasPersistedKey,
@@ -230,7 +229,6 @@ export function ChatView({
     handleChatStop,
     interruptActiveChatPipeline,
     handleChatEdit,
-    handleChatDelete,
     elizaCloudConnected,
     elizaCloudVoiceProxyAvailable,
     elizaCloudHasPersistedKey,
@@ -732,7 +730,6 @@ export function ChatView({
   const chatMessageLabels = useMemo(
     () => ({
       cancel: t("common.cancel"),
-      delete: t("aria.deleteMessage"),
       edit: t("aria.editMessage"),
       play: t("aria.playMessage"),
       responseInterrupted: t("chatmessage.ResponseInterrupte"),
@@ -777,15 +774,6 @@ export function ChatView({
       void copyToClipboard(text);
     },
     [copyToClipboard],
-  );
-  // Persistent per-message delete (#13533): the server DELETE + optimistic
-  // removal with rollback lives in handleChatDelete. Distinct from
-  // handleDismissSuggestion, which is a local-only (#8792) removal.
-  const handleDeleteMessage = useCallback(
-    (messageId: string) => {
-      void handleChatDelete(messageId);
-    },
-    [handleChatDelete],
   );
   // Reply arms the composer: set the shared reply target so the next turn
   // carries replyToMessageId (→ REPLY_CONTEXT) and the pill renders above the
@@ -834,7 +822,6 @@ export function ChatView({
           onEdit={handleEditMessage}
           onSpeak={handleSpeakMessage}
           onCopy={handleCopyMessageText}
-          onDelete={handleDeleteMessage}
           onReply={handleReplyMessage}
           onDismissSuggestion={handleDismissSuggestion}
           onAcceptSuggestion={handleAcceptSuggestion}
