@@ -3,7 +3,7 @@
  * #13422 keep the brand-alias contract for `ELIZA_STATE_DIR` — the only
  * alias-table key read at the four migrated sites (`core/cli.ts`
  * export-trajectories input dir + rollback-prompt store root, `cli/train.ts`
- * artifact store root). A branded `MILADY_STATE_DIR` resolves through the real
+ * artifact store root). A branded `ACME_STATE_DIR` resolves through the real
  * shared `readAliasedEnv` those lines now call, the canonical `ELIZA_STATE_DIR`
  * wins when both are set, a blank value is treated as unset, and resolution
  * never materializes the `ELIZA_STATE_DIR` mirror on `process.env`. The migrated
@@ -21,8 +21,8 @@ import {
 } from "@elizaos/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-const ALIAS_PAIRS = buildBrandEnvAliases("MILADY");
-const TRACKED = ["MILADY_STATE_DIR", "ELIZA_STATE_DIR", "TRAINING_STATE_DIR"];
+const ALIAS_PAIRS = buildBrandEnvAliases("ACME");
+const TRACKED = ["ACME_STATE_DIR", "ELIZA_STATE_DIR", "TRAINING_STATE_DIR"];
 
 const savedConfig = getBootConfig();
 const savedEnv: Record<string, string | undefined> = {};
@@ -49,7 +49,7 @@ beforeEach(() => {
     delete process.env[key];
   }
   // Pin the alias table on the immutable BootConfig exactly as a branded
-  // (MILADY) app boot does — this is what makes MILADY_* resolvable without the
+  // (ACME) app boot does — this is what makes ACME_* resolvable without the
   // process.env mirror.
   setBootConfig({ ...savedConfig, envAliases: ALIAS_PAIRS });
 });
@@ -63,19 +63,19 @@ afterEach(() => {
 });
 
 describe("plugin-training ELIZA_STATE_DIR alias reads (#13422 P7)", () => {
-  it("resolves a branded MILADY_STATE_DIR without writing the ELIZA_ mirror", () => {
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+  it("resolves a branded ACME_STATE_DIR without writing the ELIZA_ mirror", () => {
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
-    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/milady/state");
-    expect(exportTrajectoriesInputDir()).toBe("/var/milady/state/trajectories");
-    expect(trainStateDir()).toBe("/var/milady/state");
+    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/acme/state");
+    expect(exportTrajectoriesInputDir()).toBe("/var/acme/state/trajectories");
+    expect(trainStateDir()).toBe("/var/acme/state");
     // Security property: the read must not synthesize the canonical mirror.
     expect(process.env.ELIZA_STATE_DIR).toBeUndefined();
   });
 
   it("prefers the canonical ELIZA_STATE_DIR over the branded alias", () => {
     process.env.ELIZA_STATE_DIR = "/var/eliza/state";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
     expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/eliza/state");
     expect(exportTrajectoriesInputDir()).toBe("/var/eliza/state/trajectories");
@@ -84,11 +84,11 @@ describe("plugin-training ELIZA_STATE_DIR alias reads (#13422 P7)", () => {
 
   it("treats a blank ELIZA_STATE_DIR as unset and still surfaces the branded alias", () => {
     process.env.ELIZA_STATE_DIR = "   ";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
     // empty-is-unset: the blank canonical value must not shadow the alias.
-    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/milady/state");
-    expect(exportTrajectoriesInputDir()).toBe("/var/milady/state/trajectories");
+    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/acme/state");
+    expect(exportTrajectoriesInputDir()).toBe("/var/acme/state/trajectories");
   });
 
   it("falls back to the ~/.eliza default when neither key is set", () => {
@@ -101,7 +101,7 @@ describe("plugin-training ELIZA_STATE_DIR alias reads (#13422 P7)", () => {
 
   it("keeps the raw TRAINING_STATE_DIR ahead of the aliased ELIZA_STATE_DIR in train.ts", () => {
     process.env.TRAINING_STATE_DIR = "/var/training/state";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
 
     expect(trainStateDir()).toBe("/var/training/state");
   });
