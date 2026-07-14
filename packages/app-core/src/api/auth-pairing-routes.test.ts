@@ -549,17 +549,17 @@ describe("auth pairing pair-code route", () => {
   });
 
   // #13422: the pairing gate reads ELIZA_PAIRING_DISABLED through the
-  // alias-aware reader, so a rebranded deployment's MILADY_PAIRING_DISABLED must
+  // alias-aware reader, so a rebranded deployment's ACME_PAIRING_DISABLED must
   // disable pairing WITHOUT the process.env alias-sync mirror mutation, and a
   // present canonical ELIZA_PAIRING_DISABLED must still win over the branded key.
   it("does not reveal a code when pairing is disabled via a branded (non-ELIZA) alias", async () => {
     const savedConfig = getBootConfig();
-    const savedBranded = process.env.MILADY_PAIRING_DISABLED;
+    const savedBranded = process.env.ACME_PAIRING_DISABLED;
     setBootConfig({
       ...savedConfig,
-      envAliases: buildBrandEnvAliases("MILADY"),
+      envAliases: buildBrandEnvAliases("ACME"),
     });
-    process.env.MILADY_PAIRING_DISABLED = "1";
+    process.env.ACME_PAIRING_DISABLED = "1";
     delete process.env.ELIZA_PAIRING_DISABLED;
 
     try {
@@ -582,24 +582,24 @@ describe("auth pairing pair-code route", () => {
     } finally {
       setBootConfig(savedConfig);
       if (savedBranded === undefined) {
-        delete process.env.MILADY_PAIRING_DISABLED;
+        delete process.env.ACME_PAIRING_DISABLED;
       } else {
-        process.env.MILADY_PAIRING_DISABLED = savedBranded;
+        process.env.ACME_PAIRING_DISABLED = savedBranded;
       }
     }
   });
 
   it("keeps a present canonical ELIZA_PAIRING_DISABLED ahead of the branded alias", async () => {
     const savedConfig = getBootConfig();
-    const savedBranded = process.env.MILADY_PAIRING_DISABLED;
+    const savedBranded = process.env.ACME_PAIRING_DISABLED;
     setBootConfig({
       ...savedConfig,
-      envAliases: buildBrandEnvAliases("MILADY"),
+      envAliases: buildBrandEnvAliases("ACME"),
     });
     // Canonical present (and not "1") wins over a branded "1": pairing stays
     // ENABLED, proving the reader honors the ELIZA_* precedence contract.
     process.env.ELIZA_PAIRING_DISABLED = "0";
-    process.env.MILADY_PAIRING_DISABLED = "1";
+    process.env.ACME_PAIRING_DISABLED = "1";
 
     try {
       vi.spyOn(crypto, "randomInt").mockImplementation(() => 0);
@@ -621,9 +621,9 @@ describe("auth pairing pair-code route", () => {
       setBootConfig(savedConfig);
       delete process.env.ELIZA_PAIRING_DISABLED;
       if (savedBranded === undefined) {
-        delete process.env.MILADY_PAIRING_DISABLED;
+        delete process.env.ACME_PAIRING_DISABLED;
       } else {
-        process.env.MILADY_PAIRING_DISABLED = savedBranded;
+        process.env.ACME_PAIRING_DISABLED = savedBranded;
       }
     }
   });
