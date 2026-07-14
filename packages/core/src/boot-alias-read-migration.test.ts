@@ -16,23 +16,23 @@ const STORE_KEY = Symbol.for("elizaos.app.boot-config");
 const WINDOW_KEY = "__ELIZAOS_APP_BOOT_CONFIG__";
 type Slot = Record<PropertyKey, unknown>;
 
-// The real MILADY-branded pairs for the keys under test. A NON-ELIZA prefix is
+// The real ACME-branded pairs for the keys under test. A NON-ELIZA prefix is
 // the security-relevant fixture; an ELIZA->ELIZA self-mirror proves nothing.
-const MILADY_ALIASES = [
-	["MILADY_STATE_DIR", "ELIZA_STATE_DIR"],
-	["MILADY_SETTINGS_DEBUG", "ELIZA_SETTINGS_DEBUG"],
-	["VITE_MILADY_SETTINGS_DEBUG", "VITE_ELIZA_SETTINGS_DEBUG"],
+const ACME_ALIASES = [
+	["ACME_STATE_DIR", "ELIZA_STATE_DIR"],
+	["ACME_SETTINGS_DEBUG", "ELIZA_SETTINGS_DEBUG"],
+	["VITE_ACME_SETTINGS_DEBUG", "VITE_ELIZA_SETTINGS_DEBUG"],
 ] as const;
 
 describe("issue #13422 core read-migrations resolve a branded prefix without the mirror", () => {
 	const savedEnv: Record<string, string | undefined> = {};
 	const tracked = [
 		"ELIZA_TRAJECTORY_DIR",
-		"MILADY_STATE_DIR",
+		"ACME_STATE_DIR",
 		"ELIZA_STATE_DIR",
-		"MILADY_SETTINGS_DEBUG",
+		"ACME_SETTINGS_DEBUG",
 		"ELIZA_SETTINGS_DEBUG",
-		"VITE_MILADY_SETTINGS_DEBUG",
+		"VITE_ACME_SETTINGS_DEBUG",
 		"VITE_ELIZA_SETTINGS_DEBUG",
 	];
 	let savedStore: unknown;
@@ -49,7 +49,7 @@ describe("issue #13422 core read-migrations resolve a branded prefix without the
 		// Install the alias table on the shared boot-config store exactly as the app
 		// boot path does; this is what makes resolveAliasedEnvValue's default alias
 		// source resolve branded keys inside the migrated functions.
-		slot[STORE_KEY] = { current: { envAliases: MILADY_ALIASES } };
+		slot[STORE_KEY] = { current: { envAliases: ACME_ALIASES } };
 	});
 
 	afterEach(() => {
@@ -64,12 +64,12 @@ describe("issue #13422 core read-migrations resolve a branded prefix without the
 		}
 	});
 
-	it("resolveTrajectoryDir derives from a branded MILADY_STATE_DIR with zero mirror writes", () => {
-		process.env.MILADY_STATE_DIR = "/var/milady/state";
+	it("resolveTrajectoryDir derives from a branded ACME_STATE_DIR with zero mirror writes", () => {
+		process.env.ACME_STATE_DIR = "/var/acme/state";
 		const before = { ...process.env };
 
 		expect(resolveTrajectoryDir()).toBe(
-			path.join("/var/milady/state", "trajectories"),
+			path.join("/var/acme/state", "trajectories"),
 		);
 
 		// The migrated read must not materialize the ELIZA_ target.
@@ -79,14 +79,14 @@ describe("issue #13422 core read-migrations resolve a branded prefix without the
 
 	it("resolveTrajectoryDir prefers a canonical ELIZA_STATE_DIR over the branded alias", () => {
 		process.env.ELIZA_STATE_DIR = "/var/eliza/state";
-		process.env.MILADY_STATE_DIR = "/var/milady/state";
+		process.env.ACME_STATE_DIR = "/var/acme/state";
 		expect(resolveTrajectoryDir()).toBe(
 			path.join("/var/eliza/state", "trajectories"),
 		);
 	});
 
-	it("isElizaSettingsDebugEnabled honors a branded MILADY_SETTINGS_DEBUG with zero mirror writes", () => {
-		process.env.MILADY_SETTINGS_DEBUG = "1";
+	it("isElizaSettingsDebugEnabled honors a branded ACME_SETTINGS_DEBUG with zero mirror writes", () => {
+		process.env.ACME_SETTINGS_DEBUG = "1";
 		const before = { ...process.env };
 
 		expect(isElizaSettingsDebugEnabled()).toBe(true);
@@ -95,8 +95,8 @@ describe("issue #13422 core read-migrations resolve a branded prefix without the
 		expect(process.env).toEqual(before);
 	});
 
-	it("isElizaSettingsDebugEnabled honors a branded VITE_MILADY_SETTINGS_DEBUG", () => {
-		process.env.VITE_MILADY_SETTINGS_DEBUG = "true";
+	it("isElizaSettingsDebugEnabled honors a branded VITE_ACME_SETTINGS_DEBUG", () => {
+		process.env.VITE_ACME_SETTINGS_DEBUG = "true";
 		expect(isElizaSettingsDebugEnabled()).toBe(true);
 		expect(process.env.VITE_ELIZA_SETTINGS_DEBUG).toBeUndefined();
 	});
@@ -109,7 +109,7 @@ describe("issue #13422 core read-migrations resolve a branded prefix without the
 		// Canonical precedence: an explicit ELIZA_ '0' is the resolved value, so the
 		// branded '1' never surfaces — debug stays off.
 		process.env.ELIZA_SETTINGS_DEBUG = "0";
-		process.env.MILADY_SETTINGS_DEBUG = "1";
+		process.env.ACME_SETTINGS_DEBUG = "1";
 		expect(isElizaSettingsDebugEnabled()).toBe(false);
 	});
 });
