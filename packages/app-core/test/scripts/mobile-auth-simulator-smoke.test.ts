@@ -2,7 +2,7 @@
  * Unit coverage for the mobile-auth-simulator-smoke deep-link target
  * resolution (#13583). Guards against the wrong-target footgun where a nested
  * elizaOS checkout resolves to the OUTER consumer app (firing e.g.
- * `milady://auth/callback` instead of this repo's `elizaos://`), and against
+ * `acme://auth/callback` instead of this repo's `elizaos://`), and against
  * the fire-and-forget deep-link leg that never asserted which package handled
  * the intent.
  */
@@ -23,7 +23,7 @@ import {
 } from "../../scripts/mobile-auth-simulator-smoke.mjs";
 
 const ELIZA_APP_ID = "ai.elizaos.app";
-const CONSUMER_APP_ID = "com.milady.app";
+const CONSUMER_APP_ID = "com.acme.app";
 
 describe("mobile-auth-simulator-smoke: resolve-activity assertion", () => {
   it("parses the --brief bare component line", () => {
@@ -78,7 +78,7 @@ describe("mobile-auth-simulator-smoke: resolve-activity assertion", () => {
     // consumer's MainActivity, not this repo's. Previously fire-and-forget so
     // this exited 0 silently; the resolve-activity preflight must reject it.
     expect(
-      resolvedActivityMatchesApp("com.milady.app/.MainActivity", ELIZA_APP_ID),
+      resolvedActivityMatchesApp("com.acme.app/.MainActivity", ELIZA_APP_ID),
     ).toBe(false);
     // Guard against a prefix-collision false-accept (ai.elizaos.app.other).
     expect(
@@ -302,7 +302,7 @@ describe("mobile-auth-simulator-smoke: target app-dir resolution (#13583)", () =
     const elizaRoot = path.join(tmpRoot, "eliza");
     const consumerRoot = path.join(tmpRoot, "consumer");
     writeAppTree(elizaRoot, ELIZA_APP_ID, "elizaos");
-    writeAppTree(consumerRoot, CONSUMER_APP_ID, "milady");
+    writeAppTree(consumerRoot, CONSUMER_APP_ID, "acme");
 
     process.env.ELIZA_MOBILE_REPO_ROOT = elizaRoot;
     const pinnedEliza = resolveTargetAppDir("");
