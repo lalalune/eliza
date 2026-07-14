@@ -778,17 +778,35 @@ describe("buildModelMetadata (RUNTIME_MODEL_CONTEXT self-report)", () => {
     claudeLarge: process.env.ELIZA_CLI_CLAUDE_MODEL,
     claudePlanner: process.env.ELIZA_CLI_CLAUDE_PLANNER_MODEL,
     codexLarge: process.env.ELIZA_CLI_CODEX_MODEL,
+    codexPlanner: process.env.ELIZA_CLI_CODEX_PLANNER_MODEL,
   };
   afterEach(() => {
     process.env.ELIZA_PLANNER_NATIVE_TOOLS = prev.planner ?? "";
     process.env.ELIZA_CLI_CLAUDE_MODEL = prev.claudeLarge ?? "";
     process.env.ELIZA_CLI_CLAUDE_PLANNER_MODEL = prev.claudePlanner ?? "";
     process.env.ELIZA_CLI_CODEX_MODEL = prev.codexLarge ?? "";
+    process.env.ELIZA_CLI_CODEX_PLANNER_MODEL = prev.codexPlanner ?? "";
   });
 
   it("is undefined when the plugin is inert", () => {
     expect(buildModelMetadata({ ELIZA_CHAT_VIA_CLI: undefined })).toBeUndefined();
     expect(buildModelMetadata({ ELIZA_CHAT_VIA_CLI: "gemini" })).toBeUndefined();
+  });
+
+  it("reports backend defaults when model overrides are empty", () => {
+    process.env.ELIZA_PLANNER_NATIVE_TOOLS = "0";
+    process.env.ELIZA_CLI_CLAUDE_MODEL = "";
+    process.env.ELIZA_CLI_CLAUDE_PLANNER_MODEL = "";
+    process.env.ELIZA_CLI_CODEX_MODEL = "";
+    process.env.ELIZA_CLI_CODEX_PLANNER_MODEL = "";
+
+    const claude = buildModelMetadata({ ELIZA_CHAT_VIA_CLI: "claude-sdk" });
+    expect(claude?.RESPONSE_HANDLER).toEqual({ displayModel: "claude-opus-4-8" });
+    expect(claude?.ACTION_PLANNER).toEqual({ displayModel: "claude-opus-4-8" });
+
+    const codex = buildModelMetadata({ ELIZA_CHAT_VIA_CLI: "codex-sdk" });
+    expect(codex?.RESPONSE_HANDLER).toEqual({ displayModel: "gpt-5.5" });
+    expect(codex?.ACTION_PLANNER).toEqual({ displayModel: "gpt-5.5" });
   });
 
   it("reports the configured claude models per tier (nubs's live config shape)", () => {
