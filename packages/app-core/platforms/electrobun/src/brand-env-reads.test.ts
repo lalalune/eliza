@@ -16,7 +16,7 @@ import {
   resolveRendererUrlFromEnv,
 } from "./brand-env-reads";
 
-const BRAND = "MILADY";
+const BRAND = "ACME";
 const aliases = buildBrandEnvAliases(BRAND);
 const savedConfig = getBootConfig();
 const tracked = [
@@ -34,7 +34,7 @@ beforeEach(() => {
     delete process.env[key];
   }
   // Pin the brand<->eliza alias table on the immutable BootConfig, exactly as
-  // the app boot path does, so the reader can resolve MILADY_* -> ELIZA_*.
+  // the app boot path does, so the reader can resolve ACME_* -> ELIZA_*.
   setBootConfig({ ...savedConfig, envAliases: aliases });
 });
 
@@ -47,20 +47,20 @@ afterEach(() => {
 });
 
 describe("resolveRendererUrlFromEnv", () => {
-  it("resolves the branded MILADY_RENDERER_URL alias", () => {
-    process.env.MILADY_RENDERER_URL = "http://127.0.0.1:5199";
+  it("resolves the branded ACME_RENDERER_URL alias", () => {
+    process.env.ACME_RENDERER_URL = "http://127.0.0.1:5199";
     expect(resolveRendererUrlFromEnv()).toBe("http://127.0.0.1:5199");
   });
 
   it("prefers canonical ELIZA_RENDERER_URL over the branded alias", () => {
     process.env.ELIZA_RENDERER_URL = "http://canonical:6100";
-    process.env.MILADY_RENDERER_URL = "http://branded:6101";
+    process.env.ACME_RENDERER_URL = "http://branded:6101";
     expect(resolveRendererUrlFromEnv()).toBe("http://canonical:6100");
   });
 
   it("a blank ELIZA_RENDERER_URL does not mask a present branded alias", () => {
     process.env.ELIZA_RENDERER_URL = "   ";
-    process.env.MILADY_RENDERER_URL = "http://branded:6102";
+    process.env.ACME_RENDERER_URL = "http://branded:6102";
     expect(resolveRendererUrlFromEnv()).toBe("http://branded:6102");
   });
 
@@ -72,7 +72,7 @@ describe("resolveRendererUrlFromEnv", () => {
   });
 
   it("performs zero alias writes to process.env while resolving", () => {
-    process.env.MILADY_RENDERER_URL = "http://127.0.0.1:5199";
+    process.env.ACME_RENDERER_URL = "http://127.0.0.1:5199";
     const before = { ...process.env };
     resolveRendererUrlFromEnv();
     // The migration exists to stop materializing ELIZA_* targets on read.
@@ -82,21 +82,21 @@ describe("resolveRendererUrlFromEnv", () => {
 });
 
 describe("resolveNamespaceFromEnv", () => {
-  it("resolves the branded MILADY_NAMESPACE alias", () => {
-    process.env.MILADY_NAMESPACE = "milady";
-    expect(resolveNamespaceFromEnv("fallback-brand")).toBe("milady");
+  it("resolves the branded ACME_NAMESPACE alias", () => {
+    process.env.ACME_NAMESPACE = "acme";
+    expect(resolveNamespaceFromEnv("fallback-brand")).toBe("acme");
   });
 
   it("prefers canonical ELIZA_NAMESPACE over the branded alias", () => {
     process.env.ELIZA_NAMESPACE = "eliza";
-    process.env.MILADY_NAMESPACE = "milady";
+    process.env.ACME_NAMESPACE = "acme";
     expect(resolveNamespaceFromEnv("fallback-brand")).toBe("eliza");
   });
 
   it("a blank ELIZA_NAMESPACE does not mask a present branded alias", () => {
     process.env.ELIZA_NAMESPACE = "  ";
-    process.env.MILADY_NAMESPACE = "milady";
-    expect(resolveNamespaceFromEnv("fallback-brand")).toBe("milady");
+    process.env.ACME_NAMESPACE = "acme";
+    expect(resolveNamespaceFromEnv("fallback-brand")).toBe("acme");
   });
 
   it("falls back to the compiled-in brand namespace when unset", () => {
@@ -104,7 +104,7 @@ describe("resolveNamespaceFromEnv", () => {
   });
 
   it("performs zero alias writes to process.env while resolving", () => {
-    process.env.MILADY_NAMESPACE = "milady";
+    process.env.ACME_NAMESPACE = "acme";
     const before = { ...process.env };
     resolveNamespaceFromEnv("fallback-brand");
     expect(process.env.ELIZA_NAMESPACE).toBeUndefined();

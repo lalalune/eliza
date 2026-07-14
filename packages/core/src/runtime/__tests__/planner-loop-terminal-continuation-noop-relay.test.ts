@@ -202,7 +202,7 @@ describe("planner-loop - terminal continuation missing-input relay", () => {
 
 	it("does not leak diagnostic text when the successful tool lacks the noop marker", async () => {
 		const shellLog =
-			"$ cat secrets.txt\nexit 0\ncwd=/home/milady\nAWS_SECRET=leak-me";
+			"$ cat secrets.txt\nexit 0\ncwd=/workspace\nAWS_SECRET=leak-me";
 		const runtime = plannerEmitsNoopThenTerminalText(
 			"I need to call SHELL again before answering.",
 		);

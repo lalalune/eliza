@@ -1,6 +1,6 @@
 /**
  * Proves the bin.ts boot debug-log env reads migrated to `readAliasedEnv`
- * (#13422 P1 long-tail) resolve a NON-ELIZA brand prefix (MILADY_*) through the
+ * (#13422 P1 long-tail) resolve a NON-ELIZA brand prefix (ACME_*) through the
  * boot-config alias table WITHOUT the `process.env alias-sync` mirror mutation, that
  * a present canonical `ELIZA_*` value wins over the branded alias, and that an
  * empty value reads as unset. bin.ts itself is not import-testable (its module
@@ -17,12 +17,12 @@ import {
 } from "@elizaos/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-const MILADY_ALIASES = buildBrandEnvAliases("MILADY");
+const ACME_ALIASES = buildBrandEnvAliases("ACME");
 
 const TOUCHED_ENV_KEYS = [
-  "MILADY_PLATFORM",
+  "ACME_PLATFORM",
   "ELIZA_PLATFORM",
-  "MILADY_STATE_DIR",
+  "ACME_STATE_DIR",
   "ELIZA_STATE_DIR",
 ] as const;
 
@@ -35,7 +35,7 @@ describe("#13422 P1 — alias-aware bin.ts boot debug-log env reads", () => {
       savedEnv.set(key, process.env[key]);
       delete process.env[key];
     }
-    setBootConfig({ ...savedConfig, envAliases: MILADY_ALIASES });
+    setBootConfig({ ...savedConfig, envAliases: ACME_ALIASES });
   });
 
   afterEach(() => {
@@ -48,34 +48,34 @@ describe("#13422 P1 — alias-aware bin.ts boot debug-log env reads", () => {
   });
 
   describe("ELIZA_PLATFORM", () => {
-    it("resolves from the branded MILADY_PLATFORM without writing the ELIZA mirror", () => {
-      process.env.MILADY_PLATFORM = "android";
+    it("resolves from the branded ACME_PLATFORM without writing the ELIZA mirror", () => {
+      process.env.ACME_PLATFORM = "android";
       expect(readAliasedEnv("ELIZA_PLATFORM")).toBe("android");
       expect(process.env.ELIZA_PLATFORM).toBeUndefined();
     });
 
     it("lets a present canonical ELIZA_PLATFORM win over the branded alias", () => {
       process.env.ELIZA_PLATFORM = "ios";
-      process.env.MILADY_PLATFORM = "android";
+      process.env.ACME_PLATFORM = "android";
       expect(readAliasedEnv("ELIZA_PLATFORM")).toBe("ios");
     });
 
     it("reads an empty branded value as unset", () => {
-      process.env.MILADY_PLATFORM = "   ";
+      process.env.ACME_PLATFORM = "   ";
       expect(readAliasedEnv("ELIZA_PLATFORM")).toBeUndefined();
     });
   });
 
   describe("ELIZA_STATE_DIR", () => {
-    it("resolves from the branded MILADY_STATE_DIR without writing the ELIZA mirror", () => {
-      process.env.MILADY_STATE_DIR = "/data/milady/state";
-      expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/data/milady/state");
+    it("resolves from the branded ACME_STATE_DIR without writing the ELIZA mirror", () => {
+      process.env.ACME_STATE_DIR = "/data/acme/state";
+      expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/data/acme/state");
       expect(process.env.ELIZA_STATE_DIR).toBeUndefined();
     });
 
     it("lets a present canonical ELIZA_STATE_DIR win over the branded alias", () => {
       process.env.ELIZA_STATE_DIR = "/canonical/state";
-      process.env.MILADY_STATE_DIR = "/data/milady/state";
+      process.env.ACME_STATE_DIR = "/data/acme/state";
       expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/canonical/state");
     });
 
