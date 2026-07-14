@@ -3,8 +3,9 @@
  * bounds parsing, the seed-task table, and the persist gate that only promotes an
  * optimized prompt when it beats the baseline. No model calls.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  main,
   parseBoundedIntegerArg,
   SEED_TASKS,
   validatePersistableResult,
@@ -36,6 +37,21 @@ describe("lifeops-gepa-seed", () => {
       "schedule_plan",
       "screentime_recap",
     ]);
+  });
+
+  it("rejects an unknown task before selecting or calling a model", async () => {
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      await expect(main(["--task", "unknown-task"])).resolves.toBe(1);
+      expect(stderr.mock.calls.flat().join("")).toContain(
+        'unknown --task "unknown-task"',
+      );
+      expect(stderr.mock.calls.flat().join("")).toContain("calendar_extract");
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it("uses the live health planner baseline and JSON-shaped examples", () => {
@@ -298,6 +314,10 @@ describe("lifeops-gepa-seed", () => {
     const inputs = seed.dataset.map((example) => example.input.user).join("\n");
     expect(inputs).toContain("lifecycle: escalation");
     expect(inputs).toContain("urgency: critical");
+    expect(inputs).toContain("Name: Eliza");
+    expect(inputs).toContain(
+      "Eliza: deal — coffee is a load-bearing beverage.",
+    );
     // Multilingual coverage per the GEPA real-conversation requirement.
     expect(inputs).toContain("la basura");
     expect(inputs).toContain("appeler maman");
