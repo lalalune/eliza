@@ -35,7 +35,7 @@ describe("planner-loop — post-tool evaluator failure recovery", () => {
 	it("relays the successful tool result when the evaluator provider call fails (HTTP 400)", async () => {
 		// The real FILE write action marks its confirmation user-facing
 		// (`userFacingSuccessResult`); mirror that opt-in here.
-		const wrote = "Wrote 16 bytes to /home/milady/hello-elizacode.txt";
+		const wrote = "Wrote 16 bytes to /workspace/hello-elizacode.txt";
 		const executeToolCall = vi.fn(async () => ({
 			success: true,
 			text: wrote,
@@ -79,7 +79,7 @@ describe("planner-loop — post-tool evaluator failure recovery", () => {
 	it("propagates a non-provider error even when a tool succeeded — not a bug-swallower", async () => {
 		// A programmer/schema bug carries no HTTP status or network code, so it must
 		// surface instead of being masked as a finished turn by the relay.
-		const wrote = "Wrote 16 bytes to /home/milady/hello-elizacode.txt";
+		const wrote = "Wrote 16 bytes to /workspace/hello-elizacode.txt";
 		const executeToolCall = vi.fn(async () => ({
 			success: true,
 			text: wrote,
@@ -108,7 +108,7 @@ describe("planner-loop — post-tool evaluator failure recovery", () => {
 		// channel; with nothing user-facing to relay it rethrows the provider error
 		// instead.
 		const shellLog =
-			"$ cat secrets.txt\nexit 0\ncwd=/home/milady\nAWS_SECRET=leak-me";
+			"$ cat secrets.txt\nexit 0\ncwd=/workspace\nAWS_SECRET=leak-me";
 		const executeToolCall = vi.fn(async () => ({
 			success: true,
 			text: shellLog,
@@ -130,7 +130,7 @@ describe("planner-loop — post-tool evaluator failure recovery", () => {
 	it("does not regress the happy path — returns the evaluator's message on FINISH", async () => {
 		const evaluatorMessage =
 			"Created hello-elizacode.txt with ELIZA CODE WORKS.";
-		const wrote = "Wrote 16 bytes to /home/milady/hello-elizacode.txt";
+		const wrote = "Wrote 16 bytes to /workspace/hello-elizacode.txt";
 		// FILE now sets userFacingText, yet an explicit evaluator messageToUser
 		// still outranks it (verifiedUserFacing is deliberately unset).
 		const executeToolCall = vi.fn(async () => ({
