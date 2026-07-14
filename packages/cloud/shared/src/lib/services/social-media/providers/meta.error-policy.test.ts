@@ -159,7 +159,7 @@ describe("metaProvider.getAccountAnalytics — internal failure propagates, empt
     globalThis.fetch = mock(async () =>
       jsonResponse({
         id: "ig-1",
-        username: "milady",
+        username: "elizaOS",
         followers_count: 500,
         follows_count: 42,
         media_count: 8,
@@ -179,7 +179,7 @@ describe("metaProvider.getAccountAnalytics — internal failure propagates, empt
 
   it("returns real Facebook page metrics on success", async () => {
     globalThis.fetch = mock(async () =>
-      jsonResponse({ id: "page-1", name: "Milady", fan_count: 1234 }),
+      jsonResponse({ id: "page-1", name: "elizaOS", fan_count: 1234 }),
     ) as typeof fetch;
 
     const result = await metaProvider.getAccountAnalytics!({

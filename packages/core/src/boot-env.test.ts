@@ -97,21 +97,21 @@ describe("boot config store is write-once", () => {
 	});
 });
 
-// Non-ELIZA white-label brand boot: with a MILADY_* alias table on the store and
+// Non-ELIZA white-label brand boot: with an ACME_* alias table on the store and
 // NO process.env mirror mutation, every boot-critical key must still resolve to
-// its MILADY_* value through the reader, and a canonical ELIZA_* value must win
+// its ACME_* value through the reader, and a canonical ELIZA_* value must win
 // when both are set. This is the regression proof that deleting the mirror is
-// safe for brands like Milady (#13423 / #12251 finale).
+// safe for arbitrary white-label brands (#13423 / #12251 finale).
 describe("non-ELIZA brand boot resolves via the reader (no mirror)", () => {
 	const BOOT_CRITICAL: ReadonlyArray<readonly [string, string]> = [
-		["MILADY_STATE_DIR", "ELIZA_STATE_DIR"],
-		["MILADY_API_TOKEN", "ELIZA_API_TOKEN"],
-		["MILADY_API_PORT", "ELIZA_API_PORT"],
-		["MILADY_UI_PORT", "ELIZA_UI_PORT"],
-		["MILADY_NAMESPACE", "ELIZA_NAMESPACE"],
-		["MILADY_CONFIG_PATH", "ELIZA_CONFIG_PATH"],
-		["MILADY_ALLOWED_ORIGINS", "ELIZA_ALLOWED_ORIGINS"],
-		["MILADY_PLATFORM", "ELIZA_PLATFORM"],
+		["ACME_STATE_DIR", "ELIZA_STATE_DIR"],
+		["ACME_API_TOKEN", "ELIZA_API_TOKEN"],
+		["ACME_API_PORT", "ELIZA_API_PORT"],
+		["ACME_UI_PORT", "ELIZA_UI_PORT"],
+		["ACME_NAMESPACE", "ELIZA_NAMESPACE"],
+		["ACME_CONFIG_PATH", "ELIZA_CONFIG_PATH"],
+		["ACME_ALLOWED_ORIGINS", "ELIZA_ALLOWED_ORIGINS"],
+		["ACME_PLATFORM", "ELIZA_PLATFORM"],
 	];
 	const tracked = BOOT_CRITICAL.flat();
 	const savedEnv: Record<string, string | undefined> = {};
@@ -136,16 +136,16 @@ describe("non-ELIZA brand boot resolves via the reader (no mirror)", () => {
 		}
 	});
 
-	it("resolves each boot-critical key from its MILADY_* value without mirroring", () => {
+	it("resolves each boot-critical key from its ACME_* value without mirroring", () => {
 		for (const [brand] of BOOT_CRITICAL) {
-			process.env[brand] = `milady-${brand}`;
+			process.env[brand] = `acme-${brand}`;
 		}
 		const before = { ...process.env };
 
 		for (const [brand, eliza] of BOOT_CRITICAL) {
 			// A consumer that reads the canonical ELIZA_* key resolves the branded
 			// value through the alias table, without the mirror ever running.
-			expect(resolveAliasedEnvValue(eliza)).toBe(`milady-${brand}`);
+			expect(resolveAliasedEnvValue(eliza)).toBe(`acme-${brand}`);
 			// And nothing was written back — the ELIZA_* mirror is never created.
 			expect(process.env[eliza]).toBeUndefined();
 		}
@@ -156,7 +156,7 @@ describe("non-ELIZA brand boot resolves via the reader (no mirror)", () => {
 
 	it("prefers the canonical ELIZA_* value when both brand and canonical are set", () => {
 		for (const [brand, eliza] of BOOT_CRITICAL) {
-			process.env[brand] = `milady-${brand}`;
+			process.env[brand] = `acme-${brand}`;
 			process.env[eliza] = `eliza-${eliza}`;
 		}
 		for (const [_brand, eliza] of BOOT_CRITICAL) {

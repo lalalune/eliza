@@ -1,6 +1,6 @@
 /**
  * Proves the boot-critical auth/token/port env reads migrated to `readAliasedEnv`
- * (#13422 P3) resolve a NON-ELIZA brand prefix (MILADY_*) through the boot-config
+ * (#13422 P3) resolve a NON-ELIZA brand prefix (ACME_*) through the boot-config
  * alias table WITHOUT the `process.env alias-sync` mirror mutation, and that a present
  * canonical `ELIZA_*` value still wins over the branded alias. Drives the real
  * exported helpers (`resolveCorsOrigin`, `pairingEnabled`, `resolveTerminalRunRejection`,
@@ -28,26 +28,26 @@ import {
 import { resolveMcpTerminalAuthorizationRejection } from "./server-helpers-mcp.ts";
 import { resolveWalletExportRejection } from "./server-helpers-wallet.ts";
 
-const MILADY_ALIASES = buildBrandEnvAliases("MILADY");
+const ACME_ALIASES = buildBrandEnvAliases("ACME");
 
 // Every canonical + branded key any test below touches. Snapshotted and cleared
 // around each test so a leaked value can never make an alias read pass by mirror.
 const TOUCHED_ENV_KEYS = [
-  "MILADY_CLOUD_PROVISIONED",
+  "ACME_CLOUD_PROVISIONED",
   "ELIZA_CLOUD_PROVISIONED",
-  "MILADY_PAIRING_DISABLED",
+  "ACME_PAIRING_DISABLED",
   "ELIZA_PAIRING_DISABLED",
-  "MILADY_TERMINAL_RUN_TOKEN",
+  "ACME_TERMINAL_RUN_TOKEN",
   "ELIZA_TERMINAL_RUN_TOKEN",
-  "MILADY_WALLET_EXPORT_TOKEN",
+  "ACME_WALLET_EXPORT_TOKEN",
   "ELIZA_WALLET_EXPORT_TOKEN",
-  "MILADY_ALLOW_WS_QUERY_TOKEN",
+  "ACME_ALLOW_WS_QUERY_TOKEN",
   "ELIZA_ALLOW_WS_QUERY_TOKEN",
-  "MILADY_API_PORT",
+  "ACME_API_PORT",
   "ELIZA_API_PORT",
-  "MILADY_CHAT_GENERATION_TIMEOUT_MS",
+  "ACME_CHAT_GENERATION_TIMEOUT_MS",
   "ELIZA_CHAT_GENERATION_TIMEOUT_MS",
-  "MILADY_API_TOKEN",
+  "ACME_API_TOKEN",
   "ELIZA_API_TOKEN",
   "ELIZA_API_BIND",
   "ELIZA_ALLOW_UNAUTHENTICATED_STDIO_MCP",
@@ -66,7 +66,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
       savedEnv.set(key, process.env[key]);
       delete process.env[key];
     }
-    setBootConfig({ ...savedConfig, envAliases: MILADY_ALIASES });
+    setBootConfig({ ...savedConfig, envAliases: ACME_ALIASES });
   });
 
   afterEach(() => {
@@ -79,26 +79,26 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
   });
 
   describe("resolveCorsOrigin — ELIZA_CLOUD_PROVISIONED", () => {
-    it("allows any origin from the branded MILADY_CLOUD_PROVISIONED flag without writing the ELIZA mirror", () => {
-      process.env.MILADY_CLOUD_PROVISIONED = "1";
-      expect(resolveCorsOrigin("https://dashboard.milady.example")).toBe(
-        "https://dashboard.milady.example",
+    it("allows any origin from the branded ACME_CLOUD_PROVISIONED flag without writing the ELIZA mirror", () => {
+      process.env.ACME_CLOUD_PROVISIONED = "1";
+      expect(resolveCorsOrigin("https://dashboard.acme.example")).toBe(
+        "https://dashboard.acme.example",
       );
       expect(process.env.ELIZA_CLOUD_PROVISIONED).toBeUndefined();
     });
 
     it("lets a present canonical ELIZA_CLOUD_PROVISIONED win over the branded alias", () => {
       process.env.ELIZA_CLOUD_PROVISIONED = "0";
-      process.env.MILADY_CLOUD_PROVISIONED = "1";
+      process.env.ACME_CLOUD_PROVISIONED = "1";
       // ELIZA "0" wins → allow-all is OFF → a non-local origin is rejected.
-      expect(resolveCorsOrigin("https://dashboard.milady.example")).toBeNull();
+      expect(resolveCorsOrigin("https://dashboard.acme.example")).toBeNull();
     });
   });
 
   describe("pairingEnabled — ELIZA_PAIRING_DISABLED", () => {
-    it("is disabled by the branded MILADY_PAIRING_DISABLED flag without writing the ELIZA mirror", () => {
+    it("is disabled by the branded ACME_PAIRING_DISABLED flag without writing the ELIZA mirror", () => {
       process.env.ELIZA_API_TOKEN = "pairing-api-token";
-      process.env.MILADY_PAIRING_DISABLED = "1";
+      process.env.ACME_PAIRING_DISABLED = "1";
       expect(pairingEnabled()).toBe(false);
       expect(process.env.ELIZA_PAIRING_DISABLED).toBeUndefined();
     });
@@ -106,17 +106,17 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
     it("lets a present canonical ELIZA_PAIRING_DISABLED=0 win over the branded disable flag", () => {
       process.env.ELIZA_API_TOKEN = "pairing-api-token";
       process.env.ELIZA_PAIRING_DISABLED = "0";
-      process.env.MILADY_PAIRING_DISABLED = "1";
+      process.env.ACME_PAIRING_DISABLED = "1";
       expect(pairingEnabled()).toBe(true);
     });
   });
 
   describe("resolveTerminalRunRejection — ELIZA_TERMINAL_RUN_TOKEN", () => {
-    it("authorizes against the branded MILADY_TERMINAL_RUN_TOKEN without writing the ELIZA mirror", () => {
-      process.env.MILADY_TERMINAL_RUN_TOKEN = "milady-terminal-secret";
+    it("authorizes against the branded ACME_TERMINAL_RUN_TOKEN without writing the ELIZA mirror", () => {
+      process.env.ACME_TERMINAL_RUN_TOKEN = "acme-terminal-secret";
       expect(
         resolveTerminalRunRejection(asReq(), {
-          terminalToken: "milady-terminal-secret",
+          terminalToken: "acme-terminal-secret",
         }),
       ).toBeNull();
       expect(
@@ -127,7 +127,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
 
     it("lets a present canonical ELIZA_TERMINAL_RUN_TOKEN win over the branded alias", () => {
       process.env.ELIZA_TERMINAL_RUN_TOKEN = "canonical-terminal-secret";
-      process.env.MILADY_TERMINAL_RUN_TOKEN = "brand-terminal-secret";
+      process.env.ACME_TERMINAL_RUN_TOKEN = "brand-terminal-secret";
       expect(
         resolveTerminalRunRejection(asReq(), {
           terminalToken: "canonical-terminal-secret",
@@ -144,7 +144,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
 
   describe("WS/SSE query token gate — ELIZA_ALLOW_WS_QUERY_TOKEN", () => {
     it("opens the SSE query-token path from the branded flag without writing the ELIZA mirror", () => {
-      process.env.MILADY_ALLOW_WS_QUERY_TOKEN = "1";
+      process.env.ACME_ALLOW_WS_QUERY_TOKEN = "1";
       const req = {
         method: "GET",
         headers: { accept: "text/event-stream" },
@@ -165,7 +165,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
 
     it("accepts a WebSocket handshake query token when the branded flag is set", () => {
       process.env.ELIZA_API_TOKEN = "ws-expected-token";
-      process.env.MILADY_ALLOW_WS_QUERY_TOKEN = "1";
+      process.env.ACME_ALLOW_WS_QUERY_TOKEN = "1";
       const request = {
         method: "GET",
         headers: {},
@@ -177,7 +177,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
     it("lets a present canonical ELIZA_ALLOW_WS_QUERY_TOKEN=0 win over the branded flag", () => {
       process.env.ELIZA_API_TOKEN = "ws-expected-token";
       process.env.ELIZA_ALLOW_WS_QUERY_TOKEN = "0";
-      process.env.MILADY_ALLOW_WS_QUERY_TOKEN = "1";
+      process.env.ACME_ALLOW_WS_QUERY_TOKEN = "1";
       const request = {
         method: "GET",
         headers: {},
@@ -189,11 +189,11 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
   });
 
   describe("resolveWalletExportRejection — ELIZA_WALLET_EXPORT_TOKEN", () => {
-    it("authorizes against the branded MILADY_WALLET_EXPORT_TOKEN without writing the ELIZA mirror", () => {
-      process.env.MILADY_WALLET_EXPORT_TOKEN = "milady-wallet-secret";
+    it("authorizes against the branded ACME_WALLET_EXPORT_TOKEN without writing the ELIZA mirror", () => {
+      process.env.ACME_WALLET_EXPORT_TOKEN = "acme-wallet-secret";
       expect(
         resolveWalletExportRejection(
-          asReq({ "x-eliza-export-token": "milady-wallet-secret" }),
+          asReq({ "x-eliza-export-token": "acme-wallet-secret" }),
           { confirm: true },
         ),
       ).toBeNull();
@@ -216,7 +216,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
 
     it("lets a present canonical ELIZA_WALLET_EXPORT_TOKEN win over the branded alias", () => {
       process.env.ELIZA_WALLET_EXPORT_TOKEN = "canonical-wallet-secret";
-      process.env.MILADY_WALLET_EXPORT_TOKEN = "brand-wallet-secret";
+      process.env.ACME_WALLET_EXPORT_TOKEN = "brand-wallet-secret";
       expect(
         resolveWalletExportRejection(
           asReq({ "x-eliza-export-token": "canonical-wallet-secret" }),
@@ -237,8 +237,8 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
       local: { type: "stdio", command: "echo", args: [] },
     };
 
-    it("treats the branded MILADY_TERMINAL_RUN_TOKEN as configured so the stdio gate demands a token (not 403-unconfigured)", () => {
-      process.env.MILADY_TERMINAL_RUN_TOKEN = "milady-terminal-secret";
+    it("treats the branded ACME_TERMINAL_RUN_TOKEN as configured so the stdio gate demands a token (not 403-unconfigured)", () => {
+      process.env.ACME_TERMINAL_RUN_TOKEN = "acme-terminal-secret";
       const rejection = resolveMcpTerminalAuthorizationRejection(
         asReq(),
         stdioServers,
@@ -271,7 +271,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
     // exact `readAliasedEnv("ELIZA_API_PORT")` / `readAliasedEnv("ELIZA_CHAT_GENERATION_TIMEOUT_MS")`
     // calls exercised here; the port selection also feeds the alias-aware resolveDesktopApiPort.
     it("resolves ELIZA_API_PORT from the branded alias, honors ELIZA precedence, and writes no mirror", () => {
-      process.env.MILADY_API_PORT = "45999";
+      process.env.ACME_API_PORT = "45999";
       expect(readAliasedEnv("ELIZA_API_PORT")).toBe("45999");
       expect(resolveDesktopApiPort(process.env)).toBe(45999);
       expect(process.env.ELIZA_API_PORT).toBeUndefined();
@@ -282,7 +282,7 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
     });
 
     it("resolves ELIZA_CHAT_GENERATION_TIMEOUT_MS from the branded alias, honors ELIZA precedence, and writes no mirror", () => {
-      process.env.MILADY_CHAT_GENERATION_TIMEOUT_MS = "123456";
+      process.env.ACME_CHAT_GENERATION_TIMEOUT_MS = "123456";
       expect(readAliasedEnv("ELIZA_CHAT_GENERATION_TIMEOUT_MS")).toBe("123456");
       expect(process.env.ELIZA_CHAT_GENERATION_TIMEOUT_MS).toBeUndefined();
 
