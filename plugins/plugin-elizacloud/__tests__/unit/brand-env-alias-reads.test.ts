@@ -1,7 +1,7 @@
 /**
  * Issue #13422 P8 slice: the aliased env reads migrated to the alias-aware
  * reader across the elizacloud / matrix / streaming / coding-tools plugins must
- * resolve a NON-ELIZA brand prefix (MILADY_*) WITHOUT the process.env alias-sync
+ * resolve a NON-ELIZA brand prefix (ACME_*) WITHOUT the process.env alias-sync
  * mirror, with the canonical ELIZA_* key still winning when both are set and an
  * empty branded value reading as unset. Drives the real migrated
  * `isCloudProvisionedContainer()` for its two keys and asserts the shared
@@ -18,20 +18,20 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isCloudProvisionedContainer } from "../../src/routes/cloud-provisioning";
 
-const BRAND = "MILADY";
+const BRAND = "ACME";
 
 // Every P8 canonical key + its branded alias, plus the other env vars
 // `isCloudProvisionedContainer` consults, tracked so each case starts clean.
 const TRACKED = [
-  "MILADY_CLOUD_PROVISIONED",
+  "ACME_CLOUD_PROVISIONED",
   "ELIZA_CLOUD_PROVISIONED",
-  "MILADY_API_TOKEN",
+  "ACME_API_TOKEN",
   "ELIZA_API_TOKEN",
-  "MILADY_PLATFORM",
+  "ACME_PLATFORM",
   "ELIZA_PLATFORM",
-  "MILADY_STATE_DIR",
+  "ACME_STATE_DIR",
   "ELIZA_STATE_DIR",
-  "MILADY_CLOUD_TTS_DISABLED",
+  "ACME_CLOUD_TTS_DISABLED",
   "ELIZA_CLOUD_TTS_DISABLED",
   "STEWARD_AGENT_TOKEN",
   "ELIZAOS_CLOUD_ENABLED",
@@ -60,8 +60,8 @@ describe("issue #13422 P8 aliased reads resolve a branded prefix with zero mirro
   });
 
   it("isCloudProvisionedContainer resolves branded flag + token, no ELIZA_ mirror", () => {
-    process.env.MILADY_CLOUD_PROVISIONED = "1";
-    process.env.MILADY_API_TOKEN = "milady-inbound-token";
+    process.env.ACME_CLOUD_PROVISIONED = "1";
+    process.env.ACME_API_TOKEN = "acme-inbound-token";
     const before = { ...process.env };
 
     expect(isCloudProvisionedContainer()).toBe(true);
@@ -76,27 +76,27 @@ describe("issue #13422 P8 aliased reads resolve a branded prefix with zero mirro
   it("canonical ELIZA_CLOUD_PROVISIONED wins over the branded alias", () => {
     // Canonical "0" beats branded "1": provisioning gate stays closed.
     process.env.ELIZA_CLOUD_PROVISIONED = "0";
-    process.env.MILADY_CLOUD_PROVISIONED = "1";
-    process.env.MILADY_API_TOKEN = "milady-inbound-token";
+    process.env.ACME_CLOUD_PROVISIONED = "1";
+    process.env.ACME_API_TOKEN = "acme-inbound-token";
     expect(readAliasedEnv("ELIZA_CLOUD_PROVISIONED")).toBe("0");
     expect(isCloudProvisionedContainer()).toBe(false);
   });
 
   it("an empty branded flag reads as unset (normalizeEnvValue contract)", () => {
-    process.env.MILADY_CLOUD_PROVISIONED = "   ";
-    process.env.MILADY_API_TOKEN = "milady-inbound-token";
+    process.env.ACME_CLOUD_PROVISIONED = "   ";
+    process.env.ACME_API_TOKEN = "acme-inbound-token";
     expect(readAliasedEnv("ELIZA_CLOUD_PROVISIONED")).toBeUndefined();
     expect(isCloudProvisionedContainer()).toBe(false);
   });
 
   it("readAliasedEnv resolves platform / state-dir / cloud-TTS from branded keys, no mirror", () => {
-    process.env.MILADY_PLATFORM = "android";
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
-    process.env.MILADY_CLOUD_TTS_DISABLED = "true";
+    process.env.ACME_PLATFORM = "android";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
+    process.env.ACME_CLOUD_TTS_DISABLED = "true";
     const before = { ...process.env };
 
     expect(readAliasedEnv("ELIZA_PLATFORM")).toBe("android");
-    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/milady/state");
+    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/acme/state");
     expect(readAliasedEnv("ELIZA_CLOUD_TTS_DISABLED")).toBe("true");
 
     expect(process.env.ELIZA_PLATFORM).toBeUndefined();
@@ -107,15 +107,15 @@ describe("issue #13422 P8 aliased reads resolve a branded prefix with zero mirro
 
   it("canonical ELIZA_ keys win over branded aliases for platform / cloud-TTS", () => {
     process.env.ELIZA_PLATFORM = "ios";
-    process.env.MILADY_PLATFORM = "android";
+    process.env.ACME_PLATFORM = "android";
     process.env.ELIZA_CLOUD_TTS_DISABLED = "false";
-    process.env.MILADY_CLOUD_TTS_DISABLED = "true";
+    process.env.ACME_CLOUD_TTS_DISABLED = "true";
     expect(readAliasedEnv("ELIZA_PLATFORM")).toBe("ios");
     expect(readAliasedEnv("ELIZA_CLOUD_TTS_DISABLED")).toBe("false");
   });
 
   it("an empty branded state dir reads as unset", () => {
-    process.env.MILADY_STATE_DIR = "   ";
+    process.env.ACME_STATE_DIR = "   ";
     expect(readAliasedEnv("ELIZA_STATE_DIR")).toBeUndefined();
   });
 });
