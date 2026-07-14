@@ -9,12 +9,21 @@
  * the exact response shapes the UI consumes.
  */
 
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { IAgentRuntime, Memory, UUID } from "@elizaos/core";
 import type { TranscriptSegment } from "@elizaos/shared/transcripts";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { installMobileFsShim } from "../shared/fs-shim.ts";
 import {
 	handleDirectCoreRoute,
 	type IosBridgeBackend,
@@ -22,6 +31,10 @@ import {
 } from "./bridge.ts";
 
 const AGENT_ID = "00000000-0000-0000-0000-0000000000aa" as UUID;
+
+beforeAll(() => {
+	installMobileFsShim(tmpdir());
+});
 
 /** A minimal in-memory runtime implementing the memory APIs the shims use. */
 function createFakeRuntime(): IAgentRuntime {
@@ -550,6 +563,457 @@ describe("iOS bridge — conversation message failure surfacing", () => {
 			"[ios-bridge] createMemory(messages) failed:",
 			expect.anything(),
 		);
+	});
+});
+
+describe("iOS bridge — local inference control routes", () => {
+	let backend: IosBridgeBackend;
+	let stateDir: string;
+	let previousStateDir: string | undefined;
+
+	beforeEach(() => {
+		backend = makeBackend(createFakeRuntime());
+		previousStateDir = process.env.ELIZA_STATE_DIR;
+		stateDir = mkdtempSync(path.join(tmpdir(), "ios-bridge-inference-"));
+		process.env.ELIZA_STATE_DIR = stateDir;
+	});
+
+	afterEach(() => {
+		if (previousStateDir === undefined) delete process.env.ELIZA_STATE_DIR;
+		else process.env.ELIZA_STATE_DIR = previousStateDir;
+		rmSync(stateDir, { recursive: true, force: true });
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+	});
+
+	function installCustomModel(): void {
+		const inferenceRoot = path.join(stateDir, "local-inference");
+		const modelsDir = path.join(inferenceRoot, "models");
+		mkdirSync(modelsDir, { recursive: true });
+		writeFileSync(path.join(modelsDir, "custom-chat.gguf"), "gguf-fixture");
+		writeFileSync(
+			path.join(inferenceRoot, "routing.json"),
+			JSON.stringify({
+				preferences: {
+					preferredProvider: { TEXT_SMALL: "capacitor-llama" },
+					policy: { TEXT_SMALL: "local-only" },
+				},
+			}),
+		);
+	}
+
+	it("round-trips installed-model discovery, routing, assignments, and verification", async () => {
+		installCustomModel();
+
+		const installed = await call(
+			backend,
+			"GET",
+			"/api/local-inference/installed",
+		);
+		expect(installed.status).toBe(200);
+		expect(installed.json.models).toEqual([
+			expect.objectContaining({
+				id: "custom-chat",
+				displayName: "custom-chat",
+				source: "external-scan",
+			}),
+		]);
+
+		const catalog = await call(backend, "GET", "/api/local-inference/catalog");
+		expect(catalog.status).toBe(200);
+		expect(catalog.json.models).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "custom-chat",
+					ggufFile: "custom-chat.gguf",
+				}),
+			]),
+		);
+
+		const providers = await call(
+			backend,
+			"GET",
+			"/api/local-inference/providers",
+		);
+		expect(providers.status).toBe(200);
+		expect(providers.json.providers).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "eliza-local-inference",
+					enableState: { enabled: true, reason: "Eliza-1 bundle installed" },
+				}),
+			]),
+		);
+
+		const downloads = await call(
+			backend,
+			"GET",
+			"/api/local-inference/downloads",
+		);
+		expect(downloads.json.downloads).toEqual([
+			expect.objectContaining({
+				jobId: "installed:custom-chat",
+				modelId: "custom-chat",
+				state: "completed",
+			}),
+		]);
+
+		const routing = await call(backend, "GET", "/api/local-inference/routing");
+		expect(routing.json.preferences).toEqual({
+			preferredProvider: { TEXT_SMALL: "capacitor-llama" },
+			policy: { TEXT_SMALL: "local-only" },
+		});
+
+		const assigned = await call(
+			backend,
+			"POST",
+			"/api/local-inference/assignments",
+			{ slot: "TEXT_SMALL", modelId: "custom-chat" },
+		);
+		expect(assigned.json.assignments).toEqual({ TEXT_SMALL: "custom-chat" });
+		const persisted = await call(
+			backend,
+			"GET",
+			"/api/local-inference/assignments",
+		);
+		expect(persisted.json.assignments).toEqual({ TEXT_SMALL: "custom-chat" });
+
+		const cleared = await call(
+			backend,
+			"POST",
+			"/api/local-inference/assignments",
+			{ slot: "TEXT_SMALL", modelId: null },
+		);
+		expect(cleared.json.assignments).toEqual({});
+
+		const invalidSlot = await call(
+			backend,
+			"POST",
+			"/api/local-inference/assignments",
+			{ slot: "NOT_A_SLOT", modelId: "custom-chat" },
+		);
+		expect(invalidSlot.status).toBe(400);
+
+		const unknownModel = await call(
+			backend,
+			"POST",
+			"/api/local-inference/assignments",
+			{ slot: "TEXT_SMALL", modelId: "missing-model" },
+		);
+		expect(unknownModel.status).toBe(404);
+
+		const verified = await call(
+			backend,
+			"POST",
+			"/api/local-inference/installed/custom-chat/verify",
+		);
+		expect(verified.status).toBe(200);
+		expect(verified.json).toMatchObject({
+			ok: true,
+			modelId: "custom-chat",
+			sizeBytes: 12,
+		});
+
+		const missingVerification = await call(
+			backend,
+			"POST",
+			"/api/local-inference/installed/missing/verify",
+		);
+		expect(missingVerification.status).toBe(404);
+	});
+
+	it("returns observable device and hub snapshots when native hardware IPC is unavailable", async () => {
+		installCustomModel();
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const device = await call(backend, "GET", "/api/local-inference/device");
+		expect(device.json).toMatchObject({
+			enabled: true,
+			connected: true,
+			transport: "bun-host-ipc",
+			primaryDeviceId: "ios-native-llama",
+		});
+
+		const hardware = await call(
+			backend,
+			"GET",
+			"/api/local-inference/hardware",
+		);
+		expect(hardware.json).toMatchObject({
+			platform: "ios",
+			gpu: { backend: "metal", available: false },
+			source: "ios-native-llama",
+		});
+
+		const hub = await call(backend, "GET", "/api/local-inference/hub");
+		expect(hub.status).toBe(200);
+		expect(hub.json).toMatchObject({
+			active: { status: "idle", provider: "capacitor-llama" },
+			assignments: {},
+			hardware: { platform: "ios", source: "ios-native-llama" },
+		});
+		expect(hub.json.catalog).toEqual(expect.any(Array));
+		expect(hub.json.installed).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: "custom-chat" })]),
+		);
+		expect(errorSpy).toHaveBeenCalledWith(
+			"[ios-bridge] hardware info unavailable:",
+			"iOS native host-call protocol is not installed",
+		);
+	});
+
+	it("validates download, active-model, streaming, TTS, and ASR requests before native work", async () => {
+		const missingDownload = await call(
+			backend,
+			"POST",
+			"/api/local-inference/downloads",
+			{},
+		);
+		expect(missingDownload.status).toBe(400);
+
+		const unsupportedDownload = await call(
+			backend,
+			"POST",
+			"/api/local-inference/downloads",
+			{ spec: { id: "unknown-model" } },
+		);
+		expect(unsupportedDownload.status).toBe(400);
+
+		const active = await call(backend, "GET", "/api/local-inference/active");
+		expect(active.json).toMatchObject({
+			modelId: null,
+			modelPath: null,
+			status: "idle",
+		});
+
+		const missingActive = await call(
+			backend,
+			"POST",
+			"/api/local-inference/active",
+			{ modelId: "missing-model" },
+		);
+		expect(missingActive.status).toBe(404);
+
+		const unloaded = await call(
+			backend,
+			"DELETE",
+			"/api/local-inference/active",
+		);
+		expect(unloaded.json).toMatchObject({ status: "idle", modelId: null });
+
+		for (const endpoint of [
+			"/api/local-inference/downloads/stream",
+			"/api/local-inference/device/stream",
+		]) {
+			const stream = await call(backend, "GET", endpoint);
+			expect(stream.status).toBe(501);
+			expect(stream.json.code).toBe("streaming_not_supported");
+		}
+
+		const missingTtsText = await call(
+			backend,
+			"POST",
+			"/api/tts/local-inference",
+			{},
+		);
+		expect(missingTtsText.status).toBe(400);
+
+		const unavailableTts = await call(
+			backend,
+			"POST",
+			"/api/tts/local-inference",
+			{ text: "<think>ignore</think> hello" },
+		);
+		expect(unavailableTts.status).toBe(503);
+		expect(unavailableTts.json.code).toBe("ios_local_voice_assets_missing");
+
+		const invalidAsr = await handleDirectCoreRoute(
+			backend,
+			"POST",
+			"/api/asr/local-inference",
+			jsonBody({ pcm: [0, "invalid"] }),
+		);
+		expect(invalidAsr).toBeNull();
+
+		const unavailableAsr = await call(
+			backend,
+			"POST",
+			"/api/asr/local-inference",
+			{ pcm: [0, 0.25, -0.25], sampleRate: "16000" },
+		);
+		expect(unavailableAsr.status).toBe(503);
+		expect(unavailableAsr.json.code).toBe("ios_local_voice_assets_missing");
+	});
+
+	it("records a failed native model activation and returns to idle on unload", async () => {
+		installCustomModel();
+		vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(
+			handleDirectCoreRoute(
+				backend,
+				"POST",
+				"/api/local-inference/active",
+				jsonBody({ modelId: "custom-chat" }),
+			),
+		).rejects.toThrow("iOS native host-call protocol is not installed");
+
+		const failed = await call(backend, "GET", "/api/local-inference/active");
+		expect(failed.json).toMatchObject({
+			modelId: "custom-chat",
+			status: "error",
+			error: "iOS native host-call protocol is not installed",
+		});
+
+		const unloaded = await call(
+			backend,
+			"DELETE",
+			"/api/local-inference/active",
+		);
+		expect(unloaded.json).toMatchObject({
+			modelId: null,
+			modelPath: null,
+			status: "idle",
+		});
+	});
+
+	it("downloads a catalog model into the registry through the streamed response body", async () => {
+		const bytes = new TextEncoder().encode("tiny-gguf-fixture");
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(bytes, {
+					status: 200,
+					headers: { "content-length": String(bytes.byteLength) },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const started = await call(
+			backend,
+			"POST",
+			"/api/local-inference/downloads",
+			{ modelId: "eliza-1-2b" },
+		);
+		expect(started.status).toBe(200);
+		expect(started.json.job).toMatchObject({
+			modelId: "eliza-1-2b",
+			state: "queued",
+		});
+
+		let completed: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const status = await call(
+				backend,
+				"GET",
+				"/api/local-inference/downloads",
+			);
+			completed = (
+				status.json.downloads as Array<Record<string, unknown>>
+			).find((job) => job.modelId === "eliza-1-2b");
+			if (completed?.state === "completed" || completed?.state === "failed") {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+
+		expect(completed).toMatchObject({
+			modelId: "eliza-1-2b",
+			state: "completed",
+			received: bytes.byteLength,
+			total: bytes.byteLength,
+		});
+		expect(fetchMock).toHaveBeenCalledWith(
+			"https://huggingface.co/elizaos/eliza-1/resolve/main/bundles/2b/text/eliza-1-2b-128k.gguf",
+			{ redirect: "follow" },
+		);
+
+		const installed = await call(
+			backend,
+			"GET",
+			"/api/local-inference/installed",
+		);
+		expect(installed.json.models).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "eliza-1-2b",
+					sizeBytes: bytes.byteLength,
+					source: "eliza-download",
+				}),
+			]),
+		);
+	});
+});
+
+describe("iOS bridge — startup compatibility routes", () => {
+	it("serves the local startup, auth, app-run, and conversation contracts", async () => {
+		const backend = makeBackend(createFakeRuntime());
+
+		const health = await call(backend, "GET", "/api/health");
+		expect(health.json).toMatchObject({
+			ready: true,
+			runtime: "ok",
+			agentName: "TestAgent",
+			iosBridge: "bun",
+		});
+
+		const status = await call(backend, "GET", "/api/status");
+		expect(status.json).toMatchObject({
+			state: "running",
+			canRespond: true,
+			pendingRestart: false,
+		});
+
+		const appRuns = await call(backend, "GET", "/api/apps/runs");
+		expect(appRuns.json).toEqual([]);
+
+		const firstRunStatus = await call(backend, "GET", "/api/first-run/status");
+		expect(firstRunStatus.json).toEqual({
+			complete: true,
+			cloudProvisioned: false,
+			deploymentTarget: "local",
+		});
+		const firstRun = await call(backend, "POST", "/api/first-run", {});
+		expect(firstRun.json).toMatchObject({ ok: true, complete: true });
+
+		const me = await call(backend, "GET", "/api/auth/me");
+		expect(me.json).toMatchObject({
+			identity: { id: "local-agent", kind: "machine" },
+			access: { mode: "local" },
+		});
+		const authStatus = await call(backend, "GET", "/api/auth/status");
+		expect(authStatus.json).toMatchObject({
+			required: false,
+			authenticated: true,
+			localAccess: true,
+		});
+
+		const created = await call(backend, "POST", "/api/conversations", {
+			title: "  Local test  ",
+			metadata: { source: "coverage" },
+		});
+		const conversation = created.json.conversation as { id: string };
+		const conversations = await call(backend, "GET", "/api/conversations");
+		expect(conversations.json.conversations).toEqual([
+			expect.objectContaining({
+				id: conversation.id,
+				title: "Local test",
+				metadata: { source: "coverage" },
+			}),
+		]);
+
+		const messages = await call(
+			backend,
+			"GET",
+			`/api/conversations/${conversation.id}/messages`,
+		);
+		expect(messages.json).toEqual({ messages: [] });
+		const missingConversation = await call(
+			backend,
+			"POST",
+			"/api/conversations/missing/messages/stream",
+			{ text: "hello" },
+		);
+		expect(missingConversation.status).toBe(404);
 	});
 });
 
