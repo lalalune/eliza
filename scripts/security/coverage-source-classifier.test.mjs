@@ -21,21 +21,42 @@ describe("coverage source classifier", () => {
     expect(
       sourceRetainsRuntimeCode("export interface Record { id: string }\n"),
     ).toBe(false);
-    expect(
-      sourceRetainsRuntimeCode("export type Identifier = string;\n"),
-    ).toBe(false);
-    expect(
-      sourceRetainsRuntimeCode("export const value: number = 1;\n"),
-    ).toBe(true);
+    expect(sourceRetainsRuntimeCode("export type Identifier = string;\n")).toBe(
+      false,
+    );
+    expect(sourceRetainsRuntimeCode("export const value: number = 1;\n")).toBe(
+      true,
+    );
   });
 
   test("excludes pure re-export facades", () => {
-    expect(sourceRetainsRuntimeCode('export * from "./runtime.js";\n')).toBe(false);
-    expect(sourceRetainsRuntimeCode('export { value } from "./runtime.js";\n')).toBe(false);
+    expect(sourceRetainsRuntimeCode('export * from "./runtime.js";\n')).toBe(
+      false,
+    );
+    expect(
+      sourceRetainsRuntimeCode('export { value } from "./runtime.js";\n'),
+    ).toBe(false);
+  });
+
+  test("retains executable source changes", () => {
+    expect(
+      sourceChangesRuntimeCode(
+        "export const value: number = 1;\n",
+        "export const value: number = 2;\n",
+      ),
+    ).toBe(true);
+    expect(
+      sourceChangesRuntimeCode(
+        "export const value: number = 1;\n",
+        "export interface Value { id: string }\n",
+      ),
+    ).toBe(false);
   });
 
   test("classifies paths and reports exclusions", () => {
-    const directory = mkdtempSync(join(tmpdir(), "coverage-source-classifier-"));
+    const directory = mkdtempSync(
+      join(tmpdir(), "coverage-source-classifier-"),
+    );
     const runtimePath = join(directory, "runtime.ts");
     const typesPath = join(directory, "types.ts");
     writeFileSync(runtimePath, "export const value: number = 1;\n");
@@ -71,6 +92,37 @@ describe("coverage source classifier", () => {
     expect(warnings.join("")).toContain(
       "treating unclassifiable module as executable",
     );
+  });
+
+  test("uses base sources and fails wide when this runtime cannot prove equivalence", () => {
+    const directory = mkdtempSync(join(tmpdir(), "coverage-source-delta-"));
+    const changedPath = join(directory, "changed.ts");
+    const equivalentPath = join(directory, "equivalent.ts");
+    writeFileSync(changedPath, "export const value: number = 2;\n");
+    writeFileSync(equivalentPath, "export const value: number = 1;\n");
+
+    try {
+      let output = "";
+      let errors = "";
+      classifyPaths(
+        [changedPath, equivalentPath],
+        (message) => {
+          output += message;
+        },
+        (message) => {
+          errors += message;
+        },
+        {
+          readBaseSource: () => "export const value: number = 1;\n",
+        },
+      );
+
+      expect(output).toContain(changedPath);
+      expect(output).toContain(equivalentPath);
+      expect(errors).toContain("treating unclassifiable source change");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 
