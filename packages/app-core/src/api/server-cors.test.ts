@@ -6,7 +6,7 @@
  * explicit `ELIZA_ALLOWED_ORIGINS` remote origins normalize and gate correctly,
  * that the env-derived port cache recomputes after invalidation, and — the
  * security-critical proof for #13422 — that a non-ELIZA brand prefix
- * (`MILADY_*`) resolves the CORS ports/origins through the alias-aware readers
+ * (`ACME_*`) resolves the CORS ports/origins through the alias-aware readers
  * WITHOUT materializing the `ELIZA_*` mirror keys, with the canonical `ELIZA_*`
  * key still winning when both are set.
  */
@@ -137,7 +137,7 @@ describe("server CORS origin allowlist", () => {
 // from its own `<PREFIX>_*` keys without the `process.env alias-sync` mirror
 // mutation, and the canonical `ELIZA_*` key must still win when both are set.
 describe("server CORS allowlist — branded alias resolution (#13422)", () => {
-  const BRAND = "MILADY";
+  const BRAND = "ACME";
   const savedConfig = getBootConfig();
   const tracked = [
     "ELIZA_API_PORT",

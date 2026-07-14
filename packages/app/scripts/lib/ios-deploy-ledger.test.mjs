@@ -43,20 +43,12 @@ describe("resolveLedgerStateDir precedence", () => {
       resolveLedgerStateDir({
         env: {
           ELIZA_DEVICES_STATUS_DIR: "/d/state",
-          MILADY_STATE_DIR: "/m/state",
           ELIZA_STATE_DIR: "/e/state",
+          XDG_STATE_HOME: "/xdg",
         },
         homedir: home,
       }),
     ).toBe("/d/state");
-  });
-  it("prefers MILADY_STATE_DIR over ELIZA_STATE_DIR", () => {
-    expect(
-      resolveLedgerStateDir({
-        env: { MILADY_STATE_DIR: "/m/state", ELIZA_STATE_DIR: "/e/state" },
-        homedir: home,
-      }),
-    ).toBe("/m/state");
   });
   it("falls back to ELIZA_STATE_DIR", () => {
     expect(
@@ -69,10 +61,10 @@ describe("resolveLedgerStateDir precedence", () => {
   it("honors XDG_STATE_HOME + namespace", () => {
     expect(
       resolveLedgerStateDir({
-        env: { XDG_STATE_HOME: "/xdg", ELIZA_NAMESPACE: "milady" },
+        env: { XDG_STATE_HOME: "/xdg", ELIZA_NAMESPACE: "acme" },
         homedir: home,
       }),
-    ).toBe(path.join("/xdg", "milady"));
+    ).toBe(path.join("/xdg", "acme"));
   });
   it("defaults to ~/.local/state/eliza", () => {
     expect(resolveLedgerStateDir({ env: {}, homedir: home })).toBe(
