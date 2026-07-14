@@ -50,6 +50,28 @@ describe("changed-source runtime classifier", () => {
     expect(sourceChangesRuntimeCode(base, head)).toBe(false);
   });
 
+  test("excludes ordinary prose-only comment changes", () => {
+    const base = `/** Resolves the canonical state directory. */
+export const value: number = 1; // Kept stable for callers.
+`;
+    const head = `/** Resolves the per-user state directory for Eliza agents. */
+export const value: number = 1; // Kept stable for API consumers; see {@link value}.
+`;
+    expect(sourceChangesRuntimeCode(base, head)).toBe(false);
+  });
+
+  test("ignores prose length before an unchanged semantic directive", () => {
+    const base = `// Stable value.
+/* c8 ignore next */
+export const value: number = 1;
+`;
+    const head = `// Stable public value shared by every runtime consumer.
+/* c8 ignore next */
+export const value: number = 1;
+`;
+    expect(sourceChangesRuntimeCode(base, head)).toBe(false);
+  });
+
   test("retains comment directives that affect bundling or coverage", () => {
     const base = 'export const load = () => import("./module");\n';
     expect(
@@ -64,6 +86,27 @@ describe("changed-source runtime classifier", () => {
         "/* c8 ignore next */\nexport const value: number = 1;\n",
       ),
     ).toBe(true);
+
+    for (const directive of [
+      "// @ts-check",
+      "/** @jsxImportSource react */",
+      '/* webpackChunkName: "lazy-view" */',
+      "/* v8 ignore next */",
+      "/* istanbul ignore file */",
+      "/*#__PURE__*/",
+      "/* @__INLINE__ */",
+      "/* #__NOINLINE__ */",
+      "//# sourceMappingURL=module.js.map",
+      '/// <reference types="bun" />',
+    ]) {
+      expect(
+        sourceChangesRuntimeCode(
+          "export const value: number = 1;\n",
+          `${directive}\nexport const value: number = 1;\n`,
+        ),
+        directive,
+      ).toBe(true);
+    }
   });
 
   test("retains type changes that can alter decorator metadata", () => {
@@ -71,6 +114,54 @@ describe("changed-source runtime classifier", () => {
       sourceChangesRuntimeCode(
         "class Example { @field value: string; }\n",
         "class Example { @field value: number; }\n",
+      ),
+    ).toBe(true);
+  });
+
+  test("excludes prose-only changes in a file with decorators", () => {
+    expect(
+      sourceChangesRuntimeCode(
+        "// old prose\nclass Example { @field value: string; }\n",
+        "// clearer explanatory prose\nclass Example { @field value: string; }\n",
+      ),
+    ).toBe(false);
+  });
+
+  test("excludes prose-only changes despite literal at-signs", () => {
+    for (const expression of [
+      '"(@notDecorator"',
+      "`prefix, @notDecorator`",
+      "`first line\nsecond line, @notDecorator`",
+      "/,@notDecorator/",
+    ]) {
+      expect(
+        sourceChangesRuntimeCode(
+          `export const value = ${expression}; // old prose\n`,
+          `export const value = ${expression}; // new explanatory prose\n`,
+        ),
+        expression,
+      ).toBe(false);
+    }
+
+    for (const statement of [
+      "if (ready) /,@notDecorator/.test(value);",
+      "if (ready) {} /,@notDecorator/.test(value);",
+    ]) {
+      expect(
+        sourceChangesRuntimeCode(
+          `${statement} // old prose\n`,
+          `${statement} // new explanatory prose\n`,
+        ),
+        statement,
+      ).toBe(false);
+    }
+  });
+
+  test("retains decorated type changes inside template interpolation", () => {
+    expect(
+      sourceChangesRuntimeCode(
+        `export const value = \`\${class { @field item: string; }}\`;\n`,
+        `export const value = \`\${class { @field item: number; }}\`;\n`,
       ),
     ).toBe(true);
   });
