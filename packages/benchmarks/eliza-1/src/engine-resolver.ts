@@ -75,7 +75,7 @@ interface SharedPathsLike {
  *   ELIZA_STATE_DIR > ~/.${ELIZA_NAMESPACE ?? "eliza"}
  *
  * State-dir and namespace resolve through core's non-mutating alias reader so
- * a branded prefix (e.g. `MILADY_STATE_DIR`) is honoured from the alias table
+ * a branded prefix (e.g. `ACME_STATE_DIR`) is honoured from the alias table
  * with nothing written back to `process.env` (#13423).
  */
 export function benchElizaModelsDir(): string {

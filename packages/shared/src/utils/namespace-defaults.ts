@@ -1,7 +1,7 @@
 /**
- * Resolves the app namespace default from `ELIZA_NAMESPACE`, so white-label
- * entrypoints (Milady, Eliza) consistently fall back to their own namespace
- * rather than a hardcoded one.
+ * Resolves the app namespace default from `ELIZA_NAMESPACE`, allowing branded
+ * entrypoints to inject their namespace before shared bootstrap applies the
+ * canonical `eliza` fallback.
  */
 type NamespaceDefaultsEnv = {
   ELIZA_NAMESPACE?: string;

@@ -338,25 +338,25 @@ describe("syncElizaEnvAliases", () => {
 // canonical ELIZA_ key still winning when both are set. A NON-ELIZA prefix is
 // the security-relevant fixture: an ELIZA->ELIZA self-mirror proves nothing.
 describe("issue #13422 P4 agent-boot keys resolve a branded prefix with zero mirror writes", () => {
-  const BRAND = "MILADY";
+  const BRAND = "ACME";
   const savedConfig = getBootConfig();
   const aliases = buildBrandEnvAliases(BRAND);
   const tracked = [
-    "MILADY_STATE_DIR",
+    "ACME_STATE_DIR",
     "ELIZA_STATE_DIR",
-    "MILADY_PLATFORM",
+    "ACME_PLATFORM",
     "ELIZA_PLATFORM",
-    "MILADY_API_PORT",
+    "ACME_API_PORT",
     "ELIZA_API_PORT",
-    "MILADY_PORT",
+    "ACME_PORT",
     "ELIZA_PORT",
-    "MILADY_UI_PORT",
+    "ACME_UI_PORT",
     "ELIZA_UI_PORT",
-    "MILADY_CLOUD_PROVISIONED",
+    "ACME_CLOUD_PROVISIONED",
     "ELIZA_CLOUD_PROVISIONED",
-    "MILADY_CLOUD_MANAGED_AGENTS_API_SEGMENT",
+    "ACME_CLOUD_MANAGED_AGENTS_API_SEGMENT",
     "ELIZA_CLOUD_MANAGED_AGENTS_API_SEGMENT",
-    "MILADY_AGENT_ORCHESTRATOR",
+    "ACME_AGENT_ORCHESTRATOR",
     "ELIZA_AGENT_ORCHESTRATOR",
   ];
   const savedEnv: Record<string, string | undefined> = {};
@@ -379,16 +379,16 @@ describe("issue #13422 P4 agent-boot keys resolve a branded prefix with zero mir
   });
 
   it("readAliasedEnv resolves the boot-critical agent keys from branded values, no mirror", () => {
-    process.env.MILADY_STATE_DIR = "/var/milady/state";
-    process.env.MILADY_CLOUD_PROVISIONED = "1";
-    process.env.MILADY_CLOUD_MANAGED_AGENTS_API_SEGMENT = "milady";
-    process.env.MILADY_AGENT_ORCHESTRATOR = "true";
+    process.env.ACME_STATE_DIR = "/var/acme/state";
+    process.env.ACME_CLOUD_PROVISIONED = "1";
+    process.env.ACME_CLOUD_MANAGED_AGENTS_API_SEGMENT = "acme";
+    process.env.ACME_AGENT_ORCHESTRATOR = "true";
     const before = { ...process.env };
 
-    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/milady/state");
+    expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/var/acme/state");
     expect(readAliasedEnv("ELIZA_CLOUD_PROVISIONED")).toBe("1");
     expect(readAliasedEnv("ELIZA_CLOUD_MANAGED_AGENTS_API_SEGMENT")).toBe(
-      "milady",
+      "acme",
     );
     // plugin-collector lowercases this for its 0/false/no vs 1/true/yes gate.
     expect(readAliasedEnv("ELIZA_AGENT_ORCHESTRATOR")?.toLowerCase()).toBe(
@@ -406,16 +406,16 @@ describe("issue #13422 P4 agent-boot keys resolve a branded prefix with zero mir
 
   it("canonical ELIZA_ key wins over the branded alias", () => {
     process.env.ELIZA_CLOUD_PROVISIONED = "1";
-    process.env.MILADY_CLOUD_PROVISIONED = "0";
+    process.env.ACME_CLOUD_PROVISIONED = "0";
     expect(readAliasedEnv("ELIZA_CLOUD_PROVISIONED")).toBe("1");
 
     process.env.ELIZA_STATE_DIR = "/canonical";
-    process.env.MILADY_STATE_DIR = "/branded";
+    process.env.ACME_STATE_DIR = "/branded";
     expect(readAliasedEnv("ELIZA_STATE_DIR")).toBe("/canonical");
   });
 
-  it("resolveDesktopApiPort (eliza.ts boot) honors a branded MILADY_API_PORT, no mirror", () => {
-    process.env.MILADY_API_PORT = "31555";
+  it("resolveDesktopApiPort (eliza.ts boot) honors a branded ACME_API_PORT, no mirror", () => {
+    process.env.ACME_API_PORT = "31555";
     const before = { ...process.env };
     // The eliza.ts boot guard reads readAliasedEnv('ELIZA_API_PORT') then calls
     // resolveDesktopApiPort — both must see the branded port.
@@ -425,15 +425,15 @@ describe("issue #13422 P4 agent-boot keys resolve a branded prefix with zero mir
     expect(process.env).toEqual(before);
   });
 
-  it("canonical ELIZA_API_PORT wins over a branded MILADY_API_PORT", () => {
+  it("canonical ELIZA_API_PORT wins over a branded ACME_API_PORT", () => {
     process.env.ELIZA_API_PORT = "31337";
-    process.env.MILADY_API_PORT = "40000";
+    process.env.ACME_API_PORT = "40000";
     expect(readAliasedEnv("ELIZA_API_PORT")).toBe("31337");
     expect(resolveDesktopApiPort()).toBe(31337);
   });
 
-  it("isAndroidMobile / resolvePlatform (bin.ts) honor a branded MILADY_PLATFORM, no mirror", () => {
-    process.env.MILADY_PLATFORM = "android";
+  it("isAndroidMobile / resolvePlatform (bin.ts) honor a branded ACME_PLATFORM, no mirror", () => {
+    process.env.ACME_PLATFORM = "android";
     const before = { ...process.env };
     expect(resolvePlatform()).toBe("android");
     expect(isAndroidMobile()).toBe(true);
@@ -441,9 +441,9 @@ describe("issue #13422 P4 agent-boot keys resolve a branded prefix with zero mir
     expect(process.env).toEqual(before);
   });
 
-  it("canonical ELIZA_PLATFORM wins over a branded MILADY_PLATFORM", () => {
+  it("canonical ELIZA_PLATFORM wins over a branded ACME_PLATFORM", () => {
     process.env.ELIZA_PLATFORM = "ios";
-    process.env.MILADY_PLATFORM = "android";
+    process.env.ACME_PLATFORM = "android";
     expect(resolvePlatform()).toBe("ios");
     expect(isAndroidMobile()).toBe(false);
   });
