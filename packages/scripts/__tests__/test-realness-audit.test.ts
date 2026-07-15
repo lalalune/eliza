@@ -1,4 +1,4 @@
-// Exercises tests test realness audit.test automation behavior with deterministic script fixtures.
+/** Exercises the repository's test-realness policy with deterministic fixtures. */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -37,6 +37,16 @@ function write(root: string, relativePath: string, content: string) {
   const filePath = path.join(root, relativePath);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, content);
+}
+
+function git(root: string, ...args: string[]): string {
+  const result = spawnSync("git", ["-C", root, ...args], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+  }
+  return result.stdout.trim();
 }
 
 describe("test-realness-audit", () => {
@@ -271,6 +281,7 @@ describe("test-realness-audit", () => {
 
   test("--check fails closed when the diff-scoped base cannot be resolved", () => {
     const root = makeRepo();
+    git(root, "init");
     write(
       root,
       "packages/sample/plain.test.ts",
@@ -303,6 +314,131 @@ describe("test-realness-audit", () => {
 
     const result = audit.scanTestRealness({ repoRoot: root });
     expect(result.summary.byCategory.focusedOnly).toBe(0);
+  });
+
+  test("declared submodules stay excluded across checkout states", () => {
+    const root = makeRepo();
+    write(
+      root,
+      "packages/sample/plain.test.ts",
+      "import { test } from 'vitest';\ntest('plain', () => {});\n",
+    );
+    write(
+      root,
+      ".gitmodules",
+      [
+        '[submodule "vendor/upstream"]',
+        "  path = plugins/vendor/upstream",
+        "  url = https://example.test/upstream.git",
+      ].join("\n"),
+    );
+    write(
+      root,
+      "plugins/vendor/upstream/upstream.test.ts",
+      `import { test } from 'vitest';\ntest${todoSuffix}('upstream policy', () => {});\n`,
+    );
+
+    const upstreamRoot = path.join(root, "plugins", "vendor", "upstream");
+    git(upstreamRoot, "init");
+    git(upstreamRoot, "add", "upstream.test.ts");
+    git(
+      upstreamRoot,
+      "-c",
+      "user.name=Test Fixture",
+      "-c",
+      "user.email=test@example.test",
+      "commit",
+      "-m",
+      "fixture",
+    );
+    const upstreamCommit = git(upstreamRoot, "rev-parse", "HEAD");
+
+    git(root, "init");
+    git(root, "add", ".gitmodules");
+    git(
+      root,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${upstreamCommit},plugins/vendor/upstream`,
+    );
+    fs.rmSync(path.join(upstreamRoot, ".git"), {
+      recursive: true,
+      force: true,
+    });
+
+    const sourcePopulated = audit.scanTestRealness({
+      repoRoot: root,
+      requireVerifiedSubmodules: true,
+    });
+    expect(
+      sourcePopulated.files.map((file: string) => path.relative(root, file)),
+    ).toEqual([path.join("packages", "sample", "plain.test.ts")]);
+    expect(sourcePopulated.summary.byCategory.todoTest).toBe(0);
+
+    write(
+      root,
+      "plugins/vendor/upstream/.git",
+      "gitdir: ../../../../.git/modules/plugins/vendor/upstream\n",
+    );
+
+    const initialized = audit.scanTestRealness({
+      repoRoot: root,
+      requireVerifiedSubmodules: true,
+    });
+    expect(
+      initialized.files.map((file: string) => path.relative(root, file)),
+    ).toEqual([path.join("packages", "sample", "plain.test.ts")]);
+    expect(initialized.summary.byCategory.todoTest).toBe(0);
+  });
+
+  test("a declaration without an indexed gitlink cannot hide first-party tests", () => {
+    const root = makeRepo();
+    write(
+      root,
+      ".gitmodules",
+      [
+        '[submodule "vendor/upstream"]',
+        "  path = plugins/vendor/upstream",
+        "  url = https://example.test/upstream.git",
+      ].join("\n"),
+    );
+    write(
+      root,
+      "plugins/vendor/upstream/visible.test.ts",
+      `import { test } from 'vitest';\ntest${todoSuffix}('visible policy', () => {});\n`,
+    );
+    git(root, "init");
+    git(root, "add", ".gitmodules", "plugins/vendor/upstream/visible.test.ts");
+
+    const result = audit.scanTestRealness({
+      repoRoot: root,
+      requireVerifiedSubmodules: true,
+    });
+    expect(
+      result.files.map((file: string) => path.relative(root, file)),
+    ).toContain(path.join("plugins", "vendor", "upstream", "visible.test.ts"));
+    expect(result.summary.byCategory.todoTest).toBe(1);
+  });
+
+  test("an undeclared nested repository cannot hide first-party tests", () => {
+    const root = makeRepo();
+    write(
+      root,
+      "plugins/first-party/.git",
+      "gitdir: ../../../.git/modules/plugins/first-party\n",
+    );
+    write(
+      root,
+      "plugins/first-party/visible.test.ts",
+      `import { test } from 'vitest';\ntest${todoSuffix}('visible policy', () => {});\n`,
+    );
+
+    const result = audit.scanTestRealness({ repoRoot: root });
+    expect(
+      result.files.map((file: string) => path.relative(root, file)),
+    ).toEqual([path.join("plugins", "first-party", "visible.test.ts")]);
+    expect(result.summary.byCategory.todoTest).toBe(1);
   });
 
   test("report labels categories with their enforcement mode and deltas", () => {
