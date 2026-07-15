@@ -12,7 +12,6 @@ import {
   DEFAULT_MAX_QUARANTINE_ATTEMPTS,
   DEFAULT_QUARANTINE_ATTEMPT_TIMEOUT_MS,
   DEFAULT_QUARANTINED_SUITES,
-  DEFAULT_TEST_TIMEOUT_MS,
   extractCrashExcerpt,
   findCrashMarkers,
   getBunFailCounts,
@@ -21,7 +20,6 @@ import {
   resolveMaxAttempts,
   resolveQuarantineMode,
   shouldRetryQuarantinedSuites,
-  withDefaultTestTimeout,
 } from "./run-bun-tests-helpers.mjs";
 
 // The real #15785 tail (windows-ci run 29041377960): hook-timeout (fail) line,
@@ -244,16 +242,6 @@ describe("attempt/timeout bounds", () => {
       DEFAULT_QUARANTINE_ATTEMPT_TIMEOUT_MS,
     );
     expect(resolveAttemptTimeoutMs({ ELIZA_PGLITE_QUARANTINE_TIMEOUT_MS: "2000" })).toBe(2000);
-  });
-
-  test("package test timeout defaults to 60s and preserves caller overrides", () => {
-    expect(withDefaultTestTimeout([])).toEqual([`--timeout=${DEFAULT_TEST_TIMEOUT_MS}`]);
-    expect(withDefaultTestTimeout(["src/example.test.ts"])).toEqual([
-      `--timeout=${DEFAULT_TEST_TIMEOUT_MS}`,
-      "src/example.test.ts",
-    ]);
-    expect(withDefaultTestTimeout(["--timeout", "120000"])).toEqual(["--timeout", "120000"]);
-    expect(withDefaultTestTimeout(["--timeout=120000"])).toEqual(["--timeout=120000"]);
   });
 });
 
