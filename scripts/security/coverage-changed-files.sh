@@ -67,7 +67,9 @@ changed_source() {
         grep -Fxq "$file" "$NODE_SELF_TEST_MANIFEST" && continue
         echo "$file"
       done \
-    | node --no-warnings "$SCRIPT_DIR/coverage-source-classifier.mjs" --base "$MERGE_BASE"
+    | node --no-warnings "$SCRIPT_DIR/coverage-source-classifier.mjs" \
+        --base "$MERGE_BASE" \
+        --head "$HEAD"
 }
 
 changed_tests() {

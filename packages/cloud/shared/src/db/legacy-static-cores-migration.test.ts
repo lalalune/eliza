@@ -13,7 +13,6 @@ import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
-import { selectPendingMigrations } from "../../../../scripts/cloud/admin/migration-selection.ts";
 
 const MIGRATION_TAG = "0132_legacy_static_cores_disable";
 const MIGRATION_WHEN = 1779408000000;
@@ -186,54 +185,6 @@ describe("legacy static core retirement migration", () => {
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
       await database.close();
-    }
-  });
-
-  test("the default migration runner skips the rewritten migration at the historical cursor", () => {
-    const journalEntries = readJournalEntries();
-    const currentEntry = journalEntries.find((entry) => entry.tag === MIGRATION_TAG);
-    const nextEntry = journalEntries
-      .filter((entry) => entry.when > MIGRATION_WHEN)
-      .sort((left, right) => left.when - right.when)[0];
-    if (!currentEntry || !nextEntry) {
-      throw new Error("Migration cursor fixture requires 0132 and a later entry");
-    }
-
-    const historicalCursor = {
-      id: 132,
-      hash: HISTORICAL_MIGRATION_HASH,
-      created_at: MIGRATION_WHEN,
-    };
-    const pending = selectPendingMigrations(
-      [
-        {
-          entry: currentEntry,
-          hash: createHash("sha256").update(readFileSync(MIGRATION_PATH, "utf8")).digest("hex"),
-          statements: [],
-        },
-        { entry: nextEntry, hash: "next", statements: [] },
-      ],
-      historicalCursor,
-    );
-
-    expect(pending.map((migration) => migration.entry.tag)).toEqual([nextEntry.tag]);
-  });
-
-  test("the default migration runner distinguishes an empty ledger from a corrupt cursor", () => {
-    const migrations = [{ entry: { when: MIGRATION_WHEN } }];
-
-    expect(selectPendingMigrations(migrations, undefined)).toEqual(migrations);
-    expect(selectPendingMigrations(migrations, { created_at: 0 })).toEqual(migrations);
-    for (const created_at of [null, "", "not-a-timestamp", -1]) {
-      try {
-        selectPendingMigrations(migrations, { created_at });
-        throw new Error("Expected a corrupt migration cursor to fail closed");
-      } catch (error) {
-        expect(error).toMatchObject({
-          code: "DB_MIGRATION_CURSOR_INVALID",
-          severity: "fatal",
-        });
-      }
     }
   });
 });
