@@ -16,7 +16,7 @@
  * so probes fire there exactly as before.
  */
 
-import { act, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../api/runtime-mode-client", () => ({
@@ -140,6 +140,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   __resetAuthStatusForTests();
   __resetRuntimeModeCacheForTests();
   if (originalLocationDescriptor) {
