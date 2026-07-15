@@ -27,7 +27,9 @@ plugins/plugin-sql/
     index.ts                    Default entry (same implementation as index.node.ts; uses ./utils)
     index.node.ts               Node/Bun entry: PostgreSQL + PGlite; createDatabaseAdapter()
     index.browser.ts            Browser entry: PGlite-only plugin
-    base.ts                     BaseDrizzleAdapter — shared IDatabaseAdapter implementation
+    base.ts                     Stable BaseDrizzleAdapter entrypoint; routes structured message search
+    base-adapter-core.ts        Shared IDatabaseAdapter implementation for every SQL backend
+    message-search.ts           Search-object DDL and operator-safe full-text message queries
     types.ts                    DrizzleDatabase union type; getDb() helper
     agent-mapping.ts            Utilities for normalizing agent message examples from DB rows
     utils.ts / utils.node.ts / utils.browser.ts  Platform-specific helpers (resolvePgliteDir)
@@ -115,7 +117,7 @@ Settings are read via `runtime.getSetting(key)` inside `plugin.init`.
 
 1. Create `src/stores/<domain>.store.ts` implementing your query functions against `DrizzleDatabase`.
 2. Export from `src/stores/index.ts`.
-3. Call from `BaseDrizzleAdapter` in `src/base.ts` or from the relevant `PgDatabaseAdapter` / `PgliteDatabaseAdapter`.
+3. Call from `BaseDrizzleAdapter` in `src/base-adapter-core.ts`, from the focused message-search path in `src/message-search.ts`, or from the relevant `PgDatabaseAdapter` / `PgliteDatabaseAdapter`.
 
 ### Add a new service
 

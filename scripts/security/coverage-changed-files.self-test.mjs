@@ -8,6 +8,27 @@ import { dirname, join } from "node:path";
 
 const root = new URL("../..", import.meta.url).pathname;
 const script = join(root, "scripts/security/coverage-changed-files.sh");
+const identicalRenameSource = [
+  "export const one = 1;",
+  "export const two = 2;",
+  "export const three = 3;",
+  "export const four = 4;",
+  "export const five = 5;",
+  "",
+].join("\n");
+const changedRenameBaseSource = [
+  "export const stableOne = 1;",
+  "export const stableTwo = 2;",
+  "export const stableThree = 3;",
+  "export const changedValue = 1;",
+  "export const stableFour = 4;",
+  "export const stableFive = 5;",
+  "",
+].join("\n");
+const changedRenameHeadSource = changedRenameBaseSource.replace(
+  "changedValue = 1",
+  "changedValue = 2",
+);
 
 function git(cwd, ...args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -79,6 +100,9 @@ try {
 
   // Merge-base commit: the point the feature branch forks from.
   write(dir, "packages/demo/src/base.ts", "export const base = 1;\n");
+  write(dir, "packages/demo/src/adapter.ts", identicalRenameSource);
+  write(dir, "packages/demo/src/changed-adapter.ts", changedRenameBaseSource);
+  write(dir, "packages/demo/src/cross-directory.ts", identicalRenameSource);
   write(
     dir,
     "packages/demo/src/runtime-equivalent.ts",
@@ -123,6 +147,24 @@ try {
   // Feature branch forks from the merge-base and adds its own source + tests.
   git(dir, "checkout", "-q", "-b", "feature", mergeBase);
   rmSync(join(dir, "packages/demo/src/deleted.ts"));
+  write(
+    dir,
+    "packages/demo/src/adapter.ts",
+    'export { one, two, three, four, five } from "./adapter-core";\nexport const wrapperVersion = 1;\n',
+  );
+  write(dir, "packages/demo/src/adapter-core.ts", identicalRenameSource);
+  rmSync(join(dir, "packages/demo/src/changed-adapter.ts"));
+  write(
+    dir,
+    "packages/demo/src/changed-adapter-core.ts",
+    changedRenameHeadSource,
+  );
+  rmSync(join(dir, "packages/demo/src/cross-directory.ts"));
+  write(
+    dir,
+    "packages/demo/relocated/cross-directory.ts",
+    identicalRenameSource,
+  );
   write(
     dir,
     "packages/demo/src/runtime-equivalent.ts",
@@ -459,6 +501,28 @@ try {
       `added runtime source missing from changed source: ${out.files.join(",")}`,
     );
   });
+
+  assertCase(
+    "only byte-identical same-directory relocations are runtime-equivalent",
+    () => {
+      assert.ok(
+        !out.files.includes("packages/demo/src/adapter-core.ts"),
+        `byte-identical rename remained enforced: ${out.files.join(",")}`,
+      );
+      assert.ok(
+        out.files.includes("packages/demo/src/adapter.ts"),
+        `replacement wrapper escaped enforcement: ${out.files.join(",")}`,
+      );
+      assert.ok(
+        out.files.includes("packages/demo/src/changed-adapter-core.ts"),
+        `changed rename escaped enforcement: ${out.files.join(",")}`,
+      );
+      assert.ok(
+        out.files.includes("packages/demo/relocated/cross-directory.ts"),
+        `cross-directory rename escaped enforcement: ${out.files.join(",")}`,
+      );
+    },
+  );
 
   assertCase("semantic comment changes remain LCOV-enforced", () => {
     assert.ok(out.files.includes("packages/demo/src/vite-directive.ts"));
