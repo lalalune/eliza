@@ -1,34 +1,27 @@
 /**
- * Postgres full-text + trigram search objects for chat message search at scale
- * (#13534). Chat messages are `memories` rows (`type='messages'`, body at
- * `content->>'text'`); this module installs the immutable folding + document
- * functions and the two GIN indexes that let `BaseDrizzleAdapter.searchMessages`
- * run corpus-wide `websearch_to_tsquery` + `ts_rank_cd` ranking instead of the
- * old recency-truncated `ILIKE` scan.
+ * Installs and queries the Postgres search objects for corpus-wide chat search
+ * (#13534): immutable text folding, a materialized message document, and FTS
+ * plus trigram GIN indexes over `memories` rows of type `messages`.
  *
- * Why a custom immutable fold instead of `unaccent`: `unaccent` is not immutable
- * (its rules live in a mutable dictionary) and the bundled PGlite build does not
- * ship it, so accent/case/apostrophe folding is a fixed `translate()` map
- * (café→cafe, don't→dont) that IS immutable and therefore usable in a generated
- * column and expression index.
+ * The fixed `translate()` fold replaces mutable, PGlite-absent `unaccent`, so it
+ * is safe in generated columns and expression indexes. Materializing attachment
+ * parsing and folding on write avoids recomputing them across the corpus when a
+ * fuzzy fallback misses the FTS index.
  *
- * Why a STORED generated column (`message_search_document`) rather than indexing
- * the function expression directly: the fold+document function does jsonb
- * parsing, an attachment `string_agg` subquery, and a `translate()` per call.
- * Evaluating it per row at query time makes any query that cannot be answered by
- * the FTS GIN index alone (the `pg_trgm` partial-word fallback, or an FTS-index
- * miss) an O(n) scan that recomputes the document for every row — 10k rows × the
- * function ≈ seconds. Materializing the document once at write time (the column
- * is computed on INSERT/UPDATE) turns that fallback into a plain indexed / cheap
- * text scan. The FTS GIN indexes `to_tsvector(message_search_document)` and the
- * trigram GIN indexes the column with `gin_trgm_ops`; the query references the
- * column, so the planner uses the indexes and never recomputes the function.
- * `pg_trgm` is best-effort: where it is unavailable the FTS index still answers
- * whole-word queries and the `LIKE` fallback scans the cheap stored column, so
- * partial/substring recall degrades in speed, never in correctness.
+ * Operator-bearing websearch queries use FTS only because literal and trigram
+ * fallbacks cannot preserve phrase, negation, or OR semantics. `pg_trgm` remains
+ * optional: without it, whole-word correctness stays indexed while substring
+ * matching uses the inexpensive stored document.
  */
-import { logger } from "@elizaos/core";
-import { sql } from "drizzle-orm";
+import {
+  type AccessContext,
+  logger,
+  type Memory,
+  type MessageSearchHit,
+  type UUID,
+} from "@elizaos/core";
+import { and, asc, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
+import { memoryTable } from "./schema";
 import type { DrizzleDatabase } from "./types";
 
 export const FTS_CONFIG = "english";
@@ -44,6 +37,165 @@ const STRIP_CHARS = "'’`";
 
 /** SQL string literal for `translate`'s `from` set, single-quotes doubled. */
 const FOLD_FROM_LITERAL = (ACCENT_FROM + STRIP_CHARS).replace(/'/g, "''");
+
+export interface StructuredMessageSearchParams {
+  roomIds: UUID[];
+  query: string;
+  tableName?: string;
+  limit?: number;
+  offset?: number;
+  since?: number;
+  until?: number;
+  accessContext?: AccessContext;
+}
+
+interface MessageSearchRow {
+  id: string;
+  createdAt: Date;
+  content: unknown;
+  entityId: string | null;
+  agentId: string;
+  roomId: string | null;
+  worldId: string | null;
+  unique: boolean;
+  metadata: unknown;
+  ftsRank: unknown;
+}
+
+/** Whether relaxing this query to literal/fuzzy matching would change its meaning. */
+export function usesStructuredWebsearchSyntax(value: string): boolean {
+  return value.includes('"') || /(^|\s)-(?=\S)/.test(value) || /(^|\s)or(?=\s|$)/i.test(value);
+}
+
+function isMessageSearchObjectsMissing(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const layer = current as { code?: unknown; message?: unknown; cause?: unknown };
+    const message = typeof layer.message === "string" ? layer.message : "";
+    if (
+      (layer.code === "42703" || layer.code === "42883" || /does not exist/i.test(message)) &&
+      /message_search_document|eliza_search_fold/i.test(message)
+    ) {
+      return true;
+    }
+    current = layer.cause;
+  }
+  return false;
+}
+
+function mapMessageSearchRows(rows: MessageSearchRow[]): MessageSearchHit[] {
+  return rows.map((row) => ({
+    memory: {
+      id: row.id as UUID,
+      createdAt: row.createdAt.getTime(),
+      content: typeof row.content === "string" ? JSON.parse(row.content) : row.content,
+      entityId: row.entityId as UUID,
+      agentId: row.agentId as UUID,
+      roomId: row.roomId as UUID,
+      worldId: (row.worldId ?? undefined) as UUID | undefined,
+      unique: row.unique,
+      metadata: row.metadata,
+    } as Memory,
+    ftsRank: Number(row.ftsRank),
+    trigramSimilarity: 0,
+  }));
+}
+
+async function executeStructuredMessageSearch(
+  db: DrizzleDatabase,
+  agentId: UUID,
+  params: StructuredMessageSearchParams,
+  document: SQL,
+  foldedQuery: SQL
+): Promise<MessageSearchHit[]> {
+  const tableName = params.tableName ?? MESSAGE_SEARCH_TABLE_TYPE;
+  const tsvector = sql`to_tsvector('${sql.raw(FTS_CONFIG)}', ${document})`;
+  const tsquery = sql`websearch_to_tsquery('${sql.raw(FTS_CONFIG)}', ${foldedQuery})`;
+  const ftsRank = sql<number>`ts_rank_cd(${tsvector}, ${tsquery})`;
+  const conditions: SQL[] = [
+    eq(memoryTable.type, tableName),
+    eq(memoryTable.agentId, agentId),
+    inArray(memoryTable.roomId, params.roomIds),
+    sql`${tsvector} @@ ${tsquery}`,
+  ];
+  if (typeof params.since === "number") {
+    conditions.push(gte(memoryTable.createdAt, new Date(params.since)));
+  }
+  if (typeof params.until === "number") {
+    conditions.push(lte(memoryTable.createdAt, new Date(params.until)));
+  }
+
+  const rows = await db
+    .select({
+      id: memoryTable.id,
+      createdAt: memoryTable.createdAt,
+      content: memoryTable.content,
+      entityId: memoryTable.entityId,
+      agentId: memoryTable.agentId,
+      roomId: memoryTable.roomId,
+      worldId: memoryTable.worldId,
+      unique: memoryTable.unique,
+      metadata: memoryTable.metadata,
+      ftsRank: ftsRank.as("fts_rank"),
+    })
+    .from(memoryTable)
+    .where(and(...conditions))
+    .orderBy(sql`fts_rank DESC`, desc(memoryTable.createdAt), asc(memoryTable.id))
+    .limit(params.limit ?? 20)
+    .offset(params.offset ?? 0);
+  return mapMessageSearchRows(rows);
+}
+
+/**
+ * Runs operator-bearing queries through full-text search only. If production
+ * has intentionally deferred the generated-column/index migration, the same
+ * fold and document expression is evaluated inline so correctness survives at
+ * sequential-scan cost until operators install the search objects.
+ */
+export async function searchStructuredMessages(
+  db: DrizzleDatabase,
+  agentId: UUID,
+  params: StructuredMessageSearchParams
+): Promise<MessageSearchHit[]> {
+  if (params.roomIds.length === 0) return [];
+
+  try {
+    return await executeStructuredMessageSearch(
+      db,
+      agentId,
+      params,
+      sql`message_search_document`,
+      sql`eliza_search_fold(${params.query})`
+    );
+  } catch (error) {
+    if (!isMessageSearchObjectsMissing(error)) throw error;
+    // error-policy:J4 production Postgres may defer the heavy search-object
+    // migration; this explicit sequential FTS path preserves operator meaning.
+    logger.warn(
+      {
+        src: "plugin:sql",
+        error: error instanceof Error ? error.message : String(error),
+      },
+      "[MessageSearch] search objects are missing; using sequential structured search"
+    );
+  }
+
+  const inlineDocument = sql`translate(lower(
+    coalesce(${memoryTable.content}->>'text', '')
+    || ' ' ||
+    coalesce((
+      SELECT string_agg(coalesce(attachment->>'title', '') || ' ' || coalesce(attachment->>'url', ''), ' ')
+      FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(${memoryTable.content}->'attachments') = 'array'
+             THEN ${memoryTable.content}->'attachments' ELSE '[]'::jsonb END
+      ) AS attachment
+    ), '')
+  ), '${sql.raw(FOLD_FROM_LITERAL)}', '${sql.raw(ACCENT_TO)}')`;
+  const inlineQuery = sql`translate(lower(${params.query}), '${sql.raw(FOLD_FROM_LITERAL)}', '${sql.raw(ACCENT_TO)}')`;
+  return await executeStructuredMessageSearch(db, agentId, params, inlineDocument, inlineQuery);
+}
 
 /**
  * Create (idempotently) the folding/document functions and the FTS + trigram
