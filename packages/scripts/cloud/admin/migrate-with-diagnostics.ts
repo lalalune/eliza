@@ -5,10 +5,6 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { enforceTlsForRemote } from "@elizaos/cloud-shared/db/client";
 import pg from "pg";
-import {
-  migrationCursorValue,
-  selectPendingMigrations,
-} from "./migration-selection.ts";
 
 const { Client } = pg;
 
@@ -83,6 +79,15 @@ async function readMigration(entry: JournalEntry): Promise<Migration> {
   };
 }
 
+function createdAtValue(
+  migration: AppliedMigration | undefined,
+): number | null {
+  if (!migration?.created_at) return null;
+
+  const value = Number(migration.created_at);
+  return Number.isFinite(value) ? value : null;
+}
+
 function summarizeStatement(statement: string): string {
   return statement.replace(/\s+/g, " ").slice(0, 500);
 }
@@ -125,7 +130,7 @@ async function getLastAppliedMigration(
   const result = await client.query<AppliedMigration>(`
     SELECT id, hash, created_at
     FROM "${MIGRATIONS_SCHEMA}"."${MIGRATIONS_TABLE}"
-    ORDER BY created_at DESC NULLS FIRST, id DESC
+    ORDER BY created_at DESC
     LIMIT 1
   `);
 
@@ -229,7 +234,7 @@ async function main(): Promise<void> {
     await ensureMigrationsTable(client);
 
     const lastApplied = await getLastAppliedMigration(client);
-    const lastAppliedCreatedAt = migrationCursorValue(lastApplied);
+    const lastAppliedCreatedAt = createdAtValue(lastApplied);
     console.log(
       `[db:migrate] last applied migration: ${
         lastAppliedCreatedAt === null
@@ -238,7 +243,11 @@ async function main(): Promise<void> {
       }`,
     );
 
-    const pending = selectPendingMigrations(migrations, lastApplied);
+    const pending = migrations.filter(
+      (migration) =>
+        lastAppliedCreatedAt === null ||
+        migration.entry.when > lastAppliedCreatedAt,
+    );
     console.log(`[db:migrate] pending migrations: ${pending.length}`);
 
     for (const migration of pending) {
@@ -251,9 +260,7 @@ async function main(): Promise<void> {
   }
 }
 
-if (import.meta.main) {
-  main().catch((error) => {
-    console.error(`[db:migrate] fatal: ${formatDatabaseError(error)}`);
-    process.exit(1);
-  });
-}
+main().catch((error) => {
+  console.error(`[db:migrate] fatal: ${formatDatabaseError(error)}`);
+  process.exit(1);
+});
