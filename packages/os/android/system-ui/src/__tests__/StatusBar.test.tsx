@@ -1,8 +1,10 @@
-// Exercises Android SystemUI rendering behavior for the elizaOS image.
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+/** Verifies the AOSP status surface renders device state with accessible indicator semantics. */
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 import { StatusBar } from "../components/StatusBar";
 import { MockSystemProvider } from "../providers/MockSystemProvider";
+
+afterEach(cleanup);
 
 describe("StatusBar", () => {
   it("renders indicators from MockSystemProvider", () => {
@@ -30,13 +32,19 @@ describe("StatusBar", () => {
     expect(screen.getByLabelText(/Battery 78%/)).toBeDefined();
   });
 
-  it("renders an HH:MM clock string", () => {
+  it("exposes the clock and indicator group to assistive technology", () => {
     render(
       <MockSystemProvider locale="en-US" timeZone="UTC" tickMs={60_000}>
         <StatusBar />
       </MockSystemProvider>,
     );
-    const clockEls = screen.getAllByLabelText(/Time \d{2}:\d{2}/);
-    expect(clockEls.length).toBeGreaterThan(0);
+
+    const clock = screen.getByRole("timer", {
+      name: /^Time \d{2}:\d{2}$/,
+    });
+    expect(clock.textContent).toMatch(/^\d{2}:\d{2}$/);
+    expect(
+      screen.getByRole("toolbar", { name: "System indicators" }),
+    ).toBeDefined();
   });
 });

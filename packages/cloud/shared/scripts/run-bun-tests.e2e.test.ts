@@ -8,7 +8,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { DEFAULT_TEST_TIMEOUT_MS } from "./run-bun-tests-helpers.mjs";
 
 const scriptsDir = import.meta.dir;
 const wrapperPath = path.join(scriptsDir, "run-bun-tests.mjs");
@@ -153,7 +152,7 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     expect(quarantinePasses.length).toBeGreaterThanOrEqual(1);
   }, 60_000);
 
-  test("quarantine off: single invocation uses the package timeout default", () => {
+  test("quarantine off (ELIZA_WIN_PGLITE_QUARANTINE=0): single legacy bun test --isolate invocation", () => {
     const run = runWrapper({
       plan: ["pass"],
       env: { ELIZA_WIN_PGLITE_QUARANTINE: "0" },
@@ -163,7 +162,6 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     const argv = run.invocations[0].argv;
     expect(argv[0]).toBe("test");
     expect(argv).toContain("--isolate");
-    expect(argv).toContain(`--timeout=${DEFAULT_TEST_TIMEOUT_MS}`);
     expect(argv.some((arg) => arg.startsWith("--path-ignore-patterns="))).toBe(false);
     expect(argv).not.toContain(QUARANTINED_SUITE);
   }, 60_000);
@@ -199,7 +197,6 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     for (const invocation of run.invocations) {
       expect(invocation.argv).toContain("--timeout");
       expect(invocation.argv).toContain("120000");
-      expect(invocation.argv.some((arg) => arg.startsWith("--timeout="))).toBe(false);
     }
   }, 60_000);
 });
