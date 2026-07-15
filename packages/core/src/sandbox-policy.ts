@@ -7,7 +7,7 @@
  * affected actions off entirely rather than letting them fail at spawn time.
  */
 
-import { getBuildVariant, getDirectDownloadUrl } from "./build-variant.js";
+import { getBuildVariant, getDirectDownloadUrl } from "./build-variant.ts";
 
 export function isLocalCodeExecutionAllowed(): boolean {
 	return getBuildVariant() === "direct";
