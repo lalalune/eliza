@@ -879,14 +879,23 @@ describe("iOS bridge — local inference control routes", () => {
 
 	it("downloads a catalog model into the registry through the streamed response body", async () => {
 		const bytes = new TextEncoder().encode("tiny-gguf-fixture");
-		const fetchMock = vi.fn(
-			async () =>
-				new Response(bytes, {
+		const fetchRequests: Array<{
+			input: Parameters<typeof fetch>[0];
+			init?: Parameters<typeof fetch>[1];
+		}> = [];
+		vi.stubGlobal(
+			"fetch",
+			async (
+				input: Parameters<typeof fetch>[0],
+				init?: Parameters<typeof fetch>[1],
+			) => {
+				fetchRequests.push({ input, init });
+				return new Response(bytes, {
 					status: 200,
 					headers: { "content-length": String(bytes.byteLength) },
-				}),
+				});
+			},
 		);
-		vi.stubGlobal("fetch", fetchMock);
 
 		const started = await call(
 			backend,
@@ -922,10 +931,13 @@ describe("iOS bridge — local inference control routes", () => {
 			received: bytes.byteLength,
 			total: bytes.byteLength,
 		});
-		expect(fetchMock).toHaveBeenCalledWith(
-			"https://huggingface.co/elizaos/eliza-1/resolve/main/bundles/2b/text/eliza-1-2b-128k.gguf",
-			{ redirect: "follow" },
-		);
+		expect(fetchRequests).toEqual([
+			{
+				input:
+					"https://huggingface.co/elizaos/eliza-1/resolve/main/bundles/2b/text/eliza-1-2b-128k.gguf",
+				init: { redirect: "follow" },
+			},
+		]);
 
 		const installed = await call(
 			backend,
