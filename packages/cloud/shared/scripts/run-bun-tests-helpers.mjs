@@ -34,23 +34,6 @@ const MAX_QUARANTINE_ATTEMPTS_CEILING = 5;
 export const DEFAULT_QUARANTINE_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
- * Per-test timeout for the package-wide Bun process. The wrapper runs from the
- * package directory, where the repository-root bunfig is not loaded, so make
- * its intended 60-second default explicit while preserving caller overrides.
- */
-export const DEFAULT_TEST_TIMEOUT_MS = 60_000;
-
-/** Add the package default unless the caller already supplied either Bun form. */
-export function withDefaultTestTimeout(passthroughArgs) {
-  const hasExplicitTimeout = passthroughArgs.some(
-    (arg) => arg === "--timeout" || arg.startsWith("--timeout="),
-  );
-  return hasExplicitTimeout
-    ? [...passthroughArgs]
-    : [`--timeout=${DEFAULT_TEST_TIMEOUT_MS}`, ...passthroughArgs];
-}
-
-/**
  * Output markers that identify a NATIVE crash of the bun process (as opposed
  * to a reported test failure). Sourced from the real #15785 crash output and
  * Bun's panic/crash-handler formats.
