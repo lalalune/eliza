@@ -219,6 +219,46 @@ describe("searchMessages FTS + trigram (real DB)", () => {
     expect(union.some((t) => t.includes("deliberately misspelled"))).toBe(false);
   });
 
+  it("10c. structured queries apply inclusive time windows before ranking", async () => {
+    const cutoff = Date.now();
+    const olderId = v4() as UUID;
+    const newerId = v4() as UUID;
+    for (const [id, createdAt] of [
+      [olderId, cutoff - 10_000],
+      [newerId, cutoff + 10_000],
+    ] as const) {
+      await adapter.createMemory(
+        {
+          id,
+          entityId,
+          agentId,
+          roomId: roomA,
+          worldId,
+          content: { text: "temporal quartz marker" },
+          metadata: { type: "messages" },
+          createdAt,
+        } as never,
+        "messages"
+      );
+    }
+
+    const older = await adapter.searchMessages({
+      roomIds: [roomA],
+      query: '"temporal quartz"',
+      tableName: "messages",
+      until: cutoff,
+    });
+    expect(older.map((hit) => hit.memory.id)).toEqual([olderId]);
+
+    const newer = await adapter.searchMessages({
+      roomIds: [roomA],
+      query: '"temporal quartz"',
+      tableName: "messages",
+      since: cutoff,
+    });
+    expect(newer.map((hit) => hit.memory.id)).toEqual([newerId]);
+  });
+
   it("11. near-duplicates all returned, deterministically ordered by recency then id", async () => {
     const hits = await adapter.searchMessages({
       roomIds: [roomA],
@@ -355,9 +395,35 @@ describe("searchMessages FTS + trigram (real DB)", () => {
   it("18. empty room set short-circuits to no rows without a query", async () => {
     const hits = await adapter.searchMessages({
       roomIds: [],
-      query: "anything",
+      query: '"anything"',
       tableName: "messages",
     });
     expect(hits).toHaveLength(0);
+  });
+
+  it("19. structured semantics survive deferred search-object installation", async () => {
+    const db = adapter.getDatabase() as DrizzleDatabase;
+    await db.execute(sql`
+      ALTER TABLE memories
+      RENAME COLUMN message_search_document TO message_search_document_deferred
+    `);
+    try {
+      const hits = await adapter.searchMessages({
+        roomIds: [roomA],
+        query: "alpha OR zephyr",
+        tableName: "messages",
+        limit: 50,
+      });
+      const texts = hits.map((hit) => (hit.memory.content as { text?: string }).text ?? "");
+      expect(texts.some((text) => text.includes("exact phrase alpha beta"))).toBe(true);
+      expect(texts.some((text) => text.includes("duplicate marker zephyr"))).toBe(true);
+      expect(texts.some((text) => text.includes("deliberately misspelled"))).toBe(false);
+      expect(hits.every((hit) => hit.ftsRank > 0 && hit.trigramSimilarity === 0)).toBe(true);
+    } finally {
+      await db.execute(sql`
+        ALTER TABLE memories
+        RENAME COLUMN message_search_document_deferred TO message_search_document
+      `);
+    }
   });
 });
