@@ -1,13 +1,14 @@
-// End-to-end coverage for scripts/run-bun-tests.mjs (#15785): spawns the REAL
-// wrapper process, which spawns real children through the ELIZA_BUN_TEST_BIN
-// seam (scripts/__fixtures__/stub-bun-runner.mjs emitting the verbatim #15785
-// panic output). Exercises the full classify → capture → retry → exit-code
-// pipeline with real processes on any platform.
+/**
+ * Exercises the cloud test wrapper's classify, capture, retry, and exit pipeline
+ * through real child processes. A scripted Bun seam emits the recorded #15785
+ * panic output so the process boundary runs consistently on every platform.
+ */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DEFAULT_TEST_TIMEOUT_MS } from "./run-bun-tests-helpers.mjs";
 
 const scriptsDir = import.meta.dir;
 const wrapperPath = path.join(scriptsDir, "run-bun-tests.mjs");
@@ -152,7 +153,7 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     expect(quarantinePasses.length).toBeGreaterThanOrEqual(1);
   }, 60_000);
 
-  test("quarantine off (ELIZA_WIN_PGLITE_QUARANTINE=0): single legacy bun test --isolate invocation", () => {
+  test("quarantine off: single invocation uses the package timeout default", () => {
     const run = runWrapper({
       plan: ["pass"],
       env: { ELIZA_WIN_PGLITE_QUARANTINE: "0" },
@@ -162,6 +163,7 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     const argv = run.invocations[0].argv;
     expect(argv[0]).toBe("test");
     expect(argv).toContain("--isolate");
+    expect(argv).toContain(`--timeout=${DEFAULT_TEST_TIMEOUT_MS}`);
     expect(argv.some((arg) => arg.startsWith("--path-ignore-patterns="))).toBe(false);
     expect(argv).not.toContain(QUARANTINED_SUITE);
   }, 60_000);
@@ -197,6 +199,7 @@ describe("run-bun-tests wrapper e2e (#15785 quarantine + crash retry)", () => {
     for (const invocation of run.invocations) {
       expect(invocation.argv).toContain("--timeout");
       expect(invocation.argv).toContain("120000");
+      expect(invocation.argv.some((arg) => arg.startsWith("--timeout="))).toBe(false);
     }
   }, 60_000);
 });
