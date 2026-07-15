@@ -4,6 +4,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as nodeModule from "node:module";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const bunTypeScriptTranspiler = globalThis.Bun
@@ -176,37 +177,121 @@ export function classifyPaths(
   }
 }
 
-function parseBaseRef(args) {
-  if (args.length === 0) return undefined;
-  if (args.length === 2 && args[0] === "--base" && args[1]) return args[1];
-  throw new Error(
-    "usage: coverage-source-classifier.mjs [--base <git-revision>]",
-  );
+function parseRevisions(args) {
+  if (args.length === 0) return {};
+  const revisions = {};
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!value || (flag !== "--base" && flag !== "--head")) {
+      throw new Error(
+        "usage: coverage-source-classifier.mjs [--base <git-revision> --head <git-revision>]",
+      );
+    }
+    revisions[flag.slice(2)] = value;
+  }
+  if (revisions.head && !revisions.base) {
+    throw new Error("--head requires --base");
+  }
+  return revisions;
 }
 
-function readSourceAtRevision(revision, path) {
+function readSourceAtRevision(revision, sourcePath) {
   try {
-    return execFileSync("git", ["cat-file", "blob", `${revision}:${path}`], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    return execFileSync(
+      "git",
+      ["cat-file", "blob", `${revision}:${sourcePath}`],
+      {
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
   } catch {
-    // New and renamed paths have no blob at the merge base. Retaining them is
-    // conservative, and also fail-widens unexpected Git lookup failures.
     return undefined;
   }
 }
 
+/**
+ * Finds same-directory renames and extracted copies between the revisions.
+ * Moving across directories stays enforced because it can change relative
+ * import resolution.
+ */
+function readSameDirectoryRelocations(baseRef, headRef) {
+  if (!headRef) return new Map();
+  try {
+    const output = execFileSync(
+      "git",
+      [
+        "diff",
+        "--name-status",
+        "-z",
+        "--find-renames",
+        "--find-copies-harder",
+        "--diff-filter=CR",
+        baseRef,
+        headRef,
+      ],
+      {
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    const fields = output.split("\0");
+    const relocations = new Map();
+    for (let index = 0; index < fields.length; ) {
+      const status = fields[index++];
+      if (!status) continue;
+      const sourcePath = fields[index++];
+      const destinationPath = fields[index++];
+      if (
+        /^[CR]\d+$/.test(status) &&
+        sourcePath &&
+        destinationPath &&
+        path.dirname(sourcePath) === path.dirname(destinationPath)
+      ) {
+        relocations.set(destinationPath, sourcePath);
+      }
+    }
+    return relocations;
+  } catch {
+    // Rename discovery only narrows proven no-op moves. Failure retains the
+    // destination as a new executable file, which is the safe default.
+    return new Map();
+  }
+}
+
+function createBaseSourceReader(baseRef, headRef) {
+  const relocationSources = readSameDirectoryRelocations(baseRef, headRef);
+  return (currentPath) => {
+    const samePathSource = readSourceAtRevision(baseRef, currentPath);
+    if (samePathSource !== undefined) return samePathSource;
+
+    const relocatedFrom = relocationSources.get(currentPath);
+    if (!relocatedFrom) return undefined;
+    const relocatedSource = readSourceAtRevision(baseRef, relocatedFrom);
+    if (relocatedSource === undefined) return undefined;
+
+    // Any content change keeps the renamed path enforced; only a byte-identical
+    // move can borrow the old path as its comparison baseline.
+    return readFileSync(currentPath, "utf8") === relocatedSource
+      ? relocatedSource
+      : undefined;
+  };
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const baseRef = parseBaseRef(process.argv.slice(2));
+  const { base: baseRef, head: headRef } = parseRevisions(
+    process.argv.slice(2),
+  );
   classifyPaths(
     readFileSync(0, "utf8").split("\n").filter(Boolean),
     undefined,
     undefined,
     {
       readBaseSource: baseRef
-        ? (path) => readSourceAtRevision(baseRef, path)
+        ? createBaseSourceReader(baseRef, headRef)
         : undefined,
     },
   );
