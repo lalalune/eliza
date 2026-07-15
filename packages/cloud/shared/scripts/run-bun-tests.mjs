@@ -1,44 +1,20 @@
 #!/usr/bin/env node
 
-// Package `test` entry — wraps what used to be a bare `bun test --isolate`.
-//
-// WHY (#15785): on the Windows CI shard (`windows-ci.yml` app-and-cli lane,
-// pinned to Bun canary) the PGlite-backed tenant-db placement-claimer suite
-// intermittently wedges in a beforeEach/afterEach hook and then takes the
-// WHOLE `bun test` process down with a native crash:
-//
-//   (fail) tenant DB durable placement claimer > (unnamed) [6147.35ms]
-//     ^ a beforeEach/afterEach hook timed out for this test.
-//   panic(main thread): Illegal instruction at address 0x7FF6B271CDB0
-//   oh no: Bun has crashed. This indicates a bug in Bun, not your code.
-//   error: script "test" exited with code 3
-//
-// That is a Bun/PGlite (WASM) bug, not a test bug — the byte-identical suite
-// passed 11h earlier. Workflow files cannot carry the mitigation (see the
-// issue), so it lives here in the test entry:
-//
-//   - non-win32 (default): exactly `bun test --isolate [args]` — unchanged.
-//   - win32 (or ELIZA_WIN_PGLITE_QUARANTINE=1):
-//       pass 1  `bun test --isolate` over everything EXCEPT the quarantined
-//               PGlite tenant-db suites (repeated --path-ignore-patterns).
-//       pass 2  the quarantined suites in their own child `bun test` process,
-//               retried a bounded number of times ONLY when the child died
-//               with a native-crash signature; full crash output is captured
-//               to a file for the upstream Bun report
-//               (scripts/bun-pglite-crash-upstream-report.md).
-//
-// Integrity guarantees (#13620 — no vacuous green):
-//   - every quarantined suite still RUNS on every platform; this is not a skip
-//     list, and a missing quarantined file fails the run loudly.
-//   - a reported test failure (assertion/hook fail with a completed run) is
-//     NEVER retried — it fails the run immediately.
-//   - retries are bounded; a persistent crash still fails the run.
-//   - the main pass keeps plain fail-fast semantics: any non-zero exit fails
-//     the run (no crash-retry outside the quarantined suites).
-//
-// Extra CLI args are forwarded verbatim to BOTH passes (flags like --timeout
-// or --conditions compose fine; a positional file filter will run matching
-// files in both passes — harmless, but scope filters manually if that grates).
+/**
+ * Runs the cloud-shared Bun suite with an explicit 60-second per-test timeout
+ * and Windows-only isolation for the PGlite placement-claimer suite.
+ *
+ * Windows Bun can wedge in a PGlite hook and then terminate with a native
+ * illegal-instruction crash (#15785). The Windows path excludes that suite
+ * from the main pass and runs it in a dedicated child, capturing full crash
+ * output and retrying only bounded, positively identified native crashes.
+ *
+ * Every quarantined suite still runs, stale suite paths fail loudly, genuine
+ * test failures never retry, and main-pass failures stay red (#13620). An
+ * explicit `--timeout` overrides the package default; caller ignore patterns
+ * shape only the main pass so they cannot suppress the must-run quarantine.
+ * See `bun-pglite-crash-upstream-report.md` for reporting.
+ */
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -54,12 +30,13 @@ import {
   resolveMaxAttempts,
   resolveQuarantineMode,
   shouldRetryQuarantinedSuites,
+  withDefaultTestTimeout,
 } from "./run-bun-tests-helpers.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.resolve(here, "..");
 const repoRoot = path.resolve(packageDir, "../../..");
-const passthroughArgs = process.argv.slice(2);
+const passthroughArgs = withDefaultTestTimeout(process.argv.slice(2));
 
 const UPSTREAM_TEMPLATE = "packages/cloud/shared/scripts/bun-pglite-crash-upstream-report.md";
 
@@ -240,7 +217,8 @@ async function main() {
   });
 
   if (!quarantineOn) {
-    // Behavior-identical to the previous `"test": "bun test --isolate"`.
+    // Keep the simple one-process path, with the package-wide timeout made
+    // explicit because Bun does not load the repository bunfig from this cwd.
     const result = await runBunTest(["--isolate", ...passthroughArgs], {
       inherit: true,
     });
