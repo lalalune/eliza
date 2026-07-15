@@ -1,11 +1,10 @@
-// Pure decision logic for scripts/run-bun-tests.mjs (the package `test` entry).
-//
-// Split out so the crash-signature classifier and retry-bound rules are
-// unit-testable without spawning bun (scripts/run-bun-tests-helpers.test.ts).
-//
-// The ANSI/fail-count parsing mirrors packages/scripts/test-cloud-run-helpers.mjs
-// (the bun status-99 normalizer precedent). It is duplicated here — not imported
-// across packages — so the package test entry stays self-contained.
+/**
+ * Pure decision logic for the cloud-shared Bun test wrapper.
+ *
+ * Keeping crash classification and retry bounds here makes them testable
+ * without spawning Bun. ANSI and fail-count parsing mirrors the root cloud
+ * runner but stays local so this package's test entry remains self-contained.
+ */
 
 /**
  * The PGlite-backed tenant-db suites that intermittently take Bun canary down
@@ -33,6 +32,23 @@ const MAX_QUARANTINE_ATTEMPTS_CEILING = 5;
  * and ~40s on a cold Defender-scanned box, so 10 minutes is generous.
  */
 export const DEFAULT_QUARANTINE_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Per-test timeout for the package-wide Bun process. The wrapper runs from the
+ * package directory, where the repository-root bunfig is not loaded, so make
+ * its intended 60-second default explicit while preserving caller overrides.
+ */
+export const DEFAULT_TEST_TIMEOUT_MS = 60_000;
+
+/** Add the package default unless the caller already supplied either Bun form. */
+export function withDefaultTestTimeout(passthroughArgs) {
+  const hasExplicitTimeout = passthroughArgs.some(
+    (arg) => arg === "--timeout" || arg.startsWith("--timeout="),
+  );
+  return hasExplicitTimeout
+    ? [...passthroughArgs]
+    : [`--timeout=${DEFAULT_TEST_TIMEOUT_MS}`, ...passthroughArgs];
+}
 
 /**
  * Output markers that identify a NATIVE crash of the bun process (as opposed

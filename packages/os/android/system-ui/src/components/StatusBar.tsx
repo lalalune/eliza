@@ -1,4 +1,4 @@
-// Renders an Android SystemUI surface for the elizaOS device image.
+/** Renders the Android status surface from the active device-state provider. */
 import { useMemo } from "react";
 import { useSystemProvider } from "../providers/context";
 import { AudioIcon } from "./indicators/AudioIcon";
@@ -29,7 +29,13 @@ export function StatusBar() {
   return (
     <header className="elizaos-mobile-statusbar">
       <div className="elizaos-mobile-statusbar-left">
-        <span className="elizaos-mobile-clock">{formatted.time}</span>
+        <span
+          className="elizaos-mobile-clock"
+          role="timer"
+          aria-label={`Time ${formatted.time}`}
+        >
+          {formatted.time}
+        </span>
         <span className="elizaos-mobile-date">{formatted.date}</span>
       </div>
       <div
