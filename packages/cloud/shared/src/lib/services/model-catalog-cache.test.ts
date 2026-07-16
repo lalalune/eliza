@@ -6,7 +6,6 @@
  */
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { ElizaError } from "@elizaos/core";
 import { CacheClient } from "../cache/client";
 import type { CatalogModel } from "../models";
 import {
@@ -229,59 +228,70 @@ describe("ModelCatalogCache with CacheClient memory adapter", () => {
     expect(fetchCalls).toBe(0);
   });
 
-  test("rejects null and invalid real-cache values as typed contract failures", async () => {
+  test("a configured empty refresh is a typed failure that preserves last-good data", async () => {
+    let fetched: CatalogModel[] = [catalogModel("last-good")];
     const store = memoryCache();
     const catalog = new ModelCatalogCache({
       key: KEY,
       store,
       isProviderConfigured: () => true,
-      fetchModels: async () => [catalogModel("unused")],
+      fetchModels: async () => fetched,
       freshnessSeconds: 60,
       retentionSeconds: RETENTION_SECONDS,
     });
-    const freshMetadata = {
-      cachedAt: Date.now(),
-      staleAt: Date.now() + 60_000,
-    };
 
-    await store.set(KEY, { ...freshMetadata, data: null }, RETENTION_SECONDS);
-    await expect(catalog.getCached()).rejects.toMatchObject({
-      name: "ElizaError",
-      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
-      context: { key: KEY, boundary: "cache", receivedKind: "null" },
-      cause: expect.any(TypeError),
-    });
+    await catalog.refresh();
+    const lastGoodEntry = await store.get(KEY);
+    fetched = [];
 
-    await store.set(KEY, { ...freshMetadata, data: { id: "not-an-array" } }, RETENTION_SECONDS);
-    const invalidRead = catalog.getCached();
-    await expect(invalidRead).rejects.toBeInstanceOf(ElizaError);
-    await expect(invalidRead).rejects.toMatchObject({
-      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
-      context: { key: KEY, boundary: "cache", receivedKind: "object" },
-      cause: expect.any(TypeError),
-    });
-
-    await store.set(
-      KEY,
-      {
-        ...freshMetadata,
-        data: [{ object: "model", created: 0, owned_by: "test" }],
-      },
-      RETENTION_SECONDS,
-    );
-    await expect(catalog.getCached()).rejects.toMatchObject({
+    await expect(catalog.refresh()).rejects.toMatchObject({
       name: "ElizaError",
       code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
       context: {
         key: KEY,
-        boundary: "cache",
-        modelIndex: 0,
-        field: "id",
-        expected: "non-empty string",
-        receivedKind: "undefined",
+        boundary: "refresh",
+        receivedKind: "array",
+        expected: "non-empty array",
       },
       cause: expect.any(TypeError),
     });
+    expect(await store.get(KEY)).toEqual(lastGoodEntry);
+  });
+
+  test("evicts and reloads poisoned fresh cache values", async () => {
+    let fetchCalls = 0;
+    const store = memoryCache();
+    const catalog = new ModelCatalogCache({
+      key: KEY,
+      store,
+      isProviderConfigured: () => true,
+      fetchModels: async () => {
+        fetchCalls += 1;
+        return [catalogModel(`recovered-${fetchCalls}`)];
+      },
+      freshnessSeconds: 60,
+      retentionSeconds: RETENTION_SECONDS,
+    });
+    const cachedAt = Date.now();
+    const freshMetadata = {
+      cachedAt,
+      staleAt: cachedAt + 60_000,
+    };
+    const poisonedValues = [
+      null,
+      { id: "not-an-array" },
+      [{ object: "model", created: 0, owned_by: "test" }],
+      [],
+    ];
+
+    for (const poisoned of poisonedValues) {
+      await store.set(KEY, { ...freshMetadata, data: poisoned }, RETENTION_SECONDS);
+      const expected = [catalogModel(`recovered-${fetchCalls + 1}`)];
+      expect(await catalog.getCached()).toEqual(expected);
+      expect(await store.get<SWRCacheEntry<CatalogModel[]>>(KEY)).toMatchObject({ data: expected });
+    }
+
+    expect(fetchCalls).toBe(poisonedValues.length);
   });
 
   test("rejects a malformed fetched model before it can populate the real cache", async () => {
@@ -322,6 +332,42 @@ describe("ModelCatalogCache with CacheClient memory adapter", () => {
           id: "provider/model",
           created: 0,
           architecture: { output_modalities: ["text", null] },
+        },
+      ],
+      freshnessSeconds: 60,
+      retentionSeconds: RETENTION_SECONDS,
+    });
+
+    await expect(catalog.getCached()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: KEY,
+        boundary: "refresh",
+        modelIndex: 0,
+        field: "architecture.output_modalities",
+        expected: "string array",
+        receivedKind: "array",
+      },
+      cause: expect.any(TypeError),
+    });
+    expect(await store.get(KEY)).toBeNull();
+  });
+
+  test("rejects sparse nested string arrays before they can poison serialization", async () => {
+    const sparseModalities: string[] = [];
+    sparseModalities.length = 2;
+    sparseModalities[1] = "text";
+    const store = memoryCache();
+    const catalog = new ModelCatalogCache({
+      key: KEY,
+      store,
+      isProviderConfigured: () => true,
+      fetchModels: async () => [
+        {
+          id: "provider/model",
+          created: 0,
+          architecture: { output_modalities: sparseModalities },
         },
       ],
       freshnessSeconds: 60,
