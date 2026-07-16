@@ -1,6 +1,6 @@
 /**
  * Tests the agent vault id: a deterministic sha256 over the canonical state dir
- * (base64url-truncated, stable `mldy1-` prefix) that namespaces an agent's
+ * (base64url-truncated, stable `eliza1-` prefix) that namespaces an agent's
  * secrets in the OS keychain, plus the `<vaultId>:<kind>` keychain-account
  * derivation. The same install always resolves the same vault, and two
  * different state dirs never collide onto one keychain namespace.
@@ -16,7 +16,7 @@ describe("deriveAgentVaultId", () => {
     const a = deriveAgentVaultId("/Users/x/.eliza");
     const b = deriveAgentVaultId("/Users/x/.eliza");
     expect(a).toBe(b);
-    expect(a).toMatch(/^mldy1-[A-Za-z0-9_-]{16}$/);
+    expect(a).toMatch(/^eliza1-[A-Za-z0-9_-]{16}$/);
   });
 
   it("distinguishes different state dirs", () => {
@@ -28,8 +28,8 @@ describe("deriveAgentVaultId", () => {
 
 describe("keychainAccountForSecretKind", () => {
   it("namespaces the secret kind under the vault id", () => {
-    expect(keychainAccountForSecretKind("mldy1-abc", "wallet" as never)).toBe(
-      "mldy1-abc:wallet",
+    expect(keychainAccountForSecretKind("eliza1-abc", "wallet" as never)).toBe(
+      "eliza1-abc:wallet",
     );
   });
 });

@@ -2,7 +2,7 @@
  * Derives the opaque, per-install vault id that namespaces an agent's secrets in
  * the OS keychain. The id is a deterministic sha256 over the canonical state dir
  * (XDG / `ELIZA_STATE_DIR` precedence, realpath-normalized), base64url-truncated
- * behind a stable `mldy1-` prefix, so one install always resolves the same vault
+ * behind a stable `eliza1-` prefix, so one install always resolves the same vault
  * and two state dirs never collide. The state-dir logic is inlined rather than
  * imported from core's heavier composition helpers, and the vault id is paired
  * with a secret kind to form the keychain account handle.
@@ -51,14 +51,14 @@ export function resolveCanonicalStateDir(): string {
 }
 
 /**
- * Opaque vault id for OS secret stores: `mldy1-` + first 16 chars of base64url(sha256(canonicalStateDir)).
+ * Opaque vault id for OS secret stores: `eliza1-` + first 16 chars of base64url(sha256(canonicalStateDir)).
  */
 export function deriveAgentVaultId(
   canonicalStateDir = resolveCanonicalStateDir(),
 ): string {
   const hash = createHash("sha256").update(canonicalStateDir, "utf8").digest();
   const token = Buffer.from(hash).toString("base64url").slice(0, 16);
-  return `mldy1-${token}`;
+  return `eliza1-${token}`;
 }
 
 export function keychainAccountForSecretKind(

@@ -7,11 +7,11 @@
  * Environment variables always override persisted values.
  */
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { readAliasedEnv } from "@elizaos/shared";
+import { deriveAgentVaultId } from "../security/agent-vault-id";
 import type {
   PlatformSecureStore,
   SecureStoreSecretKind,
@@ -71,19 +71,6 @@ interface StewardCredentialPersistenceOptions {
 
 function resolveCredentialsPath(): string {
   return path.join(resolveStateDir(), CREDENTIALS_FILENAME);
-}
-
-function deriveStewardVaultId(): string {
-  const resolved = path.resolve(resolveStateDir());
-  let canonicalStateDir = resolved;
-  try {
-    canonicalStateDir = fs.realpathSync(resolved);
-  } catch {
-    // Directory may not exist before first save.
-  }
-  const hash = createHash("sha256").update(canonicalStateDir, "utf8").digest();
-  const token = Buffer.from(hash).toString("base64url").slice(0, 16);
-  return `mldy1-${token}`;
 }
 
 function createStewardSecureStore(
@@ -192,7 +179,7 @@ export async function loadStewardCredentials(
     return typeof value === "string" && value.trim().length > 0;
   });
   if (await store.isAvailable()) {
-    const vaultId = deriveStewardVaultId();
+    const vaultId = deriveAgentVaultId();
     await migrateLegacyFileSecrets(store, vaultId, parsed);
 
     const secureValues: Partial<
@@ -255,7 +242,7 @@ export async function saveStewardCredentials(
 ): Promise<void> {
   const store = createStewardSecureStore(options);
   if (await store.isAvailable()) {
-    const vaultId = deriveStewardVaultId();
+    const vaultId = deriveAgentVaultId();
     await Promise.all(
       (Object.keys(STEWARD_SECRET_KINDS) as StewardCredentialSecretField[]).map(
         (field) =>

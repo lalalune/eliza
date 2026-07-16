@@ -353,7 +353,7 @@ test("shopify utility controls exercise commerce workflows", async ({
     "Shopify inventory tab",
   );
   await page.getByLabel("Location").selectOption("Main Warehouse");
-  await expect(page.getByText("MLDY-HOODIE")).toBeVisible();
+  await expect(page.getByText("ELIZA-HOODIE")).toBeVisible();
   await clickRequired(
     page.getByRole("button", { name: "Increase inventory by 1" }).first(),
     "Shopify inventory increase",

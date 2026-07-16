@@ -950,7 +950,7 @@ function smokeShopifyInventory() {
     items: [
       {
         id: "gid://shopify/InventoryItem/3001",
-        sku: "MLDY-HOODIE",
+        sku: "ELIZA-HOODIE",
         productTitle: "Example Hoodie",
         variantTitle: "Black / M",
         locationId: "gid://shopify/Location/1",
