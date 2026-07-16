@@ -2478,13 +2478,11 @@ function getMessageHandlerCandidateActions(
 	);
 }
 
-// The two stage-1 plan fields the escalation predicates read as plain values.
-// `candidateActions` stays per call site because the backstop path cleans it
-// through `getMessageHandlerCandidateActions` while the evaluator path forwards
-// the raw list. A stage-1 plan legitimately may carry no contexts and no reply,
-// so an absent optional field normalizes to the empty shape those pure
-// predicates already treat as "nothing there" — normalized here once instead of
-// at every call site.
+// Stage-1 plans originate at a model boundary, so candidate actions always pass
+// through the same string-array validator before escalation logic consumes
+// them. Contexts and reply text are legitimately optional; normalize those two
+// fields once to the empty shapes the pure predicates define as "nothing
+// present" instead of repeating boundary handling at every call site.
 function messageHandlerStageOneReplyContexts(
 	messageHandler: MessageHandlerResult,
 ): { stageOneContexts: readonly string[]; stageOneReplyText: string } {
@@ -3122,7 +3120,8 @@ export const BUILTIN_RESPONSE_HANDLER_EVALUATORS: readonly ResponseHandlerEvalua
 				return !shouldSuppressInferredCandidateEscalation({
 					inference,
 					...messageHandlerStageOneReplyContexts(messageHandler),
-					stageOneCandidateActions: messageHandler.plan.candidateActions ?? [],
+					stageOneCandidateActions:
+						getMessageHandlerCandidateActions(messageHandler),
 				});
 			},
 			evaluate: ({ message, messageHandler, runtime }) => {
@@ -3134,7 +3133,8 @@ export const BUILTIN_RESPONSE_HANDLER_EVALUATORS: readonly ResponseHandlerEvalua
 				const candidateActions = shouldSuppressInferredCandidateEscalation({
 					inference,
 					...messageHandlerStageOneReplyContexts(messageHandler),
-					stageOneCandidateActions: messageHandler.plan.candidateActions ?? [],
+					stageOneCandidateActions:
+						getMessageHandlerCandidateActions(messageHandler),
 				})
 					? []
 					: inference.names;
