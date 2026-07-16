@@ -14,6 +14,9 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ElizaClient } from "../../api/client-base";
+import "../../api/client-chat";
+import type { AgentRequestTransport } from "../../api/transport";
 
 const mocks = vi.hoisted(() => ({
   client: {
@@ -187,7 +190,11 @@ vi.mock("./chat-view-hooks", () => ({
 
 import { ChatView } from "./ChatView";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // biome-ignore lint/suspicious/noDocumentCookie: jsdom must seed the exact cookie API the inbox client reads.
+  document.cookie = "eliza_csrf=; Max-Age=0; Path=/";
+});
 
 describe("ChatView inbox account routing", () => {
   beforeEach(() => {
@@ -221,5 +228,39 @@ describe("ChatView inbox account routing", () => {
     expect(request).not.toHaveProperty("channel");
     expect(request).not.toHaveProperty("metadata");
     expect(request).not.toHaveProperty("connectorSendAs");
+  });
+});
+
+describe("inbox mutation transport", () => {
+  it("mirrors the browser CSRF cookie and includes session credentials", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom must seed the exact cookie API the inbox client reads.
+    document.cookie = "eliza_csrf=inbox-csrf-token; Path=/";
+    const request = vi.fn(
+      async (_url: string, _init: RequestInit) =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+    );
+    const transport: AgentRequestTransport = {
+      request,
+    };
+    const inboxClient = new ElizaClient("https://example.test");
+    inboxClient.setRequestTransport(transport);
+
+    await inboxClient.sendInboxMessage({
+      accountId: "discord-owner",
+      roomId: "discord-room-1",
+      source: "discord",
+      text: "ship it",
+    });
+
+    expect(request).toHaveBeenCalledOnce();
+    const [url, init] = request.mock.calls[0] ?? [];
+    expect(url).toBe("https://example.test/api/inbox/messages");
+    expect(init).toMatchObject({ credentials: "include", method: "POST" });
+    expect(new Headers(init?.headers).get("x-eliza-csrf")).toBe(
+      "inbox-csrf-token",
+    );
   });
 });
