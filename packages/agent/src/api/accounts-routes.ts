@@ -775,31 +775,35 @@ async function handleListAllAccounts(
           atMs: providerBroker.lastSelection.atMs,
         }
       : null;
-    const recentFailovers = (providerBroker?.recentFailovers ?? []).map(
-      (failover) => ({
-        fromAccountId: failover.fromAccountId,
-        toAccountId: failover.toAccountId,
-        atMs: failover.atMs,
-        cause: failover.cause.reason,
-      }),
-    );
+    // A provider absent from the broker snapshot has by definition no
+    // recorded failovers — the snapshot only carries providers with activity.
+    const recentFailovers = providerBroker
+      ? providerBroker.recentFailovers.map((failover) => ({
+          fromAccountId: failover.fromAccountId,
+          toAccountId: failover.toAccountId,
+          atMs: failover.atMs,
+          cause: failover.cause.reason,
+        }))
+      : [];
     return {
       providerId,
       strategy,
       runtimeEligibility: runtimeEligibilityForProvider(providerId),
-      accounts: linkedConfigs.map((cfg) => ({
-        ...cfg,
-        hasCredential: onDiskSet.has(cfg.id),
-        observability: {
-          activeLeaseCount:
-            broker.accounts[brokerAccountKey(providerId, cfg.id)]
-              ?.activeLeaseCount ?? 0,
-          lastLeaseAt:
-            broker.accounts[brokerAccountKey(providerId, cfg.id)]
-              ?.lastLeaseAt ?? null,
-          servedLastRequest: lastSelection?.accountId === cfg.id,
-        },
-      })),
+      accounts: linkedConfigs.map((cfg) => {
+        // An account missing from the broker snapshot has never been leased;
+        // zero/none is its true observability state, not a fabricated default.
+        const brokerAccount =
+          broker.accounts[brokerAccountKey(providerId, cfg.id)];
+        return {
+          ...cfg,
+          hasCredential: onDiskSet.has(cfg.id),
+          observability: {
+            activeLeaseCount: brokerAccount ? brokerAccount.activeLeaseCount : 0,
+            lastLeaseAt: brokerAccount ? brokerAccount.lastLeaseAt : null,
+            servedLastRequest: lastSelection?.accountId === cfg.id,
+          },
+        };
+      }),
       ...(selection ? { selection } : {}),
       observability: {
         lastSelection,
