@@ -923,7 +923,7 @@
       "idx": 131,
       "version": "7",
       "when": 1779408000000,
-      "tag": "0132_reserved_migration_slot",
+      "tag": "0132_pre_autoscaler_node_guard",
       "breakpoints": true
     },
     {

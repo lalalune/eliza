@@ -1,7 +1,7 @@
 /**
- * Proves migration 0132 remains a runnable, inert journal slot. The real
- * Drizzle ledger checks cover both a fresh database and an already-applied
- * database without requiring historical infrastructure identifiers.
+ * Proves migration 0132 preserves its deployed cursor while failing closed for
+ * stale pre-autoscaler capacity. The suite drives real PostgreSQL semantics and
+ * Drizzle ledger behavior without requiring historical node identifiers.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -13,7 +13,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
 
-const MIGRATION_TAG = "0132_reserved_migration_slot";
+const MIGRATION_TAG = "0132_pre_autoscaler_node_guard";
 const MIGRATION_WHEN = 1779408000000;
 const APPLIED_MIGRATION_HASH = "ebf27fedc8ecfdcf6318e4d194412808e5405473c9cc11cc62916060379d28e1";
 const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
@@ -69,7 +69,19 @@ async function seedAppliedMigration(database: PGlite): Promise<void> {
   `);
 }
 
-describe("neutralized static core migration slot", () => {
+async function createDockerNodesTable(database: PGlite): Promise<void> {
+  await database.exec(`
+    CREATE TABLE docker_nodes (
+      node_id text PRIMARY KEY,
+      capacity integer NOT NULL,
+      enabled boolean NOT NULL,
+      status text NOT NULL,
+      created_at timestamptz NOT NULL
+    );
+  `);
+}
+
+describe("pre-autoscaler node migration guard", () => {
   test("keeps the deployed journal cursor and matching filename", () => {
     expect(readJournalEntry()).toMatchObject({
       idx: 131,
@@ -98,6 +110,29 @@ describe("neutralized static core migration slot", () => {
       ]);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
+      await database.close();
+    }
+  });
+
+  test("fails closed without mutating suspicious pre-autoscaler capacity", async () => {
+    const database = await PGlite.create();
+    const migrationSql = readFileSync(MIGRATION_PATH, "utf8");
+
+    try {
+      await createDockerNodesTable(database);
+      await database.exec(`
+        INSERT INTO docker_nodes (node_id, capacity, enabled, status, created_at)
+        VALUES ('pre-autoscaler-node', 100, true, 'offline', '2026-03-15T00:00:00Z');
+      `);
+
+      await expect(database.exec(migrationSql)).rejects.toThrow(
+        /pre-autoscaler offline nodes require explicit operator review/,
+      );
+      const nodes = await database.query<{ capacity: number; enabled: boolean }>(
+        "SELECT capacity, enabled FROM docker_nodes",
+      );
+      expect(nodes.rows).toEqual([{ capacity: 100, enabled: true }]);
+    } finally {
       await database.close();
     }
   });
