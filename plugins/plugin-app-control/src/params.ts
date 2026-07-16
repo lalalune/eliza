@@ -71,6 +71,12 @@ function extractAfterVerbs(
 	return null;
 }
 
+export interface AppControlOptions {
+	app?: string;
+	name?: string;
+	runId?: string;
+}
+
 export function normalizeActionOptions(
 	options: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {

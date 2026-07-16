@@ -45,6 +45,10 @@ export function updateStartupEmbeddingProgress(
   }
 }
 
+export function clearStartupEmbeddingProgress(): void {
+  snapshot = null;
+}
+
 /**
  * Fields merged into the JSON `startup` object on GET /api/status (Compat layer).
  */

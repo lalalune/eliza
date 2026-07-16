@@ -210,6 +210,9 @@ async function readPendingCallDraft(
   roomId: string,
   actionName: PendingCallActionName,
 ): Promise<PendingCallDraft | null> {
+  if (typeof runtime.getCache !== "function") {
+    return null;
+  }
   return (
     (await runtime.getCache<PendingCallDraft>(
       getPendingCallCacheKey(roomId, actionName),
@@ -222,6 +225,9 @@ async function clearPendingCallDraft(
   roomId: string,
   actionName: PendingCallActionName,
 ): Promise<void> {
+  if (typeof runtime.deleteCache !== "function") {
+    return;
+  }
   await runtime.deleteCache(getPendingCallCacheKey(roomId, actionName));
 }
 
@@ -597,7 +603,10 @@ async function dialOwner(
   const result = deliveryToResult(delivery, to, "owner");
   if (result.success) {
     await clearPendingCallDraft(runtime, message.roomId, "CALL_USER");
-    if (pendingDraft?.approvalTaskId) {
+    if (
+      pendingDraft?.approvalTaskId &&
+      typeof runtime.deleteTask === "function"
+    ) {
       await runtime.deleteTask(pendingDraft.approvalTaskId as never);
     }
   }
@@ -743,7 +752,10 @@ async function dialExternal(
   const result = deliveryToResult(delivery, to, "external");
   if (result.success) {
     await clearPendingCallDraft(runtime, message.roomId, "CALL_EXTERNAL");
-    if (pendingDraft?.approvalTaskId) {
+    if (
+      pendingDraft?.approvalTaskId &&
+      typeof runtime.deleteTask === "function"
+    ) {
       await runtime.deleteTask(pendingDraft.approvalTaskId as never);
     }
   }
