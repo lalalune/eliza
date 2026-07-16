@@ -775,8 +775,8 @@ async function handleListAllAccounts(
           atMs: providerBroker.lastSelection.atMs,
         }
       : null;
-    // A provider absent from the broker snapshot has by definition no
-    // recorded failovers — the snapshot only carries providers with activity.
+    // A supported provider may be absent until the pool or broker observes it;
+    // absence therefore represents the designed no-recorded-failovers state.
     const recentFailovers = providerBroker
       ? providerBroker.recentFailovers.map((failover) => ({
           fromAccountId: failover.fromAccountId,
