@@ -156,7 +156,7 @@ export interface ModelCatalogCacheOptions {
   key: string;
   store: ModelCatalogCacheStore;
   isProviderConfigured: () => boolean;
-  fetchModels: () => Promise<CatalogModel[]>;
+  fetchModels: () => Promise<unknown>;
   freshnessSeconds: number;
   retentionSeconds: number;
   now?: () => number;
@@ -168,7 +168,193 @@ export interface ModelCatalogCacheOptions {
 function valueKind(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "array";
+  if (typeof value === "number" && !Number.isFinite(value)) return "non-finite-number";
   return typeof value;
+}
+
+interface CatalogContractViolation {
+  field: string;
+  expected: string;
+  received: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function validateOptionalFields(model: Record<string, unknown>): CatalogContractViolation | null {
+  const stringFields = ["name", "description", "type"] as const;
+  for (const field of stringFields) {
+    if (field in model && typeof model[field] !== "string") {
+      return { field, expected: "string", received: model[field] };
+    }
+  }
+
+  const numberFields = ["released", "context_length", "context_window", "max_tokens"] as const;
+  for (const field of numberFields) {
+    const value = model[field];
+    if (field in model && (typeof value !== "number" || !Number.isFinite(value))) {
+      return { field, expected: "finite number", received: value };
+    }
+  }
+
+  const booleanFields = ["recommended", "free"] as const;
+  for (const field of booleanFields) {
+    if (field in model && typeof model[field] !== "boolean") {
+      return { field, expected: "boolean", received: model[field] };
+    }
+  }
+
+  const stringArrayFields = ["tags", "supported_parameters"] as const;
+  for (const field of stringArrayFields) {
+    if (field in model && !isStringArray(model[field])) {
+      return { field, expected: "string array", received: model[field] };
+    }
+  }
+
+  if ("pricing" in model && !isRecord(model.pricing)) {
+    return { field: "pricing", expected: "object", received: model.pricing };
+  }
+
+  if ("architecture" in model) {
+    if (!isRecord(model.architecture)) {
+      return { field: "architecture", expected: "object", received: model.architecture };
+    }
+
+    const architecture = model.architecture;
+    if ("modality" in architecture && typeof architecture.modality !== "string") {
+      return {
+        field: "architecture.modality",
+        expected: "string",
+        received: architecture.modality,
+      };
+    }
+    for (const field of ["input_modalities", "output_modalities"] as const) {
+      if (field in architecture && !isStringArray(architecture[field])) {
+        return {
+          field: `architecture.${field}`,
+          expected: "string array",
+          received: architecture[field],
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+type CatalogModelValidation =
+  | { valid: true; model: CatalogModel }
+  | { valid: false; violation: CatalogContractViolation };
+
+function validateCatalogModel(value: unknown): CatalogModelValidation {
+  if (!isRecord(value)) {
+    return {
+      valid: false,
+      violation: { field: "entry", expected: "object", received: value },
+    };
+  }
+  if (typeof value.id !== "string" || value.id.trim().length === 0) {
+    return {
+      valid: false,
+      violation: { field: "id", expected: "non-empty string", received: value.id },
+    };
+  }
+  if ("object" in value && value.object !== "model") {
+    return {
+      valid: false,
+      violation: { field: "object", expected: 'literal "model"', received: value.object },
+    };
+  }
+  if (typeof value.created !== "number" || !Number.isFinite(value.created)) {
+    return {
+      valid: false,
+      violation: { field: "created", expected: "finite number", received: value.created },
+    };
+  }
+  if (
+    "owned_by" in value &&
+    (typeof value.owned_by !== "string" || value.owned_by.trim().length === 0)
+  ) {
+    return {
+      valid: false,
+      violation: { field: "owned_by", expected: "non-empty string", received: value.owned_by },
+    };
+  }
+
+  const optionalViolation = validateOptionalFields(value);
+  if (optionalViolation) return { valid: false, violation: optionalViolation };
+
+  // OpenRouter omits the OpenAI list metadata fields. Normalize them at this
+  // boundary so old provider-shaped cache entries and new refreshes both leave
+  // the service as the stricter internal CatalogModel contract.
+  const model: CatalogModel = {
+    id: value.id,
+    object: "model",
+    created: value.created,
+    owned_by: typeof value.owned_by === "string" ? value.owned_by : value.id.split("/", 1)[0],
+  };
+
+  if (typeof value.released === "number") model.released = value.released;
+  if (typeof value.name === "string") model.name = value.name;
+  if (typeof value.description === "string") model.description = value.description;
+  if (typeof value.context_length === "number") model.context_length = value.context_length;
+  if (typeof value.context_window === "number") model.context_window = value.context_window;
+  if (typeof value.max_tokens === "number") model.max_tokens = value.max_tokens;
+  if (typeof value.type === "string") model.type = value.type;
+  if (isStringArray(value.tags)) model.tags = value.tags;
+  if (isRecord(value.pricing)) model.pricing = value.pricing;
+  if (typeof value.recommended === "boolean") model.recommended = value.recommended;
+  if (typeof value.free === "boolean") model.free = value.free;
+  if (isStringArray(value.supported_parameters)) {
+    model.supported_parameters = value.supported_parameters;
+  }
+  if (isRecord(value.architecture)) {
+    const architecture: NonNullable<CatalogModel["architecture"]> = {};
+    if (typeof value.architecture.modality === "string") {
+      architecture.modality = value.architecture.modality;
+    }
+    if (isStringArray(value.architecture.input_modalities)) {
+      architecture.input_modalities = value.architecture.input_modalities;
+    }
+    if (isStringArray(value.architecture.output_modalities)) {
+      architecture.output_modalities = value.architecture.output_modalities;
+    }
+    model.architecture = architecture;
+  }
+
+  return { valid: true, model };
+}
+
+function catalogContractError(
+  key: string,
+  boundary: "cache" | "refresh",
+  received: unknown,
+  modelIndex?: number,
+  field?: string,
+  expected?: string,
+): ElizaError {
+  const receivedKind = valueKind(received);
+  const location = modelIndex === undefined ? "catalog" : `catalog[${modelIndex}].${field}`;
+  const expectation = expected ?? "array";
+  const cause = new TypeError(
+    `Expected ${location} to be ${expectation}, received ${receivedKind}`,
+  );
+  return new ElizaError("Model catalog cache contract returned an invalid value", {
+    code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+    context: {
+      key,
+      boundary,
+      receivedKind,
+      ...(modelIndex === undefined ? {} : { modelIndex, field, expected: expectation }),
+    },
+    cause,
+    severity: "fatal",
+  });
 }
 
 function requireCatalogModels(
@@ -176,16 +362,26 @@ function requireCatalogModels(
   key: string,
   boundary: "cache" | "refresh",
 ): CatalogModel[] {
-  if (Array.isArray(value)) return value as CatalogModel[];
+  if (!Array.isArray(value)) throw catalogContractError(key, boundary, value);
 
-  const receivedKind = valueKind(value);
-  const cause = new TypeError(`Expected a model catalog array, received ${receivedKind}`);
-  throw new ElizaError("Model catalog cache contract returned an invalid value", {
-    code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
-    context: { key, boundary, receivedKind },
-    cause,
-    severity: "fatal",
-  });
+  const models: CatalogModel[] = [];
+  for (const [modelIndex, model] of value.entries()) {
+    const validation = validateCatalogModel(model);
+    if (!validation.valid) {
+      const { violation } = validation;
+      throw catalogContractError(
+        key,
+        boundary,
+        violation.received,
+        modelIndex,
+        violation.field,
+        violation.expected,
+      );
+    }
+    models.push(validation.model);
+  }
+
+  return models;
 }
 
 /** Owns the BitRouter catalog's shared-cache and refresh policy. */
@@ -193,7 +389,7 @@ export class ModelCatalogCache {
   private readonly key: string;
   private readonly store: ModelCatalogCacheStore;
   private readonly isProviderConfigured: () => boolean;
-  private readonly fetchModels: () => Promise<CatalogModel[]>;
+  private readonly fetchModels: () => Promise<unknown>;
   private readonly freshnessSeconds: number;
   private readonly retentionSeconds: number;
   private readonly now: () => number;

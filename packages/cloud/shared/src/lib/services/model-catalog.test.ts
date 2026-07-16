@@ -95,14 +95,30 @@ afterAll(() => {
 });
 
 describe("model catalog cache wiring", () => {
-  test("caches a valid catalog with 15-minute freshness and seven-day retention", async () => {
-    const fresh = [catalogModel("fresh-model")];
-    listModelsImpl = async () => ({ json: async () => ({ data: fresh }) });
+  test("normalizes and caches a valid OpenRouter catalog with the production TTLs", async () => {
+    const providerModel = {
+      id: "moonshotai/kimi-k3",
+      created: 1_784_215_858,
+      name: "MoonshotAI: Kimi K3",
+      architecture: {
+        modality: "text+image->text",
+        input_modalities: ["text", "image"],
+        output_modalities: ["text"],
+      },
+      pricing: { prompt: "0.000003", completion: "0.000015" },
+      supported_parameters: ["reasoning", "tools"],
+    };
+    const normalized: CatalogModel = {
+      ...providerModel,
+      object: "model",
+      owned_by: "moonshotai",
+    };
+    listModelsImpl = async () => ({ json: async () => ({ data: [providerModel] }) });
 
-    expect(await getCachedBitRouterModelCatalog()).toEqual(fresh);
+    expect(await getCachedBitRouterModelCatalog()).toEqual([normalized]);
     expect(listModelsCalls).toBe(1);
     const entry = await cache.get<SWRCacheEntry<CatalogModel[]>>(CACHE_KEY);
-    expect(entry).toMatchObject({ data: fresh });
+    expect(entry).toMatchObject({ data: [normalized] });
     expect(
       (entry as SWRCacheEntry<CatalogModel[]>).staleAt -
         (entry as SWRCacheEntry<CatalogModel[]>).cachedAt,
@@ -142,6 +158,30 @@ describe("model catalog cache wiring", () => {
       context: {
         provider: "openrouter",
         field: "data",
+        receivedKind: "string",
+      },
+      cause: expect.any(TypeError),
+    });
+    expect(listModelsCalls).toBe(1);
+    expect(await cache.get(CACHE_KEY)).toBeNull();
+  });
+
+  test("rejects an invalid provider model entry before writing cache", async () => {
+    listModelsImpl = async () => ({
+      json: async () => ({
+        data: [{ id: "", object: "model", created: 0, owned_by: "openrouter" }],
+      }),
+    });
+
+    await expect(getCachedBitRouterModelCatalog()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: CACHE_KEY,
+        boundary: "refresh",
+        modelIndex: 0,
+        field: "id",
+        expected: "non-empty string",
         receivedKind: "string",
       },
       cause: expect.any(TypeError),
