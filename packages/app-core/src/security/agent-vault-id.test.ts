@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 import {
   deriveAgentVaultId,
+  deriveCompatibleVaultTokens,
   keychainAccountForSecretKind,
 } from "./agent-vault-id.ts";
 
@@ -23,6 +24,31 @@ describe("deriveAgentVaultId", () => {
     expect(deriveAgentVaultId("/Users/x/.eliza")).not.toBe(
       deriveAgentVaultId("/Users/y/.eliza"),
     );
+  });
+
+  it("derives current and home-scoped state-root compatibility tokens", () => {
+    const current = deriveAgentVaultId("/Users/x/.local/state/eliza");
+    const tokens = deriveCompatibleVaultTokens(current, {
+      homeDir: "/Users/x",
+      namespace: "eliza",
+    });
+
+    expect(tokens).toContain(current.slice("eliza1-".length));
+    expect(tokens).toContain(
+      deriveAgentVaultId("/Users/x/.eliza").slice("eliza1-".length),
+    );
+    expect(tokens).toHaveLength(2);
+  });
+
+  it("preserves hyphens inside the fixed-width state token", () => {
+    const token = "AbCdEf0123_-wXyZ";
+
+    expect(
+      deriveCompatibleVaultTokens(`eliza1-${token}`, {
+        homeDir: "/Users/x",
+        namespace: "eliza",
+      }),
+    ).toContain(token);
   });
 });
 
