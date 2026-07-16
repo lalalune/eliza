@@ -38,8 +38,6 @@ afterEach(() => {
 
 describe("resolveLedgerStateDir precedence", () => {
   const home = () => "/home/tester";
-  const retiredPrefix = String.fromCharCode(77, 73, 76, 65, 68, 89);
-  const retiredStateDirKey = `${retiredPrefix}_STATE_DIR`;
 
   it("prefers ELIZA_DEVICES_STATUS_DIR over every other source", () => {
     expect(
@@ -47,7 +45,6 @@ describe("resolveLedgerStateDir precedence", () => {
         env: {
           ELIZA_DEVICES_STATUS_DIR: "/d/state",
           ELIZA_STATE_DIR: "/e/state",
-          [retiredStateDirKey]: "/retired/state",
           XDG_STATE_HOME: "/xdg",
         },
         homedir: home,
@@ -57,29 +54,12 @@ describe("resolveLedgerStateDir precedence", () => {
   it("falls back to ELIZA_STATE_DIR", () => {
     expect(
       resolveLedgerStateDir({
-        env: {
-          ELIZA_STATE_DIR: "/e/state",
-          [retiredStateDirKey]: "/retired/state",
-        },
+        env: { ELIZA_STATE_DIR: "/e/state" },
         homedir: home,
       }),
     ).toBe("/e/state");
   });
-  it("recovers the retired distribution state dir without accepting unrelated keys", () => {
-    expect(
-      resolveLedgerStateDir({
-        env: {
-          [retiredStateDirKey]: "/retired/state",
-          ALPHA_STATE_DIR: "/unrelated/state",
-          ELIZA_IOS_STATE_DIR: "/nested/eliza/state",
-          VITE_ACME_STATE_DIR: "/vite/state",
-          XDG_STATE_HOME: "/xdg",
-        },
-        homedir: home,
-      }),
-    ).toBe("/retired/state");
-  });
-  it("ignores unrelated state-dir variables when the compatibility key is absent", () => {
+  it("ignores unrelated state-dir variables", () => {
     expect(
       resolveLedgerStateDir({
         env: {
