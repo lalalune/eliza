@@ -126,6 +126,20 @@ describe("Deepgram Flux realtime adapter", () => {
     expect(url.searchParams.get("eager_eot_threshold")).toBe("0.4");
     expect(url.searchParams.get("eot_threshold")).toBe("0.9");
     expect(url.searchParams.get("eot_timeout_ms")).toBe("1500");
+    expect(url.searchParams.get("mip_opt_out")).toBe("true");
+  });
+
+  it("allows an explicit operator override of the Deepgram training opt-out", () => {
+    const config = resolveDeepgramFluxConfig({
+      deepgramApiKey: "dg-secret",
+      mipOptOut: "false",
+    });
+
+    expect(
+      new URL(buildDeepgramFluxListenUrl(config)).searchParams.get(
+        "mip_opt_out",
+      ),
+    ).toBe("false");
   });
 
   it("passes the server-side API key by Authorization header and never in the query URL", () => {
@@ -134,6 +148,9 @@ describe("Deepgram Flux realtime adapter", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0].headers.Authorization).toBe("Token dg-secret");
     expect(requests[0].url).not.toContain("dg-secret");
+    expect(new URL(requests[0].url).searchParams.get("mip_opt_out")).toBe(
+      "true",
+    );
     expect(socket.binaryType).toBe("arraybuffer");
   });
 
@@ -434,6 +451,12 @@ describe("Deepgram Flux realtime adapter", () => {
       resolveDeepgramFluxConfig({
         deepgramApiKey: "dg-secret",
         eotTimeoutMs: 10_001,
+      }),
+    ).toThrow(DeepgramFluxConfigError);
+    expect(() =>
+      resolveDeepgramFluxConfig({
+        deepgramApiKey: "dg-secret",
+        mipOptOut: "sometimes",
       }),
     ).toThrow(DeepgramFluxConfigError);
   });
