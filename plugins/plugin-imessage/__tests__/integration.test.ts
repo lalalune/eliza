@@ -1,13 +1,25 @@
 /**
- * Unit coverage for the plugin's public export surface and the pure
- * target/handle/parsing helpers (`isPhoneNumber`, `isEmail`,
- * `normalizeIMessageTarget`, AppleScript/chat.db parsers, chunking). No macOS,
- * chat.db, or live service — deterministic string/shape assertions only.
+ * Public helper and chat.db reader coverage. Pure target/parsing behavior is
+ * deterministic; supported SQLite runtimes also exercise real temporary
+ * databases through the same joins, cursors, and attachment queries as the
+ * connector and corpus exporter.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import imessagePlugin, {
@@ -28,6 +40,7 @@ import imessagePlugin, {
   // Type utilities
   isPhoneNumber,
   isValidIMessageTarget,
+  jsMsToAppleDateBounds,
   MAX_IMESSAGE_MESSAGE_LENGTH,
   normalizeContactHandle,
   normalizeIMessageTarget,
@@ -36,6 +49,7 @@ import imessagePlugin, {
   // Parsing functions
   parseContactsOutput,
   parseMessagesFromAppleScript,
+  snapshotChatDb,
   splitMessageForIMessage,
 } from "../src/index";
 
@@ -561,6 +575,21 @@ describe("appleDateToJsMs", () => {
   });
 });
 
+describe("jsMsToAppleDateBounds", () => {
+  it("preserves exact millisecond cutoffs without unsafe number multiplication", () => {
+    const cutoff = Date.UTC(2024, 6, 5);
+    const bounds = jsMsToAppleDateBounds(cutoff);
+
+    expect(bounds.seconds).toBe((cutoff - Date.UTC(2001, 0, 1)) / 1000);
+    expect(bounds.nanoseconds).toBe(BigInt(cutoff - Date.UTC(2001, 0, 1)) * 1_000_000n);
+  });
+
+  it("rejects invalid or pre-Apple-epoch bounds", () => {
+    expect(() => jsMsToAppleDateBounds(Number.NaN)).toThrow(/safe epoch-millisecond/);
+    expect(() => jsMsToAppleDateBounds(Date.UTC(2000, 11, 31))).toThrow(/safe epoch-millisecond/);
+  });
+});
+
 describe("chatDbMessageToPublicShape", () => {
   it("maps every ChatDbMessage field onto the public IMessageMessage shape", () => {
     const result = chatDbMessageToPublicShape({
@@ -587,6 +616,8 @@ describe("chatDbMessageToPublicShape", () => {
         {
           guid: "att-1",
           filename: "/tmp/image.png",
+          transferName: "image.png",
+          path: "/tmp/image.png",
           uti: "public.png",
           mimeType: "image/png",
           totalBytes: 123,
@@ -908,6 +939,281 @@ describe("openChatDb + ChatDbReader (bun:sqlite backed)", () => {
       expect(afterEleven.map((r) => r.rowId)).toEqual([12, 13]);
 
       reader.close();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("pages a bounded historical window without join duplicates or cursor gaps", async ({
+    skip,
+  }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      const openDatabase = await getDatabase();
+      if (!openDatabase) {
+        skip("No supported SQLite runtime is available for iMessage fixture tests");
+        return;
+      }
+      const cutoff = Date.UTC(2024, 6, 5);
+      const before = BigInt(cutoff - Date.UTC(2001, 0, 1) - 1) * 1_000_000n;
+      const exact = BigInt(cutoff - Date.UTC(2001, 0, 1)) * 1_000_000n;
+      const after = BigInt(cutoff - Date.UTC(2001, 0, 1) + 1) * 1_000_000n;
+      const fixture = openDatabase(path);
+      fixture.run(
+        `INSERT INTO message (ROWID, guid, text, date, is_from_me, handle_id, service) VALUES (14, 'guid-14', 'before', ${before}, 0, 1, 'iMessage')`
+      );
+      fixture.run(
+        `INSERT INTO message (ROWID, guid, text, date, is_from_me, handle_id, service) VALUES (15, 'guid-15', 'exact', ${exact}, 0, 1, 'iMessage')`
+      );
+      fixture.run(
+        `INSERT INTO message (ROWID, guid, text, date, is_from_me, handle_id, service) VALUES (16, 'guid-16', 'after', ${after}, 0, 1, 'iMessage')`
+      );
+      fixture.run("INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 14)");
+      fixture.run("INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 15)");
+      fixture.run("INSERT INTO chat_message_join (chat_id, message_id) VALUES (2, 15)");
+      fixture.run("INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 16)");
+      fixture.close();
+
+      const reader = await openChatDb(path);
+      if (!reader) return;
+      const first = reader.pageMessages({
+        sinceMs: cutoff,
+        untilMs: cutoff + 2,
+        afterRowId: 0,
+        throughRowId: 16,
+        limit: 1,
+      });
+      const second = reader.pageMessages({
+        sinceMs: cutoff,
+        untilMs: cutoff + 2,
+        afterRowId: first[0]?.rowId ?? 0,
+        throughRowId: 16,
+        limit: 1,
+      });
+      const eof = reader.pageMessages({
+        sinceMs: cutoff,
+        untilMs: cutoff + 2,
+        afterRowId: second[0]?.rowId ?? 0,
+        throughRowId: 16,
+        limit: 1,
+      });
+
+      expect(first.map((row) => row.rowId)).toEqual([15]);
+      expect(second.map((row) => row.rowId)).toEqual([16]);
+      expect(eof).toEqual([]);
+      reader.close();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("exports authoritative attachments when the message cache bit is false", async ({ skip }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      const openDatabase = await getDatabase();
+      if (!openDatabase) {
+        skip("No supported SQLite runtime is available for iMessage fixture tests");
+        return;
+      }
+      const fixture = openDatabase(path);
+      fixture.run("UPDATE message SET cache_has_attachments = 0 WHERE ROWID = 10");
+      fixture.run(
+        "INSERT INTO attachment (ROWID, guid, transfer_name, filename, mime_type, uti, total_bytes, is_sticker) VALUES (200, 'att-200', 'second.png', '/tmp/second.png', 'image/png', 'public.png', 200, 0)"
+      );
+      fixture.run(
+        "INSERT INTO attachment (ROWID, guid, transfer_name, filename, mime_type, uti, total_bytes, is_sticker) VALUES (100, 'att-100', 'first.png', '/tmp/first.png', 'image/png', 'public.png', 100, 0)"
+      );
+      fixture.run(
+        "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (10, 200)"
+      );
+      fixture.run(
+        "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (10, 100)"
+      );
+      fixture.close();
+
+      const reader = await openChatDb(path);
+      if (!reader) return;
+      const rows = reader.pageMessages({
+        sinceMs: Date.UTC(2001, 0, 1),
+        untilMs: Date.UTC(2001, 0, 1, 0, 30),
+        afterRowId: 0,
+        throughRowId: 10,
+        limit: 10,
+      });
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.attachments.map((attachment) => attachment.guid)).toEqual([
+        "att-100",
+        "att-200",
+      ]);
+      reader.close();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("throws when strict export sees malformed, truncated, or invalid-UTF8 attributedBody", async ({
+    skip,
+  }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      const openDatabase = await getDatabase();
+      if (!openDatabase) return;
+      const typedBody = (declaredLength: number, bytes: number[]) =>
+        Buffer.concat([
+          Buffer.alloc(12),
+          Buffer.from("NSString", "latin1"),
+          Buffer.from([0x00, 0x2b, declaredLength]),
+          Buffer.from(bytes),
+        ]);
+      const bodies = [
+        Buffer.from([0x00, 0x01, 0x02, 0x03]),
+        typedBody(10, [0x68, 0x69]),
+        typedBody(2, [0xc3, 0x28]),
+      ];
+      for (const body of bodies) {
+        const fixture = openDatabase(path);
+        fixture.run(
+          `UPDATE message SET text = NULL, attributedBody = X'${body.toString("hex")}' WHERE ROWID = 10`
+        );
+        fixture.close();
+
+        const reader = await openChatDb(path);
+        if (!reader) return;
+        expect(() =>
+          reader.pageMessages({
+            sinceMs: Date.UTC(2001, 0, 1),
+            untilMs: Date.UTC(2001, 0, 1, 0, 30),
+            afterRowId: 0,
+            throughRowId: 10,
+            limit: 10,
+          })
+        ).toThrow(/attributedBody could not be decoded/);
+        reader.close();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("backs up a read-only source to an apostrophe path without changing the source", async ({
+    skip,
+  }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      chmodSync(path, 0o400);
+      const beforeBytes = readFileSync(path);
+      const beforeStat = statSync(path, { bigint: true });
+      const destination = join(dirname(path), "snapshot's.db");
+
+      const snapshot = await snapshotChatDb(path, destination);
+      expect(snapshot.path).toBe(join(realpathSync(dirname(destination)), basename(destination)));
+      expect(snapshot.bytes).toBeGreaterThan(0);
+      expect(snapshot.sha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(readFileSync(path)).toEqual(beforeBytes);
+      const afterStat = statSync(path, { bigint: true });
+      expect(afterStat.size).toBe(beforeStat.size);
+      expect(afterStat.mtimeNs).toBe(beforeStat.mtimeNs);
+      expect(afterStat.ctimeNs).toBe(beforeStat.ctimeNs);
+      expect(Number(statSync(destination).mode & 0o777)).toBe(0o600);
+      expect(existsSync(`${destination}-wal`)).toBe(false);
+      expect(existsSync(`${destination}-shm`)).toBe(false);
+      const temporarySidecars = readdirSync(dirname(destination)).filter(
+        (entry) =>
+          entry.startsWith(".imessage-snapshot-") ||
+          (entry.startsWith(`${basename(destination)}.`) &&
+            (entry.endsWith(".tmp-wal") || entry.endsWith(".tmp-shm")))
+      );
+      expect(temporarySidecars).toEqual([]);
+
+      const reader = await openChatDb(destination);
+      expect(reader?.getLatestRowIdStrict()).toBe(13);
+      reader?.close();
+      await expect(snapshotChatDb(path, destination)).rejects.toThrow(/destination already exists/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rejects control characters before opening or snapshotting SQLite paths", async ({ skip }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      await expect(openChatDb(`${path}\n`)).rejects.toThrow(/control characters/);
+      await expect(snapshotChatDb(path, join(dirname(path), "snapshot\n.db"))).rejects.toThrow(
+        /control characters/
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns the canonical snapshot path when the destination parent is a symlink", async ({
+    skip,
+  }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    const actualParent = mkdtempSync(join(tmpdir(), "imessage-snapshot-parent-"));
+    const linkedParent = join(dirname(path), "snapshot-parent-link");
+    try {
+      symlinkSync(actualParent, linkedParent);
+      const destination = join(linkedParent, "snapshot.db");
+      const snapshot = await snapshotChatDb(path, destination);
+      expect(snapshot.path).toBe(join(realpathSync(actualParent), "snapshot.db"));
+      unlinkSync(linkedParent);
+      expect(readFileSync(snapshot.path).byteLength).toBe(snapshot.bytes);
+    } finally {
+      if (existsSync(linkedParent)) unlinkSync(linkedParent);
+      rmSync(actualParent, { recursive: true, force: true });
+      cleanup();
+    }
+  });
+
+  it("rejects relative SQLite paths resolved beneath a control-character cwd", async ({ skip }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    const controlDirectory = mkdtempSync(join(tmpdir(), "imessage-control-\n"));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(controlDirectory);
+      await expect(openChatDb("chat.db")).rejects.toThrow(/control characters/);
+      await expect(snapshotChatDb("chat.db", join(dirname(path), "snapshot.db"))).rejects.toThrow(
+        /control characters/
+      );
+      await expect(snapshotChatDb(path, "snapshot.db")).rejects.toThrow(/control characters/);
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(controlDirectory, { recursive: true, force: true });
+      cleanup();
+    }
+  });
+
+  it("rejects a benign symlink whose canonical database path contains controls", async ({
+    skip,
+  }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      const controlledTarget = join(dirname(path), "chat\n.db");
+      renameSync(path, controlledTarget);
+      symlinkSync(controlledTarget, path);
+      await expect(openChatDb(path)).rejects.toThrow(/control characters/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("throws for invalid bounds and after the strict reader is closed", async ({ skip }) => {
+    const { path, cleanup } = await makeFixtureDb(skip);
+    try {
+      const reader = await openChatDb(path);
+      if (!reader) return;
+      const base = {
+        sinceMs: Date.UTC(2024, 6, 5),
+        untilMs: Date.UTC(2024, 6, 6),
+        afterRowId: 0,
+        throughRowId: 13,
+        limit: 100,
+      };
+      expect(() => reader.pageMessages({ ...base, limit: 0 })).toThrow(/Invalid.*page bounds/);
+      reader.close();
+      expect(() => reader.pageMessages(base)).toThrow(/closed.*reader/);
     } finally {
       cleanup();
     }

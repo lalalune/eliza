@@ -5,6 +5,10 @@
  * failure into a process exit code.
  */
 import {
+  collectIMessageCorpus,
+  verifyIMessageCollectionReceipt,
+} from "./collectors/imessage.ts";
+import {
   runScrubPipeline,
   type ScrubMode,
   type ScrubStageSelector,
@@ -39,6 +43,16 @@ function requireFlagValue(args: string[], flag: string): string {
   const value = readFlagValue(args, flag);
   if (!value) throw new Error(`${flag} is required`);
   return value;
+}
+
+function readIsoTimestamp(args: string[], flag: string): number | undefined {
+  const value = readFlagValue(args, flag);
+  if (!value) return undefined;
+  const timestamp = Date.parse(value);
+  if (!Number.isSafeInteger(timestamp)) {
+    throw new Error(`${flag} must be an ISO timestamp`);
+  }
+  return timestamp;
 }
 
 function parseVerifyCliOptions(args: string[]): VerifyCorpusOptions {
@@ -114,8 +128,49 @@ async function main(argv: string[]): Promise<number> {
     return result.status === "passed" ? 0 : 1;
   }
 
+  if (command === "collect") {
+    if (maybeTarget !== "imessage") {
+      throw new Error("corpus collect currently supports imessage");
+    }
+    const pageSizeValue = readFlagValue(rest, "--page-size");
+    const policy =
+      readFlagValue(rest, "--unavailable-attachment-policy") ?? "fail";
+    if (policy !== "fail" && policy !== "record-omission") {
+      throw new Error(
+        "--unavailable-attachment-policy must be fail or record-omission",
+      );
+    }
+    const result = await collectIMessageCorpus({
+      outputRoot: requireFlagValue(rest, "--output"),
+      accountId: requireFlagValue(rest, "--account-id"),
+      ownerId: requireFlagValue(rest, "--owner-id"),
+      ownerDisplay: requireFlagValue(rest, "--owner-display"),
+      ownerAddress: readFlagValue(rest, "--owner-address"),
+      dbPath: readFlagValue(rest, "--db"),
+      attachmentRoot: readFlagValue(rest, "--attachment-root"),
+      sinceMs: readIsoTimestamp(rest, "--since"),
+      untilMs: readIsoTimestamp(rest, "--until"),
+      pageSize: pageSizeValue === undefined ? undefined : Number(pageSizeValue),
+      unavailableAttachmentPolicy: policy,
+    });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return 0;
+  }
+
+  if (command === "verify-receipt") {
+    if (maybeTarget !== "imessage") {
+      throw new Error("corpus verify-receipt currently supports imessage");
+    }
+    const result = await verifyIMessageCollectionReceipt(
+      requireFlagValue(rest, "--output"),
+      requireFlagValue(rest, "--account-id"),
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return 0;
+  }
+
   process.stderr.write(
-    "usage: corpus validate <file-or-dir>\n       corpus scrub --target <file-or-dir> --stage <stage|all> --mode <deep|fast-track> [--resume] [--dry-run]\n       corpus verify --target <dir> --manifest <file> --candidates <file> --canaries <file> --ledger <file> --gazetteer <file> --deletion-rules <file> --deletion-review-queue <file> --deletion-review-decision <file> --deletion-approval <file> --placeholder-registry <file> --ruleset-version <version> --report <file>\n",
+    "usage: corpus validate <file-or-dir>\n       corpus scrub --target <file-or-dir> --stage <stage|all> --mode <deep|fast-track> [--resume] [--dry-run]\n       corpus collect imessage --output <private-ignored-dir> --account-id <slug> --owner-id <id> --owner-display <name> [--owner-address <address>] [--db <chat.db>] [--attachment-root <dir>] [--since <iso>] [--until <iso>] [--page-size <1..1000>] [--unavailable-attachment-policy <fail|record-omission>]\n       corpus verify-receipt imessage --output <private-ignored-dir> --account-id <slug>\n       corpus verify --target <dir> --manifest <file> --candidates <file> --canaries <file> --ledger <file> --gazetteer <file> --deletion-rules <file> --deletion-review-queue <file> --deletion-review-decision <file> --deletion-approval <file> --placeholder-registry <file> --ruleset-version <version> --report <file>\n",
   );
   return 2;
 }
