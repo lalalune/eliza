@@ -24,6 +24,7 @@ import {
 	runV5MessageRuntimeStage1,
 } from "../services/message";
 import { runWithTrajectoryContext } from "../trajectory-context";
+import type { Action } from "../types/components";
 import type { Memory } from "../types/memory";
 import { ModelType } from "../types/model";
 import { ChannelType, type UUID } from "../types/primitives";
@@ -3748,7 +3749,7 @@ describe("runV5MessageRuntimeStage1", () => {
 				validate: vi.fn(async () => true),
 				handler,
 			},
-		] as IAgentRuntime["actions"];
+		] satisfies Action[];
 		runtime.responseHandlerEvaluators = [
 			{
 				name: "test.inject_untrusted_candidate_shape",
