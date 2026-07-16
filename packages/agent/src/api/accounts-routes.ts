@@ -798,7 +798,9 @@ async function handleListAllAccounts(
           ...cfg,
           hasCredential: onDiskSet.has(cfg.id),
           observability: {
-            activeLeaseCount: brokerAccount ? brokerAccount.activeLeaseCount : 0,
+            activeLeaseCount: brokerAccount
+              ? brokerAccount.activeLeaseCount
+              : 0,
             lastLeaseAt: brokerAccount ? brokerAccount.lastLeaseAt : null,
             servedLastRequest: lastSelection?.accountId === cfg.id,
           },
