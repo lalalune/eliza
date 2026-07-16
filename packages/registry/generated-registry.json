@@ -509,6 +509,52 @@
       "registryKind": "plugin",
       "directory": "elizaos-plugin"
     },
+    "@williamweishuhn/valuepacket-adapter-eliza": {
+      "git": {
+        "repo": "KryptosAI/ValuePacket",
+        "v0": {
+          "branch": null
+        },
+        "v1": {
+          "branch": null
+        },
+        "v2": {
+          "branch": "main"
+        }
+      },
+      "npm": {
+        "repo": "@williamweishuhn/valuepacket-adapter-eliza",
+        "v0": null,
+        "v1": null,
+        "v2": "0.1.2"
+      },
+      "supports": {
+        "v0": false,
+        "v1": false,
+        "v2": true
+      },
+      "description": "ValuePacket payment protocol adapter — let your ElizaOS agent pay and get paid by other AI agents across any framework using on-chain payment channels with EIP-712 signed micropayments.",
+      "homepage": "https://github.com/KryptosAI/ValuePacket",
+      "topics": [
+        "payment",
+        "settlement",
+        "crypto",
+        "stablecoin",
+        "agent-economy",
+        "micropayments"
+      ],
+      "stargazers_count": 0,
+      "language": "TypeScript",
+      "origin": "third-party",
+      "source": "community",
+      "support": "community",
+      "builtIn": false,
+      "firstParty": false,
+      "thirdParty": true,
+      "kind": "plugin",
+      "registryKind": "plugin",
+      "directory": "adapters/eliza"
+    },
     "@xynqai/plugin-eliza": {
       "git": {
         "repo": "visionsXBT/xynq",
