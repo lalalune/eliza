@@ -51,7 +51,7 @@
     "tsSuppress": 0,
     "nonNullAssertion": 488,
     "nullishEmptyString": 579,
-    "nullishEmptyArray": 580,
+    "nullishEmptyArray": 578,
     "nullishEmptyObject": 374,
     "nullishZero": 368
   },
