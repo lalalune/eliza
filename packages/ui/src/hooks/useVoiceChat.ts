@@ -1604,6 +1604,11 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
          * path, so chat fell back to browser (Edge) TTS. If cloud rejects
          * (no key), fall back to the upstream ElevenLabs proxy.
          */
+        // #16425: ONE key per logical utterance across BOTH proxy legs (the
+        // cloud proxy and its direct-ElevenLabs-proxy retry below re-POST the
+        // same utterance), so upstream billing can replay the committed
+        // reservation instead of charging the retry as a new operation.
+        const proxyUtteranceKey = crypto.randomUUID();
         const makeProxyRequestInit = (): RequestInit => {
           const dbg = task.debugUtteranceContext;
           return {
@@ -1611,6 +1616,7 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
             headers: {
               "Content-Type": "application/json",
               Accept: "audio/mpeg",
+              "Idempotency-Key": proxyUtteranceKey,
               ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
               ...(isTtsDebugEnabled() && dbg
                 ? {
@@ -1931,12 +1937,19 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
                   ),
                 }
               : {};
+          // #16425: ONE key per logical utterance, sent on BOTH the direct
+          // request and the proxy fallback. The cloud route keys its credit
+          // reservation on it, so a fallback retry after an ambiguous network
+          // outcome replays the committed reservation instead of billing the
+          // same utterance twice. (Header is in CORS_ALLOW_HEADER_NAMES.)
+          const ttsUtteranceKey = crypto.randomUUID();
           const fetchViaProxy = (url: string, bearer: string | null) =>
             fetchWithCsrf(url, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 Accept: "audio/wav, audio/mpeg, audio/*;q=0.9",
+                "Idempotency-Key": ttsUtteranceKey,
                 ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
                 ...debugHeaders,
               },
@@ -1964,6 +1977,7 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
+                  "Idempotency-Key": ttsUtteranceKey,
                   ...(route.bearer
                     ? { Authorization: `Bearer ${route.bearer}` }
                     : {}),
