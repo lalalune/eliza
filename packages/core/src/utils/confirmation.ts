@@ -45,6 +45,15 @@ const DEFAULT_TTL_MS = 5 * 60_000;
 const DEFAULT_CONFIRM_REGEX =
 	/^\s*(yes|yeah|yep|y|ok|okay|sure|confirm|confirmed|do it|go ahead|proceed|approve|approved|si|sí|oui|ja|hai|はい|确认|확인)\b/i;
 
+/**
+ * Default broad cancel detector. Anything that doesn't match yes and DOES
+ * match cancel is treated as an explicit cancel; anything else (random
+ * unrelated reply) is treated as cancel-by-default to avoid silently
+ * holding pending state.
+ */
+const DEFAULT_CANCEL_REGEX =
+	/^\s*(no|nope|n|cancel|stop|abort|forget it|never mind|nevermind|nah|non|nein|否)\b/i;
+
 const EXTERNAL_CONTENT_START = "<<<EXTERNAL_UNTRUSTED_CONTENT>>>";
 const EXTERNAL_CONTENT_END = "<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>";
 const EXTERNAL_CONTENT_METADATA_SEPARATOR = "\n---\n";
@@ -81,6 +90,8 @@ export interface RequireConfirmationArgs {
 	ttlMs?: number;
 	/** Custom yes detector. */
 	confirmRegex?: RegExp;
+	/** Custom cancel detector. */
+	cancelRegex?: RegExp;
 	/** Optional structured metadata to stash on the pending record (passed back on confirm). */
 	metadata?: Record<string, unknown>;
 }
@@ -158,6 +169,7 @@ export async function requireConfirmation(
 ): Promise<ConfirmationDecision> {
 	const ttlMs = args.ttlMs ?? DEFAULT_TTL_MS;
 	const confirmRegex = args.confirmRegex ?? DEFAULT_CONFIRM_REGEX;
+	const cancelRegex = args.cancelRegex ?? DEFAULT_CANCEL_REGEX;
 	const userId = String(args.message.entityId);
 	const cacheKey = buildCacheKey(userId, args.actionName, args.pendingKey);
 	const userText = readUserText(args.message);
@@ -187,9 +199,13 @@ export async function requireConfirmation(
 	// Existing pending record found — interpret the user's reply.
 	await args.runtime.deleteCache(cacheKey);
 
-	const status: ConfirmationStatus = confirmRegex.test(userText)
+	const isConfirmed = confirmRegex.test(userText);
+	const isCancelled = !isConfirmed && cancelRegex.test(userText);
+	const status: ConfirmationStatus = isConfirmed
 		? "confirmed"
-		: "cancelled";
+		: isCancelled
+			? "cancelled"
+			: "cancelled";
 	return { status, metadata: existing.metadata };
 }
 

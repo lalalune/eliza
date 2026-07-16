@@ -1137,11 +1137,17 @@ export function createScheduledTaskRunner(
         task.state.completedAt = now().toISOString();
       }
       await persist(task);
-      await logger.log(task.taskId, outcome, {
+      await logger.log(task.taskId, outcomeToLogTransition(outcome), {
         reason: `pipeline: ${outcome}`,
       });
     }
     return settleTerminal(task, outcome);
+  }
+
+  function outcomeToLogTransition(
+    outcome: TerminalState,
+  ): "completed" | "skipped" | "expired" | "failed" | "dismissed" {
+    return outcome;
   }
 
   // -------------------------------------------------------------------------

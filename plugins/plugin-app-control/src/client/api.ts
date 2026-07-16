@@ -26,6 +26,7 @@ export interface AppControlClient {
 	listAppRuns(): Promise<AppRunSummary[]>;
 	launchApp(name: string): Promise<AppLaunchResult>;
 	stopAppRun(runId: string): Promise<AppStopResult>;
+	stopAppByName(name: string): Promise<AppStopResult>;
 }
 
 function getApiBase(): string {
@@ -279,6 +280,18 @@ export function createAppControlClient(): AppControlClient {
 				{ method: "POST" },
 				parseStopResult,
 				`Failed to stop app run ${runId}`,
+			);
+		},
+
+		async stopAppByName(name: string) {
+			return requestJson(
+				"/api/apps/stop",
+				{
+					method: "POST",
+					body: JSON.stringify({ name }),
+				},
+				parseStopResult,
+				`Failed to stop app ${name}`,
 			);
 		},
 	};

@@ -232,3 +232,5 @@ export function createConsolidationRegistry(): ConsolidationRegistry {
     },
   };
 }
+
+export const __anchorTestUtils = { todayIsoWithLocalHHMM };

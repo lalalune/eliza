@@ -233,6 +233,10 @@ export function getActivitySignalBus(
   return buses.get(runtime) ?? null;
 }
 
+export function __resetActivitySignalBusForTests(runtime: IAgentRuntime): void {
+  buses.delete(runtime);
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports so callers import bus + family types from one place.
 // ---------------------------------------------------------------------------

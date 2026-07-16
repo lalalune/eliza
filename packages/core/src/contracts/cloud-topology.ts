@@ -36,6 +36,18 @@ function asConfigRecord(value: unknown): Record<string, unknown> | null {
 		: null;
 }
 
+function _readConfigString(
+	source: Record<string, unknown> | null | undefined,
+	key: string,
+): string | undefined {
+	const value = source?.[key];
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function normalizeSecretString(value: unknown): string | undefined {
 	if (typeof value !== "string") {
 		return undefined;
@@ -100,7 +112,7 @@ export function resolveElizaCloudTopology(
 
 	return {
 		linked: isElizaCloudLinkedInConfig(config),
-		provider,
+		provider: provider === "elizacloud" ? "elizacloud" : null,
 		runtime,
 		services: resolvedServices,
 		shouldLoadPlugin:
