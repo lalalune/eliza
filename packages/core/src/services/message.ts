@@ -4490,7 +4490,7 @@ function _isSimpleMessageHandlerShortcut(
 	);
 	return (
 		nonSimpleContexts.length === 0 &&
-		(messageHandler.plan.candidateActions?.length ?? 0) === 0
+		getMessageHandlerCandidateActions(messageHandler).length === 0
 	);
 }
 
@@ -5418,11 +5418,9 @@ function buildRoutedDeterministicPlannerFallbackToolCall(args: {
 	}
 
 	const text = getUserMessageText(args.message) ?? "";
-	const candidateActionNames = Array.isArray(
-		args.messageHandler.plan.candidateActions,
-	)
-		? args.messageHandler.plan.candidateActions
-		: [];
+	const candidateActionNames = getMessageHandlerCandidateActions(
+		args.messageHandler,
+	);
 	const candidates = new Set(
 		candidateActionNames.map(normalizeActionIdentifier),
 	);
@@ -7005,7 +7003,7 @@ export async function runV5MessageRuntimeStage1(args: {
 		// candidateActions) and the message carries explicit addressees.
 		const mayPromoteToTool =
 			messageHandler.plan.requiresTool === true ||
-			(messageHandler.plan.candidateActions?.length ?? 0) > 0;
+			getMessageHandlerCandidateActions(messageHandler).length > 0;
 		// Fail SAFE on any resolution error (DB hiccup in getEntitiesForRoom): a
 		// transient failure must NOT convert a normal turn into the generic
 		// failure reply — it just means "don't suppress", matching the
@@ -7348,16 +7346,15 @@ export async function runV5MessageRuntimeStage1(args: {
 				plannerToolNames.has(normalizeActionIdentifier(resolved.name))
 			);
 		};
-		const stageOneCandidateActions = messageHandler.plan.candidateActions;
+		const stageOneCandidateActions =
+			getMessageHandlerCandidateActions(messageHandler);
 		const stageOneNamedAToolForThisTurn =
 			messageHandler.plan.requiresTool === true &&
-			Array.isArray(stageOneCandidateActions) &&
 			stageOneCandidateActions.some((name) =>
-				candidateResolvesToPlannerTool(String(name)),
+				candidateResolvesToPlannerTool(name),
 			);
 		const stageOneNamedOwnerLifeManagementTool =
 			stageOneNamedAToolForThisTurn &&
-			Array.isArray(stageOneCandidateActions) &&
 			stageOneCandidateActions.some(isOwnerLifeManagementToolCandidate);
 		const requireNonTerminalToolCall =
 			(stageOneNamedAToolForThisTurn || benchmarkForcingToolCall) &&

@@ -3711,6 +3711,81 @@ describe("runV5MessageRuntimeStage1", () => {
 		}
 	});
 
+	it("sanitizes mixed-type Stage 1 candidates before enforcing an owner tool", async () => {
+		const runtime = makeRuntime([
+			stage1Response({
+				thought: "The current request needs a calendar check.",
+				contexts: ["general"],
+			}),
+			JSON.stringify({
+				thought: "I can answer directly.",
+				toolCalls: [],
+				messageToUser: "Your calendar looks clear.",
+			}),
+			{
+				text: "",
+				toolCalls: [
+					{
+						id: "calendar-1",
+						name: "CALENDAR",
+						arguments: {},
+					},
+				],
+			},
+			JSON.stringify({
+				success: true,
+				decision: "FINISH",
+				thought: "The calendar check completed.",
+				messageToUser: "Your calendar looks clear.",
+			}),
+		]);
+		const handler = vi.fn(async () => ({ success: true, text: "checked" }));
+		runtime.actions = [
+			{
+				name: "CALENDAR",
+				description: "Inspect the owner's calendar.",
+				contexts: ["general"],
+				validate: vi.fn(async () => true),
+				handler,
+			},
+		] as IAgentRuntime["actions"];
+		runtime.responseHandlerEvaluators = [
+			{
+				name: "test.inject_untrusted_candidate_shape",
+				priority: 5,
+				shouldRun: () => true,
+				evaluate: ({ messageHandler }) => {
+					Reflect.set(messageHandler.plan, "candidateActions", [
+						42,
+						"CALENDAR",
+					]);
+					return { requiresTool: true };
+				},
+			} satisfies ResponseHandlerEvaluator,
+		];
+
+		const result = await runV5MessageRuntimeStage1({
+			runtime,
+			message: makeMessage(),
+			state: makeState(),
+			responseId: "00000000-0000-0000-0000-000000000005" as UUID,
+		});
+
+		const firstPlannerParams = useModelCalls(runtime)[1]?.[1] as {
+			messages?: Array<{ role?: string; content?: string | null }>;
+		};
+		expect(JSON.stringify(firstPlannerParams.messages)).toContain(
+			"Stage 1 router marked this current turn as requiring a tool",
+		);
+		expect(handler).toHaveBeenCalledTimes(1);
+		expect(result.kind).toBe("planned_reply");
+		if (result.kind === "planned_reply") {
+			expect(result.result.responseContent?.text).toBe(
+				"Your calendar looks clear.",
+			);
+		}
+	});
+
 	it("keeps stale prior assistant tool answers out of tool-planner context", async () => {
 		const runtime = makeRuntime([
 			stage1Response({
