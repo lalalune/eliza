@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IAgentRuntime } from "@elizaos/core";
 import type {
   PullRequestInfo,
   WorkspaceFinalization,
@@ -25,6 +26,7 @@ import {
   getStatus,
   push,
 } from "../services/workspace-git-ops.ts";
+import { CodingWorkspaceService } from "../services/workspace-service.ts";
 import type { WorkspaceResult } from "../services/workspace-types.ts";
 
 const cleanupDirs: string[] = [];
@@ -52,6 +54,20 @@ function makeRepoPair(): { bare: string; work: string } {
   git(work, "commit", "-q", "-m", "seed");
   git(work, "push", "-q", "-u", "origin", "main");
   return { bare, work };
+}
+
+function serviceWithWorkspace(
+  workspace: WorkspaceResult,
+): CodingWorkspaceService {
+  const runtime = {
+    getSetting: () => undefined,
+    reportError: () => undefined,
+  } as unknown as IAgentRuntime;
+  const service = new CodingWorkspaceService(runtime, {
+    baseDir: tempDir("workspace-service-base-"),
+  });
+  Reflect.get(service, "workspaces").set(workspace.id, workspace);
+  return service;
 }
 
 afterEach(() => {
@@ -158,6 +174,100 @@ describe("push (real git, local bare remote)", () => {
     ).rejects.toThrow();
     // The remote kept the other clone's commit — nothing was clobbered.
     expect(git(bare, "log", "-1", "--pretty=%B", "main")).toBe("remote moved");
+  });
+});
+
+describe("CodingWorkspaceService git coordination", () => {
+  it("coordinates status and commit while enforcing safe push transports", async () => {
+    const { bare, work } = makeRepoPair();
+    const workspace: WorkspaceResult = {
+      id: "workspace-git-coordination",
+      path: work,
+      branch: "main",
+      baseBranch: "main",
+      isWorktree: false,
+      repo: bare,
+      status: "ready",
+    };
+    const service = serviceWithWorkspace(workspace);
+    writeFileSync(join(work, "coordinated.txt"), "coordinated\n");
+
+    await expect(service.getStatus(workspace.id)).resolves.toMatchObject({
+      clean: false,
+      untracked: ["coordinated.txt"],
+    });
+    const hash = await service.commit(workspace.id, {
+      message: "test: coordinate workspace git operations",
+      all: true,
+    });
+    await expect(
+      service.push(workspace.id, { setUpstream: true }),
+    ).rejects.toThrow(/transport 'file' not allowed/);
+
+    expect(git(work, "rev-parse", "HEAD")).toBe(hash);
+    expect(git(bare, "rev-parse", "refs/heads/main")).not.toBe(hash);
+    await expect(service.getStatus(workspace.id)).resolves.toMatchObject({
+      clean: true,
+    });
+  });
+
+  it("fails each git operation when the workspace identity is unknown", async () => {
+    const { work } = makeRepoPair();
+    const service = serviceWithWorkspace({
+      id: "known",
+      path: work,
+      branch: "main",
+      baseBranch: "main",
+      isWorktree: false,
+      repo: "acme/widgets",
+      status: "ready",
+    });
+
+    await expect(service.getStatus("missing")).rejects.toThrow(
+      "Workspace missing not found",
+    );
+    await expect(
+      service.commit("missing", { message: "must not commit", all: true }),
+    ).rejects.toThrow("Workspace missing not found");
+    await expect(service.push("missing")).rejects.toThrow(
+      "Workspace missing not found",
+    );
+  });
+
+  it("resolves explicit, registered, and git-origin repository identities", async () => {
+    const { bare, work } = makeRepoPair();
+    const registered = serviceWithWorkspace({
+      id: "registered",
+      path: work,
+      branch: "main",
+      baseBranch: "main",
+      isWorktree: false,
+      repo: "acme/widgets",
+      status: "ready",
+    });
+
+    await expect(
+      registered.resolveRepository({ repo: "  acme/direct  " }),
+    ).resolves.toBe("acme/direct");
+    await expect(registered.resolveRepository({ workdir: work })).resolves.toBe(
+      "acme/widgets",
+    );
+
+    const unregistered = serviceWithWorkspace({
+      id: "elsewhere",
+      path: tempDir("workspace-service-elsewhere-"),
+      branch: "main",
+      baseBranch: "main",
+      isWorktree: false,
+      repo: "acme/elsewhere",
+      status: "ready",
+    });
+    await expect(
+      unregistered.resolveRepository({ workdir: work }),
+    ).resolves.toBe(bare);
+    await expect(unregistered.resolveRepository({})).rejects.toThrow(
+      /requires a repository or workdir/,
+    );
   });
 });
 

@@ -1,13 +1,7 @@
 /**
- * Coding Workspace Service - Manages git workspaces for coding tasks
- *
- * Delegates to:
- * - workspace-github.ts  (issue management, OAuth, PAT auth)
- * - workspace-git-ops.ts (status, commit, push, PR creation)
- * - workspace-lifecycle.ts (GC, scratch dir cleanup)
- * - workspace-types.ts   (shared interface definitions)
- *
- * @module services/workspace-service
+ * Manages git workspaces, scratch promotion, and GitHub finalization for coding
+ * agents. Specialized modules own authentication, git operations, lifecycle,
+ * persistence, and diff policy while this service coordinates their state.
  */
 
 import { execFile } from "node:child_process";
@@ -62,8 +56,10 @@ import {
   getIssue as ghGetIssue,
   listComments as ghListComments,
   listIssues as ghListIssues,
+  listOpenPullRequestChangedFiles as ghListOpenPullRequestChangedFiles,
   reopenIssue as ghReopenIssue,
   updateIssue as ghUpdateIssue,
+  type OpenPullRequestChangedFiles,
 } from "./workspace-github.js";
 
 export type { AuthPromptCallback } from "./workspace-github.js";
@@ -116,6 +112,42 @@ import type {
   WorkspaceResult,
   WorkspaceStatusResult,
 } from "./workspace-types.js";
+
+function gitOriginRemote(workdir: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "git",
+      ["remote", "get-url", "origin"],
+      { cwd: workdir, encoding: "utf8", timeout: 10_000 },
+      (error, stdout) => {
+        if (error) {
+          reject(
+            new ElizaError(
+              "Unable to resolve the workspace GitHub repository",
+              {
+                code: "CODING_WORKSPACE_REPOSITORY_UNRESOLVED",
+                cause: error,
+                context: { workdir },
+              },
+            ),
+          );
+          return;
+        }
+        const remote = stdout.trim();
+        if (!remote) {
+          reject(
+            new ElizaError("Workspace origin remote is empty", {
+              code: "CODING_WORKSPACE_REPOSITORY_UNRESOLVED",
+              context: { workdir },
+            }),
+          );
+          return;
+        }
+        resolve(remote);
+      },
+    );
+  });
+}
 
 type WorkspaceEventCallback = (event: WorkspaceEvent) => void;
 type ScratchRetentionPolicy = "ephemeral" | "pending_decision" | "persistent";
@@ -910,13 +942,18 @@ export class CodingWorkspaceService {
   // === Delegated GitHub / Issue Management ===
 
   private getGitHubContext(): GitHubContext {
+    const service = this;
     return {
       runtime: this.runtime,
-      githubClient: this.githubClient,
+      get githubClient() {
+        return service.githubClient;
+      },
       setGithubClient: (client: GitHubPatClientInstance) => {
         this.githubClient = client;
       },
-      githubAuthInProgress: this.githubAuthInProgress,
+      get githubAuthInProgress() {
+        return service.githubAuthInProgress;
+      },
       setGithubAuthInProgress: (p: Promise<GitHubPatClientInstance> | null) => {
         this.githubAuthInProgress = p;
       },
@@ -960,6 +997,41 @@ export class CodingWorkspaceService {
     },
   ): Promise<IssueInfo[]> {
     return ghListIssues(this.getGitHubContext(), repo, options);
+  }
+
+  /**
+   * Open-PR changed-file truth used by lane planning and wave supervision. A
+   * caller may name the repository directly or provide a local workdir whose
+   * registered workspace/origin remote identifies it.
+   */
+  async listOpenPullRequestChangedFiles(input: {
+    repo?: string;
+    workdir?: string;
+  }): Promise<OpenPullRequestChangedFiles[]> {
+    const repo = await this.resolveRepository(input);
+    return ghListOpenPullRequestChangedFiles(this.getGitHubContext(), repo);
+  }
+
+  /** Resolve the repository identity shared by PR and durable-task collisions. */
+  async resolveRepository(input: {
+    repo?: string;
+    workdir?: string;
+  }): Promise<string> {
+    let repo = input.repo?.trim();
+    if (!repo && input.workdir) {
+      const resolvedWorkdir = path.resolve(input.workdir);
+      const registered = this.listWorkspaces().find(
+        (workspace) => path.resolve(workspace.path) === resolvedWorkdir,
+      );
+      repo = registered?.repo ?? (await gitOriginRemote(resolvedWorkdir));
+    }
+    if (!repo) {
+      throw new ElizaError(
+        "Lane collision discovery requires a repository or workdir",
+        { code: "CODING_WORKSPACE_REPOSITORY_REQUIRED" },
+      );
+    }
+    return repo;
   }
 
   async updateIssue(

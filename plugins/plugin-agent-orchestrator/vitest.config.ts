@@ -5,6 +5,10 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
+const coverageEnabled = process.argv.some((argument) =>
+  /^--coverage(?:$|[.=])/.test(argument),
+);
+
 export default defineConfig({
   resolve: {
     alias: {
@@ -22,6 +26,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // V8 coverage cannot reliably flush this package's local HTTP/git suites
+    // after fork teardown; threads preserve file isolation and let LCOV finish.
+    pool: coverageEnabled ? "threads" : "forks",
     setupFiles: ["./__tests__/setup.ts"],
     include: ["__tests__/**/*.test.ts", "src/__tests__/**/*.test.ts"],
     coverage: {

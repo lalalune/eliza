@@ -1,5 +1,5 @@
 /**
- * HTTP-boundary tests for the GitHub issue functions in workspace-github.ts.
+ * HTTP-boundary tests for GitHub issue and pull-request functions.
  * A REAL local node:http server implements the GitHub REST endpoints and a
  * REAL `GitHubPatClient` (Octokit under the hood) is pointed at it via its
  * `baseUrl` option, then injected through the production `GitHubContext`
@@ -21,9 +21,11 @@ import {
   ensureGitHubClient,
   type GitHubContext,
   listIssues,
+  listOpenPullRequestChangedFiles,
   parseOwnerRepo,
   updateIssue,
 } from "../services/workspace-github.ts";
+import { CodingWorkspaceService } from "../services/workspace-service.ts";
 
 const { GitHubPatClient } = createRequire(import.meta.url)(
   "git-workspace-service",
@@ -84,6 +86,51 @@ class FakeGitHub {
           return;
         }
         res.setHeader("Content-Type", "application/json");
+        if (req.method === "GET" && /\/pulls\?/.test(path)) {
+          res.end(
+            JSON.stringify([
+              {
+                number: 17,
+                title: "Active refactor",
+                html_url: "http://local/acme/widgets/pull/17",
+              },
+            ]),
+          );
+          return;
+        }
+        if (req.method === "GET" && /\/pulls\/17\/files\?/.test(path)) {
+          res.end(
+            JSON.stringify([
+              {
+                filename: "src/runtime.ts",
+                previous_filename: "src/legacy-runtime.ts",
+              },
+              { filename: "src/runtime.test.ts" },
+            ]),
+          );
+          return;
+        }
+        if (
+          req.method === "GET" &&
+          /\/issues\/7\/comments(?:\?|$)/.test(path)
+        ) {
+          res.end(
+            JSON.stringify([
+              {
+                id: 999,
+                body: "on it",
+                user: { login: "octocat" },
+                created_at: "2026-07-01T00:00:00Z",
+                html_url: "http://local/comment/999",
+              },
+            ]),
+          );
+          return;
+        }
+        if (req.method === "GET" && /\/issues\/7(?:\?|$)/.test(path)) {
+          res.end(JSON.stringify(this.issueJson()));
+          return;
+        }
         if (req.method === "GET" && /\/issues(\?|$)/.test(path)) {
           res.end(
             JSON.stringify([
@@ -187,6 +234,17 @@ function makeCtx(client: GitHubPatClientInstance | null): GitHubContext {
   };
 }
 
+function makeWorkspaceService(
+  client: GitHubPatClientInstance,
+): CodingWorkspaceService {
+  const service = new CodingWorkspaceService({
+    getSetting: () => undefined,
+    reportError: () => undefined,
+  } as unknown as IAgentRuntime);
+  Reflect.set(service, "githubClient", client);
+  return service;
+}
+
 describe("parseOwnerRepo", () => {
   it("parses owner/repo shorthand and full GitHub URLs", () => {
     expect(parseOwnerRepo("acme/widgets")).toEqual({
@@ -194,6 +252,10 @@ describe("parseOwnerRepo", () => {
       repo: "widgets",
     });
     expect(parseOwnerRepo("https://github.com/acme/widgets")).toEqual({
+      owner: "acme",
+      repo: "widgets",
+    });
+    expect(parseOwnerRepo("git@github.com:acme/widgets.git")).toEqual({
       owner: "acme",
       repo: "widgets",
     });
@@ -229,12 +291,16 @@ describe("ensureGitHubClient", () => {
 describe("issue functions over a real local GitHub API server", () => {
   const github = new FakeGitHub();
   let ctx: GitHubContext;
+  let service: CodingWorkspaceService;
 
   beforeAll(async () => {
     await github.start();
-    ctx = makeCtx(
-      new GitHubPatClient({ token: "ghp_local", baseUrl: github.baseUrl }),
-    );
+    const client = new GitHubPatClient({
+      token: "ghp_local",
+      baseUrl: github.baseUrl,
+    });
+    ctx = makeCtx(client);
+    service = makeWorkspaceService(client);
   });
   afterAll(async () => {
     await github.stop();
@@ -259,6 +325,79 @@ describe("issue functions over a real local GitHub API server", () => {
     expect(issue.title).toBe("Broken widget");
     expect(issue.labels).toEqual(["bug"]);
     expect(issue.assignees).toEqual(["octocat"]);
+  });
+
+  it("lists open PR changed files through the authenticated client transport", async () => {
+    await expect(
+      listOpenPullRequestChangedFiles(ctx, "acme/widgets"),
+    ).resolves.toEqual([
+      {
+        id: "pr-17",
+        number: 17,
+        title: "Active refactor",
+        url: "http://local/acme/widgets/pull/17",
+        paths: [
+          "src/legacy-runtime.ts",
+          "src/runtime.test.ts",
+          "src/runtime.ts",
+        ],
+      },
+    ]);
+    expect(github.requests.at(-2)?.path).toContain(
+      "/repos/acme/widgets/pulls?state=open&per_page=100&page=1",
+    );
+    expect(github.lastRequest().path).toContain(
+      "/repos/acme/widgets/pulls/17/files?per_page=100&page=1",
+    );
+    expect(github.lastRequest().auth).toBe("token ghp_local");
+  });
+
+  it("coordinates GitHub issue and collision operations through the workspace service", async () => {
+    service.setAuthPromptCallback(async () => true);
+
+    await expect(
+      service.createIssue("acme/widgets", {
+        title: "Service-created widget",
+        body: "Created through the coordinator",
+      }),
+    ).resolves.toMatchObject({ number: 7 });
+    await expect(service.getIssue("acme/widgets", 7)).resolves.toMatchObject({
+      number: 7,
+      state: "open",
+    });
+    await expect(
+      service.listIssues("acme/widgets", { state: "open" }),
+    ).resolves.toHaveLength(1);
+    await expect(
+      service.listOpenPullRequestChangedFiles({ repo: " acme/widgets " }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        number: 17,
+        paths: [
+          "src/legacy-runtime.ts",
+          "src/runtime.test.ts",
+          "src/runtime.ts",
+        ],
+      }),
+    ]);
+    await expect(
+      service.updateIssue("acme/widgets", 7, { title: "Coordinated widget" }),
+    ).resolves.toMatchObject({ title: "Coordinated widget" });
+    await expect(
+      service.addComment("acme/widgets", 7, "on it"),
+    ).resolves.toMatchObject({ body: "on it" });
+    await expect(service.listComments("acme/widgets", 7)).resolves.toHaveLength(
+      1,
+    );
+    await expect(service.closeIssue("acme/widgets", 7)).resolves.toMatchObject({
+      state: "closed",
+    });
+    await expect(service.reopenIssue("acme/widgets", 7)).resolves.toMatchObject(
+      { state: "open" },
+    );
+    await expect(
+      service.addLabels("acme/widgets", 7, ["triage"]),
+    ).resolves.toBeUndefined();
   });
 
   it("updateIssue PATCHes the issue with only the provided fields", async () => {
