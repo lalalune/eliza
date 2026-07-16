@@ -578,31 +578,45 @@ export class CacheClient {
       return await revalidate();
     }
 
+    let value: unknown;
+    let duration: number;
     try {
       const start = Date.now();
-      const value = await redis.get(this.pk(key));
-      const duration = Date.now() - start;
+      value = await redis.get(this.pk(key));
+      duration = Date.now() - start;
+    } catch (error) {
+      this.recordFailure();
+      logger.warn("[Cache] GET-with-SWR failed, falling back to revalidate", {
+        key,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return await revalidate();
+    }
 
-      if (value === null || value === undefined) {
-        this.logMetric(key, "miss", duration);
-        const fresh = await revalidate();
-        if (fresh !== null) {
-          await this.set(
-            key,
-            {
-              data: fresh,
-              cachedAt: Date.now(),
-              staleAt: Date.now() + staleTTL * 1000,
-            } as CachedValue<T>,
-            effectiveTTL,
-          );
-        }
-        return fresh;
+    if (value === null || value === undefined) {
+      this.logMetric(key, "miss", duration);
+
+      // Upstream availability must not feed the cache backend's circuit
+      // breaker. A loader rejection therefore propagates outside the adapter
+      // catch and is observed by the caller exactly once.
+      const fresh = await revalidate();
+      if (fresh !== null) {
+        await this.set(
+          key,
+          {
+            data: fresh,
+            cachedAt: Date.now(),
+            staleAt: Date.now() + staleTTL * 1000,
+          } as CachedValue<T>,
+          effectiveTTL,
+        );
       }
+      return fresh;
+    }
 
+    try {
       const raw = typeof value === "string" ? JSON.parse(value) : value;
       const parsed = raw as CachedValue<T>;
-
       const now = Date.now();
       const isStale = now > parsed.staleAt;
 
@@ -629,7 +643,13 @@ export class CacheClient {
             );
           });
 
-          const revalidationPromise = Promise.race([revalidate(), timeoutPromise])
+          // Deferring invocation converts a synchronous loader throw into the
+          // background rejection observed below, keeping it outside the cache
+          // adapter failure boundary just like an asynchronous rejection.
+          const revalidationPromise = Promise.race([
+            Promise.resolve().then(revalidate),
+            timeoutPromise,
+          ])
             .then((fresh) => {
               if (fresh !== null) {
                 return this.set(
