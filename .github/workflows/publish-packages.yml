@@ -477,6 +477,9 @@ jobs:
           elizaos-app --help | tee /tmp/elizaos-debian-help.txt
           grep -q 'Usage:' /tmp/elizaos-debian-help.txt
           grep -q 'Commands:' /tmp/elizaos-debian-help.txt
+          node packages/scripts/verify-packaged-cli.mjs \
+            --expected "$EXPECTED_VERSION" \
+            -- elizaos-app
 
       - name: Attest Debian build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
@@ -583,6 +586,9 @@ jobs:
           EXPECTED_VERSION="${{ needs.prepare.outputs.version }}"
           export EXPECTED_VERSION
           flatpak --user install --reinstall -y dist-flatpak/elizaos-app.flatpak
+          node packages/scripts/verify-packaged-cli.mjs \
+            --expected "$EXPECTED_VERSION" \
+            -- flatpak run ai.elizaos.App
           test "$(flatpak run ai.elizaos.App --version)" = "$EXPECTED_VERSION"
           test "$(flatpak run --command=node ai.elizaos.App --version)" = "v24.15.0"
           flatpak run ai.elizaos.App --help | tee /tmp/elizaos-flatpak-help.txt

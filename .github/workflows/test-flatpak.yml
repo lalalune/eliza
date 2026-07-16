@@ -73,6 +73,9 @@ jobs:
           EXPECTED_VERSION="$(node -p "require('./package.json').version")"
           export EXPECTED_VERSION
           flatpak --user install --reinstall -y dist-flatpak/elizaos-app.flatpak
+          node packages/scripts/verify-packaged-cli.mjs \
+            --expected "$EXPECTED_VERSION" \
+            -- flatpak run ai.elizaos.App
           test "$(flatpak run ai.elizaos.App --version)" = "$EXPECTED_VERSION"
           test "$(flatpak run --command=node ai.elizaos.App --version)" = "v24.15.0"
           flatpak run ai.elizaos.App --help | tee /tmp/elizaos-flatpak-help.txt
