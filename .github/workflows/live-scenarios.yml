@@ -42,8 +42,9 @@
 # 1Password vault: this workflow's plain `*_API_KEY` secrets are sourced from the
 # `eliza-e2e` 1Password vault. The vault must exist in 1Password and the
 # corresponding GitHub Actions secrets must be configured on the
-# `elizaOS/eliza` repo before this workflow can run successfully. See
-# scenario-matrix.yml for the structured `ELIZA_E2E_*` connector secrets.
+# `elizaOS/eliza` repo before this workflow can run successfully. Structured
+# per-account `ELIZA_E2E_*` coverage is tracked in #16448; this authority
+# exposes only the canonical runtime credentials listed above.
 
 name: Live Scenarios
 

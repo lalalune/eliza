@@ -12,7 +12,6 @@ This directory contains GitHub Actions workflows for the elizaOS project (v2.0.0
 | `test.yml` | Push to develop, manual, schedule | Broader post-merge develop tests; live jobs are separate |
 | `quality.yml` | PR to main, push main/develop, manual | Extended format, type-safety, homepage, secret, UI-determinism, and lint checks |
 | `scenario-pr.yml` | PR to main, push develop, manual/schedule | Secret-free deterministic scenario/browser E2E gate |
-| `scenario-matrix.yml` | Develop/manual opt-in | Real-service scenario matrix; not a PR gate |
 | `pr.yaml` | PR opened/edited | PR title validation |
 | `release.yaml` | Push to main, Release | NPM beta/production package releases |
 | `claude.yml` | @claude mentions | Interactive Claude assistance |
@@ -200,8 +199,9 @@ surface is owned by `develop-pr.yml` and aggregated by `develop-pr-gate.yml`;
 
 PR E2E does not require `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, or any other paid
 provider key. Live/provider-key coverage belongs to the dedicated live jobs and
-workflows (`cloud-live-e2e`, `provider-live-e2e`, `live-scenarios.yml`,
-`scenario-matrix.yml`) where missing-key behavior is documented per lane.
+workflows (`cloud-live-e2e`, `provider-live-e2e`, `live-scenarios.yml`, and
+connector-specific live workflows) where missing-key behavior is documented per
+lane. Trustworthy all-shard credential coverage is tracked in #16448.
 
 ## Code Review Workflows
 

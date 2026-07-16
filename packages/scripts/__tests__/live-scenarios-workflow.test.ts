@@ -1,10 +1,13 @@
 /**
- * Pins the credentialed scenario workflow's clean-checkout build prerequisites
- * to every dist-exported package imported before scenario selection, and the
- * source-export conditions each live lane runs under.
+ * Pins the credentialed scenario authority's clean-checkout prerequisites,
+ * source-export conditions, and honest catalog ownership after no-op workflow
+ * entry points are retired.
  */
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workflowPath = fileURLToPath(
@@ -12,6 +15,10 @@ const workflowPath = fileURLToPath(
 );
 const agentPackagePath = fileURLToPath(
   new URL("../../agent/package.json", import.meta.url),
+);
+const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const coverageAuditPath = fileURLToPath(
+  new URL("../check-scenario-workflow-coverage.mjs", import.meta.url),
 );
 
 test("builds the dist-exported runtime packages before the scenario CLI starts", () => {
@@ -45,3 +52,41 @@ test("includes the dynamically loaded app manager in the agent build graph", () 
     "workspace:*",
   );
 });
+
+test("keeps retired no-op workflow entry points absent", () => {
+  for (const workflow of ["gpu-bench-nightly.yml", "scenario-matrix.yml"]) {
+    expect(existsSync(path.join(repoRoot, ".github/workflows", workflow))).toBe(
+      false,
+    );
+  }
+
+  const auditSource = readFileSync(coverageAuditPath, "utf8");
+  expect(auditSource).not.toContain("ELIZA_SCENARIO_MATRIX_ENABLED");
+  expect(auditSource).not.toContain("scenario-matrix.yml");
+});
+
+test("reports uncovered live-only scenarios as explicit deferrals", () => {
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "scenario-coverage-"));
+  const reportDir = path.join(tempRoot, "report");
+  try {
+    const completed = spawnSync(
+      process.execPath,
+      [coverageAuditPath, "--report-dir", reportDir, "--json"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+
+    expect(completed.status, completed.stderr).toBe(0);
+    const summary = JSON.parse(completed.stdout) as {
+      deferredLiveOnlyDefaultCount: number;
+      deferredDefaultReasons: Record<string, string>;
+      missingDefaultIds: string[];
+    };
+    expect(summary.missingDefaultIds).toEqual([]);
+    expect(summary.deferredLiveOnlyDefaultCount).toBeGreaterThan(0);
+    expect(Object.values(summary.deferredDefaultReasons)).toContainEqual(
+      expect.stringContaining("#16448"),
+    );
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}, 30_000);
