@@ -1,11 +1,7 @@
 /**
- * `CacheClient.getWithSWR` over the real memory backend: miss → revalidate →
- * cache, fresh hit skips revalidation, a stale hit serves the last-good value
- * while revalidating in background — and the regression this pins: a FAILING
- * background revalidation must not become an unhandled rejection (nothing
- * awaits the queued promise; bun's unhandled-rejection detector fails the run
- * pre-fix) and must keep serving the last-good value so the next stale hit can
- * retry.
+ * Exercises `CacheClient.getWithSWR` through the real memory backend, including
+ * cold fills, fresh hits, stale revalidation, rejected background loads, and
+ * separation between upstream availability and cache-backend health.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 
@@ -92,8 +88,8 @@ describe("CacheClient getWithSWR over the memory backend", () => {
     await sleep(5);
 
     // Stale hit with a now-failing loader: the stale value is served and the
-    // background revalidation rejects. Pre-fix, that rejection was unhandled
-    // (bun's detector fails this run); post-fix it is logged and swallowed.
+    // background revalidation rejects. Nobody awaits the queued promise, so the
+    // cache client must observe that rejection while retaining the stale entry.
     fail = true;
     expect(await cache.getWithSWR("swr:fail", 0, load, 120)).toEqual({
       v: "good",
@@ -113,6 +109,42 @@ describe("CacheClient getWithSWR over the memory backend", () => {
     expect(await cache.getWithSWR("swr:fail", 60, load, 120)).toEqual({
       v: "good",
     });
+  });
+
+  test("repeated cold loader failures do not open the cache circuit or hide stale data", async () => {
+    const { CacheClient } = await import("./client");
+    const cache = new CacheClient();
+    const retained = { v: "last-good" };
+
+    expect(
+      await cache.getWithSWR("swr:retained-after-upstream-failures", 0, async () => retained, 120),
+    ).toEqual(retained);
+    await sleep(5);
+
+    const upstreamError = new Error("provider unavailable");
+    let loaderCalls = 0;
+    const failingLoader = async () => {
+      loaderCalls += 1;
+      throw upstreamError;
+    };
+
+    // Six failures cross CacheClient's five-backend-failure circuit threshold.
+    // They come from the upstream loader, so the memory backend must remain
+    // available and each caller must observe one load attempt, not a fallback
+    // retry from the adapter catch.
+    for (let index = 0; index < 6; index += 1) {
+      await expect(
+        cache.getWithSWR(`swr:provider-cold-${index}`, 60, failingLoader, 120),
+      ).rejects.toBe(upstreamError);
+    }
+    expect(loaderCalls).toBe(6);
+    expect(cache.isAvailable()).toBe(true);
+
+    expect(
+      await cache.getWithSWR("swr:retained-after-upstream-failures", 0, failingLoader, 120),
+    ).toEqual(retained);
+    await sleep(25);
+    expect(cache.isAvailable()).toBe(true);
   });
 });
 
