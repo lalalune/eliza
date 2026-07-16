@@ -161,6 +161,38 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 
+  it("keeps an established session active while refetch revalidates it", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, AUTH_ME_BODY));
+
+    const { result } = renderHook(() => useAuthStatus({ pollIntervalMs: 0 }));
+    await waitFor(() =>
+      expect(result.current.state.phase).toBe("authenticated"),
+    );
+
+    let resolveRevalidation: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveRevalidation = resolve;
+        }),
+    );
+
+    act(() => {
+      result.current.refetch();
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(result.current.state.phase).toBe("authenticated");
+    expect(isAuthenticatedNow()).toBe(true);
+
+    await act(async () => {
+      resolveRevalidation(jsonResponse(200, AUTH_ME_BODY));
+    });
+    await waitFor(() =>
+      expect(result.current.state.phase).toBe("authenticated"),
+    );
+    expect(isAuthenticatedNow()).toBe(true);
+  });
+
   it("without a prime, activation fetches exactly like before", async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, AUTH_ME_BODY));
 

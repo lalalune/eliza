@@ -84,12 +84,9 @@ function publishAuthStatus(state: AuthStatusState): void {
 async function fetchAuthStatus(): Promise<void> {
   if (authStatusFetch) return authStatusFetch;
 
-  publishAuthStatus(
-    authStatusSnapshot.phase === "loading"
-      ? authStatusSnapshot
-      : { phase: "loading" },
-  );
-
+  // Revalidation keeps the last terminal snapshot until the server answers.
+  // Publishing the initial-only loading state here would briefly tear down
+  // authenticated shell loaders and clear their cached command catalogs.
   authStatusFetch = (async () => {
     for (let attempt = 0; ; attempt += 1) {
       const result = await authMe();
