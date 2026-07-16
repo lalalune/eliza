@@ -7320,17 +7320,17 @@ export async function runV5MessageRuntimeStage1(args: {
 				plannerToolNames.has(normalizeActionIdentifier(resolved.name))
 			);
 		};
+		const stageOneCandidateActions = messageHandler.plan.candidateActions;
 		const stageOneNamedAToolForThisTurn =
 			messageHandler.plan.requiresTool === true &&
-			(messageHandler.plan.candidateActions ?? []).some((name) =>
+			Array.isArray(stageOneCandidateActions) &&
+			stageOneCandidateActions.some((name) =>
 				candidateResolvesToPlannerTool(String(name)),
 			);
 		const stageOneNamedOwnerLifeManagementTool =
 			stageOneNamedAToolForThisTurn &&
-			Array.isArray(messageHandler.plan.candidateActions) &&
-			messageHandler.plan.candidateActions.some(
-				isOwnerLifeManagementToolCandidate,
-			);
+			Array.isArray(stageOneCandidateActions) &&
+			stageOneCandidateActions.some(isOwnerLifeManagementToolCandidate);
 		const requireNonTerminalToolCall =
 			(stageOneNamedAToolForThisTurn || benchmarkForcingToolCall) &&
 			plannerTools.length > 0 &&
