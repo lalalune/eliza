@@ -90,6 +90,29 @@ interface CachedValue<T> {
   staleAt: number;
 }
 
+function isCachedValueEnvelope<T>(value: unknown): value is CachedValue<T> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+
+  const envelope = value as Record<string, unknown>;
+  if (
+    !Object.hasOwn(envelope, "data") ||
+    !Object.hasOwn(envelope, "cachedAt") ||
+    !Object.hasOwn(envelope, "staleAt")
+  ) {
+    return false;
+  }
+
+  const { cachedAt, staleAt } = envelope;
+  return (
+    typeof cachedAt === "number" &&
+    Number.isFinite(cachedAt) &&
+    cachedAt >= 0 &&
+    typeof staleAt === "number" &&
+    Number.isFinite(staleAt) &&
+    staleAt >= cachedAt
+  );
+}
+
 function serializeCacheValue<T>(value: T): string {
   return JSON.stringify(value);
 }
@@ -578,6 +601,23 @@ export class CacheClient {
       return await revalidate();
     }
 
+    const loadAndCache = async (): Promise<T> => {
+      const fresh = await revalidate();
+      if (fresh !== null) {
+        const cachedAt = Date.now();
+        await this.set(
+          key,
+          {
+            data: fresh,
+            cachedAt,
+            staleAt: cachedAt + staleTTL * 1000,
+          } as CachedValue<T>,
+          effectiveTTL,
+        );
+      }
+      return fresh;
+    };
+
     let value: unknown;
     let duration: number;
     try {
@@ -585,6 +625,8 @@ export class CacheClient {
       value = await redis.get(this.pk(key));
       duration = Date.now() - start;
     } catch (error) {
+      // error-policy:J1 the cache-adapter boundary records backend failure and
+      // delegates to the authoritative loader instead of fabricating a hit.
       this.recordFailure();
       logger.warn("[Cache] GET-with-SWR failed, falling back to revalidate", {
         key,
@@ -599,101 +641,83 @@ export class CacheClient {
       // Upstream availability must not feed the cache backend's circuit
       // breaker. A loader rejection therefore propagates outside the adapter
       // catch and is observed by the caller exactly once.
-      const fresh = await revalidate();
-      if (fresh !== null) {
-        await this.set(
-          key,
-          {
-            data: fresh,
-            cachedAt: Date.now(),
-            staleAt: Date.now() + staleTTL * 1000,
-          } as CachedValue<T>,
-          effectiveTTL,
-        );
-      }
-      return fresh;
+      return await loadAndCache();
     }
 
-    try {
-      const raw = typeof value === "string" ? JSON.parse(value) : value;
-      const parsed = raw as CachedValue<T>;
-      const now = Date.now();
-      const isStale = now > parsed.staleAt;
+    const parsed = parseCacheValue<unknown>(value);
+    if (!isCachedValueEnvelope<T>(parsed)) {
+      // error-policy:J3 cache contents are untrusted input; an invalid envelope
+      // is evicted and replaced only with an authoritative loader result.
+      logger.warn("[Cache] Invalid SWR envelope; deleting before revalidation", { key });
+      await this.del(key);
+      return await loadAndCache();
+    }
 
-      if (isStale) {
-        this.logMetric(key, "stale", duration);
+    const now = Date.now();
+    const isStale = now > parsed.staleAt;
 
-        // Return stale data immediately
-        const staleData = parsed.data;
+    if (isStale) {
+      this.logMetric(key, "stale", duration);
 
-        if (this.revalidationQueue.size >= this.MAX_REVALIDATION_QUEUE_SIZE) {
-          logger.warn(
-            `[Cache] Revalidation queue full (${this.revalidationQueue.size}/${this.MAX_REVALIDATION_QUEUE_SIZE}). ` +
-              `Skipping background revalidation for key: ${key}`,
-          );
-          return staleData;
-        }
+      // Return stale data immediately
+      const staleData = parsed.data;
 
-        // Revalidate in background (deduplicated)
-        if (!this.revalidationQueue.has(key)) {
-          const timeoutPromise = new Promise<T | null>((_, reject) => {
-            setTimeout(
-              () => reject(new Error("Revalidation timeout")),
-              this.REVALIDATION_TIMEOUT_MS,
-            );
-          });
-
-          // Deferring invocation converts a synchronous loader throw into the
-          // background rejection observed below, keeping it outside the cache
-          // adapter failure boundary just like an asynchronous rejection.
-          const revalidationPromise = Promise.race([
-            Promise.resolve().then(revalidate),
-            timeoutPromise,
-          ])
-            .then((fresh) => {
-              if (fresh !== null) {
-                return this.set(
-                  key,
-                  {
-                    data: fresh,
-                    cachedAt: Date.now(),
-                    staleAt: Date.now() + staleTTL * 1000,
-                  } as CachedValue<T>,
-                  effectiveTTL,
-                );
-              }
-            })
-            .catch((error) => {
-              // Fire-and-forget: without this catch every failed/timed-out
-              // background revalidation became an unhandled rejection (nobody
-              // awaits the queued promise). The stale value already served
-              // stays in place; the next stale hit retries.
-              logger.warn("[Cache] Background revalidation failed", {
-                key,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            })
-            .finally(() => {
-              this.revalidationQueue.delete(key);
-            });
-
-          this.revalidationQueue.set(key, revalidationPromise);
-        }
-
+      if (this.revalidationQueue.size >= this.MAX_REVALIDATION_QUEUE_SIZE) {
+        logger.warn(
+          `[Cache] Revalidation queue full (${this.revalidationQueue.size}/${this.MAX_REVALIDATION_QUEUE_SIZE}). ` +
+            `Skipping background revalidation for key: ${key}`,
+        );
         return staleData;
       }
 
-      this.logMetric(key, "hit", duration);
-      this.resetFailures();
-      return parsed.data;
-    } catch (error) {
-      this.recordFailure();
-      logger.warn("[Cache] GET-with-SWR failed, falling back to revalidate", {
-        key,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return await revalidate();
+      // Revalidate in background (deduplicated)
+      if (!this.revalidationQueue.has(key)) {
+        const timeoutPromise = new Promise<T | null>((_, reject) => {
+          setTimeout(() => reject(new Error("Revalidation timeout")), this.REVALIDATION_TIMEOUT_MS);
+        });
+
+        // Deferring invocation converts a synchronous loader throw into the
+        // background rejection observed below, keeping it outside the cache
+        // adapter failure boundary just like an asynchronous rejection.
+        const revalidationPromise = Promise.race([
+          Promise.resolve().then(revalidate),
+          timeoutPromise,
+        ])
+          .then((fresh) => {
+            if (fresh !== null) {
+              const cachedAt = Date.now();
+              return this.set(
+                key,
+                {
+                  data: fresh,
+                  cachedAt,
+                  staleAt: cachedAt + staleTTL * 1000,
+                } as CachedValue<T>,
+                effectiveTTL,
+              );
+            }
+          })
+          .catch((error) => {
+            // error-policy:J5 this is the sole observer for the fire-and-forget
+            // revalidation; stale data remains in place and a later hit retries.
+            logger.warn("[Cache] Background revalidation failed", {
+              key,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          })
+          .finally(() => {
+            this.revalidationQueue.delete(key);
+          });
+
+        this.revalidationQueue.set(key, revalidationPromise);
+      }
+
+      return staleData;
     }
+
+    this.logMetric(key, "hit", duration);
+    this.resetFailures();
+    return parsed.data;
   }
 
   /**

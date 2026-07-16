@@ -260,6 +260,88 @@ describe("ModelCatalogCache with CacheClient memory adapter", () => {
       context: { key: KEY, boundary: "cache", receivedKind: "object" },
       cause: expect.any(TypeError),
     });
+
+    await store.set(
+      KEY,
+      {
+        ...freshMetadata,
+        data: [{ object: "model", created: 0, owned_by: "test" }],
+      },
+      RETENTION_SECONDS,
+    );
+    await expect(catalog.getCached()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: KEY,
+        boundary: "cache",
+        modelIndex: 0,
+        field: "id",
+        expected: "non-empty string",
+        receivedKind: "undefined",
+      },
+      cause: expect.any(TypeError),
+    });
+  });
+
+  test("rejects a malformed fetched model before it can populate the real cache", async () => {
+    const store = memoryCache();
+    const catalog = new ModelCatalogCache({
+      key: KEY,
+      store,
+      isProviderConfigured: () => true,
+      fetchModels: async () => [catalogModel("")],
+      freshnessSeconds: 60,
+      retentionSeconds: RETENTION_SECONDS,
+    });
+
+    await expect(catalog.getCached()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: KEY,
+        boundary: "refresh",
+        modelIndex: 0,
+        field: "id",
+        expected: "non-empty string",
+        receivedKind: "string",
+      },
+      cause: expect.any(TypeError),
+    });
+    expect(await store.get(KEY)).toBeNull();
+  });
+
+  test("rejects malformed nested fields before a fetched model can populate the cache", async () => {
+    const store = memoryCache();
+    const catalog = new ModelCatalogCache({
+      key: KEY,
+      store,
+      isProviderConfigured: () => true,
+      fetchModels: async () => [
+        {
+          id: "provider/model",
+          created: 0,
+          architecture: { output_modalities: ["text", null] },
+        },
+      ],
+      freshnessSeconds: 60,
+      retentionSeconds: RETENTION_SECONDS,
+    });
+
+    await expect(catalog.getCached()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: KEY,
+        boundary: "refresh",
+        modelIndex: 0,
+        field: "architecture.output_modalities",
+        expected: "string array",
+        receivedKind: "array",
+      },
+      cause: expect.any(TypeError),
+    });
+    expect(await store.get(KEY)).toBeNull();
   });
 
   test("explicit refresh preserves the cached entry through failure and cooldown", async () => {
