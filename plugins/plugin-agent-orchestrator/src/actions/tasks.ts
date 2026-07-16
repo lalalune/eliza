@@ -617,18 +617,22 @@ async function runPromptViaSmithers(
   timeoutMs: number | undefined,
   model: string | undefined,
   keepAliveAfterComplete: boolean,
+  durableIdentity?: { taskId: string; runId: string },
 ): Promise<void> {
   const startedAt = Date.now();
   let completed = false;
   try {
-    const { lastResponse } = await runDurableTask(service, session, task, {
+    const durableRun = await runDurableTask(service, session, task, {
       timeoutMs,
       model,
+      ...durableIdentity,
     });
     if (service.emitsPromptTerminalEvents !== true) {
       emitSessionEvent(service, session.sessionId, "task_complete", {
-        response: lastResponse,
+        response: durableRun.lastResponse,
         durationMs: Date.now() - startedAt,
+        taskId: durableRun.taskId,
+        runId: durableRun.runId,
       });
     }
     completed = true;
@@ -730,6 +734,62 @@ async function runPromptAndClose(
   }
 }
 
+/** Internal lane execution contract used only by the gated planner adapter. */
+export interface PlannedTaskLaneExecution {
+  runId: string;
+  metadata: Record<string, unknown>;
+  repo?: string;
+  workdir?: string;
+  route?: ResolvedWorkdirRoute;
+  isolateWorkdir?: boolean;
+}
+
+async function stopSessionAfterLaneSetupFailure(
+  runtime: IAgentRuntime,
+  service: ReturnType<typeof getAcpService> & {},
+  sessionId: string,
+): Promise<void> {
+  try {
+    await service.stopSession(sessionId);
+    emitSessionEvent(service, sessionId, "stopped", { sessionId });
+  } catch (error) {
+    // error-policy:J6 a failed lane setup still propagates its primary error;
+    // teardown failure is separately reported so the leaked process is visible.
+    logger(runtime).warn(
+      `[TASKS:create] failed to stop session ${sessionId} after lane setup failure: ${failureMessage(error)}`,
+    );
+    runtime.reportError("LanePlanner.setupTeardown", error, { sessionId });
+    emitSessionEvent(service, sessionId, "error", {
+      message: `Lane setup teardown failed: ${failureMessage(error)}`,
+    });
+  }
+}
+
+async function retireFailedPlannedTask(
+  taskService: OrchestratorTaskService,
+  taskId: string,
+  failure: string,
+): Promise<void> {
+  // Archive is the task service's terminal retirement boundary; the summary
+  // preserves the failure reason so collision scans do not see a phantom lane.
+  const updated = await taskService.updateTask(taskId, {
+    summary: `Lane execution failed before completion: ${failure}`,
+  });
+  if (!updated) {
+    throw new ElizaError("Unable to record the failed lane task", {
+      code: "LANE_TASK_FAILURE_RECORD_MISSING",
+      context: { taskId },
+    });
+  }
+  const archived = await taskService.archiveTask(taskId);
+  if (!archived) {
+    throw new ElizaError("Unable to retire the failed lane task", {
+      code: "LANE_TASK_RETIRE_FAILED",
+      context: { taskId },
+    });
+  }
+}
+
 async function runCreate(
   runtime: IAgentRuntime,
   message: Memory,
@@ -737,6 +797,7 @@ async function runCreate(
   params: Record<string, unknown>,
   content: Record<string, unknown>,
   callback: HandlerCallback | undefined,
+  planned?: PlannedTaskLaneExecution,
 ): Promise<ActionResult> {
   const service = getAcpService(runtime);
   if (!service) {
@@ -755,6 +816,13 @@ async function runCreate(
     state,
   );
   const tasks = taskParts(params, content, text);
+  if (planned && tasks.length !== 1) {
+    throw new ElizaError("A planned lane must execute exactly one task", {
+      code: "LANE_TASK_COUNT_INVALID",
+      context: { runId: planned.runId, taskCount: tasks.length },
+    });
+  }
+  const plannedTask = planned ? tasks[0] : undefined;
   if (tasks.length > MAX_CONCURRENT_AGENTS) {
     const msg = `Too many task agents requested (${tasks.length}); maximum is ${MAX_CONCURRENT_AGENTS}.`;
     await callbackText(callback, msg);
@@ -780,7 +848,25 @@ async function runCreate(
       })) ?? "codex",
     );
   const explicitWorkdir = pickString(params, content, "workdir");
-  const fallbackWorkdir = explicitWorkdir ?? process.cwd();
+  const fallbackWorkdir = planned?.workdir ?? explicitWorkdir ?? process.cwd();
+  const lockWorkdir = pickBoolean(params, content, "lockWorkdir") === true;
+  // Resolve the planned lane before minting its durable task so project binding
+  // and collision identity refer to the same workdir the subprocess will use.
+  const plannedRoute = plannedTask
+    ? planned?.workdir
+      ? {
+          workdir: planned.workdir,
+          ...(planned.route ? { route: planned.route } : {}),
+          ...(planned.isolateWorkdir ? { isolate: true } : {}),
+        }
+      : resolveSpawnWorkdir(
+          runtime,
+          plannedTask,
+          routingRequest,
+          explicitWorkdir,
+          { lockWorkdir },
+        )
+    : undefined;
   const model = pickString(params, content, "model");
   const memoryContent = pickString(params, content, "memoryContent");
   const approvalPreset = parseApproval(
@@ -815,6 +901,82 @@ async function runCreate(
     extraMetadata,
     resolvedTaskRoomId,
   );
+  const taskTitle =
+    pickString(params, content, "title") ??
+    pickString(params, content, "goal") ??
+    (tasks[0] ? labelFrom(tasks[0], 0) : "Coding task");
+  const taskGoal = pickString(params, content, "goal") ?? taskTitle;
+  const taskPriority = (pickString(params, content, "priority") ?? "normal") as
+    | "low"
+    | "normal"
+    | "high"
+    | "urgent";
+  const acceptanceCriteria = pickStringArrayFromInputs(
+    params,
+    content,
+    "acceptanceCriteria",
+  );
+  const taskRoomId =
+    typeof swarmRoomMetadata.taskRoomId === "string"
+      ? swarmRoomMetadata.taskRoomId
+      : undefined;
+  // Preserve the ORIGIN (chat) room on the durable task's `roomId` so the
+  // supervisor can bridge task status back to the human (getTaskOriginTarget),
+  // while `taskRoomId` carries the DISTINCT swarm room the sub-agents share.
+  // When task rooms are opted out, both resolve to the origin room (no change).
+  const originRoomId =
+    typeof swarmRoomMetadata.originRoomId === "string"
+      ? swarmRoomMetadata.originRoomId
+      : undefined;
+  let taskService = planned
+    ? (runtime.getService?.(OrchestratorTaskService.serviceType) as
+        | OrchestratorTaskService
+        | null
+        | undefined)
+    : undefined;
+  const mintTaskThread = async (
+    boundWorkdir: string | undefined,
+    metadata?: Record<string, unknown>,
+  ): Promise<string | null> => {
+    if (!taskService || typeof taskService.createTask !== "function")
+      return null;
+    // Bind the durable task to a registered Project: an explicit caller
+    // `projectId` (validated against the registry by the service) wins;
+    // otherwise the resolved spawn workdir is realpath-matched against the
+    // registry. Unmatched workdirs remain unbound.
+    const explicitProjectId = pickString(params, content, "projectId");
+    const detail = await taskService.createTask({
+      title: taskTitle,
+      goal: taskGoal,
+      kind: "coding",
+      priority: taskPriority,
+      originalRequest: messageText(message),
+      ...(explicitProjectId ? { projectId: explicitProjectId } : {}),
+      ...(boundWorkdir ? { workdir: boundWorkdir } : {}),
+      ...((originRoomId ?? taskRoomId)
+        ? { roomId: originRoomId ?? taskRoomId }
+        : {}),
+      ...(taskRoomId ? { taskRoomId } : {}),
+      acceptanceCriteria,
+      ...(metadata ? { metadata } : {}),
+    });
+    return detail?.id ?? null;
+  };
+  // Planned lanes must exist in the durable store before ACP/Smithers starts.
+  // This lets collision readers and event routing see in-flight work rather
+  // than discovering a task only after its subprocess has already completed.
+  let threadId = planned
+    ? await mintTaskThread(plannedRoute?.workdir, planned.metadata)
+    : null;
+  if (planned && !threadId) {
+    throw new ElizaError(
+      "Unable to create the durable lane task before execution",
+      {
+        code: "LANE_TASK_CREATE_FAILED",
+        context: { runId: planned.runId },
+      },
+    );
+  }
   const settled = await Promise.allSettled(
     tasks.map(async (part, index) => {
       const parsed = parseAgentPrefix(part, baseAgentType);
@@ -827,8 +989,9 @@ async function runCreate(
         workdir: sessionWorkdir,
         route,
         isolate: isolateWorkdir,
-      } = resolveSpawnWorkdir(runtime, task, routingRequest, explicitWorkdir, {
-        lockWorkdir: pickBoolean(params, content, "lockWorkdir") === true,
+      } = plannedRoute ??
+      resolveSpawnWorkdir(runtime, task, routingRequest, explicitWorkdir, {
+        lockWorkdir,
       });
       // This path spawns WITHOUT `initialTask` and delivers the task via
       // sendPrompt (smithers or direct), so the AcpService initialTask deploy
@@ -858,11 +1021,45 @@ async function runCreate(
           userId: message.entityId,
           label,
           source: content.source,
+          ...(threadId ? { taskId: threadId } : {}),
           workdirRouteId: route?.id,
           workdirRoute: route,
           keepAliveAfterComplete,
         },
       });
+      if (planned && threadId && taskService) {
+        try {
+          const attached = await taskService.attachSession(threadId, {
+            sessionId: session.sessionId,
+            agentType: session.agentType,
+            workdir: session.workdir,
+            status: session.status,
+            ...(planned.repo ? { repo: planned.repo } : {}),
+            ...(session.metadata ? { metadata: session.metadata } : {}),
+            label,
+            originalTask: taskWithRouteHints,
+            ...(model ? { model } : {}),
+          });
+          if (!attached) {
+            throw new ElizaError(
+              "Unable to attach the lane session before execution",
+              {
+                code: "LANE_SESSION_ATTACH_FAILED",
+                context: { taskId: threadId, sessionId: session.sessionId },
+              },
+            );
+          }
+        } catch (error) {
+          // error-policy:J6 the primary attach failure is rethrown after the
+          // unowned subprocess is stopped; cleanup reports its own failures.
+          await stopSessionAfterLaneSetupFailure(
+            runtime,
+            service,
+            session.sessionId,
+          );
+          throw error;
+        }
+      }
       if (shouldUseSmithersTaskRunner()) {
         await runPromptViaSmithers(
           service,
@@ -871,6 +1068,9 @@ async function runCreate(
           timeoutMs,
           model,
           keepAliveAfterComplete,
+          planned && threadId
+            ? { taskId: threadId, runId: planned.runId }
+            : undefined,
         );
       } else {
         await runPromptAndClose(
@@ -935,16 +1135,27 @@ async function runCreate(
   const failed = results.filter((result) => result.status === "failed");
   if (failed.length > 0) {
     const textOut = `I started some task agents, but ${failed.length} failed to launch: ${failed.map((item) => String(item.error)).join("; ")}.`;
+    if (planned && threadId && taskService) {
+      await retireFailedPlannedTask(
+        taskService,
+        threadId,
+        failed.map((item) => String(item.error)).join("; "),
+      );
+    }
     await callbackText(callback, textOut);
     return {
       success: false,
       text: textOut,
-      data: { agents: results, suppressActionResultClipboard: true },
+      data: {
+        agents: results,
+        ...(threadId ? { taskId: threadId } : {}),
+        suppressActionResultClipboard: true,
+      },
     };
   }
 
-  // Mint a durable orchestrator task thread so the chat surface can render
-  // the `[TASK:<id>]<title>[/TASK]` widget that links back to the workbench.
+  // Unplanned legacy creates mint a durable task thread after every ACP session
+  // succeeds so the chat surface can render its workbench widget.
   // The ACP sessions have already succeeded; a failure here is logged but
   // never demotes the action's success — the agents are still running.
   //
@@ -954,61 +1165,12 @@ async function runCreate(
   // event routing drops their session events, and the widget reads `0/0
   // agents`. Per-session attach failures are logged but never demote the
   // action's success, same policy as thread-mint failure.
-  const taskTitle =
-    pickString(params, content, "title") ??
-    pickString(params, content, "goal") ??
-    (tasks[0] ? labelFrom(tasks[0], 0) : "Coding task");
-  const taskGoal = pickString(params, content, "goal") ?? taskTitle;
-  const taskPriority = (pickString(params, content, "priority") ?? "normal") as
-    | "low"
-    | "normal"
-    | "high"
-    | "urgent";
-  const acceptanceCriteria = pickStringArrayFromInputs(
-    params,
-    content,
-    "acceptanceCriteria",
-  );
-  const taskRoomId =
-    typeof swarmRoomMetadata.taskRoomId === "string"
-      ? swarmRoomMetadata.taskRoomId
-      : undefined;
-  // Preserve the ORIGIN (chat) room on the durable task's `roomId` so the
-  // supervisor can bridge task status back to the human (getTaskOriginTarget),
-  // while `taskRoomId` carries the DISTINCT swarm room the sub-agents share.
-  // When task rooms are opted out, both resolve to the origin room (no change).
-  const originRoomId =
-    typeof swarmRoomMetadata.originRoomId === "string"
-      ? swarmRoomMetadata.originRoomId
-      : undefined;
-  let threadId: string | null = null;
-  const taskService = runtime.getService?.(
-    OrchestratorTaskService.serviceType,
-  ) as OrchestratorTaskService | null | undefined;
+  taskService ??= runtime.getService?.(OrchestratorTaskService.serviceType) as
+    | OrchestratorTaskService
+    | null
+    | undefined;
   try {
-    if (taskService && typeof taskService.createTask === "function") {
-      // Bind the durable task to a registered Project: an explicit caller
-      // `projectId` (validated against the registry by the service) wins;
-      // otherwise the resolved spawn workdir (all sessions of this create share
-      // it) is realpath-matched against the registry. Unmatched = unbound.
-      const explicitProjectId = pickString(params, content, "projectId");
-      const boundWorkdir = sessions[0]?.workdir;
-      const detail = await taskService.createTask({
-        title: taskTitle,
-        goal: taskGoal,
-        kind: "coding",
-        priority: taskPriority,
-        originalRequest: messageText(message),
-        ...(explicitProjectId ? { projectId: explicitProjectId } : {}),
-        ...(boundWorkdir ? { workdir: boundWorkdir } : {}),
-        ...((originRoomId ?? taskRoomId)
-          ? { roomId: originRoomId ?? taskRoomId }
-          : {}),
-        ...(taskRoomId ? { taskRoomId } : {}),
-        acceptanceCriteria,
-      });
-      threadId = detail?.id ?? null;
-    }
+    if (!planned) threadId = await mintTaskThread(sessions[0]?.workdir);
   } catch (error) {
     // error-policy:J4 durable-thread mint failed → omit the task widget (threadId
     // null); the spawned agents already succeeded, and the failure is warned.
@@ -1020,11 +1182,11 @@ async function runCreate(
     threadId = null;
   }
 
-  // Bind every successfully spawned session to the freshly-minted thread so
-  // the task widget / tasks panel sees them (sessionCount, latestSessionId,
-  // token usage). Thread-mint-failed path skips this cleanly — no taskId to
-  // attach against, and the sessions are still running / stopped independently.
+  // Bind every successfully spawned legacy session to the freshly-minted thread
+  // so the task widget sees session count, latest session, and token usage.
+  // Planned lanes were bound before their first prompt and skip this block.
   if (
+    !planned &&
     threadId &&
     taskService &&
     typeof taskService.attachSession === "function"
@@ -1076,6 +1238,29 @@ async function runCreate(
       suppressActionResultClipboard: true,
     },
   };
+}
+
+/**
+ * Execute one already-planned lane through the same TASKS/Smithers path as a
+ * legacy create, while forcing its durable task to be minted and session-bound
+ * before the first agent turn.
+ */
+export function runPlannedTaskLane(
+  runtime: IAgentRuntime,
+  message: Memory,
+  state: State | undefined,
+  options: HandlerOptions,
+  planned: PlannedTaskLaneExecution,
+): Promise<ActionResult> {
+  return runCreate(
+    runtime,
+    message,
+    state,
+    paramsRecord(options as HandlerOptionsLike),
+    contentRecord(message),
+    undefined,
+    planned,
+  );
 }
 
 function pickStringArrayFromInputs(

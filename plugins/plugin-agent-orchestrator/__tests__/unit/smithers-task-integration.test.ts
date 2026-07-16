@@ -76,6 +76,32 @@ describe("runDurableTask", () => {
   );
 
   it(
+    "uses the durable task and lane run identities supplied by the planner",
+    async () => {
+      const service: AcpTaskService = {
+        sendPrompt: async () => ({
+          stopReason: "end_turn",
+          finalText: "planned lane done",
+        }),
+      };
+      const taskId = `task-${Math.random().toString(36).slice(2, 10)}`;
+      const runId = `${taskId}:lane-1`;
+      const result = await runDurableTask(
+        service,
+        uniqueSession(),
+        "planned lane",
+        { taskId, runId },
+      );
+      expect(result).toMatchObject({
+        taskId,
+        runId,
+        status: "completed",
+      });
+    },
+    TIMEOUT,
+  );
+
+  it(
     "propagates a prompt error (even when a single-turn loop would swallow it)",
     async () => {
       const service: AcpTaskService = {

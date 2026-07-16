@@ -204,6 +204,24 @@ const BINARY_EXTENSIONS = new Set<string>([
   "db",
 ]);
 
+/**
+ * Repo-relative patterns the lane planner places outside every agent's scope.
+ * This is derived from the same built-in policy that blocks unsafe PR diffs so
+ * planning and finalization cannot disagree about lockfiles or build configs.
+ */
+export function standardLaneForbiddenPaths(): string[] {
+  return [
+    ...[...LOCKFILE_BASENAMES].map((name) => `**/${name}`),
+    ...BUILD_CONFIG_STEMS.map((stem) => `**/${stem}*`),
+    ...[...BINARY_EXTENSIONS].map((extension) => `**/*.${extension}`),
+  ].sort((a, b) => a.localeCompare(b));
+}
+
+/** Return the shared built-in policy reason when a concrete lane path is forbidden. */
+export function standardLaneForbiddenReason(path: string): string | null {
+  return forbiddenReason(path, []);
+}
+
 /** Compiled secret patterns, sourced once from core's redact patterns. */
 const SECRET_PATTERNS: readonly RegExp[] = compileSecretPatterns();
 

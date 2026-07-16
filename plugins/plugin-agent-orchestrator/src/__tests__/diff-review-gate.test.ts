@@ -1,7 +1,15 @@
+/**
+ * Pins the shared diff safety policy used by PR finalization and lane planning.
+ * The tests keep concrete path classification aligned with the planner-facing
+ * forbidden-pattern contract while exercising all failure severities.
+ */
+
 import { describe, expect, it } from "vitest";
 import {
   type DiffGateResult,
   reviewDiff,
+  standardLaneForbiddenPaths,
+  standardLaneForbiddenReason,
   summarizeDiffGate,
 } from "../services/diff-review-gate.js";
 
@@ -99,6 +107,16 @@ describe("reviewDiff — secret detection blocks", () => {
 });
 
 describe("reviewDiff — forbidden-file blocks", () => {
+  it("exposes the same built-in path policy to lane planning", () => {
+    expect(standardLaneForbiddenPaths()).toEqual(
+      expect.arrayContaining(["**/bun.lock", "**/vite.config*", "**/*.png"]),
+    );
+    expect(standardLaneForbiddenReason("packages/app/bun.lock")).toContain(
+      "lockfile",
+    );
+    expect(standardLaneForbiddenReason("src/app-config-loader.ts")).toBeNull();
+  });
+
   it("blocks a lockfile change", () => {
     const diff = addedFileDiff("bun.lock", ['  "foo": "1.0.0"']);
     const result = reviewDiff({ diff, changedFiles: ["bun.lock"] });
