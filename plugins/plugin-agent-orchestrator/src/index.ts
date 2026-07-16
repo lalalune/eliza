@@ -34,6 +34,30 @@ import {
 // side-effect of evaluating that module. Without this the entire
 // `/api/coding-agents/*` surface 404s on the node bundle.
 export { codingAgentRouteRegistration } from "./register-routes.js";
+export {
+  createDeterministicLanePlan,
+  DurableTaskCollisionSource,
+  type ExternalLaneCollision,
+  extractScopePaths,
+  LANE_PLANNER_SERVICE_TYPE,
+  type LaneCollision,
+  type LaneCollisionSource,
+  type LanePlan,
+  type LanePlannerInput,
+  LanePlannerService,
+  type LaneRepositoryResolver,
+  type LaneSpec,
+  type LaneTaskMetadata,
+  laneTaskMetadata,
+  parseLaneTaskMetadata,
+  scopeSetsOverlap,
+  shouldUseLanePlanner,
+  type WaveGoalEvaluation,
+  type WaveRefillRequest,
+  type WaveReplacementSpec,
+  WorkspaceLaneRepositoryResolver,
+  WorkspacePullRequestCollisionSource,
+} from "./services/lane-planner.js";
 // Shared relay sanitizer (issue elizaOS/eliza#11578). Re-exported from the
 // package root so packages/agent's swarm-synthesis path can strip captured
 // tool-output envelopes with the SAME implementation the sub-agent router uses.
@@ -43,11 +67,11 @@ export {
   stripToolTranscript,
 } from "./services/transcript-sanitizer.js";
 
+import { tasksAction } from "./actions/lane-planner-action.js";
 import {
   createTerminalUnsupportedTasksAction,
   tasksSandboxStubAction,
 } from "./actions/sandbox-stub.js";
-import { tasksAction } from "./actions/tasks.js";
 import { subAgentCompletionResponseEvaluator } from "./evaluators/sub-agent-completion.js";
 import { subAgentFailureResponseEvaluator } from "./evaluators/sub-agent-failure.js";
 import { codingAgentExamplesProvider } from "./providers/action-examples.js";
@@ -66,6 +90,7 @@ import {
   TASK_AUDIT_EVENT,
   type TaskAuditPayload,
 } from "./services/audit.js";
+import { LanePlannerService } from "./services/lane-planner.js";
 import { OrchestratorTaskService } from "./services/orchestrator-task-service.js";
 import { resolveOriginRoomId } from "./services/session-room-binding.js";
 import { SubAgentInbox } from "./services/sub-agent-inbox.js";
@@ -117,6 +142,7 @@ export function createAgentOrchestratorPlugin(): Plugin {
         serviceClass(OrchestratorTaskService),
         serviceClass(SubAgentRouter),
         serviceClass(CodingWorkspaceService),
+        serviceClass(LanePlannerService),
         serviceClass(TaskSupervisorService),
         serviceClass(TaskWatchdogService),
         // Discoverable SWARM_COORDINATOR adapter. server.ts's
@@ -323,6 +349,7 @@ export function createAgentOrchestratorPlugin(): Plugin {
         OrchestratorTaskService.serviceType,
         SubAgentRouter.serviceType,
         CodingWorkspaceService.serviceType,
+        LanePlannerService.serviceType,
         // Eager-start so its digest interval begins without waiting for a
         // getService() that nothing else issues (#8900).
         TaskSupervisorService.serviceType,
@@ -2361,7 +2388,7 @@ export {
   taskHistoryAction,
   taskShareAction,
   tasksAction,
-} from "./actions/tasks.js";
+} from "./actions/lane-planner-action.js";
 // API routes
 export {
   createCodingAgentRouteHandler,
