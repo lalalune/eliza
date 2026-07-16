@@ -17,12 +17,13 @@
  */
 
 import { loadElizaConfig, saveElizaConfig } from "@elizaos/agent";
+import { ElizaError } from "@elizaos/core";
 import { sharedVault } from "../services/vault-mirror";
 import { deriveAgentVaultId } from "./agent-vault-id";
 import type { SecureStoreSecretKind } from "./platform-secure-store";
 import {
   createNodePlatformSecureStore,
-  isWalletOsStoreReadEnabled,
+  isNodePlatformSecureStoreSupported,
 } from "./platform-secure-store-node";
 
 const WALLET_PAIRS: ReadonlyArray<readonly [string, SecureStoreSecretKind]> = [
@@ -35,26 +36,29 @@ const WALLET_PAIRS: ReadonlyArray<readonly [string, SecureStoreSecretKind]> = [
  * Used by `POST /api/agent/reset` and the equivalent CLI flow.
  */
 export async function deleteWalletSecretsFromOsStore(): Promise<void> {
-  const vault = sharedVault();
-  for (const [envKey] of WALLET_PAIRS) {
-    if (await vault.has(envKey)) {
-      await vault.remove(envKey);
+  // A retained OS entry would be imported back into the vault at the next
+  // boot, so secure-store cleanup must finish before the source-of-truth copy
+  // is removed.
+  if (isNodePlatformSecureStoreSupported()) {
+    const store = createNodePlatformSecureStore();
+    if (!(await store.isAvailable())) {
+      throw new ElizaError(
+        "OS secure store is unavailable during wallet reset",
+        {
+          code: "WALLET_RESET_SECURE_STORE_UNAVAILABLE",
+          severity: "fatal",
+        },
+      );
     }
+    const vaultId = deriveAgentVaultId();
+    await store.delete(vaultId, "wallet.evm_private_key");
+    await store.delete(vaultId, "wallet.solana_private_key");
   }
 
-  // Best-effort cleanup of the legacy OS keystore copy. We only attempt
-  // this when the user previously opted into the OS-keystore read path —
-  // otherwise the keystore was never written from this module.
-  if (!isWalletOsStoreReadEnabled()) {
-    return;
+  const vault = sharedVault();
+  for (const [envKey] of WALLET_PAIRS) {
+    if (await vault.has(envKey)) await vault.remove(envKey);
   }
-  const store = createNodePlatformSecureStore();
-  if (!(await store.isAvailable())) {
-    return;
-  }
-  const vaultId = deriveAgentVaultId();
-  await store.delete(vaultId, "wallet.evm_private_key");
-  await store.delete(vaultId, "wallet.solana_private_key");
 }
 
 export type MigrateWalletPrivateKeysToOsStoreResult = {
@@ -108,10 +112,14 @@ export async function migrateWalletPrivateKeysToOsStore(): Promise<MigrateWallet
       });
       migrated.push(envKey);
     } catch (err) {
+      // error-policy:J2 Preserve the vault failure with the affected logical slot.
       failed.push(envKey);
-      throw err instanceof Error
-        ? err
-        : new Error(`vault write failed for ${envKey}: ${String(err)}`);
+      throw new ElizaError(`vault write failed for ${envKey}`, {
+        code: "WALLET_VAULT_WRITE_FAILED",
+        cause: err,
+        context: { envKey },
+        severity: "fatal",
+      });
     }
 
     if (!fromProcess) {
