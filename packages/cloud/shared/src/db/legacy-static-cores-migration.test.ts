@@ -137,6 +137,44 @@ describe("pre-autoscaler node migration guard", () => {
     }
   });
 
+  test("allows nodes outside every guarded condition without mutation", async () => {
+    const database = await PGlite.create();
+    const migrationSql = readFileSync(MIGRATION_PATH, "utf8");
+
+    try {
+      await createDockerNodesTable(database);
+      await database.exec(`
+        INSERT INTO docker_nodes (node_id, capacity, enabled, status, created_at)
+        VALUES
+          ('bounded', 8, true, 'offline', '2026-03-15T00:00:00Z'),
+          ('cutoff', 100, true, 'offline', '2026-05-22T00:00:00Z'),
+          ('disabled', 100, false, 'offline', '2026-03-15T00:00:00Z'),
+          ('healthy', 100, true, 'healthy', '2026-03-15T00:00:00Z');
+      `);
+
+      await database.exec(migrationSql);
+      const nodes = await database.query<{
+        node_id: string;
+        capacity: number;
+        enabled: boolean;
+        status: string;
+      }>("SELECT node_id, capacity, enabled, status FROM docker_nodes ORDER BY node_id");
+      expect(nodes.rows).toEqual([
+        { node_id: "bounded", capacity: 8, enabled: true, status: "offline" },
+        { node_id: "cutoff", capacity: 100, enabled: true, status: "offline" },
+        {
+          node_id: "disabled",
+          capacity: 100,
+          enabled: false,
+          status: "offline",
+        },
+        { node_id: "healthy", capacity: 100, enabled: true, status: "healthy" },
+      ]);
+    } finally {
+      await database.close();
+    }
+  });
+
   test("does not replay any SQL after the journal cursor is present", async () => {
     const database = await PGlite.create();
     const fixtureRoot = mkdtempSync(join(tmpdir(), "static-core-migration-"));
