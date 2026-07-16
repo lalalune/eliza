@@ -98,6 +98,18 @@ async function flushDelivery(): Promise<void> {
 describe("notification-store", () => {
   beforeEach(() => {
     __resetNotificationStoreForTests();
+    __resetAuthStatusForTests();
+    __setAuthStatusForTests({
+      phase: "authenticated",
+      identity: { id: "u-1", displayName: "Owner", kind: "owner" },
+      session: { id: "s-1", kind: "browser", expiresAt: null },
+      access: {
+        mode: "session",
+        passwordConfigured: true,
+        ownerConfigured: true,
+        role: "OWNER",
+      },
+    });
     listNotifications.mockReset().mockResolvedValue({
       notifications: [],
       unreadCount: 0,
@@ -126,6 +138,7 @@ describe("notification-store", () => {
   });
 
   afterEach(() => {
+    __resetAuthStatusForTests();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -783,9 +796,23 @@ describe("notification-store — protected hydrate gate (#16242)", () => {
     await vi.waitFor(() => expect(listNotifications).toHaveBeenCalledTimes(1));
   });
 
-  it("hydrates on mount on a non-Cloud origin regardless of auth (unchanged)", async () => {
-    setOrigin("http://localhost:2138/");
+  it("holds on an authenticated self-hosted origin until sign-in", async () => {
+    setOrigin("https://agent.example.com/");
     initNotifications();
+    await Promise.resolve();
+    expect(listNotifications).not.toHaveBeenCalled();
+
+    __setAuthStatusForTests({
+      phase: "authenticated",
+      identity: { id: "u-1", displayName: "Owner", kind: "owner" },
+      session: { id: "s-1", kind: "browser", expiresAt: null },
+      access: {
+        mode: "session",
+        passwordConfigured: true,
+        ownerConfigured: true,
+        role: "OWNER",
+      },
+    });
     await vi.waitFor(() => expect(listNotifications).toHaveBeenCalledTimes(1));
   });
 });
