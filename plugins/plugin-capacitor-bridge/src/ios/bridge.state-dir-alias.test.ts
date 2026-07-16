@@ -9,23 +9,33 @@ import {
 	getBootConfig,
 	setBootConfig,
 } from "@elizaos/shared/config/boot-config-store";
+import { buildBrandEnvAliases } from "@elizaos/shared/config/brand-env-aliases";
 import { readAliasedEnv } from "@elizaos/shared/utils/env";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveMobileStateDir } from "./bridge.ts";
 
 const ACME_EDGE_TTS_KEY = "ACME_DISABLE_EDGE_TTS";
+const ACME_API_TOKEN_KEY = "ACME_API_TOKEN";
 const ACME_VITE_SETTINGS_KEY = "VITE_ACME_SETTINGS_DEBUG";
+const UNRELATED_STATE_KEY = "FOO_STATE_DIR";
+const UNRELATED_TOKEN_KEY = "FOO_API_TOKEN";
+const UNRELATED_NULL_ORIGIN_KEY = "FOO_ALLOW_NULL_ORIGIN";
 const UNRELATED_PROVIDER_KEY = "CLOUDFLARE_API_TOKEN";
 
 const TOUCHED_KEYS = [
 	"ACME_STATE_DIR",
 	"ELIZA_STATE_DIR",
 	ACME_EDGE_TTS_KEY,
+	ACME_API_TOKEN_KEY,
 	"ELIZA_DISABLE_EDGE_TTS",
 	ACME_VITE_SETTINGS_KEY,
 	"VITE_ELIZA_SETTINGS_DEBUG",
+	UNRELATED_STATE_KEY,
+	UNRELATED_TOKEN_KEY,
+	UNRELATED_NULL_ORIGIN_KEY,
 	UNRELATED_PROVIDER_KEY,
 	"ELIZA_API_TOKEN",
+	"ELIZA_ALLOW_NULL_ORIGIN",
 	"ELIZA_HOME",
 	"ELIZA_WORKSPACE_DIR",
 ] as const;
@@ -119,6 +129,47 @@ describe("iOS bridge environment alias resolution", () => {
 			UNRELATED_PROVIDER_KEY,
 			"ELIZA_API_TOKEN",
 		]);
+	});
+
+	it("does not promote a credential that shares an inferred state prefix", () => {
+		process.env[UNRELATED_STATE_KEY] = "/data/foo/state";
+		process.env[UNRELATED_TOKEN_KEY] = "provider-secret";
+
+		expect(resolveMobileStateDir()).toBe("/data/foo/state");
+		expect(getBootConfig().envAliases).toContainEqual([
+			UNRELATED_STATE_KEY,
+			"ELIZA_STATE_DIR",
+		]);
+		expect(getBootConfig().envAliases).not.toContainEqual([
+			UNRELATED_TOKEN_KEY,
+			"ELIZA_API_TOKEN",
+		]);
+		expect(readAliasedEnv("ELIZA_API_TOKEN")).toBeUndefined();
+	});
+
+	it("does not promote an auth setting that shares an inferred state prefix", () => {
+		process.env[UNRELATED_STATE_KEY] = "/data/foo/state";
+		process.env[UNRELATED_NULL_ORIGIN_KEY] = "1";
+
+		expect(resolveMobileStateDir()).toBe("/data/foo/state");
+		expect(getBootConfig().envAliases).not.toContainEqual([
+			UNRELATED_NULL_ORIGIN_KEY,
+			"ELIZA_ALLOW_NULL_ORIGIN",
+		]);
+		expect(readAliasedEnv("ELIZA_ALLOW_NULL_ORIGIN")).toBeUndefined();
+	});
+
+	it("accepts credential aliases from an explicitly trusted alias table", () => {
+		process.env[ACME_API_TOKEN_KEY] = "white-label-secret";
+		setBootConfig({
+			...getBootConfig(),
+			envAliases: buildBrandEnvAliases("ACME"),
+		});
+
+		resolveMobileStateDir();
+
+		expect(readAliasedEnv("ELIZA_API_TOKEN")).toBe("white-label-secret");
+		expect(process.env.ELIZA_API_TOKEN).toBeUndefined();
 	});
 
 	it("retains Vite aliases without inferring a non-Vite prefix", () => {

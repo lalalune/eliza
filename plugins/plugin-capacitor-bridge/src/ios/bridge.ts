@@ -181,6 +181,16 @@ const IOS_BRIDGE_BRAND_ENV_SUFFIXES = [
 	"API_PORT",
 ] as const;
 
+const IOS_BRIDGE_SAFE_INFERRED_ENV_KEYS: ReadonlySet<string> = new Set([
+	"ELIZA_STATE_DIR",
+	"ELIZA_NAMESPACE",
+	"ELIZA_PLATFORM",
+	"ELIZA_API_PORT",
+	"ELIZA_DISABLE_EDGE_TTS",
+	"ELIZA_SETTINGS_DEBUG",
+	"VITE_ELIZA_SETTINGS_DEBUG",
+]);
+
 async function loadAgentModule(): Promise<AgentModule> {
 	const [{ bootElizaRuntime }, { dispatchRoute }] = await Promise.all([
 		import("@elizaos/agent/runtime"),
@@ -1977,8 +1987,9 @@ function installIosBridgeEnvAliases(): void {
 }
 
 function resolveIosBridgeEnvAliases(): ReturnType<typeof buildBrandEnvAliases> {
+	const observedKeys = new Set(Object.keys(process.env));
 	const prefixes = new Set<string>();
-	for (const key of Object.keys(process.env)) {
+	for (const key of observedKeys) {
 		for (const suffix of IOS_BRIDGE_BRAND_ENV_SUFFIXES) {
 			const marker = `_${suffix}`;
 			if (!key.endsWith(marker)) continue;
@@ -1986,7 +1997,16 @@ function resolveIosBridgeEnvAliases(): ReturnType<typeof buildBrandEnvAliases> {
 			if (prefix && prefix !== "ELIZA") prefixes.add(prefix);
 		}
 	}
-	return [...prefixes].flatMap((prefix) => buildBrandEnvAliases(prefix));
+	// A matching bootstrap key identifies a possible white-label prefix, not a
+	// trusted configuration namespace. Full alias tables must be pre-seeded in
+	// the boot config; inference is limited to the small mobile-boot surface.
+	return [...prefixes].flatMap((prefix) =>
+		buildBrandEnvAliases(prefix).filter(
+			([brandKey, elizaKey]) =>
+				observedKeys.has(brandKey) &&
+				IOS_BRIDGE_SAFE_INFERRED_ENV_KEYS.has(elizaKey),
+		),
+	);
 }
 
 function localInferenceRootPath(): string {
