@@ -78,19 +78,29 @@ export function acpServiceToAcpLike(
 /**
  * Drive one durable coding-task run against an already-spawned ACP session via
  * the Smithers engine. Single-turn by default (`maxTurns: 1`) so it is a
- * behaviour-preserving drop-in for a direct prompt, but the run is durable: a
- * crash mid-task resumes from the same `runId` (the session id) on restart.
+ * behaviour-preserving drop-in for a direct prompt. Planner callers supply the
+ * durable task/run identities; ordinary callers retain the session-id fallback.
  */
 export async function runDurableTask(
   service: AcpTaskService,
   session: { sessionId: string },
   task: string,
-  opts: { timeoutMs?: number; model?: string; maxTurns?: number } = {},
+  opts: {
+    timeoutMs?: number;
+    model?: string;
+    maxTurns?: number;
+    taskId?: string;
+    runId?: string;
+  } = {},
 ): Promise<{
+  taskId: string;
+  runId: string;
   status: "completed";
   lastResponse: string;
   turns: number;
 }> {
+  const taskId = opts.taskId ?? session.sessionId;
+  const runId = opts.runId ?? session.sessionId;
   const executor = new SmithersTaskExecutor(
     acpServiceToAcpLike(service, opts),
     {
@@ -99,8 +109,8 @@ export async function runDurableTask(
   );
   const result = await runTaskWithSmithers(
     {
-      taskId: session.sessionId,
-      runId: session.sessionId,
+      taskId,
+      runId,
       initialPrompt: task,
       maxTurns: opts.maxTurns ?? 1,
     },
@@ -132,6 +142,8 @@ export async function runDurableTask(
     });
   }
   return {
+    taskId,
+    runId,
     status: "completed",
     lastResponse,
     turns: result.turns,

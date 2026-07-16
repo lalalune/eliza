@@ -1,5 +1,5 @@
 /**
- * HTTP-boundary tests for the GitHub issue functions in workspace-github.ts.
+ * HTTP-boundary tests for GitHub issue and pull-request functions.
  * A REAL local node:http server implements the GitHub REST endpoints and a
  * REAL `GitHubPatClient` (Octokit under the hood) is pointed at it via its
  * `baseUrl` option, then injected through the production `GitHubContext`
@@ -21,6 +21,7 @@ import {
   ensureGitHubClient,
   type GitHubContext,
   listIssues,
+  listOpenPullRequestChangedFiles,
   parseOwnerRepo,
   updateIssue,
 } from "../services/workspace-github.ts";
@@ -84,6 +85,30 @@ class FakeGitHub {
           return;
         }
         res.setHeader("Content-Type", "application/json");
+        if (req.method === "GET" && /\/pulls\?/.test(path)) {
+          res.end(
+            JSON.stringify([
+              {
+                number: 17,
+                title: "Active refactor",
+                html_url: "http://local/acme/widgets/pull/17",
+              },
+            ]),
+          );
+          return;
+        }
+        if (req.method === "GET" && /\/pulls\/17\/files\?/.test(path)) {
+          res.end(
+            JSON.stringify([
+              {
+                filename: "src/runtime.ts",
+                previous_filename: "src/legacy-runtime.ts",
+              },
+              { filename: "src/runtime.test.ts" },
+            ]),
+          );
+          return;
+        }
         if (req.method === "GET" && /\/issues(\?|$)/.test(path)) {
           res.end(
             JSON.stringify([
@@ -197,6 +222,10 @@ describe("parseOwnerRepo", () => {
       owner: "acme",
       repo: "widgets",
     });
+    expect(parseOwnerRepo("git@github.com:acme/widgets.git")).toEqual({
+      owner: "acme",
+      repo: "widgets",
+    });
   });
 
   it("throws a typed error on unparseable input", () => {
@@ -259,6 +288,31 @@ describe("issue functions over a real local GitHub API server", () => {
     expect(issue.title).toBe("Broken widget");
     expect(issue.labels).toEqual(["bug"]);
     expect(issue.assignees).toEqual(["octocat"]);
+  });
+
+  it("lists open PR changed files through the authenticated client transport", async () => {
+    await expect(
+      listOpenPullRequestChangedFiles(ctx, "acme/widgets"),
+    ).resolves.toEqual([
+      {
+        id: "pr-17",
+        number: 17,
+        title: "Active refactor",
+        url: "http://local/acme/widgets/pull/17",
+        paths: [
+          "src/legacy-runtime.ts",
+          "src/runtime.test.ts",
+          "src/runtime.ts",
+        ],
+      },
+    ]);
+    expect(github.requests.at(-2)?.path).toContain(
+      "/repos/acme/widgets/pulls?state=open&per_page=100&page=1",
+    );
+    expect(github.lastRequest().path).toContain(
+      "/repos/acme/widgets/pulls/17/files?per_page=100&page=1",
+    );
+    expect(github.lastRequest().auth).toBe("token ghp_local");
   });
 
   it("updateIssue PATCHes the issue with only the provided fields", async () => {

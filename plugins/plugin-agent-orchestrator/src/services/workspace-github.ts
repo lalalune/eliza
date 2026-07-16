@@ -1,14 +1,11 @@
 /**
- * GitHub integration for Coding Workspace Service
- *
- * Extracted from workspace-service.ts — provides GitHub API access
- * via PAT or OAuth device flow, plus all issue management operations.
- *
- * @module services/workspace-github
+ * Owns authenticated GitHub operations for coding workspaces. Stateless
+ * functions consume the workspace service's shared PAT/OAuth client so issue,
+ * pull-request, and collision reads use one credential and transport boundary.
  */
 
 import { createRequire } from "node:module";
-import type { IAgentRuntime } from "@elizaos/core";
+import { ElizaError, type IAgentRuntime } from "@elizaos/core";
 import type {
   CreateIssueOptions,
   GitHubPatClient as GitHubPatClientInstance,
@@ -53,12 +50,209 @@ export function parseOwnerRepo(repo: string): {
   owner: string;
   repo: string;
 } {
-  // Handle URLs like https://github.com/owner/repo or owner/repo
-  const match = repo.match(/(?:github\.com\/)?([^/]+)\/([^/.]+)/);
+  const trimmed = repo.trim().replace(/\/+$/, "");
+  const https = trimmed.match(
+    /^https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i,
+  );
+  const ssh = trimmed.match(
+    /^(?:ssh:\/\/)?[^@\s]+@github\.com[:/]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i,
+  );
+  const hosted = trimmed.match(
+    /^github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i,
+  );
+  const shorthand = trimmed.match(
+    /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/,
+  );
+  const match = https ?? ssh ?? hosted ?? shorthand;
   if (!match) {
-    throw new Error(`Cannot parse owner/repo from: ${repo}`);
+    throw new ElizaError(`Cannot parse owner/repo from: ${repo}`, {
+      code: "GITHUB_REPOSITORY_INVALID",
+      context: { repo },
+    });
   }
   return { owner: match[1], repo: match[2] };
+}
+
+interface GitHubRequestResponse {
+  data: unknown;
+}
+
+type GitHubRequest = (
+  route: string,
+  parameters: Record<string, unknown>,
+) => Promise<GitHubRequestResponse>;
+
+function requestFromClient(client: GitHubPatClientInstance): GitHubRequest {
+  const octokit: unknown = Reflect.get(client, "octokit");
+  if (!octokit || typeof octokit !== "object") {
+    throw new ElizaError(
+      "GitHub client does not expose its authenticated transport",
+      {
+        code: "GITHUB_TRANSPORT_UNAVAILABLE",
+      },
+    );
+  }
+  const request: unknown = Reflect.get(octokit, "request");
+  if (typeof request !== "function") {
+    throw new ElizaError("GitHub client transport has no request method", {
+      code: "GITHUB_TRANSPORT_UNAVAILABLE",
+    });
+  }
+  return async (route, parameters) => {
+    const response: unknown = await Reflect.apply(request, octokit, [
+      route,
+      parameters,
+    ]);
+    if (!response || typeof response !== "object" || !("data" in response)) {
+      throw new ElizaError("GitHub transport returned an invalid response", {
+        code: "GITHUB_RESPONSE_INVALID",
+        context: { route },
+      });
+    }
+    return { data: Reflect.get(response, "data") };
+  };
+}
+
+/** Reuse the authenticated transport owned by GitHubPatClient. */
+export async function authenticatedGitHubRequest(
+  ctx: GitHubContext,
+  route: string,
+  parameters: Record<string, unknown>,
+): Promise<unknown> {
+  const client = await ensureGitHubClient(ctx);
+  const response = await requestFromClient(client)(route, parameters);
+  return response.data;
+}
+
+/** Exhaust a GitHub list endpoint without silently truncating at 30/100 rows. */
+export async function pagedGitHubRequest(
+  ctx: GitHubContext,
+  route: string,
+  parameters: Record<string, unknown>,
+): Promise<unknown[]> {
+  const values: unknown[] = [];
+  for (let page = 1; ; page += 1) {
+    const data = await authenticatedGitHubRequest(ctx, route, {
+      ...parameters,
+      per_page: 100,
+      page,
+    });
+    if (!Array.isArray(data)) {
+      throw new ElizaError(
+        "GitHub list endpoint returned a non-array response",
+        {
+          code: "GITHUB_RESPONSE_INVALID",
+          context: { route, page },
+        },
+      );
+    }
+    values.push(...data);
+    if (data.length < 100) return values;
+  }
+}
+
+export interface OpenPullRequestChangedFiles {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  paths: string[];
+}
+
+function pullRequestIdentity(value: unknown): {
+  number: number;
+  title: string;
+  url: string;
+} {
+  if (!value || typeof value !== "object") {
+    throw new ElizaError("GitHub returned a non-object pull request", {
+      code: "GITHUB_RESPONSE_INVALID",
+    });
+  }
+  const number: unknown = Reflect.get(value, "number");
+  const title: unknown = Reflect.get(value, "title");
+  const url: unknown = Reflect.get(value, "html_url");
+  if (
+    typeof number !== "number" ||
+    !Number.isInteger(number) ||
+    typeof title !== "string" ||
+    typeof url !== "string"
+  ) {
+    throw new ElizaError(
+      "GitHub pull request response is missing identity fields",
+      {
+        code: "GITHUB_RESPONSE_INVALID",
+      },
+    );
+  }
+  return { number, title, url };
+}
+
+function changedPaths(value: unknown): string[] {
+  if (!value || typeof value !== "object") {
+    throw new ElizaError("GitHub returned a non-object changed file", {
+      code: "GITHUB_RESPONSE_INVALID",
+    });
+  }
+  const filename: unknown = Reflect.get(value, "filename");
+  if (typeof filename !== "string" || filename.trim().length === 0) {
+    throw new ElizaError("GitHub changed-file response has no filename", {
+      code: "GITHUB_RESPONSE_INVALID",
+    });
+  }
+  const previousFilename: unknown = Reflect.get(value, "previous_filename");
+  if (
+    previousFilename !== undefined &&
+    (typeof previousFilename !== "string" ||
+      previousFilename.trim().length === 0)
+  ) {
+    throw new ElizaError(
+      "GitHub renamed-file response has an invalid previous filename",
+      { code: "GITHUB_RESPONSE_INVALID" },
+    );
+  }
+  return [
+    filename,
+    ...(typeof previousFilename === "string" ? [previousFilename] : []),
+  ];
+}
+
+/** List every open PR and its complete changed-file set for collision checks. */
+export async function listOpenPullRequestChangedFiles(
+  ctx: GitHubContext,
+  repo: string,
+): Promise<OpenPullRequestChangedFiles[]> {
+  const { owner, repo: repoName } = parseOwnerRepo(repo);
+  const pulls = await pagedGitHubRequest(
+    ctx,
+    "GET /repos/{owner}/{repo}/pulls",
+    {
+      owner,
+      repo: repoName,
+      state: "open",
+    },
+  );
+  const results: OpenPullRequestChangedFiles[] = [];
+  // Serial PR file reads avoid GitHub's secondary-rate-limit burst while each
+  // individual endpoint still exhausts all of its pages.
+  for (const value of pulls) {
+    const identity = pullRequestIdentity(value);
+    const files = await pagedGitHubRequest(
+      ctx,
+      "GET /repos/{owner}/{repo}/pulls/{pull_number}/files",
+      { owner, repo: repoName, pull_number: identity.number },
+    );
+    results.push({
+      id: `pr-${identity.number}`,
+      number: identity.number,
+      title: identity.title,
+      url: identity.url,
+      paths: [...new Set(files.flatMap(changedPaths))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    });
+  }
+  return results;
 }
 
 // ── Auth ───────────────────────────────────────────────────────────
