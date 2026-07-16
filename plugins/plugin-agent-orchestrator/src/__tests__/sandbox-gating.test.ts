@@ -17,6 +17,7 @@ import {
   tasksSandboxStubAction,
 } from "../actions/sandbox-stub.js";
 import { createAgentOrchestratorPlugin } from "../index.js";
+import { LanePlannerService } from "../services/lane-planner.js";
 import type {
   OrchestratorTerminalSupport,
   OrchestratorUnsupportedReason,
@@ -113,6 +114,11 @@ describe("agent-orchestrator sandbox gating", () => {
       "agent-orchestrator.sub-agent-completion",
       "agent-orchestrator.sub-agent-failure",
     ]);
+    expect(
+      (agentOrchestratorPlugin.services ?? []).map(
+        (service) => service.serviceType,
+      ),
+    ).toContain(LanePlannerService.serviceType);
   });
 
   it("registers only a TASKS unsupported stub on Android without a staged shell", {
