@@ -103,17 +103,28 @@ describe("CacheClient getWithSWR over the memory backend", () => {
   test("malformed SWR metadata reloads once and cannot open the cache circuit", async () => {
     const { CacheClient } = await import("./client");
     const cache = new CacheClient();
+    const now = Date.now();
     const malformedEntries = [
-      { data: { v: "missing-stale-at" }, cachedAt: Date.now() },
-      { data: { v: "missing-cached-at" }, staleAt: Date.now() },
-      { data: { v: "non-finite-cached-at" }, cachedAt: Number.NaN, staleAt: Date.now() },
-      { data: { v: "string-cached-at" }, cachedAt: "now", staleAt: Date.now() },
+      { data: { v: "missing-stale-at" }, cachedAt: now },
+      { data: { v: "missing-cached-at" }, staleAt: now },
+      { data: { v: "non-finite-cached-at" }, cachedAt: Number.NaN, staleAt: now },
+      { data: { v: "string-cached-at" }, cachedAt: "now", staleAt: now },
       {
         data: { v: "non-finite-stale-at" },
-        cachedAt: Date.now(),
+        cachedAt: now,
         staleAt: Number.POSITIVE_INFINITY,
       },
       { data: { v: "reversed-window" }, cachedAt: 2, staleAt: 1 },
+      {
+        data: { v: "future-cached-at" },
+        cachedAt: now + 60_000,
+        staleAt: now + 120_000,
+      },
+      {
+        data: { v: "oversized-freshness-window" },
+        cachedAt: now,
+        staleAt: now + 120_000,
+      },
     ];
     let calls = 0;
 
@@ -141,6 +152,28 @@ describe("CacheClient getWithSWR over the memory backend", () => {
 
     expect(calls).toBe(malformedEntries.length);
     expect(cache.isAvailable()).toBe(true);
+  });
+
+  test("invalid metadata survives a failed reload and is replaced only after recovery", async () => {
+    const { CacheClient } = await import("./client");
+    const cache = new CacheClient();
+    const key = "swr:invalid-metadata-outage";
+    const lastGood = { v: "last-good" };
+    const invalidEnvelope = { data: lastGood, cachedAt: Date.now() };
+
+    await cache.set(key, invalidEnvelope, 120);
+    await expect(
+      cache.getWithSWR(key, 60, async () => {
+        throw new Error("upstream 503");
+      }),
+    ).rejects.toThrow("upstream 503");
+
+    expect(await cache.get(key)).toEqual(invalidEnvelope);
+    expect(cache.isAvailable()).toBe(true);
+
+    const recovered = { v: "recovered" };
+    expect(await cache.getWithSWR(key, 60, async () => recovered, 120)).toEqual(recovered);
+    expect(await cache.get<{ data: { v: string } }>(key)).toMatchObject({ data: recovered });
   });
 
   test("a FAILING background revalidation keeps the last-good value and does not unhandled-reject", async () => {

@@ -190,6 +190,29 @@ describe("model catalog cache wiring", () => {
     expect(await cache.get(CACHE_KEY)).toBeNull();
   });
 
+  test("a configured empty provider result cannot replace the last-good catalog", async () => {
+    const lastGood = [catalogModel("last-good")];
+    listModelsImpl = async () => ({ json: async () => ({ data: lastGood }) });
+    await getCachedBitRouterModelCatalog();
+    const lastGoodEntry = await cache.get(CACHE_KEY);
+
+    listModelsImpl = async () => ({ json: async () => ({ data: [] }) });
+    await expect(refreshBitRouterModelCatalog()).rejects.toMatchObject({
+      name: "ElizaError",
+      code: "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION",
+      context: {
+        key: CACHE_KEY,
+        boundary: "refresh",
+        receivedKind: "array",
+        expected: "non-empty array",
+      },
+      cause: expect.any(TypeError),
+    });
+
+    expect(listModelsCalls).toBe(2);
+    expect(await cache.get(CACHE_KEY)).toEqual(lastGoodEntry);
+  });
+
   test("caches an empty catalog when no provider is configured", async () => {
     openRouterConfigured = false;
 

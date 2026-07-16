@@ -18,6 +18,7 @@ export interface ModelCatalogCacheStore {
     ttl?: number,
   ): Promise<T | null>;
   set<T>(key: string, value: T, ttlSeconds: number): Promise<void>;
+  del(key: string): Promise<void>;
 }
 
 interface ModelCatalogCacheEntry {
@@ -183,7 +184,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index) || typeof value[index] !== "string") return false;
+  }
+  return true;
 }
 
 function validateOptionalFields(model: Record<string, unknown>): CatalogContractViolation | null {
@@ -350,7 +355,11 @@ function catalogContractError(
       key,
       boundary,
       receivedKind,
-      ...(modelIndex === undefined ? {} : { modelIndex, field, expected: expectation }),
+      ...(modelIndex === undefined
+        ? expected === undefined
+          ? {}
+          : { expected: expectation }
+        : { modelIndex, field, expected: expectation }),
     },
     cause,
     severity: "fatal",
@@ -361,8 +370,12 @@ function requireCatalogModels(
   value: unknown,
   key: string,
   boundary: "cache" | "refresh",
+  allowEmpty = true,
 ): CatalogModel[] {
   if (!Array.isArray(value)) throw catalogContractError(key, boundary, value);
+  if (!allowEmpty && value.length === 0) {
+    throw catalogContractError(key, boundary, value, undefined, undefined, "non-empty array");
+  }
 
   const models: CatalogModel[] = [];
   for (const [modelIndex, model] of value.entries()) {
@@ -414,7 +427,7 @@ export class ModelCatalogCache {
   private runRefresh(): Promise<ModelCatalogRefreshResult<CatalogModel[]>> {
     return this.refreshes.run(this.key, async () => {
       if (!this.isProviderConfigured()) return [];
-      return requireCatalogModels(await this.fetchModels(), this.key, "refresh");
+      return requireCatalogModels(await this.fetchModels(), this.key, "refresh", false);
     });
   }
 
@@ -432,10 +445,25 @@ export class ModelCatalogCache {
       this.retentionSeconds,
     );
 
-    // A configured cold miss rejects in loadModels. Null or another invalid
-    // value therefore means the cache boundary violated its declared contract;
-    // it must never be translated into a healthy empty catalog.
-    return requireCatalogModels(cached, this.key, "cache");
+    try {
+      // A configured cold miss rejects in loadModels. Null, an empty configured
+      // catalog, or another invalid value therefore means the cache boundary
+      // violated its declared contract; it must not masquerade as a healthy hit.
+      return requireCatalogModels(cached, this.key, "cache", !this.isProviderConfigured());
+    } catch (error) {
+      if (
+        !(error instanceof ElizaError) ||
+        error.code !== "MODEL_CATALOG_CACHE_CONTRACT_VIOLATION" ||
+        error.context?.boundary !== "cache"
+      ) {
+        throw error;
+      }
+
+      // error-policy:J3 shared-cache bytes are untrusted input. Evict the typed
+      // invalid value and return only a newly validated authoritative result.
+      await this.store.del(this.key);
+      return await this.refresh();
+    }
   }
 
   async refresh(): Promise<CatalogModel[]> {

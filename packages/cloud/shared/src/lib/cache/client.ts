@@ -90,7 +90,11 @@ interface CachedValue<T> {
   staleAt: number;
 }
 
-function isCachedValueEnvelope<T>(value: unknown): value is CachedValue<T> {
+function isCachedValueEnvelope<T>(
+  value: unknown,
+  now: number,
+  staleTTL: number,
+): value is CachedValue<T> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 
   const envelope = value as Record<string, unknown>;
@@ -103,13 +107,17 @@ function isCachedValueEnvelope<T>(value: unknown): value is CachedValue<T> {
   }
 
   const { cachedAt, staleAt } = envelope;
+  const maximumStaleAt = typeof cachedAt === "number" ? cachedAt + staleTTL * 1000 : Number.NaN;
   return (
     typeof cachedAt === "number" &&
     Number.isFinite(cachedAt) &&
     cachedAt >= 0 &&
+    cachedAt <= now &&
     typeof staleAt === "number" &&
     Number.isFinite(staleAt) &&
-    staleAt >= cachedAt
+    staleAt >= cachedAt &&
+    Number.isFinite(maximumStaleAt) &&
+    staleAt <= maximumStaleAt
   );
 }
 
@@ -645,15 +653,15 @@ export class CacheClient {
     }
 
     const parsed = parseCacheValue<unknown>(value);
-    if (!isCachedValueEnvelope<T>(parsed)) {
+    const now = Date.now();
+    if (!isCachedValueEnvelope<T>(parsed, now, staleTTL)) {
       // error-policy:J3 cache contents are untrusted input; an invalid envelope
-      // is evicted and replaced only with an authoritative loader result.
-      logger.warn("[Cache] Invalid SWR envelope; deleting before revalidation", { key });
-      await this.del(key);
+      // is never served. Keep the bytes until an authoritative load succeeds so
+      // a transient upstream failure cannot destroy potentially valid data.
+      logger.warn("[Cache] Invalid SWR envelope; revalidating before replacement", { key });
       return await loadAndCache();
     }
 
-    const now = Date.now();
     const isStale = now > parsed.staleAt;
 
     if (isStale) {
