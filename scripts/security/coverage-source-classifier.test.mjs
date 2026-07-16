@@ -94,18 +94,20 @@ describe("coverage source classifier", () => {
     );
   });
 
-  test("uses base sources and fails wide when this runtime cannot prove equivalence", () => {
+  test("uses base sources and fails wide only when comparison fails", () => {
     const directory = mkdtempSync(join(tmpdir(), "coverage-source-delta-"));
     const changedPath = join(directory, "changed.ts");
     const equivalentPath = join(directory, "equivalent.ts");
+    const unclassifiablePath = join(directory, "unclassifiable.ts");
     writeFileSync(changedPath, "export const value: number = 2;\n");
     writeFileSync(equivalentPath, "export const value: number = 1;\n");
+    writeFileSync(unclassifiablePath, "export const value: number = 1;\n");
 
     try {
       let output = "";
       let errors = "";
       classifyPaths(
-        [changedPath, equivalentPath],
+        [changedPath, equivalentPath, unclassifiablePath],
         (message) => {
           output += message;
         },
@@ -113,12 +115,21 @@ describe("coverage source classifier", () => {
           errors += message;
         },
         {
-          readBaseSource: () => "export const value: number = 1;\n",
+          readBaseSource: (path) => {
+            if (path === unclassifiablePath) {
+              throw new Error("base source unavailable");
+            }
+            return "export const value: number = 1;\n";
+          },
         },
       );
 
       expect(output).toContain(changedPath);
-      expect(output).toContain(equivalentPath);
+      expect(output).not.toContain(equivalentPath);
+      expect(output).toContain(unclassifiablePath);
+      expect(errors).toContain(
+        `excluding runtime-equivalent source change: ${equivalentPath}`,
+      );
       expect(errors).toContain("treating unclassifiable source change");
     } finally {
       rmSync(directory, { recursive: true, force: true });
