@@ -82,10 +82,8 @@ describe("CacheClient getWithSWR over the memory backend", () => {
       return { v: "good" };
     };
 
-    // Cold miss + rejecting fetcher: the upstream error reaches the caller
-    // directly. Pre-fix it fell into the backend-error catch, which recorded a
-    // cache-circuit-breaker failure and re-invoked the failing fetcher a
-    // second time.
+    // The loader stays outside the cache-adapter failure boundary so one
+    // upstream outage cannot count against the cache circuit or duplicate work.
     await expect(cache.getWithSWR("swr:coldmiss", 60, load, 120)).rejects.toThrow("upstream 503");
     expect(calls).toBe(1);
 
@@ -100,6 +98,49 @@ describe("CacheClient getWithSWR over the memory backend", () => {
       v: "good",
     });
     expect(calls).toBe(2);
+  });
+
+  test("malformed SWR metadata reloads once and cannot open the cache circuit", async () => {
+    const { CacheClient } = await import("./client");
+    const cache = new CacheClient();
+    const malformedEntries = [
+      { data: { v: "missing-stale-at" }, cachedAt: Date.now() },
+      { data: { v: "missing-cached-at" }, staleAt: Date.now() },
+      { data: { v: "non-finite-cached-at" }, cachedAt: Number.NaN, staleAt: Date.now() },
+      { data: { v: "string-cached-at" }, cachedAt: "now", staleAt: Date.now() },
+      {
+        data: { v: "non-finite-stale-at" },
+        cachedAt: Date.now(),
+        staleAt: Number.POSITIVE_INFINITY,
+      },
+      { data: { v: "reversed-window" }, cachedAt: 2, staleAt: 1 },
+    ];
+    let calls = 0;
+
+    for (const [index, malformed] of malformedEntries.entries()) {
+      const key = `swr:malformed:${index}`;
+      const fresh = { v: `fresh-${index}` };
+      await cache.set(key, malformed, 120);
+
+      expect(
+        await cache.getWithSWR(key, 60, async () => {
+          calls += 1;
+          return fresh;
+        }),
+      ).toEqual(fresh);
+
+      const stored = await cache.get<{
+        data: { v: string };
+        cachedAt: number;
+        staleAt: number;
+      }>(key);
+      expect(stored).toMatchObject({ data: fresh });
+      if (!stored) throw new Error("expected repaired SWR entry");
+      expect(stored.staleAt).toBeGreaterThanOrEqual(stored.cachedAt);
+    }
+
+    expect(calls).toBe(malformedEntries.length);
+    expect(cache.isAvailable()).toBe(true);
   });
 
   test("a FAILING background revalidation keeps the last-good value and does not unhandled-reject", async () => {

@@ -1,4 +1,4 @@
-// Coordinates cloud service model catalog behavior behind route handlers.
+/** Coordinates provider-backed model catalog caching and lookup for cloud routes. */
 import { ElizaError } from "@elizaos/core";
 import { cache } from "../cache/client";
 import { InMemoryLRUCache } from "../cache/in-memory-lru-cache";
@@ -17,18 +17,21 @@ import {
   hasOpenRouterProviderConfigured,
 } from "../providers";
 import { expandBitRouterModelIdCandidates } from "../providers/model-id-translation";
-import type { OpenAIModelsResponse } from "../providers/types";
 import { logger } from "../utils/logger";
 import { isHotPathCachesEnabled } from "./inference-hot-path-caches";
 import { ModelCatalogCache, type ModelCatalogRefreshFailure } from "./model-catalog-cache";
 
-async function fetchConfiguredBitRouterModelCatalog(): Promise<CatalogModel[]> {
+async function fetchConfiguredBitRouterModelCatalog(): Promise<unknown> {
   try {
     const response = await getOpenRouterProvider().listModels();
-    const data = (await response.json()) as OpenAIModelsResponse;
+    const responseBody: unknown = await response.json();
+    const data =
+      typeof responseBody === "object" && responseBody !== null && "data" in responseBody
+        ? responseBody.data
+        : undefined;
 
-    if (!Array.isArray(data.data)) {
-      const receivedKind = data.data === null ? "null" : typeof data.data;
+    if (!Array.isArray(data)) {
+      const receivedKind = data === null ? "null" : typeof data;
       const cause = new TypeError(
         `Expected OpenRouter response.data to be an array, received ${receivedKind}`,
       );
@@ -40,7 +43,7 @@ async function fetchConfiguredBitRouterModelCatalog(): Promise<CatalogModel[]> {
       });
     }
 
-    return data.data;
+    return data;
   } catch (cause) {
     if (cause instanceof ElizaError) throw cause;
     // error-policy:J2 Add provider context while preserving the transport or
