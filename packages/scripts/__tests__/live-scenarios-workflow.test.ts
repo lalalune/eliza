@@ -1,17 +1,23 @@
 /**
- * Pins the credentialed scenario workflow's clean-checkout build prerequisites
- * to every dist-exported package imported before scenario selection, and the
- * source-export conditions each live lane runs under.
+ * Pins the credentialed scenario workflow's build graph, source-export
+ * conditions, default evidence artifacts, and scheduled catalog coverage.
  */
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { listScenarioMetadata } from "../../scenario-runner/src/loader.ts";
 
 const workflowPath = fileURLToPath(
   new URL("../../../.github/workflows/live-scenarios.yml", import.meta.url),
 );
 const agentPackagePath = fileURLToPath(
   new URL("../../agent/package.json", import.meta.url),
+);
+const liveScenarioWrapperPath = fileURLToPath(
+  new URL("../run-live-scenarios.mjs", import.meta.url),
+);
+const defaultScenarioRoot = fileURLToPath(
+  new URL("../../test/scenarios/", import.meta.url),
 );
 
 test("builds the dist-exported runtime packages before the scenario CLI starts", () => {
@@ -43,5 +49,37 @@ test("includes the dynamically loaded app manager in the agent build graph", () 
   };
   expect(packageJson.dependencies?.["@elizaos/plugin-app-manager"]).toBe(
     "workspace:*",
+  );
+});
+
+test("discovers the orchestrator live evidence in the scheduled catalog", async () => {
+  const metadata = await listScenarioMetadata(
+    defaultScenarioRoot,
+    undefined,
+    undefined,
+    false,
+    "live-only",
+  );
+  const orchestratorEvidence = metadata.filter((entry) =>
+    [
+      "orchestrator.grilling-happy-path",
+      "orchestrator.origin-routing-live",
+    ].includes(entry.id),
+  );
+
+  expect(orchestratorEvidence.map((entry) => entry.id).sort()).toEqual([
+    "orchestrator.grilling-happy-path",
+    "orchestrator.origin-routing-live",
+  ]);
+});
+
+test("exports native trajectories into the run directory by default", () => {
+  const wrapper = readFileSync(liveScenarioWrapperPath, "utf8");
+
+  expect(wrapper).toContain(
+    'process.env.EXPORT_NATIVE_PATH ?? path.join(runDir, "native.jsonl")',
+  );
+  expect(wrapper).toMatch(
+    /if \(exportNativePath\.length > 0\)[\s\S]*args\.push\("--export-native", exportNativePath\)/,
   );
 });
