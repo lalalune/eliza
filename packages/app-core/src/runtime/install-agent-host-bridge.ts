@@ -35,16 +35,36 @@ import { sharedVault } from "../services/vault-mirror";
 
 let installed = false;
 
+const CSRF_PROTECTED_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function isInboxMutationRequest(
+  req: Parameters<
+    NonNullable<AgentHostBridge["resolveHttpRequestAuthorization"]>
+  >[0],
+): boolean {
+  if (!CSRF_PROTECTED_METHODS.has((req.method ?? "GET").toUpperCase())) {
+    return false;
+  }
+  // Match the agent dispatcher's URL semantics exactly. Raw prefix checks can
+  // misclassify absolute-form or scheme-relative request targets even though
+  // the dispatcher resolves both to the protected inbox pathname.
+  const pathname = new URL(
+    req.url ?? "/",
+    `http://${req.headers.host ?? "localhost"}`,
+  ).pathname;
+  return pathname === "/api/inbox" || pathname.startsWith("/api/inbox/");
+}
+
 export function installAgentHostBridge(): void {
   const resolveHttpRequestAuthorization: NonNullable<
     AgentHostBridge["resolveHttpRequestAuthorization"]
   > = async (req, runtime) => {
     const resolved = await resolveAuthorizedRouteRole(req, {
-      // Agent-owned legacy mutations predate app-core's CSRF header and the
-      // web client does not attach it to that surface. These requests have
-      // already passed the server's strict Origin/CORS gate; validate the
-      // host session here without imposing the compat-route CSRF contract.
-      skipCsrf: true,
+      // Inbox writes carry app-core's cookie+CSRF contract because they can
+      // select a connector identity and send externally. Unrelated agent-owned
+      // legacy mutations retain their compatibility exception after the
+      // server's strict Origin/CORS gate.
+      skipCsrf: !isInboxMutationRequest(req),
       state: {
         current: runtime,
       },

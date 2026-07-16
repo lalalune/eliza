@@ -186,10 +186,11 @@ describe("POST /api/inbox/messages connector account routing", () => {
     expect(harness.handled).toBe(true);
     expect(harness.response).toMatchObject({ status: 200, body: { ok: true } });
     expect(harness.sendMessageToTarget).toHaveBeenCalledOnce();
-    expect(harness.sendMessageToTarget.mock.calls[0]?.[0]).toMatchObject({
+    expect(harness.sendMessageToTarget.mock.calls[0]?.[0]).toEqual({
       accountId: "work",
       channelId: "channel-1",
       roomId: ROOM_ID,
+      serverId: "server-1",
       source: "discord",
     });
     expect(harness.sendMessageToTarget.mock.calls[0]?.[1]).toEqual({
@@ -526,7 +527,55 @@ describe("POST /api/inbox/messages connector account routing", () => {
     expect(harness.sendMessageToTarget).not.toHaveBeenCalled();
   });
 
-  it("allows an identityless full-authority OWNER with a verified binding", async () => {
+  it("auto-selects only the owner account bound to the browser identity", async () => {
+    const harness = await createHarness({
+      accounts: [
+        account("owner-one", {
+          accessGate: "owner_binding",
+          externalId: "owner-external-one",
+          role: "OWNER",
+        }),
+        account("owner-two", {
+          accessGate: "owner_binding",
+          externalId: "owner-external-two",
+          role: "OWNER",
+        }),
+      ],
+      body: requestBody(),
+      callerAuthorization: {
+        ok: true,
+        role: "OWNER",
+        identityId: "identity-1",
+      },
+      configureStorage: (storage) => {
+        storage.upsertOwnerBindingForTest({
+          id: "binding-1",
+          identityId: "identity-1",
+          connector: "discord",
+          externalId: "owner-external-one",
+          displayHandle: "owner one",
+          instanceId: "",
+          verifiedAt: 1,
+        });
+        storage.upsertOwnerBindingForTest({
+          id: "binding-2",
+          identityId: "identity-2",
+          connector: "discord",
+          externalId: "owner-external-two",
+          displayHandle: "owner two",
+          instanceId: "",
+          verifiedAt: 1,
+        });
+      },
+    });
+
+    expect(harness.response.status).toBe(200);
+    expect(harness.sendMessageToTarget.mock.calls[0]?.[0]).toMatchObject({
+      accountId: "owner-one",
+    });
+  });
+
+  it("does not compare an opaque OWNER principal to a DB identity binding", async () => {
     const harness = await createHarness({
       accounts: [
         account("owner", {
@@ -536,7 +585,11 @@ describe("POST /api/inbox/messages connector account routing", () => {
         }),
       ],
       body: requestBody({ accountId: "owner" }),
-      callerAuthorization: { ok: true, role: "OWNER" },
+      callerAuthorization: {
+        ok: true,
+        role: "OWNER",
+        principal: "wallet-owner",
+      },
       configureStorage: (storage) => {
         storage.upsertOwnerBindingForTest({
           id: "binding-1",

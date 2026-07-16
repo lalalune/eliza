@@ -8,6 +8,7 @@ import type {
   PostInboxMessageRequest,
 } from "@elizaos/shared";
 import { invokeDesktopBridgeRequest } from "../bridge/electrobun-rpc";
+import { CSRF_HEADER_NAME } from "./auth/sessions";
 import { ElizaClient } from "./client-base";
 import type {
   AccountConnectRequest,
@@ -81,6 +82,7 @@ import type {
   WorkbenchVfsQuota,
   WorkbenchVfsSnapshot,
 } from "./client-types";
+import { readCsrfTokenFromCookie } from "./csrf-client";
 import { isDesktopExternalApiBaseUrl } from "./desktop-external-api-base";
 
 type DocumentListOptions = {
@@ -242,6 +244,16 @@ function buildInboxChatsRpcParams(
   return options?.sources && options.sources.length > 0
     ? { sources: options.sources }
     : {};
+}
+
+function buildInboxMutationInit(data: unknown): RequestInit {
+  const csrfToken = readCsrfTokenFromCookie();
+  return {
+    method: "POST",
+    credentials: "include",
+    ...(csrfToken ? { headers: { [CSRF_HEADER_NAME]: csrfToken } } : {}),
+    body: JSON.stringify(data),
+  };
 }
 
 function appendDocumentFilterParams(
@@ -1208,10 +1220,7 @@ ElizaClient.prototype.setInboxChatMute = async function (
     scope: "room" | "server";
     muted?: boolean;
     mutedScope?: "room" | "server";
-  }>("/api/inbox/chats/mute", {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
+  }>("/api/inbox/chats/mute", buildInboxMutationInit(data));
 };
 
 ElizaClient.prototype.sendInboxMessage = async function (
@@ -1221,10 +1230,7 @@ ElizaClient.prototype.sendInboxMessage = async function (
   return this.fetch<{
     ok: boolean;
     message?: ConversationMessage & { roomId: string; source: string };
-  }>("/api/inbox/messages", {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
+  }>("/api/inbox/messages", buildInboxMutationInit(data));
 };
 
 ElizaClient.prototype.truncateConversationMessages = async function (
