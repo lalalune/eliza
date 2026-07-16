@@ -5,7 +5,7 @@
  * injection for reverse-proxy deployments.
  */
 
-import fs from "node:fs";
+import fs, { type Stats } from "node:fs";
 import type http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,13 +50,17 @@ const STATIC_MIME: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
+function isMissingPathError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return error.code === "ENOENT" || error.code === "ENOTDIR";
+}
+
 // ---------------------------------------------------------------------------
 // UI directory resolution
 // ---------------------------------------------------------------------------
 
 /** Resolved UI directory. Lazily computed once on first request. */
 let uiDir: string | null | undefined;
-let uiIndexHtml: Buffer | null = null;
 
 export function resolveUiDir(): string | null {
   if (uiDir !== undefined) return uiDir;
@@ -79,12 +83,13 @@ export function resolveUiDir(): string | null {
     try {
       if (fs.statSync(indexPath).isFile()) {
         uiDir = candidate;
-        uiIndexHtml = fs.readFileSync(indexPath);
         logger.info(`[eliza-api] Serving dashboard UI from ${candidate}`);
         return uiDir;
       }
-    } catch {
-      // Candidate not present, keep searching.
+    } catch (error) {
+      // error-policy:J4 An absent build candidate is an expected unavailable
+      // state; permission and I/O failures must remain observable.
+      if (!isMissingPathError(error)) throw error;
     }
   }
 
@@ -118,13 +123,19 @@ export function sendStaticResponse(
 
 const STATIC_CACHE_MAX = 50;
 const STATIC_CACHE_FILE_LIMIT = 512 * 1024; // 512 KB
-const staticFileCache = new Map<string, { body: Buffer; mtimeMs: number }>();
+const staticFileCache = new Map<string, { body: Buffer; version: string }>();
 
-function getCachedFile(filePath: string, mtimeMs: number): Buffer {
+function getFileVersion(stat: Stats): string {
+  // Build tools replace files atomically and may preserve their modification
+  // time, so the inode and change time are part of the cache identity.
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+function getCachedFile(filePath: string, stat: Stats): Buffer {
   return getOrReadCachedFile(
     staticFileCache,
     filePath,
-    mtimeMs,
+    getFileVersion(stat),
     (p) => fs.readFileSync(p),
     STATIC_CACHE_MAX,
     STATIC_CACHE_FILE_LIMIT,
@@ -232,6 +243,7 @@ export function serveStaticUi(
   try {
     decodedPath = decodeURIComponent(pathname);
   } catch {
+    // error-policy:J3 A malformed URL is rejected as invalid input.
     sendJsonError(res, "Invalid URL path encoding", 400);
     return true;
   }
@@ -250,7 +262,7 @@ export function serveStaticUi(
     const stat = fs.statSync(candidatePath);
     if (stat.isFile()) {
       const ext = path.extname(candidatePath).toLowerCase();
-      const body = getCachedFile(candidatePath, stat.mtimeMs);
+      const body = getCachedFile(candidatePath, stat);
       const isPreviewOrBinaryAsset =
         relativePath.startsWith("vrms/previews/") ||
         relativePath.startsWith("vrms/backgrounds/") ||
@@ -291,8 +303,10 @@ export function serveStaticUi(
       );
       return true;
     }
-  } catch {
-    // Missing file falls through to SPA index fallback below.
+  } catch (error) {
+    // error-policy:J4 A missing route file is the expected signal to try the
+    // SPA entry point; other filesystem failures must remain observable.
+    if (!isMissingPathError(error)) throw error;
   }
 
   // Only serve the SPA index.html for navigation-like requests (no file extension
@@ -301,7 +315,18 @@ export function serveStaticUi(
   const reqExt = path.extname(decodedPath).toLowerCase();
   if (reqExt && reqExt !== ".html") return false;
 
-  if (!uiIndexHtml) return false;
+  const indexPath = path.join(root, "index.html");
+  let uiIndexHtml: Buffer;
+  try {
+    const indexStat = fs.statSync(indexPath);
+    if (!indexStat.isFile()) return false;
+    uiIndexHtml = getCachedFile(indexPath, indexStat);
+  } catch (error) {
+    // error-policy:J4 A rebuild may briefly remove the SPA entry point; only
+    // that expected unavailable state degrades to an unhandled route.
+    if (!isMissingPathError(error)) throw error;
+    return false;
+  }
 
   // When served behind a reverse proxy that rewrites the app under a path prefix,
   // inject the API base so the UI client sends requests to the correct path prefix.

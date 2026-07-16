@@ -1,17 +1,25 @@
 /**
- * Token-injection gating for the served dashboard HTML.
- *
- * The dashboard `index.html` is served pre-auth, so embedding the
- * full-capability API token into it is a capability grant. These tests pin the
- * gate: the token is injected only for cloud-provisioned containers or when an
- * operator explicitly opts in with `ELIZA_FORCE_INJECT_TOKEN`, and the opt-in
- * uses the canonical truthy parser (not a strict `=== "1"`).
+ * Exercises dashboard HTML serving, including pre-auth capability injection
+ * and real filesystem replacement of the SPA entry point.
  */
 
+import {
+  mkdir,
+  mkdtemp,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   injectApiBaseIntoHtml,
   resolveInjectedDashboardToken,
+  serveStaticUi,
 } from "./static-file-server.ts";
 
 const TOKEN_ENV = "ELIZA_API_TOKEN";
@@ -122,5 +130,86 @@ describe("injectApiBaseIntoHtml web-push VAPID public key", () => {
       undefined,
     ).toString("utf-8");
     expect(out).not.toContain("webPushVapidPublicKey");
+  });
+});
+
+async function listenOnLoopback(server: Server): Promise<string> {
+  await new Promise<void>((resolve, reject) => {
+    const handleError = (error: Error) => reject(error);
+    server.once("error", handleError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", handleError);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected the static UI test server to bind a TCP port");
+  }
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+    server.closeAllConnections();
+  });
+}
+
+describe("serveStaticUi SPA index refresh", () => {
+  it("serves a replaced index file on the next navigation even when its mtime is preserved", async () => {
+    const originalCwd = process.cwd();
+    const originalNodeEnv = process.env.NODE_ENV;
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "eliza-static-ui-"));
+    const distDir = path.join(tempRoot, "packages", "app", "dist");
+    const indexPath = path.join(distDir, "index.html");
+    const replacementPath = path.join(distDir, "index.next.html");
+    const fixedTimestamp = new Date("2026-01-02T03:04:05.000Z");
+    const firstHtml =
+      '<!doctype html><html><head><script type="module" src="/assets/main-oldhash.js"></script></head></html>';
+    const secondHtml =
+      '<!doctype html><html><head><script type="module" src="/assets/main-newhash.js"></script></head></html>';
+    let server: Server | undefined;
+
+    try {
+      await mkdir(distDir, { recursive: true });
+      await writeFile(indexPath, firstHtml);
+      await utimes(indexPath, fixedTimestamp, fixedTimestamp);
+      process.chdir(tempRoot);
+      process.env.NODE_ENV = "production";
+
+      server = createServer((req, res) => {
+        const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+        if (!serveStaticUi(req, res, pathname)) {
+          res.writeHead(404);
+          res.end("Not found");
+        }
+      });
+      const baseUrl = await listenOnLoopback(server);
+
+      const firstResponse = await fetch(`${baseUrl}/settings`);
+      expect(firstResponse.status).toBe(200);
+      expect(await firstResponse.text()).toContain("main-oldhash.js");
+
+      await writeFile(replacementPath, secondHtml);
+      await utimes(replacementPath, fixedTimestamp, fixedTimestamp);
+      const firstStat = await stat(indexPath);
+      await rename(replacementPath, indexPath);
+      const secondStat = await stat(indexPath);
+      expect(secondStat.mtimeMs).toBe(firstStat.mtimeMs);
+
+      const secondResponse = await fetch(`${baseUrl}/chat`);
+      expect(secondResponse.status).toBe(200);
+      const secondBody = await secondResponse.text();
+      expect(secondBody).toContain("main-newhash.js");
+      expect(secondBody).not.toContain("main-oldhash.js");
+    } finally {
+      if (server?.listening) await closeServer(server);
+      process.chdir(originalCwd);
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 });

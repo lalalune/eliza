@@ -83,7 +83,7 @@ export function pushWithBatchEvict<T>(
 
 interface CachedFile {
   body: Buffer;
-  mtimeMs: number;
+  version: string;
 }
 
 /**
@@ -92,7 +92,7 @@ interface CachedFile {
  *
  * @param cache         - The Map serving as the LRU-ish cache.
  * @param filePath      - Absolute path to the file.
- * @param mtimeMs       - File's last-modified time (for invalidation).
+ * @param version       - Filesystem identity used for invalidation.
  * @param readFile      - Callback that reads the file (injected for testing).
  * @param maxEntries    - Maximum number of cached files.
  * @param fileSizeLimit - Maximum file size (bytes) eligible for caching.
@@ -100,13 +100,13 @@ interface CachedFile {
 export function getOrReadCachedFile(
   cache: Map<string, CachedFile>,
   filePath: string,
-  mtimeMs: number,
+  version: string,
   readFile: (p: string) => Buffer,
   maxEntries: number,
   fileSizeLimit: number,
 ): Buffer {
   const cached = cache.get(filePath);
-  if (cached && cached.mtimeMs === mtimeMs) return cached.body;
+  if (cached && cached.version === version) return cached.body;
 
   const body = readFile(filePath);
   if (body.length <= fileSizeLimit) {
@@ -114,7 +114,7 @@ export function getOrReadCachedFile(
       const firstKey = cache.keys().next().value;
       if (firstKey !== undefined) cache.delete(firstKey);
     }
-    cache.set(filePath, { body, mtimeMs });
+    cache.set(filePath, { body, version });
   }
   return body;
 }
