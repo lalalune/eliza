@@ -1,10 +1,9 @@
 // @vitest-environment jsdom
 
 /**
- * Regression guard for #16242: a fresh, unauthenticated visit to the shared
- * Eliza Cloud web app must issue ZERO protected agent probes before sign-in
- * (each 401s and Chromium logs it as a console error). Two layers are proven
- * against the REAL hooks + gate — not a mock of the gate:
+ * Protected agent loaders must issue zero requests before `/api/auth/me`
+ * establishes a session, including on authenticated self-hosted origins. Two
+ * layers are proven against the real hooks and gate:
  *
  *   - the pure gate decisions (`protectedAgentProbesEnabled`,
  *     `shouldProbeExistingLocalInstall`) that govern every gated call site, and
@@ -12,8 +11,8 @@
  *     `GET /api/commands` + `/api/custom-actions` catalog fetches — asserted by
  *     spying on the actual network functions the hooks call.
  *
- * The gate stays inert off the Cloud origin (localhost/self-hosted/desktop),
- * so probes fire there exactly as before.
+ * Trusted local agents publish an authenticated local session through the same
+ * auth snapshot, so they use the identical gate rather than an origin bypass.
  */
 
 import { act, cleanup, render, waitFor } from "@testing-library/react";
@@ -155,21 +154,9 @@ afterEach(() => {
 });
 
 describe("protectedAgentProbesEnabled (pure gate — #16242)", () => {
-  it("blocks probes only on a bare, unauthenticated Cloud control-plane origin", () => {
-    expect(protectedAgentProbesEnabled(false, CLOUD_APP_ORIGIN)).toBe(false);
-    expect(protectedAgentProbesEnabled(false, "https://elizacloud.ai")).toBe(
-      false,
-    );
-    // A session flips the gate open even on the Cloud origin.
-    expect(protectedAgentProbesEnabled(true, CLOUD_APP_ORIGIN)).toBe(true);
-    // Self-hosted / local / desktop origins never require cloud auth.
-    expect(protectedAgentProbesEnabled(false, "http://localhost:2138")).toBe(
-      true,
-    );
-    expect(
-      protectedAgentProbesEnabled(false, "https://agent.example.com"),
-    ).toBe(true);
-    expect(protectedAgentProbesEnabled(false, null)).toBe(true);
+  it("opens only after the auth snapshot carries a session", () => {
+    expect(protectedAgentProbesEnabled(false)).toBe(false);
+    expect(protectedAgentProbesEnabled(true)).toBe(true);
   });
 });
 
@@ -200,11 +187,16 @@ describe("useProtectedAgentProbesEnabled (live hook)", () => {
     await waitFor(() => expect(seen.at(-1)).toBe(true));
   });
 
-  it("is true on a localhost origin regardless of auth", () => {
+  it("holds on localhost until the trusted-local auth session resolves", async () => {
     setLocation("http://localhost:2138/");
     const seen: boolean[] = [];
     render(<GateProbe onValue={(v) => seen.push(v)} />);
-    expect(seen.at(-1)).toBe(true);
+    expect(seen.at(-1)).toBe(false);
+
+    act(() => {
+      authenticate();
+    });
+    await waitFor(() => expect(seen.at(-1)).toBe(true));
   });
 });
 
@@ -222,9 +214,15 @@ describe("useRuntimeMode — GET /api/runtime/mode gated (#16242)", () => {
     await waitFor(() => expect(runtimeModeMock).toHaveBeenCalledTimes(1));
   });
 
-  it("probes on mount on a non-Cloud origin (unchanged behavior)", async () => {
-    setLocation("http://localhost:2138/");
+  it("also waits for auth on a self-hosted origin", async () => {
+    setLocation("https://agent.example.com/");
     render(<RuntimeModeProbe />);
+    await Promise.resolve();
+    expect(runtimeModeMock).not.toHaveBeenCalled();
+
+    act(() => {
+      authenticate();
+    });
     await waitFor(() => expect(runtimeModeMock).toHaveBeenCalledTimes(1));
   });
 });
@@ -246,9 +244,16 @@ describe("useSlashCommandController — command catalog gated (#16242)", () => {
     });
   });
 
-  it("fetches the catalog on mount on a non-Cloud origin (unchanged behavior)", async () => {
-    setLocation("http://localhost:2138/");
+  it("also waits for auth on a self-hosted origin", async () => {
+    setLocation("https://agent.example.com/");
     render(<SlashProbe />);
+    await Promise.resolve();
+    expect(listCommands).not.toHaveBeenCalled();
+    expect(listCustomActions).not.toHaveBeenCalled();
+
+    act(() => {
+      authenticate();
+    });
     await waitFor(() => {
       expect(listCommands).toHaveBeenCalledWith("gui");
       expect(listCustomActions).toHaveBeenCalledTimes(1);

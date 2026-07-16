@@ -80,22 +80,18 @@ let hydrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let hydrationGeneration = 0;
 let liveEventRevision = 0;
 const notificationCleanups: Array<() => void> = [];
-// One-shot re-arm: on a fresh, unauthenticated shared Cloud app there is no
-// session yet, so the protected GET /api/notifications hydrate is held to avoid
-// a 401 (#16242). This unsubscribe is set while waiting for a session and
-// cleared once hydration is re-triggered post-sign-in.
+// One-shot re-arm: without a session the protected GET /api/notifications
+// hydrate is held to avoid a 401. This unsubscribe is set while waiting for a
+// session and cleared once hydration is re-triggered post-sign-in.
 let hydrationAuthRearmUnsub: (() => void) | null = null;
 
 /**
  * Whether the inbox hydrate may hit the protected `GET /api/notifications` now.
- * Same origin-aware gate the React shell hooks use, read without a hook so the
- * store can consult it from its module-scope hydrate path.
+ * The React shell hooks use the same session gate; this module reads it without
+ * a hook so its module-scope hydrate path observes the shared auth snapshot.
  */
 function notificationProbesEnabled(): boolean {
-  return protectedAgentProbesEnabled(
-    isAuthenticatedNow(),
-    typeof window !== "undefined" ? window.location.origin : null,
-  );
+  return protectedAgentProbesEnabled(isAuthenticatedNow());
 }
 
 function emit(): void {
@@ -471,9 +467,8 @@ async function runHydrationAttempt(generation: number): Promise<void> {
 
 function requestHydration(): Promise<void> {
   if (!notificationProbesEnabled()) {
-    // No session yet on the shared Cloud app — skip the protected fetch (it
-    // would 401 and Chromium logs the console error) and re-arm once, so the
-    // inbox hydrates the moment a session lands post-sign-in (#16242).
+    // Skip the protected fetch until the shared auth snapshot carries a
+    // session, then hydrate immediately after sign-in.
     if (!hydrationAuthRearmUnsub) {
       hydrationAuthRearmUnsub = subscribeAuthStatus(() => {
         if (!notificationProbesEnabled()) return;
