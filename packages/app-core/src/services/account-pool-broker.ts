@@ -227,6 +227,15 @@ function retryUntilMs(now: number, retryAfterMs: number | undefined): number {
   return now + Math.min(retryAfterMs, MAX_RETRY_AFTER_MS);
 }
 
+// Reports arrive from external callers, so `errorCode` is genuinely optional;
+// an absent code simply never matches a classification pattern.
+function errorCodeMatches(
+  errorCode: string | undefined,
+  pattern: RegExp,
+): boolean {
+  return errorCode !== undefined && pattern.test(errorCode);
+}
+
 function reportIsAuthFailure(report: AccountPoolBrokerReportRequest): boolean {
   if (report.httpStatus === 401 || report.httpStatus === 403) return true;
   return report.errorCode ? isAuthFailure(report.errorCode) : false;
@@ -234,7 +243,7 @@ function reportIsAuthFailure(report: AccountPoolBrokerReportRequest): boolean {
 
 function reportIsRateLimit(report: AccountPoolBrokerReportRequest): boolean {
   if (report.httpStatus === 429) return true;
-  return /rate.?limit|quota|subscription/i.test(report.errorCode ?? "");
+  return errorCodeMatches(report.errorCode, /rate.?limit|quota|subscription/i);
 }
 
 function reportIsTransient(report: AccountPoolBrokerReportRequest): boolean {
@@ -245,8 +254,9 @@ function reportIsTransient(report: AccountPoolBrokerReportRequest): boolean {
   ) {
     return true;
   }
-  return /\b(timeout|timed.?out|overload|unavailable|reset|network)\b/i.test(
-    report.errorCode ?? "",
+  return errorCodeMatches(
+    report.errorCode,
+    /\b(timeout|timed.?out|overload|unavailable|reset|network)\b/i,
   );
 }
 
@@ -279,9 +289,9 @@ function normalizeReportCause(
       reason:
         typeof status === "number" && status >= 500 && status <= 599
           ? "http_5xx"
-          : /\b(timeout|timed.?out)\b/i.test(report.errorCode ?? "")
+          : errorCodeMatches(report.errorCode, /\b(timeout|timed.?out)\b/i)
             ? "timeout"
-            : /\b(network|reset)\b/i.test(report.errorCode ?? "")
+            : errorCodeMatches(report.errorCode, /\b(network|reset)\b/i)
               ? "network"
               : "transient_error",
     };
@@ -380,7 +390,8 @@ export class AccountPoolBroker {
   ): Promise<AccountPoolBrokerLeaseResponse | null> {
     this.pruneExpired();
     const now = this.now();
-    const exclude = new Set(request.exclude ?? []);
+    // Set() treats an absent exclude list as empty — no fallback needed.
+    const exclude = new Set(request.exclude);
     const pinned = this.resolveSessionPin(request.sessionKey);
     const configured = selectionForProvider(request.providerId);
     const account =
@@ -622,9 +633,15 @@ export class AccountPoolBroker {
   snapshot(): AccountPoolBrokerSnapshot {
     this.pruneExpired();
     const activeCounts = new Map<string, number>();
+    // A key absent from the counter map means zero active leases by
+    // construction — the map is populated solely from live leases.
+    const activeCountFor = (key: string): number => {
+      const count = activeCounts.get(key);
+      return count === undefined ? 0 : count;
+    };
     for (const lease of this.byLeaseId.values()) {
       const key = observabilityAccountKey(lease.providerId, lease.accountId);
-      activeCounts.set(key, (activeCounts.get(key) ?? 0) + 1);
+      activeCounts.set(key, activeCountFor(key) + 1);
     }
 
     const accounts: AccountPoolBrokerSnapshot["accounts"] = {};
@@ -632,7 +649,7 @@ export class AccountPoolBroker {
       const key = observabilityAccountKey(account.providerId, account.id);
       const state = this.accountObservability.get(key);
       accounts[key] = {
-        activeLeaseCount: activeCounts.get(key) ?? 0,
+        activeLeaseCount: activeCountFor(key),
         lastLease: state?.lastLease ?? null,
         lastLeaseAt: state?.lastLease?.atMs ?? null,
         lastReportedStatus: state?.lastReportedStatus ?? null,
@@ -640,7 +657,7 @@ export class AccountPoolBroker {
     }
     for (const [key, state] of this.accountObservability) {
       accounts[key] ??= {
-        activeLeaseCount: activeCounts.get(key) ?? 0,
+        activeLeaseCount: activeCountFor(key),
         lastLease: state.lastLease,
         lastLeaseAt: state.lastLease?.atMs ?? null,
         lastReportedStatus: state.lastReportedStatus,
@@ -654,11 +671,10 @@ export class AccountPoolBroker {
     ]);
     const providers: AccountPoolBrokerSnapshot["providers"] = {};
     for (const providerId of providerIds) {
+      const recentFailovers = this.recentFailoversByProvider.get(providerId);
       providers[providerId] = {
         lastSelection: this.lastSelectionByProvider.get(providerId) ?? null,
-        recentFailovers: [
-          ...(this.recentFailoversByProvider.get(providerId) ?? []),
-        ],
+        recentFailovers: recentFailovers ? [...recentFailovers] : [],
       };
     }
     return { accounts, providers };
@@ -703,8 +719,8 @@ export class AccountPoolBroker {
       cause: pending.cause,
       ...(pending.model ? { model: pending.model } : {}),
     };
-    const recent = this.recentFailoversByProvider.get(lease.providerId) ?? [];
-    recent.push(failover);
+    const existing = this.recentFailoversByProvider.get(lease.providerId);
+    const recent = existing ? [...existing, failover] : [failover];
     this.recentFailoversByProvider.set(
       lease.providerId,
       recent.slice(-MAX_RECENT_FAILOVERS),
