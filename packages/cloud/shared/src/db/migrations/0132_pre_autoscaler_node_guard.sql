@@ -1,5 +1,5 @@
 -- Databases that missed the one-time infrastructure transition must stop for
--- operator review instead of carrying oversized, offline capacity into the
+-- operator review instead of carrying oversized capacity into the
 -- autoscaler. Already-migrated databases retain their existing journal cursor.
 
 DO $$
@@ -9,12 +9,11 @@ BEGIN
       SELECT 1
       FROM docker_nodes
       WHERE enabled = true
-        AND status = 'offline'
         AND capacity > 8
         AND created_at < TIMESTAMPTZ '2026-05-22 00:00:00+00'
     ) THEN
       RAISE EXCEPTION
-        'migration 0132: pre-autoscaler offline nodes require explicit operator review';
+        'migration 0132: pre-autoscaler nodes require explicit operator review';
     END IF;
   END IF;
 END $$;

@@ -122,11 +122,11 @@ describe("pre-autoscaler node migration guard", () => {
       await createDockerNodesTable(database);
       await database.exec(`
         INSERT INTO docker_nodes (node_id, capacity, enabled, status, created_at)
-        VALUES ('pre-autoscaler-node', 100, true, 'offline', '2026-03-15T00:00:00Z');
+        VALUES ('pre-autoscaler-node', 100, true, 'healthy', '2026-03-15T00:00:00Z');
       `);
 
       await expect(database.exec(migrationSql)).rejects.toThrow(
-        /pre-autoscaler offline nodes require explicit operator review/,
+        /pre-autoscaler nodes require explicit operator review/,
       );
       const nodes = await database.query<{ capacity: number; enabled: boolean }>(
         "SELECT capacity, enabled FROM docker_nodes",
@@ -148,8 +148,7 @@ describe("pre-autoscaler node migration guard", () => {
         VALUES
           ('bounded', 8, true, 'offline', '2026-03-15T00:00:00Z'),
           ('cutoff', 100, true, 'offline', '2026-05-22T00:00:00Z'),
-          ('disabled', 100, false, 'offline', '2026-03-15T00:00:00Z'),
-          ('healthy', 100, true, 'healthy', '2026-03-15T00:00:00Z');
+          ('disabled', 100, false, 'offline', '2026-03-15T00:00:00Z');
       `);
 
       await database.exec(migrationSql);
@@ -168,7 +167,6 @@ describe("pre-autoscaler node migration guard", () => {
           enabled: false,
           status: "offline",
         },
-        { node_id: "healthy", capacity: 100, enabled: true, status: "healthy" },
       ]);
     } finally {
       await database.close();
