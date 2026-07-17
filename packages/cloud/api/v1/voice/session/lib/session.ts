@@ -36,7 +36,10 @@ import type {
   VoiceUsageLimits,
   VoiceUsageStore,
 } from "@/lib/services/voice-usage-meter";
-import { streamElizaConversation } from "@/lib/voice-session/eliza-sse-bridge";
+import {
+  ElizaSseBridgeError,
+  streamElizaConversation,
+} from "@/lib/voice-session/eliza-sse-bridge";
 import { PhraseAggregator } from "@/lib/voice-session/phrase-aggregator";
 import type { ServerControlFrame } from "@/lib/voice-session/protocol";
 import {
@@ -523,6 +526,8 @@ export class VoiceSession implements LiveVoiceSession, VoiceSessionLike {
           transcript,
           agentId: this.config.agentId,
           conversationId: this.config.conversationId,
+          organizationId: this.config.organizationId,
+          userId: this.config.userId,
           traceId,
           signal: abort.signal,
           fetchImpl: this.config.fetchImpl,
@@ -590,10 +595,24 @@ export class VoiceSession implements LiveVoiceSession, VoiceSessionLike {
       // error-policy:J1 boundary translation — the LLM/TTS turn is the async
       // boundary; provider failures become a structured client `error` frame.
       if (this.currentVoiceTurnId !== traceId) return;
+      const bridgeError =
+        error instanceof ElizaSseBridgeError ? error : undefined;
       this.send({
         t: "error",
-        code: error instanceof Error ? error.name : "llm_error",
-        retryable: true,
+        code:
+          bridgeError?.upstreamCode
+            ? bridgeError.upstreamCode
+            : error instanceof Error
+              ? error.name
+              : "llm_error",
+        retryable: bridgeError ? bridgeError.retryable : true,
+        ...(bridgeError?.status ? { upstreamStatus: bridgeError.status } : {}),
+        ...(bridgeError?.upstreamMessage
+          ? { upstreamMessage: bridgeError.upstreamMessage }
+          : {}),
+        ...(bridgeError?.upstreamSnippet
+          ? { upstreamSnippet: bridgeError.upstreamSnippet }
+          : {}),
       });
       this.finishTurn(traceId);
     }
