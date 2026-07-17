@@ -19,7 +19,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   AgentContext,
   AgentRuntime,
-  JsonValue,
   Plugin,
   PluginEventRegistration,
   PluginModelRegistration,
@@ -641,19 +640,6 @@ async function migratePluginSchemasIfReady(
     }
   }
 
-  const normalizedSchema: Record<string, JsonValue> = {};
-  for (const [key, value] of Object.entries(plugin.schema)) {
-    if (
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean" ||
-      value === null ||
-      (typeof value === "object" && value !== null)
-    ) {
-      normalizedSchema[key] = value as JsonValue;
-    }
-  }
-
   const isProduction = process.env.NODE_ENV === "production";
   const previous = pluginMigrationQueues.get(adapter);
   // error-policy:J5 the registering caller awaits and observes its own
@@ -662,7 +648,7 @@ async function migratePluginSchemasIfReady(
     ? previous.catch(() => undefined)
     : Promise.resolve();
   const turn = readyForTurn.then(() =>
-    runPluginMigrations([{ name: plugin.name, schema: normalizedSchema }], {
+    runPluginMigrations([{ name: plugin.name, schema: plugin.schema }], {
       verbose: !isProduction,
       force: process.env.ELIZA_ALLOW_DESTRUCTIVE_MIGRATIONS === "true",
       dryRun: false,

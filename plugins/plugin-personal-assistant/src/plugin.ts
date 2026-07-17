@@ -9,6 +9,7 @@
  * default packs into a runnable Eliza plugin; it owns no domain logic itself.
  */
 import {
+  ElizaError,
   type EventPayload,
   EventType,
   getDefaultTriageService,
@@ -1081,8 +1082,13 @@ const rawPersonalAssistantPlugin: Plugin = {
         ScheduledTaskSeedService.serviceType,
       );
       if (schedulingIsRegistered && !seedServiceIsRegistered) {
-        throw new Error(
+        throw new ElizaError(
           "@elizaos/plugin-scheduling is registered without its seed service",
+          {
+            code: "SCHEDULED_TASK_SEED_SERVICE_MISSING",
+            context: { plugin: "@elizaos/plugin-scheduling" },
+            severity: "fatal",
+          },
         );
       }
       const activeSeedService = runtime.getService(
@@ -1090,8 +1096,15 @@ const rawPersonalAssistantPlugin: Plugin = {
       );
       if (activeSeedService) {
         if (!(activeSeedService instanceof ScheduledTaskSeedService)) {
-          throw new Error(
+          throw new ElizaError(
             "Scheduled-task seed service resolved to an unexpected implementation",
+            {
+              code: "SCHEDULED_TASK_SEED_SERVICE_INVALID",
+              context: {
+                serviceType: ScheduledTaskSeedService.serviceType,
+              },
+              severity: "fatal",
+            },
           );
         }
         await activeSeedService.seed();
@@ -1106,8 +1119,15 @@ const rawPersonalAssistantPlugin: Plugin = {
               ScheduledTaskSeedService.serviceType,
             );
             if (!(seedService instanceof ScheduledTaskSeedService)) {
-              throw new Error(
+              throw new ElizaError(
                 "Scheduled-task seed service resolved to an unexpected implementation",
+                {
+                  code: "SCHEDULED_TASK_SEED_SERVICE_INVALID",
+                  context: {
+                    serviceType: ScheduledTaskSeedService.serviceType,
+                  },
+                  severity: "fatal",
+                },
               );
             }
             await seedService.seed();

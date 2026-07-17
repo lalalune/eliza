@@ -3,7 +3,7 @@
  * Keeping seeding in its own service makes runner readiness a structural
  * dependency instead of a microtask race with plugin service registration.
  */
-import { type IAgentRuntime, Service } from "@elizaos/core";
+import { ElizaError, type IAgentRuntime, Service } from "@elizaos/core";
 import { buildFallbackDefaultPack } from "./default-pack.js";
 import {
   getScheduledTaskRunner,
@@ -48,7 +48,11 @@ export class ScheduledTaskSeedService extends Service {
   async seed(): Promise<void> {
     const runtime = this.runtime;
     if (!runtime) {
-      throw new Error("ScheduledTaskSeedService has no bound runtime");
+      throw new ElizaError("ScheduledTaskSeedService has no bound runtime", {
+        code: "SCHEDULED_TASK_SEED_RUNTIME_MISSING",
+        context: { serviceType: SCHEDULED_TASK_SEED_SERVICE_TYPE },
+        severity: "fatal",
+      });
     }
     const packs = getDefaultTaskPacks(runtime);
     const hasConsumerPack = packs.some((pack) => pack.fallback !== true);

@@ -44,7 +44,7 @@ describe("computeCanRespond", () => {
 });
 
 describe("summarizeServiceHealth", () => {
-  it("separates registered, in-flight, and failed services for boot probes", () => {
+  it("separates lifecycle states and fails closed on an unknown service", () => {
     const runtime = {
       getServiceHealth: () => ({
         database: { status: "registered", instances: 1, hasPromise: true },
@@ -54,7 +54,7 @@ describe("summarizeServiceHealth", () => {
           instances: 0,
           hasPromise: false,
         },
-        optional_unknown: {
+        inconsistent_unknown: {
           status: "unknown",
           instances: 0,
           hasPromise: false,
@@ -66,13 +66,13 @@ describe("summarizeServiceHealth", () => {
       status: "failed",
       registered: 1,
       pending: 1,
-      failed: 1,
+      failed: 2,
       pendingServices: ["scheduler"],
-      failures: ["inbox_migration"],
+      failures: ["inbox_migration", "inconsistent_unknown"],
     });
   });
 
-  it("returns an explicit zero summary before the runtime exists", () => {
+  it("returns an explicit unavailable summary before the runtime exists", () => {
     expect(summarizeServiceHealth(null)).toEqual({
       status: "unavailable",
       registered: null,

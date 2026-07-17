@@ -523,7 +523,7 @@ export function summarizeServiceHealth(
       summary.registered += 1;
       continue;
     }
-    if (health.status === "failed") {
+    if (health.status === "failed" || health.status === "unknown") {
       summary.failed += 1;
       summary.failures.push(serviceType);
       continue;
@@ -661,9 +661,13 @@ export async function handleHealthRoutes(
       }
     }
 
+    // Registration is the runtime's declaration that a service belongs in this
+    // process; optional capabilities stay unregistered. Until the service
+    // contract grows an explicit criticality tier, pending or failed registered
+    // services must fail readiness rather than recreate a false-healthy boot.
     const ready =
       runtime !== null &&
-      services.status !== "failed" &&
+      services.status === "healthy" &&
       state.agentState !== "starting" &&
       state.agentState !== "restarting";
 

@@ -4548,6 +4548,9 @@ export class AgentRuntime implements IAgentRuntime {
 					if (outcome.service && !first) first = outcome.service;
 					if (outcome.error) lastError = outcome.error;
 				}
+				// Type-level health reflects whether the capability is available. A
+				// failed sibling remains observable through reportError, but must not
+				// make a working multi-implementation capability unavailable.
 				if (first) {
 					this.serviceRegistrationStatus.set(key, "registered");
 				}
