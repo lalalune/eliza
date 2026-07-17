@@ -1,24 +1,8 @@
 /**
- * Per-runtime in-flight inference AbortController registry.
- *
- * Wave 3C's `useAppLifecycleEvents` hook (`packages/ui/src/state/
- * useAppLifecycleEvents.ts`) fires `chatAbortRef.current?.abort()` on
- * `APP_PAUSE_EVENT` to cancel UI-side streams before iOS suspends the
- * WKWebView. That covers the UI's fetch streams. This module covers the
- * runtime side: inference paths internal to the agent (the AOSP llama FFI
- * adapter, the cloud-fallback wrapper, and local model calls) can register
- * their `AbortController` here so a single hook can
- * abort ALL of them at once on pause / shutdown / account switch.
- *
- * Contract:
- *  - `trackInflight(runtime, ctrl)` returns a disposer. Callers MUST call
- *    the disposer in their `finally` block so completed calls don't keep
- *    references alive.
- *  - `abortInflightInference(runtime)` calls `.abort()` on every tracked
- *    controller for the runtime and clears the set. Returns the count so
- *    the caller can log how many were canceled.
- *  - WeakMap-keyed by runtime so per-account or test-runtime instances
- *    don't leak across each other.
+ * Compatibility registry for callers that track inference AbortControllers
+ * through app-core. Runtime inference cancellation belongs to core's
+ * TurnControllerRegistry; this WeakMap preserves the published app-core API
+ * until its next major release.
  */
 
 import type { IAgentRuntime } from "@elizaos/core";
@@ -30,10 +14,9 @@ const trackers = new WeakMap<IAgentRuntime, Set<AbortController>>();
  * Returns a disposer that removes the controller from the set; callers
  * MUST invoke it in the finally block so completed calls are GC'd.
  *
- * @deprecated Superseded by the runtime-owned registry in `@elizaos/core`
- * (`abortInflightInference` / turn-controller). Nothing registers into this
- * copy — `trackInflight` has no call sites — so aborts through this module
- * always report `{aborted: 0}`. Will be removed in the next major (#16470).
+ * @deprecated New inference paths register with the runtime-owned turn
+ * controller machinery in `@elizaos/core`. This compatibility registry will
+ * be removed in the next major release (#16470).
  */
 export function trackInflight(
   runtime: IAgentRuntime,
@@ -59,10 +42,10 @@ export function trackInflight(
  * Idempotent — calling on a runtime with no in-flight work returns
  * `{aborted: 0}` and does nothing.
  *
- * @deprecated Superseded by `@elizaos/core`'s runtime-owned registry
- * (`abortInflightInference`, re-exported from `@elizaos/core` node entry).
- * This copy is inert — nothing registers into it. Will be removed in the
- * next major (#16470).
+ * @deprecated Use `@elizaos/core`'s `abortInflightInference(runtime, reason)`.
+ * Its runtime contract and `string[]` result differ, so callers must migrate
+ * deliberately. This compatibility API will be removed in the next major
+ * release (#16470).
  */
 export function abortInflightInference(runtime: IAgentRuntime): {
   aborted: number;
@@ -83,10 +66,8 @@ export function abortInflightInference(runtime: IAgentRuntime): {
  * Inspect the current in-flight count without aborting. Used by
  * diagnostics endpoints (e.g. `/api/health` extension) and tests.
  *
- * @deprecated Superseded by `@elizaos/core`'s runtime-owned registry
- * (`abortInflightInference`, re-exported from `@elizaos/core` node entry).
- * This copy is inert — nothing registers into it. Will be removed in the
- * next major (#16470).
+ * @deprecated Inspect the runtime-owned TurnControllerRegistry instead. This
+ * compatibility API will be removed in the next major release (#16470).
  */
 export function getInflightInferenceCount(runtime: IAgentRuntime): number {
   return trackers.get(runtime)?.size ?? 0;
@@ -98,10 +79,8 @@ export function getInflightInferenceCount(runtime: IAgentRuntime): number {
  *
  * @internal
  *
- * @deprecated Superseded by `@elizaos/core`'s runtime-owned registry
- * (`abortInflightInference`, re-exported from `@elizaos/core` node entry).
- * This copy is inert — nothing registers into it. Will be removed in the
- * next major (#16470).
+ * @deprecated Core's TurnControllerRegistry owns inference cancellation. This
+ * compatibility test helper will be removed with the registry (#16470).
  */
 export function __resetInflightInferenceForTests(runtime: IAgentRuntime): void {
   trackers.delete(runtime);

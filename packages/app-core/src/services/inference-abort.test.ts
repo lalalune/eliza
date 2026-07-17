@@ -1,10 +1,5 @@
 /**
- * Pins the deprecation contract from #16470: this registry is superseded by
- * `@elizaos/core`'s runtime-owned `abortInflightInference` and is inert in
- * production (nothing calls `trackInflight`), so `abortInflightInference`
- * here must keep reporting `{aborted: 0}` for untracked runtimes, and the
- * mechanics must stay intact for any straggler external caller until the
- * deprecated module is removed in the next major.
+ * Preserves the deprecated app-core registry contract for existing importers.
  */
 import type { IAgentRuntime } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
@@ -16,11 +11,11 @@ import {
 } from "./inference-abort";
 
 function makeRuntime(): IAgentRuntime {
-  return { agentId: "test-agent" } as unknown as IAgentRuntime;
+  return { agentId: "test-agent" } as IAgentRuntime;
 }
 
 describe("inference-abort (deprecated registry, #16470)", () => {
-  it("reports {aborted: 0} for a runtime nothing registered into — the production reality", () => {
+  it("reports {aborted: 0} for an untracked runtime", () => {
     const runtime = makeRuntime();
     expect(abortInflightInference(runtime)).toEqual({ aborted: 0 });
     expect(getInflightInferenceCount(runtime)).toBe(0);

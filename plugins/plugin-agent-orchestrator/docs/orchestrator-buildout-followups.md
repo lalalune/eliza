@@ -89,8 +89,8 @@ From the fidelity review of `OrchestratorWorkbench.tsx` (largely complete; these
 - **Provider "state"**: shows policy/identity, not live health/availability.
 
 ### D. Remote / mobile for the orchestrator `[BE][FE]` — L (separate design)
-Pairing primitives exist (`auth-pairing-routes`, `tunnel-to-mobile-client`) but **no `tunnel`
-runtime service is registered** (so `runtime.getService("tunnel")` lookups and
+Pairing primitives exist in `auth-pairing-routes`, but **no `tunnel` runtime service is
+registered** (so `runtime.getService("tunnel")` lookups and
 `tunnel_authenticated_link` delivery are inert). The workbench is **polling-only**
 (`POLL_INTERVAL_MS = 5000`); there is no SSE/WS for task updates. Needs: a registered tunnel
 service (`getStatus/isActive/getUrl`), a relay decision (cloud gateway vs Headscale/ngrok per

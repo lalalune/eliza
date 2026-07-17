@@ -28,7 +28,9 @@ hardening, and the threat model below.
 ## Owner confidence
 
 - The current `scoreOwnerConfidence` weighting is **deliberately conservative**: explicit signals (recent auth, passed challenge) dominate voice similarity. Tuning belongs with the threat-model write-up.
-- Voice similarity alone must **never** authorize a protected action. The response gate (in `ambient-audio/`) uses owner confidence to decide *whether to respond*, not to decide *what authority the speaker has*.
+- Voice similarity alone must **never** authorize a protected action. Any
+  consumer may use owner confidence to decide *whether to respond*, but
+  protected-action authority still requires the explicit auth/challenge path.
 
 ## Protected actions and challenges
 
