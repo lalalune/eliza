@@ -161,6 +161,7 @@ plugins/plugin-cli-inference/
 | `ELIZA_CLI_CODEX_PLANNER_MODEL` | No | (falls back to large) | `codex-sdk` small/planner tier model |
 | `ELIZA_CLI_CODEX_REASONING_EFFORT` | No | (sdk default) | `codex-sdk`: `modelReasoningEffort` (minimal..xhigh) |
 | `ELIZA_CLI_CODEX_BIN` | No | (sdk bundled / allowlist lookup) | path to the system codex binary: REQUIRED for `codex-sdk` (bundled 0.80.0 rejects current models); also pins the cold `codex` spawn |
+| `ELIZA_CLI_SDK_TURN_TIMEOUT_MS` | No | `90000` | `claude-sdk`: per-turn wall-clock limit; explicit `0` opts out to an unbounded turn |
 | `ELIZA_CLI_TIMEOUT_MS` | No | `120000` | per-call spawn timeout (SIGTERM on expiry; CLI backends) |
 
 ## Errors

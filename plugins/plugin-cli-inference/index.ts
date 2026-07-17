@@ -1,3 +1,7 @@
+/**
+ * Registers sanctioned Claude and Codex CLI/SDK model handlers, selects the
+ * configured backend, and owns warm-session caching plus account rotation.
+ */
 import { createHash } from "node:crypto";
 import type { GenerateTextParams, IAgentRuntime, Plugin, ToolDefinition } from "@elizaos/core";
 import {
@@ -385,14 +389,15 @@ function parseTimeout(value: string | undefined): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-/** Turn-timeout parse (#16553): like {@link parseTimeout}, but an explicit
- *  `"0"` passes through as 0 — the documented operator opt-out to an
- *  unbounded turn. Unset/invalid still return undefined so the session's
- *  bounded default applies. Exported for tests. */
+/** Parse the SDK turn boundary while preserving an explicit zero as the
+ * documented operator opt-out. Invalid and unsafe integers defer to the
+ * session's bounded default. */
 export function parseTurnTimeout(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
-  const n = Number.parseInt(value, 10);
-  if (!Number.isFinite(n) || n < 0) return undefined;
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n)) return undefined;
   return n;
 }
 

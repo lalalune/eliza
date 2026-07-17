@@ -1208,8 +1208,12 @@ describe("parseTurnTimeout (#16553)", () => {
 
   it("parses a positive budget and rejects junk/negatives to undefined (bounded default applies)", () => {
     expect(parseTurnTimeout("120000")).toBe(120_000);
+    expect(parseTurnTimeout(" 120000 ")).toBe(120_000);
     expect(parseTurnTimeout(undefined)).toBeUndefined();
     expect(parseTurnTimeout("abc")).toBeUndefined();
+    expect(parseTurnTimeout("120000ms")).toBeUndefined();
+    expect(parseTurnTimeout("1.5")).toBeUndefined();
     expect(parseTurnTimeout("-5")).toBeUndefined();
+    expect(parseTurnTimeout(String(Number.MAX_SAFE_INTEGER + 1))).toBeUndefined();
   });
 });

@@ -59,9 +59,8 @@ import { ProviderApiError, parseProviderApiErrorText } from "./provider-errors";
 const DEFAULT_MODEL = "claude-opus-4-8";
 const DEFAULT_RESTART_AFTER_TURNS = 20;
 const DEFAULT_TURN_TIMEOUT_MS = 90_000;
-/** Teardown budget for `dispose()`'s interrupt ACK (#16553): long enough for a
- *  healthy CLI to acknowledge, short enough that a wedged spawn cannot wedge
- *  the turn's failure path behind it. */
+/** Healthy CLI processes acknowledge an interrupt quickly; this cap keeps a
+ * wedged control channel from blocking the provider failure boundary. */
 const DISPOSE_INTERRUPT_BUDGET_MS = 5_000;
 /** Fully-qualified names the SDK assigns our in-process MCP tools. */
 const ROUTE_TOOL = "mcp__eliza__route_action";
@@ -183,6 +182,7 @@ type SdkMessage = {
 };
 type SdkQuery = AsyncIterable<SdkMessage> & {
   interrupt?: () => Promise<void>;
+  close?: () => void;
 };
 type SdkQueryFn = (options: {
   prompt: AsyncIterable<SdkUserMessage>;
@@ -328,6 +328,7 @@ export class ClaudeSdkSession {
   private readonly zodOverride?: ZodModule;
 
   private query: SdkQuery | null = null;
+  private abortController: AbortController | null = null;
   private feed: ((msg: SdkUserMessage) => void) | null = null;
   private iterator: AsyncIterator<SdkMessage> | null = null;
   private turns = 0;
@@ -353,8 +354,8 @@ export class ClaudeSdkSession {
       config.restartAfterTurns && config.restartAfterTurns > 0
         ? config.restartAfterTurns
         : DEFAULT_RESTART_AFTER_TURNS;
-    // Explicit 0 = operator opt-out to unbounded (#16553); unset/invalid
-    // falls to the bounded default so a hung spawn can never wedge by default.
+    // Zero is an explicit operator opt-out; every implicit configuration stays
+    // bounded so a hung spawn cannot serialize later turns indefinitely.
     this.turnTimeoutMs =
       config.turnTimeoutMs === 0
         ? 0
@@ -562,7 +563,11 @@ export class ClaudeSdkSession {
       options.allowedTools = [];
       options.disallowedTools = [];
     }
-    this.query = sdk.query({ prompt: promptStream(), options });
+    const abortController = new AbortController();
+    options.abortController = abortController;
+    const query = sdk.query({ prompt: promptStream(), options });
+    this.abortController = abortController;
+    this.query = query;
     this.iterator = this.query[Symbol.asyncIterator]();
     this.turns = 0;
     logger.debug(
@@ -580,7 +585,8 @@ export class ClaudeSdkSession {
     if (!iterator) {
       throw new Error("[cli-inference:sdk] session not started");
     }
-    // Explicit operator opt-out (#16553): no timer, the read is unbounded.
+    // The explicit operator opt-out has no timer; implicit values never reach
+    // this branch.
     if (this.turnTimeoutMs === 0) {
       return iterator.next();
     }
@@ -744,18 +750,17 @@ export class ClaudeSdkSession {
   /**
    * Tear down the warm session (on restart, error, or dispose).
    *
-   * BOUNDED (#16553): `query.interrupt()` sends a control request to the CLI
-   * process and awaits its acknowledgement — a wedged spawn (version-mismatch
-   * download, OAuth refresh hang) never ACKs, so an unbounded await here
-   * swallowed the turn-timeout rejection behind it and serialized the whole
-   * inbound pipeline until an operator restart. The teardown races a short
-   * budget; on expiry the interrupt is abandoned (the session references are
-   * already nulled, so the next turn respawns cleanly) and the wedge is
-   * logged instead of inherited.
+   * `query.interrupt()` is a graceful control request and can itself block when
+   * the child cannot acknowledge commands. Its wait is capped; `query.close()`
+   * then forcefully terminates the query and subprocess, while the abort
+   * controller independently closes transport resources. Session references
+   * are cleared first so a later turn always starts a fresh query.
    */
   async dispose(): Promise<void> {
     const q = this.query;
+    const abortController = this.abortController;
     this.query = null;
+    this.abortController = null;
     this.iterator = null;
     this.feed = null;
     this.turns = 0;
@@ -774,19 +779,46 @@ export class ClaudeSdkSession {
                   model: this.model,
                   mode: this.mode,
                 },
-                `[cli-inference:sdk] abandoning interrupt of a wedged session after ${DISPOSE_INTERRUPT_BUDGET_MS}ms`
+                `[cli-inference:sdk] interrupt exceeded ${DISPOSE_INTERRUPT_BUDGET_MS}ms; forcing SDK abort`
               );
               resolve();
             }, DISPOSE_INTERRUPT_BUDGET_MS);
             timer.unref?.();
           }),
         ]);
-      } catch {
+      } catch (error) {
         // error-policy:J6 best-effort teardown — interrupting an already-dead
-        // query on dispose; failure here does not matter (the session is discarded).
+        // query can fail; the abort below remains the authoritative cleanup.
+        logger.debug(
+          {
+            src: "cli-inference:sdk",
+            model: this.model,
+            mode: this.mode,
+            error,
+          },
+          "warm Claude SDK interrupt failed during teardown"
+        );
       } finally {
         if (timer) clearTimeout(timer);
       }
     }
+    if (q?.close) {
+      try {
+        q.close();
+      } catch (error) {
+        // error-policy:J6 forced query teardown may race an SDK-side close; the
+        // abort controller below remains an independent cleanup path.
+        logger.warn(
+          {
+            src: "cli-inference:sdk",
+            model: this.model,
+            mode: this.mode,
+            error,
+          },
+          "warm Claude SDK query close failed during teardown"
+        );
+      }
+    }
+    abortController?.abort();
   }
 }

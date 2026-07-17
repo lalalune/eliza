@@ -1,14 +1,10 @@
+/**
+ * Exercises warm Claude SDK session behavior with an in-process fake SDK; no
+ * model or Claude subprocess runs in this deterministic unit harness.
+ */
 import { describe, expect, it, vi } from "vitest";
 import { ClaudeSdkSession, type SdkModule } from "../src/claude-sdk-session";
 import { ProviderApiError } from "../src/provider-errors";
-
-/**
- * Unit tests for the warm Agent SDK session, driven by a FAKE SdkModule via the
- * constructor's injectable `sdkModule` / `zodModule` seam (no real SDK, no real
- * `claude` process). Each "turn script" describes what the fake SDK does for one
- * turn: optionally invoke the in-process route tool handler (to set a decision),
- * optionally stream assistant text, then emit a terminal `result` with a subtype.
- */
 
 interface TurnScript {
   /** Never yield a message, used to test the per-turn timeout budget. */
@@ -39,9 +35,11 @@ function makeFakeSdk(
 ): {
   sdk: SdkModule;
   starts: () => number;
+  closes: () => number;
   queryOptions: () => Array<Record<string, unknown>>;
 } {
   let startCount = 0;
+  let closeCount = 0;
   const startedOptions: Array<Record<string, unknown>> = [];
   // Script progression is GLOBAL across query restarts: a self-heal/restart
   // creates a fresh query() but should continue consuming the next scripted
@@ -90,10 +88,18 @@ function makeFakeSdk(
       return {
         [Symbol.asyncIterator]: () => iter,
         interrupt: fakeOpts.interrupt ?? (async () => {}),
+        close: () => {
+          closeCount += 1;
+        },
       } as unknown as ReturnType<SdkModule["query"]>;
     },
   };
-  return { sdk, starts: () => startCount, queryOptions: () => startedOptions };
+  return {
+    sdk,
+    starts: () => startCount,
+    closes: () => closeCount,
+    queryOptions: () => startedOptions,
+  };
 }
 
 const fakeZod = {
@@ -110,7 +116,7 @@ function makeSession(
     interrupt?: () => Promise<void>;
   } = {}
 ) {
-  const { sdk, starts, queryOptions } = makeFakeSdk(scripts, {
+  const { sdk, starts, closes, queryOptions } = makeFakeSdk(scripts, {
     interrupt: opts.interrupt,
   });
   const session = new ClaudeSdkSession({
@@ -123,7 +129,7 @@ function makeSession(
     sdkModule: sdk,
     zodModule: fakeZod,
   });
-  return { session, starts, queryOptions };
+  return { session, starts, closes, queryOptions };
 }
 
 describe("ClaudeSdkSession — TEXT mode", () => {
@@ -212,14 +218,11 @@ describe("ClaudeSdkSession — TEXT mode", () => {
   });
 
   it("a wedged interrupt cannot swallow the turn-timeout rejection (#16553)", async () => {
-    // The production incident shape: the turn hangs AND the CLI process never
-    // ACKs the interrupt. The 90s timer used to fire into a catch that awaited
-    // dispose() → interrupt() unboundedly, so the turn never rejected and the
-    // whole inbound pipeline serialized behind it. The bounded teardown must
-    // abandon the wedged interrupt and let the timeout surface.
+    // A turn and its interrupt control request can wedge together. The teardown
+    // budget must surface the provider error and abort the underlying query.
     vi.useFakeTimers();
     try {
-      const { session } = makeSession([{ hang: true }], {
+      const { session, closes, queryOptions } = makeSession([{ hang: true }], {
         turnTimeoutMs: 5_000,
         interrupt: () => new Promise<void>(() => undefined), // never ACKs
       });
@@ -228,9 +231,31 @@ describe("ClaudeSdkSession — TEXT mode", () => {
       await vi.advanceTimersByTimeAsync(5_000); // turn timeout fires
       await vi.advanceTimersByTimeAsync(5_000); // dispose teardown budget expires
       await settled;
+      const controller = queryOptions()[0]?.abortController;
+      expect(controller).toBeInstanceOf(AbortController);
+      if (!(controller instanceof AbortController)) {
+        throw new Error("expected the SDK query abort controller");
+      }
+      expect(closes()).toBe(1);
+      expect(controller.signal.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("dispose aborts the SDK query after a healthy interrupt acknowledgement", async () => {
+    const { session, closes, queryOptions } = makeSession([{ text: "done", subtype: "success" }]);
+    expect(await session.send("hi")).toBe("done");
+    const controller = queryOptions()[0]?.abortController;
+    expect(controller).toBeInstanceOf(AbortController);
+    if (!(controller instanceof AbortController)) {
+      throw new Error("expected the SDK query abort controller");
+    }
+
+    await session.dispose();
+
+    expect(closes()).toBe(1);
+    expect(controller.signal.aborted).toBe(true);
   });
 
   it("explicit turnTimeoutMs 0 opts out to an unbounded turn (#16553)", async () => {
