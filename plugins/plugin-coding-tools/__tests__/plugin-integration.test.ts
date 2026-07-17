@@ -61,11 +61,20 @@ describe("@elizaos/plugin-coding-tools — plugin export shape", () => {
     }
   });
 
-  it("FILE exposes only canonical file umbrella similes", () => {
+  it("maps the Stage-1 file-operation hint family to the FILE parent", () => {
     const fileAction = (codingToolsPlugin.actions ?? []).find(
       (action) => action.name === "FILE",
     );
-    expect(fileAction?.similes).toEqual(["FILE_OPERATION", "FILE_IO"]);
+    expect(fileAction?.similes).toEqual([
+      "FILE_OPERATION",
+      "FILE_IO",
+      "FILES_READ",
+      "FILES_LIST",
+      "FILE_READ",
+      "FILE_LIST",
+      "READ_FILE",
+      "LIST_FILES",
+    ]);
   });
 
   it("each action has the required fields", () => {
