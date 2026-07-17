@@ -11,7 +11,7 @@ import {
   openAppPath,
   seedAppStorage,
 } from "./helpers";
-import { DYNAMIC_VIEW_CASES, type ViewCase } from "./plugin-view-cases";
+import { SMOKE_VIEW_CASES, type ViewCase } from "./plugin-view-cases";
 
 async function expectLoadedView(page: Page, view: ViewCase, phase: string) {
   const viewRoot = page.locator("main").first();
@@ -111,11 +111,11 @@ test.describe("registered plugin view lifecycle coverage", () => {
     });
 
     expect([...new Set(registryIds)].sort()).toEqual(
-      DYNAMIC_VIEW_CASES.map(({ id }) => id).sort(),
+      SMOKE_VIEW_CASES.map(({ id }) => id).sort(),
     );
   });
 
-  for (const view of DYNAMIC_VIEW_CASES) {
+  for (const view of SMOKE_VIEW_CASES) {
     test(`${view.id} ${view.viewType} loads, unmounts, reopens, and reloads cleanly`, async ({
       page,
     }) => {

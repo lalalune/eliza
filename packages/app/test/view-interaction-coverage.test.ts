@@ -32,7 +32,7 @@ type InteractionOwner = {
 const VISUAL_BASELINE_OWNER: InteractionOwner = {
   spec: "packages/app/test/ui-smoke/plugin-views-visual.spec.ts",
   proves:
-    "Captures screenshots and audits rendered visible text/controls for every shipped plugin view.",
+    "Captures screenshots and audits rendered visible text/controls for every plugin view served by the generic UI-smoke stub.",
   signals: ["captureScreenshotWithQualityRetry", "visibleText"],
 };
 
@@ -347,6 +347,24 @@ function viewKey(view: Pick<VisualViewCase, "id" | "viewType">) {
   return `${view.id}:${view.viewType}`;
 }
 
+function readGenericSmokeOmittedViewIds(): Set<string> {
+  const source = readFileSync(VIEW_CASES_SOURCE, "utf8");
+  const match = source.match(
+    /const GENERIC_SMOKE_OMITTED_VIEW_IDS = new Set\(\[([\s\S]*?)\]\);/,
+  );
+  expect(
+    match?.[1],
+    "GENERIC_SMOKE_OMITTED_VIEW_IDS declaration was not found",
+  ).toBeTruthy();
+  return new Set(
+    Array.from((match?.[1] ?? "").matchAll(/"([^"]+)"/g)).flatMap((entry) =>
+      entry[1] ? [entry[1]] : [],
+    ),
+  );
+}
+
+const GENERIC_SMOKE_OMITTED_VIEW_IDS = readGenericSmokeOmittedViewIds();
+
 function readVisualMatrixCases(): VisualViewCase[] {
   const source = readFileSync(VIEW_CASES_SOURCE, "utf8");
   const match = source.match(
@@ -375,7 +393,12 @@ function readVisualMatrixCases(): VisualViewCase[] {
 }
 
 function interactionOwners(view: VisualViewCase): readonly InteractionOwner[] {
-  return [VISUAL_BASELINE_OWNER, ...(GUI_INTERACTION_OWNERS[view.id] ?? [])];
+  return [
+    ...(GENERIC_SMOKE_OMITTED_VIEW_IDS.has(view.id)
+      ? []
+      : [VISUAL_BASELINE_OWNER]),
+    ...(GUI_INTERACTION_OWNERS[view.id] ?? []),
+  ];
 }
 
 function readRepoFile(relativePath: string): string {

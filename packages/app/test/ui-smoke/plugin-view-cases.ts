@@ -1,7 +1,8 @@
 /**
- * Plugin-view case fixtures used by UI-smoke specs to exercise every registered
- * GUI surface. The loader lifecycle subset is narrower because four views are
- * registered in-process rather than served by app-core's `/api/views` route.
+ * Plugin-view inventories for production coverage and stub-backed browser
+ * scenarios. The complete matrix stays aligned with shipped plugin manifests;
+ * the smoke subset stays aligned with app-core's `smokeViewDeclarations` so a
+ * missing stub declaration cannot pass against the launcher fallback.
  */
 export type ViewCase = {
   id: string;
@@ -60,16 +61,16 @@ export const VIEW_CASES: ViewCase[] = (
   shellPill: options?.shellPill === "suppressed" ? "suppressed" : "expected",
 }));
 
-// These views are mounted by app/plugin registration code and never appear in
-// `/api/views`. The lifecycle spec rewrites API declarations onto collision-free
-// harness routes, so only API-served views belong in that loader-specific lane.
-const IN_PROCESS_VIEW_IDS = new Set([
+// Dedicated flows cover these surfaces because the generic UI-smoke stub omits
+// them: Documents collides with the shell-owned Knowledge route, while Cloud,
+// LifeOps Live Test, and Cockpit require purpose-built state or live fixtures.
+const GENERIC_SMOKE_OMITTED_VIEW_IDS = new Set([
   "cloud",
   "documents",
   "lifeops-live-test",
   "cockpit",
 ]);
 
-export const DYNAMIC_VIEW_CASES = VIEW_CASES.filter(
-  ({ id }) => !IN_PROCESS_VIEW_IDS.has(id),
+export const SMOKE_VIEW_CASES = VIEW_CASES.filter(
+  ({ id }) => !GENERIC_SMOKE_OMITTED_VIEW_IDS.has(id),
 );

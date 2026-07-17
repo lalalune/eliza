@@ -11,7 +11,7 @@ import {
   seedAppStorage,
 } from "./helpers";
 import { captureScreenshotWithQualityRetry } from "./helpers/screenshot-quality";
-import { VIEW_CASES } from "./plugin-view-cases";
+import { SMOKE_VIEW_CASES } from "./plugin-view-cases";
 
 const KNOWN_BROKEN = new Set<string>([]);
 const MIN_VISIBLE_TEXT_LENGTH_BY_VIEW_ID = new Map<string, number>([
@@ -53,7 +53,7 @@ async function expectNoFailedView(
 }
 
 test.describe("registered plugin views visual coverage", () => {
-  for (const view of VIEW_CASES) {
+  for (const view of SMOKE_VIEW_CASES) {
     if (KNOWN_BROKEN.has(view.id)) continue;
     const assistantExpectation =
       view.shellPill === "expected"

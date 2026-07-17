@@ -9,7 +9,7 @@ import {
   openAppPath,
   seedAppStorage,
 } from "./helpers";
-import { VIEW_CASES } from "./plugin-view-cases";
+import { SMOKE_VIEW_CASES } from "./plugin-view-cases";
 
 /**
  * Generic per-view interaction coverage for PLUGIN views (#8796).
@@ -21,7 +21,7 @@ import { VIEW_CASES } from "./plugin-view-cases";
  * per-view video.
  */
 
-const GUI_CASES = VIEW_CASES.filter((c) => c.viewType === "gui");
+const GUI_CASES = SMOKE_VIEW_CASES.filter((c) => c.viewType === "gui");
 
 const MAX_CLICKS = 20;
 const MAX_INPUTS = 6;

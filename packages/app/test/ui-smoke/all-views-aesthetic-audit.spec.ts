@@ -35,7 +35,7 @@ import {
   type ScreenshotQuality,
   screenshotQualityIssues,
 } from "./helpers/screenshot-quality";
-import { VIEW_CASES } from "./plugin-view-cases";
+import { SMOKE_VIEW_CASES } from "./plugin-view-cases";
 import { VIEW_ROUTES } from "./view-routes";
 
 // Strict-gate config (#9304, #10710). The audit was a pure reporter — `broken` /
@@ -176,7 +176,7 @@ function buildAuditCases(): AuditCase[] {
       kind: "builtin",
     });
   }
-  for (const view of VIEW_CASES) {
+  for (const view of SMOKE_VIEW_CASES) {
     cases.push({
       id: view.id,
       slug: `plugin-${view.id}-${view.viewType}`,
