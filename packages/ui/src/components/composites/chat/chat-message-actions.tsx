@@ -1,6 +1,6 @@
 /**
  * Per-message reply, copy, playback, and edit controls. Panel chat groups the
- * controls on a neutral liquid-glass plate; the continuous overlay renders a
+ * controls on a neutral material plate; the continuous overlay renders a
  * bare icon lane beneath each message so hover and touch affordances stay
  * visually quiet. Copy and playback retain their compact state transitions.
  * Wired by ChatMessage.
@@ -11,7 +11,6 @@ import type * as React from "react";
 
 import { cn } from "../../../lib/utils";
 import {
-  LIQUID_GLASS_BLUR,
   LIQUID_GLASS_EDGE_SHADOW,
   LIQUID_GLASS_SHEEN,
 } from "../../shell/liquid-glass";
@@ -62,8 +61,6 @@ export function ChatMessageActionSurface({
           : {
               backgroundImage: LIQUID_GLASS_SHEEN,
               boxShadow: LIQUID_GLASS_EDGE_SHADOW,
-              WebkitBackdropFilter: LIQUID_GLASS_BLUR,
-              backdropFilter: LIQUID_GLASS_BLUR,
               ...style,
             }
       }
