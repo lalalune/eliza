@@ -13,7 +13,7 @@
  * classifier (`classifyToolOutput`) are pinned directly too.
  */
 
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IAgentRuntime } from "@elizaos/core";
@@ -31,9 +31,9 @@ interface SpawnResult {
   metadata?: Record<string, unknown>;
 }
 
-/** ACP fake exposing the completion surface: event subscription, spawn, the
- *  change-set read (`getSession`) AND a per-session `workdir` so the trajectory
- *  writer targets the test's temp dir. */
+/** ACP fake exposing the completion surface: event subscription, spawn, and
+ * change-set reads. Each test points the canonical state directory inside its
+ * temporary root so trajectory writes never escape the harness. */
 class BundleFakeAcp {
   private handler:
     | ((sessionId: string, event: string, data: unknown) => void)
@@ -93,6 +93,10 @@ class BundleFakeAcp {
     return [];
   }
 
+  getOrchestratorOwnedArtifacts(): [] {
+    return [];
+  }
+
   updateSessionMetadata(): Promise<void> {
     return Promise.resolve();
   }
@@ -111,7 +115,12 @@ function runtime(
   useModel: (modelType: unknown, params: unknown) => Promise<string>,
 ): IAgentRuntime {
   return {
-    getService: () => acp,
+    getService: (type: string) =>
+      type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE"
+        ? acp
+        : undefined,
+    getSetting: () => undefined,
+    reportError: vi.fn(),
     useModel,
     logger: {
       debug: vi.fn(),
@@ -177,6 +186,7 @@ describe("classifyToolOutput", () => {
 describe("completion-evidence bundle assembly + trajectory persistence", () => {
   const prevFlag = process.env.ELIZA_ORCHESTRATOR_AUTO_GOAL_VERIFY;
   const prevIndependent = process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY;
+  const prevStateDir = process.env.ELIZA_STATE_DIR;
   let workdir: string;
 
   beforeEach(async () => {
@@ -186,8 +196,9 @@ describe("completion-evidence bundle assembly + trajectory persistence", () => {
     // here so these assertions exercise the evidence bundle the judge sees.
     process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY = "0";
     workdir = await mkdtemp(join(tmpdir(), "evidence-bundle-"));
+    process.env.ELIZA_STATE_DIR = join(workdir, "state");
   });
-  afterEach(() => {
+  afterEach(async () => {
     if (prevFlag === undefined) {
       delete process.env.ELIZA_ORCHESTRATOR_AUTO_GOAL_VERIFY;
     } else {
@@ -198,6 +209,12 @@ describe("completion-evidence bundle assembly + trajectory persistence", () => {
     } else {
       process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY = prevIndependent;
     }
+    if (prevStateDir === undefined) {
+      delete process.env.ELIZA_STATE_DIR;
+    } else {
+      process.env.ELIZA_STATE_DIR = prevStateDir;
+    }
+    await rm(workdir, { recursive: true, force: true });
   });
 
   it("populates ≥3 bundle fields and feeds them to the verifier", async () => {
@@ -326,8 +343,9 @@ describe("completion-evidence bundle assembly + trajectory persistence", () => {
 
     const trajectoryPath = join(
       workdir,
-      ".eliza",
+      "state",
       "trajectories",
+      task.id,
       "completion-evidence.jsonl",
     );
     // The write is fire-and-forget (real mkdir + appendFile + addEvent); wait

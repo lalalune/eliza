@@ -76,7 +76,9 @@ const nativeClientMock = getNativeMockState();
 
 vi.mock("../../src/services/acp-native-transport.js", () => {
   const state = getNativeMockState();
-  state.NativeAcpClient = class MockNativeAcpClient implements MockNativeClient {
+  state.NativeAcpClient = class MockNativeAcpClient
+    implements MockNativeClient
+  {
     opts: NativeOptions;
     eventHandler?: NativeEventHandler;
     start = vi.fn(async () => {
@@ -432,7 +434,8 @@ describe("AcpService", () => {
     const args = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
     expect(args).not.toContain("--no-terminal");
     const env = spawnMock.mock.calls[0]?.[2]?.env as
-      Record<string, string> | undefined;
+      | Record<string, string>
+      | undefined;
     expect(env?.PARALLAX_SESSION_ID).toBe(result.sessionId);
   });
 
@@ -466,7 +469,8 @@ describe("AcpService", () => {
       await service.stop();
 
       const env = spawnMock.mock.calls[0]?.[2]?.env as
-        Record<string, string> | undefined;
+        | Record<string, string>
+        | undefined;
       expect(env).toMatchObject({
         GIT_AUTHOR_NAME: "Configured Author",
         GIT_AUTHOR_EMAIL: "author@example.test",
@@ -478,7 +482,7 @@ describe("AcpService", () => {
     }
   });
 
-  it("does not create SKILLS.md in a caller-owned non-isolated workdir", async () => {
+  it("writes and fingerprints an explicitly requested non-isolated SKILLS.md", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acp-skills-"));
     try {
       const skillsService = {
@@ -501,6 +505,10 @@ describe("AcpService", () => {
         name: "skills-non-isolated",
         agentType: "codex",
         workdir: dir,
+        skillsManifest: {
+          recommendedSlugs: ["github"],
+          includeViewKindContract: false,
+        },
       });
       await waitForSpawn(reg);
       reg.proc.stdout.emit(
@@ -510,10 +518,89 @@ describe("AcpService", () => {
         ),
       );
       closeOk(reg);
+      const result = await promise;
+
+      expect(readFileSync(join(dir, "SKILLS.md"), "utf8")).toContain("GitHub");
+      expect(result.metadata?.orchestratorOwnedArtifacts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "SKILLS.md",
+            source: "skills-manifest",
+          }),
+        ]),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not create SKILLS.md for an ordinary non-isolated spawn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acp-skills-unrequested-"));
+    try {
+      const skillsService = {
+        getEligibleSkills: async () => [
+          {
+            slug: "github",
+            name: "GitHub",
+            description: "gh CLI usage.",
+            content: "# GitHub\n",
+          },
+        ],
+        isSkillEnabled: () => true,
+      };
+      const reg = nextProc();
+      const service = new AcpService(
+        runtime({}, { AGENT_SKILLS_SERVICE: skillsService }),
+      );
+      await service.start();
+      const promise = service.spawnSession({
+        name: "skills-unrequested",
+        agentType: "codex",
+        workdir: dir,
+      });
+      await waitForSpawn(reg);
+      reg.proc.stdout.emit(
+        "data",
+        Buffer.from(
+          '{"jsonrpc":"2.0","method":"session_started","params":{"sessionId":"skills-unrequested"}}\n',
+        ),
+      );
+      closeOk(reg);
       await promise;
 
       expect(existsSync(join(dir, "SKILLS.md"))).toBe(false);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the spawn when requested skill context cannot be built", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acp-skills-failure-"));
+    const skillsService = {
+      getEligibleSkills: async () => {
+        throw new Error("skills unavailable");
+      },
+      isSkillEnabled: () => true,
+    };
+    const service = new AcpService(
+      runtime({}, { AGENT_SKILLS_SERVICE: skillsService }),
+    );
+    try {
+      await service.start();
+      await expect(
+        service.spawnSession({
+          name: "skills-failure",
+          agentType: "codex",
+          workdir: dir,
+          skillsManifest: {
+            recommendedSlugs: ["github"],
+            includeViewKindContract: false,
+          },
+        }),
+      ).rejects.toThrow("skills unavailable");
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      await service.stop();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -634,6 +721,7 @@ describe("AcpService", () => {
         name: "broker-spawn",
         agentType: "codex",
         workdir: dir,
+        isolateWorkdir: true,
       });
       await waitForSpawn(reg);
       reg.proc.stdout.emit(
@@ -643,12 +731,12 @@ describe("AcpService", () => {
         ),
       );
       closeOk(reg);
-      await promise;
+      const result = await promise;
 
-      expect(readFileSync(join(dir, "SKILLS.md"), "utf8")).toContain(
+      expect(readFileSync(join(result.workdir, "SKILLS.md"), "utf8")).toContain(
         "Parent Eliza Agent",
       );
-      expect(readFileSync(join(dir, "AGENTS.md"), "utf8")).toContain(
+      expect(readFileSync(join(result.workdir, "AGENTS.md"), "utf8")).toContain(
         "Asking the parent Eliza agent to act",
       );
     } finally {
@@ -1188,7 +1276,8 @@ describe("AcpService", () => {
     expect(args).not.toContain("opencode");
 
     const env = spawnMock.mock.calls[0]?.[2]?.env as
-      Record<string, string> | undefined;
+      | Record<string, string>
+      | undefined;
     const config = JSON.parse(env?.OPENCODE_CONFIG_CONTENT ?? "{}") as {
       provider?: Record<
         string,
@@ -1231,7 +1320,8 @@ describe("AcpService", () => {
     expect(args).not.toContain("opencode");
 
     const env = spawnMock.mock.calls[0]?.[2]?.env as
-      Record<string, string> | undefined;
+      | Record<string, string>
+      | undefined;
     expect(env?.OPENCODE_MODEL).toBeUndefined();
     expect(env?.OPENAI_MODEL).toBeUndefined();
   });
@@ -1654,7 +1744,8 @@ describe("AcpService", () => {
 
     const result = await sent;
     const promptEnv = spawnMock.mock.calls[1]?.[2]?.env as
-      Record<string, string> | undefined;
+      | Record<string, string>
+      | undefined;
     expect(promptEnv?.PARALLAX_SESSION_ID).toBe(sessionId);
     expect(result.response).toContain("done");
     expect(result.response).toContain("[tool output: Running tool]");
@@ -1833,46 +1924,44 @@ describe("AcpService", () => {
     expect((await service.getSession(sessionId))?.status).toBe("ready");
   });
 
-  it.each(["max_tokens", "interrupted"])(
-    "native sendPrompt does not advertise an incomplete %s turn as task_complete",
-    async (stopReason) => {
-      const service = new AcpService(
-        runtime({ ELIZA_ACP_TRANSPORT: "native" }),
-      );
-      const events: string[] = [];
-      service.onSessionEvent((_sid, event) => events.push(event));
-      await service.start();
-      const { sessionId } = await service.spawnSession({
-        name: `native-${stopReason}`,
-        agentType: "codex",
-        workdir: "/tmp/acp-test",
-      });
-      events.length = 0;
-      const client = firstNativeClient();
-      client.prompt.mockImplementationOnce(async () => {
-        client.emit({
-          jsonrpc: "2.0",
-          id: "prompt",
-          sessionId: "protocol-session",
-          result: {
-            stopReason,
-            content: [{ type: "text", text: "partial output" }],
-          },
-        } as AcpJsonRpcMessage);
-        return { stopReason };
-      });
+  it.each([
+    "max_tokens",
+    "interrupted",
+  ])("native sendPrompt does not advertise an incomplete %s turn as task_complete", async (stopReason) => {
+    const service = new AcpService(runtime({ ELIZA_ACP_TRANSPORT: "native" }));
+    const events: string[] = [];
+    service.onSessionEvent((_sid, event) => events.push(event));
+    await service.start();
+    const { sessionId } = await service.spawnSession({
+      name: `native-${stopReason}`,
+      agentType: "codex",
+      workdir: "/tmp/acp-test",
+    });
+    events.length = 0;
+    const client = firstNativeClient();
+    client.prompt.mockImplementationOnce(async () => {
+      client.emit({
+        jsonrpc: "2.0",
+        id: "prompt",
+        sessionId: "protocol-session",
+        result: {
+          stopReason,
+          content: [{ type: "text", text: "partial output" }],
+        },
+      } as AcpJsonRpcMessage);
+      return { stopReason };
+    });
 
-      const result = await service.sendPrompt(sessionId, "continue the task");
+    const result = await service.sendPrompt(sessionId, "continue the task");
 
-      expect(result).toMatchObject({
-        stopReason,
-        finalText: "partial output",
-      });
-      expect(events).not.toContain("task_complete");
-      expect(events).not.toContain("stopped");
-      expect((await service.getSession(sessionId))?.status).toBe("ready");
-    },
-  );
+    expect(result).toMatchObject({
+      stopReason,
+      finalText: "partial output",
+    });
+    expect(events).not.toContain("task_complete");
+    expect(events).not.toContain("stopped");
+    expect((await service.getSession(sessionId))?.status).toBe("ready");
+  });
 
   // Fix #2 (PR #9855): a terminal `stopReason === "error"` that nonetheless
   // captured a real deliverable (the sub-agent edited files / deployed / printed

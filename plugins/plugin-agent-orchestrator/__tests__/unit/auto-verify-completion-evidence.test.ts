@@ -7,6 +7,9 @@
  * URLs, mined build/test output — and NOT the bare event summary.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { IAgentRuntime } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OrchestratorTaskService } from "../../src/services/orchestrator-task-service.js";
@@ -70,6 +73,10 @@ class EvidenceFakeAcp {
     return [];
   }
 
+  getOrchestratorOwnedArtifacts(): [] {
+    return [];
+  }
+
   updateSessionMetadata(): Promise<void> {
     return Promise.resolve();
   }
@@ -89,7 +96,12 @@ function runtime(
   useModel: (modelType: unknown, params: unknown) => Promise<string>,
 ): IAgentRuntime {
   return {
-    getService: () => acp,
+    getService: (type: string) =>
+      type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE"
+        ? acp
+        : undefined,
+    getSetting: () => undefined,
+    reportError: vi.fn(),
     useModel,
     logger: {
       debug: vi.fn(),
@@ -120,6 +132,8 @@ function changeSet(): WorkspaceChangeSet {
 describe("auto-verify completion evidence pipeline", () => {
   const prevFlag = process.env.ELIZA_ORCHESTRATOR_AUTO_GOAL_VERIFY;
   const prevIndependent = process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY;
+  const prevStateDir = process.env.ELIZA_STATE_DIR;
+  let stateDir: string;
 
   beforeEach(() => {
     process.env.ELIZA_ORCHESTRATOR_AUTO_GOAL_VERIFY = "1";
@@ -127,6 +141,8 @@ describe("auto-verify completion evidence pipeline", () => {
     // separate gate that precedes the judge for code-change tasks; turn it off
     // here so these assertions exercise the evidence assembly the judge sees.
     process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY = "0";
+    stateDir = mkdtempSync(join(tmpdir(), "completion-evidence-state-"));
+    process.env.ELIZA_STATE_DIR = stateDir;
   });
   afterEach(() => {
     if (prevFlag === undefined) {
@@ -139,6 +155,12 @@ describe("auto-verify completion evidence pipeline", () => {
     } else {
       process.env.ELIZA_ORCHESTRATOR_INDEPENDENT_VERIFY = prevIndependent;
     }
+    if (prevStateDir === undefined) {
+      delete process.env.ELIZA_STATE_DIR;
+    } else {
+      process.env.ELIZA_STATE_DIR = prevStateDir;
+    }
+    rmSync(stateDir, { recursive: true, force: true });
   });
 
   it("feeds the verifier the rich sectioned evidence, not the bare summary", async () => {

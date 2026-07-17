@@ -104,6 +104,10 @@ class FakeAcp {
   getSession(id: string): LiveSession | undefined {
     return this.live.find((session) => session.id === id);
   }
+
+  getOrchestratorOwnedArtifacts(): [] {
+    return [];
+  }
 }
 
 function liveSession(id: string): LiveSession {
@@ -151,9 +155,13 @@ async function harness(): Promise<{
   const acp = new FakeAcp();
   let taskService: OrchestratorTaskService | null = null;
   const runtime = {
-    getService: vi.fn((type: string) =>
-      type === OrchestratorTaskService.serviceType ? taskService : acp,
-    ),
+    getService: vi.fn((type: string) => {
+      if (type === OrchestratorTaskService.serviceType) return taskService;
+      if (type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE") {
+        return acp;
+      }
+      return null;
+    }),
     hasService: vi.fn(() => true),
     getRoom: vi.fn(async () => null),
     reportError: vi.fn(),

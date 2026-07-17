@@ -99,13 +99,13 @@ import {
   type SessionStoreBackend,
 } from "./session-store.js";
 import { buildSkillsManifest } from "./skill-manifest.js";
-import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
-  canonicalForwardedEnvKey,
   forwardableSubAgentEnv as applySubAgentEnvPolicy,
+  canonicalForwardedEnvKey,
   isCloudKeyForwardingOptIn,
   isDeniedSubAgentEnvKey,
 } from "./sub-agent-env-policy.js";
+import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
   appendSubagentStdout,
   isSubagentStdoutLoggingEnabled,
@@ -1654,10 +1654,9 @@ export class AcpService extends Service {
         id,
         await writeWorkspaceIdentity(workdir, { brokerWired }),
       );
-      // Write SKILLS.md only into orchestrator-owned isolated scratch. Real
-      // routed repos may bring their own manifest; absent means absent there.
-      // The broker skill is advertised only when wired; the recommended-slugs /
-      // ViewKind extras are opt-in via opts.skillsManifest.
+      // Every spawn needs the same skill-discovery path. Existing repo-owned
+      // manifests win; a newly generated manifest is fingerprinted so the
+      // completion gate can distinguish it from worker output.
       await this.writeSkillsManifest(workdir, id, isolate, brokerWired, opts);
 
       // Record the workspace HEAD + already-dirty files at spawn so the change
@@ -1937,17 +1936,18 @@ export class AcpService extends Service {
   }
 
   /**
-   * Write SKILLS.md into orchestrator-owned isolated scratch so the sub-agent
-   * can discover the parent's installed skills and request them back via the
-   * parent. The broker skill is advertised only when the router is wired;
+   * Write SKILLS.md into orchestrator-owned scratch, or into a caller-owned
+   * workspace when the caller explicitly requests manifest enrichment. The
+   * broker skill is advertised only when the router is wired;
    * `opts.skillsManifest` adds the recommended-slug highlight and Cloud
-   * ViewKind contract for app-building tasks. Best-effort — a failed write
-   * warns and the spawn proceeds without the manifest.
+   * ViewKind contract for app-building tasks.
    *
    * Skips a workspace that already carries its own `SKILLS.md`, preserving the
-   * caller-owned manifest. Non-isolated spawns (routed self-checkout / explicit
-   * project workdir) never get a new file; an absent repo-local manifest means
-   * the repository intentionally has no skills manifest.
+   * caller-owned manifest. Ordinary non-isolated spawns do not create one; the
+   * explicit enrichment used by economics tasks preserves their established
+   * Cloud/ViewKind context without changing every routed repository. A
+   * generated file is recorded by content fingerprint so unchanged
+   * orchestrator context is not mistaken for worker residue.
    */
   private async writeSkillsManifest(
     workdir: string,
@@ -1957,36 +1957,33 @@ export class AcpService extends Service {
     opts: SpawnOptions,
   ): Promise<void> {
     if (existsSync(join(workdir, "SKILLS.md"))) return;
-    if (!isolatedWorkdir) return;
-    try {
-      const manifest = await buildSkillsManifest(this.runtime, {
-        ...(opts.skillsManifest?.recommendedSlugs
-          ? { recommendedSlugs: opts.skillsManifest.recommendedSlugs }
-          : {}),
-        ...(brokerWired
-          ? { virtualSkills: [{ ...PARENT_AGENT_BROKER_MANIFEST_ENTRY }] }
-          : {}),
-        includeViewKindContract:
-          opts.skillsManifest?.includeViewKindContract ?? false,
+    if (!isolatedWorkdir && !opts.skillsManifest) return;
+    const manifest = await buildSkillsManifest(this.runtime, {
+      ...(opts.skillsManifest?.recommendedSlugs
+        ? { recommendedSlugs: opts.skillsManifest.recommendedSlugs }
+        : {}),
+      ...(brokerWired
+        ? { virtualSkills: [{ ...PARENT_AGENT_BROKER_MANIFEST_ENTRY }] }
+        : {}),
+      includeViewKindContract:
+        opts.skillsManifest?.includeViewKindContract ?? false,
+    });
+    const skillsPath = join(workdir, "SKILLS.md");
+    const record = createOwnedArtifactRecord(
+      workdir,
+      skillsPath,
+      manifest.markdown,
+      "skills-manifest",
+    );
+    if (!record) {
+      throw new ElizaError("Generated skills manifest escaped its workspace", {
+        code: "ORCHESTRATOR_ARTIFACT_PATH_INVALID",
+        context: { sessionId, workdir, skillsPath },
+        severity: "fatal",
       });
-      const skillsPath = join(workdir, "SKILLS.md");
-      await writeFile(skillsPath, manifest.markdown, "utf8");
-      const record = createOwnedArtifactRecord(
-        workdir,
-        skillsPath,
-        manifest.markdown,
-        "skills-manifest",
-      );
-      if (record) this.recordOrchestratorOwnedArtifacts(sessionId, [record]);
-    } catch (err) {
-      // error-policy:J7 SKILLS.md scaffolding is best-effort; a failed write is
-      // warned and the spawn proceeds without it — a missing manifest only
-      // degrades skill discovery.
-      this.runtime.logger?.warn?.(
-        { src: "acp-service", sessionId, workdir },
-        `failed to write SKILLS.md: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
+    await writeFile(skillsPath, manifest.markdown, "utf8");
+    this.recordOrchestratorOwnedArtifacts(sessionId, [record]);
   }
 
   async sendPrompt(
@@ -4506,7 +4503,8 @@ export class AcpService extends Service {
     data?: unknown,
   ): void {
     const loggerFn = this.logger[level] as
-      ((message: string, data?: unknown) => void) | undefined;
+      | ((message: string, data?: unknown) => void)
+      | undefined;
     loggerFn?.call(this.logger, `[AcpService] ${message}`, data);
   }
 

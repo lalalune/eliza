@@ -126,6 +126,10 @@ class FakeAcp {
     return [];
   }
 
+  getOrchestratorOwnedArtifacts(_sessionId: string): [] {
+    return [];
+  }
+
   getCapacity(): Promise<{
     maxSessions: number;
     systemHeadroom: number;
@@ -166,7 +170,10 @@ function runtime(
   settings: Record<string, string> = {},
 ): IAgentRuntime {
   return {
-    getService: () => acp ?? null,
+    getService: (type: string) =>
+      type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE"
+        ? (acp ?? null)
+        : null,
     getSetting: (key: string) => settings[key],
     reportError: vi.fn(),
     logger: {
@@ -205,8 +212,13 @@ function runtimeWithWorkspace(
   useModel?: IAgentRuntime["useModel"],
 ): IAgentRuntime {
   return {
-    getService: (type: string) =>
-      type === CodingWorkspaceService.serviceType ? workspace : (acp ?? null),
+    getService: (type: string) => {
+      if (type === CodingWorkspaceService.serviceType) return workspace;
+      if (type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE") {
+        return acp ?? null;
+      }
+      return null;
+    },
     getSetting: () => undefined,
     useModel,
     reportError: vi.fn(),
@@ -2122,7 +2134,10 @@ describe("OrchestratorTaskService — store degradation resilience (#11641)", ()
   } {
     const warn = vi.fn();
     const rt = {
-      getService: () => acp ?? null,
+      getService: (type: string) =>
+        type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE"
+          ? (acp ?? null)
+          : null,
       reportError: vi.fn(),
       logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
     } as never as IAgentRuntime;

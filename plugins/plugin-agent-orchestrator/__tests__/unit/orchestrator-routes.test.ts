@@ -32,12 +32,17 @@ const acpStub = {
     }),
   sendToSession: () => Promise.resolve(),
   stopSession: () => Promise.resolve(),
+  getOrchestratorOwnedArtifacts: () => [],
 };
 
 function makeService(): OrchestratorTaskService {
   return new OrchestratorTaskService(
     {
-      getService: () => acpStub,
+      getService: (type: string) =>
+        type === "ACP_SERVICE" || type === "ACP_SUBPROCESS_SERVICE"
+          ? acpStub
+          : undefined,
+      getSetting: () => undefined,
       logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     } as never,
     { store: new OrchestratorTaskStore({ backend: "memory" }) },

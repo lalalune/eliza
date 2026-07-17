@@ -90,6 +90,7 @@ function makeFakeAcp() {
       return { stopReason: "end_turn", finalText: "ok" };
     }),
     stopSession: vi.fn(async () => undefined),
+    getOrchestratorOwnedArtifacts: () => [],
   };
   return {
     service,
@@ -634,6 +635,7 @@ function makeVerifierAcp(verifierResponse: () => string) {
     stopSession: vi.fn(async (sessionId: string) => {
       stopped.push(sessionId);
     }),
+    getOrchestratorOwnedArtifacts: () => [],
     getSession: vi.fn(async () => undefined),
     spawnSession: vi.fn(
       async (opts: {

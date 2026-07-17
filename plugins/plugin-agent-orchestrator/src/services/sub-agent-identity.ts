@@ -13,7 +13,7 @@
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { logger } from "@elizaos/core";
+import { ElizaError, logger } from "@elizaos/core";
 import { readConfigEnvKey } from "./config-env.js";
 import {
   renderCoAuthorTrailer,
@@ -281,47 +281,42 @@ export async function writeWorkspaceIdentity(
   const coAuthorTrailer =
     opts.coAuthorTrailer ??
     renderCoAuthorTrailer(resolveGitIdentityConfig(readConfigEnvKey));
-  try {
-    const alreadyHasIdentity = IDENTITY_FILENAMES.some((name) =>
-      existsSync(join(workdir, name)),
-    );
-    if (alreadyHasIdentity) {
-      // A real repo already carries its own AGENTS.md/CLAUDE.md (the common
-      // coding-task case) which are TRACKED files — we must NEVER mutate them:
-      // dirtying them would leak an Eliza stanza into the agent's own
-      // `git add -A` commit/PR (the previous guard deliberately avoided touching
-      // existing manuals). The co-author *trailer* instruction is therefore only
-      // scaffolded into BARE workspaces (our own file). For repos with their own
-      // manuals the load-bearing identity fix (pinned GIT_AUTHOR_*/GIT_COMMITTER_*
-      // env from buildEnv) still applies; a non-repo-dirtying trailer mechanism
-      // for these (e.g. an out-of-tree commit.template) is a follow-up.
-      return [];
-    }
-    const manual = buildSubAgentIdentityMd({ ...opts, coAuthorTrailer });
-    await Promise.all(
-      IDENTITY_FILENAMES.map((name) =>
-        writeFile(join(workdir, name), manual, "utf8"),
-      ),
-    );
-    logger.debug(
-      `[sub-agent-identity] scaffolded operating manual into bare workspace ${workdir}`,
-    );
-    return IDENTITY_FILENAMES.flatMap((name) => {
-      const record = createOwnedArtifactRecord(
-        workdir,
-        name,
-        manual,
-        "identity-scaffold",
-      );
-      return record ? [record] : [];
-    });
-  } catch (err) {
-    // error-policy:J7 identity scaffold is best-effort; a failure warns and must
-    // not abort the spawn — a missing manual only degrades context.
-    logger.warn(
-      { error: err },
-      `[sub-agent-identity] could not scaffold identity into ${workdir}`,
-    );
+  const alreadyHasIdentity = IDENTITY_FILENAMES.some((name) =>
+    existsSync(join(workdir, name)),
+  );
+  if (alreadyHasIdentity) {
+    // Repository-owned manuals are often tracked and may carry more specific
+    // instructions. Mutating either would both override that contract and leak
+    // orchestrator prose into the worker's eventual commit.
     return [];
   }
+  const manual = buildSubAgentIdentityMd({ ...opts, coAuthorTrailer });
+  const artifacts = IDENTITY_FILENAMES.map((name) => {
+    const record = createOwnedArtifactRecord(
+      workdir,
+      name,
+      manual,
+      "identity-scaffold",
+    );
+    if (!record) {
+      throw new ElizaError(
+        "Generated identity scaffold escaped its workspace",
+        {
+          code: "ORCHESTRATOR_ARTIFACT_PATH_INVALID",
+          context: { workdir, name },
+          severity: "fatal",
+        },
+      );
+    }
+    return record;
+  });
+  await Promise.all(
+    IDENTITY_FILENAMES.map((name) =>
+      writeFile(join(workdir, name), manual, "utf8"),
+    ),
+  );
+  logger.debug(
+    `[sub-agent-identity] scaffolded operating manual into bare workspace ${workdir}`,
+  );
+  return artifacts;
 }

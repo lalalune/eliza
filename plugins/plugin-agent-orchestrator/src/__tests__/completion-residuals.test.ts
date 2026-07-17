@@ -12,6 +12,8 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,8 +30,8 @@ import {
 import {
   createOwnedArtifactRecord,
   ORCHESTRATOR_OWNED_ARTIFACTS_METADATA_KEY,
-  readOwnedArtifactsFromMetadata,
   type OrchestratorOwnedArtifact,
+  readOwnedArtifactsFromMetadata,
 } from "../services/orchestrator-artifact-ownership.js";
 
 const roots: string[] = [];
@@ -345,6 +347,25 @@ describe("collectCompletionResiduals — orchestrator-owned scaffold paths", () 
     expect(result.residuals).toEqual([]);
   });
 
+  it("rejects malformed persisted ownership records", () => {
+    const valid: OrchestratorOwnedArtifact = {
+      path: "AGENTS.md",
+      sha256: "a".repeat(64),
+      byteLength: 12,
+      source: "identity-scaffold",
+    };
+    const recovered = readOwnedArtifactsFromMetadata({
+      [ORCHESTRATOR_OWNED_ARTIFACTS_METADATA_KEY]: [
+        valid,
+        { ...valid, sha256: "not-a-digest" },
+        { ...valid, byteLength: 1.5 },
+        { ...valid, source: "completion-evidence" },
+      ],
+    });
+
+    expect(recovered).toEqual([valid]);
+  });
+
   it("still blocks an unchanged orchestrator scaffold after git add stages it", async () => {
     const { workdir } = makeRepo({ withUpstream: false });
     const orchestratorOwnedArtifacts = writeOrchestratorOwnedScaffolds(workdir);
@@ -389,6 +410,28 @@ describe("collectCompletionResiduals — orchestrator-owned scaffold paths", () 
     const { workdir } = makeRepo({ withUpstream: false });
     const orchestratorOwnedArtifacts = writeOrchestratorOwnedScaffolds(workdir);
     writeFileSync(join(workdir, "AGENTS.md"), "agent shell rewrite\n");
+
+    const result = await collectCompletionResiduals({
+      workdir,
+      repoExpected: true,
+      orchestratorOwnedArtifacts,
+    });
+
+    expect(result.status).toBe("residuals");
+    const residual = result.residuals.find(
+      (row) => row.kind === "uncommitted_changes",
+    );
+    expect(residual?.items).toEqual(["?? AGENTS.md"]);
+  });
+
+  it("still blocks when a fingerprinted scaffold is replaced by a symlink", async () => {
+    const { workdir } = makeRepo({ withUpstream: false });
+    const orchestratorOwnedArtifacts = writeOrchestratorOwnedScaffolds(workdir);
+    const agentsPath = join(workdir, "AGENTS.md");
+    const externalPath = join(workdir, "..", "same-agent-identity.md");
+    writeFileSync(externalPath, "agent identity\n");
+    unlinkSync(agentsPath);
+    symlinkSync(externalPath, agentsPath);
 
     const result = await collectCompletionResiduals({
       workdir,

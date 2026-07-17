@@ -28,9 +28,19 @@ describe("writeWorkspaceIdentity", () => {
   });
 
   it("scaffolds both AGENTS.md and CLAUDE.md into a bare workspace", async () => {
-    await writeWorkspaceIdentity(dir);
+    const artifacts = await writeWorkspaceIdentity(dir);
     expect(existsSync(join(dir, "AGENTS.md"))).toBe(true);
     expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
+    expect(artifacts).toEqual([
+      expect.objectContaining({
+        path: "AGENTS.md",
+        source: "identity-scaffold",
+      }),
+      expect.objectContaining({
+        path: "CLAUDE.md",
+        source: "identity-scaffold",
+      }),
+    ]);
     // Default (no broker) renders the manual with the placeholder stripped.
     const expected = buildSubAgentIdentityMd({ brokerWired: false });
     expect(readFileSync(join(dir, "AGENTS.md"), "utf8")).toBe(expected);
@@ -110,5 +120,10 @@ describe("writeWorkspaceIdentity", () => {
     writeFileSync(join(dir, "CLAUDE.md"), "# existing\n", "utf8");
     await writeWorkspaceIdentity(dir);
     expect(existsSync(join(dir, "AGENTS.md"))).toBe(false);
+  });
+
+  it("surfaces scaffold write failures to the spawn boundary", async () => {
+    rmSync(dir, { recursive: true, force: true });
+    await expect(writeWorkspaceIdentity(dir)).rejects.toThrow();
   });
 });

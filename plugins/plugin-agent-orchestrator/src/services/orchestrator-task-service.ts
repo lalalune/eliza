@@ -26,7 +26,6 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   ElizaError,
@@ -122,8 +121,8 @@ import {
 } from "./independent-verifier.js";
 import {
   ORCHESTRATOR_OWNED_ARTIFACTS_METADATA_KEY,
-  readOwnedArtifactsFromMetadata,
   type OrchestratorOwnedArtifact,
+  readOwnedArtifactsFromMetadata,
 } from "./orchestrator-artifact-ownership.js";
 import {
   summarizeUsage,
@@ -659,10 +658,13 @@ function residualsOrchestratorOwnedArtifacts(
   session: OrchestratorTaskSession | undefined,
 ): OrchestratorOwnedArtifact[] {
   if (!session) return [];
+  const persisted = readOwnedArtifactsFromMetadata(session.metadata);
   const live = acp?.getOrchestratorOwnedArtifacts(session.sessionId) ?? [];
-  return live.length > 0
-    ? live
-    : readOwnedArtifactsFromMetadata(session.metadata);
+  return [
+    ...new Map(
+      [...persisted, ...live].map((artifact) => [artifact.path, artifact]),
+    ).values(),
+  ];
 }
 
 /** Envelope-derived residuals legs from the VALID CompletionEnvelope stamped
@@ -2041,14 +2043,12 @@ export class OrchestratorTaskService extends Service {
     taskId: string,
     _sessionId: string,
   ): Promise<string> {
-    let dir = join(homedir(), ".eliza", "trajectories", taskId);
-    try {
-      dir = join(resolveStateDir(), "trajectories", taskId);
-    } catch {
-      // error-policy:J4 the configured state-dir lookup is optional enrichment;
-      // on failure fall back to the documented home-scoped trajectory dir.
-    }
-    return join(dir, "completion-evidence.jsonl");
+    return join(
+      resolveStateDir(),
+      "trajectories",
+      taskId,
+      "completion-evidence.jsonl",
+    );
   }
 
   /** The git change set for a completed session: prefer the live ACP session
@@ -4501,9 +4501,7 @@ export class OrchestratorTaskService extends Service {
       throw err;
     }
 
-    const resultMetadata = result.metadata as
-      | Record<string, unknown>
-      | undefined;
+    const resultMetadata = result.metadata;
     const account = accountMetaFromSessionMetadata(resultMetadata);
     const orchestratorOwnedArtifacts =
       readOwnedArtifactsFromMetadata(resultMetadata);

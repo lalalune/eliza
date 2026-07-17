@@ -153,6 +153,8 @@ function acpRuntime(settings: Record<string, string | undefined> = {}) {
   return {
     logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     getSetting: vi.fn((key: string) => values[key]),
+    getService: vi.fn(() => null),
+    reportError: vi.fn(),
     services: new Map<string, unknown[]>(),
   } as never;
 }

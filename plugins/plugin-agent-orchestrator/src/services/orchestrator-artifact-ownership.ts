@@ -6,13 +6,12 @@
  * wrote and can still verify.
  */
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type OrchestratorOwnedArtifactSource =
   | "identity-scaffold"
-  | "skills-manifest"
-  | "completion-evidence";
+  | "skills-manifest";
 
 export interface OrchestratorOwnedArtifact {
   path: string;
@@ -27,7 +26,6 @@ export const ORCHESTRATOR_OWNED_ARTIFACTS_METADATA_KEY =
 const OWNED_ARTIFACT_SOURCES: ReadonlySet<string> = new Set([
   "identity-scaffold",
   "skills-manifest",
-  "completion-evidence",
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -45,8 +43,9 @@ function isOwnedArtifact(value: unknown): value is OrchestratorOwnedArtifact {
     isRecord(value) &&
     typeof value.path === "string" &&
     typeof value.sha256 === "string" &&
+    /^[a-f0-9]{64}$/.test(value.sha256) &&
     typeof value.byteLength === "number" &&
-    Number.isFinite(value.byteLength) &&
+    Number.isSafeInteger(value.byteLength) &&
     value.byteLength >= 0 &&
     isOwnedArtifactSource(value.source)
   );
@@ -104,7 +103,21 @@ export function ownedArtifactStillMatches(
   const path = toWorkdirRelative(workdir, artifact.path);
   if (!path || path !== artifact.path) return false;
   try {
-    const current = readFileSync(join(workdir, path));
+    const fullPath = join(workdir, path);
+    const stats = lstatSync(fullPath);
+    if (!stats.isFile() || stats.isSymbolicLink()) return false;
+    const canonicalWorkdir = realpathSync(workdir);
+    const canonicalFile = realpathSync(fullPath);
+    const canonicalRelative = relative(canonicalWorkdir, canonicalFile);
+    if (
+      !canonicalRelative ||
+      canonicalRelative === ".." ||
+      canonicalRelative.startsWith(`..${sep}`) ||
+      isAbsolute(canonicalRelative)
+    ) {
+      return false;
+    }
+    const current = readFileSync(fullPath);
     const currentFingerprint = fingerprint(current);
     return (
       currentFingerprint.sha256 === artifact.sha256 &&
