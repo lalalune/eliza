@@ -2,61 +2,18 @@ name: Cloud CF Deploy
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: Cloudflare environment to inspect
-        required: true
-        default: staging
-        type: choice
-        options: [staging, production]
-      force:
-        description: Unused compatibility input
-        required: false
-        default: false
-        type: boolean
-permissions:
-  contents: read
+      environment: {required: true, default: staging, type: choice, options: [staging, production]}
+      force: {required: false, default: false, type: boolean}
+permissions: {contents: read}
 jobs:
   tail:
-    if: inputs.environment == 'staging'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - run: npm install -g wrangler@4.61.1
-      - name: Tail staging worker for one live diagnostic turn
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set +e
-          timeout 150s wrangler tail eliza-cloud-api-staging --format json | tee /tmp/worker-tail.jsonl
-          exit_code=${PIPESTATUS[0]}
-          echo "tail_exit=$exit_code"
-          test "$exit_code" = 0 -o "$exit_code" = 124
-      - name: Reproduce exact bridge request beside direct canonical request
+      - name: Exact server-held bridge request against held live agent
         env:
           ELIZACLOUD_API_KEY: ${{ secrets.ELIZACLOUD_API_KEY }}
-          ORG_ID: "41ac20f4-b799-40b1-a487-2d6a748afe92"
-          USER_ID: "eedbba1d-0afe-4da6-8a9d-7f7e5b8354b4"
         run: |
-          set -euo pipefail
-          BASE=https://api-staging.elizacloud.ai
           AUTH="Bearer $ELIZACLOUD_API_KEY"
-          NAME="bridge-diag-$(date +%s)"
-          CHAR=$(curl -fsS -X POST "$BASE/api/my-agents/characters" -H "Authorization: $AUTH" -H 'Content-Type: application/json' --data "{\"name\":\"$NAME\",\"system\":\"Answer briefly.\",\"bio\":\"Temporary bridge diagnostic.\",\"settings\":{\"model\":\"gemma-4-31b\"}}")
-          CHAR_ID=$(jq -r .id <<<"$CHAR")
-          AGENT=$(curl -fsS -X POST "$BASE/api/v1/eliza/agents" -H "Authorization: $AUTH" -H 'Content-Type: application/json' --data "{\"agentName\":\"$NAME\",\"characterId\":\"$CHAR_ID\",\"agentConfig\":{\"model\":\"gemma-4-31b\",\"system\":\"Answer briefly.\"},\"autoProvision\":true}")
-          AGENT_ID=$(jq -r '.data.agentId // .data.id' <<<"$AGENT")
-          CONV_ID=$(cat /proc/sys/kernel/random/uuid)
-          cleanup() { curl -sS -X DELETE "$BASE/api/v1/eliza/agents/$AGENT_ID" -H "Authorization: $AUTH" >/dev/null; curl -sS -X DELETE "$BASE/api/my-agents/characters/$CHAR_ID" -H "Authorization: $AUTH" >/dev/null; }
-          trap cleanup EXIT
-          URL="$BASE/api/v1/eliza/agents/$AGENT_ID/api/conversations/$CONV_ID/messages/stream"
-          curl -sS -o /tmp/direct.body -w '%{http_code}' -X POST "$URL" -H "Authorization: $AUTH" -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"text":"Reply exactly: direct ok"}' > /tmp/direct.status
-          curl -sS -o /tmp/bridge.body -w '%{http_code}' -X POST "$URL" -H "Authorization: $AUTH" -H "X-Service-Key: $AUTH" -H "X-Eliza-Organization-Id: $ORG_ID" -H "X-Eliza-User-Id: $USER_ID" -H "X-Eliza-Agent-Id: $AGENT_ID" -H "X-Eliza-Conversation-Id: $CONV_ID" -H 'X-Eliza-Voice-Trace-Id: diag' -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"text":"Reply exactly: bridge ok"}' > /tmp/bridge.status
-          printf 'direct_status=%s\nbridge_status=%s\nbridge_body=' "$(cat /tmp/direct.status)" "$(cat /tmp/bridge.status)"
-          head -c 1000 /tmp/bridge.body; echo
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: staging-worker-tail
-          path: /tmp/worker-tail.jsonl
+          URL="https://api-staging.elizacloud.ai/api/v1/eliza/agents/66db3a1b-ac2d-40cd-beda-53f0cb21eb9e/api/conversations/f07266f9-b6b6-4a0b-9724-10ae33770bee/messages/stream"
+          curl -sS -o /tmp/body -w 'status=%{http_code}\n' -X POST "$URL" -H "Authorization: $AUTH" -H "X-Service-Key: $AUTH" -H "X-Eliza-Organization-Id: 41ac20f4-b799-40b1-a487-2d6a748afe92" -H "X-Eliza-User-Id: eedbba1d-0afe-4da6-8a9d-7f7e5b8354b4" -H "X-Eliza-Agent-Id: 66db3a1b-ac2d-40cd-beda-53f0cb21eb9e" -H "X-Eliza-Conversation-Id: f07266f9-b6b6-4a0b-9724-10ae33770bee" -H 'X-Eliza-Voice-Trace-Id: diag-held' -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"text":"Reply exactly: bridge held ok"}'
+          printf 'body='; head -c 1000 /tmp/body; echo
