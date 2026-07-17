@@ -315,6 +315,7 @@ export async function requestJson(
     try {
       response = await fetchImpl(url, { headers: apiHeaders(token) });
     } catch (error) {
+      // error-policy:J1 GitHub API transport boundary retries transient network failures and throws with cause after the bounded attempt budget.
       if (attempt === maxAttempts) {
         throw new Error(
           `GitHub API request failed for ${url} after ${maxAttempts} attempts: ${error instanceof Error ? error.message : String(error)}`,

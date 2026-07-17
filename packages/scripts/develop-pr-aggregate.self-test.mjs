@@ -203,6 +203,26 @@ assert.deepEqual(retriedPayload, { check_runs: [] });
 assert.equal(apiAttempts.length, 3);
 assert.deepEqual(retrySleeps, [5, 10]);
 
+let networkAttempts = 0;
+const networkSleeps = [];
+const recoveredNetworkPayload = await requestJson(
+  "https://api.github.test/check-runs",
+  "test-token",
+  {
+    fetchImpl: async () => {
+      networkAttempts += 1;
+      if (networkAttempts === 1) throw new Error("connection reset");
+      return Response.json({ check_runs: [] });
+    },
+    sleepImpl: async (delayMs) => networkSleeps.push(delayMs),
+    maxAttempts: 2,
+    baseDelayMs: 7,
+  },
+);
+assert.deepEqual(recoveredNetworkPayload, { check_runs: [] });
+assert.equal(networkAttempts, 2);
+assert.deepEqual(networkSleeps, [7]);
+
 let permanentAttempts = 0;
 await assert.rejects(
   requestJson("https://api.github.test/missing", "test-token", {
