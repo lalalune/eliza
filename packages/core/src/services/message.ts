@@ -3110,7 +3110,7 @@ export const BUILTIN_RESPONSE_HANDLER_EVALUATORS: readonly ResponseHandlerEvalua
 				const text = getUserMessageText(message);
 				if (!text?.trim()) return false;
 				const inference = inferDirectCurrentRequestCandidateInference(
-					runtime.actions ?? [],
+					runtime.actions,
 					text,
 				);
 				if (inference.names.length === 0) return false;
@@ -3126,9 +3126,9 @@ export const BUILTIN_RESPONSE_HANDLER_EVALUATORS: readonly ResponseHandlerEvalua
 				});
 			},
 			evaluate: ({ message, messageHandler, runtime }) => {
-				const text = getUserMessageText(message) ?? "";
+				const text = getUserMessageText(message);
 				const inference = inferDirectCurrentRequestCandidateInference(
-					runtime.actions ?? [],
+					runtime.actions,
 					text,
 				);
 				const candidateActions = shouldSuppressInferredCandidateEscalation({
@@ -4814,7 +4814,7 @@ function shouldReplaceUnavailableLiveLookupAck(args: {
 	actions: ReadonlyArray<Pick<Action, "name" | "similes">>;
 	reply: string;
 }): boolean {
-	const text = (getUserMessageText(args.message) ?? "").trim();
+	const text = getUserMessageText(args.message).trim();
 	return (
 		text.length > 0 &&
 		looksLikeWebSearchRequest(text) &&
@@ -5368,7 +5368,7 @@ function trimExtractedUrl(value: string): string {
 function extractCalendlyAvailabilityFallbackParams(
 	message: Memory,
 ): Record<string, unknown> | null {
-	const text = getUserMessageText(message) ?? "";
+	const text = getUserMessageText(message);
 	const lower = text.toLowerCase();
 	if (
 		!/\bcalendly\b|api\.calendly\.com/u.test(lower) ||
@@ -5417,7 +5417,7 @@ function buildRoutedDeterministicPlannerFallbackToolCall(args: {
 		return null;
 	}
 
-	const text = getUserMessageText(args.message) ?? "";
+	const text = getUserMessageText(args.message);
 	const candidateActionNames = Array.isArray(
 		args.messageHandler.plan.candidateActions,
 	)
@@ -6217,7 +6217,7 @@ export async function runShortcutGate(args: {
 	senderRole: RoleGateRole;
 }): Promise<V5MessageRuntimeStage1Result | null> {
 	if (process.env.ELIZA_SHORTCUTS_DISABLED === "1") return null;
-	const text = getUserMessageText(args.message) ?? "";
+	const text = getUserMessageText(args.message);
 	if (!text.trim()) return null;
 
 	const registry = (args.runtime as { shortcutRegistry?: ShortcutRegistry })
@@ -6451,7 +6451,7 @@ export async function runV5MessageRuntimeStage1(args: {
 				traceId: getTrajectoryContext()?.traceId,
 				rootMessage: {
 					id: String(args.message.id ?? args.responseId),
-					text: getUserMessageText(args.message) ?? "",
+					text: getUserMessageText(args.message),
 					sender: args.message.entityId
 						? String(args.message.entityId)
 						: undefined,
@@ -6605,7 +6605,7 @@ export async function runV5MessageRuntimeStage1(args: {
 		// equivalent (unforced) contract for them.
 		const responseGrammar = buildResponseGrammar(
 			{
-				actions: args.runtime.actions ?? [],
+				actions: args.runtime.actions,
 				responseHandlerFields: selectedResponseHandlerFields,
 				responseHandlerFieldSignature:
 					args.runtime.responseHandlerFieldRegistry?.composeSchemaSignature(
@@ -7084,7 +7084,7 @@ export async function runV5MessageRuntimeStage1(args: {
 			if (
 				shouldReplaceUnavailableLiveLookupAck({
 					message: args.message,
-					actions: args.runtime.actions ?? [],
+					actions: args.runtime.actions,
 					reply,
 				})
 			) {
@@ -7154,8 +7154,8 @@ export async function runV5MessageRuntimeStage1(args: {
 		);
 		const directPlannerCandidateActions =
 			inferDirectCurrentRequestCandidateActions(
-				args.runtime.actions ?? [],
-				getUserMessageText(args.message) ?? "",
+				args.runtime.actions,
+				getUserMessageText(args.message),
 			);
 		if (directPlannerCandidateActions.length > 0) {
 			messageHandler.plan.candidateActions = uniqueActionNames([
@@ -7178,7 +7178,7 @@ export async function runV5MessageRuntimeStage1(args: {
 			fullSurfaceEnv === "yes" ||
 			fullSurfaceEnv === "on";
 		const plannerCandidateActions = useFullSurface
-			? (args.runtime.actions ?? []).filter(
+			? args.runtime.actions.filter(
 					(action) =>
 						// Full-surface = the eliza-code coding sub-agent (its ACP server
 						// sets ELIZA_PLANNER_FULL_ACTION_SURFACE). It must NOT receive the
@@ -8040,8 +8040,8 @@ function extractMessageHandlerUsage(raw: GenerateTextResult):
 	| undefined {
 	const usage = raw.usage;
 	if (!usage) return undefined;
-	const promptTokens = usage.promptTokens ?? 0;
-	const completionTokens = usage.completionTokens ?? 0;
+	const promptTokens = usage.promptTokens;
+	const completionTokens = usage.completionTokens;
 	const totalTokens = usage.totalTokens ?? promptTokens + completionTokens;
 	const out: {
 		promptTokens: number;

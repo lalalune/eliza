@@ -1085,12 +1085,12 @@ export async function hasRoleAccess(
 		if (!result) {
 			const senderRank =
 				ROLE_RANK[getUnresolvedSenderRoleFloor(context.message)];
-			const requiredRank = ROLE_RANK[requiredRole] ?? 0;
+			const requiredRank = ROLE_RANK[requiredRole];
 			return senderRank >= requiredRank;
 		}
 
-		const senderRank = ROLE_RANK[result.role] ?? 0;
-		const requiredRank = ROLE_RANK[requiredRole] ?? 0;
+		const senderRank = ROLE_RANK[result.role];
+		const requiredRank = ROLE_RANK[requiredRole];
 		return senderRank >= requiredRank;
 	} catch {
 		return false;

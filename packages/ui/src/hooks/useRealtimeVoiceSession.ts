@@ -258,6 +258,15 @@ function fallbackReasonForError(
   return null;
 }
 
+// agentId/conversationId are typed `string | null | undefined`, but they arrive
+// here from callers' runtime state (route/store values) that can hand us a
+// non-string id; a bare `id?.trim()` then throws "trim is not a function". Treat
+// any non-string id as absent — identity-key semantics already collapse an empty
+// id to "no session", so this normalizes the boundary without masking a pipeline.
+function trimmedId(value: string | null | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 export function useRealtimeVoiceSession(
   options: UseRealtimeVoiceSessionOptions,
 ): UseRealtimeVoiceSessionState {
@@ -345,7 +354,7 @@ export function useRealtimeVoiceSession(
     [],
   );
 
-  const hasIds = Boolean(agentId?.trim()) && Boolean(conversationId?.trim());
+  const hasIds = Boolean(trimmedId(agentId)) && Boolean(trimmedId(conversationId));
   const available = flagEnabled && hasIds && !featureDisabled;
 
   const applyServerEventToTranscript = useCallback(
@@ -696,7 +705,7 @@ export function useRealtimeVoiceSession(
   // changes while a start/live session owns the mic, stop the old socket and
   // re-mint against the latest ids. A generation guard prevents rapid thread
   // switches from resurrecting an intermediate identity.
-  const identityKey = `${agentId?.trim() ?? ""}\n${conversationId?.trim() ?? ""}`;
+  const identityKey = `${trimmedId(agentId)}\n${trimmedId(conversationId)}`;
   const previousIdentityRef = useRef(identityKey);
   useEffect(() => {
     if (previousIdentityRef.current === identityKey) return;

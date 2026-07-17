@@ -35,6 +35,7 @@ import {
   routerLoopTransition,
 } from "../../src/services/router-loop-guard.js";
 import { CodingWorkspaceService } from "../../src/services/workspace-service.js";
+import { ACP_SUBPROCESS_SERVICE_TYPE } from "../../src/services/acp-service.js";
 
 // This suite pins the status state machine and the ACP→task event bridge — NOT
 // the #8896 default-criteria feature. createTask now auto-populates acceptance
@@ -166,7 +167,8 @@ function runtime(
   settings: Record<string, string> = {},
 ): IAgentRuntime {
   return {
-    getService: () => acp ?? null,
+    getService: (type: string) =>
+      type === ACP_SUBPROCESS_SERVICE_TYPE ? (acp ?? null) : null,
     getSetting: (key: string) => settings[key],
     reportError: vi.fn(),
     logger: {
@@ -206,7 +208,11 @@ function runtimeWithWorkspace(
 ): IAgentRuntime {
   return {
     getService: (type: string) =>
-      type === CodingWorkspaceService.serviceType ? workspace : (acp ?? null),
+      type === CodingWorkspaceService.serviceType
+        ? workspace
+        : type === ACP_SUBPROCESS_SERVICE_TYPE
+          ? (acp ?? null)
+          : null,
     getSetting: () => undefined,
     useModel,
     reportError: vi.fn(),
@@ -688,7 +694,7 @@ describe("OrchestratorTaskService — lifecycle", () => {
     expect(fetchGroundTruth).not.toHaveBeenCalled();
   });
 
-  it("automatic validation reuses the stored ground-truth verdict when promoting", async () => {
+  it("automatic validation re-verifies ground truth with a fresh promotion pass", async () => {
     const acp = new FakeAcp();
     const workspace = new CodingWorkspaceService(runtime(acp));
     const fetchGroundTruth = vi.fn(async () => ({
@@ -733,7 +739,13 @@ describe("OrchestratorTaskService — lifecycle", () => {
     });
     await settleStatus(service, task.id, "done");
 
-    expect(fetchGroundTruth).toHaveBeenCalledTimes(1);
+    // The auto-verify pipeline hits GitHub twice per promotion, by design: the
+    // deterministic hard-fail gate verifies the raw completion first, then
+    // promotion re-verifies through the same verifyGroundTruthForValidation used
+    // by the manual validateTask path — which never trusts a possibly-stale
+    // metadata verdict and always fetches a fresh one to gate curated-memory
+    // harvest. The judge model still runs exactly once.
+    expect(fetchGroundTruth).toHaveBeenCalledTimes(2);
     expect(useModel).toHaveBeenCalledTimes(1);
     expect(
       (await store.getTask(task.id))?.task.metadata.groundTruthVerdict,
@@ -2122,7 +2134,8 @@ describe("OrchestratorTaskService — store degradation resilience (#11641)", ()
   } {
     const warn = vi.fn();
     const rt = {
-      getService: () => acp ?? null,
+      getService: (type: string) =>
+        type === ACP_SUBPROCESS_SERVICE_TYPE ? (acp ?? null) : null,
       reportError: vi.fn(),
       logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
     } as never as IAgentRuntime;

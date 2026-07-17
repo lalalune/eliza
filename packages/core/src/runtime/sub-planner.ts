@@ -71,7 +71,7 @@ function buildSubPlannerTools(actions: readonly Action[]): ToolDefinition[] {
 				...canonical,
 				name,
 				description:
-					`${canonical.description ?? action.description ?? ""}\nAlias for ${action.name}.`.trim(),
+					`${canonical.description ?? action.description}\nAlias for ${action.name}.`.trim(),
 			};
 			toolsByName.set(name, aliasTool);
 			tools.push(aliasTool);

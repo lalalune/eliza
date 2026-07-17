@@ -100,8 +100,8 @@ export async function getCachedImageDescription(
 	if (cached && (cached.description || cached.text)) {
 		return {
 			title: cached.title || "Image",
-			description: cached.description ?? "",
-			text: cached.text ?? cached.description ?? "",
+			description: cached.description,
+			text: cached.text,
 		};
 	}
 	return undefined;

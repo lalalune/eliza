@@ -170,11 +170,11 @@ function splitSharedBudget(
 ): Record<string, number> {
 	const keys = Object.keys(parts);
 	const budgets = allocateFairBudgets(
-		keys.map((key) => parts[key]?.length ?? 0),
+		keys.map((key) => parts[key].length),
 		sharedBudget,
 	);
 	return Object.fromEntries(
-		keys.map((key, index) => [key, budgets[index] ?? 0]),
+		keys.map((key, index) => [key, budgets[index]]),
 	);
 }
 
@@ -188,7 +188,7 @@ function renderSharedContext(params: {
 }): string {
 	const { runtime, message, agentName, options, parts, budgets } = params;
 	const part = (name: string, fallback = "(none)") => {
-		const text = trimTailForPrompt(parts[name] ?? "", budgets[name] ?? 0);
+		const text = trimTailForPrompt(parts[name], budgets[name]);
 		return text || fallback;
 	};
 
@@ -365,7 +365,7 @@ function buildPrompt(params: {
 		budgets: sharedBudgets,
 	});
 	const boundedEvaluatorSections = sections.map((section, index) =>
-		renderEvaluatorSection(section, evaluatorBudgets[index] ?? 0),
+		renderEvaluatorSection(section, evaluatorBudgets[index]),
 	);
 	const evaluatorSections = boundedEvaluatorSections.join("\n\n");
 	const prompt = renderPrompt(sharedContext, evaluatorSections);
@@ -389,10 +389,10 @@ function buildPrompt(params: {
 		shared: renderPrompt(unboundedSharedContext, "").length,
 	};
 	for (const [index, section] of sections.entries()) {
-		sectionChars[section.name] = boundedEvaluatorSections[index]?.length ?? 0;
+		sectionChars[section.name] = boundedEvaluatorSections[index].length;
 		originalSectionChars[section.name] = renderEvaluatorSection(
 			section,
-			evaluatorRawLengths[index] ?? 0,
+			evaluatorRawLengths[index],
 		).length;
 	}
 	return { prompt, sectionChars, originalSectionChars };

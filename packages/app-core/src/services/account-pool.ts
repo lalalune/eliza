@@ -1180,12 +1180,14 @@ function routeTargetsProvider(
 }
 
 /**
- * Live read of the configured per-provider selection (the app's
- * `config.accountStrategies` picker plus any llmText service-routing pin).
- * Every account-selecting bridge resolves through this so the picker steers
- * all of them — including the coding-agent bridge.
+ * The explicitly-configured per-provider selection: the app's
+ * `config.accountStrategies` picker choice plus any llmText service-routing
+ * pin. `strategy` is `undefined` when nothing is configured — callers layer
+ * their own default on top. The coding-agent bridge reads this (not
+ * `selectionForProvider`) so its env-var / least-used fallback is not shadowed
+ * by the provider default `selectionForProvider` applies.
  */
-export function selectionForProvider(providerId: PoolProviderId): {
+export function configuredSelectionForProvider(providerId: PoolProviderId): {
   strategy?: Strategy;
   accountIds?: string[];
 } {
@@ -1199,13 +1201,31 @@ export function selectionForProvider(providerId: PoolProviderId): {
   return {
     strategy:
       routeSelection.strategy ??
-      normalizeStrategy(
-        defaultSelectionConfig.accountStrategies?.[providerId],
-      ) ??
+      normalizeStrategy(defaultSelectionConfig.accountStrategies?.[providerId]),
+    accountIds: routeSelection.accountIds,
+  };
+}
+
+/**
+ * Live read of the configured per-provider selection with the provider default
+ * strategy applied when nothing is configured (anthropic-subscription drains
+ * weekly windows before reset by default). The runtime, broker, and public-pool
+ * status selection paths resolve through this so the picker steers them while
+ * still defaulting sensibly. Coding spawns use `configuredSelectionForProvider`
+ * so this default does not override their env-var / least-used fallback.
+ */
+export function selectionForProvider(providerId: PoolProviderId): {
+  strategy?: Strategy;
+  accountIds?: string[];
+} {
+  const configured = configuredSelectionForProvider(providerId);
+  return {
+    strategy:
+      configured.strategy ??
       (providerId === "anthropic-subscription"
         ? "drain-soonest-reset"
         : undefined),
-    accountIds: routeSelection.accountIds,
+    accountIds: configured.accountIds,
   };
 }
 

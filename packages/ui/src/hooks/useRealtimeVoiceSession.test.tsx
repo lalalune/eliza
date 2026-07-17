@@ -541,6 +541,16 @@ describe("useRealtimeVoiceSession", () => {
     expect(result.current.available).toBe(false);
   });
 
+  it("treats a non-string id as absent instead of throwing on .trim()", () => {
+    // A caller's runtime state can hand the hook a non-string id; the identity
+    // key must not blow up with "trim is not a function" (regression: #16192).
+    const { options } = makeOptions({
+      conversationId: 123 as unknown as string,
+    });
+    const { result } = renderHook(() => useRealtimeVoiceSession(options));
+    expect(result.current.available).toBe(false);
+  });
+
   it("surfaces a paused (not broken) state on a visibility-suspend, and clears on resume", async () => {
     const { options, ws, micCtx } = makeOptions();
     const { result } = renderHook(() => useRealtimeVoiceSession(options));

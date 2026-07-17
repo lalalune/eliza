@@ -63,9 +63,9 @@ import {
 import type { LinkedAccountProviderId } from "@elizaos/shared/contracts/service-routing";
 import {
   type AccountPool,
+  configuredSelectionForProvider,
   isAccountSelectableNow,
   type Strategy,
-  selectionForProvider,
 } from "./account-pool.js";
 import {
   claudeMinRemainingMs,
@@ -827,14 +827,17 @@ function makeBridge(pool: AccountPool): CodingAgentSelectorBridge {
       if (candidates.length === 0) return null;
       for (const providerId of candidates) {
         // Explicit caller override > the app's per-provider
-        // config.accountStrategies (same live selectionForProvider read the
-        // anthropic/subscription bridges use, so the rotation-strategy picker
-        // steers coding spawns too) > ELIZA_CODING_ACCOUNT_STRATEGY env >
-        // least-used. Strategy only — the llmText route's accountIds pin the
-        // chat brain's account, not coding sub-agents.
+        // config.accountStrategies picker choice (configuredSelectionForProvider
+        // reads the same picker the runtime/subscription bridges honor, so the
+        // rotation-strategy picker steers coding spawns too) >
+        // ELIZA_CODING_ACCOUNT_STRATEGY env > least-used. The configured read
+        // deliberately excludes selectionForProvider's provider default so the
+        // env-var / least-used fallback still applies here. Strategy only — the
+        // llmText route's accountIds pin the chat brain's account, not coding
+        // sub-agents.
         const strategy =
           opts?.strategy ??
-          selectionForProvider(providerId).strategy ??
+          configuredSelectionForProvider(providerId).strategy ??
           getDefaultCodingStrategy();
         const account = await pool.select({
           providerId,

@@ -2130,8 +2130,8 @@ export function findAllMnemonicPhrases(text: string): MnemonicSpan[] {
 			for (let j = i + 1; j < i + count; j += 1) {
 				const prev = tokens[j - 1];
 				const cur = tokens[j];
-				const gapStart = (prev.index ?? 0) + prev[0].length;
-				if (!/^\s+$/.test(text.slice(gapStart, cur.index ?? 0))) {
+				const gapStart = prev.index + prev[0].length;
+				if (!/^\s+$/.test(text.slice(gapStart, cur.index))) {
 					adjacent = false;
 					break;
 				}
@@ -2144,8 +2144,8 @@ export function findAllMnemonicPhrases(text: string): MnemonicSpan[] {
 			if (mnemonicValid(phrase)) {
 				const first = tokens[i];
 				const last = tokens[i + count - 1];
-				const start = first.index ?? 0;
-				const end = (last.index ?? 0) + last[0].length;
+				const start = first.index;
+				const end = last.index + last[0].length;
 				spans.push({ value: text.slice(start, end), start, end });
 				i += count;
 				matched = true;

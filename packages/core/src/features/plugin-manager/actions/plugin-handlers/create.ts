@@ -281,7 +281,7 @@ async function dispatchCodingAgent({
 	pluginName: string;
 	callback?: HandlerCallback;
 }): Promise<DispatchResult> {
-	const createTaskName = findCodingDelegationActionName(runtime.actions ?? []);
+	const createTaskName = findCodingDelegationActionName(runtime.actions);
 	const createTask = runtime.actions.find(
 		(action) => action.name === createTaskName,
 	);

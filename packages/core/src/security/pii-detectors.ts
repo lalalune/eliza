@@ -419,7 +419,7 @@ export function detectPii(
 			}
 			const value = extractValue(detector, match);
 			if (!value) continue;
-			const start = (match.index ?? 0) + whole.indexOf(value);
+			const start = match.index + whole.indexOf(value);
 			candidates.push({
 				kind: detector.kind,
 				value,

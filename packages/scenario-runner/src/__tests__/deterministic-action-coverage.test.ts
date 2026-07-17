@@ -77,7 +77,13 @@ const CORE_ACTION_SURFACE: Record<string, readonly string[]> = {
     "SETTINGS",
     "VIEWS",
   ],
-  "@elizaos/plugin-coding-tools": ["FILE", "SHELL", "WORKTREE"],
+  "@elizaos/plugin-coding-tools": [
+    "FILE",
+    "SHELL",
+    "WEB_FETCH",
+    "WEB_SEARCH",
+    "WORKTREE",
+  ],
   "@elizaos/plugin-commands": [
     "ACCOUNTS_COMMAND",
     "BACKEND_COMMAND",
@@ -215,6 +221,11 @@ const KNOWN_UNCOVERED: readonly string[] = [
   "SHARE_TRANSCRIPT",
   // New workflow code-eval action (#8914); no deterministic keyless scenario yet.
   "EVAL_CODE",
+  // Coding-tools public-web research actions; both reach the real network (and
+  // WEB_SEARCH a live search backend), so the keyless mock lane cannot exercise
+  // them — no deterministic scenario yet.
+  "WEB_FETCH",
+  "WEB_SEARCH",
   // App-control agent/model switchers + settings surface; dispatched through
   // dashboard affordances, no deterministic keyless scenarios yet.
   "AGENT_SWITCH",

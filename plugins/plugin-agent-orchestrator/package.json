@@ -72,6 +72,10 @@
     "git-workspace-service": "0.4.5"
   },
   "dependencies": {
+    "@octokit/core": "^7.0.6",
+    "@octokit/plugin-paginate-rest": "^14.0.0",
+    "@octokit/plugin-request-log": "^6.0.0",
+    "@octokit/plugin-rest-endpoint-methods": "^17.0.0",
     "@octokit/rest": "^22.0.0",
     "coding-agent-adapters": "0.16.3",
     "drizzle-orm": "^0.45.1",

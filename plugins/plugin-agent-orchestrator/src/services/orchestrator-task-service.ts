@@ -2879,7 +2879,7 @@ export class OrchestratorTaskService extends Service {
         summary: summarizeResiduals(residuals),
         data: {
           verifier: COMPLETION_RESIDUALS_VERIFIER_NAME,
-          residuals: residuals as unknown as Record<string, unknown>,
+          residuals: residuals,
         },
         timestamp: Date.now(),
         createdAt: nowIso(),
@@ -2956,7 +2956,7 @@ export class OrchestratorTaskService extends Service {
         verifier: result.verifier ?? "orchestrator",
         humanOverride: result.humanOverride === true,
         ...(residuals
-          ? { residuals: residuals as unknown as Record<string, unknown> }
+          ? { residuals: residuals }
           : {}),
         ...(residualsProvenance ? { residualsProvenance } : {}),
       },
@@ -3194,7 +3194,7 @@ export class OrchestratorTaskService extends Service {
             summary: summarizeResiduals(residuals),
             data: {
               verifier: COMPLETION_RESIDUALS_VERIFIER_NAME,
-              residuals: residuals as unknown as Record<string, unknown>,
+              residuals: residuals,
             },
             timestamp: Date.now(),
             createdAt: nowIso(),

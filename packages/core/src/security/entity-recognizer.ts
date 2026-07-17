@@ -125,7 +125,7 @@ export class RegexEntityRecognizer implements PiiEntityRecognizer {
 				for (const match of text.matchAll(pattern)) {
 					const value = match[0].trim();
 					if (!value) continue;
-					const start = match.index ?? 0;
+					const start = match.index;
 					spans.push({ kind, value, start, end: start + match[0].length });
 				}
 			}
