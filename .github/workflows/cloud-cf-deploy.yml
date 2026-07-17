@@ -33,6 +33,28 @@ jobs:
           exit_code=${PIPESTATUS[0]}
           echo "tail_exit=$exit_code"
           test "$exit_code" = 0 -o "$exit_code" = 124
+      - name: Reproduce exact bridge request beside direct canonical request
+        env:
+          ELIZACLOUD_API_KEY: ${{ secrets.ELIZACLOUD_API_KEY }}
+          ORG_ID: "41ac20f4-b799-40b1-a487-2d6a748afe92"
+          USER_ID: "eedbba1d-0afe-4da6-8a9d-7f7e5b8354b4"
+        run: |
+          set -euo pipefail
+          BASE=https://api-staging.elizacloud.ai
+          AUTH="Bearer $ELIZACLOUD_API_KEY"
+          NAME="bridge-diag-$(date +%s)"
+          CHAR=$(curl -fsS -X POST "$BASE/api/my-agents/characters" -H "Authorization: $AUTH" -H 'Content-Type: application/json' --data "{\"name\":\"$NAME\",\"system\":\"Answer briefly.\",\"bio\":\"Temporary bridge diagnostic.\",\"settings\":{\"model\":\"gemma-4-31b\"}}")
+          CHAR_ID=$(jq -r .id <<<"$CHAR")
+          AGENT=$(curl -fsS -X POST "$BASE/api/v1/eliza/agents" -H "Authorization: $AUTH" -H 'Content-Type: application/json' --data "{\"agentName\":\"$NAME\",\"characterId\":\"$CHAR_ID\",\"agentConfig\":{\"model\":\"gemma-4-31b\",\"system\":\"Answer briefly.\"},\"autoProvision\":true}")
+          AGENT_ID=$(jq -r '.data.agentId // .data.id' <<<"$AGENT")
+          CONV_ID=$(cat /proc/sys/kernel/random/uuid)
+          cleanup() { curl -sS -X DELETE "$BASE/api/v1/eliza/agents/$AGENT_ID" -H "Authorization: $AUTH" >/dev/null; curl -sS -X DELETE "$BASE/api/my-agents/characters/$CHAR_ID" -H "Authorization: $AUTH" >/dev/null; }
+          trap cleanup EXIT
+          URL="$BASE/api/v1/eliza/agents/$AGENT_ID/api/conversations/$CONV_ID/messages/stream"
+          curl -sS -o /tmp/direct.body -w '%{http_code}' -X POST "$URL" -H "Authorization: $AUTH" -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"text":"Reply exactly: direct ok"}' > /tmp/direct.status
+          curl -sS -o /tmp/bridge.body -w '%{http_code}' -X POST "$URL" -H "Authorization: $AUTH" -H "X-Service-Key: $AUTH" -H "X-Eliza-Organization-Id: $ORG_ID" -H "X-Eliza-User-Id: $USER_ID" -H "X-Eliza-Agent-Id: $AGENT_ID" -H "X-Eliza-Conversation-Id: $CONV_ID" -H 'X-Eliza-Voice-Trace-Id: diag' -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"text":"Reply exactly: bridge ok"}' > /tmp/bridge.status
+          printf 'direct_status=%s\nbridge_status=%s\nbridge_body=' "$(cat /tmp/direct.status)" "$(cat /tmp/bridge.status)"
+          head -c 1000 /tmp/bridge.body; echo
       - if: always()
         uses: actions/upload-artifact@v4
         with:
