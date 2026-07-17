@@ -258,18 +258,12 @@ function getCallbackReasonMessage(
 const EMAIL_RESEND_COOLDOWN_MS = 30_000;
 const EMAIL_STATUS_POLL_MS = 3_000;
 
-function sanitizeOneTimeCode(value: string): string {
-  return value.replace(/[^0-9]/g, "").slice(0, 6);
+function createEmailResendDeadlineMs(): number {
+  return Date.now() + EMAIL_RESEND_COOLDOWN_MS;
 }
 
-function challengeExpiresAtMs(challenge: StewardEmailLoginChallenge): number {
-  if (typeof challenge.expiresAt === "number") {
-    return challenge.expiresAt < 10_000_000_000
-      ? challenge.expiresAt * 1000
-      : challenge.expiresAt;
-  }
-  const parsed = Date.parse(challenge.expiresAt);
-  return Number.isFinite(parsed) ? parsed : Date.now();
+function sanitizeOneTimeCode(value: string): string {
+  return value.replace(/[^0-9]/g, "").slice(0, 6);
 }
 
 function mapChallengeStatus(status: StewardEmailLoginStatus): EmailCheckState {
@@ -329,6 +323,9 @@ export default function StewardLoginSection() {
   );
 
   const emailInputRef = useRef<HTMLInputElement>(null);
+  const emailAttemptGenerationRef = useRef(0);
+  const emailStartControllerRef = useRef<AbortController | null>(null);
+  const emailVerifyControllerRef = useRef<AbortController | null>(null);
 
   const [email, setEmail] = useState("");
   const [otpCode, setOtpCode] = useState("");
@@ -337,6 +334,9 @@ export default function StewardLoginSection() {
     useState<StewardEmailLoginChallenge | null>(null);
   const [emailCheckState, setEmailCheckState] =
     useState<EmailCheckState>("pending");
+  const [emailPollingError, setEmailPollingError] = useState<string | null>(
+    null,
+  );
   const [resendRemainingSeconds, setResendRemainingSeconds] = useState(0);
   const [resendAvailableAt, setResendAvailableAt] = useState(0);
   const [step, setStep] = useState<AuthStep>("idle");
@@ -407,6 +407,19 @@ export default function StewardLoginSection() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(
+    () => () => {
+      emailAttemptGenerationRef.current += 1;
+      const startController = emailStartControllerRef.current;
+      const verifyController = emailVerifyControllerRef.current;
+      emailStartControllerRef.current = null;
+      emailVerifyControllerRef.current = null;
+      startController?.abort();
+      verifyController?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     const code = consumeStewardCodeFromQuery();
@@ -564,36 +577,63 @@ export default function StewardLoginSection() {
     const { challengeId, pollSecret } = emailChallenge;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let activeController: AbortController | null = null;
+    let consecutiveFailures = 0;
 
     const poll = async () => {
+      let nextPollDelayMs = EMAIL_STATUS_POLL_MS;
+      activeController = new AbortController();
       try {
         const status = await pollStewardEmailSignInStatus(
-          { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
+          {
+            baseUrl: stewardApiUrl,
+            tenantId: STEWARD_TENANT_ID,
+            signal: activeController.signal,
+          },
           challengeId,
           pollSecret,
         );
         if (cancelled) return;
+        consecutiveFailures = 0;
+        setEmailPollingError(null);
         const mapped = mapChallengeStatus(status);
         setEmailCheckState(mapped);
         if (mapped !== "pending") return;
       } catch (pollError) {
-        if (!cancelled) {
-          setError(
-            describeEmailLoginError(
-              pollError,
-              "Could not check that sign-in email. You can still enter the code.",
-            ),
-          );
+        // error-policy:J4 The code remains usable while polling failures render as a distinct degraded state.
+        if (cancelled) return;
+        if (pollError instanceof StewardEmailLoginError) {
+          if (pollError.status === 401 || pollError.status === 403) {
+            setEmailCheckState("invalid");
+            return;
+          }
+          if (pollError.status === 410) {
+            setEmailCheckState("expired");
+            return;
+          }
         }
+        setEmailPollingError(
+          describeEmailLoginError(
+            pollError,
+            "Status updates are unavailable. You can still enter the code.",
+          ),
+        );
+        consecutiveFailures += 1;
+        nextPollDelayMs = Math.min(
+          EMAIL_STATUS_POLL_MS * 2 ** Math.min(consecutiveFailures, 3),
+          30_000,
+        );
       }
+      activeController = null;
       if (!cancelled) {
-        timer = setTimeout(poll, EMAIL_STATUS_POLL_MS);
+        timer = setTimeout(poll, nextPollDelayMs);
       }
     };
 
     timer = setTimeout(poll, EMAIL_STATUS_POLL_MS);
     return () => {
       cancelled = true;
+      activeController?.abort();
       if (timer) clearTimeout(timer);
     };
   }, [emailChallenge, emailCheckState, step, stewardApiUrl]);
@@ -606,10 +646,7 @@ export default function StewardLoginSection() {
 
     const update = () => {
       const resendMs = Math.max(0, resendAvailableAt - Date.now());
-      const expiryMs = Math.max(
-        0,
-        challengeExpiresAtMs(emailChallenge) - Date.now(),
-      );
+      const expiryMs = Math.max(0, emailChallenge.expiresAtMs - Date.now());
       if (expiryMs === 0 && emailCheckState === "pending") {
         setEmailCheckState("expired");
       }
@@ -707,26 +744,53 @@ export default function StewardLoginSection() {
   }
 
   async function handleEmail() {
-    if (!email.trim()) {
+    const submittedEmail = email.trim();
+    if (!submittedEmail) {
       setError("Enter your email");
       return;
     }
+    const attemptGeneration = emailAttemptGenerationRef.current + 1;
+    emailAttemptGenerationRef.current = attemptGeneration;
+    emailStartControllerRef.current?.abort();
+    const controller = new AbortController();
+    emailStartControllerRef.current = controller;
     setLoading("email");
     setError(null);
     try {
       const challenge = await startStewardEmailLogin(
-        { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
-        email.trim(),
+        {
+          baseUrl: stewardApiUrl,
+          tenantId: STEWARD_TENANT_ID,
+          signal: controller.signal,
+        },
+        submittedEmail,
       );
+      if (
+        controller.signal.aborted ||
+        emailAttemptGenerationRef.current !== attemptGeneration
+      ) {
+        return;
+      }
       setEmailChallenge(challenge);
       setEmailCode("");
       setEmailCheckState("pending");
-      setResendAvailableAt(Date.now() + EMAIL_RESEND_COOLDOWN_MS);
+      setEmailPollingError(null);
+      setResendAvailableAt(createEmailResendDeadlineMs());
       setStep("email-sent");
-      setLoading(null);
     } catch (e: unknown) {
+      // error-policy:J4 The login form is the user-facing boundary for challenge-start failures.
+      if (
+        controller.signal.aborted ||
+        emailAttemptGenerationRef.current !== attemptGeneration
+      ) {
+        return;
+      }
       setError(describeEmailLoginError(e, "Failed to send sign-in email."));
-      setLoading(null);
+    } finally {
+      if (emailStartControllerRef.current === controller) {
+        emailStartControllerRef.current = null;
+        setLoading(null);
+      }
     }
   }
 
@@ -736,33 +800,64 @@ export default function StewardLoginSection() {
       setError("Enter the six-digit code from your email.");
       return;
     }
+    if (emailVerifyControllerRef.current) return;
+    const attemptGeneration = emailAttemptGenerationRef.current;
+    const controller = new AbortController();
+    emailVerifyControllerRef.current = controller;
     setLoading("email");
     setError(null);
     try {
       const result = await verifyStewardEmailSignInCode(
-        { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
+        {
+          baseUrl: stewardApiUrl,
+          tenantId: STEWARD_TENANT_ID,
+          signal: controller.signal,
+        },
         email.trim(),
         code,
       );
-      if ("mfaRequired" in result) {
+      if (
+        controller.signal.aborted ||
+        emailAttemptGenerationRef.current !== attemptGeneration
+      ) {
+        return;
+      }
+      if (result.mfaRequired) {
         throw new Error(
           "Additional verification is required to finish signing in.",
         );
       }
       await handleSuccess(result.token, result.refreshToken);
     } catch (e: unknown) {
+      // error-policy:J4 Code rejection and session-establishment failures stay visible in the active challenge.
+      if (
+        controller.signal.aborted ||
+        emailAttemptGenerationRef.current !== attemptGeneration
+      ) {
+        return;
+      }
       setError(
         describeEmailLoginError(e, "That code did not work. Try again."),
       );
-      setLoading(null);
+    } finally {
+      if (emailVerifyControllerRef.current === controller) {
+        emailVerifyControllerRef.current = null;
+        setLoading(null);
+      }
     }
   }
 
   function cancelEmailLogin() {
+    emailAttemptGenerationRef.current += 1;
+    emailStartControllerRef.current?.abort();
+    emailVerifyControllerRef.current?.abort();
+    emailStartControllerRef.current = null;
+    emailVerifyControllerRef.current = null;
     setStep("idle");
     setEmailChallenge(null);
     setEmailCode("");
     setEmailCheckState("pending");
+    setEmailPollingError(null);
     setError(null);
     setLoading(null);
   }
@@ -900,10 +995,10 @@ export default function StewardLoginSection() {
         </div>
         <p className="text-sm text-muted">{checkEmailMessage}</p>
 
-        {error && (
+        {(error || emailPollingError) && (
           <Alert variant="destructive">
             <AlertCircle />
-            <AlertDescription>{error}</AlertDescription>
+            <AlertDescription>{error || emailPollingError}</AlertDescription>
           </Alert>
         )}
 
@@ -1002,6 +1097,7 @@ export default function StewardLoginSection() {
           type="button"
           className="inline-flex min-h-touch items-center rounded-md px-3 text-sm font-medium text-muted transition-colors hover:text-txt active:scale-[0.98]"
           onClick={cancelEmailLogin}
+          disabled={loading !== null}
         >
           {t("cloud.login.backToLogin", { defaultValue: "Back to login" })}
         </Button>

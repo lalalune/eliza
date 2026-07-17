@@ -1,10 +1,10 @@
-// @vitest-environment jsdom
-
 /**
  * Email magic-link companion-code login coverage. The Steward HTTP adapter is
  * doubled so these tests can assert the login state machine: code redemption
  * establishes the session, while remote link approval polling only updates UI.
  */
+
+// @vitest-environment jsdom
 
 import {
   act,
@@ -73,12 +73,15 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
 vi.mock("../../lib/steward-email-login", () => ({
   StewardEmailLoginError: class StewardEmailLoginError extends Error {
     status: number;
-    code: string | null;
-    constructor(message: string, status: number, code: string | null) {
+    upstreamCode: string | undefined;
+    constructor(
+      message: string,
+      options: { status: number; upstreamCode?: string },
+    ) {
       super(message);
       this.name = "StewardEmailLoginError";
-      this.status = status;
-      this.code = code;
+      this.status = options.status;
+      this.upstreamCode = options.upstreamCode;
     }
   },
   startStewardEmailLogin: emailLoginSpies.start,
@@ -122,11 +125,12 @@ describe("StewardLoginSection email magic-link companion code", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     emailLoginSpies.start.mockResolvedValue({
-      expiresAt: Date.now() + 600_000,
+      expiresAtMs: Date.now() + 600_000,
       challengeId: "challenge-1",
       pollSecret: "poll-secret",
     });
     emailLoginSpies.verify.mockResolvedValue({
+      mfaRequired: false,
       token: "session-token",
       refreshToken: "refresh-token",
     });
@@ -151,10 +155,11 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
     await waitFor(() =>
       expect(emailLoginSpies.verify).toHaveBeenCalledWith(
-        {
+        expect.objectContaining({
           baseUrl: "https://api.example.test/steward",
           tenantId: "elizacloud",
-        },
+          signal: expect.any(AbortSignal),
+        }),
         "person@example.com",
         "123456",
       ),
@@ -190,7 +195,11 @@ describe("StewardLoginSection email magic-link companion code", () => {
       "../../lib/steward-email-login"
     );
     emailLoginSpies.verify.mockRejectedValue(
-      new StewardEmailLoginError("already used", 410, "challenge_consumed"),
+      new StewardEmailLoginError("already used", {
+        code: "STEWARD_EMAIL_LOGIN_HTTP_FAILED",
+        status: 410,
+        upstreamCode: "challenge_consumed",
+      }),
     );
     renderSection();
     await startEmailLogin();
@@ -223,7 +232,7 @@ describe("StewardLoginSection email magic-link companion code", () => {
     cleanup();
     vi.clearAllMocks();
     emailLoginSpies.start.mockResolvedValue({
-      expiresAt: Date.now() + 600_000,
+      expiresAtMs: Date.now() + 600_000,
       challengeId: "challenge-2",
       pollSecret: "poll-secret-2",
     });
@@ -238,5 +247,166 @@ describe("StewardLoginSection email magic-link companion code", () => {
 
     expect(await screen.findByText("Email expired")).toBeTruthy();
     expect(sessionSpies.sync).not.toHaveBeenCalled();
+  });
+
+  it("keeps code entry usable while a failed poll retries with backoff", async () => {
+    emailLoginSpies.poll
+      .mockRejectedValueOnce(new Error("status transport unavailable"))
+      .mockResolvedValue("pending");
+    renderSection();
+    await startEmailLogin();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    expect(
+      await screen.findByText("status transport unavailable"),
+    ).toBeTruthy();
+    expect(
+      screen.getByLabelText("Six-digit code").hasAttribute("disabled"),
+    ).toBe(false);
+    expect(emailLoginSpies.poll).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(emailLoginSpies.poll).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(emailLoginSpies.poll).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(screen.queryByText("status transport unavailable")).toBeNull(),
+    );
+  });
+
+  it("expires from the validated server timestamp before the next poll", async () => {
+    emailLoginSpies.start.mockResolvedValue({
+      expiresAtMs: Date.now() + 1_000,
+      challengeId: "challenge-expiring",
+      pollSecret: "poll-secret-expiring",
+    });
+    renderSection();
+    await startEmailLogin();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(await screen.findByText("Email expired")).toBeTruthy();
+    expect(emailLoginSpies.poll).not.toHaveBeenCalled();
+  });
+
+  it("preserves the magic-link-only state only when both polling credentials are absent", async () => {
+    emailLoginSpies.start.mockResolvedValue({
+      expiresAtMs: Date.now() + 600_000,
+    });
+    renderSection();
+
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "person@example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /Magic Link/i }));
+
+    expect(
+      await screen.findByText(
+        "Check your inbox and open the magic link to sign in.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Six-digit code")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(emailLoginSpies.poll).not.toHaveBeenCalled();
+  });
+
+  it("aborts an in-flight challenge start when the login surface unmounts", async () => {
+    let startSignal: AbortSignal | undefined;
+    emailLoginSpies.start.mockImplementation(
+      (options: { signal?: AbortSignal }) => {
+        startSignal = options.signal;
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+    const rendered = renderSection();
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "person@example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /Magic Link/i }));
+    await waitFor(() => expect(startSignal).toBeDefined());
+    expect(startSignal?.aborted).toBe(false);
+
+    rendered.unmount();
+    await Promise.resolve();
+    expect(startSignal?.aborted).toBe(true);
+  });
+
+  it("allows only one in-flight verification for repeated activation", async () => {
+    let resolveVerification:
+      | ((value: {
+          mfaRequired: false;
+          token: string;
+          refreshToken: string;
+        }) => void)
+      | undefined;
+    emailLoginSpies.verify.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveVerification = resolve;
+        }),
+    );
+    renderSection();
+    await startEmailLogin();
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    const verifyButton = screen.getByRole("button", { name: /Verify code/i });
+    fireEvent.click(verifyButton);
+    fireEvent.click(verifyButton);
+    expect(emailLoginSpies.verify).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveVerification?.({
+        mfaRequired: false,
+        token: "session-token",
+        refreshToken: "refresh-token",
+      });
+    });
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledTimes(1));
+  });
+
+  it("aborts an in-flight verification when the login surface unmounts", async () => {
+    let verificationSignal: AbortSignal | undefined;
+    emailLoginSpies.verify.mockImplementation(
+      (options: { signal?: AbortSignal }) => {
+        verificationSignal = options.signal;
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+    const rendered = renderSection();
+    await startEmailLogin();
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    expect(verificationSignal?.aborted).toBe(false);
+
+    rendered.unmount();
+    await Promise.resolve();
+    expect(verificationSignal?.aborted).toBe(true);
   });
 });

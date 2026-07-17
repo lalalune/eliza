@@ -95,6 +95,8 @@ interface CloudAuditCase {
   route: string;
   /** Seed the persisted Steward token before boot (authed dashboard pages). */
   auth: boolean;
+  /** Drive a public route into a stable interaction state before capture. */
+  variant?: "email-code";
 }
 
 const AUTH = true;
@@ -246,6 +248,13 @@ const CLOUD_AUDIT_CASES: CloudAuditCase[] = [
     auth: PUBLIC,
   },
   { slug: "login", path: "/login", route: "login", auth: PUBLIC },
+  {
+    slug: "login-email-code",
+    path: "/login",
+    route: "login",
+    auth: PUBLIC,
+    variant: "email-code",
+  },
   {
     slug: "auth-success",
     path: "/auth/success",
@@ -567,7 +576,40 @@ test.describe("cloud-surfaces aesthetic audit (#10725/#11342)", () => {
           await seedStewardToken(page);
         }
         await installCloudApiStubs(page);
+        if (auditCase.variant === "email-code") {
+          await page.route("**/steward/auth/email/send", async (route) => {
+            await route.fulfill({
+              status: 200,
+              contentType: "application/json",
+              body: JSON.stringify({
+                ok: true,
+                data: {
+                  expiresAt: "2099-01-01T00:00:00.000Z",
+                  challengeId: "aesthetic-challenge",
+                  pollSecret: "aesthetic-poll-secret",
+                },
+              }),
+            });
+          });
+          await page.route("**/steward/auth/email/status", async (route) => {
+            await route.fulfill({
+              status: 200,
+              contentType: "application/json",
+              body: JSON.stringify({
+                ok: true,
+                data: { status: "pending" },
+              }),
+            });
+          });
+        }
         await page.goto(auditCase.path, { waitUntil: "domcontentloaded" });
+        if (auditCase.variant === "email-code") {
+          const emailInput = page.getByPlaceholder("you@example.com");
+          await expect(emailInput).toBeVisible();
+          await emailInput.fill("person@example.com");
+          await page.getByRole("button", { name: /Magic Link/i }).click();
+          await expect(page.getByLabel("Six-digit code")).toBeVisible();
+        }
 
         // Wait for the page to actually paint text (lazy route chunk +
         // react-query settle). Non-fatal: a page that never paints is recorded

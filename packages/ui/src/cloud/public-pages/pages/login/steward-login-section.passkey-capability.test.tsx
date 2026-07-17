@@ -1,10 +1,10 @@
-// @vitest-environment jsdom
-
 /**
  * Login-page coverage for the passkey capability gate. The Steward SDK and
  * capability probe are doubled so the tests can assert the rendered branches
  * deterministically without invoking browser WebAuthn.
  */
+
+// @vitest-environment jsdom
 
 import {
   cleanup,
@@ -56,12 +56,15 @@ vi.mock("@stwd/sdk", () => ({
 vi.mock("../../lib/steward-email-login", () => ({
   StewardEmailLoginError: class StewardEmailLoginError extends Error {
     status: number;
-    code: string | null;
-    constructor(message: string, status: number, code: string | null) {
+    upstreamCode: string | undefined;
+    constructor(
+      message: string,
+      options: { status: number; upstreamCode?: string },
+    ) {
       super(message);
       this.name = "StewardEmailLoginError";
-      this.status = status;
-      this.code = code;
+      this.status = options.status;
+      this.upstreamCode = options.upstreamCode;
     }
   },
   startStewardEmailLogin: emailLoginSpies.start,
@@ -130,11 +133,12 @@ describe("StewardLoginSection passkey capability gating", () => {
     stewardAuthSpies.getSession.mockReturnValue(null);
     stewardAuthSpies.refreshSession.mockResolvedValue(null);
     emailLoginSpies.start.mockResolvedValue({
-      expiresAt: "2026-07-17T12:10:00.000Z",
+      expiresAtMs: Date.parse("2026-07-17T12:10:00.000Z"),
       challengeId: "challenge-1",
       pollSecret: "poll-secret",
     });
     emailLoginSpies.verify.mockResolvedValue({
+      mfaRequired: false,
       token: "email-token",
       refreshToken: null,
     });
@@ -169,7 +173,11 @@ describe("StewardLoginSection passkey capability gating", () => {
 
     await waitFor(() =>
       expect(emailLoginSpies.start).toHaveBeenCalledWith(
-        { baseUrl: "https://api.example.test", tenantId: "elizacloud" },
+        expect.objectContaining({
+          baseUrl: "https://api.example.test",
+          tenantId: "elizacloud",
+          signal: expect.any(AbortSignal),
+        }),
         "person@example.com",
       ),
     );
