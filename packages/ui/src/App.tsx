@@ -141,7 +141,9 @@ import {
 import { isShellPaintable } from "./state/startup-coordinator";
 import {
   authProbeShouldHoldShell,
+  bootstrapOwnsStartupSurface,
   firstRunOwnsLoginSurface,
+  needsBootstrapSession,
   topLevelAuthGateOwnsSurface,
 } from "./state/top-level-auth-gate";
 import { isLoopbackGatewayHost } from "./state/use-startup-shell-controller";
@@ -2040,6 +2042,7 @@ function AppContent() {
     startupError,
     startupCoordinator,
     firstRunComplete,
+    firstRunCloudProvisionedContainer,
     retryStartup,
     tab,
     setTab,
@@ -2058,6 +2061,7 @@ function AppContent() {
     startupError: s.startupError,
     startupCoordinator: s.startupCoordinator,
     firstRunComplete: s.firstRunComplete,
+    firstRunCloudProvisionedContainer: s.firstRunCloudProvisionedContainer,
     retryStartup: s.retryStartup,
     tab: s.tab,
     setTab: s.setTab,
@@ -2093,6 +2097,12 @@ function AppContent() {
   // Runtime-dependent effects and overlay apps below stay gated on
   // `isCoordinatorReady` and defer safely.
   const isShellPaintableNow = isShellPaintable(startupCoordinator.phase);
+  const bootstrapOwnsSurface = bootstrapOwnsStartupSurface(
+    startupCoordinator.phase,
+    firstRunComplete,
+    firstRunCloudProvisionedContainer,
+    needsBootstrapSession(),
+  );
 
   useEffect(() => {
     if (!isShellPaintableNow) return;
@@ -2696,7 +2706,7 @@ function AppContent() {
     );
   }
 
-  if (!isShellPaintableNow) {
+  if (!isShellPaintableNow || bootstrapOwnsSurface) {
     return (
       <BugReportProvider value={bugReport}>
         <StartupScreen />
