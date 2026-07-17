@@ -1,4 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+/**
+ * Destructive credential-storage guards are exercised against isolated state,
+ * inherited live paths, and symlink aliases without touching real accounts.
+ */
+
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +33,13 @@ describe("credential deletion test-state guard", () => {
       deleteAccount("anthropic-subscription", "guard-probe-does-not-exist"),
     ).toThrow(
       /Refusing to delete credentials from a non-temporary Eliza state directory/,
+    );
+    expect(() =>
+      deleteAccount("anthropic-subscription", "guard-probe-does-not-exist"),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "REAL_STATE_CREDENTIAL_DELETE_BLOCKED",
+      }),
     );
   });
 
@@ -64,6 +76,27 @@ describe("credential deletion test-state guard", () => {
       ).not.toThrow();
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a temporary path that resolves through a symlink to live state", () => {
+    const linkContainer = mkdtempSync(
+      path.join(tmpdir(), "eliza-account-storage-link-"),
+    );
+    const linkedHome = path.join(linkContainer, "linked-home");
+    symlinkSync(
+      process.cwd(),
+      linkedHome,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    process.env.ELIZA_HOME = linkedHome;
+    vi.stubEnv("VITEST", "true");
+    try {
+      expect(() =>
+        deleteAccount("anthropic-subscription", "guard-probe-does-not-exist"),
+      ).toThrow(/non-temporary Eliza state directory/);
+    } finally {
+      rmSync(linkContainer, { recursive: true, force: true });
     }
   });
 

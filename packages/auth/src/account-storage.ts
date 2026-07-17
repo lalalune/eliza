@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { logger, resolveStateDir } from "@elizaos/core";
+import { ElizaError, logger, resolveStateDir } from "@elizaos/core";
 import { writeJsonAtomicSync } from "./atomic-json.ts";
 import {
   ACCOUNT_CREDENTIAL_PROVIDER_IDS,
@@ -72,6 +72,21 @@ function isTestProcess(): boolean {
   );
 }
 
+function resolveThroughExistingAncestors(target: string): string {
+  const missingSegments: string[] = [];
+  let existingAncestor = path.resolve(target);
+  while (!fs.existsSync(existingAncestor)) {
+    const parent = path.dirname(existingAncestor);
+    if (parent === existingAncestor) break;
+    missingSegments.unshift(path.basename(existingAncestor));
+    existingAncestor = parent;
+  }
+  return path.resolve(
+    fs.realpathSync.native(existingAncestor),
+    ...missingSegments,
+  );
+}
+
 /**
  * Tests must opt into a throwaway ELIZA_HOME before deleting credentials.
  * This prevents a test worker inherited from an interactive shell from
@@ -82,17 +97,26 @@ function assertDestructiveStorageAllowed(): void {
     return;
   }
 
-  const targetAuthRoot = path.resolve(authRoot());
-  const temporaryRoot = path.resolve(tmpdir());
+  // Resolve existing ancestors so `/tmp/test-home -> ~/.eliza` cannot make a
+  // live credential directory look temporary through a lexical path prefix.
+  const targetAuthRoot = resolveThroughExistingAncestors(authRoot());
+  const temporaryRoot = fs.realpathSync.native(tmpdir());
+  const relativeToTemporaryRoot = path.relative(temporaryRoot, targetAuthRoot);
   const isTemporaryTarget =
-    targetAuthRoot.startsWith(`${temporaryRoot}${path.sep}`) &&
-    targetAuthRoot !== temporaryRoot;
+    relativeToTemporaryRoot !== "" &&
+    relativeToTemporaryRoot !== ".." &&
+    !relativeToTemporaryRoot.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relativeToTemporaryRoot);
 
   if (!isTemporaryTarget) {
-    throw new Error(
+    throw new ElizaError(
       "Refusing to delete credentials from a non-temporary Eliza state directory during tests. " +
         "Set ELIZA_HOME to a mkdtemp directory under the OS temporary directory, or explicitly " +
         "set ELIZA_ALLOW_REAL_STATE_IN_TESTS=1 to override.",
+      {
+        code: "REAL_STATE_CREDENTIAL_DELETE_BLOCKED",
+        severity: "fatal",
+      },
     );
   }
 }
