@@ -1,8 +1,5 @@
 /**
- * Renderer pins for the completion-evidence bundle, centered on the
- * claims-vs-proof stance: probe-verified URLs vs mentioned URLs, and (#16523)
- * ledger-verified files vs unverified file claims. The judge only ever sees
- * the serialized string, so the section wording IS the contract.
+ * Pins the verifier-facing serialization of completion evidence.
  */
 import { describe, expect, it } from "vitest";
 import {

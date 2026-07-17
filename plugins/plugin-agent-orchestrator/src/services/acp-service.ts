@@ -47,6 +47,10 @@ import {
 } from "./acp-provisioning.js";
 import { augmentTaskWithDeployGuidance } from "./app-deploy-guidance.js";
 import {
+  collectFileMutationPaths,
+  isMutatingFileToolCall,
+} from "./claimed-file-verification.js";
+import {
   type CodexSandboxMode,
   detectLandlockAvailability,
   isCodexLandlockPanic,
@@ -94,13 +98,13 @@ import {
   type SessionStoreBackend,
 } from "./session-store.js";
 import { buildSkillsManifest } from "./skill-manifest.js";
-import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
-  canonicalForwardedEnvKey,
   forwardableSubAgentEnv as applySubAgentEnvPolicy,
+  canonicalForwardedEnvKey,
   isCloudKeyForwardingOptIn,
   isDeniedSubAgentEnvKey,
 } from "./sub-agent-env-policy.js";
+import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
   appendSubagentStdout,
   isSubagentStdoutLoggingEnabled,
@@ -4379,32 +4383,6 @@ export class AcpService extends Service {
     }
   }
 
-  // Tool-call arg keys that carry a target file path / signal a write.
-  private static readonly EDIT_PATH_KEYS = [
-    "filePath",
-    "file_path",
-    "path",
-    "file",
-    "target",
-    "abspath",
-  ];
-  private static readonly WRITE_CONTENT_KEYS = [
-    "content",
-    "contents",
-    "new_string",
-    "newText",
-    "patch",
-    "diff",
-  ];
-  private static readonly MUTATING_TOOL_KINDS = new Set([
-    "edit",
-    "write",
-    "create",
-    "patch",
-    "move",
-    "delete",
-  ]);
-
   /**
    * Record the file path(s) of an edit/write tool call so the change set at
    * completion includes gitignored files the agent authored. Self-gates: only
@@ -4412,21 +4390,8 @@ export class AcpService extends Service {
    * so reads/searches/shell calls are ignored.
    */
   private recordEditedPaths(sessionId: string, toolCall: AcpToolCall): void {
-    const kind = (toolCall.kind ?? "").toLowerCase();
-    const rawInput = toolCall.rawInput ?? {};
-    const looksMutating =
-      AcpService.MUTATING_TOOL_KINDS.has(kind) ||
-      AcpService.WRITE_CONTENT_KEYS.some((key) => key in rawInput);
-    if (!looksMutating) return;
-    const paths: string[] = [];
-    for (const key of AcpService.EDIT_PATH_KEYS) {
-      const value = rawInput[key];
-      if (typeof value === "string" && value.trim()) paths.push(value.trim());
-    }
-    for (const location of toolCall.locations ?? []) {
-      if (typeof location?.path === "string" && location.path.trim())
-        paths.push(location.path.trim());
-    }
+    if (!isMutatingFileToolCall(toolCall)) return;
+    const paths = collectFileMutationPaths(toolCall);
     if (paths.length === 0) return;
     const set = this.changedPathsBySession.get(sessionId) ?? new Set<string>();
     for (const path of paths) {
@@ -4459,7 +4424,8 @@ export class AcpService extends Service {
     data?: unknown,
   ): void {
     const loggerFn = this.logger[level] as
-      ((message: string, data?: unknown) => void) | undefined;
+      | ((message: string, data?: unknown) => void)
+      | undefined;
     loggerFn?.call(this.logger, `[AcpService] ${message}`, data);
   }
 

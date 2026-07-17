@@ -59,6 +59,7 @@ import {
 import { assignAgentName } from "./agent-name-assignment.js";
 import {
   extractWriteLedger,
+  type UnverifiedFileClaim,
   verifyClaimedFiles,
 } from "./claimed-file-verification.js";
 import {
@@ -613,6 +614,25 @@ function collectUrls(texts: readonly string[]): string[] {
   return urls;
 }
 
+const CLAIMED_FILE_LEDGER_VERIFIER_NAME = "claimed-file-ledger";
+
+function describeUnverifiedFileClaim(claim: UnverifiedFileClaim): string {
+  return claim.reason === "rejected-write"
+    ? `${claim.path}: the tool layer rejected the write`
+    : `${claim.path}: no successful write was recorded`;
+}
+
+function buildClaimedFileCorrection(
+  claims: readonly UnverifiedFileClaim[],
+): string {
+  return [
+    "Completion claim verification found file changes with no successful write in this session:",
+    ...claims.map((claim) => `- ${describeUnverifiedFileClaim(claim)}`),
+    "",
+    "Do not report these paths as created or modified unless a write succeeds. If a file already existed and you only inspected or verified it, remove it from CompletionEnvelope.filesChanged and state that it was pre-existing. Otherwise perform the required write, verify the result, and return a corrected completion envelope.",
+  ].join("\n");
+}
+
 function findPlanRevision(
   doc: OrchestratorTaskDocument,
   planRevisionId?: string,
@@ -923,6 +943,11 @@ export class OrchestratorTaskService extends Service {
   // attempt counter across the model `await` and double-send a correction.
   private readonly autoVerifyInFlight = new Set<string>();
 
+  // ACP emits callbacks synchronously while persistence is asynchronous. Keep
+  // each session's protocol order so a terminal tool outcome is durable before
+  // a following `task_complete` cross-checks the write ledger.
+  private readonly sessionEventTails = new Map<string, Promise<void>>();
+
   /** Per-task async mutex serializing the two completion-metadata writers
    * (autoVerifyCompletion and validateTask). Both replace `task.metadata`
    * wholesale through store.updateTask, so an unserialized read-probe-write
@@ -1048,7 +1073,36 @@ export class OrchestratorTaskService extends Service {
 
   private subscribeToAcp(acp: AcpService): void {
     this.unsubscribe = acp.onSessionEvent((sessionId, event, data) => {
-      void this.onSessionEvent(sessionId, event, data);
+      this.enqueueSessionEvent(sessionId, event, data);
+    });
+  }
+
+  private enqueueSessionEvent(
+    sessionId: string,
+    event: string,
+    data: unknown,
+  ): void {
+    const previous = this.sessionEventTails.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(() =>
+      this.onSessionEvent(sessionId, event, data),
+    );
+    const settled = run.then(
+      () => undefined,
+      (err) => {
+        // error-policy:J1 ACP subscription boundary — onSessionEvent normally
+        // translates its own failures; this catches an unexpected boundary
+        // rejection while keeping later events in the session processable.
+        this.runtime.reportError("OrchestratorTask.sessionEventQueue", err, {
+          sessionId,
+          event,
+        });
+      },
+    );
+    this.sessionEventTails.set(sessionId, settled);
+    void settled.then(() => {
+      if (this.sessionEventTails.get(sessionId) === settled) {
+        this.sessionEventTails.delete(sessionId);
+      }
     });
   }
 
@@ -1264,7 +1318,21 @@ export class OrchestratorTaskService extends Service {
             { taskId, sessionId },
           );
         }
-        await this.advanceTaskStatus(taskId, "completion_reported");
+        // Transition and deterministic file-claim enforcement share the same
+        // write lock as manual validation. A validator cannot slip between
+        // `validating` becoming visible and a rejected-write claim being
+        // blocked.
+        const fileClaimsBlocked = await this.withTaskWriteLock(
+          taskId,
+          async () => {
+            await this.advanceTaskStatus(taskId, "completion_reported");
+            return this.enforceClaimedFileClaims(
+              taskId,
+              sessionId,
+              summary ?? "",
+            );
+          },
+        );
         // Issue #8124: the orchestrator should always behave like `/goal` —
         // confirm the sub-agent met every acceptance criterion before marking
         // the task done. Feed the verifier REAL completion evidence (git
@@ -1282,12 +1350,14 @@ export class OrchestratorTaskService extends Service {
         // reworded evidence bundle: the #8895 CompletionEnvelope lives verbatim in
         // the sub-agent's last message, not in the prose evidence, so the structural
         // parser must see the original text.
-        void this.autoVerifyCompletion(
-          taskId,
-          sessionId,
-          completionEvidence,
-          summary ?? "",
-        );
+        if (!fileClaimsBlocked) {
+          void this.autoVerifyCompletion(
+            taskId,
+            sessionId,
+            completionEvidence,
+            summary ?? "",
+          );
+        }
         break;
       }
       case "error": {
@@ -3093,28 +3163,113 @@ export class OrchestratorTaskService extends Service {
   }
 
   /**
+   * Stamp a valid completion envelope and block file claims that have no
+   * successful write in the session ledger. This boundary is deterministic,
+   * always on, and runs under the task write lock before manual or model
+   * validation can promote the task.
+   */
+  private async enforceClaimedFileClaims(
+    taskId: string,
+    sessionId: string,
+    rawCompletion: string,
+  ): Promise<boolean> {
+    const doc = await this.store.getTask(taskId);
+    if (!doc) return false;
+    if (doc.task.status !== "validating") return false;
+    const parse = parseCompletionEnvelope(rawCompletion);
+    if (!parse.present || !parse.ok) return false;
+
+    const ledgerVerdict = verifyClaimedFiles(
+      parse.envelope.filesChanged,
+      extractWriteLedger(
+        doc.events.filter(
+          (event) =>
+            event.sessionId === sessionId || event.sessionId === undefined,
+        ),
+      ),
+    );
+    const unverifiedClaims = ledgerVerdict.ledgerObserved
+      ? ledgerVerdict.unverifiedClaims
+      : [];
+    const unverifiedPaths = unverifiedClaims.map((claim) => claim.path);
+    const workerMissingArtifacts = parse.envelope.missingArtifacts ?? [];
+
+    await this.store.updateTask(taskId, {
+      metadata: {
+        ...doc.task.metadata,
+        completionEnvelope: {
+          diffSummary: parse.envelope.diffSummary,
+          filesChanged: parse.envelope.filesChanged,
+          ...(parse.envelope.realWorkdir
+            ? { realWorkdir: parse.envelope.realWorkdir }
+            : {}),
+          ...(parse.envelope.verifiedChangedFiles
+            ? { verifiedChangedFiles: parse.envelope.verifiedChangedFiles }
+            : {}),
+          ...(unverifiedPaths.length > 0
+            ? {
+                artifactsVerified: false,
+                missingArtifacts: [
+                  ...new Set([...workerMissingArtifacts, ...unverifiedPaths]),
+                ],
+              }
+            : {
+                ...(typeof parse.envelope.artifactsVerified === "boolean"
+                  ? { artifactsVerified: parse.envelope.artifactsVerified }
+                  : {}),
+                ...(parse.envelope.missingArtifacts
+                  ? { missingArtifacts: parse.envelope.missingArtifacts }
+                  : {}),
+              }),
+          testResults: parse.envelope.testResults,
+          acceptanceCriteriaStatus: parse.envelope.acceptanceCriteriaStatus,
+          residualRisks: parse.envelope.residualRisks,
+        },
+      },
+    });
+
+    if (unverifiedClaims.length === 0) return false;
+    const missing = unverifiedClaims.map(describeUnverifiedFileClaim);
+    await this.reEngageOrEscalate({
+      taskId,
+      sessionId,
+      correction: buildClaimedFileCorrection(unverifiedClaims),
+      eventType: "claimed_file_verification_failed",
+      verifier: CLAIMED_FILE_LEDGER_VERIFIER_NAME,
+      summary: `Completion claimed ${unverifiedClaims.length} file change(s) without a successful write.`,
+      missing,
+      attempt: num(doc.task.metadata?.autoVerifyAttempts),
+    });
+    return true;
+  }
+
+  /**
    * Verify a freshly-`validating` task against its acceptance criteria before
    * promoting it to `done` (issue #8124). One linear pipeline runs inside the
    * re-entrancy guard:
    *
-   * 1. **Remote ground truth.** The claimed GitHub PR, head-SHA check rollup,
+   * The always-on claimed-file boundary has already stamped a valid envelope
+   * and blocked unsupported writes before this model-gated pipeline starts.
+   *
+   * 1. **Completion residuals.** Git state, test results, and disclosed risks
+   *    are checked without model spend.
+   * 2. **Remote ground truth.** The claimed GitHub PR, head-SHA check rollup,
    *    and changed files are verified without a model call. The structured
    *    verdict is persisted and appended to the existing completion evidence;
    *    optional hard-fail policy blocks a missing PR or red required checks.
-   * 2. **Structural envelope gate (#8895).** {@link parseCompletionEnvelope} reads
+   * 3. **Structural envelope gate (#8895).** {@link parseCompletionEnvelope} reads
    *    the sub-agent's verbatim final message. A PRESENT-but-malformed envelope is
    *    blocked *before* any model spend and the worker is re-prompted with
    *    {@link envelopeCorrection}. An ABSENT envelope falls through unchanged
-   *    (back-compat). A VALID envelope is stamped onto `metadata.completionEnvelope`
-   *    and its {@link summarizeEnvelope} is prepended to the judge's evidence so the
-   *    judge grills the contract, not prose.
-   * 3. **Independent execution verifier (#8898).** For code-change tasks
+   *    (back-compat). A valid envelope's {@link summarizeEnvelope} is prepended to
+   *    the judge's evidence so the judge grills the contract, not prose.
+   * 4. **Independent execution verifier (#8898).** For code-change tasks
    *    ({@link shouldRunIndependentVerify}) a SEPARATE read-only ACP session re-runs
    *    the tests/diff and returns an execution-grounded verdict. A failing verdict
    *    BLOCKS (provenance `independent-acp-verifier`); an inconclusive verdict keeps
    *    the task `validating` (never a false promotion on a verifier crash); a
    *    passing/skipped verdict falls through.
-   * 4. **Text judge (fallback).** {@link verifyGoalCompletion} (`ModelType.TEXT_SMALL`)
+   * 5. **Text judge (fallback).** {@link verifyGoalCompletion} (`ModelType.TEXT_SMALL`)
    *    judges the evidence and promotes (→ `done`) or re-prompts.
    *
    * All failure paths share one {@link reEngageOrEscalate} helper, one
@@ -3351,84 +3506,9 @@ export class OrchestratorTaskService extends Service {
         return;
       }
       if (parse.present && parse.ok) {
-        // Deterministic claimed-file cross-check (#16523): the envelope's
-        // `filesChanged` are CLAIMS; the session's recorded tool events are
-        // the ledger of what was actually written and how each write ended.
-        // Flag-don't-rewrite: the envelope text/fields the worker produced
-        // stay intact, and unverified claims ride the envelope's existing
-        // marker fields (`artifactsVerified` / `missingArtifacts`) fail-closed
-        // — a claim with no matching successful ledger write can never pass
-        // through as "Created". No model spend.
-        const ledgerVerdict = verifyClaimedFiles(
-          parse.envelope.filesChanged,
-          extractWriteLedger(
-            doc.events.filter(
-              (event) =>
-                event.sessionId === sessionId || event.sessionId === undefined,
-            ),
-          ),
-        );
-        const unverifiedPaths = ledgerVerdict.unverifiedClaims.map(
-          (claim) => claim.path,
-        );
-        const ledgerMarkers =
-          ledgerVerdict.ledgerObserved && unverifiedPaths.length > 0
-            ? {
-                artifactsVerified: false,
-                missingArtifacts: [
-                  ...new Set([
-                    ...(parse.envelope.missingArtifacts ?? []),
-                    ...unverifiedPaths,
-                  ]),
-                ],
-              }
-            : {};
-        // Valid contract: stamp the structured fields and feed the judge a
-        // contract-grounded evidence string instead of raw prose.
-        await this.store.updateTask(taskId, {
-          metadata: {
-            ...doc.task.metadata,
-            completionEnvelope: {
-              diffSummary: parse.envelope.diffSummary,
-              filesChanged: parse.envelope.filesChanged,
-              ...(parse.envelope.realWorkdir
-                ? { realWorkdir: parse.envelope.realWorkdir }
-                : {}),
-              ...(parse.envelope.verifiedChangedFiles
-                ? { verifiedChangedFiles: parse.envelope.verifiedChangedFiles }
-                : {}),
-              ...(typeof parse.envelope.artifactsVerified === "boolean"
-                ? { artifactsVerified: parse.envelope.artifactsVerified }
-                : {}),
-              ...(parse.envelope.missingArtifacts
-                ? { missingArtifacts: parse.envelope.missingArtifacts }
-                : {}),
-              testResults: parse.envelope.testResults,
-              acceptanceCriteriaStatus: parse.envelope.acceptanceCriteriaStatus,
-              residualRisks: parse.envelope.residualRisks,
-              // Last so the deterministic verdict wins over any self-reported
-              // `artifactsVerified: true` covering a rejected write.
-              ...ledgerMarkers,
-            },
-          },
-        });
+        // The deterministic boundary already stamped this envelope before the
+        // model-verification path began; feed that same contract to the judge.
         evidence = `${summarizeEnvelope(parse.envelope)}\n\n${evidence}`;
-        if (ledgerVerdict.ledgerObserved && unverifiedPaths.length > 0) {
-          evidence = appendCompletionEvidenceSection(
-            evidence,
-            [
-              "## UNVERIFIED FILE CLAIMS (envelope `filesChanged` with no successful write in the tool ledger)",
-              ...ledgerVerdict.unverifiedClaims.map(
-                (claim) =>
-                  `- ${claim.path} (${
-                    claim.reason === "rejected-write"
-                      ? "the tool layer REJECTED this write"
-                      : "no successful write observed"
-                  })`,
-              ),
-            ].join("\n"),
-          );
-        }
       }
 
       // 3. Independent read-only execution verifier (#8898).
@@ -3546,9 +3626,10 @@ export class OrchestratorTaskService extends Service {
 
   /**
    * Shared re-prompt / escalation path for every failed completion verdict — the
-   * remote-ground-truth gate, malformed-envelope gate (#8895), independent-verify
-   * block (#8898), and text judge. ONE `autoVerifyAttempts` counter and ONE
-   * {@link MAX_AUTO_VERIFY_ATTEMPTS} cap govern all three: under the cap the
+   * file-claim, residuals, remote-ground-truth, malformed-envelope (#8895),
+   * independent-verify (#8898), and text-judge gates. ONE `autoVerifyAttempts`
+   * counter and ONE {@link MAX_AUTO_VERIFY_ATTEMPTS} cap govern all failures:
+   * under the cap the
    * kept-alive worker is reactivated and re-prompted with `correction` (and a
    * reflexion post-mortem is recorded for the next respawn, #8899); at the cap, or
    * when the corrective send fails, the task is parked on `waiting_on_user` instead

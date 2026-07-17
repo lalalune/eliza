@@ -31,6 +31,7 @@
  * @module services/completion-evidence
  */
 
+import type { UnverifiedFileClaim } from "./claimed-file-verification.js";
 import type { WorkspaceChangeSet } from "./workspace-diff.js";
 
 /** One recorded signal (a durable event or sub-agent message) the assembler
@@ -118,10 +119,7 @@ export interface CompletionEvidenceBundle {
    *  unverified section so a reported "Created X" cannot masquerade as an
    *  observed write. Only populated when the session actually recorded a
    *  mutating tool ledger. */
-  unverifiedClaimedFiles?: Array<{
-    path: string;
-    reason: "rejected-write" | "no-write-observed";
-  }>;
+  unverifiedClaimedFiles?: UnverifiedFileClaim[];
   /** Screenshot artifact paths found on the task/session. */
   screenshots: string[];
   /** Path to the persisted trajectory JSONL artifact for this completion. */
@@ -347,10 +345,7 @@ function renderMentionedUrlsSection(urls: readonly string[]): string {
  *  `rejected-write` means the tool layer actively REFUSED the write (e.g. the
  *  stale-write guard), so the judge must treat that file as NOT delivered. */
 function renderUnverifiedFilesSection(
-  files: ReadonlyArray<{
-    path: string;
-    reason: "rejected-write" | "no-write-observed";
-  }>,
+  files: readonly UnverifiedFileClaim[],
 ): string {
   const lines = [
     "## UNVERIFIED FILE CLAIMS (no successful write in the tool ledger — treat each as NOT delivered until re-verified)",

@@ -1,8 +1,5 @@
 /**
- * Deterministic claimed-file verification (#16523): folding recorded tool
- * events into a write ledger, and cross-checking completion-report claims
- * against it — fail-closed (a claim with no successful ledger write is
- * unverified) but never false-flagging sessions with no structured ledger.
+ * Exercises the pure ACP tool-ledger fold and claimed-file verdict contract.
  */
 import { describe, expect, it } from "vitest";
 import {

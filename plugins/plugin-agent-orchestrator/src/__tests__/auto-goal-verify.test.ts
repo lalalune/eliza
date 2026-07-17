@@ -1,9 +1,6 @@
 /**
- * Verifies the auto-goal-verification pipeline end to end against the REAL
- * service + store: the deterministic residuals gate (real temp git workspaces,
- * no mocked git), the envelope gate, the independent verifier, the text judge,
- * reflexion persistence, and the validateTask/humanOverride transition rules.
- * Deterministic — the only stub is the judge model response.
+ * Exercises the real task service and in-memory store with fake ACP/model
+ * boundaries; residual checks run against real temporary Git repositories.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -630,14 +627,86 @@ describe("claimed-file ledger cross-check (#16523)", () => {
     });
   }
 
-  it("a claimed file whose write the tool layer rejected is flagged fail-closed, not relayed as Created", async () => {
+  it("blocks a claimed file whose write the tool layer rejected before the model judge", async () => {
     const fake = makeFakeAcp();
     const store = new OrchestratorTaskStore({ backend: "memory" });
     const { taskId, sessionId } = await seedTaskWithSession(store, [
       "tests pass",
     ]);
-    // The issue's trace shape: the only writer of the claimed path was
-    // terminally rejected (the stale-write guard's invalid_param).
+    const { runtime, useModel } = makeSpyRuntime(fake.service, () =>
+      JSON.stringify({ passed: true, summary: "confirmed", missing: [] }),
+    );
+    const service = new OrchestratorTaskService(runtime as never, { store });
+    await service.start();
+
+    const originalAddEvent = store.addEvent.bind(store);
+    let releaseToolPersistence: (() => void) | undefined;
+    let markToolPersistenceStarted: (() => void) | undefined;
+    const toolPersistenceGate = new Promise<void>((resolve) => {
+      releaseToolPersistence = resolve;
+    });
+    const toolPersistenceStarted = new Promise<void>((resolve) => {
+      markToolPersistenceStarted = resolve;
+    });
+    let completionPersistenceStarted = false;
+    vi.spyOn(store, "addEvent").mockImplementation(async (event) => {
+      if (event.eventType === "tool_running") {
+        markToolPersistenceStarted?.();
+        await toolPersistenceGate;
+      }
+      if (event.eventType === "task_complete") {
+        completionPersistenceStarted = true;
+      }
+      await originalAddEvent(event);
+    });
+
+    // Deliberately hold the terminal tool event while task_complete arrives.
+    // The session queue must keep completion behind it; otherwise the verifier
+    // reads a partial ledger and can relay the phantom claim.
+    fake.emit(sessionId, "tool_running", {
+      toolCall: {
+        id: "w1",
+        kind: "write",
+        rawInput: { file_path: "src/x.ts", content: "v1" },
+        status: "failed",
+      },
+    });
+    await toolPersistenceStarted;
+    fake.emit(sessionId, "task_complete", { response: fence(VALID_ENVELOPE) });
+    await Promise.resolve();
+    expect(completionPersistenceStarted).toBe(false);
+    releaseToolPersistence?.();
+    await until(() => fake.service.sendToSession.mock.calls.length > 0);
+
+    const doc = await store.getTask(taskId);
+    const envelope = doc?.task.metadata.completionEnvelope as
+      | {
+          filesChanged: string[];
+          artifactsVerified?: boolean;
+          missingArtifacts?: string[];
+        }
+      | undefined;
+    expect(envelope?.filesChanged).toEqual(["src/x.ts"]);
+    expect(envelope?.artifactsVerified).toBe(false);
+    expect(envelope?.missingArtifacts).toContain("src/x.ts");
+    expect(useModel).not.toHaveBeenCalled();
+    expect(doc?.task.status).toBe("active");
+    expect(
+      doc?.events.some(
+        (event) => event.eventType === "claimed_file_verification_failed",
+      ),
+    ).toBe(true);
+    const correction = fake.sent.at(-1)?.text;
+    expect(correction).toContain("src/x.ts");
+    expect(correction).toContain("tool layer rejected the write");
+    expect(correction).toContain("pre-existing");
+  });
+
+  it("enforces the deterministic claim gate with no criteria and the model judge disabled", async () => {
+    process.env.ELIZA_ORCHESTRATOR_AUTO_GOAL_VERIFY = "0";
+    const fake = makeFakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const { taskId, sessionId } = await seedTaskWithSession(store, []);
     await addToolEvent(store, taskId, sessionId, {
       id: "w1",
       kind: "write",
@@ -651,29 +720,53 @@ describe("claimed-file ledger cross-check (#16523)", () => {
     await service.start();
 
     fake.emit(sessionId, "task_complete", { response: fence(VALID_ENVELOPE) });
+    await until(() => fake.service.sendToSession.mock.calls.length > 0);
+
+    const doc = await store.getTask(taskId);
+    expect(useModel).not.toHaveBeenCalled();
+    expect(doc?.task.status).toBe("active");
+    expect(doc?.task.metadata.autoVerifyAttempts).toBe(1);
+  });
+
+  it("clears the rejection markers after a successful retry writes the claimed file", async () => {
+    const fake = makeFakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const { taskId, sessionId } = await seedTaskWithSession(store, [
+      "tests pass",
+    ]);
+    await addToolEvent(store, taskId, sessionId, {
+      id: "failed-write",
+      kind: "write",
+      rawInput: { file_path: "src/x.ts", content: "v1" },
+      status: "failed",
+    });
+    const { runtime, useModel } = makeSpyRuntime(fake.service, () =>
+      JSON.stringify({ passed: true, summary: "confirmed", missing: [] }),
+    );
+    const service = new OrchestratorTaskService(runtime as never, { store });
+    await service.start();
+
+    fake.emit(sessionId, "task_complete", { response: fence(VALID_ENVELOPE) });
+    await until(() => fake.service.sendToSession.mock.calls.length > 0);
+
+    await addToolEvent(store, taskId, sessionId, {
+      id: "successful-retry",
+      kind: "write",
+      rawInput: { file_path: "src/x.ts", content: "v2" },
+      status: "completed",
+    });
+    fake.emit(sessionId, "task_complete", { response: fence(VALID_ENVELOPE) });
     await until(
       async () => (await store.getTask(taskId))?.task.status === "done",
     );
 
-    // Flag-don't-rewrite: the worker's fields are intact, and the
-    // deterministic markers ride the envelope's existing fields.
     const doc = await store.getTask(taskId);
     const envelope = doc?.task.metadata.completionEnvelope as
-      | {
-          filesChanged: string[];
-          artifactsVerified?: boolean;
-          missingArtifacts?: string[];
-        }
+      | { artifactsVerified?: boolean; missingArtifacts?: string[] }
       | undefined;
-    expect(envelope?.filesChanged).toEqual(["src/x.ts"]);
-    expect(envelope?.artifactsVerified).toBe(false);
-    expect(envelope?.missingArtifacts).toContain("src/x.ts");
-    // The judge saw the fail-closed section, not a bare "Created" claim.
-    const judgePrompt = useModel.mock.calls[0]?.[1] as
-      | { prompt?: string }
-      | undefined;
-    expect(judgePrompt?.prompt).toContain("UNVERIFIED FILE CLAIMS");
-    expect(judgePrompt?.prompt).toContain("REJECTED");
+    expect(envelope?.artifactsVerified).toBeUndefined();
+    expect(envelope?.missingArtifacts).toBeUndefined();
+    expect(useModel).toHaveBeenCalledTimes(1);
   });
 
   it("a claim backed by a successful ledger write gets no markers", async () => {

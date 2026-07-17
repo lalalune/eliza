@@ -1,29 +1,12 @@
 /**
- * Deterministic claimed-file verification against the session tool ledger
- * (#16523).
- *
- * Sub-agent completion reports can claim "Created X" for writes the tool
- * layer actually REJECTED (e.g. plugin-coding-tools' stale-write guard
- * returning `invalid_param`). The recorded `tool_running`/`tool_result`
- * events are a deterministic ledger of what was really attempted and how it
- * ended, so claimed created/modified paths can be cross-checked with zero
- * model spend — the file-path analog of the existing `verifiedUrls` vs
- * `mentionedUrls` claims-vs-proof split.
- *
- * Philosophy is flag-don't-rewrite: the agent's text stays intact and
- * markers ride alongside it. Fail-closed for the relay layer: a claimed path
- * with no matching successful ledger write surfaces as unverified — it never
- * silently passes through as "Created". The one deliberate boundary: when a
- * session recorded NO mutating tool call at all ({@link WriteLedger.observed}
- * false — adapters that fold tool results into plain messages), there is no
- * ledger to audit against and callers must render nothing rather than
- * false-flag every claim of a legacy adapter.
+ * Cross-checks completion file claims against recorded ACP tool outcomes.
+ * The task service blocks unsupported claims, while AcpService reuses the path
+ * extraction contract so change capture and verification cannot drift.
  */
 
-/** Tool-call arg keys that carry a target file path / signal a write.
- *  Shared with `AcpService.recordEditedPaths` so the changeset capture and
- *  this ledger can never disagree about what counts as a write. */
-export const EDIT_PATH_KEYS = [
+// Both AcpService change capture and the completion verifier call the helpers
+// below, keeping this adapter-specific vocabulary at one boundary.
+const EDIT_PATH_KEYS = [
   "filePath",
   "file_path",
   "path",
@@ -32,7 +15,7 @@ export const EDIT_PATH_KEYS = [
   "abspath",
 ] as const;
 
-export const WRITE_CONTENT_KEYS = [
+const WRITE_CONTENT_KEYS = [
   "content",
   "contents",
   "new_string",
@@ -41,7 +24,7 @@ export const WRITE_CONTENT_KEYS = [
   "diff",
 ] as const;
 
-export const MUTATING_TOOL_KINDS: ReadonlySet<string> = new Set([
+const MUTATING_TOOL_KINDS: ReadonlySet<string> = new Set([
   "edit",
   "write",
   "create",
@@ -49,6 +32,13 @@ export const MUTATING_TOOL_KINDS: ReadonlySet<string> = new Set([
   "move",
   "delete",
 ]);
+
+/** Tool-call fields needed to classify a file mutation and extract its paths. */
+export interface FileMutationToolCall {
+  kind?: unknown;
+  rawInput?: unknown;
+  locations?: unknown;
+}
 
 /** Minimal shape of a recorded orchestrator task event this module reads. */
 export interface ToolLedgerEvent {
@@ -69,13 +59,20 @@ export interface WriteLedger {
   observed: boolean;
 }
 
-export type UnverifiedClaimReason = "rejected-write" | "no-write-observed";
+type UnverifiedClaimReason = "rejected-write" | "no-write-observed";
 
+/** One completion path that lacks a successful write outcome. */
+export interface UnverifiedFileClaim {
+  path: string;
+  reason: UnverifiedClaimReason;
+}
+
+/** Claim partition produced from one session's write ledger. */
 export interface ClaimedFileVerdict {
   /** Claims backed by a successful ledger write. */
   verifiedClaims: string[];
   /** Claims with no successful ledger write, fail-closed labelled. */
-  unverifiedClaims: Array<{ path: string; reason: UnverifiedClaimReason }>;
+  unverifiedClaims: UnverifiedFileClaim[];
   /** Mirrors {@link WriteLedger.observed}; when false the verdict is
    *  non-actionable and must not be rendered. */
   ledgerObserved: boolean;
@@ -95,8 +92,20 @@ function normalizePath(path: string): string {
   return p;
 }
 
-/** Collect the target paths of one tool call, mirroring `recordEditedPaths`. */
-function collectCallPaths(toolCall: Record<string, unknown>): string[] {
+/** Whether a structured tool call carries a file-mutation signal. */
+export function isMutatingFileToolCall(
+  toolCall: FileMutationToolCall,
+): boolean {
+  const kind = (str(toolCall.kind) ?? "").toLowerCase();
+  if (MUTATING_TOOL_KINDS.has(kind)) return true;
+  const rawInput = isRecord(toolCall.rawInput) ? toolCall.rawInput : {};
+  return WRITE_CONTENT_KEYS.some((key) => key in rawInput);
+}
+
+/** Collect normalized target paths from a structured file-mutation call. */
+export function collectFileMutationPaths(
+  toolCall: FileMutationToolCall,
+): string[] {
   const rawInput = isRecord(toolCall.rawInput) ? toolCall.rawInput : {};
   const paths: string[] = [];
   for (const key of EDIT_PATH_KEYS) {
@@ -110,13 +119,6 @@ function collectCallPaths(toolCall: Record<string, unknown>): string[] {
     if (value) paths.push(normalizePath(value));
   }
   return paths;
-}
-
-function isMutatingCall(toolCall: Record<string, unknown>): boolean {
-  const kind = (str(toolCall.kind) ?? "").toLowerCase();
-  if (MUTATING_TOOL_KINDS.has(kind)) return true;
-  const rawInput = isRecord(toolCall.rawInput) ? toolCall.rawInput : {};
-  return WRITE_CONTENT_KEYS.some((key) => key in rawInput);
 }
 
 /**
@@ -139,12 +141,13 @@ export function extractWriteLedger(events: ToolLedgerEvent[]): WriteLedger {
     const toolCall = isRecord(event.data.toolCall)
       ? event.data.toolCall
       : event.data;
-    if (!isMutatingCall(toolCall)) continue;
+    if (!isMutatingFileToolCall(toolCall)) continue;
     // A call without an id cannot be folded across updates; give it a unique
     // slot so its own status still classifies its paths.
     const id = str(toolCall.id) ?? `__anonymous_${anonymousIndex++}`;
     const entry = byCall.get(id) ?? { paths: new Set<string>() };
-    for (const path of collectCallPaths(toolCall)) entry.paths.add(path);
+    for (const path of collectFileMutationPaths(toolCall))
+      entry.paths.add(path);
     const status = (str(toolCall.status) ?? "").toLowerCase();
     if (status) entry.status = status;
     byCall.set(id, entry);
