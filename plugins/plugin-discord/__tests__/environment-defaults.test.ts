@@ -7,8 +7,7 @@
  * keys before a dynamic import to read them deterministically.
  */
 import type { IAgentRuntime } from "@elizaos/core";
-import { describe, expect, it } from "vitest";
-import { validateDiscordConfig } from "../environment";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const POSTURE_ENV_KEYS = [
 	"DISCORD_SHOULD_IGNORE_BOT_MESSAGES",
@@ -16,6 +15,29 @@ const POSTURE_ENV_KEYS = [
 	"DISCORD_AUTO_REPLY",
 	"DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES",
 ] as const;
+
+const savedEnv = new Map<string, string | undefined>();
+
+beforeEach(() => {
+	for (const key of POSTURE_ENV_KEYS) {
+		savedEnv.set(key, process.env[key]);
+		delete process.env[key];
+	}
+	vi.resetModules();
+});
+
+afterEach(() => {
+	for (const key of POSTURE_ENV_KEYS) {
+		const value = savedEnv.get(key);
+		if (value === undefined) {
+			delete process.env[key];
+		} else {
+			process.env[key] = value;
+		}
+	}
+	savedEnv.clear();
+	vi.resetModules();
+});
 
 function runtimeWith(settings: Record<string, unknown> = {}): IAgentRuntime {
 	return {
@@ -26,9 +48,6 @@ function runtimeWith(settings: Record<string, unknown> = {}): IAgentRuntime {
 
 describe("Discord default posture", () => {
 	it("engages bots, replies without a mention, and auto-answers by default", async () => {
-		for (const key of POSTURE_ENV_KEYS) {
-			delete process.env[key];
-		}
 		const { getDiscordSettings } = await import("../environment");
 		const settings = getDiscordSettings(runtimeWith());
 
@@ -84,6 +103,7 @@ describe("Discord default posture", () => {
 	});
 
 	it("validateDiscordConfig parses a present token and rejects a missing one", async () => {
+		const { validateDiscordConfig } = await import("../environment");
 		await expect(
 			validateDiscordConfig(runtimeWith({ DISCORD_API_TOKEN: "token" })),
 		).resolves.toMatchObject({ DISCORD_API_TOKEN: "token" });

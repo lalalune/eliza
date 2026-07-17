@@ -140,6 +140,7 @@ where to get the credentials, minimum required fields, and tips for optional fie
 - `CHANNEL_IDS` — Comma-separated channel IDs to listen in
 - `DISCORD_VOICE_CHANNEL_ID` — For voice channel support
 - `DISCORD_SHOULD_IGNORE_BOT_MESSAGES` — `true` to prevent bot-to-bot loops
+- `DISCORD_BOT_REPLY_CHAIN_LIMIT` — addressed bot turns per channel/minute (`3` by default; `0` for unlimited)
 - `DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES` — `true` to disable DM responses
 - `DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS` — `true` to only respond when @mentioned
 - `DISCORD_LISTEN_CHANNEL_IDS` — Channel IDs to listen but not post unsolicited

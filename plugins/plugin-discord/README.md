@@ -48,15 +48,19 @@ DISCORD_LISTEN_CHANNEL_IDS=123456789012345678
 DISCORD_VOICE_CHANNEL_ID=123456789012345678
 
 # Behavior Settings (Optional)
-# If true, ignore messages from other bots (default: true)
+# If true, ignore messages from other bots (default: false)
 DISCORD_SHOULD_IGNORE_BOT_MESSAGES=true
 
 # If true, ignore direct messages by default (default: true).
 # DMs can still be allowed explicitly via DISCORD_ALLOW_FROM / pairing allowlist.
 DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES=true
 
-# If true, only respond when explicitly @mentioned (default: true)
+# If true, only respond when explicitly @mentioned (default: false)
 DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS=true
+
+# Maximum addressed bot-authored messages handled per channel within one minute.
+# A human message resets the chain. Set 0 for unlimited (default: 3).
+DISCORD_BOT_REPLY_CHAIN_LIMIT=3
 
 # Generation Timeout (Optional)
 # Wall-clock budget for generating a single reply before the bot gives up and

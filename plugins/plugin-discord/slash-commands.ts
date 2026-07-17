@@ -233,7 +233,7 @@ const settingsCommand: SlashCommand = {
 				content: [
 					"**Current Settings**",
 					`- Respond only to mentions: **${runtime.getSetting("DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS") ?? "false"}**`,
-					`- Ignore bot messages: **${runtime.getSetting("DISCORD_SHOULD_IGNORE_BOT_MESSAGES") ?? "true"}**`,
+					`- Ignore bot messages: **${runtime.getSetting("DISCORD_SHOULD_IGNORE_BOT_MESSAGES") ?? "false"}**`,
 					`- Allowed channels: **${runtime.getSetting("CHANNEL_IDS") ?? "(all channels)"}**`,
 					`- Agent name: **${runtime.character?.name ?? "Unknown"}**`,
 				].join("\n"),

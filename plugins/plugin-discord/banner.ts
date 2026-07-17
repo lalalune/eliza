@@ -493,13 +493,17 @@ export function printBanner(options: BannerOptions): void {
  * Print the Discord plugin banner with current settings.
  */
 export function printDiscordBanner(runtime: IAgentRuntime): void {
-	// Get settings
 	const apiToken = runtime.getSetting("DISCORD_API_TOKEN");
+	const botTokens = runtime.getSetting("DISCORD_BOT_TOKENS");
 	const applicationId = runtime.getSetting("DISCORD_APPLICATION_ID");
+	const channelIds = runtime.getSetting("CHANNEL_IDS");
 	const ignoreBots = runtime.getSetting("DISCORD_SHOULD_IGNORE_BOT_MESSAGES");
 	const ignoreDMs = runtime.getSetting("DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES");
 	const onlyMentions = runtime.getSetting(
 		"DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS",
+	);
+	const botReplyChainLimit = runtime.getSetting(
+		"DISCORD_BOT_REPLY_CHAIN_LIMIT",
 	);
 	const listenChannels = runtime.getSetting("DISCORD_LISTEN_CHANNEL_IDS");
 	const voiceChannelId = runtime.getSetting("DISCORD_VOICE_CHANNEL_ID");
@@ -517,7 +521,13 @@ export function printDiscordBanner(runtime: IAgentRuntime): void {
 				required: true,
 			},
 			{ name: "DISCORD_APPLICATION_ID", value: applicationId },
+			{
+				name: "DISCORD_BOT_TOKENS",
+				value: botTokens,
+				sensitive: true,
+			},
 			{ name: "DISCORD_VOICE_CHANNEL_ID", value: voiceChannelId },
+			{ name: "CHANNEL_IDS", value: channelIds },
 			{ name: "DISCORD_LISTEN_CHANNEL_IDS", value: listenChannels },
 			{
 				name: "DISCORD_SHOULD_IGNORE_BOT_MESSAGES",
@@ -533,6 +543,11 @@ export function printDiscordBanner(runtime: IAgentRuntime): void {
 				name: "DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS",
 				value: onlyMentions,
 				defaultValue: "false",
+			},
+			{
+				name: "DISCORD_BOT_REPLY_CHAIN_LIMIT",
+				value: botReplyChainLimit,
+				defaultValue: "3",
 			},
 		],
 		runtime,

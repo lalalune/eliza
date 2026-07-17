@@ -125,7 +125,8 @@ bun run --cwd plugins/plugin-discord clean       # rm dist + .turbo + generated 
 | `CHANNEL_IDS` | No | Comma-separated channel IDs the bot is restricted to (whitelist) |
 | `DISCORD_LISTEN_CHANNEL_IDS` | No | Comma-separated channel IDs where the bot ingests messages but does NOT reply |
 | `DISCORD_VOICE_CHANNEL_ID` | No | Voice channel ID to auto-join on guild scan; defaults to most-populated channel |
-| `DISCORD_SHOULD_IGNORE_BOT_MESSAGES` | No | `"true"` to ignore messages from other bots. Default: `false` — the bot engages other bots (agent-to-agent chat is first-class); the core bot-noise triage (`ELIZA_BOT_NOISE_TRIAGE`, on by default) still pre-filters unaddressed webhook/bot group chatter. See `DISCORD_DEFAULTS` in `environment.ts`. |
+| `DISCORD_SHOULD_IGNORE_BOT_MESSAGES` | No | `"true"` to ignore messages from other bots. Default: `false` — the bot engages other bots (agent-to-agent chat is first-class); the core bot-noise triage (`ELIZA_BOT_NOISE_TRIAGE`, on by default) pre-filters unaddressed webhook/bot group chatter. See `DISCORD_DEFAULTS` in `environment.ts`. |
+| `DISCORD_BOT_REPLY_CHAIN_LIMIT` | No | Maximum addressed bot-authored messages handled per channel within one minute (default: `3`). A human message resets the chain; `0` disables the bound. |
 | `DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES` | No | `"false"` to process DMs (default: `true`) |
 | `DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS` | No | `"true"` to reply only when @-mentioned. Default: `false` — the bot replies in-channel without requiring a mention. |
 | `DISCORD_DM_POLICY` | No | DM access policy: `open` / `allowlist` / `pairing` / `disabled` (default: `pairing`) |

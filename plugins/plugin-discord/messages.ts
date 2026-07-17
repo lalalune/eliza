@@ -37,6 +37,10 @@ import {
 } from "discord.js";
 import { isDiscordUserAddressed } from "./addressing";
 import { AttachmentManager } from "./attachments";
+import {
+	BotReplyChainGuard,
+	resolveBotReplyChainLimit,
+} from "./bot-reply-chain-guard";
 // See service.ts for detailed documentation on Discord ID handling.
 // Key point: Discord snowflake IDs (e.g., "1253563208833433701") are NOT valid UUIDs.
 // Use stringToUuid() to convert them, not asUUID() which would throw an error.
@@ -637,6 +641,7 @@ export class MessageManager {
 	private envelopeEnabled: boolean;
 	private draftStreamingEnabled: boolean;
 	private stalenessConfig: DiscordStalenessConfig;
+	private botReplyChainGuard: BotReplyChainGuard;
 	private recentlyProcessedMessageIds = new Map<string, number>();
 	private static readonly PROCESSED_MESSAGE_TTL_MS = 2 * 60 * 1000;
 	/**
@@ -666,6 +671,11 @@ export class MessageManager {
 		// Load Discord settings with proper priority (env vars > character settings > defaults)
 		this.discordSettings =
 			discordService.discordSettings ?? getDiscordSettings(this.runtime);
+		this.botReplyChainGuard = new BotReplyChainGuard(
+			resolveBotReplyChainLimit(
+				this.runtime.getSetting("DISCORD_BOT_REPLY_CHAIN_LIMIT"),
+			),
+		);
 		const reactionScopeSetting = this.runtime.getSetting(
 			"DISCORD_STATUS_REACTIONS",
 		) as string | undefined;
@@ -845,6 +855,25 @@ export class MessageManager {
 		// `isDiscordUserAddressed`'s first-mention semantics (and its tests)
 		// untouched.
 		const isBotDirectlyAddressed = isBotAddressed || isBotPlatformMentioned;
+		const botReplyChain = this.botReplyChainGuard.observe({
+			channelId: message.channel.id,
+			authorIsBot: message.author.bot === true,
+			directlyAddressesAgent: isBotDirectlyAddressed,
+		});
+		if (botReplyChain.blocked) {
+			this.runtime.logger.warn(
+				{
+					src: "plugin:discord",
+					agentId: this.runtime.agentId,
+					channelId: message.channel.id,
+					authorId: message.author.id,
+					count: botReplyChain.count,
+					limit: botReplyChain.limit,
+				},
+				"Dropping addressed bot message after reply-chain limit",
+			);
+			return;
+		}
 		const isInThread = message.channel.isThread();
 		const isDM = message.channel.type === DiscordChannelType.DM;
 		const strictModeEnabled =

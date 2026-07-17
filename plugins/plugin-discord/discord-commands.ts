@@ -38,9 +38,9 @@ const INTEGRATION_USER_INSTALL = 1;
  * availability: a non-guild-only command is offered in guilds, bot DMs, AND
  * private channels (group DMs) with both install types. Discord only accepts
  * `integrationTypes` including USER_INSTALL when the application itself is
- * configured as user-installable in the developer portal — so this stays
- * OFF by default (`DISCORD_USER_INSTALL`), because registering user-install
- * commands against a guild-install-only app is rejected by the API.
+ * configured as user-installable in the developer portal. User install is on
+ * by default; guild-install-only apps must set `DISCORD_USER_INSTALL=false`
+ * because Discord rejects user-install commands for those applications.
  */
 /**
  * Discord's hard limit on command and option description length. Exceeding it

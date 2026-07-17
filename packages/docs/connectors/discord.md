@@ -16,6 +16,7 @@ Connect your agent to Discord servers and DMs using the `@elizaos/plugin-discord
 | `CHANNEL_IDS` | No | Comma-separated list of channel IDs to restrict the bot to |
 | `DISCORD_LISTEN_CHANNEL_IDS` | No | Comma-separated list of channel IDs where the bot only listens (no responses) |
 | `DISCORD_SHOULD_IGNORE_BOT_MESSAGES` | No | If `true`, ignore messages from other bots (default `false` — the bot engages other bots) |
+| `DISCORD_BOT_REPLY_CHAIN_LIMIT` | No | Maximum addressed bot-authored messages handled per channel within one minute (default `3`; `0` disables the bound) |
 | `DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES` | No | If `true`, ignore direct messages (default `true`) |
 | `DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS` | No | If `true`, only respond when explicitly @mentioned (default `false` — replies in-channel without a mention) |
 | `DISCORD_AUTO_REPLY` | No | If `false`, ingest messages into memory without generating replies (default `true`) |
@@ -76,6 +77,7 @@ When loaded, secrets are pushed to `process.env` for the plugin to consume:
 | `DISCORD_LISTEN_CHANNEL_IDS` | No | Comma-separated list of channel IDs where the bot will only listen (not respond) |
 | `DISCORD_VOICE_CHANNEL_ID` | No | Voice channel ID the bot should join (auto-selects based on activity if not set) |
 | `DISCORD_SHOULD_IGNORE_BOT_MESSAGES` | No | Ignore messages from other bots |
+| `DISCORD_BOT_REPLY_CHAIN_LIMIT` | No | Bound addressed bot-to-bot reply chains (default `3`; `0` for unlimited) |
 | `DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES` | No | Ignore direct messages |
 | `DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS` | No | Only respond when explicitly @mentioned |
 

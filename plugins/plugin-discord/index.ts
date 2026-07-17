@@ -12,13 +12,12 @@ import {
 	logger,
 	type Plugin,
 } from "@elizaos/core";
-import { printBanner } from "./banner";
+import { printDiscordBanner } from "./banner";
 import { createDiscordConnectorAccountProvider } from "./connector-account-provider";
 import { DISCORD_SERVICE_NAME } from "./constants";
 import { discordDataRoutes } from "./data-routes";
 import { registerDiscordTargetSource } from "./discord-target-source";
 import { DiscordOwnerPairingServiceImpl } from "./owner-pairing-service";
-import { getPermissionValues } from "./permissions";
 import { registerDiscordDmSensitiveRequestAdapter } from "./sensitive-request-adapter";
 import { DiscordService } from "./service";
 import { discordSetupRoutes } from "./setup-routes";
@@ -75,77 +74,7 @@ const discordPlugin: Plugin = {
 
 		const token = runtime.getSetting("DISCORD_API_TOKEN") as string;
 		const botTokens = runtime.getSetting("DISCORD_BOT_TOKENS") as string;
-		const applicationId = runtime.getSetting(
-			"DISCORD_APPLICATION_ID",
-		) as string;
-		const voiceChannelId = runtime.getSetting(
-			"DISCORD_VOICE_CHANNEL_ID",
-		) as string;
-		const channelIds = runtime.getSetting("CHANNEL_IDS") as string;
-		const listenChannelIds = runtime.getSetting(
-			"DISCORD_LISTEN_CHANNEL_IDS",
-		) as string;
-		const ignoreBotMessages = runtime.getSetting(
-			"DISCORD_SHOULD_IGNORE_BOT_MESSAGES",
-		) as string;
-		const ignoreDirectMessages = runtime.getSetting(
-			"DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES",
-		) as string;
-		const respondOnlyToMentions = runtime.getSetting(
-			"DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS",
-		) as string;
-
-		printBanner({
-			pluginName: "plugin-discord",
-			description: "Discord bot integration for servers and channels",
-			applicationId: applicationId || undefined,
-			discordPermissions: applicationId ? getPermissionValues() : undefined,
-			settings: [
-				{
-					name: "DISCORD_API_TOKEN",
-					value: token,
-					sensitive: true,
-					required: true,
-				},
-				{
-					name: "DISCORD_APPLICATION_ID",
-					value: applicationId,
-				},
-				{
-					name: "DISCORD_BOT_TOKENS",
-					value: botTokens,
-					sensitive: true,
-				},
-				{
-					name: "DISCORD_VOICE_CHANNEL_ID",
-					value: voiceChannelId,
-				},
-				{
-					name: "CHANNEL_IDS",
-					value: channelIds,
-				},
-				{
-					name: "DISCORD_LISTEN_CHANNEL_IDS",
-					value: listenChannelIds,
-				},
-				{
-					name: "DISCORD_SHOULD_IGNORE_BOT_MESSAGES",
-					value: ignoreBotMessages,
-					defaultValue: "true",
-				},
-				{
-					name: "DISCORD_SHOULD_IGNORE_DIRECT_MESSAGES",
-					value: ignoreDirectMessages,
-					defaultValue: "true",
-				},
-				{
-					name: "DISCORD_SHOULD_RESPOND_ONLY_TO_MENTIONS",
-					value: respondOnlyToMentions,
-					defaultValue: "true",
-				},
-			],
-			runtime,
-		});
+		printDiscordBanner(runtime);
 
 		if (
 			(!token || token.trim() === "") &&

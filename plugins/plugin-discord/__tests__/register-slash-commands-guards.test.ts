@@ -4,8 +4,8 @@
  * application yet, no commands to register, a command missing name/description,
  * a failed global commands.set() call, and the commandRegistrationQueue
  * serializing two concurrent registrations while surfacing a queue failure to
- * BOTH the caller and the logger. Same in-memory Discord API double pattern as
- * slash-command-registration-scope.test.ts.
+ * the caller, agent error stream, and logger. Same in-memory Discord API double
+ * pattern as slash-command-registration-scope.test.ts.
  */
 import type { IAgentRuntime } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
@@ -26,6 +26,7 @@ function makeRuntime() {
 	return {
 		agentId: AGENT_ID,
 		getSetting: vi.fn(() => undefined),
+		reportError: vi.fn(),
 		logger: {
 			debug: vi.fn(),
 			error: vi.fn(),
@@ -105,7 +106,7 @@ describe("DiscordService.registerSlashCommands — guard clauses", () => {
 		expect(set).not.toHaveBeenCalled();
 	});
 
-	it("logs and continues past a failed global commands.set() write instead of aborting registration", async () => {
+	it("rejects and reports a failed global commands.set() write", async () => {
 		const set = vi.fn(async () => {
 			throw new Error("50013: Missing Permissions");
 		});
@@ -118,15 +119,19 @@ describe("DiscordService.registerSlashCommands — guard clauses", () => {
 			},
 		});
 
-		await service.registerSlashCommands([command("ask")]);
+		await expect(
+			service.registerSlashCommands([command("ask")]),
+		).rejects.toThrow("50013: Missing Permissions");
 
-		expect(runtime.logger.error).toHaveBeenCalledWith(
+		expect(runtime.reportError).toHaveBeenCalledWith(
+			"DiscordService.commandSync",
+			expect.any(Error),
 			expect.objectContaining({ accountId: "default" }),
-			expect.stringContaining("Failed to register/clear global commands"),
 		);
-		// The command is still recorded even though the Discord write failed —
-		// the queue continues past the caught error.
-		expect(service.slashCommands.map((c) => c.name)).toEqual(["ask"]);
+		expect(runtime.logger.info).not.toHaveBeenCalledWith(
+			expect.anything(),
+			"Commands registered",
+		);
 	});
 
 	it("rejects the caller when the registration queue itself throws, without losing the next registration", async () => {

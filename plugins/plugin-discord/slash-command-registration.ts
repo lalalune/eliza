@@ -4,7 +4,7 @@
  * pushes the result to Discord: globally (for DMs), per-guild (for instant
  * availability), and per-target-guild for commands pinned to specific guild
  * IDs. Extracted out of `service.ts` so this logic — and the
- * `DISCORD_USER_INSTALL` opt-in this file threads through every
+ * `DISCORD_USER_INSTALL` setting this file threads through every
  * `transformCommandToDiscordApi` call — has a coverage surface independent of
  * the surrounding god-class (#16067).
  *
@@ -88,9 +88,6 @@ export async function registerDiscordSlashCommands(
 		}
 	}
 
-	let registrationError: Error | null = null;
-	let registrationFailed = false;
-
 	// User-installable / group-DM command availability, ON by default so
 	// commands work in group DMs and DMs-with-others out of the box. This
 	// REQUIRES the Discord app be configured as "User Install" in the developer
@@ -101,6 +98,7 @@ export async function registerDiscordSlashCommands(
 		String(host.runtime.getSetting("DISCORD_USER_INSTALL") ?? "true"),
 	);
 
+	let registrationError: Error | null = null;
 	host.commandRegistrationQueue = host.commandRegistrationQueue
 		.then(async () => {
 			const commandMap = new Map<string, DiscordSlashCommand>();
@@ -144,19 +142,7 @@ export async function registerDiscordSlashCommands(
 				throw new Error("Discord client application is not available");
 			}
 
-			try {
-				await clientApp.commands.set(transformedGlobalCommands);
-			} catch (err) {
-				host.runtime.logger.error(
-					{
-						src: "plugin:discord",
-						agentId: host.runtime.agentId,
-						accountId: state.accountId,
-						error: err instanceof Error ? err.message : String(err),
-					},
-					"Failed to register/clear global commands",
-				);
-			}
+			await clientApp.commands.set(transformedGlobalCommands);
 
 			// Per-guild registration pushes ONLY the guild-only commands: global
 			// commands live in the global scope, and Discord renders a command
@@ -259,9 +245,15 @@ export async function registerDiscordSlashCommands(
 			);
 		})
 		.catch((error) => {
-			registrationFailed = true;
+			// error-policy:J5 the caller observes this failure through the explicit
+			// rethrow below; the catch keeps the shared queue usable for later syncs.
 			registrationError =
 				error instanceof Error ? error : new Error(String(error));
+			host.runtime.reportError(
+				"DiscordService.commandSync",
+				registrationError,
+				{ accountId: state.accountId },
+			);
 			host.runtime.logger.error(
 				{
 					src: "plugin:discord",
@@ -275,7 +267,7 @@ export async function registerDiscordSlashCommands(
 
 	await host.commandRegistrationQueue;
 
-	if (registrationFailed && registrationError) {
+	if (registrationError) {
 		throw registrationError;
 	}
 }

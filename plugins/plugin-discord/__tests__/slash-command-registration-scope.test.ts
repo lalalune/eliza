@@ -22,7 +22,7 @@ function command(
 	} as unknown as DiscordSlashCommand;
 }
 
-function makeService() {
+function makeService(settings: Record<string, unknown> = {}) {
 	const globalAndGuildSet = vi.fn(async () => undefined);
 	const targetedCreate = vi.fn(async () => undefined);
 	const targetedFetch = vi.fn(async () => ({ find: () => undefined }));
@@ -44,7 +44,7 @@ function makeService() {
 	};
 	const runtime = {
 		agentId: AGENT_ID,
-		getSetting: vi.fn(() => undefined),
+		getSetting: vi.fn((key: string) => settings[key]),
 		logger: {
 			debug: vi.fn(),
 			error: vi.fn(),
@@ -116,6 +116,25 @@ describe("Discord slash-command registration scopes", () => {
 			expect.objectContaining({ name: "global" }),
 		]);
 		expect(globalAndGuildSet).toHaveBeenNthCalledWith(2, [], "guild-a");
+	});
+
+	it("defaults global commands to user-install contexts and honors the guild-only override", async () => {
+		const defaults = makeService();
+		await defaults.service.registerSlashCommands([command("global")]);
+		expect(defaults.globalAndGuildSet.mock.calls[0]?.[0]).toEqual([
+			expect.objectContaining({
+				contexts: [0, 1, 2],
+				integrationTypes: [0, 1],
+			}),
+		]);
+
+		const guildOnly = makeService({ DISCORD_USER_INSTALL: "false" });
+		await guildOnly.service.registerSlashCommands([command("global")]);
+		expect(guildOnly.globalAndGuildSet.mock.calls[0]?.[0]).toEqual([
+			expect.not.objectContaining({
+				integrationTypes: expect.anything(),
+			}),
+		]);
 	});
 
 	it("surfaces a failed guild write via reportError and still syncs the other guilds", async () => {
