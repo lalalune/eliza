@@ -33,6 +33,7 @@ import {
 } from "@elizaos/shared/voice/first-sentence-snip";
 import { z } from "zod";
 import { userVoicesRepository } from "@/db/repositories/user-voices";
+import type { VoiceTtsOperation } from "@/db/schemas/voice-tts-operations";
 import { ApiError } from "@/lib/api/cloud-worker-errors";
 import { requireAuthOrApiKeyWithOrg } from "@/lib/auth";
 import { CUSTOM_VOICE_TTS_MARKUP } from "@/lib/pricing-constants";
@@ -52,6 +53,14 @@ import {
   shouldBypassCloudFirstLineCache,
 } from "@/lib/services/tts-first-line-cache";
 import { usageService } from "@/lib/services/usage";
+import {
+  buildCanonicalVoiceTtsRequestHash,
+  InvalidVoiceTtsIdempotencyKeyError,
+  normalizeVoiceTtsIdempotencyKey,
+  type StoredVoiceTtsResult,
+  type VoiceTtsOperationClaim,
+  voiceTtsOperationsService,
+} from "@/lib/services/voice-tts-operations";
 import { logger } from "@/lib/utils/logger";
 import {
   CartesiaRestTtsError,
@@ -84,6 +93,21 @@ function resolveElevenLabsVoiceRevision(
 }
 
 const MAX_TEXT_LENGTH = 5000;
+const MAX_REPLAY_AUDIO_BYTES = 64 * 1024 * 1024;
+
+class VoiceTtsHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: Record<string, unknown>,
+  ) {
+    super(typeof body.error === "string" ? body.error : "TTS request failed");
+    this.name = "VoiceTtsHttpError";
+  }
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 const TtsBody = z.object({
   text: z.string(),
@@ -100,6 +124,165 @@ interface TtsTimings {
   authMs?: number;
   admissionMs?: number;
   synthesisMs?: number;
+}
+
+async function drainAudioStream(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    total += result.value.byteLength;
+    if (total > MAX_REPLAY_AUDIO_BYTES) {
+      await reader.cancel("TTS replay audio exceeded the byte cap");
+      throw new Error("TTS replay audio exceeded the byte cap");
+    }
+    chunks.push(result.value);
+  }
+  if (total === 0) {
+    throw new Error("TTS provider returned empty audio");
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function operationClaimResponse(
+  claim: VoiceTtsOperationClaim,
+): Response | null {
+  if (claim.kind === "claimed") return null;
+  if (claim.kind === "conflict") {
+    return Response.json(
+      {
+        error: "Idempotency key reused with a different TTS request",
+        code: "idempotency_key_conflict",
+      },
+      { status: 409 },
+    );
+  }
+  if (claim.kind === "pending") {
+    return Response.json(
+      {
+        error: "TTS request is still processing",
+        code: "idempotency_in_progress",
+      },
+      { status: 409, headers: { "Retry-After": "1" } },
+    );
+  }
+  if (claim.kind === "failed") {
+    return Response.json(claim.body, {
+      status: claim.status,
+      headers: { "X-TTS-Idempotent-Replay": "true" },
+    });
+  }
+  return new Response(claim.result.bytes as unknown as BodyInit, {
+    status: 200,
+    headers: {
+      ...claim.result.headers,
+      "Content-Type": claim.result.contentType,
+      "Cache-Control": "no-store",
+      "X-TTS-Idempotent-Replay": "true",
+    },
+  });
+}
+
+function mapVoiceTtsError(error: unknown): Response {
+  if (error instanceof VoiceTtsHttpError) {
+    return Response.json(error.body, { status: error.status });
+  }
+  if (error instanceof InvalidVoiceTtsIdempotencyKeyError) {
+    return Response.json(
+      { error: error.message, code: "invalid_idempotency_key" },
+      { status: 400 },
+    );
+  }
+  if (error instanceof InsufficientCreditsError) {
+    return Response.json(
+      {
+        error: "Insufficient credits for text-to-speech",
+        required: error.required,
+      },
+      { status: 402 },
+    );
+  }
+  if (error instanceof ApiError) {
+    return Response.json(error.toJSON(), { status: error.status });
+  }
+  if (error instanceof CartesiaRestTtsError) {
+    const status =
+      error.classification === "auth"
+        ? error.status === 403
+          ? 403
+          : 401
+        : error.classification === "rate_limit" ||
+            error.classification === "quota"
+          ? 429
+          : error.classification === "bad_request"
+            ? 400
+            : 502;
+    return Response.json(
+      {
+        error: error.safeProviderMessage,
+        provider: "cartesia",
+        code: error.classification,
+      },
+      { status },
+    );
+  }
+
+  const errorMessage =
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : typeof error === "string"
+        ? error.toLowerCase()
+        : "";
+  if (
+    errorMessage.includes("invalid or expired api key") ||
+    errorMessage.includes("invalid or expired token") ||
+    errorMessage.includes("api key is inactive") ||
+    errorMessage.includes("unauthorized") ||
+    errorMessage.includes("authentication required") ||
+    errorMessage.includes("forbidden")
+  ) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (errorMessage.includes("rate limit")) {
+    return Response.json(
+      { error: "Rate limit exceeded. Please try again in a moment." },
+      { status: 429 },
+    );
+  }
+  if (errorMessage.includes("quota")) {
+    return Response.json(
+      {
+        error:
+          "Voice service is temporarily unavailable due to high demand. Please try again in a few moments.",
+        type: "service_unavailable",
+        retryAfter: "5 minutes",
+      },
+      { status: 503 },
+    );
+  }
+  if (errorMessage.includes("voice")) {
+    return Response.json(
+      { error: "Invalid voice ID. Please select a different voice." },
+      { status: 400 },
+    );
+  }
+  if (errorMessage.includes("elevenlabs_api_key")) {
+    return Response.json({ error: "Service not configured" }, { status: 500 });
+  }
+  return Response.json(
+    { error: "Failed to generate speech. Please try again." },
+    { status: 500 },
+  );
 }
 
 function buildTtsObservabilityHeaders(
@@ -164,6 +347,8 @@ const MAX_CARTESIA_PCM_BYTES = 16 * 1024 * 1024;
  */
 async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
   let reservation: CreditReservation | undefined;
+  let activeOperation: VoiceTtsOperation | undefined;
+  let operationRequestHash: string | undefined;
   const requestStart = Date.now();
   const timings: TtsTimings = {};
 
@@ -232,6 +417,66 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
       );
     }
 
+    const idempotencyKey = normalizeVoiceTtsIdempotencyKey(
+      request.headers.get("Idempotency-Key"),
+    );
+    if (idempotencyKey) {
+      if (!env.BLOB) {
+        throw new VoiceTtsHttpError(503, {
+          error: "TTS replay storage is not configured",
+          code: "idempotency_unavailable",
+        });
+      }
+      const effectiveVoiceId =
+        providerSelection.provider === "cartesia"
+          ? cartesiaVoiceId
+          : providerSelection.provider === "kokoro"
+            ? providerSelection.voiceId
+            : voiceId || "EXAVITQu4vr4xnSDxMaL";
+      const effectiveModelId =
+        providerSelection.provider === "cartesia"
+          ? "sonic-3.5"
+          : providerSelection.provider === "kokoro"
+            ? "kokoro-default"
+            : modelId || "eleven_flash_v2_5";
+      operationRequestHash = await buildCanonicalVoiceTtsRequestHash({
+        text,
+        provider: providerSelection.provider,
+        voiceId: effectiveVoiceId,
+        modelId: effectiveModelId,
+        format: wantWav ? "wav" : "mp3",
+        affiliateCode: request.headers.get("X-Affiliate-Code")?.trim() || null,
+      });
+      let claim = await voiceTtsOperationsService.claim({
+        bucket: env.BLOB,
+        organizationId: user.organization_id,
+        idempotencyKey,
+        requestHash: operationRequestHash,
+      });
+      if (claim.kind === "pending") {
+        claim = await voiceTtsOperationsService.waitForTerminal({
+          bucket: env.BLOB,
+          operation: claim.operation,
+          requestHash: operationRequestHash,
+          keyHashPrefix: claim.keyHashPrefix,
+          signal: request.signal,
+        });
+      }
+      const replayResponse = operationClaimResponse(claim);
+      if (replayResponse) {
+        logger.info("[Voice TTS API] Replayed idempotent operation", {
+          keyHashPrefix: claim.keyHashPrefix,
+          outcome: claim.kind,
+        });
+        return replayResponse;
+      }
+      activeOperation = claim.operation;
+      logger.info("[Voice TTS API] Claimed idempotent operation", {
+        operationId: activeOperation.id,
+        keyHashPrefix: claim.keyHashPrefix,
+      });
+    }
+
     await contentSafetyService.assertSafeForPublicUse({
       surface: "media_generation_prompt",
       organizationId: user.organization_id,
@@ -286,13 +531,31 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
             logger.info(
               `[Voice TTS API] Kokoro first-line cache HIT (${cached.byteSize}B, hits=${cached.hitCount}, voice=${kokoroVoice}) — no upstream request`,
             );
+            const headers = {
+              "Cache-Control": "no-cache",
+              ...buildTtsObservabilityHeaders("kokoro", timings),
+              "X-TTS-Cache": "hit; kokoro; first-sentence",
+            };
+            if (activeOperation) {
+              await voiceTtsOperationsService.stageResult({
+                bucket: env.BLOB,
+                operation: activeOperation,
+                result: {
+                  bytes: cached.bytes,
+                  contentType: cached.contentType,
+                  headers,
+                },
+              });
+              await voiceTtsOperationsService.complete({
+                operationId: activeOperation.id,
+              });
+              activeOperation = undefined;
+            }
             return new Response(cached.bytes as unknown as BodyInit, {
               status: 200,
               headers: {
                 "Content-Type": cached.contentType,
-                "Cache-Control": "no-cache",
-                ...buildTtsObservabilityHeaders("kokoro", timings),
-                "X-TTS-Cache": "hit; kokoro; first-sentence",
+                ...headers,
               },
             });
           }
@@ -323,10 +586,7 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
         logger.error(
           `[Voice TTS API] Kokoro synthesis failed (${kokoroResponse.status})`,
         );
-        return Response.json(
-          { error: "TTS synthesis failed" },
-          { status: 502 },
-        );
+        throw new VoiceTtsHttpError(502, { error: "TTS synthesis failed" });
       }
       const kokoroContentType =
         kokoroResponse.headers.get("Content-Type") ?? "audio/wav";
@@ -366,14 +626,49 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
             );
           });
 
+        const headers = {
+          "Cache-Control": "no-store",
+          ...buildTtsObservabilityHeaders("kokoro", timings),
+          "X-TTS-Cache": "miss; kokoro",
+        };
+        if (activeOperation) {
+          await voiceTtsOperationsService.stageResult({
+            bucket: env.BLOB,
+            operation: activeOperation,
+            result: { bytes, contentType: kokoroContentType, headers },
+          });
+          await voiceTtsOperationsService.complete({
+            operationId: activeOperation.id,
+          });
+          activeOperation = undefined;
+        }
         return new Response(bytes as unknown as BodyInit, {
           status: 200,
           headers: {
             "Content-Type": kokoroContentType,
-            "Cache-Control": "no-store",
-            ...buildTtsObservabilityHeaders("kokoro", timings),
-            "X-TTS-Cache": "miss; kokoro",
+            ...headers,
           },
+        });
+      }
+
+      if (activeOperation) {
+        const bytes = new Uint8Array(await kokoroResponse.arrayBuffer());
+        const headers = {
+          "Cache-Control": "no-store",
+          ...buildTtsObservabilityHeaders("kokoro", timings),
+        };
+        await voiceTtsOperationsService.stageResult({
+          bucket: env.BLOB,
+          operation: activeOperation,
+          result: { bytes, contentType: kokoroContentType, headers },
+        });
+        await voiceTtsOperationsService.complete({
+          operationId: activeOperation.id,
+        });
+        activeOperation = undefined;
+        return new Response(bytes as unknown as BodyInit, {
+          status: 200,
+          headers: { "Content-Type": kokoroContentType, ...headers },
         });
       }
 
@@ -470,15 +765,33 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
           logger.info(
             `[Voice TTS API] first-line cache HIT (${cacheScope}, ${cached.byteSize}B, hits=${cached.hitCount})`,
           );
+          const headers = {
+            "Cache-Control": "no-cache",
+            ...buildTtsObservabilityHeaders(
+              providerSelection.provider,
+              timings,
+            ),
+            "X-TTS-Cache": "hit; first-sentence",
+          };
+          if (activeOperation) {
+            await voiceTtsOperationsService.stageResult({
+              bucket: env.BLOB,
+              operation: activeOperation,
+              result: {
+                bytes: cached.bytes,
+                contentType: cached.contentType,
+                headers,
+              },
+            });
+            await voiceTtsOperationsService.complete({
+              operationId: activeOperation.id,
+            });
+            activeOperation = undefined;
+          }
           return new Response(cached.bytes as unknown as BodyInit, {
             headers: {
               "Content-Type": cached.contentType,
-              "Cache-Control": "no-cache",
-              ...buildTtsObservabilityHeaders(
-                providerSelection.provider,
-                timings,
-              ),
-              "X-TTS-Cache": "hit; first-sentence",
+              ...headers,
             },
           });
         }
@@ -526,12 +839,30 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
           logger.info(
             `[Voice TTS API] WAV first-line cache HIT (${cached.byteSize}B, hits=${cached.hitCount})`,
           );
+          const headers = {
+            "Cache-Control": "no-cache",
+            ...buildTtsObservabilityHeaders("cartesia", timings),
+            "X-TTS-Cache": "hit; first-sentence; wav",
+          };
+          if (activeOperation) {
+            await voiceTtsOperationsService.stageResult({
+              bucket: env.BLOB,
+              operation: activeOperation,
+              result: {
+                bytes: cached.bytes,
+                contentType: "audio/wav",
+                headers,
+              },
+            });
+            await voiceTtsOperationsService.complete({
+              operationId: activeOperation.id,
+            });
+            activeOperation = undefined;
+          }
           return new Response(cached.bytes as unknown as BodyInit, {
             headers: {
               "Content-Type": "audio/wav",
-              "Cache-Control": "no-cache",
-              ...buildTtsObservabilityHeaders("cartesia", timings),
-              "X-TTS-Cache": "hit; first-sentence; wav",
+              ...headers,
             },
           });
         }
@@ -553,31 +884,25 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
         1_000_000
       : ttsCost.totalCost;
 
-    // #16425: the client mints one Idempotency-Key per logical utterance and
-    // sends it on BOTH the direct request and the proxy fallback, so a retry
-    // after an ambiguous network outcome replays the committed reservation
-    // instead of charging the utterance twice. Org-scoped inside reserve().
-    const ttsIdempotencyKey = request.headers.get("Idempotency-Key");
-
-    try {
-      reservation = await creditsService.reserve({
-        organizationId: user.organization_id,
-        amount: estimatedCost,
-        userId: user.id,
-        description: `TTS generation: ${text.length} chars${isCustomVoice ? " (custom voice)" : ""}`,
-        ...(ttsIdempotencyKey && { idempotencyKey: ttsIdempotencyKey }),
-      });
-    } catch (error) {
-      if (error instanceof InsufficientCreditsError) {
-        return Response.json(
-          {
-            error: "Insufficient credits for text-to-speech",
-            required: error.required,
-          },
-          { status: 402 },
+    reservation = await creditsService.reserve({
+      organizationId: user.organization_id,
+      amount: estimatedCost,
+      userId: user.id,
+      description: `TTS generation: ${text.length} chars${isCustomVoice ? " (custom voice)" : ""}`,
+      // The server operation id is safe to persist in the credit ledger. The
+      // caller's key remains hashed in the operation table only.
+      ...(activeOperation && { idempotencyKey: activeOperation.id }),
+    });
+    if (activeOperation) {
+      if (!reservation.reservationTransactionId) {
+        throw new Error(
+          "Keyed TTS reservation did not return a transaction id",
         );
       }
-      throw error;
+      await voiceTtsOperationsService.attachReservation(
+        activeOperation.id,
+        reservation.reservationTransactionId,
+      );
     }
     timings.admissionMs = Date.now() - admissionStart;
 
@@ -592,6 +917,7 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
     // the user's price (Cartesia's upstream cost is lower, not higher).
     let wav: Uint8Array | undefined;
     let audioStream: ReadableStream<Uint8Array> | undefined;
+    let replayAudioBytes: Uint8Array | undefined;
     let synthesisEngine: "elevenlabs" | "cartesia" = "elevenlabs";
     let cartesiaMp3ContentType = "audio/mpeg";
     if (cartesiaEligible && cartesiaApiKey) {
@@ -674,6 +1000,32 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
       durationMs: duration,
     });
 
+    if (activeOperation) {
+      if (wav) {
+        replayAudioBytes = wav;
+      } else if (audioStream) {
+        replayAudioBytes = await drainAudioStream(audioStream);
+      } else {
+        throw new Error("TTS synthesis did not return audio");
+      }
+      const contentType = wav ? "audio/wav" : cartesiaMp3ContentType;
+      const replayHeaders = {
+        "Cache-Control": "no-cache",
+        ...buildTtsObservabilityHeaders(synthesisEngine, timings),
+        "X-TTS-Cache": "miss",
+      };
+      const replayResult: StoredVoiceTtsResult = {
+        bytes: replayAudioBytes,
+        contentType,
+        headers: replayHeaders,
+      };
+      await voiceTtsOperationsService.stageResult({
+        bucket: env.BLOB,
+        operation: activeOperation,
+        result: replayResult,
+      });
+    }
+
     const billing = await billFlatUsage(
       {
         organizationId: user.organization_id,
@@ -685,6 +1037,7 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
             : `elevenlabs/${modelId || "eleven_flash_v2_5"}`,
         provider: synthesisEngine,
         billingSource: "elevenlabs",
+        requestId: activeOperation?.id ?? null,
         // Affiliate revenue-share via X-Affiliate-Code (existing billFlatUsage branch).
         affiliateCode: request.headers.get("X-Affiliate-Code"),
         description: `TTS generation: ${text.length} chars${isCustomVoice ? " (custom voice)" : ""}`,
@@ -705,48 +1058,56 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
       reservation,
     );
 
-    (async () => {
-      try {
-        await usageService.create({
-          organization_id: user.organization_id,
-          user_id: user.id,
-          api_key_id: apiKey?.id ?? null,
-          type: "tts",
-          // Attribute the engine that actually synthesized; the CHARGE always
-          // comes from the ElevenLabs catalog rate (billingSource below), so a
-          // Cartesia-served request costs the user exactly what the
-          // ElevenLabs-served one would.
-          model:
-            synthesisEngine === "cartesia"
-              ? "sonic-3.5"
-              : modelId || "eleven_flash_v2_5",
-          provider: synthesisEngine,
-          input_tokens: Math.ceil(text.length / 4),
-          output_tokens: 0,
-          input_cost: String(billing.totalCost),
-          output_cost: String(0),
-          markup: String(billing.platformMarkup),
-          duration_ms: duration,
-          is_successful: true,
-          metadata: {
-            voiceId: voiceId || "default",
-            userVoiceId: userVoiceId,
-            voiceName: voiceName,
-            textLength: text.length,
-            characterCount: text.length,
-            isCustomVoice,
-            baseTotalCost: billing.baseTotalCost,
-            billingSource: "elevenlabs",
-            synthesisEngine,
-          },
-        });
-      } catch (error) {
+    const usageInput = {
+      organization_id: user.organization_id,
+      user_id: user.id,
+      api_key_id: apiKey?.id ?? null,
+      type: "tts",
+      // Attribute the engine that actually synthesized; the charge still uses
+      // the ElevenLabs catalog rate, independent of the selected engine.
+      model:
+        synthesisEngine === "cartesia"
+          ? "sonic-3.5"
+          : modelId || "eleven_flash_v2_5",
+      provider: synthesisEngine,
+      input_tokens: Math.ceil(text.length / 4),
+      output_tokens: 0,
+      input_cost: String(billing.totalCost),
+      output_cost: String(0),
+      markup: String(billing.platformMarkup),
+      request_id: activeOperation?.id ?? null,
+      duration_ms: duration,
+      is_successful: true,
+      metadata: {
+        voiceId: voiceId || "default",
+        userVoiceId,
+        voiceName,
+        textLength: text.length,
+        characterCount: text.length,
+        isCustomVoice,
+        baseTotalCost: billing.baseTotalCost,
+        billingSource: "elevenlabs",
+        synthesisEngine,
+      },
+    };
+
+    if (activeOperation) {
+      const usageRecord = await usageService.create(usageInput);
+      await voiceTtsOperationsService.complete({
+        operationId: activeOperation.id,
+        usageRecordId: usageRecord.id,
+      });
+      activeOperation = undefined;
+    } else {
+      void usageService.create(usageInput).catch((error) => {
+        // error-policy:J7 usage analytics cannot invalidate audio already
+        // streamed to an unkeyed caller, but the failure remains observable.
         logger.error("[Voice TTS API] Failed to create usage record", {
           errorType: error instanceof Error ? error.name : "unknown",
           userVoiceId,
         });
-      }
-    })();
+      });
+    }
 
     // ---------------------------------------------------------------------
     // First-line cache populate path.
@@ -822,6 +1183,17 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
       })();
     }
 
+    if (replayAudioBytes) {
+      return new Response(replayAudioBytes as unknown as BodyInit, {
+        headers: {
+          "Content-Type": wav ? "audio/wav" : cartesiaMp3ContentType,
+          "Cache-Control": "no-cache",
+          ...buildTtsObservabilityHeaders(synthesisEngine, timings),
+          "X-TTS-Cache": "miss",
+        },
+      });
+    }
+
     // WAV path: raw PCM (Cartesia frames or the ElevenLabs PCM stream)
     // buffered and wrapped in a WAV header so codec-less clients can decode
     // it. (Buffered, not streamed — fine for short TTS replies; the MP3 path
@@ -853,92 +1225,55 @@ async function __hono_POST(request: Request, env: AppEnv["Bindings"]) {
       errorType: error instanceof Error ? error.name : "unknown",
     });
 
+    const response = mapVoiceTtsError(error);
+    if (activeOperation && env.BLOB) {
+      let failureBody: Record<string, unknown> = {
+        error: "Failed to generate speech. Please try again.",
+      };
+      try {
+        const parsed: unknown = await response.clone().json();
+        if (isUnknownRecord(parsed)) {
+          failureBody = parsed;
+        }
+        await voiceTtsOperationsService.fail({
+          bucket: env.BLOB,
+          operationId: activeOperation.id,
+          status: response.status,
+          body: failureBody,
+        });
+      } catch (stateError) {
+        // error-policy:J1 the HTTP boundary translates an idempotency-ledger
+        // failure to 500 because returning the original response could invite
+        // an unsafe retry against unknown state.
+        logger.error("[Voice TTS API] Failed to persist operation failure", {
+          operationId: activeOperation.id,
+          errorType: stateError instanceof Error ? stateError.name : "unknown",
+        });
+        return Response.json(
+          { error: "Failed to persist TTS operation state" },
+          { status: 500 },
+        );
+      }
+    }
+
     if (reservation) {
-      await reservation.reconcile(0);
-      logger.info("[Voice TTS API] Refunded credits after error");
+      try {
+        await reservation.reconcile(0);
+        logger.info("[Voice TTS API] Refunded credits after error");
+      } catch (reconcileError) {
+        // error-policy:J1 the route boundary cannot report a safe failure while
+        // the reservation settlement itself is unknown.
+        logger.error("[Voice TTS API] Credit refund failed", {
+          errorType:
+            reconcileError instanceof Error ? reconcileError.name : "unknown",
+        });
+        return Response.json(
+          { error: "Failed to settle TTS credits" },
+          { status: 500 },
+        );
+      }
     }
-
-    if (error instanceof ApiError) {
-      return Response.json(error.toJSON(), { status: error.status });
-    }
-
-    if (error instanceof CartesiaRestTtsError) {
-      const status =
-        error.classification === "auth"
-          ? error.status === 403
-            ? 403
-            : 401
-          : error.classification === "rate_limit" ||
-              error.classification === "quota"
-            ? 429
-            : error.classification === "bad_request"
-              ? 400
-              : 502;
-      return Response.json(
-        {
-          error: error.safeProviderMessage,
-          provider: "cartesia",
-          code: error.classification,
-        },
-        { status },
-      );
-    }
-
-    const errorMessage =
-      error instanceof Error
-        ? error.message.toLowerCase()
-        : typeof error === "string"
-          ? error.toLowerCase()
-          : "";
-
-    if (
-      errorMessage.includes("invalid or expired api key") ||
-      errorMessage.includes("invalid or expired token") ||
-      errorMessage.includes("api key is inactive") ||
-      errorMessage.includes("unauthorized") ||
-      errorMessage.includes("authentication required") ||
-      errorMessage.includes("forbidden")
-    ) {
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    if (errorMessage.includes("rate limit")) {
-      return Response.json(
-        { error: "Rate limit exceeded. Please try again in a moment." },
-        { status: 429 },
-      );
-    }
-
-    if (errorMessage.includes("quota")) {
-      return Response.json(
-        {
-          error:
-            "Voice service is temporarily unavailable due to high demand. Please try again in a few moments.",
-          type: "service_unavailable",
-          retryAfter: "5 minutes",
-        },
-        { status: 503 },
-      );
-    }
-
-    if (errorMessage.includes("voice")) {
-      return Response.json(
-        { error: "Invalid voice ID. Please select a different voice." },
-        { status: 400 },
-      );
-    }
-
-    if (errorMessage.includes("elevenlabs_api_key")) {
-      return Response.json(
-        { error: "Service not configured" },
-        { status: 500 },
-      );
-    }
-
-    return Response.json(
-      { error: "Failed to generate speech. Please try again." },
-      { status: 500 },
-    );
+    return response;
   }
 }
 

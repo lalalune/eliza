@@ -329,6 +329,12 @@ export interface SpeakTask {
   text: string;
   append: boolean;
   segment: SpeechSegmentKind;
+  /**
+   * One operation key for the logical queued utterance. `enqueueSpeech`
+   * assigns it before transport work so direct/proxy retries and queue resume
+   * reuse the same durable cloud operation.
+   */
+  operationIdempotencyKey?: string;
   cacheKey?: string;
   /**
    * Optional emotion hint forwarded to providers that support it
