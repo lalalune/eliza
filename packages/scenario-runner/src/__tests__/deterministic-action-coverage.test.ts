@@ -77,7 +77,13 @@ const CORE_ACTION_SURFACE: Record<string, readonly string[]> = {
     "SETTINGS",
     "VIEWS",
   ],
-  "@elizaos/plugin-coding-tools": ["FILE", "SHELL", "WORKTREE"],
+  "@elizaos/plugin-coding-tools": [
+    "FILE",
+    "SHELL",
+    "WEB_FETCH",
+    "WEB_SEARCH",
+    "WORKTREE",
+  ],
   "@elizaos/plugin-commands": [
     "ACCOUNTS_COMMAND",
     "BACKEND_COMMAND",
@@ -167,6 +173,10 @@ const SOURCE_ONLY_ACTIONS: Record<string, readonly string[]> = {
   "plugins/plugin-app-control/src/actions/views.ts": [
     "CLOSE_ALL_VIEWS",
     "CLOSE_VIEW",
+  // Coding web research actions need deterministic network fixtures before
+  // they can join the keyless scenario-covered action set.
+  "WEB_FETCH",
+  "WEB_SEARCH",
   ],
 };
 
