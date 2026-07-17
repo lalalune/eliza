@@ -45,13 +45,18 @@ function writeLcovRecords(dir, sourcePaths) {
 // Write a single-record lcov under an explicit filename so a test can hand the
 // awk MULTIPLE lcov inputs (one per lane), exactly as the CI does with the
 // per-nearest-config lcov.info files.
-function writeLcovAs(dir, name, sourcePath, found, hit) {
+function writeLcovAs(dir, name, sourcePath, found, hit, lineHits = []) {
   const file = join(dir, name);
   writeFileSync(
     file,
-    [`SF:${sourcePath}`, `LF:${found}`, `LH:${hit}`, "end_of_record", ""].join(
-      "\n",
-    ),
+    [
+      `SF:${sourcePath}`,
+      ...lineHits.map(([line, hits]) => `DA:${line},${hits}`),
+      `LF:${found}`,
+      `LH:${hit}`,
+      "end_of_record",
+      "",
+    ].join("\n"),
   );
   return file;
 }
@@ -212,18 +217,46 @@ try {
       );
     },
   );
-  assertGate("uses changed-line coverage for a surgical legacy-file edit", () => {
-    const source = "packages/demo/src/legacy.ts";
-    // Whole-file coverage is 4%, but both changed instrumentable lines are hit.
-    const lcov = writeLcov(dir, source, 100, 4, [[200, 1], [201, 1]]);
-    const result = runGate({
-      changed: source,
-      lcov,
-      delta: `${source}\t5103\t0\t200,201`,
-    });
-    assert.equal(result.status, 0, result.stdout);
-    assert.match(result.stdout, /100\.00% .*changed-line mode/);
-  });
+  assertGate(
+    "uses changed-line coverage for a surgical legacy-file edit",
+    () => {
+      const source = "packages/demo/src/legacy.ts";
+      // Whole-file coverage is 4%, but both changed instrumentable lines are hit.
+      const lcov = writeLcov(dir, source, 100, 4, [
+        [200, 1],
+        [201, 1],
+      ]);
+      const result = runGate({
+        changed: source,
+        lcov,
+        delta: `${source}\t5103\t0\t200,201`,
+      });
+      assert.equal(result.status, 0, result.stdout);
+      assert.match(result.stdout, /100\.00% .*changed-line mode/);
+    },
+  );
+
+  assertGate(
+    "unions changed-line hits across lanes without hiding misses",
+    () => {
+      const source = "packages/demo/src/legacy-multi-lane.ts";
+      const laneA = writeLcovAs(dir, "delta-a.lcov", source, 100, 90, [
+        [200, 1],
+      ]);
+      const laneB = writeLcovAs(dir, "delta-b.lcov", source, 100, 90, [
+        [201, 0],
+      ]);
+      const result = runGate({
+        changed: source,
+        lcov: [laneA, laneB],
+        threshold: 75,
+        delta: `${source}\t5103\t0\t200,201`,
+      });
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(result.stdout, /50\.00% .*changed-line mode/);
+      assert.match(result.stdout, /BELOW:/);
+    },
+  );
 
   assertGate("new files retain whole-file enforcement", () => {
     const source = "packages/demo/src/new-large.ts";
@@ -238,22 +271,28 @@ try {
     assert.match(result.stdout, /BELOW:/);
   });
 
-  assertGate("non-instrumentable changed lines fall back to whole-file coverage", () => {
-    const source = "packages/demo/src/legacy-types.ts";
-    const lcov = writeLcov(dir, source, 100, 80, [[999, 1]]);
-    const result = runGate({
-      changed: source,
-      lcov,
-      delta: `${source}\t5103\t0\t200`,
-    });
-    assert.equal(result.status, 0, result.stdout);
-    assert.match(result.stdout, /non-instrumentable; whole-file fallback/);
-    assert.doesNotMatch(result.stdout, /changed-line mode/);
-  });
+  assertGate(
+    "non-instrumentable changed lines fall back to whole-file coverage",
+    () => {
+      const source = "packages/demo/src/legacy-types.ts";
+      const lcov = writeLcov(dir, source, 100, 80, [[999, 1]]);
+      const result = runGate({
+        changed: source,
+        lcov,
+        delta: `${source}\t5103\t0\t200`,
+      });
+      assert.equal(result.status, 0, result.stdout);
+      assert.match(result.stdout, /non-instrumentable; whole-file fallback/);
+      assert.doesNotMatch(result.stdout, /changed-line mode/);
+    },
+  );
 
   assertGate("broad edits retain whole-file enforcement", () => {
     const source = "packages/demo/src/legacy-refactor.ts";
-    const changedLines = Array.from({ length: 60 }, (_, index) => index + 1).join(",");
+    const changedLines = Array.from(
+      { length: 60 },
+      (_, index) => index + 1,
+    ).join(",");
     const lcov = writeLcov(dir, source, 100, 20, [[1, 1]]);
     const result = runGate({
       changed: source,
@@ -270,7 +309,8 @@ try {
       // eliza.ts cannot be instrumented; only foo.ts appears in LCOV.
       const lcov = writeLcov(dir, "packages/demo/src/foo.ts");
       const result = runGate({
-        changed: "packages/demo/src/foo.ts\npackages/agent/src/runtime/eliza.ts",
+        changed:
+          "packages/demo/src/foo.ts\npackages/agent/src/runtime/eliza.ts",
         lcov,
         excluded: "packages/agent/src/runtime/eliza.ts",
       });
@@ -288,14 +328,22 @@ try {
     () => {
       // Collection got fixed: the file shows up at 25% — below the floor, so
       // the manifest entry must NOT shield it.
-      const lcov = writeLcov(dir, "packages/agent/src/runtime/eliza.ts", 100, 25);
+      const lcov = writeLcov(
+        dir,
+        "packages/agent/src/runtime/eliza.ts",
+        100,
+        25,
+      );
       const result = runGate({
         changed: "packages/agent/src/runtime/eliza.ts",
         lcov,
         excluded: "packages/agent/src/runtime/eliza.ts",
       });
       assert.equal(result.status, 1, result.stdout);
-      assert.match(result.stdout, /BELOW: packages\/agent\/src\/runtime\/eliza\.ts/);
+      assert.match(
+        result.stdout,
+        /BELOW: packages\/agent\/src\/runtime\/eliza\.ts/,
+      );
     },
   );
 

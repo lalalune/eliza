@@ -64,31 +64,33 @@ function path_matches_lcov(current_path, changed_path,    current_len, changed_l
   if (matched == "") next
   value = $0; sub(/^DA:/, "", value); split(value, da, ",")
   line = da[1] + 0; hits = da[2] + 0
-  if (changed_line[matched SUBSEP line]) {
-    lane_delta_found[matched]++
-    if (hits > 0) lane_delta_hit[matched]++
+  key = matched SUBSEP line
+  if (changed_line[key]) {
+    delta_instrumented[key] = 1
+    if (hits > 0) delta_hit[key] = 1
   }
 }
 /^end_of_record/ {
   if (matched != "" && lines_found > 0) {
     pct = (lines_hit / lines_found) * 100
     if (!(matched in file_pct) || pct > file_pct[matched]) file_pct[matched] = pct
-    if (lane_delta_found[matched] > 0) {
-      delta_pct = (lane_delta_hit[matched] / lane_delta_found[matched]) * 100
-      if (!(matched in file_delta_pct) || delta_pct > file_delta_pct[matched]) {
-        file_delta_pct[matched] = delta_pct
-        file_delta_found[matched] = lane_delta_found[matched]
-      }
-    }
   }
   current = ""; matched = ""; lines_found = 0; lines_hit = 0
-  # These counts are lane-local. Reset all keys because LCOV records are serial.
-  for (key in lane_delta_found) delete lane_delta_found[key]
-  for (key in lane_delta_hit) delete lane_delta_hit[key]
 }
 
 END {
   missing_count = 0; changed_count = 0; changed_sum = 0
+  # A changed line is instrumentable when any LCOV lane reports it, and covered
+  # when any lane hits it. Union by source line so a partial lane cannot hide a
+  # miss merely by reporting a higher percentage over fewer changed lines.
+  for (key in changed_line) {
+    split(key, pair, SUBSEP)
+    path = pair[1]
+    if (key in delta_instrumented) {
+      file_delta_found[path]++
+      if (key in delta_hit) file_delta_hit[path]++
+    }
+  }
   for (f in changed_map) {
     if (!(f in file_pct)) {
       if (f in excluded_map) {
@@ -98,15 +100,15 @@ END {
       printf "  MISSING: %s\n", f; missing_count++; continue
     }
     changed_count++
-    use_delta = file_new[f] == 0 && file_lines[f] > delta_min_lines && changed_line_count[f] > 0 && (changed_line_count[f] * 100 / file_lines[f]) < delta_max_percent && (f in file_delta_pct)
+    use_delta = file_new[f] == 0 && file_lines[f] > delta_min_lines && changed_line_count[f] > 0 && (changed_line_count[f] * 100 / file_lines[f]) < delta_max_percent && file_delta_found[f] > 0
     if (use_delta) {
-      pct = file_delta_pct[f]
+      pct = (file_delta_hit[f] / file_delta_found[f]) * 100
       printf "  %6.2f%% %s (changed-line mode: %d instrumentable of %d changed lines, %d total lines)\n", pct, f, file_delta_found[f], changed_line_count[f], file_lines[f]
     } else {
       pct = file_pct[f]
       reason = ""
       if (file_new[f]) reason = "new file"
-      else if (file_lines[f] > delta_min_lines && changed_line_count[f] > 0 && (changed_line_count[f] * 100 / file_lines[f]) < delta_max_percent && !(f in file_delta_pct)) reason = "changed lines non-instrumentable; whole-file fallback"
+      else if (file_lines[f] > delta_min_lines && changed_line_count[f] > 0 && (changed_line_count[f] * 100 / file_lines[f]) < delta_max_percent && file_delta_found[f] == 0) reason = "changed lines non-instrumentable; whole-file fallback"
       printf "  %6.2f%% %s%s\n", pct, f, (reason == "" ? "" : " (" reason ")")
     }
     changed_sum += pct

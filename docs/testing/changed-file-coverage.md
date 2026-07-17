@@ -16,7 +16,9 @@ Only instrumentable changed lines are measured in that mode. New files and
 larger refactors always use whole-file coverage. If a small diff contains only
 non-instrumentable lines, such as types or configuration, the gate falls back
 to whole-file coverage rather than passing vacuously. Deleted lines do not have
-a runtime location in the new file and are not counted.
+a runtime location in the new file and are not counted. When several test lanes
+report the same source, the gate unions instrumentation and hits by source line;
+a partial lane cannot hide an uncovered changed line by reporting fewer lines.
 
 Files entirely absent from LCOV still fail closed. A confirmed instrumentation
 failure can be listed temporarily in
