@@ -159,8 +159,8 @@ export function findMissingRoots(testRoots, existsFn) {
 
 // --- Clean-install preflight (#16187) ---
 //
-// A frozen `bun install` with ELIZA_SKIP_ARTIFACT_SYNC=1 leaves the tree with
-// no built dist/ and no generated i18n keyword modules. The cloud suites
+// A frozen dependency install leaves the tree with no built dist/ and no
+// generated i18n keyword modules. The cloud suites
 // resolve `@elizaos/core` through its package.json `bun` export condition
 // (packages/core/dist/node/index.node.js) and import the gitignored keyword
 // modules from source, so without these artifacts every DB/service batch dies
@@ -276,7 +276,7 @@ export function ensureCloudTestRuntime({
       );
     }
     log(
-      "[test:cloud] missing runtime artifact(s) (clean install without artifact sync?):\n" +
+      "[test:cloud] missing runtime artifact(s) (clean install before package build?):\n" +
         `${missing.map((file) => `  - ${file}`).join("\n")}\n` +
         `[test:cloud] running ${step.label}\n`,
     );

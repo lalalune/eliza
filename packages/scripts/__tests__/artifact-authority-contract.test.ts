@@ -123,6 +123,15 @@ describe("artifact-authority-contract", () => {
     });
   });
 
+  test("rejects a checkout marker left by the retired overlay", () => {
+    withRepo({}, (root) => {
+      write(root, ".eliza-artifacts-version", "2026-06-18.1\n");
+      expect(() => runContract(root)).toThrow(
+        /.eliza-artifacts-version is retired/,
+      );
+    });
+  });
+
   test("rejects ignore rules that conceal archive state or prebuilt CUDA output", () => {
     withRepo(
       {

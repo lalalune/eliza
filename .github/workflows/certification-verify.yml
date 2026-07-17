@@ -136,7 +136,7 @@ jobs:
           install-native-deps: "false"
           install-protoc: "false"
           setup-python: "false"
-          run-postinstall: "false" # certify:verify needs only zod; skips the multi-GB artifact sync
+          run-postinstall: "false" # certify:verify needs only zod; skips workspace lifecycle/build steps
           skip-avatar-clone: "true"
           no-vision-deps: "true"
 

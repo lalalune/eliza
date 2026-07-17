@@ -4,7 +4,7 @@
  * Installs may patch/build workspace dependencies, but they must never overlay
  * the checkout from a global archive or revive prebuilt native/runtime outputs.
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,6 +15,7 @@ const DEFAULT_REPO_ROOT = resolve(
 );
 
 const RETIRED_FILES = [
+  ".eliza-artifacts-version",
   "packages/scripts/artifacts-manifest.json",
   "packages/scripts/sync-artifacts.mjs",
 ];
@@ -198,7 +199,8 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT) {
 
 const isMain =
   process.argv[1] !== undefined &&
-  fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+  realpathSync(fileURLToPath(import.meta.url)) ===
+    realpathSync(process.argv[1]);
 
 if (isMain) {
   try {
