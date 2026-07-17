@@ -11,7 +11,7 @@ import {
   openAppPath,
   seedAppStorage,
 } from "./helpers";
-import { VIEW_CASES, type ViewCase } from "./plugin-view-cases";
+import { DYNAMIC_VIEW_CASES, type ViewCase } from "./plugin-view-cases";
 
 async function expectLoadedView(page: Page, view: ViewCase, phase: string) {
   const viewRoot = page.locator("main").first();
@@ -76,7 +76,46 @@ async function installDynamicViewHarnessRoute(
 }
 
 test.describe("registered plugin view lifecycle coverage", () => {
-  for (const view of VIEW_CASES) {
+  test("loader matrix matches every declaration served by /api/views", async ({
+    page,
+  }) => {
+    await seedAppStorage(page);
+    await installDefaultAppRoutes(page);
+    await openAppPath(page, "/views");
+
+    const registryIds = await page.evaluate(async () => {
+      const response = await fetch("/api/views");
+      if (!response.ok) {
+        throw new Error(`View registry returned HTTP ${response.status}`);
+      }
+      const payload: unknown = await response.json();
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("views" in payload) ||
+        !Array.isArray(payload.views)
+      ) {
+        throw new Error("View registry payload must contain a views array");
+      }
+      return payload.views.map((entry: unknown) => {
+        if (
+          typeof entry !== "object" ||
+          entry === null ||
+          !("id" in entry) ||
+          typeof entry.id !== "string"
+        ) {
+          throw new Error("Every view registry entry must have a string id");
+        }
+        return entry.id;
+      });
+    });
+
+    expect([...new Set(registryIds)].sort()).toEqual(
+      DYNAMIC_VIEW_CASES.map(({ id }) => id).sort(),
+    );
+  });
+
+  for (const view of DYNAMIC_VIEW_CASES) {
     test(`${view.id} ${view.viewType} loads, unmounts, reopens, and reloads cleanly`, async ({
       page,
     }) => {
