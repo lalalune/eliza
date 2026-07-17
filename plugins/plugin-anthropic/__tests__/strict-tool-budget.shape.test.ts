@@ -1,13 +1,8 @@
 /**
- * Anthropic strict-tool grammar budget (#16499): the server hard-400s any
- * request whose STRICT tool surface exceeds 20 strict tools or 24 optional
- * parameters counted recursively across strict schemas. The enforcer
- * downgrades an over-budget surface to non-strict for that request (looser
- * tool-calling instead of a failed turn) and passes under-budget surfaces
- * through untouched — covering BOTH strict-carrying shapes (flat definitions
- * and OpenAI-style `function` wrappers).
+ * Anthropic request-shape tests for all published strict-grammar limits across
+ * tool definitions and JSON output schemas (#16499).
  */
-import type { IAgentRuntime } from "@elizaos/core";
+import type { ElizaError, IAgentRuntime } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { enforceAnthropicStrictToolBudget } from "../models/text";
 
@@ -92,6 +87,115 @@ describe("enforceAnthropicStrictToolBudget (#16499)", () => {
     expect((out.REPLY as Record<string, unknown>).strict).toBeUndefined();
   });
 
+  it("counts optional parameters hidden inside composition branches", () => {
+    const nestedProperties = Object.fromEntries(
+      Array.from({ length: 25 }, (_, i) => [`nested_${i}`, { type: "string" }])
+    );
+    const tools = {
+      composed: {
+        strict: true,
+        parameters: {
+          type: "object",
+          properties: {
+            choice: {
+              anyOf: [
+                {
+                  type: "object",
+                  properties: nestedProperties,
+                  required: [],
+                },
+                { type: "null" },
+              ],
+            },
+          },
+          required: ["choice"],
+        },
+      },
+    } as LooseToolSet;
+    const out = enforceAnthropicStrictToolBudget(
+      tools as Parameters<typeof enforceAnthropicStrictToolBudget>[0]
+    ) as LooseToolSet;
+    expect((out.composed as Record<string, unknown>).strict).toBeUndefined();
+  });
+
+  it("downgrades when more than 16 parameters use union types", () => {
+    const properties = Object.fromEntries(
+      Array.from({ length: 17 }, (_, i) => [`union_${i}`, { type: ["string", "null"] }])
+    );
+    const tools = {
+      union_heavy: {
+        strict: true,
+        parameters: {
+          type: "object",
+          properties,
+          required: Object.keys(properties),
+        },
+      },
+    } as LooseToolSet;
+    const out = enforceAnthropicStrictToolBudget(
+      tools as Parameters<typeof enforceAnthropicStrictToolBudget>[0]
+    ) as LooseToolSet;
+    expect((out.union_heavy as Record<string, unknown>).strict).toBeUndefined();
+  });
+
+  it("budgets tools and a JSON output schema as one compiled grammar", () => {
+    const tools = { tool_side: flatStrictTool(12) } as LooseToolSet;
+    const outputProperties = Object.fromEntries(
+      Array.from({ length: 13 }, (_, i) => [`output_${i}`, { type: "string" }])
+    );
+    const out = enforceAnthropicStrictToolBudget(
+      tools as Parameters<typeof enforceAnthropicStrictToolBudget>[0],
+      { type: "object", properties: outputProperties, required: [] }
+    ) as LooseToolSet;
+    expect((out.tool_side as Record<string, unknown>).strict).toBeUndefined();
+  });
+
+  it("keeps a combined tool and JSON output surface at the exact optional limit", () => {
+    const tools = { tool_side: flatStrictTool(12) } as LooseToolSet;
+    const outputProperties = Object.fromEntries(
+      Array.from({ length: 12 }, (_, i) => [`output_${i}`, { type: "string" }])
+    );
+    const out = enforceAnthropicStrictToolBudget(
+      tools as Parameters<typeof enforceAnthropicStrictToolBudget>[0],
+      { type: "object", properties: outputProperties, required: [] }
+    );
+    expect(out).toBe(tools);
+  });
+
+  it("fails locally when a JSON output schema alone exceeds the optional limit", () => {
+    const outputProperties = Object.fromEntries(
+      Array.from({ length: 25 }, (_, i) => [`output_${i}`, { type: "string" }])
+    );
+    expect(() =>
+      enforceAnthropicStrictToolBudget(undefined, {
+        type: "object",
+        properties: outputProperties,
+        required: [],
+      })
+    ).toThrowError(
+      expect.objectContaining<Partial<ElizaError>>({
+        code: "ANTHROPIC_SCHEMA_COMPLEXITY_LIMIT",
+      })
+    );
+  });
+
+  it("fails locally when a JSON output schema alone exceeds the union limit", () => {
+    const outputProperties = Object.fromEntries(
+      Array.from({ length: 17 }, (_, i) => [`output_${i}`, { type: ["string", "null"] }])
+    );
+    expect(() =>
+      enforceAnthropicStrictToolBudget(undefined, {
+        type: "object",
+        properties: outputProperties,
+        required: Object.keys(outputProperties),
+      })
+    ).toThrowError(
+      expect.objectContaining<Partial<ElizaError>>({
+        code: "ANTHROPIC_SCHEMA_COMPLEXITY_LIMIT",
+      })
+    );
+  });
+
   it("downgrades when more than 20 strict tools are present, even with tiny schemas", () => {
     const tools: LooseToolSet = {};
     for (let i = 0; i < 21; i++) tools[`tool_${i}`] = flatStrictTool(1);
@@ -140,8 +244,6 @@ describe("enforceAnthropicStrictToolBudget (#16499)", () => {
   });
 });
 
-// ── Pipeline-level: the budget is enforced at the real provider seam ─────────
-// Mirrors effort-thinking.shape's harness: mocked AI SDK, REAL handleTextLarge.
 function createRuntime(settings: Record<string, string>) {
   return {
     character: { name: "Claude Agent", system: "system prompt" },
@@ -226,11 +328,41 @@ describe("ACTION_PLANNER with the issue's surface shape (#16499)", () => {
       | { tools?: Record<string, Record<string, unknown>> }
       | undefined;
     if (!call?.tools) throw new Error("generateText received no tools");
-    // Every action arrives as a named tool, none of them strict — the surface
-    // that used to 400 now compiles without the grammar caps.
     expect(Object.keys(call.tools)).toHaveLength(21);
     expect(call.tools.ACTION_0?.strict).toBeUndefined();
     expect(call.tools.ACTION_20).toBeDefined();
+  }, 60_000);
+
+  it("preserves strict mode on an under-budget named planner definition", async () => {
+    const generateText = mockAiSdk();
+    const { handleActionPlanner } = await import("../models/text");
+    await handleActionPlanner(
+      createRuntime({
+        ANTHROPIC_API_KEY: "test-key",
+        ANTHROPIC_LARGE_MODEL: "claude-sonnet-4-5",
+      }),
+      {
+        prompt: "plan",
+        tools: [
+          {
+            name: "SAFE_ACTION",
+            description: "safe action",
+            type: "function",
+            strict: true,
+            parameters: {
+              type: "object",
+              properties: { value: { type: "string" } },
+              required: ["value"],
+            },
+          },
+        ],
+      } as never
+    );
+    const call = generateText.mock.calls[0]?.[0] as
+      | { tools?: Record<string, Record<string, unknown>> }
+      | undefined;
+    if (!call?.tools) throw new Error("generateText received no tools");
+    expect(call.tools.SAFE_ACTION?.strict).toBe(true);
   }, 60_000);
 });
 

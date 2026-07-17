@@ -26,6 +26,7 @@ import type {
 import {
   buildCanonicalSystemPrompt,
   dropDuplicateLeadingSystemMessage,
+  ElizaError,
   logger,
   ModelType,
   resolveEffectiveSystemPrompt,
@@ -353,6 +354,7 @@ function readToolSet(value: GenerateTextParams["tools"]): ToolSet | undefined {
       tools[rawTool.name] = {
         ...(typeof rawTool.description === "string" ? { description: rawTool.description } : {}),
         inputSchema: jsonSchema(schema),
+        ...(typeof rawTool.strict === "boolean" ? { strict: rawTool.strict } : {}),
       };
     } else if (!isArr && !namedKeys.has(origKey)) {
       // Pre-built AI SDK Tool entry inside a Record — pass through under its
@@ -392,34 +394,87 @@ function readToolChoice(value: GenerateTextParams["toolChoice"]): ToolChoice<Too
 }
 
 /**
- * Anthropic's server enforces two grammar-compilation caps on STRICT tools per
- * request (#16499): at most 20 strict tools, and at most 24 optional (non-
- * required) parameters counted across all strict tool schemas — recursively
- * through nested objects and array items. The default core action catalog
- * alone exceeds both (45 tools / 465 optional params; `MESSAGE` compiles to 64
- * on its own), so an over-budget strict surface hard-400s the whole turn.
+ * Anthropic compiles strict tool and JSON-output schemas into one grammar per
+ * request. The explicit service limits are 20 strict tools, 24 optional
+ * parameters, and 16 union-typed parameters across that combined grammar.
+ * Exceeding any limit rejects the request before generation (#16499).
  */
 const ANTHROPIC_MAX_STRICT_TOOLS = 20;
 const ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS = 24;
+const ANTHROPIC_MAX_STRICT_SCHEMA_UNION_PARAMS = 16;
 
-/** Optional-parameter count the way Anthropic's grammar compiler counts: every
- * property not listed in `required`, recursing into object properties and
- * array `items` (nested optionals count toward the same request-wide cap). */
-function countOptionalParams(schema: unknown): number {
-  if (!isRecord(schema)) return 0;
-  let count = 0;
+interface StrictSchemaMetrics {
+  optionalParams: number;
+  unionParams: number;
+}
+
+const EMPTY_STRICT_SCHEMA_METRICS: StrictSchemaMetrics = {
+  optionalParams: 0,
+  unionParams: 0,
+};
+
+function addStrictSchemaMetrics(
+  left: StrictSchemaMetrics,
+  right: StrictSchemaMetrics
+): StrictSchemaMetrics {
+  return {
+    optionalParams: left.optionalParams + right.optionalParams,
+    unionParams: left.unionParams + right.unionParams,
+  };
+}
+
+/**
+ * Measures every schema branch that can contribute parameters to Anthropic's
+ * compiled grammar. Composition branches matter because generated schemas
+ * commonly place nullable objects behind `anyOf` rather than directly under
+ * `properties`.
+ */
+function measureStrictSchema(schema: unknown): StrictSchemaMetrics {
+  if (Array.isArray(schema)) {
+    return schema.reduce<StrictSchemaMetrics>(
+      (total, child) => addStrictSchemaMetrics(total, measureStrictSchema(child)),
+      EMPTY_STRICT_SCHEMA_METRICS
+    );
+  }
+  if (!isRecord(schema)) return EMPTY_STRICT_SCHEMA_METRICS;
+
+  let metrics: StrictSchemaMetrics = {
+    optionalParams: 0,
+    unionParams: Array.isArray(schema.anyOf) || Array.isArray(schema.type) ? 1 : 0,
+  };
   const properties = isRecord(schema.properties) ? schema.properties : undefined;
   if (properties) {
     const required = new Set(
       Array.isArray(schema.required) ? (schema.required as unknown[]).map(String) : []
     );
     for (const [key, child] of Object.entries(properties)) {
-      if (!required.has(key)) count += 1;
-      count += countOptionalParams(child);
+      if (!required.has(key)) metrics.optionalParams += 1;
+      metrics = addStrictSchemaMetrics(metrics, measureStrictSchema(child));
     }
   }
-  if (isRecord(schema.items)) count += countOptionalParams(schema.items);
-  return count;
+
+  for (const key of [
+    "items",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+  ]) {
+    metrics = addStrictSchemaMetrics(metrics, measureStrictSchema(schema[key]));
+  }
+  for (const key of ["prefixItems", "allOf", "anyOf", "oneOf"]) {
+    metrics = addStrictSchemaMetrics(metrics, measureStrictSchema(schema[key]));
+  }
+  for (const key of ["patternProperties", "dependentSchemas", "$defs", "definitions"]) {
+    const schemaMap = isRecord(schema[key]) ? schema[key] : undefined;
+    if (schemaMap) {
+      metrics = addStrictSchemaMetrics(metrics, measureStrictSchema(Object.values(schemaMap)));
+    }
+  }
+  return metrics;
 }
 
 /** Both tool shapes that can carry a strict flag through this seam: a flat
@@ -449,26 +504,60 @@ function stripToolStrict(entry: unknown): unknown {
   return out;
 }
 
+function readResponseSchema(responseSchema: unknown): unknown {
+  if (!isRecord(responseSchema)) return responseSchema;
+  if ("schema" in responseSchema) return responseSchema.schema;
+  if ("responseFormat" in responseSchema && "parseCompleteOutput" in responseSchema) {
+    return undefined;
+  }
+  return responseSchema;
+}
+
 /**
- * Downgrade an over-budget strict tool surface to non-strict for THIS request
- * (the count-based Anthropic analog of #11156's OpenAI keyword sanitizer):
- * looser tool-calling beats a hard 400 that fails the whole turn. Under-budget
- * surfaces pass through untouched, so providers/models that fit keep strict
- * grammar guarantees.
+ * Downgrades an over-budget strict tool surface for one request. This is the
+ * count-based Anthropic analog of #11156's OpenAI keyword sanitizer: looser
+ * tool calling is preferable to rejecting the whole turn, while under-budget
+ * surfaces retain their strict grammar guarantees.
  */
-export function enforceAnthropicStrictToolBudget(tools: ToolSet | undefined): ToolSet | undefined {
+export function enforceAnthropicStrictToolBudget(
+  tools: ToolSet | undefined,
+  responseSchema?: unknown
+): ToolSet | undefined {
+  const outputSchema = readResponseSchema(responseSchema);
+  const outputSchemaIsOpaque = responseSchema !== undefined && outputSchema === undefined;
+  const outputMetrics = measureStrictSchema(outputSchema);
+  if (
+    outputMetrics.optionalParams > ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS ||
+    outputMetrics.unionParams > ANTHROPIC_MAX_STRICT_SCHEMA_UNION_PARAMS
+  ) {
+    throw new ElizaError("Anthropic JSON output schema exceeds the explicit grammar limits", {
+      code: "ANTHROPIC_SCHEMA_COMPLEXITY_LIMIT",
+      severity: "fatal",
+      context: {
+        optionalParams: outputMetrics.optionalParams,
+        maxOptionalParams: ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS,
+        unionParams: outputMetrics.unionParams,
+        maxUnionParams: ANTHROPIC_MAX_STRICT_SCHEMA_UNION_PARAMS,
+      },
+    });
+  }
+
   if (!tools) return tools;
   const entries = Object.entries(tools as Record<string, unknown>);
   const strictEntries = entries.filter(([, entry]) => readToolStrictAndSchema(entry).strict);
   if (strictEntries.length === 0) return tools;
 
-  const optionalParams = strictEntries.reduce(
-    (total, [, entry]) => total + countOptionalParams(readToolStrictAndSchema(entry).schema),
-    0
+  const toolMetrics = strictEntries.reduce<StrictSchemaMetrics>(
+    (total, [, entry]) =>
+      addStrictSchemaMetrics(total, measureStrictSchema(readToolStrictAndSchema(entry).schema)),
+    EMPTY_STRICT_SCHEMA_METRICS
   );
+  const combinedMetrics = addStrictSchemaMetrics(toolMetrics, outputMetrics);
   if (
+    !outputSchemaIsOpaque &&
     strictEntries.length <= ANTHROPIC_MAX_STRICT_TOOLS &&
-    optionalParams <= ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS
+    combinedMetrics.optionalParams <= ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS &&
+    combinedMetrics.unionParams <= ANTHROPIC_MAX_STRICT_SCHEMA_UNION_PARAMS
   ) {
     return tools;
   }
@@ -478,8 +567,11 @@ export function enforceAnthropicStrictToolBudget(tools: ToolSet | undefined): To
       src: "plugin:anthropic",
       strictTools: strictEntries.length,
       maxStrictTools: ANTHROPIC_MAX_STRICT_TOOLS,
-      optionalParams,
+      optionalParams: combinedMetrics.optionalParams,
       maxOptionalParams: ANTHROPIC_MAX_STRICT_TOOL_OPTIONAL_PARAMS,
+      unionParams: combinedMetrics.unionParams,
+      maxUnionParams: ANTHROPIC_MAX_STRICT_SCHEMA_UNION_PARAMS,
+      outputSchemaIsOpaque,
     },
     "Strict tool surface exceeds Anthropic's grammar caps; sending tools non-strict for this request (#16499)"
   );
@@ -493,7 +585,7 @@ function toAnthropicTextParams(params: GenerateTextParams): GenerateTextParamsWi
   const normalized: GenerateTextParamsWithProviderOptions = {
     ...rest,
     messages: readModelMessages(messages),
-    tools: enforceAnthropicStrictToolBudget(readToolSet(tools)),
+    tools: enforceAnthropicStrictToolBudget(readToolSet(tools), rest.responseSchema),
     toolChoice: readToolChoice(toolChoice),
     providerOptions: readProviderOptions(providerOptions),
   };
