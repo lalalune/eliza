@@ -27,6 +27,7 @@ import {
   deleteAccount,
   listAccounts,
   loadAccount,
+  runWithAccountAuthGeneration,
   saveAccount,
 } from "./account-storage.ts";
 import { refreshAnthropicToken } from "./anthropic.ts";
@@ -53,6 +54,11 @@ const DEFAULT_ACCOUNT_ID = "default";
 /** Buffer before expiry to trigger refresh (5 minutes) */
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const invalidClaudeCodeRefreshTokens = new Set<string>();
+
+/** Clears refresh-token suppression retained by the current process. */
+export function resetCredentialRefreshStateForAgentReset(): void {
+  invalidClaudeCodeRefreshTokens.clear();
+}
 
 /** Stable failure categories for callers that manage account-pool health. */
 export type AccessTokenFailureKind =
@@ -264,6 +270,16 @@ export function getAccessToken(
 export async function getAccessToken(
   provider: AccountCredentialProvider,
   accountId: string = DEFAULT_ACCOUNT_ID,
+  opts?: GetAccessTokenOptions | GetAccessTokenOutcomeOptions,
+): Promise<string | null | AccessTokenOutcome> {
+  return runWithAccountAuthGeneration(() =>
+    getAccessTokenWithinGeneration(provider, accountId, opts),
+  );
+}
+
+async function getAccessTokenWithinGeneration(
+  provider: AccountCredentialProvider,
+  accountId: string,
   opts?: GetAccessTokenOptions | GetAccessTokenOutcomeOptions,
 ): Promise<string | null | AccessTokenOutcome> {
   const returnOutcome =

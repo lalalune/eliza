@@ -7,8 +7,16 @@
  */
 
 import { promises as fs } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+} from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { AuditLog } from "./audit.js";
 import { decrypt, encrypt } from "./crypto.js";
@@ -84,6 +92,148 @@ export interface PgliteVaultOptions {
   readonly logger?: VaultLogger;
 }
 
+function isPathWithin(root: string, target: string): boolean {
+  const fromRoot = relative(root, target);
+  return (
+    fromRoot === "" ||
+    (fromRoot !== ".." &&
+      !fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) &&
+      !isAbsolute(fromRoot))
+  );
+}
+
+async function nearestExistingPath(target: string): Promise<string> {
+  let candidate = target;
+  while (true) {
+    try {
+      await fs.lstat(candidate);
+      return candidate;
+    } catch (error) {
+      // error-policy:J3 Only ENOENT identifies an absent path component;
+      // every other filesystem failure makes vault cleanup unprovable.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) return candidate;
+    candidate = parent;
+  }
+}
+
+async function validateVaultPathComponents(
+  target: string,
+  label: string,
+): Promise<string> {
+  const resolved = resolve(target);
+  const anchors = [tmpdir()]
+    .map((candidate) => resolve(candidate))
+    .filter((candidate) => isPathWithin(candidate, resolved))
+    .sort((left, right) => right.length - left.length);
+  const lexicalAnchor = anchors[0] ?? parse(resolved).root;
+  const canonicalAnchor = await fs.realpath(lexicalAnchor);
+  let current = lexicalAnchor;
+  for (const component of relative(lexicalAnchor, resolved)
+    .split(process.platform === "win32" ? "\\" : "/")
+    .filter(Boolean)) {
+    current = join(current, component);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) {
+        throw new Error(`refusing symlinked ${label}: ${current}`);
+      }
+    } catch (error) {
+      // error-policy:J3 Missing future components are safe to validate
+      // lexically; any other lstat failure aborts vault deletion.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw error;
+    }
+  }
+
+  const existing = await nearestExistingPath(resolved);
+  if (isPathWithin(lexicalAnchor, existing)) {
+    const expected = resolve(
+      canonicalAnchor,
+      relative(lexicalAnchor, existing),
+    );
+    if ((await fs.realpath(existing)) !== expected) {
+      throw new Error(`refusing redirected ${label}: ${resolved}`);
+    }
+  }
+  return resolved;
+}
+
+async function validateVaultOwnedTarget(
+  stateRoot: string,
+  target: string,
+): Promise<string> {
+  const resolvedRoot = await validateVaultPathComponents(
+    stateRoot,
+    "vault state root",
+  );
+  const resolvedTarget = await validateVaultPathComponents(
+    target,
+    "vault reset path",
+  );
+  if (
+    resolvedTarget === resolvedRoot ||
+    !isPathWithin(resolvedRoot, resolvedTarget)
+  ) {
+    throw new Error(
+      `refusing vault reset path outside state root: ${resolvedTarget}`,
+    );
+  }
+  try {
+    const canonicalRoot = await fs.realpath(resolvedRoot);
+    const existingTarget = await nearestExistingPath(resolvedTarget);
+    if (
+      isPathWithin(resolvedRoot, existingTarget) &&
+      !isPathWithin(canonicalRoot, await fs.realpath(existingTarget))
+    ) {
+      throw new Error(
+        `refusing redirected vault reset path: ${resolvedTarget}`,
+      );
+    }
+  } catch (error) {
+    // error-policy:J3 A not-yet-created state root has no canonical target to
+    // compare; every other realpath failure aborts reset.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return resolvedTarget;
+}
+
+async function resolveVaultResetPaths(
+  stateRoot: string,
+  dataDir: string,
+  auditPath: string,
+  legacyStorePath?: string,
+): Promise<readonly string[]> {
+  await validateVaultPathComponents(stateRoot, "vault state root");
+  const targets = new Set<string>([dataDir, auditPath, `${auditPath}.1`]);
+  if (legacyStorePath) {
+    targets.add(legacyStorePath);
+    const legacyDir = dirname(legacyStorePath);
+    if (resolve(legacyDir) === resolve(stateRoot)) {
+      await validateVaultPathComponents(legacyDir, "vault legacy store root");
+    } else {
+      await validateVaultOwnedTarget(stateRoot, legacyDir);
+    }
+    const legacyTempPrefix = `${basename(legacyStorePath)}.tmp.`;
+    try {
+      for (const name of await fs.readdir(legacyDir)) {
+        if (name.startsWith(legacyTempPrefix)) {
+          targets.add(join(legacyDir, name));
+        }
+      }
+    } catch (error) {
+      // error-policy:J3 A missing legacy directory is explicitly absent;
+      // unreadable directories cannot be treated as successfully scrubbed.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  for (const target of targets) {
+    await validateVaultOwnedTarget(stateRoot, target);
+  }
+  return [...targets];
+}
+
 /**
  * Outcome of inspecting a PGlite data dir's `postmaster.pid`. `cleared-*`
  * means the lock is provably stale and the open may be retried;
@@ -157,6 +307,7 @@ export async function reconcileStalePglitePid(
 export class PgliteVaultImpl implements Vault {
   private cachedKey: Buffer | null = null;
   private dbPromise: Promise<PGlite> | null = null;
+  private destroyed = false;
   private readonly audit: AuditLog;
 
   constructor(private readonly opts: PgliteVaultOptions) {
@@ -368,6 +519,70 @@ export class PgliteVaultImpl implements Vault {
     await db.close();
   }
 
+  /** Closes the database and removes every owned vault persistence artifact. */
+  async destroy(): Promise<void> {
+    const dataDir = resolve(this.opts.dataDir ?? defaultPgliteVaultDataDir());
+    const stateRoot = dirname(dataDir);
+    if (
+      basename(dataDir) !== ".vault-pglite" ||
+      stateRoot === parse(stateRoot).root
+    ) {
+      throw new Error(`refusing unsafe vault reset path: ${dataDir}`);
+    }
+    const auditPath = resolve(this.opts.auditPath);
+    const legacyStorePath = this.opts.legacyStorePath
+      ? resolve(this.opts.legacyStorePath)
+      : undefined;
+    const paths = await resolveVaultResetPaths(
+      stateRoot,
+      dataDir,
+      auditPath,
+      legacyStorePath,
+    );
+
+    this.destroyed = true;
+    let closeError: unknown;
+    try {
+      await this.close();
+    } catch (error) {
+      // error-policy:J6 Database close is teardown; deletion may continue only
+      // when the single-writer lock proves no live process still owns it.
+      closeError = error;
+      await validateVaultOwnedTarget(stateRoot, dataDir);
+      const pidStatus = await reconcileStalePglitePid(dataDir);
+      if (pidStatus === "active" || pidStatus === "unconfirmed") {
+        throw new Error(
+          `vault persistence is still owned by a live or unconfirmed process: ${dataDir}`,
+          { cause: error },
+        );
+      }
+    }
+    for (const target of paths) {
+      await validateVaultOwnedTarget(stateRoot, target);
+      await fs.rm(target, { force: true, recursive: target === dataDir });
+    }
+    for (const target of paths) {
+      try {
+        await fs.access(target);
+      } catch (error) {
+        // error-policy:J3 ENOENT is the required post-delete state; every
+        // other access failure keeps reset from reporting success.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new Error(
+        `vault persistence survived destructive reset: ${target}`,
+      );
+    }
+    if (closeError) {
+      this.opts.logger?.warn(
+        `[vault] removed persistence after the database failed to close: ${
+          closeError instanceof Error ? closeError.message : String(closeError)
+        }`,
+      );
+    }
+  }
+
   // ── internals ────────────────────────────────────────────────────────
 
   private async readValue(key: string): Promise<string> {
@@ -441,6 +656,9 @@ export class PgliteVaultImpl implements Vault {
   }
 
   private async db(): Promise<PGlite> {
+    if (this.destroyed) {
+      throw new Error("vault is closed for destructive reset");
+    }
     if (!this.dbPromise) {
       // Never cache a rejected open: a transient failure (e.g. a stale lock a
       // later attempt can clear) must not brick the vault for the rest of the

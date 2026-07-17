@@ -53,6 +53,12 @@ type SignalNativeModule = {
   getProfile: (authDir: string) => Promise<{ uuid: string; phoneNumber?: string | null }>;
 };
 
+interface SignalCliExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+}
+
 /** Validate accountId to prevent path traversal. */
 export function sanitizeAccountId(raw: string): string {
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "");
@@ -347,12 +353,31 @@ export class SignalPairingSession {
   private phoneNumber: string | null = null;
   private lastError: string | null = null;
   private activeChild: ChildProcess | null = null;
+  private activeStart: Promise<void> | null = null;
+  private acceptingStarts = true;
 
   constructor(options: SignalPairingOptions) {
     this.options = options;
   }
 
   async start(): Promise<void> {
+    if (!this.acceptingStarts) {
+      throw new Error("Signal pairing session has been stopped");
+    }
+    if (this.activeStart) {
+      await this.activeStart;
+      return;
+    }
+    const run = this.startInternal();
+    this.activeStart = run;
+    try {
+      await run;
+    } finally {
+      if (this.activeStart === run) this.activeStart = null;
+    }
+  }
+
+  private async startInternal(): Promise<void> {
     this.aborted = false;
     this.qrDataUrl = null;
     this.phoneNumber = null;
@@ -364,6 +389,7 @@ export class SignalPairingSession {
       const importedQrCode = await import("qrcode");
       qrCode = importedQrCode.default as QrCodeModule;
     } catch (err) {
+      if (this.aborted) return;
       const message = `Failed to load QR dependency: ${String(err)}`;
       this.lastError = message;
       this.setStatus("error");
@@ -376,10 +402,12 @@ export class SignalPairingSession {
       return;
     }
 
+    if (this.aborted) return;
     fs.mkdirSync(this.options.authDir, { recursive: true });
 
     try {
       const native = await this.loadSignalNativeModule();
+      if (this.aborted) return;
       if (native) {
         await this.startWithSignalNative(native, qrCode);
         return;
@@ -405,10 +433,28 @@ export class SignalPairingSession {
     }
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    const errors: unknown[] = [];
+    this.acceptingStarts = false;
     this.aborted = true;
-    this.activeChild?.kill("SIGTERM");
+    try {
+      this.activeChild?.kill("SIGTERM");
+    } catch (error) {
+      // error-policy:J6 Reset must still drain the pairing task when process termination reports an error.
+      errors.push(error);
+    }
     this.activeChild = null;
+    if (this.activeStart) {
+      try {
+        await this.activeStart;
+      } catch (error) {
+        // error-policy:J6 Surface every teardown failure after all pairing work has quiesced.
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Failed to stop Signal pairing cleanly");
+    }
   }
 
   getStatus(): SignalPairingStatus {
@@ -463,6 +509,7 @@ export class SignalPairingSession {
       margin: 2,
       color: { dark: "#000000", light: "#ffffff" },
     });
+    if (this.aborted) return;
 
     this.qrDataUrl = qrDataUrl;
     this.lastError = null;
@@ -488,6 +535,7 @@ export class SignalPairingSession {
       logger.warn(`${LOG_PREFIX} Failed to read Signal profile after linking: ${String(error)}`);
     }
 
+    if (this.aborted) return;
     this.finishConnected(phoneNumber || null, uuid || undefined);
   }
 
@@ -515,6 +563,18 @@ export class SignalPairingSession {
 
     const stderrLines: string[] = [];
     let provisioningUrl: string | null = null;
+    let childExited = false;
+    const childExit = new Promise<SignalCliExit>((resolve) => {
+      let settled = false;
+      const settle = (result: SignalCliExit): void => {
+        if (settled) return;
+        settled = true;
+        childExited = true;
+        resolve(result);
+      };
+      child.once("error", (error) => settle({ code: null, signal: null, error }));
+      child.once("exit", (code, signal) => settle({ code, signal }));
+    });
     const waitForProvisioningUrl = new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(
@@ -546,70 +606,88 @@ export class SignalPairingSession {
       stdoutReader.on("line", (line) => onLine(line, "stdout"));
       stderrReader.on("line", (line) => onLine(line, "stderr"));
 
-      child.once("error", (error) => {
+      void childExit.then((result) => {
+        if (provisioningUrl) return;
         clearTimeout(timer);
-        reject(error);
-      });
-
-      child.once("exit", (code, signal) => {
-        if (provisioningUrl) {
-          return;
-        }
-        clearTimeout(timer);
-        const detail =
-          stderrLines.join("\n") ||
-          (signal
-            ? `signal-cli link terminated by ${signal}`
-            : `signal-cli link exited with code ${String(code)}`);
-        reject(new Error(detail));
-      });
-    });
-
-    const linkUrl = await waitForProvisioningUrl;
-    if (this.aborted) {
-      return;
-    }
-
-    const qrDataUrl = await qrCode.toDataURL(linkUrl, {
-      width: 256,
-      margin: 2,
-      color: { dark: "#000000", light: "#ffffff" },
-    });
-    this.qrDataUrl = qrDataUrl;
-    this.lastError = null;
-    this.setStatus("waiting_for_qr");
-    this.options.onEvent({
-      type: "signal-qr",
-      accountId: this.options.accountId,
-      qrDataUrl,
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (code, signal) => {
-        if (this.aborted) {
-          resolve();
-          return;
-        }
-        if (code === 0) {
-          resolve();
+        if (result.error) {
+          reject(result.error);
           return;
         }
         const detail =
           stderrLines.join("\n") ||
-          (signal
-            ? `signal-cli link terminated by ${signal}`
-            : `signal-cli link exited with code ${String(code)}`);
+          (result.signal
+            ? `signal-cli link terminated by ${result.signal}`
+            : `signal-cli link exited with code ${String(result.code)}`);
         reject(new Error(detail));
       });
     });
 
-    if (this.aborted) {
-      return;
-    }
+    try {
+      const linkUrl = await waitForProvisioningUrl;
+      if (this.aborted) {
+        await childExit;
+        return;
+      }
 
-    const phoneNumber = await this.readLinkedSignalAccount(cliPath);
-    this.finishConnected(phoneNumber, undefined);
+      const qrDataUrl = await qrCode.toDataURL(linkUrl, {
+        width: 256,
+        margin: 2,
+        color: { dark: "#000000", light: "#ffffff" },
+      });
+      if (this.aborted) {
+        await childExit;
+        return;
+      }
+      this.qrDataUrl = qrDataUrl;
+      this.lastError = null;
+      this.setStatus("waiting_for_qr");
+      this.options.onEvent({
+        type: "signal-qr",
+        accountId: this.options.accountId,
+        qrDataUrl,
+      });
+
+      const result = await childExit;
+      if (this.aborted) {
+        return;
+      }
+      if (result.error) {
+        throw result.error;
+      }
+      if (result.code !== 0) {
+        const detail =
+          stderrLines.join("\n") ||
+          (result.signal
+            ? `signal-cli link terminated by ${result.signal}`
+            : `signal-cli link exited with code ${String(result.code)}`);
+        throw new Error(detail);
+      }
+
+      const phoneNumber = await this.readLinkedSignalAccount(cliPath);
+      if (this.aborted) return;
+      this.finishConnected(phoneNumber, undefined);
+    } catch (error) {
+      // error-policy:J6 A failed link cannot release its auth directory until signal-cli has exited.
+      const terminationErrors: unknown[] = [error];
+      if (!childExited) {
+        try {
+          child.kill("SIGTERM");
+        } catch (killError) {
+          // error-policy:J2 Preserve process-termination context alongside the original pairing failure.
+          terminationErrors.push(killError);
+        }
+        await childExit;
+      }
+      if (terminationErrors.length > 1) {
+        throw new AggregateError(
+          terminationErrors,
+          "Signal pairing failed while stopping signal-cli"
+        );
+      }
+      throw error;
+    } finally {
+      if (this.activeChild === child) this.activeChild = null;
+    }
   }
 
   private finishConnected(phoneNumber: string | null, uuid?: string): void {

@@ -8,6 +8,7 @@
 import type { IAgentRuntime, Plugin } from "@elizaos/core";
 import { getConnectorAccountManager, logger } from "@elizaos/core";
 import {
+  enableTelegramAccountAuthSessionHydration,
   stopTelegramAccountAuthSession,
   telegramAccountRoutes,
 } from "./account-setup-routes";
@@ -56,6 +57,7 @@ const telegramPlugin: Plugin = {
     _config: Record<string, string>,
     runtime: IAgentRuntime,
   ): Promise<void> => {
+    enableTelegramAccountAuthSessionHydration();
     // Register with the ConnectorAccountManager so the generic HTTP CRUD
     // surface can list, create, patch, and delete Telegram accounts. Telegram
     // has no OAuth flow; only CRUD adapters are wired.
@@ -80,6 +82,7 @@ const telegramPlugin: Plugin = {
     registerTelegramTriageAdapter();
   },
   async dispose(runtime: IAgentRuntime) {
+    await stopTelegramAccountAuthSession();
     await TelegramService.stop(runtime);
   },
 };

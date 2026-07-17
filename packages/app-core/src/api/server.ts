@@ -19,8 +19,13 @@ import {
   AGENT_EVENT_ALLOWED_STREAMS,
   CONFIG_WRITE_ALLOWED_TOP_KEYS,
   type ConversationMeta,
+  cancelAllOAuthFlowsForReset,
   clearPersistedFirstRunConfig,
   cloneWithoutBlockedObjectKeys,
+  deleteAgentStateForReset,
+  deleteAllStoredAccountAuthState,
+  deleteConfigEnvForReset,
+  deleteExternalAgentStateForReset,
   discoverInstalledPlugins,
   discoverPluginsFromManifest,
   type ElizaConfig,
@@ -35,21 +40,43 @@ import {
   loadElizaConfig,
   normalizeWsClientId,
   persistConversationRoomTitle,
+  resetCredentialRefreshStateForAgentReset,
+  resetRuntimeOperationStateForAgentReset,
+  resetSubscriptionOAuthStateForAgentReset,
   resolveDefaultAgentWorkspaceDir,
   resolveMcpServersRejection,
   resolvePluginConfigMutationRejections,
   resolveUserPath,
   routeAutonomyTextToUser,
+  runWithAccountAuthGeneration,
   saveElizaConfig,
+  saveElizaConfigForReset,
   streamResponseBodyWithByteLimit,
   startApiServer as upstreamStartApiServer,
+  validateAccountAuthResetPaths,
+  validateAgentStateResetPath,
+  validateConfigEnvResetPaths,
+  validateExternalAgentStateResetPaths,
   validateMcpServerConfig,
+  validateOwnedResetTarget,
+  validateResetPathComponents,
+  writeAgentStateOwnershipMarker,
 } from "@elizaos/agent";
 // Override the wallet export rejection function with the hardened version
 // that adds rate limiting, audit logging, and a forced confirmation delay.
-import { type AgentRuntime, logger, resolveStateDir } from "@elizaos/core";
+import {
+  type AgentRuntime,
+  ElizaError,
+  logger,
+  resetConnectorAccountStateForDestructiveReset,
+  resolveStateDir,
+} from "@elizaos/core";
 import { resolveLinkedAccountsInConfig } from "@elizaos/shared/contracts/first-run-options";
 import { handleAccountPoolStatusRoute } from "./account-pool-status-routes";
+import {
+  serializeCsrfExpiryCookie,
+  serializeSessionExpiryCookie,
+} from "./auth/sessions.ts";
 import {
   ensureCompatSensitiveRouteAuthorized,
   ensureRouteAuthorized,
@@ -177,6 +204,7 @@ import { handleSecretsInventoryRoute } from "./secrets-inventory-routes";
 import { handleSecretsManagerRoute } from "./secrets-manager-routes";
 import { handleSensitiveRequestRoutes } from "./sensitive-request-routes";
 import { getCorsAllowedPorts, isAllowedOrigin } from "./server-cors";
+import { resetVolatileCredentialStateForAgentReset } from "./volatile-credential-reset";
 
 const _require = createRequire(import.meta.url);
 
@@ -210,9 +238,26 @@ import {
   getCloudSecret,
 } from "@elizaos/shared/elizacloud/cloud-secrets";
 import { getStartupEmbeddingAugmentation } from "../runtime/startup-overlay.js";
+import {
+  isCredentialMutationContinuation,
+  withCredentialStateMutation,
+  withCredentialStateReset,
+} from "../security/credential-state-lock";
 import { hydrateWalletKeysFromNodePlatformSecureStore } from "../security/hydrate-wallet-keys-from-platform-store";
 import { isNodePlatformSecureStoreDefaultAvailable } from "../security/platform-secure-store-node";
-import { deleteWalletSecretsFromOsStore } from "../security/wallet-os-store-actions";
+import { deleteAgentSecretsFromSecureStores } from "../security/wallet-os-store-actions";
+import { closeAccountPoolForCredentialReset } from "../services/account-pool";
+import { closeAccountPoolBrokerForCredentialReset } from "./account-pool-broker-routes";
+
+let deleteAgentSecretsForReset = deleteAgentSecretsFromSecureStores;
+
+/** Test seam for the destructive store boundary; production always uses the real cleanup. */
+export function _setDeleteAgentSecretsForResetForTests(
+  implementation: (() => Promise<void>) | null,
+): void {
+  deleteAgentSecretsForReset =
+    implementation ?? deleteAgentSecretsFromSecureStores;
+}
 
 // ---------------------------------------------------------------------------
 // Import from extracted modules for use within this file
@@ -330,76 +375,166 @@ function resolveCompatPgliteDataDir(config: ElizaConfig): string {
   return path.join(resolveUserPath(workspaceDir), ".elizadb");
 }
 
-/**
- * Reset hop for `POST /api/agent/reset`. Deliberately operates entirely
- * in-process: stops the runtime then removes the PGlite data dir.
- *
- * Must NOT issue loopback HTTP requests back to this same server — the
- * single Node listener can't service the outer request and a re-entrant
- * call simultaneously and the request hangs (issue #7409).
- *
- * Exported via `_clearCompatPgliteDataDirForTests` for the regression
- * test that asserts no `fetch()` is invoked during reset.
- */
-async function clearCompatPgliteDataDir(
+async function stopCompatRuntimeForReset(
   runtime: AgentRuntime | null,
-  config: ElizaConfig,
 ): Promise<void> {
-  if (typeof runtime?.stop === "function") {
-    // `runtime.stop()` releases plugins/services to drop the PGlite write lock
-    // before we delete the data dir. On mobile CPU with many plugins loaded it
-    // can take a while, and a hung plugin shutdown must not wedge reset forever.
-    // POSIX `rm` succeeds with open file handles, so if stop overruns we log and
-    // proceed to delete anyway; the lingering runtime is torn down by the
-    // first-run restart that follows on the client.
-    let stopTimedOut = false;
+  if (runtime) {
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     try {
       await Promise.race([
-        Promise.resolve(runtime.stop({ fast: true })),
-        new Promise<void>((resolve) => {
+        Promise.resolve(runtime.teardownForReset()),
+        new Promise<never>((_resolve, reject) => {
           timeoutHandle = setTimeout(() => {
-            stopTimedOut = true;
-            resolve();
+            reject(
+              new ElizaError("runtime stop timed out during agent reset", {
+                code: "AGENT_RESET_RUNTIME_STOP_TIMEOUT",
+                context: { timeoutMs: RUNTIME_STOP_RESET_TIMEOUT_MS },
+                severity: "fatal",
+              }),
+            );
           }, RUNTIME_STOP_RESET_TIMEOUT_MS);
         }),
       ]);
-    } catch (err) {
-      logger.warn(
-        `[eliza][reset] runtime.stop() failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    } catch (error) {
+      // error-policy:J2 Preserve typed timeouts and add reset context to runtime failures.
+      if (
+        error instanceof ElizaError &&
+        error.code === "AGENT_RESET_RUNTIME_STOP_TIMEOUT"
+      ) {
+        throw error;
+      }
+      throw new ElizaError("runtime could not stop for agent reset", {
+        code: "AGENT_RESET_RUNTIME_STOP_FAILED",
+        cause: error,
+        severity: "fatal",
+      });
     } finally {
       if (timeoutHandle) {
         clearTimeout(timeoutHandle);
       }
     }
-    if (stopTimedOut) {
-      logger.warn(
-        `[eliza][reset] runtime.stop() exceeded ${RUNTIME_STOP_RESET_TIMEOUT_MS}ms; deleting PGlite data dir anyway`,
-      );
-    }
+  }
+}
+
+function validateCompatPgliteDataDir(
+  config: ElizaConfig,
+  stateDir: string,
+): string {
+  if (
+    config.database?.provider === "postgres" ||
+    process.env.POSTGRES_URL?.trim() ||
+    process.env.DATABASE_URL?.trim()
+  ) {
+    throw new ElizaError(
+      "agent reset cannot erase an external Postgres database; remove its agent data explicitly before resetting",
+      {
+        code: "AGENT_RESET_EXTERNAL_DATABASE_UNSUPPORTED",
+        severity: "fatal",
+      },
+    );
   }
 
   const dataDir = resolveCompatPgliteDataDir(config);
   if (path.basename(dataDir) !== ".elizadb") {
-    logger.warn(
-      `[eliza][reset] Refusing to delete unexpected PGlite dir: ${dataDir}`,
-    );
-    return;
+    throw new ElizaError("refusing unsafe PGlite reset path", {
+      code: "AGENT_RESET_DATABASE_PATH_UNSAFE",
+      context: { dataDir },
+      severity: "fatal",
+    });
+  }
+
+  const resolvedStateDir = path.resolve(stateDir);
+  const resolvedDataDir = path.resolve(dataDir);
+  const configuredWorkspace = path.resolve(
+    resolveUserPath(
+      config.agents?.defaults?.workspace ?? resolveDefaultAgentWorkspaceDir(),
+    ),
+  );
+  const expectedWorkspaceDataDir = path.join(configuredWorkspace, ".elizadb");
+  const configuredPgliteDataDir = config.database?.pglite?.dataDir?.trim();
+  const expectedConfiguredDataDir = configuredPgliteDataDir
+    ? path.resolve(resolveUserPath(configuredPgliteDataDir))
+    : null;
+  if (
+    resolvedDataDir !== expectedConfiguredDataDir &&
+    resolvedDataDir !== expectedWorkspaceDataDir &&
+    resolvedDataDir !== path.join(resolvedStateDir, ".elizadb") &&
+    !resolvedDataDir.startsWith(`${resolvedStateDir}${path.sep}`)
+  ) {
+    throw new ElizaError("refusing unowned PGlite reset path", {
+      code: "AGENT_RESET_DATABASE_PATH_UNSAFE",
+      context: { dataDir: resolvedDataDir },
+      severity: "fatal",
+    });
+  }
+
+  const ownedRoot = resolvedDataDir.startsWith(`${resolvedStateDir}${path.sep}`)
+    ? resolvedStateDir
+    : resolvedDataDir === expectedWorkspaceDataDir
+      ? configuredWorkspace
+      : path.dirname(resolvedDataDir);
+  try {
+    validateResetPathComponents(resolvedStateDir, "agent state root");
+    validateOwnedResetTarget(ownedRoot, resolvedDataDir, "PGlite data");
+  } catch (error) {
+    // error-policy:J2 Preserve the path probe as the cause while exposing the
+    // reset route's stable typed failure to every host.
+    throw new ElizaError("refusing symlinked PGlite reset path", {
+      code: "AGENT_RESET_DATABASE_PATH_UNSAFE",
+      cause: error,
+      context: { dataDir: resolvedDataDir },
+      severity: "fatal",
+    });
+  }
+
+  return resolvedDataDir;
+}
+
+function deleteCompatPgliteDataDir(dataDir: string): void {
+  try {
+    validateOwnedResetTarget(path.dirname(dataDir), dataDir, "PGlite data");
+  } catch (error) {
+    // error-policy:J2 A last-moment path change retains its filesystem cause
+    // while surfacing the same typed reset failure as preflight.
+    throw new ElizaError("refusing symlinked PGlite reset path", {
+      code: "AGENT_RESET_DATABASE_PATH_UNSAFE",
+      cause: error,
+      context: { dataDir },
+      severity: "fatal",
+    });
   }
 
   try {
+    fs.rmSync(dataDir, { recursive: true, force: true });
     if (fs.existsSync(dataDir)) {
-      fs.rmSync(dataDir, { recursive: true, force: true });
-      logger.info(
-        `[eliza][reset] Deleted PGlite data dir (GGUF models preserved): ${dataDir}`,
-      );
+      throw new Error("data directory still exists after removal");
     }
-  } catch (err) {
-    logger.warn(
-      `[eliza][reset] Failed to delete PGlite data dir: ${err instanceof Error ? err.message : String(err)}`,
+    logger.info(
+      `[eliza][reset] Deleted PGlite data dir (GGUF models preserved): ${dataDir}`,
     );
+  } catch (error) {
+    // error-policy:J2 Database cleanup is part of reset's success contract.
+    throw new ElizaError("PGlite data directory could not be removed", {
+      code: "AGENT_RESET_DATABASE_DELETE_FAILED",
+      cause: error,
+      context: { dataDir },
+      severity: "fatal",
+    });
   }
+}
+
+/**
+ * Stops the runtime and removes the PGlite state in-process so reset never
+ * deadlocks by issuing a loopback request to its own Node listener (#7409).
+ */
+async function clearCompatPgliteDataDir(
+  runtime: AgentRuntime | null,
+  config: ElizaConfig,
+): Promise<void> {
+  const stateDir = resolveStateDir();
+  const dataDir = validateCompatPgliteDataDir(config, stateDir);
+  await stopCompatRuntimeForReset(runtime);
+  deleteCompatPgliteDataDir(dataDir);
 }
 
 export const _clearCompatPgliteDataDirForTests = clearCompatPgliteDataDir;
@@ -924,28 +1059,67 @@ const COMPAT_ROUTE_CHAIN: readonly CompatRouteChainEntry[] = [
       }
 
       try {
-        logger.info(
-          "[eliza][reset] POST /api/agent/reset: loading config, will clear first-run state, persisted provider config, and cloud keys (GGUF / MODELS_DIR untouched)",
-        );
-        const config = loadElizaConfig();
-        logger.info(
-          "[eliza][reset] Skipping loopback API cleanup; runtime stop plus PGlite data-dir removal clears conversations, knowledge, and trajectories without re-entering the HTTP server.",
-        );
-        await clearCompatPgliteDataDir(state.current, config);
-        state.current = null;
-        clearPersistedFirstRunConfig(config);
-        saveElizaConfig(config);
-        clearCloudSecrets();
-        try {
-          await deleteWalletSecretsFromOsStore();
-        } catch (osErr) {
-          logger.warn(
-            `[eliza][reset] OS wallet store cleanup: ${osErr instanceof Error ? osErr.message : String(osErr)}`,
+        await withCredentialStateReset(async () => {
+          logger.info(
+            "[eliza][reset] POST /api/agent/reset: loading config, will clear first-run state, persisted provider config, and cloud keys (GGUF / MODELS_DIR untouched)",
           );
-        }
-        logger.info(
-          "[eliza][reset] POST /api/agent/reset: eliza.json saved; renderer should restart API process if embedded/third-party dev",
-        );
+          const stateDir = resolveStateDir();
+          const stateResetOptions = {
+            runtimeOwnsState: state.current !== null,
+          } as const;
+          validateAgentStateResetPath(stateDir, stateResetOptions);
+          validateAccountAuthResetPaths();
+          validateConfigEnvResetPaths({ stateDir });
+          const config = loadElizaConfig();
+          const workspaceDir = resolveUserPath(
+            config.agents?.defaults?.workspace ??
+              resolveDefaultAgentWorkspaceDir(),
+          );
+          validateExternalAgentStateResetPaths(
+            stateDir,
+            process.env,
+            workspaceDir,
+          );
+          const pgliteDataDir = validateCompatPgliteDataDir(config, stateDir);
+          await stopCompatRuntimeForReset(state.current);
+          // A later cleanup failure must not leave API status pointing at the
+          // runtime object that has already been stopped successfully.
+          state.current = null;
+          resetRuntimeOperationStateForAgentReset();
+          // The reset barrier has drained any accepted keepalive sweep. Stop
+          // its timer and drop the cached pool before deleting its auth tree.
+          closeAccountPoolForCredentialReset();
+          closeAccountPoolBrokerForCredentialReset();
+          deleteAllStoredAccountAuthState();
+          cancelAllOAuthFlowsForReset();
+          resetSubscriptionOAuthStateForAgentReset();
+          resetCredentialRefreshStateForAgentReset();
+          resetConnectorAccountStateForDestructiveReset();
+          resetVolatileCredentialStateForAgentReset();
+          // The exclusive reset gate drains earlier hydrations before this
+          // delete and rejects later mutations until every source is gone.
+          await deleteAgentSecretsForReset();
+          deleteCompatPgliteDataDir(pgliteDataDir);
+          clearPersistedFirstRunConfig(config);
+          // Scrub symlink targets and external config overrides before the
+          // state-tree wipe removes their directory entries.
+          saveElizaConfigForReset(config);
+          await deleteConfigEnvForReset({ stateDir });
+          deleteExternalAgentStateForReset(stateDir, process.env, workspaceDir);
+          deleteAgentStateForReset(stateDir, stateResetOptions);
+          saveElizaConfigForReset(config);
+          if (stateResetOptions.runtimeOwnsState) {
+            writeAgentStateOwnershipMarker(stateDir, stateResetOptions);
+          }
+          clearCloudSecrets();
+          logger.info(
+            "[eliza][reset] POST /api/agent/reset: eliza.json saved; renderer should restart API process if embedded/third-party dev",
+          );
+        });
+        res.setHeader("Set-Cookie", [
+          serializeSessionExpiryCookie(),
+          serializeCsrfExpiryCookie(),
+        ]);
         sendJsonResponse(res, 200, { ok: true });
       } catch (err) {
         logger.warn(
@@ -1108,6 +1282,73 @@ export function getSharedCompatRuntimeState(): CompatRuntimeState {
   return sharedCompatRuntimeState;
 }
 
+function waitForResponseCompletion(res: http.ServerResponse): Promise<void> {
+  if (res.writableFinished || res.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      res.off("finish", finish);
+      res.off("close", finish);
+      resolve();
+    };
+    res.once("finish", finish);
+    res.once("close", finish);
+  });
+}
+
+function isPathWithin(pathname: string, root: string): boolean {
+  return pathname === root || pathname.startsWith(`${root}/`);
+}
+
+/**
+ * Identifies HTTP work that can persist config, credentials, or vault state.
+ * The reset barrier counts these requests until their response finishes, while
+ * chat streams and unrelated data mutations remain outside the drain set.
+ */
+export function requestMayMutateCredentialState(
+  method: string | undefined,
+  pathname: string,
+): boolean {
+  if (pathname === "/api/agent/reset") return false;
+
+  const normalizedMethod = (method ?? "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(normalizedMethod)) {
+    if (
+      pathname === "/v1/chat/completions" ||
+      /^\/api\/agents\/[^/]+\/message\/?$/.test(pathname) ||
+      isPathWithin(pathname, "/api/chat")
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  // These read-shaped routes can create or refresh persistent credentials.
+  if (
+    isPathWithin(pathname, "/api/auth") ||
+    isPathWithin(pathname, "/api/accounts") ||
+    isPathWithin(pathname, "/api/embed/auth") ||
+    isPathWithin(pathname, "/api/secrets") ||
+    isPathWithin(pathname, "/internal/account-pool/v1") ||
+    isPathWithin(pathname, "/api/setup/telegram-account") ||
+    pathname === "/api/first-run/status" ||
+    pathname === "/api/wallet/keys" ||
+    (normalizedMethod === "GET" &&
+      /^\/api\/connectors\/[^/]+\/oauth\/callback\/?$/.test(pathname)) ||
+    (normalizedMethod === "GET" &&
+      /^\/api\/lifeops\/connectors\/health\/[^/]+\/callback\/?$/.test(
+        pathname,
+      )) ||
+    (normalizedMethod === "GET" &&
+      (isPathWithin(pathname, "/api/discord/guilds") ||
+        isPathWithin(pathname, "/api/discord/channels"))) ||
+    isPathWithin(pathname, "/api/apps/feed") ||
+    isPathWithin(pathname, "/api/subscription")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function patchHttpCreateServerForCompat(): () => void {
   // Always capture the shared singleton. A caller-local CompatRuntimeState
   // would split early and late patch sites back into different state objects.
@@ -1191,8 +1432,8 @@ export function patchHttpCreateServerForCompat(): () => void {
         syncCompatConfigFiles();
       });
 
-      {
-        const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      const dispatchRequest = async (): Promise<void> => {
         if (
           pathname.startsWith("/api/database") ||
           pathname.startsWith("/api/trajectories")
@@ -1219,22 +1460,76 @@ export function patchHttpCreateServerForCompat(): () => void {
           }
           return;
         }
+
+        try {
+          await Promise.resolve(listener(req, res));
+        } catch (err) {
+          logger.error(
+            {
+              error: err instanceof Error ? err.message : String(err),
+              stack: err instanceof Error ? err.stack : undefined,
+            },
+            "[CompatApiServer] Upstream listener error",
+          );
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader("content-type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        }
+      };
+      const dispatchWithAuthGeneration = (): Promise<void> =>
+        runWithAccountAuthGeneration(dispatchRequest);
+
+      const isMutation = requestMayMutateCredentialState(req.method, pathname);
+      const isNestedLoopbackMutation =
+        (req.socket.remoteAddress === "127.0.0.1" ||
+          req.socket.remoteAddress === "::1" ||
+          req.socket.remoteAddress === "::ffff:127.0.0.1") &&
+        isCredentialMutationContinuation(
+          req.headers["x-eliza-credential-mutation-continuation"],
+        );
+      if (
+        isMutation &&
+        pathname !== "/api/agent/reset" &&
+        !isNestedLoopbackMutation
+      ) {
+        try {
+          await withCredentialStateMutation(async () => {
+            await dispatchWithAuthGeneration();
+            await waitForResponseCompletion(res);
+          });
+        } catch (error) {
+          if (
+            error instanceof ElizaError &&
+            error.code === "CREDENTIAL_RESET_IN_PROGRESS" &&
+            !res.headersSent
+          ) {
+            res.statusCode = 503;
+            res.setHeader("Retry-After", "1");
+            res.setHeader("content-type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ error: "agent_reset_in_progress" }));
+            return;
+          }
+          // error-policy:J1 The HTTP listener translates mutation-gate failures.
+          logger.error(
+            {
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+            },
+            "[CompatApiServer] Mutating request failed",
+          );
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader("content-type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+          return;
+        }
+        return;
       }
 
-      Promise.resolve(listener(req, res)).catch((err) => {
-        logger.error(
-          {
-            error: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-          },
-          "[CompatApiServer] Upstream listener error",
-        );
-        if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("content-type", "application/json; charset=utf-8");
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      });
+      await dispatchWithAuthGeneration();
     };
 
     const created =

@@ -39,6 +39,12 @@ const NONCE_TTL_MS = 5 * 60 * 1000;
 const rateLimitMap = new Map<string, RateLimitEntry>();
 const pendingExportNonces = new Map<string, { issuedAt: number; ip: string }>();
 
+/** Invalidates pending export capabilities and per-client reset-era state. */
+export function resetWalletExportGuardForAgentReset(): void {
+  pendingExportNonces.clear();
+  rateLimitMap.clear();
+}
+
 const sweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of rateLimitMap) {

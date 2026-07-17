@@ -35,6 +35,7 @@ import {
   HEALTH_DEFAULT_PACKS,
   registerHealthDefaultPacks,
 } from "./default-packs/index.js";
+import { clearPendingHealthOAuthSessionsForAgent } from "./health-bridge/health-oauth.js";
 
 // Public surface — consumers (app-lifeops and other plugins) import the
 // helpers they need by name from `@elizaos/plugin-health`.
@@ -120,6 +121,9 @@ export const healthPlugin: Plugin = {
       runtime,
       createDefaultCircadianInsightContract(),
     );
+  },
+  dispose: async (runtime: IAgentRuntime): Promise<void> => {
+    clearPendingHealthOAuthSessionsForAgent(String(runtime.agentId));
   },
 };
 

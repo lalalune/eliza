@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveStateDir } from "@elizaos/agent";
 
-const ENV_KEYS = ["ELIZA_DEVICE_ID", "ELIZA_DEVICE_ID"] as const;
+const ENV_KEYS = ["ELIZA_DEVICE_ID"] as const;
 const CACHE_FILE_NAME = "device-id";
 const RANDOM_SUFFIX_BYTES = 3; // 3 bytes -> 6 hex chars
 
@@ -67,9 +67,8 @@ function deviceIdCachePath(env: NodeJS.ProcessEnv): string {
  *
  * Resolution order:
  *   1. `ELIZA_DEVICE_ID` env var
- *   2. `ELIZA_DEVICE_ID` env var
- *   3. Cached value at `<state-dir>/device-id`
- *   4. Newly generated `<hostname>-<6-char-hex>`, persisted to that file
+ *   2. Cached value at `<state-dir>/device-id`
+ *   3. Newly generated `<hostname>-<6-char-hex>`, persisted to that file
  *
  * The result is memoized for the lifetime of the process so repeated calls
  * are cheap and guaranteed to return the same value.
@@ -131,8 +130,8 @@ export function getDeviceFingerprint(
 }
 
 /**
- * Test-only: drops the in-memory cache so the next `getDeviceId` call
- * re-runs the env -> file -> generate resolution.
+ * Drops the in-memory copy so lifecycle teardown cannot resurrect a deleted
+ * state file. Normal plugin reloads recover the same id from disk.
  */
 export function resetCachedDeviceId(): void {
   cachedDeviceId = null;

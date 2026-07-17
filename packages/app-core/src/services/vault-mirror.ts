@@ -31,6 +31,11 @@ export function sharedVault(): Vault {
   return sharedSecretsManager().vault;
 }
 
+/** Drops the process facade after its persistent vault has been destroyed. */
+export function resetSharedVaultAfterDestructiveReset(): void {
+  cachedManager = null;
+}
+
 /**
  * Test-only: drop the cached vault so the next `sharedVault()` call
  * re-initializes from the (possibly newly configured) environment.

@@ -6,7 +6,14 @@
  * never collide on the PGlite single-writer constraint.
  */
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -72,6 +79,114 @@ describe("PgliteVaultImpl", () => {
 
     await v.close();
     expect(keyBuf.every((b) => b === 0)).toBe(true);
+  });
+
+  it("destroy removes persistence and permanently rejects late writes", async () => {
+    const dataDir = join(workDir, ".vault-pglite");
+    const auditPath = join(workDir, "audit", "vault.jsonl");
+    await vault.set("OPENAI_API_KEY", "secret", { sensitive: true });
+
+    await vault.destroy();
+
+    await expect(access(dataDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(auditPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      vault.set("OPENAI_API_KEY", "late", { sensitive: true }),
+    ).rejects.toThrow("closed for destructive reset");
+  });
+
+  it("destroy refuses unowned and symlinked data directories", async () => {
+    const sentinel = join(workDir, "sentinel.txt");
+    await writeFile(sentinel, "keep");
+    const unsafe = new PgliteVaultImpl({
+      dataDir: workDir,
+      masterKey: inMemoryMasterKey(generateMasterKey()),
+      auditPath: join(workDir, "audit", "vault.jsonl"),
+    });
+    await expect(unsafe.destroy()).rejects.toThrow(
+      "refusing unsafe vault reset path",
+    );
+    await expect(access(sentinel)).resolves.toBeUndefined();
+
+    const external = await mkdtemp(join(tmpdir(), "vault-external-"));
+    const link = join(workDir, ".vault-pglite");
+    await vault.close();
+    await rm(link, { force: true, recursive: true });
+    await symlink(external, link, "dir");
+    const symlinked = new PgliteVaultImpl({
+      dataDir: link,
+      masterKey: inMemoryMasterKey(generateMasterKey()),
+      auditPath: join(workDir, "audit", "vault.jsonl"),
+    });
+    await expect(symlinked.destroy()).rejects.toThrow(
+      "refusing symlinked vault reset path",
+    );
+    await writeFile(join(external, "survived"), "yes");
+    await expect(access(join(external, "survived"))).resolves.toBeUndefined();
+    await rm(external, { force: true, recursive: true });
+  });
+
+  it("destroy rejects a symlinked state-root ancestor before closing the vault", async () => {
+    const actualRoot = join(workDir, "actual-state");
+    const linkedRoot = join(workDir, "linked-state");
+    await mkdir(actualRoot, { recursive: true });
+    await writeFile(join(actualRoot, "sentinel.txt"), "keep");
+    await symlink(actualRoot, linkedRoot, "dir");
+    const guarded = new PgliteVaultImpl({
+      dataDir: join(linkedRoot, ".vault-pglite"),
+      masterKey: inMemoryMasterKey(generateMasterKey()),
+      auditPath: join(linkedRoot, "audit", "vault.jsonl"),
+    });
+
+    await expect(guarded.destroy()).rejects.toThrow(
+      "refusing symlinked vault state root",
+    );
+    await expect(
+      access(join(actualRoot, "sentinel.txt")),
+    ).resolves.toBeUndefined();
+    await expect(guarded.has("still-open")).resolves.toBe(false);
+    await guarded.close();
+  });
+
+  it("destroy preflights symlinked audit and legacy-temp ancestors", async () => {
+    const stateRoot = join(workDir, "guarded-state");
+    const external = await mkdtemp(join(tmpdir(), "vault-reset-external-"));
+    await mkdir(stateRoot, { recursive: true });
+    await writeFile(join(external, "sentinel.txt"), "keep");
+    await symlink(external, join(stateRoot, "audit"), "dir");
+    const guardedAudit = new PgliteVaultImpl({
+      dataDir: join(stateRoot, ".vault-pglite"),
+      masterKey: inMemoryMasterKey(generateMasterKey()),
+      auditPath: join(stateRoot, "audit", "vault.jsonl"),
+    });
+
+    await expect(guardedAudit.destroy()).rejects.toThrow(
+      "refusing symlinked vault reset path",
+    );
+    await expect(guardedAudit.has("still-open")).resolves.toBe(false);
+    await guardedAudit.close();
+    await rm(join(stateRoot, "audit"), { force: true });
+
+    const legacyPath = join(stateRoot, "vault.json");
+    const legacyTemp = `${legacyPath}.tmp.external`;
+    await writeFile(legacyPath, '{"version":1,"entries":{}}\n');
+    await symlink(join(external, "sentinel.txt"), legacyTemp);
+    const guardedLegacy = new PgliteVaultImpl({
+      dataDir: join(stateRoot, ".vault-pglite"),
+      legacyStorePath: legacyPath,
+      masterKey: inMemoryMasterKey(generateMasterKey()),
+      auditPath: join(stateRoot, "audit", "vault.jsonl"),
+    });
+
+    await expect(guardedLegacy.destroy()).rejects.toThrow(
+      "refusing symlinked vault reset path",
+    );
+    await expect(guardedLegacy.has("still-open")).resolves.toBe(false);
+    await guardedLegacy.close();
+    await expect(
+      access(join(external, "sentinel.txt")),
+    ).resolves.toBeUndefined();
+    await rm(external, { force: true, recursive: true });
   });
 
   it("has returns true/false correctly", async () => {

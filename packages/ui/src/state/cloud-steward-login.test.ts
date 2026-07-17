@@ -13,6 +13,11 @@ import {
   launchStewardLogin,
   registerStewardLoginLauncher,
 } from "./cloud-steward-login";
+import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+  RendererCredentialResetError,
+} from "./credential-storage-keys";
 
 const STEWARD_TOKEN_KEY = "steward_session_token";
 
@@ -124,6 +129,31 @@ describe("cloud-steward-login seam", () => {
       expect(hasStewardLoginLauncher()).toBe(true);
     } finally {
       unregister();
+    }
+  });
+
+  it("drains a launcher token that resolves after destructive reset", async () => {
+    let resolveLauncher: ((result: { token: string }) => void) | undefined;
+    const unregister = registerStewardLoginLauncher(
+      () =>
+        new Promise((resolve) => {
+          resolveLauncher = resolve;
+        }),
+    );
+    const loginPromise = launchStewardLogin();
+    await vi.waitFor(() => expect(resolveLauncher).toBeTypeOf("function"));
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      localStorage.setItem(STEWARD_TOKEN_KEY, "late-launcher-token");
+      resolveLauncher?.({ token: "late-launcher-token" });
+
+      await expect(loginPromise).rejects.toBeInstanceOf(
+        RendererCredentialResetError,
+      );
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    } finally {
+      unregister();
+      finishRendererCredentialReset(resetGeneration);
     }
   });
 

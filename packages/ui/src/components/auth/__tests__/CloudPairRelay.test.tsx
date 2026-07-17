@@ -3,13 +3,17 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BOOT_CONFIG,
   getBootConfig,
   setBootConfig,
 } from "../../../config/boot-config";
+import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+} from "../../../state/credential-storage-keys";
 import {
   clearElizaApiToken,
   getElizaApiToken,
@@ -159,6 +163,45 @@ describe("CloudPairRelay", () => {
     expect(window.sessionStorage.getItem(CLOUD_PAIR_SESSION_STORAGE_KEY)).toBe(
       "agent-key",
     );
+  });
+
+  it("drops a delayed pair response invalidated by destructive reset", async () => {
+    let resolveExchange: ((apiToken: string) => void) | undefined;
+    const exchangeFn = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveExchange = resolve;
+        }),
+    );
+    const persistFn = vi.fn();
+    const onPaired = vi.fn();
+
+    render(
+      <CloudPairRelay
+        token="pair-token"
+        exchangeFn={exchangeFn}
+        persistFn={persistFn}
+        onPaired={onPaired}
+      />,
+    );
+    await waitFor(() => expect(resolveExchange).toBeTypeOf("function"));
+
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      await act(async () => {
+        resolveExchange?.("late-agent-key");
+        await Promise.resolve();
+      });
+
+      expect(persistFn).not.toHaveBeenCalled();
+      expect(onPaired).not.toHaveBeenCalled();
+      expect(getBootConfig().apiToken).toBeUndefined();
+      expect(
+        window.sessionStorage.getItem(CLOUD_PAIR_SESSION_STORAGE_KEY),
+      ).toBeNull();
+    } finally {
+      finishRendererCredentialReset(resetGeneration);
+    }
   });
 
   it("shows a clean Cloud-pair error instead of the local password form", async () => {

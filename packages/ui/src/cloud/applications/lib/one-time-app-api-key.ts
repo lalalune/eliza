@@ -6,10 +6,21 @@
  * Overview tab can reveal it on first mount, then drop it.
  */
 
+import {
+  assertRendererCredentialWriteAllowed,
+  captureRendererCredentialWriteGeneration,
+  type RendererCredentialWriteGeneration,
+} from "../../../state/credential-storage-keys";
+
 const oneTimeAppApiKeys = new Map<string, string>();
 
-export function storeOneTimeAppApiKey(appId: string, apiKey: string): void {
+export function storeOneTimeAppApiKey(
+  appId: string,
+  apiKey: string,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
   if (!appId || !apiKey) return;
+  assertRendererCredentialWriteAllowed(generation);
   oneTimeAppApiKeys.set(appId, apiKey);
 }
 
@@ -19,4 +30,9 @@ export function consumeOneTimeAppApiKey(appId: string): string | undefined {
     oneTimeAppApiKeys.delete(appId);
   }
   return apiKey;
+}
+
+/** Drops every unconsumed API key when the owning agent is reset. */
+export function clearOneTimeAppApiKeysForReset(): void {
+  oneTimeAppApiKeys.clear();
 }

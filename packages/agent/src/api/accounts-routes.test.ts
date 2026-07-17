@@ -98,9 +98,9 @@ vi.mock("../runtime/host-bridge.ts", () => ({
 
 import {
   __clearSubscriptionCliInstallFailures,
-  _resetAccountsRoutesPoolCache,
   type AccountsRouteContext,
   handleAccountsRoutes,
+  resetAccountsRoutesPoolCacheForAgentReset,
 } from "./accounts-routes.ts";
 
 type JsonCall = { body: unknown; status?: number };
@@ -178,7 +178,7 @@ describe("accounts routes", () => {
     });
     fakes.submitFlowCode.mockReturnValue(true);
     fakes.cancelFlow.mockReturnValue(true);
-    _resetAccountsRoutesPoolCache();
+    resetAccountsRoutesPoolCacheForAgentReset();
   });
 
   it("ignores unrelated paths and rejects unknown providers", async () => {

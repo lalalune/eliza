@@ -78,6 +78,7 @@ export interface ITwitterClient {
   client: ClientBase;
   post?: TwitterPostClient;
   interaction?: TwitterInteractionClient;
+  stop(): Promise<void>;
 }
 
 /**

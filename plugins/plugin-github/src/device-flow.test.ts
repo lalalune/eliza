@@ -6,6 +6,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  clearDeviceFlowsForAgent,
   clearDeviceFlowsForTest,
   DeviceFlowError,
   pollDeviceFlow,
@@ -25,6 +26,17 @@ function jsonResponse(payload: unknown, status = 200): Response {
 interface RecordedRequest {
   url: string;
   body: string;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 /** Scripted GitHub: first call answers device/code, later calls answer token polls. */
@@ -123,6 +135,43 @@ describe("startDeviceFlow", () => {
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DeviceFlowError);
     expect((err as DeviceFlowError).code).toBe("upstream");
+  });
+
+  it("does not create a flow when lifecycle cleanup wins an in-flight start", async () => {
+    const response = deferred<Response>();
+    const requestStarted = deferred<void>();
+    let signal: AbortSignal | null = null;
+    const fetchImpl = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      signal = init?.signal ?? null;
+      requestStarted.resolve();
+      return response.promise;
+    }) as typeof fetch;
+
+    const starting = startDeviceFlow({
+      clientId: "client-1",
+      agentKey: "agent-a",
+      deps: { fetchImpl },
+    });
+    await requestStarted.promise;
+    clearDeviceFlowsForAgent("agent-a");
+    expect(signal?.aborted).toBe(true);
+    response.resolve(
+      jsonResponse({
+        device_code: "late-secret-device-code",
+        user_code: "LATE-CODE",
+        verification_uri: "https://github.com/login/device",
+        expires_in: 900,
+        interval: 5,
+      }),
+    );
+
+    await expect(starting).rejects.toMatchObject({
+      code: "unknown_flow",
+      status: 404,
+    });
   });
 });
 
@@ -297,6 +346,81 @@ describe("pollDeviceFlow", () => {
       deps: { fetchImpl, now: () => 0 },
     });
     expect(completed.status).toBe("complete");
+  });
+
+  it("lifecycle cleanup invalidates only the stopped agent's pending grants", async () => {
+    const { fetchImpl } = scriptedGitHub([
+      () => jsonResponse({ access_token: "gho_agent_b", scope: "repo" }),
+    ]);
+    const flowA = await startDeviceFlow({
+      clientId: "client-1",
+      agentKey: "agent-a",
+      deps: { fetchImpl, now: () => 0 },
+    });
+    const flowB = await startDeviceFlow({
+      clientId: "client-1",
+      agentKey: "agent-b",
+      deps: { fetchImpl, now: () => 0 },
+    });
+
+    clearDeviceFlowsForAgent("agent-a");
+
+    await expect(
+      pollDeviceFlow({
+        flowId: flowA.flowId,
+        agentKey: "agent-a",
+        deps: { fetchImpl, now: () => 0 },
+      }),
+    ).rejects.toMatchObject({ code: "unknown_flow", status: 404 });
+    await expect(
+      pollDeviceFlow({
+        flowId: flowB.flowId,
+        agentKey: "agent-b",
+        deps: { fetchImpl, now: () => 0 },
+      }),
+    ).resolves.toMatchObject({ status: "complete", token: "gho_agent_b" });
+  });
+
+  it("does not return a token when lifecycle cleanup wins an in-flight poll", async () => {
+    const tokenResponse = deferred<Response>();
+    const pollStarted = deferred<void>();
+    let pollSignal: AbortSignal | null = null;
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === DEVICE_CODE_URL) {
+        return jsonResponse({
+          device_code: "secret-device-code",
+          user_code: "ABCD-EFGH",
+          verification_uri: "https://github.com/login/device",
+          expires_in: 900,
+          interval: 5,
+        });
+      }
+      pollSignal = init?.signal ?? null;
+      pollStarted.resolve();
+      return tokenResponse.promise;
+    }) as typeof fetch;
+    const started = await startDeviceFlow({
+      clientId: "client-1",
+      agentKey: "agent-a",
+      deps: { fetchImpl, now: () => 0 },
+    });
+
+    const polling = pollDeviceFlow({
+      flowId: started.flowId,
+      agentKey: "agent-a",
+      deps: { fetchImpl, now: () => 0 },
+    });
+    await pollStarted.promise;
+    clearDeviceFlowsForAgent("agent-a");
+    expect(pollSignal?.aborted).toBe(true);
+    tokenResponse.resolve(
+      jsonResponse({ access_token: "gho_late_token", scope: "repo" }),
+    );
+
+    await expect(polling).rejects.toMatchObject({
+      code: "unknown_flow",
+      status: 404,
+    });
   });
 
   it("maps an unrecognized GitHub error code to a terminal upstream error", async () => {

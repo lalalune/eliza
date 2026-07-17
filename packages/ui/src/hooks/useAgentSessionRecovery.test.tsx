@@ -17,6 +17,7 @@ const mockCloudToken = vi.fn<() => string | null>();
 const mockActiveServer = vi.fn();
 const mockBootConfig = vi.fn(() => ({ cloudApiBase: "https://elizacloud.ai" }));
 const mockRunRecovery = vi.fn();
+const mockSetToken = vi.fn();
 
 vi.mock("../api/client-cloud", () => ({
   getCloudAuthToken: () => mockCloudToken(),
@@ -30,7 +31,14 @@ vi.mock("../config/boot-config", () => ({
 vi.mock("../state/agent-session-recovery-runner", () => ({
   runAgentSessionRecovery: (...args: unknown[]) => mockRunRecovery(...args),
 }));
+vi.mock("../api", () => ({
+  client: { setToken: mockSetToken },
+}));
 
+import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+} from "../state/credential-storage-keys";
 import { useAgentSessionRecovery } from "./useAgentSessionRecovery";
 
 function Probe(props: {
@@ -115,6 +123,31 @@ describe("useAgentSessionRecovery", () => {
         onPairedInProcess: expect.any(Function),
       }),
     );
+  });
+
+  it("does not set the client token when reset starts during the lazy import", async () => {
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+    };
+    mockCloudToken.mockReturnValue("steward.jwt.token");
+    mockActiveServer.mockReturnValue(cloudServer("agent-1"));
+    mockRunRecovery.mockReturnValue(new Promise(() => {}));
+
+    render(
+      <Probe active reason="remote_auth_required" onStatus={() => undefined} />,
+    );
+    await waitFor(() => expect(mockRunRecovery).toHaveBeenCalledOnce());
+    const onPairedInProcess = mockRunRecovery.mock.calls[0][0]
+      .onPairedInProcess as (apiToken: string) => Promise<void>;
+
+    const callbackPromise = onPairedInProcess("late-agent-token");
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      await callbackPromise;
+      expect(mockSetToken).not.toHaveBeenCalled();
+    } finally {
+      finishRendererCredentialReset(resetGeneration);
+    }
   });
 
   it("stays idle (wall) when there is no cloud session", async () => {

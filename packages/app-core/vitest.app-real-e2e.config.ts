@@ -9,6 +9,10 @@ import baseConfig from "../../packages/test/vitest/default.config";
 process.env.LIVE = "1";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const pluginWalletSrc = path.resolve(here, "../../plugins/plugin-wallet/src");
+const baseAliases = Array.isArray(baseConfig.resolve?.alias)
+  ? baseConfig.resolve.alias
+  : [];
 
 /**
  * Config for the `test/app/*.{real,live}.e2e.test.ts` browser-driven real e2e
@@ -27,6 +31,15 @@ export default defineConfig({
   resolve: {
     ...baseConfig.resolve,
     preserveSymlinks: false,
+    alias: [
+      // The base workspace alias targets the package entry file. Resolve
+      // subpaths first or Vite appends `/diagnostic` to `src/index.ts`.
+      {
+        find: /^@elizaos\/plugin-wallet\/(.+)$/,
+        replacement: path.join(pluginWalletSrc, "$1"),
+      },
+      ...baseAliases,
+    ],
   },
   test: {
     ...baseConfig.test,

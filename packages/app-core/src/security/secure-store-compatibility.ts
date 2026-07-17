@@ -1,11 +1,12 @@
 /**
  * Recovers OS secure-store entries after a service or account namespace
  * rotation without retaining any prior product identity. Discovery reads only
- * public item metadata, selection is anchored to the stable state-directory
- * hash and secret-kind suffix, and every candidate secret read remains
- * targeted. The same structural selection powers explicit cleanup so a reset
- * cannot resurrect a predecessor entry on the next boot.
+ * public item metadata, selection requires the current service and exact state
+ * token, and every candidate secret read remains targeted. The same structural
+ * selection powers explicit cleanup so a reset cannot resurrect a predecessor
+ * entry on the next boot.
  */
+import { ElizaError } from "@elizaos/core";
 import type {
   SecureStoreGetResult,
   SecureStoreSecretKind,
@@ -13,8 +14,33 @@ import type {
 
 const VAULT_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16}$/;
 const ACCOUNT_PREFIX_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/;
+const MAX_ACCOUNT_PREFIX_LENGTH = 128;
 const MAX_SECRET_SERVICE_COLLECTIONS = 64;
 const MAX_SECRET_SERVICE_ITEMS = 4_096;
+const MAX_SECRET_SERVICE_ATTRIBUTES = 64;
+const MAX_SECRET_SERVICE_ATTRIBUTE_KEY_LENGTH = 128;
+const MAX_SECRET_SERVICE_ATTRIBUTE_VALUE_LENGTH = 1_024;
+const MAX_SECRET_SERVICE_OBJECT_PATH_LENGTH = 1_024;
+const MAX_DBUS_TYPE_DEPTH = 4;
+const MAX_DBUS_TYPE_NODES = 8;
+const MAX_METADATA_FIELD_LENGTH = 512;
+const MAX_KEYCHAIN_LOCATOR_LENGTH = 1_024;
+const MAX_KEYCHAIN_DUMP_LENGTH = 4 * 1_024 * 1_024;
+const MAX_KEYCHAIN_LINE_LENGTH = 16_384;
+const MAX_KEYCHAIN_RECORDS = 4_096;
+const MAX_COMPATIBLE_CANDIDATES = 8;
+
+function compatibilityError(
+  code: string,
+  message: string,
+  cause?: unknown,
+): ElizaError {
+  return new ElizaError(message, {
+    code,
+    severity: "fatal",
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
 
 export interface SecureStoreMetadataRef {
   /** Stable metadata object identity, such as a Keychain path or D-Bus item. */
@@ -36,7 +62,69 @@ export type CompatibleSecretRecoveryResult =
   | { ok: false; reason: "not_found" | "error"; message?: string };
 
 interface AccountShape {
+  prefix: string;
   token: string;
+}
+
+/**
+ * Shares a short-lived metadata snapshot across adjacent secret operations.
+ * A caller can force a new native enumeration when a targeted item disappears
+ * or reset needs proof from the current store state.
+ */
+export class SecureStoreMetadataSnapshotCache {
+  private snapshot:
+    | { loadedAt: number; refs: readonly SecureStoreMetadataRef[] }
+    | undefined;
+  private pending: Promise<readonly SecureStoreMetadataRef[]> | undefined;
+  private generation = 0;
+
+  constructor(
+    private readonly load: () => Promise<readonly SecureStoreMetadataRef[]>,
+    private readonly maxAgeMs = 1_000,
+    private readonly now: () => number = Date.now,
+  ) {
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+      throw compatibilityError(
+        "SECURE_STORE_METADATA_CACHE_INVALID",
+        "secure-store metadata cache age is invalid",
+      );
+    }
+  }
+
+  async get(forceRefresh = false): Promise<readonly SecureStoreMetadataRef[]> {
+    if (
+      !forceRefresh &&
+      this.snapshot &&
+      this.now() - this.snapshot.loadedAt <= this.maxAgeMs
+    ) {
+      return this.snapshot.refs;
+    }
+    if (!forceRefresh && this.pending) return this.pending;
+
+    if (forceRefresh) this.snapshot = undefined;
+    const generation = ++this.generation;
+    const pending = this.load().then((refs) => {
+      const snapshot = Object.freeze(
+        refs.map((ref) => Object.freeze({ ...ref })),
+      );
+      if (generation === this.generation) {
+        this.snapshot = { loadedAt: this.now(), refs: snapshot };
+      }
+      return snapshot;
+    });
+    this.pending = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.pending === pending) this.pending = undefined;
+    }
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    this.snapshot = undefined;
+    this.pending = undefined;
+  }
 }
 
 /** Exact current storage is authoritative; compatibility is a not-found path. */
@@ -58,7 +146,6 @@ export async function preferCurrentSecretAfterRecovery(options: {
   recovered: CompatibleSecretRecoveryResult;
   readCurrent: () => Promise<SecureStoreGetResult>;
 }): Promise<SecureStoreGetResult> {
-  if (!options.recovered.ok) return options.recovered;
   const current = await options.readCurrent();
   if (current.ok || current.reason !== "not_found") return current;
   return options.recovered;
@@ -68,6 +155,7 @@ function parseCompatibleAccountShape(
   account: string,
   kind: SecureStoreSecretKind,
 ): AccountShape | null {
+  if (account.length > MAX_METADATA_FIELD_LENGTH) return null;
   const kindSuffix = `:${kind}`;
   if (!account.endsWith(kindSuffix)) return null;
 
@@ -80,12 +168,13 @@ function parseCompatibleAccountShape(
   const prefix = namespaceAndToken.slice(0, tokenSeparator);
   const token = namespaceAndToken.slice(tokenSeparator + 1);
   if (
+    prefix.length > MAX_ACCOUNT_PREFIX_LENGTH ||
     !ACCOUNT_PREFIX_PATTERN.test(prefix) ||
     !VAULT_TOKEN_PATTERN.test(token)
   ) {
     return null;
   }
-  return { token };
+  return { prefix, token };
 }
 
 function dedupeMetadataRefs(
@@ -105,13 +194,25 @@ function structurallyCompatibleRefs(
   currentAccount: string,
   kind: SecureStoreSecretKind,
 ): Array<SecureStoreMetadataRef & AccountShape> {
+  const currentShape = parseCompatibleAccountShape(currentAccount, kind);
+  if (!currentShape) {
+    throw compatibilityError(
+      "SECURE_STORE_CURRENT_ACCOUNT_INVALID",
+      "current secure-store account is malformed",
+    );
+  }
   const compatible: Array<SecureStoreMetadataRef & AccountShape> = [];
   for (const ref of dedupeMetadataRefs(refs)) {
-    if (ref.service === currentService && ref.account === currentAccount) {
+    if (ref.service !== currentService || ref.account === currentAccount)
       continue;
-    }
     const shape = parseCompatibleAccountShape(ref.account, kind);
-    if (shape) compatible.push({ ...ref, ...shape });
+    if (
+      shape &&
+      shape.token === currentShape.token &&
+      shape.prefix !== currentShape.prefix
+    ) {
+      compatible.push({ ...ref, ...shape });
+    }
   }
   return compatible;
 }
@@ -119,36 +220,40 @@ function structurallyCompatibleRefs(
 function withoutAccountShape(
   ref: SecureStoreMetadataRef & AccountShape,
 ): SecureStoreMetadataRef {
-  const { token: _token, ...metadata } = ref;
+  const { prefix: _prefix, token: _token, ...metadata } = ref;
   return metadata;
 }
 
 /**
- * Selects readable candidates only when their token is derivable from a state
- * root owned by this installation. Structural similarity alone is never enough
- * because another local agent may use the same secret kinds.
+ * Selects readable predecessors only under the current service and state token.
+ * A different service or token belongs to a different installation even when
+ * its account has the same shape and secret-kind suffix.
  */
 export function selectCompatibleCandidates(
   refs: readonly SecureStoreMetadataRef[],
   currentService: string,
   currentAccount: string,
   kind: SecureStoreSecretKind,
-  compatibleTokens: ReadonlySet<string>,
 ): CompatibleCandidateSelection {
-  const structural = structurallyCompatibleRefs(
+  const known = structurallyCompatibleRefs(
     refs,
     currentService,
     currentAccount,
     kind,
   );
-  const known = structural.filter((ref) => compatibleTokens.has(ref.token));
   if (known.length === 0) return { status: "not_found" };
+  if (known.length > MAX_COMPATIBLE_CANDIDATES) {
+    return { status: "ambiguous" };
+  }
 
   const byTarget = new Map<string, SecureStoreMetadataRef[]>();
   for (const ref of known) {
-    const group = byTarget.get(ref.targetId) ?? [];
-    group.push(ref);
-    byTarget.set(ref.targetId, group);
+    const group = byTarget.get(ref.targetId);
+    if (group) {
+      group.push(ref);
+    } else {
+      byTarget.set(ref.targetId, [ref]);
+    }
   }
 
   if ([...byTarget.values()].some((group) => group.length !== 1)) {
@@ -162,25 +267,25 @@ export function selectCompatibleCandidates(
 
 /**
  * Returns every structurally compatible target that explicit reset must
- * remove. Cleanup is deliberately stricter than read recovery: only derivable
- * state-directory tokens may be deleted, so a unique entry from another local
- * installation is never mistaken for this vault during reset.
+ * remove. The current service and exact state token constrain deletion so an
+ * entry from another local installation is never mistaken for this vault.
  */
 export function selectCompatibleCleanupTargets(
   refs: readonly SecureStoreMetadataRef[],
   currentService: string,
   currentAccount: string,
   kind: SecureStoreSecretKind,
-  compatibleTokens: ReadonlySet<string>,
 ): CompatibleCandidateSelection {
-  const structural = structurallyCompatibleRefs(
+  const known = structurallyCompatibleRefs(
     refs,
     currentService,
     currentAccount,
     kind,
   );
-  const known = structural.filter((ref) => compatibleTokens.has(ref.token));
   if (known.length === 0) return { status: "not_found" };
+  if (known.length > MAX_COMPATIBLE_CANDIDATES) {
+    return { status: "ambiguous" };
+  }
 
   const byTarget = new Map<string, SecureStoreMetadataRef & AccountShape>();
   for (const ref of known) {
@@ -198,7 +303,6 @@ export function collectSecureStoreCleanupTargets(
   currentService: string,
   currentAccount: string,
   kind: SecureStoreSecretKind,
-  compatibleTokens: ReadonlySet<string>,
 ): SecureStoreMetadataRef[] {
   const targets = new Map<string, SecureStoreMetadataRef>();
   for (const ref of dedupeMetadataRefs(refs)) {
@@ -211,12 +315,64 @@ export function collectSecureStoreCleanupTargets(
     currentService,
     currentAccount,
     kind,
-    compatibleTokens,
   );
+  if (compatible.status === "ambiguous") {
+    throw compatibilityError(
+      "SECURE_STORE_CLEANUP_TARGET_LIMIT_EXCEEDED",
+      "secure-store cleanup found too many predecessor targets",
+    );
+  }
   if (compatible.status === "selected") {
     for (const ref of compatible.candidates) targets.set(ref.targetId, ref);
   }
   return [...targets.values()];
+}
+
+/**
+ * Deletes the exact account before metadata-discovered predecessors, then
+ * verifies both the targeted current read and a forced-fresh metadata view.
+ * Reset callers must finish this sequence before deleting their vault copy.
+ */
+export async function cleanupCurrentAndCompatibleSecret(options: {
+  deleteCurrent: () => Promise<void>;
+  discover: (
+    forceRefresh: boolean,
+  ) => Promise<readonly SecureStoreMetadataRef[]>;
+  deleteTarget: (target: SecureStoreMetadataRef) => Promise<void>;
+  readCurrent: () => Promise<SecureStoreGetResult>;
+  currentService: string;
+  currentAccount: string;
+  kind: SecureStoreSecretKind;
+}): Promise<void> {
+  await options.deleteCurrent();
+  const targets = collectSecureStoreCleanupTargets(
+    await options.discover(true),
+    options.currentService,
+    options.currentAccount,
+    options.kind,
+  );
+  for (const target of targets) await options.deleteTarget(target);
+
+  const current = await options.readCurrent();
+  if (current.ok || current.reason !== "not_found") {
+    throw compatibilityError(
+      "SECURE_STORE_DELETE_INCOMPLETE",
+      "secure-store cleanup could not verify exact deletion",
+    );
+  }
+  if (
+    collectSecureStoreCleanupTargets(
+      await options.discover(true),
+      options.currentService,
+      options.currentAccount,
+      options.kind,
+    ).length > 0
+  ) {
+    throw compatibilityError(
+      "SECURE_STORE_DELETE_INCOMPLETE",
+      "secure-store cleanup verification found a recoverable entry",
+    );
+  }
 }
 
 /**
@@ -225,21 +381,21 @@ export function collectSecureStoreCleanupTargets(
  * unreadable states fail closed instead of silently choosing a survivor.
  */
 export async function recoverCompatibleSecret(options: {
-  discover: () => Promise<readonly SecureStoreMetadataRef[]>;
+  discover: (
+    forceRefresh: boolean,
+  ) => Promise<readonly SecureStoreMetadataRef[]>;
   read: (candidate: SecureStoreMetadataRef) => Promise<SecureStoreGetResult>;
   currentService: string;
   currentAccount: string;
   kind: SecureStoreSecretKind;
-  compatibleTokens: ReadonlySet<string>;
 }): Promise<CompatibleSecretRecoveryResult> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const refs = await options.discover();
+    const refs = await options.discover(attempt > 0);
     const selection = selectCompatibleCandidates(
       refs,
       options.currentService,
       options.currentAccount,
       options.kind,
-      options.compatibleTokens,
     );
     if (selection.status === "not_found") {
       return { ok: false, reason: "not_found" };
@@ -314,19 +470,25 @@ export async function promoteRecoveredMacOSSecret(options: {
   readCurrent: () => Promise<SecureStoreGetResult>;
 }): Promise<SecureStoreGetResult> {
   let addSucceeded = false;
+  let addFailure: unknown;
   try {
     await options.addOnly(options.recoveredValue);
     addSucceeded = true;
-  } catch {
+  } catch (error) {
     // error-policy:J1 The exact read distinguishes a concurrent winner from add failure.
+    addFailure = error;
   }
 
   const winner = await options.readCurrent();
   if (!winner.ok) {
+    if (winner.reason !== "not_found") return winner;
     return {
       ok: false,
       reason: "error",
-      message: "macOS secure-store compatibility promotion failed",
+      message:
+        addFailure instanceof Error
+          ? `macOS secure-store compatibility promotion failed: ${addFailure.message}`
+          : "macOS secure-store compatibility promotion failed",
     };
   }
   if (addSucceeded && winner.value !== options.recoveredValue) {
@@ -346,7 +508,8 @@ export async function promoteRecoveredMacOSSecret(options: {
  */
 export class MacOSKeychainMetadataParser {
   private lineBuffer = "";
-  private droppingLongLine = false;
+  private totalLength = 0;
+  private recordsSeen = 0;
   private keychain: string | undefined;
   private recordClass: string | undefined;
   private account: string | undefined;
@@ -354,28 +517,31 @@ export class MacOSKeychainMetadataParser {
   private readonly refs: SecureStoreMetadataRef[] = [];
 
   push(chunk: string): void {
+    this.totalLength += chunk.length;
+    if (this.totalLength > MAX_KEYCHAIN_DUMP_LENGTH) {
+      throw compatibilityError(
+        "SECURE_STORE_KEYCHAIN_DUMP_LIMIT_EXCEEDED",
+        "macOS secure-store metadata exceeded its size limit",
+      );
+    }
     for (const character of chunk) {
-      if (this.droppingLongLine) {
-        if (character === "\n") this.droppingLongLine = false;
-        continue;
-      }
       if (character === "\n") {
         this.consumeLine(this.lineBuffer);
         this.lineBuffer = "";
         continue;
       }
       this.lineBuffer += character;
-      if (this.lineBuffer.length > 16_384) {
-        this.lineBuffer = "";
-        this.droppingLongLine = true;
+      if (this.lineBuffer.length > MAX_KEYCHAIN_LINE_LENGTH) {
+        throw compatibilityError(
+          "SECURE_STORE_KEYCHAIN_LINE_LIMIT_EXCEEDED",
+          "macOS secure-store metadata line exceeded its size limit",
+        );
       }
     }
   }
 
   finish(): SecureStoreMetadataRef[] {
-    if (!this.droppingLongLine && this.lineBuffer) {
-      this.consumeLine(this.lineBuffer);
-    }
+    if (this.lineBuffer) this.consumeLine(this.lineBuffer);
     this.flushRecord();
     return dedupeMetadataRefs(this.refs);
   }
@@ -383,25 +549,47 @@ export class MacOSKeychainMetadataParser {
   private consumeLine(line: string): void {
     if (line.startsWith("keychain: ")) {
       this.flushRecord();
-      this.keychain = parseQuotedMetadataValue(line.slice(10), false);
+      const locator = parseQuotedMetadataValue(
+        line.slice(10),
+        false,
+        MAX_KEYCHAIN_LOCATOR_LENGTH,
+      );
+      this.keychain = locator?.startsWith("/") ? locator : undefined;
       return;
     }
     if (line.startsWith("class: ")) {
-      this.recordClass = parseQuotedMetadataValue(line.slice(7), true);
+      this.recordClass = parseQuotedMetadataValue(line.slice(7), true, 16);
       return;
     }
     const accountMatch = line.match(/^\s+"acct"<blob>=(.*)$/);
     if (accountMatch) {
-      this.account = parseQuotedMetadataValue(accountMatch[1], true);
+      this.account = parseQuotedMetadataValue(
+        accountMatch[1],
+        true,
+        MAX_METADATA_FIELD_LENGTH,
+      );
       return;
     }
     const serviceMatch = line.match(/^\s+"svce"<blob>=(.*)$/);
     if (serviceMatch) {
-      this.service = parseQuotedMetadataValue(serviceMatch[1], true);
+      this.service = parseQuotedMetadataValue(
+        serviceMatch[1],
+        true,
+        MAX_METADATA_FIELD_LENGTH,
+      );
     }
   }
 
   private flushRecord(): void {
+    if (this.keychain) {
+      this.recordsSeen += 1;
+      if (this.recordsSeen > MAX_KEYCHAIN_RECORDS) {
+        throw compatibilityError(
+          "SECURE_STORE_KEYCHAIN_RECORD_LIMIT_EXCEEDED",
+          "macOS secure-store metadata contained too many records",
+        );
+      }
+    }
     if (
       this.recordClass === "genp" &&
       this.keychain &&
@@ -417,6 +605,7 @@ export class MacOSKeychainMetadataParser {
         locator: this.keychain,
       });
     }
+    this.keychain = undefined;
     this.recordClass = undefined;
     this.account = undefined;
     this.service = undefined;
@@ -426,13 +615,20 @@ export class MacOSKeychainMetadataParser {
 function parseQuotedMetadataValue(
   raw: string,
   asciiOnly: boolean,
+  maxLength: number,
 ): string | undefined {
   const trimmed = raw.trim();
   if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return undefined;
   try {
     // error-policy:J3 Keychain metadata is untrusted command output.
     const value: unknown = JSON.parse(trimmed);
-    if (typeof value !== "string" || value.length === 0) return undefined;
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > maxLength
+    ) {
+      return undefined;
+    }
     if (asciiOnly && !/^[\x20-\x7e]+$/.test(value)) return undefined;
     return value;
   } catch {
@@ -465,31 +661,96 @@ interface DbusTypeNode {
   child?: DbusTypeNode[];
 }
 
-function signatureForTypeNode(node: DbusTypeNode): string {
+function signatureForTypeNode(
+  value: unknown,
+  depth = 0,
+  budget: { nodes: number } = { nodes: 0 },
+): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_INVALID",
+      "Secret Service returned a malformed property type",
+    );
+  }
+  if (depth > MAX_DBUS_TYPE_DEPTH) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_DEPTH_EXCEEDED",
+      "Secret Service property type exceeded its depth limit",
+    );
+  }
+  budget.nodes += 1;
+  if (budget.nodes > MAX_DBUS_TYPE_NODES) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_LIMIT_EXCEEDED",
+      "Secret Service property type exceeded its node limit",
+    );
+  }
+
+  const node = value as Partial<DbusTypeNode>;
+  if (
+    typeof node.type !== "string" ||
+    !["a", "{", "o", "s"].includes(node.type)
+  ) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_UNSUPPORTED",
+      "Secret Service returned an unsupported property type",
+    );
+  }
+  const children = node.child;
+  if (!Array.isArray(children)) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_INVALID",
+      "Secret Service returned a malformed property type",
+    );
+  }
   if (node.type === "a") {
-    if (node.child?.length !== 1) return "";
-    return `a${signatureForTypeNode(node.child[0])}`;
+    if (children.length !== 1) {
+      throw compatibilityError(
+        "SECURE_STORE_DBUS_SIGNATURE_INVALID",
+        "Secret Service returned a malformed array property type",
+      );
+    }
+    return `a${signatureForTypeNode(children[0], depth + 1, budget)}`;
   }
   if (node.type === "{") {
-    if (node.child?.length !== 2) return "";
-    return `{${node.child.map(signatureForTypeNode).join("")}}`;
+    if (children.length !== 2) {
+      throw compatibilityError(
+        "SECURE_STORE_DBUS_SIGNATURE_INVALID",
+        "Secret Service returned a malformed dictionary property type",
+      );
+    }
+    return `{${children
+      .map((child) => signatureForTypeNode(child, depth + 1, budget))
+      .join("")}}`;
+  }
+  if (children.length !== 0) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_SIGNATURE_INVALID",
+      "Secret Service returned a malformed scalar property type",
+    );
   }
   return node.type;
 }
 
 function unwrapDbusVariant(value: unknown, expectedSignature: string): unknown {
   if (!Array.isArray(value) || value.length !== 2) {
-    throw new Error("Secret Service returned a malformed property variant");
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_VARIANT_INVALID",
+      "Secret Service returned a malformed property variant",
+    );
   }
   const [tree, body] = value;
   if (
     !Array.isArray(tree) ||
     tree.length !== 1 ||
-    signatureForTypeNode(tree[0] as DbusTypeNode) !== expectedSignature ||
+    signatureForTypeNode(tree[0]) !== expectedSignature ||
     !Array.isArray(body) ||
     body.length !== 1
   ) {
-    throw new Error("Secret Service returned an unexpected property type");
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_VARIANT_TYPE_INVALID",
+      "Secret Service returned an unexpected property type",
+    );
   }
   return body[0];
 }
@@ -507,7 +768,12 @@ async function readSecretServiceProperty(
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error("Secret Service metadata request timed out"));
+      reject(
+        compatibilityError(
+          "SECURE_STORE_DBUS_REQUEST_TIMEOUT",
+          "Secret Service metadata request timed out",
+        ),
+      );
     }, timeoutMs);
     try {
       bus.invoke(
@@ -524,7 +790,12 @@ async function readSecretServiceProperty(
           settled = true;
           clearTimeout(timer);
           if (error) {
-            reject(new Error("Secret Service metadata request failed"));
+            reject(
+              compatibilityError(
+                "SECURE_STORE_DBUS_REQUEST_FAILED",
+                "Secret Service metadata request failed",
+              ),
+            );
             return;
           }
           resolve(result);
@@ -533,28 +804,58 @@ async function readSecretServiceProperty(
     } catch (error) {
       settled = true;
       clearTimeout(timer);
-      reject(error);
+      reject(
+        compatibilityError(
+          "SECURE_STORE_DBUS_INVOKE_FAILED",
+          "Secret Service metadata invocation failed",
+          error,
+        ),
+      );
     }
   });
   return unwrapDbusVariant(value, expectedSignature);
 }
 
-function requireObjectPaths(value: unknown): string[] {
+function requireObjectPaths(
+  value: unknown,
+  maxEntries: number,
+  label: "collections" | "items",
+): string[] {
+  if (Array.isArray(value) && value.length > maxEntries) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_PATH_LIMIT_EXCEEDED",
+      `Secret Service returned too many ${label}`,
+    );
+  }
   if (
     !Array.isArray(value) ||
     value.some(
       (entry) =>
-        typeof entry !== "string" || !entry.startsWith("/") || entry === "/",
+        typeof entry !== "string" ||
+        entry.length > MAX_SECRET_SERVICE_OBJECT_PATH_LENGTH ||
+        !/^\/(?:[A-Za-z0-9_]+(?:\/[A-Za-z0-9_]+)*)$/.test(entry),
     )
   ) {
-    throw new Error("Secret Service returned malformed object paths");
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_PATH_INVALID",
+      "Secret Service returned malformed object paths",
+    );
   }
   return [...new Set(value)];
 }
 
 function requireStringAttributes(value: unknown): Record<string, string> {
+  if (Array.isArray(value) && value.length > MAX_SECRET_SERVICE_ATTRIBUTES) {
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_ATTRIBUTE_LIMIT_EXCEEDED",
+      "Secret Service returned too many item attributes",
+    );
+  }
   if (!Array.isArray(value)) {
-    throw new Error("Secret Service returned malformed item attributes");
+    throw compatibilityError(
+      "SECURE_STORE_DBUS_ATTRIBUTES_INVALID",
+      "Secret Service returned malformed item attributes",
+    );
   }
   const attributes: Record<string, string> = {};
   for (const entry of value) {
@@ -562,9 +863,18 @@ function requireStringAttributes(value: unknown): Record<string, string> {
       !Array.isArray(entry) ||
       entry.length !== 2 ||
       typeof entry[0] !== "string" ||
-      typeof entry[1] !== "string"
+      typeof entry[1] !== "string" ||
+      entry[0].length === 0 ||
+      entry[0].length > MAX_SECRET_SERVICE_ATTRIBUTE_KEY_LENGTH ||
+      entry[1].length > MAX_SECRET_SERVICE_ATTRIBUTE_VALUE_LENGTH ||
+      !/^[\x20-\x7e]+$/.test(entry[0]) ||
+      entry[1].includes("\u0000") ||
+      Object.hasOwn(attributes, entry[0])
     ) {
-      throw new Error("Secret Service returned malformed item attributes");
+      throw compatibilityError(
+        "SECURE_STORE_DBUS_ATTRIBUTES_INVALID",
+        "Secret Service returned malformed item attributes",
+      );
     }
     attributes[entry[0]] = entry[1];
   }
@@ -583,7 +893,10 @@ export async function enumerateSecretServiceMetadata(
   const remainingTime = (): number => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error("Secret Service metadata request timed out");
+      throw compatibilityError(
+        "SECURE_STORE_DBUS_REQUEST_TIMEOUT",
+        "Secret Service metadata request timed out",
+      );
     }
     return remaining;
   };
@@ -595,11 +908,13 @@ export async function enumerateSecretServiceMetadata(
     "ao",
     remainingTime(),
   );
-  const collections = requireObjectPaths(collectionValue);
-  if (collections.length > MAX_SECRET_SERVICE_COLLECTIONS) {
-    throw new Error("Secret Service returned too many collections");
-  }
+  const collections = requireObjectPaths(
+    collectionValue,
+    MAX_SECRET_SERVICE_COLLECTIONS,
+    "collections",
+  );
   const itemPaths = new Set<string>();
+  let rawItemEntries = 0;
   for (const collection of collections) {
     const itemsValue = await readSecretServiceProperty(
       bus,
@@ -609,10 +924,26 @@ export async function enumerateSecretServiceMetadata(
       "ao",
       remainingTime(),
     );
-    for (const item of requireObjectPaths(itemsValue)) {
+    if (Array.isArray(itemsValue)) {
+      rawItemEntries += itemsValue.length;
+      if (rawItemEntries > MAX_SECRET_SERVICE_ITEMS) {
+        throw compatibilityError(
+          "SECURE_STORE_DBUS_PATH_LIMIT_EXCEEDED",
+          "Secret Service returned too many items",
+        );
+      }
+    }
+    for (const item of requireObjectPaths(
+      itemsValue,
+      MAX_SECRET_SERVICE_ITEMS,
+      "items",
+    )) {
       itemPaths.add(item);
       if (itemPaths.size > MAX_SECRET_SERVICE_ITEMS) {
-        throw new Error("Secret Service returned too many items");
+        throw compatibilityError(
+          "SECURE_STORE_DBUS_PATH_LIMIT_EXCEEDED",
+          "Secret Service returned too many items",
+        );
       }
     }
   }
@@ -631,6 +962,17 @@ export async function enumerateSecretServiceMetadata(
     const service = attributes.service;
     const account = attributes.account;
     if (!service || !account) continue;
+    if (
+      service.length > MAX_METADATA_FIELD_LENGTH ||
+      account.length > MAX_METADATA_FIELD_LENGTH ||
+      !/^[\x20-\x7e]+$/.test(service) ||
+      !/^[\x20-\x7e]+$/.test(account)
+    ) {
+      throw compatibilityError(
+        "SECURE_STORE_METADATA_FIELD_INVALID",
+        "Secret Service returned invalid lookup attributes",
+      );
+    }
     refs.push({
       sourceId: item,
       targetId: `${service}\u0000${account}`,

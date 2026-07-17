@@ -10,11 +10,20 @@ import { useCallback, useRef, useState } from "react";
 import { client } from "../api";
 import { getActiveProfile, updateAgentProfile } from "./agent-profiles";
 import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+  type RendererCredentialWriteGeneration,
+} from "./credential-storage-keys";
+import {
   loadPersistedActiveServer,
   savePersistedActiveServer,
 } from "./persistence";
 
-export function persistPairedToken(token: string): void {
+export function persistPairedToken(
+  token: string,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
+  if (!isRendererCredentialWriteAllowed(generation)) return;
   const activeServer = loadPersistedActiveServer();
   if (activeServer && activeServer.kind !== "local") {
     savePersistedActiveServer({ ...activeServer, accessToken: token });
@@ -22,7 +31,7 @@ export function persistPairedToken(token: string): void {
 
   const activeProfile = getActiveProfile();
   if (activeProfile && activeProfile.kind !== "local") {
-    updateAgentProfile(activeProfile.id, { accessToken: token });
+    updateAgentProfile(activeProfile.id, { accessToken: token }, generation);
   }
 }
 
@@ -44,9 +53,11 @@ export function usePairingState() {
     setPairingError(null);
     pairingBusyRef.current = true;
     setPairingBusy(true);
+    const credentialGeneration = captureRendererCredentialWriteGeneration();
     try {
       const { token } = await client.pair(code);
-      persistPairedToken(token);
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
+      persistPairedToken(token, credentialGeneration);
       client.setToken(token);
       window.location.reload();
     } catch (err) {

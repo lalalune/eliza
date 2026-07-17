@@ -65,12 +65,16 @@ export function getWakeTelemetry(): Readonly<WakeTelemetry> {
   return { ...wakeTelemetry };
 }
 
-// Resets between tests; not exported through the public barrel.
-export function __resetWakeTelemetryForTests(): void {
+function clearWakeTelemetry(): void {
   wakeTelemetry.lastWakeFiredAt = null;
   wakeTelemetry.lastWakeKind = null;
   wakeTelemetry.lastWakeDurationMs = null;
   wakeTelemetry.lastWakeError = null;
+}
+
+// Resets between tests; not exported through the public barrel.
+export function __resetWakeTelemetryForTests(): void {
+  clearWakeTelemetry();
 }
 
 /**
@@ -171,6 +175,26 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 let runDueTasksInFlight: Promise<unknown> | null = null;
+
+/**
+ * Invalidates the wake bearer and process telemetry during destructive reset.
+ * The credential-state barrier must drain a wake already running; refusing an
+ * active task keeps reset from reporting success while retired runtime work is
+ * still executing.
+ */
+export function resetInternalWakeStateForAgentReset(): void {
+  if (runDueTasksInFlight !== null) {
+    throw new Error("cannot reset internal wake state while a task is running");
+  }
+  const secretPath = getDeviceSecretPath();
+  fs.rmSync(secretPath, { force: true });
+  if (fs.existsSync(secretPath)) {
+    throw new Error(`device wake secret survived agent reset: ${secretPath}`);
+  }
+  cachedDeviceSecret = null;
+  delete process.env.ELIZA_DEVICE_SECRET;
+  clearWakeTelemetry();
+}
 
 async function runDueTasksOnce(
   service: Service & TaskServiceLike,

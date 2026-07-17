@@ -99,24 +99,23 @@ afterEach(() => {
 });
 
 describe("success path", () => {
-  it("adopts the login, retires the source, and stores exactly the retired bytes", () => {
+  it("adopts the login and destroys the retired plaintext source", () => {
     const codexHome = path.join(home, "codex");
     const authPath = writeCodexAuth(codexHome, "refresh-1");
+    const source = JSON.parse(readFileSync(authPath, "utf-8")) as {
+      tokens: { access_token: string; refresh_token: string };
+    };
 
     const result = adoptCodexCliLogin({ codexHome, accountId: "pool-a" });
 
-    // Source is gone from the CLI read path; the retired copy exists.
+    // Both the CLI source and temporary ownership-transfer copy are gone.
     expect(existsSync(authPath)).toBe(false);
-    expect(existsSync(result.retiredTo)).toBe(true);
+    expect(result.sourceDestroyed).toBe(true);
+    expect(retiredFilesIn(codexHome)).toHaveLength(0);
 
-    // Pool credentials are byte-identical to the retired file's tokens — the
-    // invariant that makes adoption race-safe against concurrent refreshes.
-    const retired = JSON.parse(readFileSync(result.retiredTo, "utf-8")) as {
-      tokens: { access_token: string; refresh_token: string };
-    };
     const account = loadAccount("openai-codex", "pool-a");
-    expect(account?.credentials.access).toBe(retired.tokens.access_token);
-    expect(account?.credentials.refresh).toBe(retired.tokens.refresh_token);
+    expect(account?.credentials.access).toBe(source.tokens.access_token);
+    expect(account?.credentials.refresh).toBe(source.tokens.refresh_token);
     expect(account?.credentials.idToken).toBe("id.token.codex");
     expect(result.organizationId).toBe("acct-abc");
   });
@@ -132,7 +131,7 @@ describe("success path", () => {
     );
   });
 
-  it("repeated adoption preserves every retired artifact (no-clobber retirement)", () => {
+  it("repeated adoption leaves no retired plaintext artifacts", () => {
     const codexHome = path.join(home, "codex");
     writeCodexAuth(codexHome, "refresh-first");
     const first = adoptCodexCliLogin({ codexHome, accountId: "pool-a" });
@@ -144,10 +143,9 @@ describe("success path", () => {
       overwrite: true,
     });
 
-    expect(first.retiredTo).not.toBe(second.retiredTo);
-    expect(retiredFilesIn(codexHome)).toHaveLength(2);
-    expect(readFileSync(first.retiredTo, "utf-8")).toContain("refresh-first");
-    expect(readFileSync(second.retiredTo, "utf-8")).toContain("refresh-second");
+    expect(first.sourceDestroyed).toBe(true);
+    expect(second.sourceDestroyed).toBe(true);
+    expect(retiredFilesIn(codexHome)).toHaveLength(0);
     // The pool holds the latest adoption.
     expect(loadAccount("openai-codex", "pool-a")?.credentials.refresh).toBe(
       "refresh-second",
@@ -417,7 +415,8 @@ describe("two-process concurrency", () => {
         () => adoptCodexCliLogin({ codexHome, accountId: "race" }),
         "adopt_codex.concurrent_refresher",
       );
-      expect(existsSync(String(error.context?.retiredTo))).toBe(true);
+      expect(existsSync(String(error.context?.retiredTo))).toBe(false);
+      expect(retiredFilesIn(codexHome)).toHaveLength(0);
       expect(loadAccount("openai-codex", "race")).toBeNull();
       expect(await writerDone).toBe(0);
     } finally {

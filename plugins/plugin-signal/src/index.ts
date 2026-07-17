@@ -12,7 +12,11 @@ import { createSignalConnectorAccountProvider } from "./connector-account-provid
 import { DEFAULT_SIGNAL_CLI_PATH, SignalService } from "./service";
 
 // Setup routes (QR pairing / disconnect)
-import { signalSetupRoutes } from "./setup-routes";
+import {
+  enableSignalPairingSessions,
+  signalSetupRoutes,
+  stopAllSignalPairingSessions,
+} from "./setup-routes";
 
 // Cross-connector triage adapter
 import { registerSignalTriageAdapter } from "./triage-adapter";
@@ -43,6 +47,7 @@ const signalPlugin: Plugin = {
     connectorKeys: ["signal"],
   },
   init: async (_config: Record<string, string>, runtime: IAgentRuntime) => {
+    enableSignalPairingSessions();
     // Register the Signal provider with the ConnectorAccountManager so the
     // HTTP CRUD surface (packages/agent/src/api/connector-account-routes.ts)
     // can list, create, patch, and delete Signal accounts.
@@ -122,8 +127,23 @@ const signalPlugin: Plugin = {
     );
   },
   async dispose(runtime: IAgentRuntime) {
+    const errors: Error[] = [];
+    try {
+      await stopAllSignalPairingSessions();
+    } catch (error) {
+      // error-policy:J6 Service teardown still runs before disposal reports every failure.
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
     const svc = runtime.getService<SignalService>(SignalService.serviceType);
-    await svc?.stop();
+    try {
+      await svc?.stop();
+    } catch (error) {
+      // error-policy:J6 Disposal aggregates service failure with pairing-session teardown failure.
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Failed to dispose Signal plugin");
+    }
   },
 };
 

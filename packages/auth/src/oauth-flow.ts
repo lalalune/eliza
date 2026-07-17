@@ -24,6 +24,7 @@ import {
   type AccountCredentialRecord,
   listAccounts,
   loadAccount,
+  runWithAccountAuthGeneration,
   saveAccount,
 } from "./account-storage.ts";
 import { startCodexDeviceLogin } from "./codex-device.ts";
@@ -98,6 +99,17 @@ interface InternalFlowEntry {
 }
 
 const flows = new Map<string, InternalFlowEntry>();
+
+/** Cancels every interactive login and drops its in-memory PKCE/session state. */
+export function cancelAllOAuthFlowsForReset(): void {
+  for (const [sessionId, entry] of flows) {
+    if (entry.state.status === "pending") {
+      entry.handle.cancel("Agent reset");
+    }
+    if (entry.gcTimer) clearTimeout(entry.gcTimer);
+    flows.delete(sessionId);
+  }
+}
 
 function newSessionId(): string {
   return crypto.randomUUID();
@@ -357,6 +369,15 @@ interface VendorFlow {
 }
 
 async function startGenericFlow(args: {
+  providerId: SubscriptionProvider;
+  opts: StartOptions;
+  needsCodeSubmission: boolean;
+  begin: () => Promise<VendorFlow>;
+}): Promise<OAuthFlowHandle> {
+  return runWithAccountAuthGeneration(() => startGenericFlowInGeneration(args));
+}
+
+async function startGenericFlowInGeneration(args: {
   providerId: SubscriptionProvider;
   opts: StartOptions;
   needsCodeSubmission: boolean;

@@ -8,6 +8,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { runAgentSessionRecovery } from "./agent-session-recovery-runner";
+import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+} from "./credential-storage-keys";
 
 function jsonResponse(
   status: number,
@@ -100,8 +104,53 @@ describe("runAgentSessionRecovery", () => {
     expect(result).toEqual({ ok: true, redirectUrl, mode: "in-process" });
     expect(navigate).not.toHaveBeenCalled();
     expect(exchangePairToken).toHaveBeenCalledWith("one-time");
-    expect(persistPairApiToken).toHaveBeenCalledWith("agent-api-key");
-    expect(onPairedInProcess).toHaveBeenCalledWith("agent-api-key");
+    expect(persistPairApiToken).toHaveBeenCalledWith(
+      "agent-api-key",
+      expect.any(Number),
+    );
+    expect(onPairedInProcess).toHaveBeenCalledWith(
+      "agent-api-key",
+      expect.any(Number),
+    );
+  });
+
+  it("drops an in-process pair exchange invalidated by destructive reset", async () => {
+    const redirectUrl = "https://agent.elizacloud.ai/pair?token=one-time";
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(200, { data: { redirectUrl } }));
+    let resolveExchange: ((apiToken: string) => void) | undefined;
+    const exchangePairToken = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveExchange = resolve;
+        }),
+    );
+    const persistPairApiToken = vi.fn();
+    const onPairedInProcess = vi.fn();
+
+    const recoveryPromise = runAgentSessionRecovery({
+      ...baseDeps,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      navigate: vi.fn(),
+      consumeRedirectInProcess: true,
+      exchangePairToken,
+      persistPairApiToken,
+      onPairedInProcess,
+    });
+    await vi.waitFor(() => expect(resolveExchange).toBeTypeOf("function"));
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      resolveExchange?.("late-agent-api-key");
+      await expect(recoveryPromise).resolves.toMatchObject({
+        ok: false,
+        reason: "error",
+      });
+      expect(persistPairApiToken).not.toHaveBeenCalled();
+      expect(onPairedInProcess).not.toHaveBeenCalled();
+    } finally {
+      finishRendererCredentialReset(resetGeneration);
+    }
   });
 
   it("does NOT navigate on 401, the cloud session is invalid, wall stands", async () => {

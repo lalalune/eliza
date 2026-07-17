@@ -1,39 +1,14 @@
 /**
  * Regression tests for #7409: `_clearCompatPgliteDataDirForTests` must stop the
  * runtime and delete the `.elizadb` PGlite data dir purely in-process, never
- * issuing a loopback HTTP request (which would deadlock the reset hop). Also
- * asserts the delete still runs when `runtime.stop()` never resolves (watchdog
- * timeout via fake timers), the safety guard refusing any dir not named
- * `.elizadb`, and tolerance of a missing data dir. `@elizaos/core` logger and
- * `@elizaos/agent` path resolvers are mocked to keep the reset hermetic.
+ * issuing a loopback HTTP request (which would deadlock the reset hop). It also
+ * proves stop timeouts, unsafe paths, and filesystem failures reject reset
+ * instead of reporting success with live state still present.
  */
 import fs, { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-vi.mock(import("@elizaos/core"), async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    logger: {
-      ...actual.logger,
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  };
-});
-
-vi.mock(import("@elizaos/agent"), async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    resolveDefaultAgentWorkspaceDir: () => process.env.HOME ?? tmpdir(),
-    resolveUserPath: (p: string) => p,
-  };
-});
 
 import { _clearCompatPgliteDataDirForTests } from "./server";
 
@@ -62,8 +37,8 @@ describe("server reset hop (regression for #7409)", () => {
     }) as unknown as typeof globalThis.fetch;
     globalThis.fetch = fetchSpy;
 
-    const stop = vi.fn().mockResolvedValue(undefined);
-    const runtime = { stop } as unknown as Parameters<
+    const teardownForReset = vi.fn().mockResolvedValue(undefined);
+    const runtime = { teardownForReset } as unknown as Parameters<
       typeof _clearCompatPgliteDataDirForTests
     >[0];
 
@@ -75,35 +50,37 @@ describe("server reset hop (regression for #7409)", () => {
     await _clearCompatPgliteDataDirForTests(runtime, config);
     const elapsedMs = Date.now() - start;
 
-    expect(stop).toHaveBeenCalledTimes(1);
+    expect(teardownForReset).toHaveBeenCalledTimes(1);
     expect(fs.existsSync(elizadb)).toBe(false);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(elapsedMs).toBeLessThan(2000);
   });
 
-  it("deletes the data dir even when runtime.stop() never resolves", async () => {
+  it("fails without deleting when runtime.stop() never resolves", async () => {
     vi.useFakeTimers();
     try {
-      const stop = vi.fn(() => new Promise<void>(() => {}));
-      const runtime = { stop } as unknown as Parameters<
+      const teardownForReset = vi.fn(() => new Promise<void>(() => {}));
+      const runtime = { teardownForReset } as unknown as Parameters<
         typeof _clearCompatPgliteDataDirForTests
       >[0];
       const config = {
         database: { pglite: { dataDir: elizadb } },
       } as Parameters<typeof _clearCompatPgliteDataDirForTests>[1];
 
-      const pending = _clearCompatPgliteDataDirForTests(runtime, config);
+      const pending = expect(
+        _clearCompatPgliteDataDirForTests(runtime, config),
+      ).rejects.toMatchObject({ code: "AGENT_RESET_RUNTIME_STOP_TIMEOUT" });
       await vi.advanceTimersByTimeAsync(20_000);
       await pending;
 
-      expect(stop).toHaveBeenCalledTimes(1);
-      expect(fs.existsSync(elizadb)).toBe(false);
+      expect(teardownForReset).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(elizadb)).toBe(true);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("refuses to delete an unexpected directory name (safety guard)", async () => {
+  it("rejects an unexpected directory name without deleting it", async () => {
     const wrongDir = join(dataParent, "not-elizadb");
     fs.mkdirSync(wrongDir, { recursive: true });
     writeFileSync(join(wrongDir, "marker"), "x");
@@ -112,7 +89,9 @@ describe("server reset hop (regression for #7409)", () => {
       database: { pglite: { dataDir: wrongDir } },
     } as Parameters<typeof _clearCompatPgliteDataDirForTests>[1];
 
-    await _clearCompatPgliteDataDirForTests(null, config);
+    await expect(
+      _clearCompatPgliteDataDirForTests(null, config),
+    ).rejects.toMatchObject({ code: "AGENT_RESET_DATABASE_PATH_UNSAFE" });
 
     expect(fs.existsSync(wrongDir)).toBe(true);
   });
@@ -126,5 +105,19 @@ describe("server reset hop (regression for #7409)", () => {
     await expect(
       _clearCompatPgliteDataDirForTests(null, config),
     ).resolves.toBeUndefined();
+  });
+
+  it("surfaces filesystem deletion failures", async () => {
+    vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
+      throw new Error("permission denied");
+    });
+    const config = {
+      database: { pglite: { dataDir: elizadb } },
+    } as Parameters<typeof _clearCompatPgliteDataDirForTests>[1];
+
+    await expect(
+      _clearCompatPgliteDataDirForTests(null, config),
+    ).rejects.toMatchObject({ code: "AGENT_RESET_DATABASE_DELETE_FAILED" });
+    expect(fs.existsSync(elizadb)).toBe(true);
   });
 });

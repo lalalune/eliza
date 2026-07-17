@@ -144,6 +144,7 @@ export class SecretsManagerInstaller {
   private readonly jobs = new Map<string, MutableJob>();
   private readonly manager: SecretsManager;
   private readonly spawn: SpawnFn;
+  private closed = false;
 
   constructor(deps: InstallerDependencies) {
     this.manager = deps.manager;
@@ -168,6 +169,7 @@ export class SecretsManagerInstaller {
     id: InstallableBackendId,
     method: InstallMethod,
   ): InstallJobSnapshot {
+    this.assertOpen();
     if (method.kind === "manual") {
       throw new TypeError(
         `Cannot automate install for "${id}": method is manual. Direct the user to ${method.url}`,
@@ -195,7 +197,9 @@ export class SecretsManagerInstaller {
     this.jobs.set(job.id, job);
     this.evictTerminalJobs();
 
-    setImmediate(() => this.runInstallJob(job, built.command, built.args));
+    setImmediate(() => {
+      if (!this.closed) this.runInstallJob(job, built.command, built.args);
+    });
 
     return snapshotOf(job);
   }
@@ -244,6 +248,7 @@ export class SecretsManagerInstaller {
    * Throws on validation or CLI failure with a message safe to surface to UI.
    */
   async signIn(request: SigninRequest): Promise<SigninResult> {
+    this.assertOpen();
     if (request.backendId === "1password") {
       return this.signInOnePassword(request);
     }
@@ -256,15 +261,42 @@ export class SecretsManagerInstaller {
   }
 
   async signOut(backendId: InstallableBackendId): Promise<void> {
+    this.assertOpen();
     if (await this.manager.has(sessionKey(backendId))) {
+      this.assertOpen();
       await this.manager.remove(sessionKey(backendId));
     }
   }
 
   /** Read the cached session token (or null if not signed in). */
   async getSession(backendId: InstallableBackendId): Promise<string | null> {
+    this.assertOpen();
     if (!(await this.manager.has(sessionKey(backendId)))) return null;
+    this.assertOpen();
     return this.manager.get(sessionKey(backendId));
+  }
+
+  /**
+   * Invalidates this facade and terminates process-owned install jobs before a
+   * destructive reset replaces the vault. Late async sign-in continuations
+   * observe the closed flag before they can persist a session into the retired
+   * vault.
+   */
+  closeForAgentReset(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const job of this.jobs.values()) {
+      if (job.status === "pending" || job.status === "running") {
+        job.status = "cancelled";
+        job.endedAt = Date.now();
+        job.errorMessage = "Agent reset";
+        this.emit(job, { type: "error", message: "Agent reset" });
+        job.child?.kill("SIGKILL");
+      }
+      job.child = null;
+      job.emitter.removeAllListeners();
+    }
+    this.jobs.clear();
   }
 
   // ── Internals ────────────────────────────────────────────────────────────
@@ -274,6 +306,7 @@ export class SecretsManagerInstaller {
     command: string,
     args: readonly string[],
   ): void {
+    if (this.closed) return;
     this.transition(job, "running");
     const child = this.spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -294,6 +327,7 @@ export class SecretsManagerInstaller {
     pipeLines(child.stderr, (line) => onLine("stderr", line));
 
     child.on("error", (err) => {
+      if (this.closed) return;
       // ENOENT here means the package manager binary disappeared between
       // detection and spawn — surface explicitly rather than masking as
       // exitCode=1.
@@ -307,6 +341,7 @@ export class SecretsManagerInstaller {
     });
 
     child.on("close", (code) => {
+      if (this.closed) return;
       const exitCode = code ?? 1;
       job.exitCode = exitCode;
       if (exitCode === 0) {
@@ -344,6 +379,12 @@ export class SecretsManagerInstaller {
     this.transition(job, final);
     job.emitter.removeAllListeners();
     job.child = null;
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error("secrets manager installer is closed for agent reset");
+    }
   }
 
   // ── Sign-in flows ────────────────────────────────────────────────────────
@@ -414,6 +455,7 @@ export class SecretsManagerInstaller {
       );
     }
 
+    this.assertOpen();
     await this.manager.vault.set(sessionKey("1password"), sessionToken, {
       sensitive: true,
       caller: "secrets-manager-installer",
@@ -486,6 +528,7 @@ export class SecretsManagerInstaller {
       );
     }
 
+    this.assertOpen();
     await this.manager.vault.set(sessionKey("bitwarden"), sessionToken, {
       sensitive: true,
       caller: "secrets-manager-installer",
@@ -613,14 +656,22 @@ export function getSecretsManagerInstaller(
   return _installer;
 }
 
+/** Closes and forgets the installer bound to the vault being destroyed. */
+export function resetSecretsManagerInstallerForAgentReset(): void {
+  const current = _installer;
+  _installer = null;
+  current?.closeForAgentReset();
+}
+
 /** Test hook. Replace the singleton entirely (e.g. with a fake spawn). */
 export function _setSecretsManagerInstallerForTesting(
   next: SecretsManagerInstaller | null,
 ): void {
+  resetSecretsManagerInstallerForAgentReset();
   _installer = next;
 }
 
 /** Test hook. */
 export function _resetSecretsManagerInstallerForTesting(): void {
-  _installer = null;
+  resetSecretsManagerInstallerForAgentReset();
 }

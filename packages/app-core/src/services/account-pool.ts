@@ -25,7 +25,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import type { AccountCredentialRecord } from "@elizaos/auth/account-storage";
+import {
+  type AccountCredentialRecord,
+  assertAccountAuthWritesEnabled,
+  resolveAccountAuthRoot,
+  runWithAccountAuthGeneration,
+} from "@elizaos/auth/account-storage";
 import {
   getAccessToken as getAccountAccessToken,
   listProviderAccounts,
@@ -41,8 +46,8 @@ import {
 import {
   type AnthropicAccountPoolBridge,
   logger,
-  resolveStateDir,
   setAnthropicAccountPoolBridge,
+  setCodingAgentSelectorBridge,
 } from "@elizaos/core";
 import type {
   LinkedAccountConfig,
@@ -53,6 +58,7 @@ import type {
   LinkedAccountUsage,
 } from "@elizaos/shared/contracts/service-routing";
 import { isLinkedAccountProviderId } from "@elizaos/shared/contracts/service-routing";
+import { withCredentialStateMutation } from "../security/credential-state-lock";
 import {
   pollAnthropicUsage,
   pollCodexUsage,
@@ -960,12 +966,8 @@ interface PoolMetaFields {
 
 type PoolMetaStore = Record<PoolProviderId, Record<string, PoolMetaFields>>;
 
-function authRoot(): string {
-  return path.join(process.env.ELIZA_HOME || resolveStateDir(), "auth");
-}
-
 function metadataFile(): string {
-  return path.join(authRoot(), "_pool-metadata.json");
+  return path.join(resolveAccountAuthRoot(), "_pool-metadata.json");
 }
 
 function readMetaStore(): PoolMetaStore {
@@ -986,6 +988,7 @@ function readMetaStore(): PoolMetaStore {
 }
 
 function writeMetaStore(store: PoolMetaStore): void {
+  assertAccountAuthWritesEnabled();
   const file = metadataFile();
   const dir = path.dirname(file);
   if (!existsSync(dir)) {
@@ -1135,6 +1138,46 @@ async function deleteAccountMeta(
 let cachedDefaultPool: AccountPool | null = null;
 let defaultSelectionConfig: AccountPoolSelectionConfig = {};
 
+interface ManagedEnvironmentValue {
+  baseline: string | undefined;
+  applied: string;
+}
+
+const managedAccountPoolEnvironment = new Map<
+  string,
+  ManagedEnvironmentValue
+>();
+
+/**
+ * Account selection may temporarily overlay launch-time provider settings.
+ * Remember the value that preceded our latest ownership interval so reset can
+ * remove pool credentials without erasing a key changed by another subsystem.
+ */
+function applyAccountPoolEnvironment(
+  key: string,
+  value: string,
+  opts: { onlyIfAbsent?: boolean } = {},
+): void {
+  if (opts.onlyIfAbsent && process.env[key] !== undefined) return;
+
+  const existing = managedAccountPoolEnvironment.get(key);
+  const baseline =
+    existing && process.env[key] === existing.applied
+      ? existing.baseline
+      : process.env[key];
+  process.env[key] = value;
+  managedAccountPoolEnvironment.set(key, { baseline, applied: value });
+}
+
+function restoreAccountPoolEnvironment(): void {
+  for (const [key, managed] of managedAccountPoolEnvironment) {
+    if (process.env[key] !== managed.applied) continue;
+    if (managed.baseline === undefined) delete process.env[key];
+    else process.env[key] = managed.baseline;
+  }
+  managedAccountPoolEnvironment.clear();
+}
+
 function normalizeStrategy(value: unknown): Strategy | undefined {
   return value === "priority" ||
     value === "round-robin" ||
@@ -1244,6 +1287,16 @@ export async function applyAccountPoolApiCredentials(
     serviceRouting?: AccountPoolSelectionConfig["serviceRouting"];
   } = {},
 ): Promise<void> {
+  await withCredentialStateMutation(() =>
+    applyAccountPoolApiCredentialsUnlocked(opts),
+  );
+}
+
+async function applyAccountPoolApiCredentialsUnlocked(opts: {
+  activeBackend?: string | null;
+  accountStrategies?: AccountPoolSelectionConfig["accountStrategies"];
+  serviceRouting?: AccountPoolSelectionConfig["serviceRouting"];
+}): Promise<void> {
   configureDefaultAccountPoolSelection({
     accountStrategies: opts.accountStrategies,
     serviceRouting: opts.serviceRouting,
@@ -1270,12 +1323,14 @@ export async function applyAccountPoolApiCredentials(
     if (!token) continue;
 
     const envKey = DIRECT_ACCOUNT_PROVIDER_ENV[providerId];
-    process.env[envKey] = token;
+    applyAccountPoolEnvironment(envKey, token);
     if (activeProvider === providerId) {
       activeProviderToken = token;
     }
     if (providerId === "zai-api") {
-      process.env.Z_AI_API_KEY ??= token;
+      applyAccountPoolEnvironment("Z_AI_API_KEY", token, {
+        onlyIfAbsent: true,
+      });
     }
 
     const openAiCompatibleBase =
@@ -1283,8 +1338,8 @@ export async function applyAccountPoolApiCredentials(
         ? OPENAI_COMPAT_BASE_BY_DIRECT_PROVIDER[providerId]
         : undefined;
     if (openAiCompatibleBase) {
-      process.env.OPENAI_API_KEY = token;
-      process.env.OPENAI_BASE_URL = openAiCompatibleBase;
+      applyAccountPoolEnvironment("OPENAI_API_KEY", token);
+      applyAccountPoolEnvironment("OPENAI_BASE_URL", openAiCompatibleBase);
     }
   }
 
@@ -1302,8 +1357,8 @@ export async function applyAccountPoolApiCredentials(
       : undefined;
     const token = activeProviderToken;
     if (openAiCompatibleBase && token) {
-      process.env.OPENAI_API_KEY = token;
-      process.env.OPENAI_BASE_URL = openAiCompatibleBase;
+      applyAccountPoolEnvironment("OPENAI_API_KEY", token);
+      applyAccountPoolEnvironment("OPENAI_BASE_URL", openAiCompatibleBase);
     }
   }
 }
@@ -1438,6 +1493,14 @@ function resolveKeepAliveDeps(
 export async function sweepAccountPoolKeepAlive(
   deps: AccountPoolKeepAliveDeps = {},
 ): Promise<AccountPoolKeepAliveResult> {
+  return withCredentialStateMutation(() =>
+    runWithAccountAuthGeneration(() => sweepAccountPoolKeepAliveUnlocked(deps)),
+  );
+}
+
+async function sweepAccountPoolKeepAliveUnlocked(
+  deps: AccountPoolKeepAliveDeps = {},
+): Promise<AccountPoolKeepAliveResult> {
   const pool = getDefaultAccountPool();
   const keepAliveDeps = resolveKeepAliveDeps(deps);
   const result: AccountPoolKeepAliveResult = {
@@ -1570,12 +1633,24 @@ export function startAccountPoolKeepAlive(
   run();
 }
 
-export function stopAccountPoolKeepAliveForTests(): void {
+export function stopAccountPoolKeepAlive(): void {
   if (keepAliveTimer) {
     clearInterval(keepAliveTimer);
     keepAliveTimer = null;
   }
   keepAliveRunning = false;
+}
+
+export const stopAccountPoolKeepAliveForTests = stopAccountPoolKeepAlive;
+
+/** Quiesces the process-global pool before its backing auth tree is removed. */
+export function closeAccountPoolForCredentialReset(): void {
+  stopAccountPoolKeepAlive();
+  cachedDefaultPool = null;
+  defaultSelectionConfig = {};
+  setAnthropicAccountPoolBridge(null);
+  setCodingAgentSelectorBridge(null);
+  restoreAccountPoolEnvironment();
 }
 
 /**
@@ -1617,7 +1692,7 @@ function installAnthropicBridge(pool: AccountPool): void {
  * Resets the cached singleton. Test-only.
  */
 export function __resetDefaultAccountPoolForTests(): void {
-  stopAccountPoolKeepAliveForTests();
+  stopAccountPoolKeepAlive();
   cachedDefaultPool = null;
 }
 

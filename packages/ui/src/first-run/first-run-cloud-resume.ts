@@ -18,7 +18,7 @@
 import { shellLocalStorage } from "../surface-realm-channel";
 import type { FirstRunLocalInference, FirstRunProfileDraft } from "./first-run";
 
-const CLOUD_RESUME_STORAGE_KEY = "eliza:first-run:cloud-resume";
+export const CLOUD_RESUME_STORAGE_KEY = "eliza:first-run:cloud-resume";
 
 export interface CloudResumeMarker {
   /** Which runtime initiated the cloud login (drives the resume branch). */

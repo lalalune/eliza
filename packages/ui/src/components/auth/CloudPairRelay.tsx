@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
 import { getBootConfig, setBootConfig } from "../../config/boot-config";
+import {
+  assertRendererCredentialWriteAllowed,
+  CLOUD_PAIR_SESSION_STORAGE_KEY,
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+  type RendererCredentialWriteGeneration,
+} from "../../state/credential-storage-keys";
 import { setElizaApiToken } from "../../utils/eliza-globals";
 
-export const CLOUD_PAIR_SESSION_STORAGE_KEY = "eliza:cloud-pair:api-token";
+export { CLOUD_PAIR_SESSION_STORAGE_KEY };
 
 interface PairExchangeResponse {
   apiKey?: unknown;
@@ -109,9 +116,13 @@ function tryPersistCloudPairSessionToken(apiToken: string): boolean {
   }
 }
 
-export function persistCloudPairApiToken(apiToken: string): void {
+export function persistCloudPairApiToken(
+  apiToken: string,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
   const token = apiToken.trim();
   if (!token) throw new Error("Missing cloud pair API token.");
+  assertRendererCredentialWriteAllowed(generation);
 
   tryPersistCloudPairSessionToken(token);
 
@@ -138,7 +149,10 @@ export type CloudPairExchangeFn = (
 export interface CloudPairRelayProps {
   token: string;
   exchangeFn?: CloudPairExchangeFn;
-  persistFn?: (apiToken: string) => void;
+  persistFn?: (
+    apiToken: string,
+    generation?: RendererCredentialWriteGeneration,
+  ) => void;
   onPaired?: () => void;
 }
 
@@ -204,12 +218,18 @@ export function CloudPairRelay({
 
   useEffect(() => {
     const controller = new AbortController();
+    const credentialGeneration = captureRendererCredentialWriteGeneration();
     let active = true;
 
     exchangeFn(token, { signal: controller.signal })
       .then((apiToken) => {
-        if (!active) return;
-        persistFn(apiToken);
+        if (
+          !active ||
+          !isRendererCredentialWriteAllowed(credentialGeneration)
+        ) {
+          return;
+        }
+        persistFn(apiToken, credentialGeneration);
         onPaired();
       })
       .catch((error) => {

@@ -55,6 +55,8 @@ describe("agent host bridge (downward injection seam)", () => {
     let keepAliveStarted = false;
     const installed: AgentHostBridge = {
       captureWalletEnvBootBaseline: () => undefined,
+      withCredentialStateMutation: (operation) => operation(),
+      withIndependentCredentialStateMutation: (operation) => operation(),
       hydrateWalletKeysFromNodePlatformSecureStore: () => undefined,
       runVaultBootstrap: () => Promise.resolve({ migrated: 3, failed: [] }),
       sharedVault: defaultAgentHostBridge.sharedVault,
@@ -91,5 +93,66 @@ describe("agent host bridge (downward injection seam)", () => {
 
     _resetAgentHostBridge();
     expect(getAgentHostBridge()).toBe(defaultAgentHostBridge);
+  });
+
+  it("drains an accepted standalone writer and rejects later writers during reset", async () => {
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    const events: string[] = [];
+    const writer = defaultAgentHostBridge.withCredentialStateMutation(
+      async () => {
+        events.push("writer-start");
+        await writerGate;
+        events.push("writer-end");
+      },
+    );
+    await Promise.resolve();
+
+    const resetBarrier = defaultAgentHostBridge.withCredentialStateReset;
+    if (!resetBarrier) throw new Error("default reset barrier is missing");
+    const reset = resetBarrier(async () => {
+      events.push("reset");
+    });
+    await Promise.resolve();
+    await expect(
+      defaultAgentHostBridge.withCredentialStateMutation(async () => undefined),
+    ).rejects.toMatchObject({ code: "CREDENTIAL_RESET_IN_PROGRESS" });
+
+    releaseWriter();
+    await Promise.all([writer, reset]);
+    expect(events).toEqual(["writer-start", "writer-end", "reset"]);
+  });
+
+  it("does not let detached work inherit an expired standalone mutation slot", async () => {
+    let releaseDetached!: () => void;
+    const detachedGate = new Promise<void>((resolve) => {
+      releaseDetached = resolve;
+    });
+    let detached!: Promise<string>;
+    await defaultAgentHostBridge.withCredentialStateMutation(async () => {
+      detached = (async () => {
+        await detachedGate;
+        return defaultAgentHostBridge.withIndependentCredentialStateMutation(
+          async () => "late-write",
+        );
+      })();
+    });
+
+    const resetBarrier = defaultAgentHostBridge.withCredentialStateReset;
+    if (!resetBarrier) throw new Error("default reset barrier is missing");
+    let releaseReset!: () => void;
+    const resetGate = new Promise<void>((resolve) => {
+      releaseReset = resolve;
+    });
+    const reset = resetBarrier(() => resetGate);
+    releaseDetached();
+
+    await expect(detached).rejects.toMatchObject({
+      code: "CREDENTIAL_RESET_IN_PROGRESS",
+    });
+    releaseReset();
+    await reset;
   });
 });

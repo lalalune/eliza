@@ -111,9 +111,11 @@ const TELEGRAM_ACCOUNT_AUTH_STATUSES = new Set<TelegramAccountAuthStatus>([
 ]);
 
 function resolveTelegramAccountSessionDir(): string {
-  const sessionDir = path.join(resolveStateDir(), "telegram-account");
-  fs.mkdirSync(sessionDir, { recursive: true });
-  return sessionDir;
+  return path.join(resolveStateDir(), "telegram-account");
+}
+
+function ensureTelegramAccountSessionDir(): void {
+  fs.mkdirSync(resolveTelegramAccountSessionDir(), { recursive: true });
 }
 
 export function resolveTelegramAccountSessionFile(): string {
@@ -133,6 +135,7 @@ export function loadTelegramAccountSessionString(): string {
 }
 
 export function saveTelegramAccountSessionString(session: string): void {
+  ensureTelegramAccountSessionDir();
   fs.writeFileSync(resolveTelegramAccountSessionFile(), session, {
     encoding: "utf8",
     mode: 0o600,
@@ -281,6 +284,7 @@ function loadTelegramAccountAuthState(): PersistedTelegramAccountAuthState | nul
 function saveTelegramAccountAuthState(
   state: PersistedTelegramAccountAuthState,
 ): void {
+  ensureTelegramAccountSessionDir();
   fs.writeFileSync(
     resolveTelegramAccountAuthStateFile(),
     JSON.stringify(state),

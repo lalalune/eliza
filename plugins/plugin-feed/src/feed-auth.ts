@@ -11,7 +11,30 @@ interface FeedAuthToken {
   expiresAt: number;
 }
 
-let cachedToken: FeedAuthToken | null = null;
+interface FeedRuntimeAuthState {
+  cachedToken: FeedAuthToken | null;
+  generation: number;
+  controllers: Set<AbortController>;
+}
+
+interface FeedEnvironmentCredentialOwner {
+  owner: object | null;
+  value: string;
+  baseline: string | undefined;
+}
+
+const runtimeAuthStates = new WeakMap<object, FeedRuntimeAuthState>();
+const runtimeCredentialOwnership = new WeakMap<object, Map<string, string>>();
+const environmentCredentialOwners = new Map<
+  string,
+  FeedEnvironmentCredentialOwner
+>();
+const hostlessAuthState: FeedRuntimeAuthState = {
+  cachedToken: null,
+  generation: 0,
+  controllers: new Set(),
+};
+let hostlessCredentialOwnership = new Map<string, string>();
 
 interface RuntimeLike {
   agentId?: string;
@@ -26,6 +49,38 @@ interface RuntimeLike {
 
 export function asRuntimeLike(value: unknown): RuntimeLike | null {
   return value && typeof value === "object" ? (value as RuntimeLike) : null;
+}
+
+function runtimeIdentity(
+  runtime: IAgentRuntime | RuntimeLike | null,
+): object | null {
+  return runtime && typeof runtime === "object" ? runtime : null;
+}
+
+function authStateFor(
+  runtime: IAgentRuntime | RuntimeLike | null,
+): FeedRuntimeAuthState {
+  const identity = runtimeIdentity(runtime);
+  if (!identity) return hostlessAuthState;
+  let state = runtimeAuthStates.get(identity);
+  if (!state) {
+    state = { cachedToken: null, generation: 0, controllers: new Set() };
+    runtimeAuthStates.set(identity, state);
+  }
+  return state;
+}
+
+function credentialOwnershipFor(
+  runtime: IAgentRuntime | RuntimeLike | null,
+): Map<string, string> {
+  const identity = runtimeIdentity(runtime);
+  if (!identity) return hostlessCredentialOwnership;
+  let ownership = runtimeCredentialOwnership.get(identity);
+  if (!ownership) {
+    ownership = new Map();
+    runtimeCredentialOwnership.set(identity, ownership);
+  }
+  return ownership;
 }
 
 export function resolveSettingLike(
@@ -107,6 +162,11 @@ export function persistFeedCredential(
   value: string,
   secret = false,
 ): void {
+  const identity = runtimeIdentity(runtime);
+  const previousOwner = environmentCredentialOwners.get(key);
+  const baseline = previousOwner?.baseline ?? process.env[key];
+  environmentCredentialOwners.set(key, { owner: identity, value, baseline });
+  credentialOwnershipFor(runtime).set(key, value);
   process.env[key] = value;
   runtime?.setSetting?.(key, value, secret);
 
@@ -126,6 +186,40 @@ export function persistFeedCredential(
   character.secrets[key] = value;
 }
 
+/** Drops transient and plugin-created credentials when the runtime unloads. */
+export function clearFeedAuthState(
+  runtime: IAgentRuntime | RuntimeLike | null,
+): void {
+  const state = authStateFor(runtime);
+  state.generation += 1;
+  state.cachedToken = null;
+  for (const controller of state.controllers) controller.abort();
+  state.controllers.clear();
+  const ownership = credentialOwnershipFor(runtime);
+  const identity = runtimeIdentity(runtime);
+  const character = asRuntimeLike(runtime)?.character;
+  for (const [key, ownedValue] of ownership) {
+    const envOwner = environmentCredentialOwners.get(key);
+    if (envOwner?.owner === identity && process.env[key] === envOwner.value) {
+      if (envOwner.baseline === undefined) delete process.env[key];
+      else process.env[key] = envOwner.baseline;
+      environmentCredentialOwners.delete(key);
+    }
+    if (character?.settings?.secrets?.[key] === ownedValue) {
+      delete character.settings.secrets[key];
+    }
+    if (character?.secrets?.[key] === ownedValue) delete character.secrets[key];
+    runtime?.setSetting?.(key, "", true);
+    if (character?.settings?.secrets?.[key] === "") {
+      delete character.settings.secrets[key];
+    }
+    if (character?.secrets?.[key] === "") delete character.secrets[key];
+  }
+  ownership.clear();
+  if (identity) runtimeCredentialOwnership.delete(identity);
+  else hostlessCredentialOwnership = new Map();
+}
+
 async function authenticate(config: FeedConfig): Promise<string> {
   if (!config.agentId || !config.agentSecret) {
     throw new Error(
@@ -133,58 +227,73 @@ async function authenticate(config: FeedConfig): Promise<string> {
     );
   }
 
-  const url = new URL("/api/agents/auth", config.apiBaseUrl);
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      agentId: config.agentId,
-      agentSecret: config.agentSecret,
-    }),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  const state = authStateFor(config.runtime);
+  const generation = state.generation;
+  const controller = new AbortController();
+  state.controllers.add(controller);
+  try {
+    const url = new URL("/api/agents/auth", config.apiBaseUrl);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: config.agentId,
+        agentSecret: config.agentSecret,
+      }),
+      signal: AbortSignal.any([
+        controller.signal,
+        AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      ]),
+    });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Feed auth failed (${response.status}): ${text || response.statusText}`,
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Feed auth failed (${response.status}): ${text || response.statusText}`,
+      );
+    }
+
+    const data = (await response.json()) as {
+      token?: string;
+      sessionToken?: string;
+      expiresIn?: number;
+    };
+    const token = data.token ?? data.sessionToken;
+    if (!token) {
+      throw new Error("Feed auth response did not include a session token.");
+    }
+    if (state.generation !== generation) {
+      throw new Error("Feed authentication was cancelled by agent reset.");
+    }
+
+    const expiresIn = data.expiresIn ?? 14 * 60;
+    state.cachedToken = {
+      token,
+      expiresAt: Date.now() + expiresIn * 1000,
+    };
+    persistFeedCredential(
+      config.runtime,
+      FEED_AGENT_SESSION_TOKEN_KEY,
+      token,
+      true,
     );
+    persistFeedCredential(
+      config.runtime,
+      FEED_AGENT_SESSION_EXPIRES_AT_KEY,
+      String(state.cachedToken.expiresAt),
+      true,
+    );
+
+    return token;
+  } finally {
+    state.controllers.delete(controller);
   }
-
-  const data = (await response.json()) as {
-    token?: string;
-    sessionToken?: string;
-    expiresIn?: number;
-  };
-  const token = data.token ?? data.sessionToken;
-  if (!token) {
-    throw new Error("Feed auth response did not include a session token.");
-  }
-
-  const expiresIn = data.expiresIn ?? 14 * 60;
-  cachedToken = {
-    token,
-    expiresAt: Date.now() + expiresIn * 1000,
-  };
-  persistFeedCredential(
-    config.runtime,
-    FEED_AGENT_SESSION_TOKEN_KEY,
-    token,
-    true,
-  );
-  persistFeedCredential(
-    config.runtime,
-    FEED_AGENT_SESSION_EXPIRES_AT_KEY,
-    String(cachedToken.expiresAt),
-    true,
-  );
-
-  return token;
 }
 
 async function getSessionToken(config: FeedConfig): Promise<string | null> {
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 30_000) {
-    return cachedToken.token;
+  const state = authStateFor(config.runtime);
+  if (state.cachedToken && state.cachedToken.expiresAt > Date.now() + 30_000) {
+    return state.cachedToken.token;
   }
 
   if (!config.agentId || !config.agentSecret) {
@@ -194,8 +303,8 @@ async function getSessionToken(config: FeedConfig): Promise<string | null> {
   return authenticate(config);
 }
 
-function clearCachedToken(): void {
-  cachedToken = null;
+function clearCachedToken(runtime: IAgentRuntime | null): void {
+  authStateFor(runtime).cachedToken = null;
 }
 
 export async function proxyFeedRequest(
@@ -240,7 +349,7 @@ export async function proxyFeedRequest(
   const response = await send(token);
 
   if (response.status === 401 && token) {
-    clearCachedToken();
+    clearCachedToken(config.runtime);
     const newToken = await getSessionToken(config);
     if (newToken && newToken !== token) {
       return send(newToken);

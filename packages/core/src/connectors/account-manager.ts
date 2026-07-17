@@ -358,7 +358,7 @@ type ActionWithConnectorAccountPolicy = Action & {
 	accountPolicy?: ConnectorAccountPolicy | readonly ConnectorAccountPolicy[];
 };
 
-const runtimeManagers = new WeakMap<IAgentRuntime, ConnectorAccountManager>();
+let runtimeManagers = new WeakMap<IAgentRuntime, ConnectorAccountManager>();
 let standaloneManager: ConnectorAccountManager | null = null;
 const oauthCodeVerifierSecrets = new Map<string, string>();
 
@@ -1669,6 +1669,18 @@ export function getConnectorAccountManager(
 		standaloneManager.setStorage(storage);
 	}
 	return standaloneManager;
+}
+
+/**
+ * Invalidates process-local connector accounts and PKCE material after a
+ * destructive host reset. The durable storage is erased by the host; this
+ * clears the independent fallback state that would otherwise survive in the
+ * running process.
+ */
+export function resetConnectorAccountStateForDestructiveReset(): void {
+	runtimeManagers = new WeakMap<IAgentRuntime, ConnectorAccountManager>();
+	standaloneManager = null;
+	oauthCodeVerifierSecrets.clear();
 }
 
 export async function evaluateConnectorAccountPolicies(

@@ -162,7 +162,7 @@ export function defaultSecretsManager(): SecretsManager {
   return cached;
 }
 
-/** Test hook: drop the cached manager. */
-export function _resetDefaultSecretsManagerForTesting(): void {
+/** Drops the vault facade so post-reset writes bind to the recreated vault. */
+export function resetDefaultSecretsManagerForAgentReset(): void {
   cached = null;
 }

@@ -38,7 +38,7 @@ function buildDeps(
 }
 
 describe("handleResetAppliedFromMainCore", () => {
-  it("skips when a lifecycle action is already in progress", async () => {
+  it("supersedes a busy lifecycle because the shell reset already happened", async () => {
     const deps = buildDeps({
       isLifecycleBusy: vi.fn(() => true),
       getActiveLifecycleAction: vi.fn<() => LifecycleAction>(() => "start"),
@@ -47,28 +47,28 @@ describe("handleResetAppliedFromMainCore", () => {
     await handleResetAppliedFromMainCore({}, deps);
 
     expect(deps.setActionNotice).toHaveBeenCalledWith(
-      `Agent action already in progress (${LIFECYCLE_MESSAGES.start.inProgress}). Please wait.`,
+      `Reset finished in the desktop shell; cancelling ${LIFECYCLE_MESSAGES.start.inProgress} and clearing local state.`,
       "info",
-      2800,
+      4200,
     );
-    expect(deps.beginLifecycleAction).not.toHaveBeenCalled();
-    expect(deps.completeResetLocalState).not.toHaveBeenCalled();
-    expect(deps.finishLifecycleAction).not.toHaveBeenCalled();
+    expect(deps.beginLifecycleAction).toHaveBeenCalledWith("reset");
+    expect(deps.completeResetLocalState).toHaveBeenCalledWith(PARSED_STATUS);
+    // Once to cancel the superseded action, once to release reset's lock.
+    expect(deps.finishLifecycleAction).toHaveBeenCalledTimes(2);
   });
 
-  it("aborts when the reset lifecycle action cannot be claimed", async () => {
+  it("still applies mandatory cleanup when the reset lifecycle cannot be claimed", async () => {
     const deps = buildDeps({
       beginLifecycleAction: vi.fn(() => false),
     });
 
     await handleResetAppliedFromMainCore({}, deps);
 
-    expect(deps.setActionNotice).toHaveBeenCalledWith(
-      "Another agent operation is still running. Wait for it to finish, then try Reset again.",
-      "info",
-      4200,
+    expect(deps.logResetWarn).toHaveBeenCalledWith(
+      "handleResetAppliedFromMain: reset lifecycle lock unavailable; applying mandatory renderer cleanup without it",
+      expect.any(Object),
     );
-    expect(deps.completeResetLocalState).not.toHaveBeenCalled();
+    expect(deps.completeResetLocalState).toHaveBeenCalledWith(PARSED_STATUS);
     expect(deps.finishLifecycleAction).not.toHaveBeenCalled();
   });
 

@@ -26,6 +26,7 @@
 import { PROVIDER_PLUGIN_MAP } from "@elizaos/agent";
 import { loadElizaConfig } from "@elizaos/agent/config/config";
 import { logger } from "@elizaos/core";
+import { withIndependentCredentialStateMutation } from "../security/credential-state-lock";
 import { hasCompatPersistedFirstRunState } from "./compat-route-shared";
 import { isCloudProvisioned } from "./server-first-run-helpers";
 
@@ -95,14 +96,14 @@ export function triggerDeferredRuntimeBoot(reason: string): Promise<void> {
   }
   if (!bootInFlight) {
     logger.info(`[eliza] Booting the deferred agent runtime (${reason})`);
-    bootInFlight = (async () => {
+    bootInFlight = withIndependentCredentialStateMutation(async () => {
       try {
         await boot();
         pendingBoot = null;
       } finally {
         bootInFlight = null;
       }
-    })();
+    });
   }
   return bootInFlight;
 }

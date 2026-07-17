@@ -63,6 +63,7 @@ function buildSpyDeps(overrides: Partial<CompleteResetLocalStateDeps> = {}): {
     markFirstRunReset: trace("markFirstRunReset"),
     resetAvatarSelection: trace("resetAvatarSelection"),
     clearConversationLists: trace("clearConversationLists"),
+    clearRendererStorage: traceAsync("clearRendererStorage", undefined),
     fetchFirstRunOptions: traceAsync("fetchFirstRunOptions", okOptions),
     setFirstRunOptions: trace("setFirstRunOptions"),
     logResetDebug: () => {},
@@ -77,8 +78,9 @@ describe("completeResetLocalStateAfterServerWipe", () => {
     const { deps, calls } = buildSpyDeps();
     await completeResetLocalStateAfterServerWipe(null, deps);
     expect(calls).toEqual([
-      "setAgentStatus",
       "resetClientConnection",
+      "clearRendererStorage",
+      "setAgentStatus",
       "clearPersistedActiveServer",
       "clearPersistedAvatarIndex",
       "setClientBaseUrl",
@@ -92,13 +94,40 @@ describe("completeResetLocalStateAfterServerWipe", () => {
     ]);
   });
 
-  it("token-clear (clearElizaCloudSessionUi) fires immediately before markFirstRunReset", async () => {
+  it("clears renderer storage before UI callbacks and before reloading options", async () => {
     const { deps, calls } = buildSpyDeps();
     await completeResetLocalStateAfterServerWipe(null, deps);
-    const tokenIdx = calls.indexOf("clearElizaCloudSessionUi");
-    const firstRunResetIdx = calls.indexOf("markFirstRunReset");
-    expect(tokenIdx).toBeGreaterThanOrEqual(0);
-    expect(firstRunResetIdx).toBe(tokenIdx + 1);
+    const storageIdx = calls.indexOf("clearRendererStorage");
+    expect(storageIdx).toBe(calls.indexOf("resetClientConnection") + 1);
+    expect(calls.indexOf("setAgentStatus")).toBe(storageIdx + 1);
+    expect(calls.indexOf("fetchFirstRunOptions")).toBe(
+      calls.indexOf("clearConversationLists") + 1,
+    );
+  });
+
+  it("waits for renderer storage deletion before fetching first-run options", async () => {
+    let releaseStorage: (() => void) | undefined;
+    const clearRendererStorage = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseStorage = resolve;
+        }),
+    );
+    const fetchFirstRunOptions = vi.fn(async () => okOptions);
+    const { deps } = buildSpyDeps({
+      clearRendererStorage,
+      fetchFirstRunOptions,
+    });
+
+    const resetPromise = completeResetLocalStateAfterServerWipe(null, deps);
+    await Promise.resolve();
+
+    expect(clearRendererStorage).toHaveBeenCalledTimes(1);
+    expect(fetchFirstRunOptions).not.toHaveBeenCalled();
+
+    releaseStorage?.();
+    await resetPromise;
+    expect(fetchFirstRunOptions).toHaveBeenCalledTimes(1);
   });
 
   it("forwards the post-reset agent status to setAgentStatus", async () => {
@@ -146,5 +175,38 @@ describe("completeResetLocalStateAfterServerWipe", () => {
     await expect(
       completeResetLocalStateAfterServerWipe(null, deps),
     ).rejects.toThrow("setter exploded");
+  });
+
+  it("propagates renderer storage deletion failure", async () => {
+    const fetchFirstRunOptions = vi.fn(async () => okOptions);
+    const { deps } = buildSpyDeps({
+      clearRendererStorage: async () => {
+        throw new Error("native credential survived");
+      },
+      fetchFirstRunOptions,
+    });
+
+    await expect(
+      completeResetLocalStateAfterServerWipe(null, deps),
+    ).rejects.toThrow("native credential survived");
+    expect(fetchFirstRunOptions).not.toHaveBeenCalled();
+  });
+
+  it("still clears renderer credentials when connection teardown throws", async () => {
+    const clearRendererStorage = vi.fn(async () => undefined);
+    const setAgentStatus = vi.fn();
+    const { deps } = buildSpyDeps({
+      resetClientConnection: () => {
+        throw new Error("connection teardown exploded");
+      },
+      clearRendererStorage,
+      setAgentStatus,
+    });
+
+    await expect(
+      completeResetLocalStateAfterServerWipe(null, deps),
+    ).rejects.toThrow("connection teardown exploded");
+    expect(clearRendererStorage).toHaveBeenCalledOnce();
+    expect(setAgentStatus).not.toHaveBeenCalled();
   });
 });

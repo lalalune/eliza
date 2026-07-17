@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  clearOneTimeAppApiKeysForReset,
   consumeOneTimeAppApiKey,
   storeOneTimeAppApiKey,
 } from "./one-time-app-api-key.js";
@@ -33,5 +34,15 @@ describe("one-time app api key hand-off", () => {
     storeOneTimeAppApiKey("app_overwrite", "old");
     storeOneTimeAppApiKey("app_overwrite", "new");
     expect(consumeOneTimeAppApiKey("app_overwrite")).toBe("new");
+  });
+
+  it("forgets every unconsumed key during destructive reset", () => {
+    storeOneTimeAppApiKey("app_reset_a", "key-a");
+    storeOneTimeAppApiKey("app_reset_b", "key-b");
+
+    clearOneTimeAppApiKeysForReset();
+
+    expect(consumeOneTimeAppApiKey("app_reset_a")).toBeUndefined();
+    expect(consumeOneTimeAppApiKey("app_reset_b")).toBeUndefined();
   });
 });

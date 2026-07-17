@@ -1,7 +1,7 @@
 import type { LinkedAccountProviderId } from "@elizaos/shared";
 import { shellLocalStorage } from "../../surface-realm-channel";
 
-const PREFIX = "eliza.subscription-oauth.v1";
+export const SUBSCRIPTION_OAUTH_STORAGE_PREFIX = "eliza.subscription-oauth.v1";
 const MAX_AGE_MS = 20 * 60 * 1000;
 
 export type SubscriptionOAuthMode = "localhost" | "device";
@@ -18,7 +18,7 @@ export interface PersistedSubscriptionOAuth {
 }
 
 function key(providerId: LinkedAccountProviderId): string {
-  return `${PREFIX}:${providerId}`;
+  return `${SUBSCRIPTION_OAUTH_STORAGE_PREFIX}:${providerId}`;
 }
 
 export function readSubscriptionOAuth(

@@ -30,6 +30,11 @@ import {
 } from "@elizaos/core";
 import type { resolveServiceRoutingInConfig } from "@elizaos/shared";
 import type { Vault } from "@elizaos/vault";
+import {
+  withDefaultCredentialStateMutation,
+  withDefaultCredentialStateReset,
+  withDefaultIndependentCredentialStateMutation,
+} from "./default-credential-state-lock.ts";
 
 export type AccountPoolCredentialsOptions = {
   activeBackend?: string | undefined;
@@ -61,6 +66,12 @@ export interface AgentHostBridge {
    * ordering — without ever clobbering an explicit launch env var.
    */
   captureWalletEnvBootBaseline(): void;
+  withCredentialStateMutation<T>(operation: () => Promise<T>): Promise<T>;
+  withIndependentCredentialStateMutation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T>;
+  withCredentialStateReset?<T>(operation: () => Promise<T>): Promise<T>;
+  deleteHostCredentialStoresForReset?(): Promise<void>;
   hydrateWalletKeysFromNodePlatformSecureStore(): Promise<void> | void;
   runVaultBootstrap(): Promise<{ migrated: number; failed: unknown[] }>;
   sharedVault(): Vault;
@@ -123,6 +134,10 @@ function defaultBuildVariant(): "store" | "direct" {
  */
 export const defaultAgentHostBridge: AgentHostBridge = {
   captureWalletEnvBootBaseline: () => undefined,
+  withCredentialStateMutation: withDefaultCredentialStateMutation,
+  withIndependentCredentialStateMutation:
+    withDefaultIndependentCredentialStateMutation,
+  withCredentialStateReset: withDefaultCredentialStateReset,
   hydrateWalletKeysFromNodePlatformSecureStore: () => undefined,
   runVaultBootstrap: () => Promise.resolve({ migrated: 0, failed: [] }),
   sharedVault: () => noopVault,

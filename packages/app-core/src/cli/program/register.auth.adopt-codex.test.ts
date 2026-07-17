@@ -9,7 +9,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -82,7 +82,7 @@ describe("runAuthAdoptCodex", () => {
     expect(existsSync(authPath)).toBe(true);
   });
 
-  it("adopts for real with --yes: pool account written, source retired", async () => {
+  it("adopts for real with --yes: pool account written, source destroyed", async () => {
     const codexHome = path.join(home, "codex");
     const authPath = writeCodexAuth(codexHome, "rt.cli-2");
 
@@ -98,10 +98,10 @@ describe("runAuthAdoptCodex", () => {
     expect(result.organizationId).toBe("acct-cli");
     // Ownership transfer really happened on disk.
     expect(existsSync(authPath)).toBe(false);
-    expect(existsSync(String(result.retiredTo))).toBe(true);
-    expect(readFileSync(String(result.retiredTo), "utf-8")).toContain(
-      "rt.cli-2",
-    );
+    expect(result.sourceDestroyed).toBe(true);
+    expect(
+      readdirSync(codexHome).filter((name) => name.includes(".adopted-")),
+    ).toHaveLength(0);
   });
 
   it("surfaces a typed adoption failure without throwing", async () => {

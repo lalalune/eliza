@@ -26,6 +26,9 @@ vi.mock("@elizaos/core", async () => {
   const { getDefaultTriageService } = await import(
     "../../../packages/core/src/features/messaging/triage/triage-service"
   );
+  const { resolveStateDir } = await import(
+    "../../../packages/core/src/utils/state-dir"
+  );
 
   const logger = {
     debug: vi.fn(),
@@ -132,6 +135,7 @@ vi.mock("@elizaos/core", async () => {
         : stringToUuid(`${baseUserId}:${runtime.agentId}`),
     lifeOpsPassiveConnectorsEnabled: () => true,
     logger,
+    resolveStateDir,
     stringToUuid,
   };
 });

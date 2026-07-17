@@ -77,17 +77,19 @@ function sendSetupError(
 // ── Module-level auth session state ────────────────────────────────────
 
 let telegramAccountAuthSession: TelegramAccountAuthSessionLike | null = null;
+let telegramAccountAuthHydrationEnabled = true;
+
+/** Re-enables hydration when a newly initialized runtime owns the plugin. */
+export function enableTelegramAccountAuthSessionHydration(): void {
+  telegramAccountAuthHydrationEnabled = true;
+}
 
 /** Called on plugin shutdown to clean up the auth session. */
 export async function stopTelegramAccountAuthSession(): Promise<void> {
-  if (telegramAccountAuthSession) {
-    try {
-      await telegramAccountAuthSession.stop();
-    } catch {
-      /* non-fatal */
-    }
-    telegramAccountAuthSession = null;
-  }
+  telegramAccountAuthHydrationEnabled = false;
+  const session = telegramAccountAuthSession;
+  telegramAccountAuthSession = null;
+  if (session) await session.stop();
 }
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -381,6 +383,7 @@ function createSessionOptions(config: Record<string, unknown>): {
 function ensureAuthSession(
   config: Record<string, unknown>,
 ): TelegramAccountAuthSessionLike | null {
+  if (!telegramAccountAuthHydrationEnabled) return null;
   if (telegramAccountAuthSession) {
     return telegramAccountAuthSession;
   }

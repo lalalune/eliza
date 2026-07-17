@@ -51,7 +51,10 @@ import {
 import { createLogger } from "./logger";
 import { simpleHash } from "./optimization/ab-analysis";
 import { getOptimizationRootDir } from "./optimization-root-dir";
-import { installRuntimePluginLifecycle } from "./plugin-lifecycle";
+import {
+	disposeRuntimePluginHooks,
+	installRuntimePluginLifecycle,
+} from "./plugin-lifecycle";
 import { createCoreSecurityHooksPlugin } from "./plugins/core-security-hooks";
 import {
 	getNativeRuntimeFeaturePlugin,
@@ -958,6 +961,12 @@ export class AgentRuntime implements IAgentRuntime {
 	 * mismatch (#8769). Re-set on every successful `ensureEmbeddingDimension`.
 	 */
 	private pinnedEmbeddingProvider: string | undefined;
+	private adapterClosedForReset = false;
+	private resetTeardownStarted = false;
+	private resetTeardownComplete = false;
+	private resetTeardownPromise: Promise<void> | null = null;
+	private readonly stoppedServiceInstances = new WeakSet<Service>();
+	private readonly activeServiceStarts = new Set<Promise<Service | null>>();
 	/**
 	 * The provider name that actually served the most recent successful
 	 * `useModel` call for each model type key. Populated the moment a
@@ -2217,6 +2226,124 @@ export class AgentRuntime implements IAgentRuntime {
 		}
 	}
 
+	/**
+	 * Quiesces every plugin and service, then closes the database before a
+	 * destructive reset removes persistent state. Ordinary stop/restart keeps
+	 * its existing semantics because some plugin dispose hooks intentionally
+	 * remove durable plugin-owned records.
+	 */
+	async teardownForReset(): Promise<void> {
+		if (this.resetTeardownComplete) return;
+		if (this.resetTeardownPromise) return this.resetTeardownPromise;
+
+		this.resetTeardownStarted = true;
+		this.stopped = true;
+		const teardown = Promise.resolve().then(() => this._teardownForReset());
+		this.resetTeardownPromise = teardown;
+		try {
+			await teardown;
+			this.resetTeardownComplete = true;
+		} finally {
+			if (this.resetTeardownPromise === teardown) {
+				this.resetTeardownPromise = null;
+			}
+		}
+	}
+
+	private async _teardownForReset(): Promise<void> {
+		const errors: Error[] = [];
+		try {
+			await disposeRuntimePluginHooks(this);
+		} catch (error) {
+			// error-policy:J2 reset teardown adds lifecycle context and preserves
+			// the plugin aggregate as the cause before attempting service quiescence.
+			errors.push(
+				new ElizaError(
+					"Failed to dispose runtime plugins during destructive reset",
+					{
+						code: "RUNTIME_RESET_PLUGIN_DISPOSE_FAILED",
+						cause: error,
+						severity: "fatal",
+					},
+				),
+			);
+		}
+		try {
+			await this._stopServicesForReset();
+		} catch (error) {
+			// error-policy:J2 preserve the service aggregate as the cause while
+			// exposing the reset-specific lifecycle context to callers.
+			errors.push(
+				new ElizaError(
+					"Failed to stop all runtime services for destructive reset",
+					{
+						code: "RUNTIME_RESET_SERVICE_STOP_FAILED",
+						cause: error,
+						severity: "fatal",
+					},
+				),
+			);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) {
+			throw new AggregateError(errors, "Runtime reset teardown failed");
+		}
+		if (!this.adapterClosedForReset) {
+			await this.close();
+			this.adapterClosedForReset = true;
+		}
+	}
+
+	/**
+	 * Reset cannot use ordinary stop's best-effort semantics: a service that
+	 * failed to stop may still hold a writer into the state tree. Successful
+	 * instances are remembered so a retry only revisits the failed ones.
+	 */
+	private async _stopServicesForReset(): Promise<void> {
+		this.stopped = true;
+		const inFlight = [...this.activeServiceStarts];
+		if (inFlight.length > 0) {
+			await Promise.allSettled(inFlight);
+		}
+
+		const errors: Error[] = [];
+		for (const [serviceType, services] of this.services) {
+			for (const service of services) {
+				if (this.stoppedServiceInstances.has(service)) continue;
+				try {
+					await this._stopServiceInstance(
+						serviceType,
+						service,
+						"destructive reset",
+						true,
+					);
+				} catch (error) {
+					// error-policy:J2 strict teardown attempts every service while retaining
+					// the exact stop failure as the cause of its typed service error.
+					errors.push(
+						new ElizaError(
+							`Failed to stop ${serviceType} during destructive reset`,
+							{
+								code: "RUNTIME_RESET_SERVICE_STOP_FAILED",
+								cause: error,
+								context: { serviceType },
+								severity: "fatal",
+							},
+						),
+					);
+				}
+			}
+		}
+
+		this._clearStoppedRuntimeState();
+		if (errors.length > 0) {
+			throw new AggregateError(
+				errors,
+				"Failed to stop all runtime services for destructive reset",
+			);
+		}
+	}
+
 	private async _stopServices(fast: boolean): Promise<void> {
 		this.stopped = true;
 		this.logger.debug(
@@ -2309,6 +2436,10 @@ export class AgentRuntime implements IAgentRuntime {
 			}
 		}
 
+		this._clearStoppedRuntimeState();
+	}
+
+	private _clearStoppedRuntimeState(): void {
 		// Reject any pending service load promises so callers don't hang
 		const stopError = new Error("Runtime stopped");
 		for (const [serviceType, handler] of this.servicePromiseHandlers) {
@@ -2336,11 +2467,13 @@ export class AgentRuntime implements IAgentRuntime {
 		serviceType: string,
 		service: Service | null | undefined,
 		reason: string,
+		throwOnFailure = false,
 	): Promise<void> {
 		const maybe = service as { stop?: () => Promise<void> | void } | null;
 		if (maybe && typeof maybe.stop === "function") {
 			try {
 				await Promise.resolve().then(() => maybe.stop?.());
+				this.stoppedServiceInstances.add(service as Service);
 			} catch (err) {
 				this.logger.warn(
 					{
@@ -2352,17 +2485,24 @@ export class AgentRuntime implements IAgentRuntime {
 					},
 					"Service stop() threw; continuing",
 				);
+				if (throwOnFailure) throw err;
 			}
 		} else if (!maybe) {
 			this.logger.warn(
 				{ src: "agent", agentId: this.agentId, serviceType, reason },
 				"Null service instance during stop; skipping",
 			);
+			if (throwOnFailure) {
+				throw new Error(`Null ${serviceType} service cannot be stopped`);
+			}
 		} else {
 			this.logger.warn(
 				{ src: "agent", agentId: this.agentId, serviceType, reason },
 				"Service instance is missing stop(); skipping",
 			);
+			if (throwOnFailure) {
+				throw new Error(`${serviceType} service is missing stop()`);
+			}
 		}
 	}
 
@@ -4538,11 +4678,15 @@ export class AgentRuntime implements IAgentRuntime {
 				return first;
 			})();
 			this.startingServices.set(key, inFlight);
+			this.activeServiceStarts.add(inFlight);
 		}
 		try {
 			return await inFlight;
 		} finally {
-			this.startingServices.delete(key);
+			if (this.startingServices.get(key) === inFlight) {
+				this.startingServices.delete(key);
+			}
+			this.activeServiceStarts.delete(inFlight);
 		}
 	}
 
@@ -4573,11 +4717,21 @@ export class AgentRuntime implements IAgentRuntime {
 				return null;
 			}
 			if (this.stopped) {
-				await this._stopServiceInstance(
-					key,
-					serviceInstance,
-					"late service start after runtime stop",
-				);
+				if (this.resetTeardownStarted) {
+					const services = this.services.get(key);
+					if (services) {
+						if (!services.includes(serviceInstance))
+							services.push(serviceInstance);
+					} else {
+						this.services.set(key, [serviceInstance]);
+					}
+				} else {
+					await this._stopServiceInstance(
+						key,
+						serviceInstance,
+						"late service start after runtime stop",
+					);
+				}
 				this.serviceRegistrationStatus.set(key, "failed");
 				return null;
 			}

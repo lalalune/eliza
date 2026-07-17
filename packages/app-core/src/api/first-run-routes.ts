@@ -12,9 +12,6 @@
  * completion state is on disk, the handler fires the single-flight runtime
  * boot; cloud/remote targets deliberately leave the process runtime-less.
  *
- * A defensive delayed resave (`scheduleCloudApiKeyResave`) re-writes
- * `cloud.apiKey` if a concurrent config write clobbers it — a best-effort
- * workaround for an unreproduced upstream race, logged at warn on failure.
  */
 import type http from "node:http";
 import {
@@ -26,12 +23,12 @@ import { logger } from "@elizaos/core";
 import {
   type DeploymentTargetRuntime,
   getCloudSecret,
-  migrateLegacyRuntimeConfig,
   normalizeDeploymentTargetConfig,
   normalizeFirstRunProviderId,
   normalizeLinkedAccountFlagsConfig,
   normalizeServiceRoutingConfig,
 } from "@elizaos/shared";
+import { credentialMutationContinuationHeaders } from "../security/credential-state-lock";
 import { ensureRouteAuthorized } from "./auth.ts";
 import {
   type CompatRuntimeState,
@@ -82,6 +79,7 @@ async function syncFirstRunConfigState(
 
   const headers: Record<string, string> = {
     "content-type": "application/json",
+    ...credentialMutationContinuationHeaders(),
   };
   const authorization = req.headers.authorization;
   if (typeof authorization === "string" && authorization.trim()) {
@@ -98,57 +96,6 @@ async function syncFirstRunConfigState(
       `Loopback config sync failed (${response.status}): ${await response.text()}`,
     );
   }
-}
-
-/**
- * Defensive resave delay (ms). Long enough that the in-flight loopback PUT
- * /api/config triggered by `syncFirstRunConfigState` plus any
- * concurrent renderer-driven PUT settles before we re-check disk. Tracked as
- * a workaround pending the upstream race fix (see WHY block on
- * `scheduleCloudApiKeyResave` below).
- */
-const CLOUD_API_KEY_RESAVE_DELAY_MS = 3000;
-
-/**
- * Defensive: re-write `cloud.apiKey` to disk after a delay if some concurrent
- * config write between now and `CLOUD_API_KEY_RESAVE_DELAY_MS` clobbered it.
- *
- * **WHY this exists:** the synchronous path (resolve apiKey → local
- * `saveElizaConfig` → loopback PUT /api/config) should be sufficient on its
- * own — the upstream PUT handler safeMerges `cloud.apiKey` from the request
- * body into `state.config` before saving. Empirically a clobber still
- * happens in some sequences (likely a concurrent renderer-driven PUT that
- * round-trips through GET (redacted) → PUT and strips apiKey before the
- * `[REDACTED]` filter catches it). Removing the resave requires reproducing
- * the race in an integration test, which is out of scope for the current
- * cleanup batch.
- *
- * Failure here is best-effort (the synchronous path already wrote apiKey
- * once), but log at warn level so a recurring failure is visible — the
- * silent `catch {}` previously here masked real bugs.
- */
-function scheduleCloudApiKeyResave(apiKey: string): void {
-  setTimeout(() => {
-    try {
-      const freshConfig = loadElizaConfig();
-      if (freshConfig.cloud?.apiKey) {
-        return;
-      }
-      if (!freshConfig.cloud) {
-        (freshConfig as Record<string, unknown>).cloud = {};
-      }
-      (freshConfig.cloud as Record<string, unknown>).apiKey = apiKey;
-      migrateLegacyRuntimeConfig(freshConfig as Record<string, unknown>);
-      saveElizaConfig(freshConfig);
-      logger.info(
-        "[api] Re-saved cloud.apiKey after upstream handler clobbered it",
-      );
-    } catch (err) {
-      logger.warn(
-        `[api] Defensive cloud.apiKey resave failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }, CLOUD_API_KEY_RESAVE_DELAY_MS);
 }
 
 /**
@@ -211,7 +158,6 @@ export async function handleFirstRunRoute(
   }
   const rawBody = Buffer.concat(chunks);
 
-  let capturedCloudApiKey: string | undefined;
   let committedRuntimeTarget: DeploymentTargetRuntime | undefined;
 
   try {
@@ -286,8 +232,6 @@ export async function handleFirstRunRoute(
             "[api] Cloud-linked first-run: resolved API key, injecting into replay body",
           );
         }
-
-        capturedCloudApiKey = resolvedCloudApiKey;
       }
       saveElizaConfig(config);
       await syncFirstRunConfigState(req, config as Record<string, unknown>);
@@ -301,10 +245,6 @@ export async function handleFirstRunRoute(
   }
 
   sendJsonResponse(res, 200, { ok: true });
-
-  if (capturedCloudApiKey) {
-    scheduleCloudApiKeyResave(capturedCloudApiKey);
-  }
 
   // Fresh-install deferred boot (see deferred-runtime-boot.ts): a committed
   // LOCAL-target onboarding is THE signal to boot the agent runtime this

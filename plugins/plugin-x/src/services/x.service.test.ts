@@ -1,7 +1,7 @@
-/** Unit tests for X account status and trusted multi-account connector routing. Network clients are deterministic fakes. */
+/** Unit tests for X account status, trusted multi-account routing, and terminal teardown with deterministic fakes. */
 import type { Content, IAgentRuntime, TargetInfo } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
-import { XService } from "./x.service";
+import { type TwitterClientInstance, XService } from "./x.service";
 
 function asRuntime<T extends object>(runtime: T): IAgentRuntime & T {
   return runtime as IAgentRuntime & T;
@@ -12,6 +12,7 @@ function runtimeWithSettings(settings: Record<string, string>): IAgentRuntime {
     agentId: "agent-1",
     getSetting: (key: string) => settings[key],
     logger: {
+      log: () => undefined,
       info: () => undefined,
       warn: () => undefined,
       error: () => undefined,
@@ -288,5 +289,62 @@ describe("XService trusted account routing", () => {
       "123456",
       "hello",
     );
+  });
+});
+
+describe("XService teardown", () => {
+  it("waits for account starts, stops every resolved client, and clears references", async () => {
+    let resolveStart!: (client: TwitterClientInstance) => void;
+    const pendingStart = new Promise<TwitterClientInstance>((resolve) => {
+      resolveStart = resolve;
+    });
+    const activeStop = vi.fn(async () => undefined);
+    const startingStop = vi.fn(async () => undefined);
+    const active = { stop: activeStop } as unknown as TwitterClientInstance;
+    const starting = {
+      stop: startingStop,
+    } as unknown as TwitterClientInstance;
+    const service = serviceWithRuntime({});
+    const internals = service as unknown as {
+      accountClients: Map<string, TwitterClientInstance>;
+      accountClientStarts: Map<string, Promise<TwitterClientInstance>>;
+      twitterClient?: TwitterClientInstance;
+    };
+    internals.accountClients.set("active", active);
+    internals.accountClientStarts.set("starting", pendingStart);
+    internals.twitterClient = active;
+
+    let stopSettled = false;
+    const stopping = service.stop().then(() => {
+      stopSettled = true;
+    });
+    await vi.waitFor(() => expect(activeStop).toHaveBeenCalledTimes(1));
+    expect(stopSettled).toBe(false);
+
+    resolveStart(starting);
+    await stopping;
+
+    expect(activeStop).toHaveBeenCalledTimes(2);
+    expect(startingStop).toHaveBeenCalledTimes(1);
+    expect(internals.accountClients.size).toBe(0);
+    expect(internals.accountClientStarts.size).toBe(0);
+    expect(internals.twitterClient).toBeUndefined();
+  });
+
+  it("terminally rejects account acquisition after stop", async () => {
+    const service = serviceWithRuntime({});
+    const getClient = (
+      service as unknown as {
+        getTwitterClientForAccount: (
+          accountId: string,
+        ) => Promise<TwitterClientInstance>;
+      }
+    ).getTwitterClientForAccount.bind(service);
+
+    await service.stop();
+
+    await expect(getClient("default")).rejects.toMatchObject({
+      name: "AbortError",
+    });
   });
 });

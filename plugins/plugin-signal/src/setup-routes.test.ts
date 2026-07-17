@@ -116,6 +116,14 @@ function createRuntime(setupService: unknown, signalService: unknown = null) {
   } as unknown as IAgentRuntime;
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 async function loadSetupRoutes(overrides: { signalLogout?: ReturnType<typeof vi.fn> } = {}) {
   vi.resetModules();
   FakePairingSession.instances = [];
@@ -235,6 +243,58 @@ describe("Signal setup routes", () => {
       channelId: "+15551234567",
     });
     expect(setupService.registerEscalationChannel).toHaveBeenCalledWith("signal");
+  });
+
+  it("drains active pairing and invalidates late connected callbacks during disposal", async () => {
+    const { signalSetupRoutes, stopAllSignalPairingSessions } = await loadSetupRoutes();
+    const config = { connectors: {} as Record<string, unknown> };
+    const setupService = {
+      getConfig: vi.fn(() => config),
+      persistConfig: vi.fn(),
+      updateConfig: vi.fn((updater: (cfg: typeof config) => void) => updater(config)),
+      registerEscalationChannel: vi.fn(() => true),
+      setOwnerContact: vi.fn(() => true),
+      getWorkspaceDir: vi.fn(() => "/tmp/eliza-workspace"),
+      broadcastWs: vi.fn(),
+    };
+
+    await signalSetupRoutes[1].handler(
+      { body: { accountId: "default" } } as RouteRequest,
+      createResponse(),
+      createRuntime(setupService)
+    );
+    const session = FakePairingSession.instances[0];
+    const allowStop = deferred();
+    session.stop.mockImplementation(async () => allowStop.promise);
+
+    let disposeSettled = false;
+    const dispose = stopAllSignalPairingSessions().then(() => {
+      disposeSettled = true;
+    });
+    await Promise.resolve();
+    expect(disposeSettled).toBe(false);
+
+    session.emit({
+      type: "signal-status",
+      accountId: "default",
+      status: "connected",
+      phoneNumber: "+15551234567",
+    });
+    expect(setupService.updateConfig).not.toHaveBeenCalled();
+    expect(setupService.setOwnerContact).not.toHaveBeenCalled();
+    expect(setupService.broadcastWs).not.toHaveBeenCalled();
+
+    allowStop.resolve();
+    await dispose;
+
+    const rejectedStart = createResponse();
+    await signalSetupRoutes[1].handler(
+      { body: { accountId: "default" } } as RouteRequest,
+      rejectedStart,
+      createRuntime(setupService)
+    );
+    expect(rejectedStart.statusCode).toBe(503);
+    expect(FakePairingSession.instances).toHaveLength(1);
   });
 
   it("cancels pairing, logs out, and removes only the requested account config", async () => {

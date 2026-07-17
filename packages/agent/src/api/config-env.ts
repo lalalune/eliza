@@ -30,6 +30,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { resolveStateDir } from "../config/paths.ts";
+import {
+  validateOwnedResetTarget,
+  validateResetPathComponents,
+} from "./reset-state.ts";
 
 const CONFIG_ENV_FILENAME = "config.env";
 const BAK_SUFFIX = ".bak";
@@ -106,6 +110,33 @@ function serialiseConfigEnv(parsed: ParsedConfigEnv): string {
   return `${parsed.lines.join("\n")}\n`;
 }
 
+function configEnvLineKey(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#")) return null;
+  const eq = line.indexOf("=");
+  if (eq <= 0) return null;
+  const key = line.slice(0, eq).trim();
+  return KEY_PATTERN.test(key) ? key : null;
+}
+
+function removeKeysFromContents(
+  contents: string,
+  keys: ReadonlySet<string>,
+): string {
+  const lines = Array.from(
+    contents.matchAll(/[^\n]*\n|[^\n]+$/g),
+    ([line]) => line,
+  );
+  return lines
+    .filter((line) => {
+      const key = configEnvLineKey(
+        line.endsWith("\n") ? line.slice(0, -1) : line,
+      );
+      return key === null || !keys.has(key);
+    })
+    .join("");
+}
+
 function encodeValue(value: string): string {
   // Quote values that contain whitespace, `#`, or non-printable characters,
   // and escape embedded quotes/backslashes/newlines so the file round-trips
@@ -130,6 +161,14 @@ function validateKey(key: string): void {
   if (BLOCKED_CONFIG_ENV_KEYS.has(key)) {
     throw new Error(
       `persistConfigEnv: key "${key}" is a shell/runtime hijack vector and cannot be written`,
+    );
+  }
+}
+
+function validateRemovalKey(key: string): void {
+  if (!KEY_PATTERN.test(key)) {
+    throw new Error(
+      `removeConfigEnvKeys: invalid key "${key}" — must match /^[A-Z][A-Z0-9_]*$/`,
     );
   }
 }
@@ -167,6 +206,31 @@ function serialise<T>(fn: () => Promise<T>): Promise<T> {
 function resolveConfigEnvPath(stateDir: string | undefined): string {
   const dir = stateDir ?? resolveStateDir();
   return path.join(dir, CONFIG_ENV_FILENAME);
+}
+
+function configEnvResetPaths(stateDir: string | undefined): string[] {
+  const filePath = resolveConfigEnvPath(stateDir);
+  return [
+    filePath,
+    `${filePath}${BAK_SUFFIX}`,
+    `${filePath}${TMP_SUFFIX}`,
+    `${filePath}${BAK_SUFFIX}${TMP_SUFFIX}`,
+  ];
+}
+
+/** Refuses link-based redirection before reset stops or deletes any state. */
+export function validateConfigEnvResetPaths(
+  opts: PersistOptions = {},
+): readonly string[] {
+  const stateDir = validateResetPathComponents(
+    opts.stateDir ?? resolveStateDir(),
+    "config.env state root",
+  );
+  const paths = configEnvResetPaths(opts.stateDir);
+  for (const candidate of paths) {
+    validateOwnedResetTarget(stateDir, candidate, "config.env");
+  }
+  return paths;
 }
 
 /**
@@ -305,6 +369,90 @@ export async function persistConfigEnv(
   });
 }
 
+/**
+ * Remove a set of keys from `config.env` in one serialized, atomic rewrite.
+ * Every definition is removed so duplicate dotenv entries cannot reactivate an
+ * older credential. Existing backup and temporary companions are redacted or
+ * removed before the live rename; this operation never snapshots plaintext
+ * credentials into a recovery file.
+ */
+export async function removeConfigEnvKeys(
+  keys: Iterable<string>,
+  opts: PersistOptions = {},
+): Promise<void> {
+  const removals = new Set(keys);
+  for (const key of removals) validateRemovalKey(key);
+  if (removals.size === 0) return;
+
+  await serialise(async () => {
+    const stateDir = opts.stateDir ?? resolveStateDir();
+    validateConfigEnvResetPaths(opts);
+    const filePath = resolveConfigEnvPath(opts.stateDir);
+    const backupPath = `${filePath}${BAK_SUFFIX}`;
+    const temporaryPath = `${filePath}${TMP_SUFFIX}`;
+    const backupTemporaryPath = `${backupPath}${TMP_SUFFIX}`;
+
+    // A previous interrupted write can contain the exact plaintext this reset
+    // is meant to destroy. Removing staging files before any new I/O prevents
+    // an unrelated failure from leaving those stale copies behind.
+    validateOwnedResetTarget(stateDir, temporaryPath, "config.env");
+    await fs.rm(temporaryPath, { force: true });
+    validateOwnedResetTarget(stateDir, backupTemporaryPath, "config.env");
+    await fs.rm(backupTemporaryPath, { force: true });
+
+    validateOwnedResetTarget(stateDir, backupPath, "config.env");
+    const existingBackup = await readIfExists(backupPath);
+    if (existingBackup !== null) {
+      const redactedBackup = removeKeysFromContents(existingBackup, removals);
+      if (redactedBackup !== existingBackup) {
+        validateOwnedResetTarget(stateDir, backupPath, "config.env");
+        await writeAtomic(backupPath, redactedBackup);
+      }
+    }
+
+    validateOwnedResetTarget(stateDir, filePath, "config.env");
+    const existing = await readIfExists(filePath);
+    if (existing !== null) {
+      const redacted = removeKeysFromContents(existing, removals);
+      if (redacted !== existing) {
+        validateOwnedResetTarget(stateDir, filePath, "config.env");
+        await writeAtomic(filePath, redacted);
+      }
+    }
+
+    // Successful atomic renames consume their staging files. Force-removing
+    // both paths also covers unchanged/missing live files and interrupted
+    // companion rewrites from older runs.
+    validateOwnedResetTarget(stateDir, temporaryPath, "config.env");
+    await fs.rm(temporaryPath, { force: true });
+    validateOwnedResetTarget(stateDir, backupTemporaryPath, "config.env");
+    await fs.rm(backupTemporaryPath, { force: true });
+
+    for (const key of removals) delete process.env[key];
+  });
+}
+
+/** Removes and verifies every persisted process-env override for full reset. */
+export async function deleteConfigEnvForReset(
+  opts: PersistOptions = {},
+): Promise<void> {
+  await serialise(async () => {
+    const paths = validateConfigEnvResetPaths(opts);
+    const stateDir = opts.stateDir ?? resolveStateDir();
+    for (const candidate of paths) {
+      validateOwnedResetTarget(stateDir, candidate, "config.env");
+      await fs.rm(candidate, { force: true });
+    }
+    for (const candidate of paths) {
+      if ((await readIfExists(candidate)) !== null) {
+        throw new Error(
+          `config.env artifact survived destructive reset: ${candidate}`,
+        );
+      }
+    }
+  });
+}
+
 /** Exposed for tests and recovery tooling. */
 export const __testing = {
   BLOCKED_CONFIG_ENV_KEYS,
@@ -312,5 +460,6 @@ export const __testing = {
   BAK_SUFFIX,
   TMP_SUFFIX,
   parseConfigEnv,
+  removeKeysFromContents,
   serialiseConfigEnv,
 };

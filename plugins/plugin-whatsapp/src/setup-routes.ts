@@ -16,7 +16,13 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import type { IAgentRuntime, Route, RouteRequest, RouteResponse } from "@elizaos/core";
+import {
+  type IAgentRuntime,
+  logger,
+  type Route,
+  type RouteRequest,
+  type RouteResponse,
+} from "@elizaos/core";
 import type { WhatsAppPairingEvent } from "./pairing-service.js";
 import {
   sanitizeAccountId,
@@ -32,11 +38,13 @@ import { isWhatsAppWebhookAuthorized, readWebhookRawBody } from "./webhook-auth.
 
 interface PairingSessionLike {
   start(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void> | void;
   getStatus(): string;
 }
 
 const whatsappPairingSessions: Map<string, PairingSessionLike> = new Map();
+let whatsappPairingGeneration = 0;
+let whatsappPairingStartsEnabled = true;
 
 const MAX_PAIRING_SESSIONS = 10;
 
@@ -84,11 +92,11 @@ function getSetupService(runtime: IAgentRuntime): ConnectorSetupService | null {
 }
 
 /** Clean up disconnected / timed-out / errored sessions. */
-function cleanupStaleSessions(): void {
+async function cleanupStaleSessions(): Promise<void> {
   for (const [id, session] of whatsappPairingSessions) {
     const status = session.getStatus();
     if (status === "disconnected" || status === "timeout" || status === "error") {
-      session.stop();
+      await session.stop();
       whatsappPairingSessions.delete(id);
     }
   }
@@ -188,7 +196,12 @@ async function handlePair(
   res: RouteResponse,
   runtime: IAgentRuntime
 ): Promise<void> {
-  cleanupStaleSessions();
+  const requestGeneration = whatsappPairingGeneration;
+  await cleanupStaleSessions();
+  if (!whatsappPairingStartsEnabled || requestGeneration !== whatsappPairingGeneration) {
+    res.status(503).json({ ok: false, error: "WhatsApp pairing is shutting down" });
+    return;
+  }
 
   const setupService = getSetupService(runtime);
   const body = req.body as { accountId?: string } | null;
@@ -215,12 +228,18 @@ async function handlePair(
 
   const workspaceDir = setupService?.getWorkspaceDir() ?? ".";
   const authDir = path.join(workspaceDir, "whatsapp-auth", accountId);
-  whatsappPairingSessions.get(accountId)?.stop();
+  await whatsappPairingSessions.get(accountId)?.stop();
+  if (!whatsappPairingStartsEnabled || requestGeneration !== whatsappPairingGeneration) {
+    res.status(503).json({ ok: false, error: "WhatsApp pairing is shutting down" });
+    return;
+  }
 
+  const generation = requestGeneration;
   const session = new WhatsAppPairingSession({
     authDir,
     accountId,
     onEvent: (event: WhatsAppPairingEvent) => {
+      if (generation !== whatsappPairingGeneration) return;
       setupService?.broadcastWs(event);
 
       if (event.status === "connected") {
@@ -270,8 +289,16 @@ async function handlePair(
 
   try {
     await session.start();
+    if (!whatsappPairingStartsEnabled || generation !== whatsappPairingGeneration) {
+      res.status(503).json({ ok: false, error: "WhatsApp pairing is shutting down" });
+      return;
+    }
     res.status(200).json({ ok: true, accountId, status: session.getStatus() });
   } catch (err) {
+    if (!whatsappPairingStartsEnabled || generation !== whatsappPairingGeneration) {
+      res.status(503).json({ ok: false, error: "WhatsApp pairing is shutting down" });
+      return;
+    }
     res.status(500).json({ ok: false, error: String(err) });
   }
 }
@@ -282,7 +309,7 @@ async function handleStatus(
   res: RouteResponse,
   runtime: IAgentRuntime
 ): Promise<void> {
-  cleanupStaleSessions();
+  await cleanupStaleSessions();
 
   const setupService = getSetupService(runtime);
   const url = new URL(req.url ?? "/", `http://${routeHost(req)}`);
@@ -342,7 +369,7 @@ async function handlePairStop(
 
   const session = whatsappPairingSessions.get(accountId);
   if (session) {
-    session.stop();
+    await session.stop();
     whatsappPairingSessions.delete(accountId);
   }
 
@@ -372,7 +399,7 @@ async function handleDisconnect(
 
   const session = whatsappPairingSessions.get(accountId);
   if (session) {
-    session.stop();
+    await session.stop();
     whatsappPairingSessions.delete(accountId);
   }
 
@@ -381,15 +408,21 @@ async function handleDisconnect(
   try {
     await whatsappLogout(workspaceDir, accountId);
   } catch (logoutErr) {
-    console.warn(
-      `[whatsapp] Logout failed for ${accountId}, deleting auth files directly:`,
-      String(logoutErr)
+    // error-policy:J1 Disconnect is the boundary that translates remote logout failure into local credential removal.
+    logger.warn(
+      { src: "plugin:whatsapp", accountId, error: String(logoutErr) },
+      "WhatsApp remote logout failed; removing local auth directly"
     );
     const authDir = path.join(workspaceDir, "whatsapp-auth", accountId);
     try {
       fs.rmSync(authDir, { recursive: true, force: true });
-    } catch {
-      /* may not exist */
+    } catch (deleteError) {
+      // error-policy:J1 The HTTP boundary reports local credential-removal failure explicitly.
+      res.status(500).json({
+        ok: false,
+        error: `Failed to remove WhatsApp auth: ${deleteError instanceof Error ? deleteError.message : String(deleteError)}`,
+      });
+      return;
     }
   }
 
@@ -471,13 +504,24 @@ export const whatsappSetupRoutes: Route[] = [
 /**
  * Stop all active pairing sessions. Called during shutdown cleanup.
  */
-export function stopAllPairingSessions(): void {
-  for (const session of whatsappPairingSessions.values()) {
-    try {
-      session.stop();
-    } catch {
-      /* non-fatal */
-    }
-  }
+export async function stopAllPairingSessions(): Promise<void> {
+  whatsappPairingStartsEnabled = false;
+  whatsappPairingGeneration += 1;
+  const sessions = [...whatsappPairingSessions.values()];
   whatsappPairingSessions.clear();
+  const results = await Promise.allSettled(sessions.map(async (session) => session.stop()));
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) =>
+      result.reason instanceof Error ? result.reason : new Error(String(result.reason))
+    );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Failed to stop all WhatsApp pairing sessions");
+  }
+}
+
+/** Starts a fresh pairing lifecycle after a runtime initializes the plugin. */
+export function enableWhatsAppPairingSessions(): void {
+  whatsappPairingGeneration += 1;
+  whatsappPairingStartsEnabled = true;
 }

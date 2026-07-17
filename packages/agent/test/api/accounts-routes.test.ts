@@ -11,8 +11,8 @@ import type { LinkedAccountConfig } from "@elizaos/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountsRouteContext } from "../../src/api/accounts-routes";
 import {
-  _resetAccountsRoutesPoolCache,
   handleAccountsRoutes,
+  resetAccountsRoutesPoolCacheForAgentReset,
 } from "../../src/api/accounts-routes";
 import {
   _resetAgentHostBridge,
@@ -93,7 +93,7 @@ function createContext(
 describe("accounts routes provider-scoped account resolution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    _resetAccountsRoutesPoolCache();
+    resetAccountsRoutesPoolCacheForAgentReset();
     // The routes read the pool through the host-bridge seam (not an
     // @elizaos/app-core import), so the fixture pool is installed the same
     // way a real host installs it.
@@ -468,7 +468,7 @@ describe("accounts routes provider-scoped account resolution", () => {
         },
       }),
     });
-    _resetAccountsRoutesPoolCache();
+    resetAccountsRoutesPoolCacheForAgentReset();
     const ctx = createContext({ method: "GET", pathname: "/api/accounts" });
 
     const handled = await handleAccountsRoutes(ctx);

@@ -14,6 +14,11 @@ import { persistMobileRuntimeModeForServerTarget } from "../first-run/mobile-run
 import { applyLaunchConnection } from "../platform";
 import { confirmDesktopAction } from "../utils/desktop-dialogs";
 import { useAppSelectorShallow } from "./app-store";
+import {
+  BOOTSTRAP_SESSION_STORAGE_KEY,
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "./credential-storage-keys";
 import type { StartupErrorReason, StartupErrorState } from "./types";
 
 /**
@@ -70,7 +75,7 @@ function phaseToStatusKey(phase: string): string {
 
 function needsBootstrapSession(): boolean {
   try {
-    return !sessionStorage.getItem("eliza_session");
+    return !sessionStorage.getItem(BOOTSTRAP_SESSION_STORAGE_KEY);
   } catch {
     // error-policy:J3 sessionStorage may be unavailable (privacy mode / disabled
     // storage); assume a bootstrap session is needed — the safe branch that runs
@@ -131,6 +136,7 @@ export function useStartupShellController(): StartupShellController {
       if (typeof payload?.gatewayUrl !== "string") {
         return;
       }
+      const credentialGeneration = captureRendererCredentialWriteGeneration();
 
       // `completeFirstRun` marks the connected remote as this device's finished
       // first-run target (device/desktop remote-connect-at-URL onboarding), so
@@ -163,12 +169,17 @@ export function useStartupShellController(): StartupShellController {
         }
       }
 
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
+
       try {
-        const connection = applyLaunchConnection({
-          kind: "remote",
-          apiBase: payload.gatewayUrl,
-          token: typeof payload.token === "string" ? payload.token : null,
-        });
+        const connection = applyLaunchConnection(
+          {
+            kind: "remote",
+            apiBase: payload.gatewayUrl,
+            token: typeof payload.token === "string" ? payload.token : null,
+          },
+          credentialGeneration,
+        );
         persistMobileRuntimeModeForServerTarget("remote");
         setState("firstRunRuntimeTarget", "remote");
         setState("firstRunRemoteApiBase", connection.apiBase);
@@ -185,6 +196,7 @@ export function useStartupShellController(): StartupShellController {
             token: connection.token,
             uiLanguage,
           });
+          if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
           setState("firstRunComplete", true);
           coordinatorDispatchRef.current({ type: "FIRST_RUN_COMPLETE" });
         }

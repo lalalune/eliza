@@ -12,6 +12,16 @@ interface TurnScript {
   finalResponse?: string;
   itemText?: string;
   throws?: string;
+  entered?: () => void;
+  waitFor?: Promise<void>;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }
 
 function makeFakeCodex(scripts: TurnScript[]): {
@@ -33,6 +43,8 @@ function makeFakeCodex(scripts: TurnScript[]): {
         return {
           run: async (_input: string, _turnOptions?: { outputSchema?: unknown }) => {
             const s = scripts[turn++] ?? {};
+            s.entered?.();
+            if (s.waitFor) await s.waitFor;
             if (s.throws) throw new Error(s.throws);
             const items = s.itemText ? [{ type: "agent_message", text: s.itemText }] : [];
             return { items, finalResponse: s.finalResponse, usage: null };
@@ -185,5 +197,29 @@ describe("CodexSdkSession — serialization", () => {
     const actions = [JSON.parse(r1).action, JSON.parse(r2).action].sort();
     expect(actions).toEqual(["A", "B"]);
     session.dispose();
+  });
+
+  it("permanent disposal drains the active turn and rejects queued/future work", async () => {
+    const release = deferred();
+    const entered = deferred();
+    const { session, starts } = makeSession([
+      {
+        finalResponse: "active result",
+        entered: entered.resolve,
+        waitFor: release.promise,
+      },
+      { finalResponse: "must not run" },
+    ]);
+    const active = session.generate("active");
+    await entered.promise;
+    const queued = session.generate("queued");
+    const disposal = session.disposePermanently();
+    release.resolve();
+
+    await expect(active).resolves.toBe("active result");
+    await expect(queued).rejects.toThrow(/permanently disposed/);
+    await disposal;
+    await expect(session.generate("future")).rejects.toThrow(/permanently disposed/);
+    expect(starts()).toBe(1);
   });
 });

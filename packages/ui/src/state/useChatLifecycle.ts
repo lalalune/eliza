@@ -7,7 +7,6 @@
 
 import { logger } from "@elizaos/logger";
 import { getDefaultStylePreset } from "@elizaos/shared";
-import { clearStoredStewardToken } from "@elizaos/shared/steward-session-client";
 import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
 import type {
   Conversation,
@@ -28,14 +27,16 @@ import { alertDesktopMessage } from "../utils";
 import { inferAgentRuntimeTarget } from "./agent-runtime-target";
 import { completeResetLocalStateAfterServerWipe as runCompleteResetLocalStateAfterServerWipe } from "./complete-reset-local-state-after-wipe";
 import { handleResetAppliedFromMainCore } from "./handle-reset-applied-from-main";
-import type { AppState, LifecycleAction } from "./internal";
 import {
+  type AppState,
   clearAvatarIndex,
   clearPersistedActiveServer,
   LIFECYCLE_MESSAGES,
+  type LifecycleAction,
   loadPersistedActiveServer,
   parseAgentStatusFromMainMenuResetPayload,
 } from "./internal";
+import { clearRendererStorageForReset } from "./renderer-reset-storage";
 import { shouldAwaitAgentReadiness } from "./types";
 
 // ── Helpers (file-local) ────────────────────────────────────────────
@@ -642,21 +643,6 @@ export function useChatLifecycle(deps: UseChatLifecycleDeps) {
           setElizaCloudUserId(null);
           setElizaCloudStatusReason(null);
           setElizaCloudLoginError(null);
-          // Clear the stored cloud session token so directCloudRequest stops
-          // firing against api.elizacloud.ai with a stale key after reset.
-          // Without this, the renderer keeps making direct cloud calls even
-          // though the UI shows disconnected. The device-code flow persists its
-          // token through the steward-session store, so clearing that store is
-          // what getCloudAuthToken() reads first.
-          //
-          // Coupling guarantee: this runs in `clearElizaCloudSessionUi`,
-          // which `complete-reset-local-state-after-wipe.ts` calls on
-          // line 43 — immediately before `markFirstRunReset()` on
-          // line 44. The two callbacks always fire as a pair, so the
-          // token clear happens on every reset path that uses the
-          // shared cascade. (The cascade is the sole caller; there
-          // is no path that calls one without the other.)
-          clearStoredStewardToken();
         },
         markFirstRunReset: () => {
           enableForceFreshFirstRun();
@@ -690,6 +676,7 @@ export function useChatLifecycle(deps: UseChatLifecycleDeps) {
           setSkills([]);
           setLogs([]);
         },
+        clearRendererStorage: clearRendererStorageForReset,
         fetchFirstRunOptions: () => client.getFirstRunOptions(),
         setFirstRunOptions,
         logResetDebug,

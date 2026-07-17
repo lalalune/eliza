@@ -340,6 +340,7 @@ export class ClaudeSdkSession {
   // are reset at the start of every `sendAndRead`.
   private pendingDecision: RouteDecision | null = null;
   private pendingEnvelope: Record<string, unknown> | null = null;
+  private terminal = false;
 
   constructor(config: ClaudeSdkSessionConfig) {
     this.model = config.model?.trim() || DEFAULT_MODEL;
@@ -390,7 +391,16 @@ export class ClaudeSdkSession {
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     // Serialize so only one turn is in flight per warm session (the streaming
     // generator is a single conversation, and pendingDecision is shared).
-    const run = this.chain.then(fn, fn);
+    if (this.terminal) {
+      return Promise.reject(new Error("[cli-inference:sdk] session permanently disposed"));
+    }
+    const guarded = () => {
+      if (this.terminal) {
+        throw new Error("[cli-inference:sdk] session permanently disposed");
+      }
+      return fn();
+    };
+    const run = this.chain.then(guarded, guarded);
     // error-policy:J5 the chain tail only serializes turns; the REAL result/error
     // is returned to the caller via `run`. Swallowing here just stops a settled
     // tail from raising an unhandled rejection — the caller still sees the error.
@@ -399,6 +409,9 @@ export class ClaudeSdkSession {
   }
 
   private async sendOnce(body: string): Promise<string> {
+    if (this.terminal) {
+      throw new Error("[cli-inference:sdk] session permanently disposed");
+    }
     if (!body.trim()) {
       throw new Error("[cli-inference:sdk] empty prompt body");
     }
@@ -425,7 +438,13 @@ export class ClaudeSdkSession {
   }
 
   private async start(startEpoch: number = this.epoch): Promise<void> {
+    if (this.terminal) {
+      throw new Error("[cli-inference:sdk] session permanently disposed");
+    }
     const sdk = this.sdkOverride ?? (await loadSdk());
+    if (this.terminal) {
+      throw new Error("[cli-inference:sdk] session permanently disposed");
+    }
     // A pull-based async generator the SDK drains; we push the next user message
     // into it via `this.feed`.
     const queue: SdkUserMessage[] = [];
@@ -836,5 +855,12 @@ export class ClaudeSdkSession {
         if (timer) clearTimeout(timer);
       }
     }
+  }
+
+  /** Permanently rejects queued/future turns and waits for active work to end. */
+  async disposePermanently(): Promise<void> {
+    this.terminal = true;
+    await this.dispose();
+    await this.chain;
   }
 }

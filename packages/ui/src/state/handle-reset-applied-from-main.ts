@@ -44,25 +44,33 @@ export async function handleResetAppliedFromMainCore(
   d.logResetInfo(
     "handleResetAppliedFromMain: main process finished reset — syncing renderer state",
   );
+  let ownsResetLifecycle = false;
   if (d.isLifecycleBusy()) {
     const activeAction = d.getActiveLifecycleAction();
-    d.logResetInfo("handleResetAppliedFromMain: skipped — lifecycle busy", {
-      activeAction,
-    });
-    d.setActionNotice(
-      `Agent action already in progress (${LIFECYCLE_MESSAGES[activeAction].inProgress}). Please wait.`,
-      "info",
-      2800,
+    d.logResetInfo(
+      "handleResetAppliedFromMain: superseding lifecycle after shell reset",
+      {
+        activeAction,
+      },
     );
-    return;
-  }
-  if (!d.beginLifecycleAction("reset")) {
     d.setActionNotice(
-      "Another agent operation is still running. Wait for it to finish, then try Reset again.",
+      `Reset finished in the desktop shell; cancelling ${LIFECYCLE_MESSAGES[activeAction].inProgress} and clearing local state.`,
       "info",
       4200,
     );
-    return;
+    // The destructive operation has already happened in main. The renderer's
+    // previous lifecycle can no longer complete against its old state, so its
+    // logical lock must not prevent mandatory credential/local cleanup.
+    d.finishLifecycleAction();
+  }
+  ownsResetLifecycle = d.beginLifecycleAction("reset");
+  if (!ownsResetLifecycle) {
+    d.logResetWarn(
+      "handleResetAppliedFromMain: reset lifecycle lock unavailable; applying mandatory renderer cleanup without it",
+      {
+        activeAction: d.getActiveLifecycleAction(),
+      },
+    );
   }
   d.setActionNotice(
     LIFECYCLE_MESSAGES.reset.progress,
@@ -100,6 +108,8 @@ export async function handleResetAppliedFromMainCore(
       type: "error",
     });
   } finally {
-    d.finishLifecycleAction();
+    if (ownsResetLifecycle) {
+      d.finishLifecycleAction();
+    }
   }
 }

@@ -7,19 +7,51 @@
  * the cloud vault entries so the next boot does not rehydrate a signed-in Eliza
  * Cloud state. Sits behind the authenticated dashboard gate; not public.
  */
+import fs from "node:fs";
 import path from "node:path";
-import type { AgentRuntime, RouteRequestMeta, UUID } from "@elizaos/core";
+import {
+  deleteAllStoredAccountAuthState,
+  validateAccountAuthResetPaths,
+} from "@elizaos/auth/account-storage";
+import { resetCredentialRefreshStateForAgentReset } from "@elizaos/auth/credentials";
+import { cancelAllOAuthFlowsForReset } from "@elizaos/auth/oauth-flow";
+import {
+  type AgentRuntime,
+  type RouteRequestMeta,
+  resetConnectorAccountStateForDestructiveReset,
+  type UUID,
+} from "@elizaos/core";
 import type { RouteHelpers } from "@elizaos/shared";
 import {
   getDefaultStylePreset,
   normalizeCharacterLanguage,
 } from "@elizaos/shared";
-import { loadElizaConfig, saveElizaConfig } from "../config/config.ts";
-import { resolveUserPath } from "../config/paths.ts";
+import { clearCloudSecrets } from "@elizaos/shared/elizacloud/cloud-secrets";
+import { loadElizaConfig, saveElizaConfigForReset } from "../config/config.ts";
+import {
+  resolveStewardCredentialsPath,
+  resolveUserPath,
+} from "../config/paths.ts";
 import { getAgentHostBridge } from "../runtime/host-bridge.ts";
+import { resolveDefaultAgentWorkspaceDir } from "../shared/workspace-resolution.ts";
 import type { AutonomousConfigLike } from "../types/config-like.ts";
 import { detectRuntimeModel } from "./agent-model.ts";
+import {
+  deleteConfigEnvForReset,
+  validateConfigEnvResetPaths,
+} from "./config-env.ts";
 import { clearPersistedFirstRunConfig } from "./provider-switch-config.ts";
+import {
+  deleteAgentStateForReset,
+  deleteExternalAgentStateForReset,
+  validateAgentStateResetPath,
+  validateExternalAgentStateResetPaths,
+  validateOwnedResetTarget,
+  validateResetPathComponents,
+  writeAgentStateOwnershipMarker,
+} from "./reset-state.ts";
+import { resetSubscriptionOAuthStateForAgentReset } from "./subscription-routes.ts";
+import { resetStewardWalletCache } from "./wallet.ts";
 
 type AgentStateStatus =
   | "not_started"
@@ -72,6 +104,7 @@ export interface AgentAdminRouteContext
   resolveStateDir: () => string;
   stateDirExists: (resolvedState: string) => boolean;
   removeStateDir: (resolvedState: string) => void;
+  resetRuntimeOperationStateForAgentReset?: () => void;
   logWarn: (message: string) => void;
 }
 
@@ -94,6 +127,65 @@ function resolveResetPgliteDataDir(
   return path.join(resolveUserPath(workspaceDir), ".elizadb");
 }
 
+function validateResetPgliteDataDir(
+  config: ReturnType<typeof loadElizaConfig>,
+  stateDir: string,
+): string {
+  if (
+    config.database?.provider === "postgres" ||
+    process.env.POSTGRES_URL?.trim() ||
+    process.env.DATABASE_URL?.trim()
+  ) {
+    throw new Error(
+      "agent reset cannot erase an external Postgres database; remove its agent data explicitly before resetting",
+    );
+  }
+  const dataDir = validateResetPathComponents(
+    resolveResetPgliteDataDir(config, stateDir),
+    "PGlite data",
+  );
+  if (path.basename(dataDir) !== ".elizadb") {
+    throw new Error(
+      `[eliza-api] Refusing to delete unexpected PGlite dir during reset: "${dataDir}"`,
+    );
+  }
+  const resolvedStateDir = validateResetPathComponents(
+    stateDir,
+    "agent state root",
+  );
+  const configuredWorkspace = validateResetPathComponents(
+    resolveUserPath(
+      config.agents?.defaults?.workspace ?? `${stateDir}/workspace`,
+    ),
+    "agent workspace",
+  );
+  const configuredPgliteDataDir = config.database?.pglite?.dataDir?.trim();
+  const expectedConfiguredDataDir = configuredPgliteDataDir
+    ? path.resolve(resolveUserPath(configuredPgliteDataDir))
+    : null;
+  if (
+    dataDir !== expectedConfiguredDataDir &&
+    dataDir !== path.join(configuredWorkspace, ".elizadb") &&
+    dataDir !== path.join(resolvedStateDir, ".elizadb") &&
+    !dataDir.startsWith(`${resolvedStateDir}${path.sep}`)
+  ) {
+    throw new Error(
+      `[eliza-api] Refusing unowned PGlite dir during reset: "${dataDir}"`,
+    );
+  }
+  const ownedRoot = dataDir.startsWith(`${resolvedStateDir}${path.sep}`)
+    ? resolvedStateDir
+    : dataDir === path.join(configuredWorkspace, ".elizadb")
+      ? configuredWorkspace
+      : path.dirname(dataDir);
+  validateOwnedResetTarget(ownedRoot, dataDir, "PGlite data");
+  return dataDir;
+}
+
+export const __agentAdminResetPathTesting = {
+  validateResetPgliteDataDir,
+};
+
 export async function handleAgentAdminRoutes(
   ctx: AgentAdminRouteContext,
 ): Promise<boolean> {
@@ -109,7 +201,7 @@ export async function handleAgentAdminRoutes(
     resolveStateDir,
     stateDirExists,
     removeStateDir,
-    logWarn,
+    resetRuntimeOperationStateForAgentReset,
   } = ctx;
 
   if (method === "POST" && pathname === "/api/agent/restart") {
@@ -170,65 +262,111 @@ export async function handleAgentAdminRoutes(
 
   if (method === "POST" && pathname === "/api/agent/reset") {
     try {
-      if (state.runtime) {
-        await state.runtime.stop({ fast: true });
-        state.runtime = null;
-      }
-
-      const stateDir = resolveStateDir();
-      const config = loadElizaConfig();
-      const dataDir = resolveResetPgliteDataDir(config, stateDir);
-      if (path.basename(dataDir) !== ".elizadb") {
-        logWarn(
-          `[eliza-api] Refusing to delete unexpected PGlite dir during reset: "${dataDir}"`,
+      const bridge = getAgentHostBridge();
+      const runReset =
+        bridge.withCredentialStateReset ?? ((operation) => operation());
+      await runReset(async () => {
+        const stateDir = resolveStateDir();
+        const stateResetOptions = {
+          runtimeOwnsState: state.runtime !== null,
+        } as const;
+        validateAgentStateResetPath(stateDir, stateResetOptions);
+        validateAccountAuthResetPaths();
+        validateConfigEnvResetPaths({ stateDir });
+        const config = loadElizaConfig();
+        const workspaceDir = resolveUserPath(
+          config.agents?.defaults?.workspace ??
+            resolveDefaultAgentWorkspaceDir(),
         );
-      } else if (stateDirExists(dataDir)) {
-        removeStateDir(dataDir);
-      }
+        validateExternalAgentStateResetPaths(
+          stateDir,
+          process.env,
+          workspaceDir,
+        );
+        const dataDir = validateResetPgliteDataDir(config, stateDir);
 
-      clearPersistedFirstRunConfig(config);
-      saveElizaConfig(config);
-
-      // Wipe cloud-related vault entries so the next boot doesn't re-hydrate
-      // the user back into a "signed in to Eliza Cloud" state. Without this,
-      // /api/agent/reset clears the renderer UI but the vault still holds
-      // ELIZAOS_CLOUD_API_KEY → vault-bootstrap rehydrates env on next start
-      // → useCloudState reports cloud connected → user sees themselves still
-      // logged in even though they just hit "Reset".
-      try {
-        const vault = getAgentHostBridge().sharedVault();
-        const cloudKeys = [
-          "ELIZAOS_CLOUD_API_KEY",
-          "ELIZAOS_CLOUD_BASE_URL",
-          "ELIZAOS_CLOUD_ENABLED",
-        ];
-        for (const key of cloudKeys) {
-          try {
-            await vault.remove(key);
-          } catch {
-            // Entry may not exist — fine.
-          }
+        if (state.runtime) {
+          await state.runtime.teardownForReset();
+          state.runtime = null;
         }
-      } catch (vaultErr) {
-        logWarn(
-          `[eliza-api] Reset: failed to wipe cloud vault entries: ${vaultErr instanceof Error ? vaultErr.message : String(vaultErr)}`,
+        resetRuntimeOperationStateForAgentReset?.();
+
+        deleteAllStoredAccountAuthState();
+        cancelAllOAuthFlowsForReset();
+        resetSubscriptionOAuthStateForAgentReset();
+        resetCredentialRefreshStateForAgentReset();
+        resetConnectorAccountStateForDestructiveReset();
+
+        if (bridge.deleteHostCredentialStoresForReset) {
+          await bridge.deleteHostCredentialStoresForReset();
+        } else {
+          const vault = bridge.sharedVault();
+          for (const key of await vault.list()) await vault.remove(key);
+          const remaining = await vault.list();
+          if (remaining.length > 0) {
+            throw new Error(
+              `vault entries survived destructive reset: ${remaining.join(", ")}`,
+            );
+          }
+          await vault.destroy?.();
+        }
+
+        if (stateDirExists(dataDir)) {
+          validateOwnedResetTarget(
+            path.dirname(dataDir),
+            dataDir,
+            "PGlite data",
+          );
+          removeStateDir(dataDir);
+        }
+        if (stateDirExists(dataDir)) {
+          throw new Error(`PGlite data survived destructive reset: ${dataDir}`);
+        }
+
+        clearPersistedFirstRunConfig(config);
+        saveElizaConfigForReset(config);
+        await deleteConfigEnvForReset({ stateDir });
+        deleteExternalAgentStateForReset(stateDir, process.env, workspaceDir);
+        deleteAgentStateForReset(stateDir, stateResetOptions);
+        saveElizaConfigForReset(config);
+        if (stateResetOptions.runtimeOwnsState) {
+          writeAgentStateOwnershipMarker(stateDir, stateResetOptions);
+        }
+        clearCloudSecrets();
+        const stewardMetadataPath = resolveStewardCredentialsPath(
+          process.env,
+          stateDir,
         );
-      }
+        validateOwnedResetTarget(
+          stateDir,
+          stewardMetadataPath,
+          "Steward credential metadata",
+        );
+        fs.rmSync(stewardMetadataPath, { force: true });
+        if (fs.existsSync(stewardMetadataPath)) {
+          throw new Error("Steward credential metadata survived reset");
+        }
+        resetStewardWalletCache();
 
-      state.agentState = "stopped";
-      state.agentName = resolveDefaultAgentName(config);
-      state.model = undefined;
-      state.startedAt = undefined;
-      state.config = config;
-      state.chatRoomId = null;
-      state.chatUserId = null;
-      state.chatConnectionReady = null;
-      state.chatConnectionPromise = null;
-      state.pendingRestartReasons = [];
-      state.conversations?.clear();
-      state.activeConversationId = null;
-      state.conversationRestorePromise = null;
+        state.agentState = "stopped";
+        state.agentName = resolveDefaultAgentName(config);
+        state.model = undefined;
+        state.startedAt = undefined;
+        state.config = config;
+        state.chatRoomId = null;
+        state.chatUserId = null;
+        state.chatConnectionReady = null;
+        state.chatConnectionPromise = null;
+        state.pendingRestartReasons = [];
+        state.conversations?.clear();
+        state.activeConversationId = null;
+        state.conversationRestorePromise = null;
+      });
 
+      res.setHeader("Set-Cookie", [
+        "eliza_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        "eliza_csrf=; Path=/; SameSite=Lax; Max-Age=0",
+      ]);
       json(res, { ok: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

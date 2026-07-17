@@ -40,9 +40,14 @@ function canonicalizeStateDir(stateDir: string): string {
   const resolved = path.resolve(stateDir);
   try {
     return fs.realpathSync(resolved);
-  } catch {
+  } catch (error) {
     // error-policy:J4 A state root may be derived before its directory exists.
-    return resolved;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolved;
+    throw new ElizaError("failed to canonicalize the agent state directory", {
+      code: "AGENT_STATE_DIR_CANONICALIZATION_FAILED",
+      cause: error,
+      severity: "fatal",
+    });
   }
 }
 
@@ -69,46 +74,6 @@ export function deriveAgentVaultId(
 ): string {
   const token = vaultTokenForCanonicalStateDir(canonicalStateDir);
   return `eliza1-${token}`;
-}
-
-/**
- * Stable state-directory tokens accepted by structural secure-store recovery.
- * Home-scoped dot-state roots remain derivable because installations that use
- * those roots must retain access after adopting the XDG state location.
- */
-export function deriveCompatibleVaultTokens(
-  vaultId: string,
-  options: { homeDir?: string; namespace?: string } = {},
-): ReadonlySet<string> {
-  const tokenSeparator = vaultId.length - 17;
-  const currentToken = vaultId.slice(tokenSeparator + 1);
-  if (
-    tokenSeparator <= 0 ||
-    vaultId[tokenSeparator] !== "-" ||
-    !/^[A-Za-z0-9_-]{16}$/.test(currentToken)
-  ) {
-    throw new ElizaError(
-      "vault id does not contain a valid state-directory token",
-      {
-        code: "INVALID_AGENT_VAULT_ID",
-        severity: "fatal",
-      },
-    );
-  }
-
-  const homeDir = options.homeDir ?? homedir();
-  const namespace =
-    options.namespace ?? readAliasedEnv("ELIZA_NAMESPACE") ?? "eliza";
-  const stateDirs = [
-    path.join(homeDir, `.${namespace}`),
-    path.join(homeDir, ".eliza"),
-  ];
-  return new Set([
-    currentToken,
-    ...stateDirs.map((stateDir) =>
-      vaultTokenForCanonicalStateDir(canonicalizeStateDir(stateDir)),
-    ),
-  ]);
 }
 
 export function keychainAccountForSecretKind(

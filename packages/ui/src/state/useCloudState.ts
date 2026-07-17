@@ -60,6 +60,10 @@ import {
   hasUsableStoredStewardToken,
   launchStewardLogin,
 } from "./cloud-steward-login";
+import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "./credential-storage-keys";
 import { scrubPersistedActiveServerToken } from "./persistence";
 import { isPrivateNetworkHost } from "./private-network-host";
 
@@ -653,6 +657,8 @@ export function useCloudState({
         await elizaCloudLoginCompletionRef.current;
         return;
       }
+      const credentialGeneration = captureRendererCredentialWriteGeneration();
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
       elizaCloudLoginBusyRef.current = true;
       setElizaCloudLoginBusy(true);
       setElizaCloudLoginError(null);
@@ -690,6 +696,13 @@ export function useCloudState({
           getBootConfig().cloudApiBase ?? "https://elizacloud.ai";
         try {
           const apiKey = await siweLoginWithInjectedWallet(siweBase);
+          if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+            closePrePoppedWindow();
+            elizaCloudLoginBusyRef.current = false;
+            setElizaCloudLoginBusy(false);
+            completeLogin();
+            return loginCompletion;
+          }
           if (apiKey) {
             closePrePoppedWindow();
             const connected = await pollCloudCredits();
@@ -966,6 +979,10 @@ export function useCloudState({
               poll = await client.cloudLoginPoll(sessionId);
             }
             if (!elizaCloudLoginPollTimer.current) return;
+            if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+              stopCloudLoginPolling();
+              return;
+            }
 
             consecutivePollErrors = 0;
             if (poll.status === "authenticated") {
@@ -1075,6 +1092,7 @@ export function useCloudState({
     }
     clearCloudLoginReturnParams();
     if (elizaCloudLoginBusyRef.current) return;
+    const credentialGeneration = captureRendererCredentialWriteGeneration();
 
     let cancelled = false;
     const sleep = (ms: number) =>
@@ -1098,7 +1116,12 @@ export function useCloudState({
             authenticatedCloudApiBase,
             sessionId,
           );
-          if (cancelled) return;
+          if (
+            cancelled ||
+            !isRendererCredentialWriteAllowed(credentialGeneration)
+          ) {
+            return;
+          }
 
           if (poll.status === "authenticated") {
             if (!poll.token) {
@@ -1429,6 +1452,7 @@ export function useCloudState({
 
     let disposed = false;
     const checkAndRefresh = async () => {
+      const credentialGeneration = captureRendererCredentialWriteGeneration();
       const token = readStoredStewardToken()?.trim();
       if (!token) return;
       const secs = cloudTokenSecsRemaining(token);
@@ -1444,7 +1468,9 @@ export function useCloudState({
         logger.warn({ err }, "[useCloudState] steward session refresh failed");
         return null;
       });
-      if (disposed) return;
+      if (disposed || !isRendererCredentialWriteAllowed(credentialGeneration)) {
+        return;
+      }
       if (result?.token) {
         writeStoredStewardToken(result.token);
       }

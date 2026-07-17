@@ -8,14 +8,8 @@
  * keeps openai.com default model ids off non-openai upstreams. Mutations are
  * applied in place; consumed by the first-run / config API routes.
  */
-import {
-  applySubscriptionCredentials,
-  deleteProviderCredentials,
-} from "@elizaos/auth/credentials";
-import {
-  SUBSCRIPTION_PROVIDER_IDS,
-  SUBSCRIPTION_PROVIDER_MAP,
-} from "@elizaos/auth/types";
+import { applySubscriptionCredentials } from "@elizaos/auth/credentials";
+import { SUBSCRIPTION_PROVIDER_MAP } from "@elizaos/auth/types";
 import type {
   DeploymentTargetConfig,
   LinkedAccountFlagsConfig,
@@ -45,7 +39,13 @@ import {
   normalizeSubscriptionProviderSelectionId,
   requiresAdditionalRuntimeProvider,
 } from "@elizaos/shared";
+import { resetHydratedConfigProcessEnv } from "../config/config.ts";
+import {
+  collectConfigEnvVars,
+  collectConnectorEnvVars,
+} from "../config/env-vars.ts";
 import type { ElizaConfig } from "../config/types.eliza.ts";
+import { readConfigEnvSync } from "./config-env.ts";
 
 type MutableElizaConfig = Partial<ElizaConfig> & {
   cloud?: Record<string, unknown>;
@@ -241,25 +241,6 @@ function setPrimaryModel(
     return;
   }
   defaults.model = { ...defaults.model, primary: primaryModel };
-}
-
-function clearPersistedEnvValue(config: MutableElizaConfig, key: string): void {
-  const env = asRecord(config.env);
-  const vars = asRecord(env?.vars);
-
-  if (vars) {
-    delete vars[key];
-    if (Object.keys(vars).length === 0 && env) {
-      delete env.vars;
-    }
-  }
-
-  if (env) {
-    delete env[key];
-    if (Object.keys(env).length === 0) {
-      delete config.env;
-    }
-  }
 }
 
 function clearCloudModelSelections(config: MutableElizaConfig): void {
@@ -695,108 +676,123 @@ export function clearSubscriptionProviderConfig(
   delete config.agents.defaults.subscriptionProvider;
 }
 
+const FIRST_RUN_SIGNAL_PROVIDERS = [
+  "anthropic",
+  "anthropic-subscription",
+  "cerebras",
+  "deepseek",
+  "gemini",
+  "grok",
+  "groq",
+  "mistral",
+  "moonshot",
+  "nearai",
+  "ollama",
+  "openai",
+  "openai-subscription",
+  "openrouter",
+  "together",
+  "zai",
+] as const satisfies readonly FirstRunLocalProviderId[];
+
+/** Every env-backed value that can restore onboarding or credential state. */
+export const FIRST_RUN_RESET_CREDENTIAL_ENV_KEYS = Object.freeze(
+  Array.from(
+    new Set([
+      ...FIRST_RUN_SIGNAL_PROVIDERS.flatMap((providerId) =>
+        getFirstRunProviderSignalEnvKeys(providerId),
+      ),
+      ...Object.values(PROVIDER_DEFAULT_MODELS).flatMap(
+        ({ smallKey, largeKey, cleanupKeys }) =>
+          cleanupKeys
+            ? [smallKey, largeKey, ...cleanupKeys]
+            : [smallKey, largeKey],
+      ),
+      "AI_GATEWAY_API_KEY",
+      "AIGATEWAY_API_KEY",
+      "GOOGLE_API_KEY",
+      "GEMINI_API_KEY",
+      "KIMI_API_KEY",
+      "EVM_PRIVATE_KEY",
+      "SOLANA_PRIVATE_KEY",
+      "ELIZA_WALLET_OS_STORE",
+      "ELIZA_WALLET_AUTO_PROVISION",
+      "WALLET_SOURCE_EVM",
+      "WALLET_SOURCE_SOLANA",
+      "STEWARD_API_URL",
+      "STEWARD_TENANT_ID",
+      "STEWARD_AGENT_ID",
+      "ELIZA_STEWARD_AGENT_ID",
+      "STEWARD_API_KEY",
+      "STEWARD_AGENT_TOKEN",
+      "STEWARD_EVM_ADDRESS",
+      "STEWARD_SOLANA_ADDRESS",
+      "SOLANA_PUBLIC_KEY",
+      "WALLET_PUBLIC_KEY",
+      "ELIZA_MANAGED_EVM_ADDRESS",
+      "ELIZA_MANAGED_SOLANA_ADDRESS",
+      "ELIZA_CLOUD_EVM_ADDRESS",
+      "ELIZA_CLOUD_SOLANA_ADDRESS",
+      "ELIZA_CLOUD_CLIENT_ADDRESS_KEY",
+      "X402_ENABLED",
+      "X402_API_KEY",
+      "X402_BASE_URL",
+      "PGLITE_DATA_DIR",
+      "FEED_AGENT_SESSION_TOKEN",
+      "FEED_AGENT_SESSION_EXPIRES_AT",
+      "EVM_RPC_URL",
+      "SOLANA_RPC_URL",
+      "NODEREAL_BSC_RPC_URL",
+      "QUICKNODE_BSC_RPC_URL",
+      "ALCHEMY_API_KEY",
+      "INFURA_API_KEY",
+      "ANKR_API_KEY",
+      "HELIUS_API_KEY",
+      "BIRDEYE_API_KEY",
+      "ELIZAOS_CLOUD_API_KEY",
+      "ELIZA_CLOUD_API_KEY",
+      "ELIZAOS_CLOUD_BASE_URL",
+      "ELIZA_CLOUD_BASE_URL",
+      "ELIZAOS_CLOUD_ENABLED",
+      "ELIZAOS_CLOUD_NANO_MODEL",
+      "ELIZAOS_CLOUD_SMALL_MODEL",
+      "ELIZAOS_CLOUD_MEDIUM_MODEL",
+      "ELIZAOS_CLOUD_LARGE_MODEL",
+      "ELIZAOS_CLOUD_MEGA_MODEL",
+      "ELIZAOS_CLOUD_RESPONSE_HANDLER_MODEL",
+      "ELIZAOS_CLOUD_SHOULD_RESPOND_MODEL",
+      "ELIZAOS_CLOUD_ACTION_PLANNER_MODEL",
+      "ELIZAOS_CLOUD_PLANNER_MODEL",
+      "ELIZAOS_CLOUD_RESPONSE_MODEL",
+      "ELIZAOS_CLOUD_MEDIA_DESCRIPTION_MODEL",
+      "GITHUB_TOKEN",
+      "TWILIO_ACCOUNT_SID",
+      "TWILIO_AUTH_TOKEN",
+      "TWILIO_PHONE_NUMBER",
+      "BLOOIO_API_KEY",
+      "BLOOIO_PHONE_NUMBER",
+    ]),
+  ),
+);
+
 /**
- * Clear persisted first-run state that should force the UI back through the
- * first-run setup on the next load/reset.
+ * Returns persisted config to a true fresh-install shape. Downloaded model
+ * artifacts live outside these config sources and are intentionally retained.
  */
 export function clearPersistedFirstRunConfig(config: MutableElizaConfig): void {
-  if (config.meta && typeof config.meta === "object") {
-    delete (config.meta as Record<string, unknown>).firstRunComplete;
-  }
+  const hydratedKeys = new Set([
+    ...FIRST_RUN_RESET_CREDENTIAL_ENV_KEYS,
+    ...Object.keys(collectConfigEnvVars(config as ElizaConfig)),
+    ...Object.keys(collectConnectorEnvVars(config as ElizaConfig)),
+    ...Object.keys(readConfigEnvSync()),
+  ]);
+  const record = config as Record<string, unknown>;
+  for (const key of Object.keys(record)) delete record[key];
 
-  config.agents = { list: [] };
-
-  if (config.cloud && typeof config.cloud === "object") {
-    config.cloud = {};
-  }
-
-  const models = asRecord(config.models);
-  if (models) {
-    delete models.nano;
-    delete models.small;
-    delete models.medium;
-    delete models.large;
-    delete models.mega;
-    if (Object.keys(models).length === 0) {
-      delete config.models;
-    }
-  }
-
-  // Clear voice settings so presets apply their correct voice on first-run setup.
-  const messages = asRecord(config.messages);
-  if (messages) {
-    delete messages.tts;
-    if (Object.keys(messages).length === 0) {
-      delete config.messages;
-    }
-  }
-
-  // Clear UI state (avatar, preset selection) so the full character resets.
-  // Without this, the avatar survives a reset but the voice doesn't,
-  // causing mismatched character state (e.g. male preset with female voice).
-  delete config.ui;
-
-  delete (config as Record<string, unknown>).connection;
-  delete config.deploymentTarget;
-  delete config.linkedAccounts;
-  delete config.serviceRouting;
-
-  const signalProviders = [
-    "anthropic",
-    "anthropic-subscription",
-    "cerebras",
-    "deepseek",
-    "gemini",
-    "grok",
-    "groq",
-    "mistral",
-    "moonshot",
-    "nearai",
-    "ollama",
-    "openai",
-    "openai-subscription",
-    "openrouter",
-    "together",
-    "zai",
-  ] as const satisfies readonly FirstRunLocalProviderId[];
-
-  for (const providerId of signalProviders) {
-    for (const envKey of getFirstRunProviderSignalEnvKeys(providerId)) {
-      clearPersistedEnvValue(config, envKey);
-      delete process.env[envKey];
-    }
-  }
-
-  // A full reset must also drop the provider-specific default model env vars
-  // that applyDefaultModelNames stamps (ANTHROPIC_LARGE_MODEL, OPENAI_SMALL_MODEL,
-  // CEREBRAS_MODEL, …); otherwise a stale model id from a prior provider survives
-  // into the next fresh first-run.
-  for (const { smallKey, largeKey, cleanupKeys } of Object.values(
-    PROVIDER_DEFAULT_MODELS,
-  )) {
-    for (const envKey of new Set([
-      smallKey,
-      largeKey,
-      ...(cleanupKeys ?? []),
-    ])) {
-      clearPersistedEnvValue(config, envKey);
-      delete process.env[envKey];
-    }
-  }
-
-  delete process.env.ELIZAOS_CLOUD_API_KEY;
-  delete process.env.ELIZAOS_CLOUD_ENABLED;
-  delete process.env.ELIZAOS_CLOUD_NANO_MODEL;
-  delete process.env.ELIZAOS_CLOUD_MEDIUM_MODEL;
-  delete process.env.ELIZAOS_CLOUD_SMALL_MODEL;
-  delete process.env.ELIZAOS_CLOUD_LARGE_MODEL;
-  delete process.env.ELIZAOS_CLOUD_MEGA_MODEL;
-  delete process.env.ELIZAOS_CLOUD_RESPONSE_HANDLER_MODEL;
-  delete process.env.ELIZAOS_CLOUD_SHOULD_RESPOND_MODEL;
-  delete process.env.ELIZAOS_CLOUD_ACTION_PLANNER_MODEL;
-  delete process.env.ELIZAOS_CLOUD_PLANNER_MODEL;
-  for (const provider of SUBSCRIPTION_PROVIDER_IDS) {
-    deleteProviderCredentials(provider);
+  const restoredLaunchEnvKeys = resetHydratedConfigProcessEnv();
+  for (const envKey of hydratedKeys) {
+    if (restoredLaunchEnvKeys.has(envKey)) continue;
+    delete process.env[envKey];
   }
 }
 

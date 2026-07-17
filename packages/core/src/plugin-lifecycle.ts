@@ -196,6 +196,43 @@ const pluginRegistrationContext =
 const pluginServiceStartContext =
 	createAsyncContextStorage<RuntimePluginServiceStartCapture>();
 const serviceClassOwners = new WeakMap<RuntimeServiceClass, string>();
+const disposedPluginHooks = new WeakMap<IAgentRuntime, WeakSet<Plugin>>();
+
+/**
+ * Runs every registered plugin's process-lifetime cleanup before runtime
+ * services stop. Successful hooks are remembered per runtime so a caller can
+ * safely retry shutdown after one plugin fails without disposing its peers
+ * twice.
+ */
+export async function disposeRuntimePluginHooks(
+	runtime: IAgentRuntime,
+): Promise<void> {
+	let disposed = disposedPluginHooks.get(runtime);
+	if (!disposed) {
+		disposed = new WeakSet<Plugin>();
+		disposedPluginHooks.set(runtime, disposed);
+	}
+
+	const errors: Error[] = [];
+	for (const plugin of [...runtime.plugins].reverse()) {
+		if (disposed.has(plugin)) continue;
+		const disposeHook = (plugin as RuntimePluginWithLifecycleHooks).dispose;
+		if (typeof disposeHook !== "function") {
+			disposed.add(plugin);
+			continue;
+		}
+		try {
+			await disposeHook(runtime);
+			disposed.add(plugin);
+		} catch (error) {
+			errors.push(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	if (errors.length > 0) {
+		throw new AggregateError(errors, "Failed to dispose all runtime plugins");
+	}
+}
 
 function getServiceClassLabel(serviceClass: RuntimeServiceClass): string {
 	return (

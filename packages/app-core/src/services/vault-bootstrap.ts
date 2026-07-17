@@ -32,6 +32,7 @@ import { logger } from "@elizaos/core";
 import type { Vault } from "@elizaos/vault";
 
 import { loadRegistry } from "../registry";
+import { withCredentialStateMutation } from "../security/credential-state-lock";
 import { sharedVault } from "./vault-mirror";
 
 interface AgentBridge {
@@ -258,6 +259,12 @@ async function mirrorProcessEnvSensitive(
 
 export async function runVaultBootstrap(
   opts: VaultBootstrapOptions = {},
+): Promise<VaultBootstrapResult> {
+  return withCredentialStateMutation(() => runVaultBootstrapUnlocked(opts));
+}
+
+async function runVaultBootstrapUnlocked(
+  opts: VaultBootstrapOptions,
 ): Promise<VaultBootstrapResult> {
   // Resolve the lazy agent bridge ONCE here; everything downstream gets it
   // injected. Single resolution point also keeps the cycle-breaking dynamic

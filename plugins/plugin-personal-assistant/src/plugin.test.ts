@@ -1,6 +1,7 @@
 /** Verifies the plugin registers its routes and auto-registers the Google plugin dependency when absent. Deterministic vitest with a stubbed runtime plugin registrar. */
 import type { IAgentRuntime, Plugin } from "@elizaos/core";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getDeviceId, resetCachedDeviceId } from "./lifeops/device-identity.js";
 import {
   ensureLifeOpsGooglePluginRegistered,
   personalAssistantPlugin,
@@ -32,6 +33,8 @@ function createRuntimeWithPluginRegistration(initialPlugins: Plugin[] = []): {
   } as IAgentRuntime;
   return { runtime, plugins, registerPlugin };
 }
+
+afterEach(() => resetCachedDeviceId());
 
 describe("LifeOps Google plugin registration", () => {
   it("exposes the owner todo action for todos-routed planner turns", () => {
@@ -111,5 +114,29 @@ describe("LifeOps Google plugin registration", () => {
     await ensureLifeOpsGooglePluginRegistered(runtime);
 
     expect(registerPlugin).not.toHaveBeenCalled();
+  });
+
+  it("drops the cached device identity during plugin disposal", async () => {
+    expect(getDeviceId({ ELIZA_DEVICE_ID: "device-before-dispose" })).toBe(
+      "device-before-dispose",
+    );
+    const runtime = {
+      agentId: "agent-1",
+      getTasks: vi.fn(async () => []),
+      deleteTask: vi.fn(async () => undefined),
+      unregisterTaskWorker: vi.fn(),
+      logger: {
+        debug: vi.fn(),
+        error: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+      },
+    } as unknown as IAgentRuntime;
+
+    await personalAssistantPlugin.dispose?.(runtime);
+
+    expect(getDeviceId({ ELIZA_DEVICE_ID: "device-after-dispose" })).toBe(
+      "device-after-dispose",
+    );
   });
 });

@@ -22,6 +22,10 @@
  */
 import { logger } from "@elizaos/logger";
 import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "./credential-storage-keys";
 
 /** Minimal EIP-1193 surface the login needs. */
 export interface InjectedEthereumProvider {
@@ -129,6 +133,8 @@ async function readBody(res: Response): Promise<string> {
 export async function siweLoginWithInjectedWallet(
   cloudApiBase: string,
 ): Promise<string | null> {
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
+  if (!isRendererCredentialWriteAllowed(credentialGeneration)) return null;
   const provider = getInjectedEthereumProvider();
   if (!provider) return null;
 
@@ -193,6 +199,7 @@ export async function siweLoginWithInjectedWallet(
   if (typeof verified.apiKey !== "string" || !verified.apiKey) {
     throw new Error("Eliza Cloud SIWE verify returned no API key.");
   }
+  if (!isRendererCredentialWriteAllowed(credentialGeneration)) return null;
 
   writeStoredStewardToken(verified.apiKey);
   logger.info(

@@ -9,6 +9,10 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+} from "../state/credential-storage-keys";
+import {
   applyLaunchConnection,
   applyLaunchConnectionFromUrl,
 } from "./browser-launch";
@@ -99,6 +103,7 @@ describe("browser launch connection handling", () => {
         kind: "remote",
         apiBase: "http://100.96.0.1:31337/v1",
       }),
+      expect.any(Number),
     );
     expect(window.location.href).toBe("http://localhost/");
   });
@@ -174,6 +179,7 @@ describe("browser launch connection handling", () => {
         apiBase: "https://my-box.local:31337",
         kind: "remote",
       }),
+      expect.any(Number),
     );
   });
 
@@ -260,5 +266,48 @@ describe("browser launch connection handling", () => {
 
     expect(mocks.setBaseUrl).not.toHaveBeenCalled();
     expect(mocks.savePersistedActiveServer).not.toHaveBeenCalled();
+  });
+
+  it("drops a launch-session response invalidated by destructive reset", async () => {
+    let resolveFetch: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "http://localhost/?cloudLaunchSession=launch-late&cloudLaunchBase=https%3A%2F%2Fapi.elizacloud.ai",
+    );
+
+    const launchPromise = applyLaunchConnectionFromUrl();
+    await vi.waitFor(() => expect(resolveFetch).toBeTypeOf("function"));
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      resolveFetch?.(
+        Response.json({
+          success: true,
+          data: {
+            connection: {
+              apiBase: "https://agent-1.elizacloud.ai",
+              token: "late-runtime-token",
+            },
+          },
+        }),
+      );
+
+      await expect(launchPromise).resolves.toBe(false);
+      expect(mocks.setBaseUrl).not.toHaveBeenCalled();
+      expect(mocks.setToken).not.toHaveBeenCalled();
+      expect(mocks.savePersistedActiveServer).not.toHaveBeenCalled();
+      expect(window.location.href).toBe("http://localhost/");
+    } finally {
+      finishRendererCredentialReset(resetGeneration);
+    }
   });
 });

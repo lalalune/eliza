@@ -55,6 +55,11 @@ import {
 } from "../utils/cloud-agent-base";
 import { getElizaApiBase } from "../utils/eliza-globals";
 import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+  type RendererCredentialWriteGeneration,
+} from "./credential-storage-keys";
+import {
   detectExistingFirstRunConnection,
   type ExistingFirstRunProbeResult,
 } from "./first-run-bootstrap";
@@ -378,7 +383,10 @@ function resolveRestoreStewardRefreshEndpoint(): string | undefined {
  *
  * The refresh runs at most once per restore, so there is no refresh loop.
  */
-async function resolveRestoredStewardToken(): Promise<string | null> {
+async function resolveRestoredStewardToken(
+  generation: RendererCredentialWriteGeneration,
+): Promise<string | null> {
+  if (!isRendererCredentialWriteAllowed(generation)) return null;
   const stored = readStoredStewardToken()?.trim();
   if (!stored) {
     // No app-origin token, but the shared, HttpOnly .elizacloud.ai session
@@ -402,6 +410,7 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
         }),
       ]);
       if (cookieTimeout) clearTimeout(cookieTimeout);
+      if (!isRendererCredentialWriteAllowed(generation)) return null;
       if (recovered?.token) {
         writeStoredStewardToken(recovered.token);
         try {
@@ -435,6 +444,7 @@ async function resolveRestoredStewardToken(): Promise<string | null> {
     }),
   ]);
   if (timeout) clearTimeout(timeout);
+  if (!isRendererCredentialWriteAllowed(generation)) return null;
 
   if (refreshed?.token) {
     writeStoredStewardToken(refreshed.token);
@@ -466,6 +476,8 @@ export async function applyRestoredConnection(args: {
   startLocalRuntime?: () => Promise<void>;
 }) {
   const { restoredActiveServer, clientRef, startLocalRuntime } = args;
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
+  if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
 
   if (restoredActiveServer.kind === "local") {
     // Don't clear an already-set token: "local" means the agent runs
@@ -491,13 +503,15 @@ export async function applyRestoredConnection(args: {
     )
       ? reconcileLegacyDedicatedCloudApiBase(resolved, restoreProbeToken)
       : Promise.resolve(null);
-    const stewardTokenPromise = resolveRestoredStewardToken();
+    const stewardTokenPromise =
+      resolveRestoredStewardToken(credentialGeneration);
     // Cloud = Steward everywhere (DECISIONS.md D3): prefer the live Steward
     // session token over the token captured at provision time (which may have
     // rotated since). If that stored JWT expired while the app was closed,
     // refresh it BEFORE handing it to the client so a returning user never
     // boots into a permanently-401ing session (see resolveRestoredStewardToken).
     const stewardToken = await stewardTokenPromise;
+    if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
     // Dedicated agent subdomains use an agent-local paired token for `/api/*`.
     // Prefer a persisted paired token there, but keep the Steward fallback so
     // older stale installs still reach the startup re-pair recovery path.
@@ -507,6 +521,7 @@ export async function applyRestoredConnection(args: {
         : stewardToken || resolved.accessToken || null,
     );
     void tierRepairPromise.then((repaired) => {
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
       if (!repaired || repaired.apiBase === resolved.apiBase) return;
       const current = loadPersistedActiveServer();
       // A user can switch agents while the compatibility probe is in flight.
@@ -624,7 +639,9 @@ export function canRestoreActiveServer(args: {
 
 function preserveCloudAuthTokenForFirstRun(
   server: PersistedActiveServer,
+  generation: RendererCredentialWriteGeneration,
 ): void {
+  if (!isRendererCredentialWriteAllowed(generation)) return;
   if (server.kind !== "cloud") return;
   // Cloud = Steward everywhere (DECISIONS.md D3): the Steward session token
   // persists in localStorage independently of the dropped active server, so
@@ -650,6 +667,10 @@ export async function runRestoringSession(
   ctxRef: React.MutableRefObject<RestoringSessionCtx | null>,
   cancelled: { current: boolean },
 ): Promise<void> {
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
+  const resetInvalidatedRun = () =>
+    cancelled.current ||
+    !isRendererCredentialWriteAllowed(credentialGeneration);
   deps.setStartupError(null);
   deps.setAuthRequired(false);
   deps.setConnected(false);
@@ -660,7 +681,7 @@ export async function runRestoringSession(
   // re-onboarded on the boot after the wipe. No-op on web/desktop and whenever
   // localStorage still carries the flag.
   await hydratePersistedFirstRunCompleteFromNativeStore();
-  if (cancelled.current) return;
+  if (resetInvalidatedRun()) return;
   let persistedActiveServer = loadPersistedActiveServer();
   let hadPrior = loadPersistedFirstRunComplete();
   const forceFreshFirstRun = isForceFreshFirstRunEnabled();
@@ -681,7 +702,7 @@ export async function runRestoringSession(
     client.setBaseUrl(null);
     client.setToken(null);
   }
-  if (cancelled.current) return;
+  if (resetInvalidatedRun()) return;
 
   const isDesktop = isElectrobunRuntime();
 
@@ -744,7 +765,7 @@ export async function runRestoringSession(
       };
     }
   }
-  if (cancelled.current) return;
+  if (resetInvalidatedRun()) return;
 
   let restoredActiveServer =
     persistedActiveServer ?? (probed ? probed.activeServer : null);
@@ -777,7 +798,10 @@ export async function runRestoringSession(
       isDesktop,
     })
   ) {
-    preserveCloudAuthTokenForFirstRun(restoredActiveServer);
+    preserveCloudAuthTokenForFirstRun(
+      restoredActiveServer,
+      credentialGeneration,
+    );
     clearPersistedActiveServer();
     savePersistedFirstRunComplete(false);
     persistedActiveServer = null;
@@ -825,6 +849,7 @@ export async function runRestoringSession(
       }
     },
   });
+  if (resetInvalidatedRun()) return;
 
   // The connection is applied (base URL + token are what the post-paint auth
   // gate will use), so start the /api/auth/me probe now — it overlaps the
@@ -849,6 +874,7 @@ export async function runRestoringSession(
   let resolvedTarget = activeServerToTarget(restoredActiveServer);
   if (resolvedTarget === "embedded-local" && isElectrobunRuntime()) {
     const runtimeMode = await desktopRuntimeMode();
+    if (resetInvalidatedRun()) return;
     if (runtimeMode?.mode && runtimeMode.mode !== "local") {
       resolvedTarget = "remote-backend";
     }

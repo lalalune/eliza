@@ -23,6 +23,11 @@ import {
   readStoredStewardToken,
 } from "@elizaos/shared/steward-session-client";
 import { cloudTokenSecsRemaining } from "../api/client-cloud";
+import {
+  assertRendererCredentialWriteAllowed,
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "./credential-storage-keys";
 
 export interface StewardLoginResult {
   /** The Steward session JWT now present in localStorage. */
@@ -102,6 +107,8 @@ export function hasUsableStoredStewardToken(): boolean {
  * so the caller can fall back to a legacy path during migration.
  */
 export async function launchStewardLogin(): Promise<StewardLoginResult> {
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
+  assertRendererCredentialWriteAllowed(credentialGeneration);
   const existing = readStoredStewardToken()?.trim();
   if (existing && isStoredStewardTokenUsable(existing)) {
     return { token: existing };
@@ -113,5 +120,12 @@ export async function launchStewardLogin(): Promise<StewardLoginResult> {
       "Eliza Cloud sign-in is unavailable: the Steward login surface is not mounted.",
     );
   }
-  return registeredLauncher();
+  const result = await registeredLauncher();
+  if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+    // The provider may persist immediately before resolving. Drain that late
+    // token before surfacing cancellation so reset remains the final writer.
+    clearStoredStewardToken();
+  }
+  assertRendererCredentialWriteAllowed(credentialGeneration);
+  return result;
 }

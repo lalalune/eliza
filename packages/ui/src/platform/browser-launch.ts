@@ -6,6 +6,12 @@ import { client } from "../api";
 import { getBootConfig } from "../config/boot-config-store";
 import { upsertAndActivateAgentProfile } from "../state/agent-profiles";
 import {
+  assertRendererCredentialWriteAllowed,
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+  type RendererCredentialWriteGeneration,
+} from "../state/credential-storage-keys";
+import {
   createPersistedActiveServer,
   savePersistedActiveServer,
 } from "../state/persistence";
@@ -174,16 +180,23 @@ async function exchangeCloudLaunchSession(
   throw lastError ?? new Error("Launch session exchange failed");
 }
 
-export function applyLaunchConnection(args: {
+export function applyLaunchConnection(
+  args: {
+    apiBase: string;
+    token?: string | null;
+    kind?: "cloud" | "remote";
+  },
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): {
   apiBase: string;
-  token?: string | null;
-  kind?: "cloud" | "remote";
-}): { apiBase: string; token: string | null } {
+  token: string | null;
+} {
   const kind = args.kind ?? "remote";
   const normalizedApiBase = normalizeLaunchApiBase(args.apiBase, {
     kind,
   });
   const token = args.token?.trim() || null;
+  assertRendererCredentialWriteAllowed(generation);
 
   client.setBaseUrl(normalizedApiBase);
   client.setToken(token);
@@ -197,18 +210,24 @@ export function applyLaunchConnection(args: {
   // with the active server — otherwise a connection made here is invisible to
   // the runtime switcher and leaves its Active badge stale. Idempotent: a
   // repeat connect to the same host re-activates rather than duplicating.
-  upsertAndActivateAgentProfile({
-    kind,
-    label: persisted.label,
-    ...(persisted.apiBase !== undefined ? { apiBase: persisted.apiBase } : {}),
-    ...(token ? { accessToken: token } : {}),
-  });
+  upsertAndActivateAgentProfile(
+    {
+      kind,
+      label: persisted.label,
+      ...(persisted.apiBase !== undefined
+        ? { apiBase: persisted.apiBase }
+        : {}),
+      ...(token ? { accessToken: token } : {}),
+    },
+    generation,
+  );
 
   return { apiBase: normalizedApiBase, token };
 }
 
 export async function applyLaunchConnectionFromUrl(): Promise<boolean> {
   if (typeof window === "undefined") return false;
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
 
   const params = getSearchParams();
   const launchSession = params.get("cloudLaunchSession")?.trim();
@@ -219,11 +238,18 @@ export async function applyLaunchConnectionFromUrl(): Promise<boolean> {
       normalizeLaunchBaseUrl(launchBase),
       launchSession,
     );
-    applyLaunchConnection({
-      kind: "cloud",
-      apiBase: connection.apiBase,
-      token: connection.token,
-    });
+    if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+      stripLaunchParams();
+      return false;
+    }
+    applyLaunchConnection(
+      {
+        kind: "cloud",
+        apiBase: connection.apiBase,
+        token: connection.token,
+      },
+      credentialGeneration,
+    );
     stripLaunchParams();
     return true;
   }
@@ -238,11 +264,18 @@ export async function applyLaunchConnectionFromUrl(): Promise<boolean> {
     return false;
   }
 
-  applyLaunchConnection({
-    kind: "remote",
-    apiBase,
-    token: null,
-  });
+  if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+    stripLaunchParams();
+    return false;
+  }
+  applyLaunchConnection(
+    {
+      kind: "remote",
+      apiBase,
+      token: null,
+    },
+    credentialGeneration,
+  );
   stripLaunchParams();
   return true;
 }

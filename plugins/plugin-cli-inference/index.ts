@@ -321,10 +321,10 @@ function getSdkSession(
 export async function disposeSdkSessions(): Promise<void> {
   const all = [...sdkSessions.values()];
   sdkSessions.clear();
-  await Promise.all(all.map((s) => s.dispose()));
+  await Promise.all(all.map((s) => s.disposePermanently()));
   const codex = [...codexSdkSessions.values()];
   codexSdkSessions.clear();
-  for (const s of codex) s.dispose();
+  await Promise.all(codex.map((s) => s.disposePermanently()));
 }
 
 // Warm Codex SDK threads, keyed by (model, mode). codex-sdk has no thread-level

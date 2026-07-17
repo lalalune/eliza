@@ -87,6 +87,8 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
 
   afterEach(() => {
     delete process.env.OPENAI_API_KEY;
+    delete process.env.EVM_PRIVATE_KEY;
+    delete process.env.STEWARD_AGENT_TOKEN;
     for (const key of [...CLOUD_ENV_KEYS, ...MODEL_ENV_KEYS]) {
       delete process.env[key];
     }
@@ -116,18 +118,7 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
     const config = buildFullyOnboardedConfig();
     clearPersistedFirstRunConfig(config);
 
-    expect((config.meta as Record<string, unknown>)?.firstRunComplete).toBe(
-      undefined,
-    );
-    expect(config.agents).toEqual({ list: [] });
-    expect(config.cloud).toEqual({});
-    expect(config.models).toBeUndefined();
-    expect(config.messages).toBeUndefined();
-    expect(config.ui).toBeUndefined();
-    expect((config as Record<string, unknown>).connection).toBeUndefined();
-    expect(config.deploymentTarget).toBeUndefined();
-    expect(config.linkedAccounts).toBeUndefined();
-    expect(config.serviceRouting).toBeUndefined();
+    expect(config).toEqual({});
   });
 
   it("clears provider credentials from both config.env and process.env", () => {
@@ -138,6 +129,39 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
 
     expect(config.env).toBeUndefined();
     expect(process.env.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  it("scrubs wallet and Steward credentials from every persisted config shape", () => {
+    process.env.EVM_PRIVATE_KEY = "process-wallet-secret";
+    process.env.STEWARD_AGENT_TOKEN = "process-steward-token";
+    const config = {
+      env: {
+        EVM_PRIVATE_KEY: "top-level-wallet-secret",
+        KEEP: "top-level-keep",
+        vars: {
+          STEWARD_AGENT_TOKEN: "nested-steward-token",
+          KEEP_NESTED: "nested-keep",
+        },
+      },
+      wallet: { rpcProviders: { evm: "https://rpc.example" } },
+      plugins: {
+        entries: {
+          connector: {
+            config: {
+              EVM_PRIVATE_KEY: "plugin-wallet-secret",
+              STEWARD_AGENT_TOKEN: "plugin-steward-token",
+              KEEP_PLUGIN: "plugin-keep",
+            },
+          },
+        },
+      },
+    } as unknown as Partial<ElizaConfig>;
+
+    clearPersistedFirstRunConfig(config);
+
+    expect(config).toEqual({});
+    expect(process.env.EVM_PRIVATE_KEY).toBeUndefined();
+    expect(process.env.STEWARD_AGENT_TOKEN).toBeUndefined();
   });
 
   it("clears provider-specific default model env vars (no stale model leaks)", () => {
@@ -165,7 +189,7 @@ describe("clearPersistedFirstRunConfig (reset everything)", () => {
   it("is a no-op-safe on an already-empty config", () => {
     const config: Partial<ElizaConfig> = {};
     expect(() => clearPersistedFirstRunConfig(config)).not.toThrow();
-    expect(config.agents).toEqual({ list: [] });
+    expect(config).toEqual({});
   });
 });
 

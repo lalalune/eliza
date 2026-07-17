@@ -843,14 +843,12 @@ export class Client {
   }
 
   /**
-   * Log out of Twitter.
-   * Note: With API v2, logout is not applicable as we use API credentials.
+   * Terminally dispose the current authentication provider and clear the client.
    */
   public async logout(): Promise<void> {
-    // With API v2 credentials, there's no logout process.
-    logger.warn(
-      "[X.Client] Logout is not applicable when using Twitter API v2 credentials",
-    );
+    const auth = this.auth;
+    this.auth = undefined;
+    await auth?.logout();
   }
 
   /**

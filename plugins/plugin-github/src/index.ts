@@ -26,6 +26,7 @@ import {
 } from "@elizaos/core";
 import { githubAction } from "./actions/github.js";
 import { createGitHubConnectorAccountProvider } from "./connector-account-provider.js";
+import { clearDeviceFlowsForAgent } from "./device-flow.js";
 import { handleGitHubRoutes } from "./routes/github-routes.js";
 import { registerGitHubSearchCategory } from "./search-category.js";
 import { GitHubService } from "./services/github-service.js";
@@ -156,6 +157,7 @@ export const githubPlugin: Plugin = {
     }
   },
   async dispose(runtime: IAgentRuntime) {
+    clearDeviceFlowsForAgent(String(runtime.agentId));
     const svc = runtime.getService<GitHubService>(GitHubService.serviceType);
     await svc?.stop();
   },

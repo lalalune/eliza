@@ -20,6 +20,7 @@ import path from "node:path";
 import {
   buildSetupError,
   type IAgentRuntime,
+  logger,
   type Route,
   type RouteRequest,
   type RouteResponse,
@@ -42,13 +43,15 @@ import {
 
 interface SignalPairingSessionLike {
   start(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void> | void;
   getStatus(): SignalPairingStatus;
   getSnapshot(): SignalPairingSnapshot;
 }
 
 const signalPairingSessions = new Map<string, SignalPairingSessionLike>();
 const signalPairingSnapshots = new Map<string, SignalPairingSnapshot>();
+let signalPairingGeneration = 0;
+let signalPairingStartsEnabled = true;
 
 const MAX_PAIRING_SESSIONS = 10;
 const TERMINAL_SIGNAL_PAIRING_STATUSES = new Set<SignalPairingStatus>([
@@ -143,12 +146,12 @@ function buildSignalStatusResponse(
 }
 
 /** Reap terminal pairing sessions before handling a request. */
-function reapTerminalSessions(): void {
+async function reapTerminalSessions(): Promise<void> {
   for (const [id, session] of signalPairingSessions) {
     const status = session.getStatus();
     if (status === "disconnected" || status === "timeout" || status === "error") {
       signalPairingSnapshots.set(id, session.getSnapshot());
-      session.stop();
+      await session.stop();
       signalPairingSessions.delete(id);
     }
   }
@@ -180,7 +183,7 @@ async function handleStatus(
   res: RouteResponse,
   runtime: IAgentRuntime
 ): Promise<void> {
-  reapTerminalSessions();
+  await reapTerminalSessions();
 
   const rawUrl = typeof req.url === "string" ? req.url : "/";
   const url = new URL(rawUrl, "http://localhost");
@@ -214,7 +217,12 @@ async function handleStart(
   res: RouteResponse,
   runtime: IAgentRuntime
 ): Promise<void> {
-  reapTerminalSessions();
+  const requestGeneration = signalPairingGeneration;
+  await reapTerminalSessions();
+  if (!signalPairingStartsEnabled || requestGeneration !== signalPairingGeneration) {
+    res.status(503).json(buildSetupError("service_unavailable", "Signal pairing is shutting down"));
+    return;
+  }
 
   const body = (req.body ?? {}) as { accountId?: string };
   let accountId: string;
@@ -244,7 +252,11 @@ async function handleStart(
   const connectors = (config.connectors ?? {}) as Record<string, unknown>;
 
   const authDir = path.join(workspaceDir, "signal-auth", accountId);
-  signalPairingSessions.get(accountId)?.stop();
+  await signalPairingSessions.get(accountId)?.stop();
+  if (!signalPairingStartsEnabled || requestGeneration !== signalPairingGeneration) {
+    res.status(503).json(buildSetupError("service_unavailable", "Signal pairing is shutting down"));
+    return;
+  }
   signalPairingSnapshots.delete(accountId);
 
   const signalConfig = (connectors.signal as Record<string, unknown> | undefined) ?? {};
@@ -254,11 +266,13 @@ async function handleStart(
       : undefined;
 
   let session: SignalPairingSessionLike;
+  const generation = requestGeneration;
   session = new SignalPairingSession({
     authDir,
     accountId,
     cliPath: configuredCliPath,
     onEvent: (event: SignalPairingEvent) => {
+      if (generation !== signalPairingGeneration) return;
       setupService?.broadcastWs(event);
       signalPairingSnapshots.set(accountId, session.getSnapshot());
 
@@ -325,7 +339,8 @@ async function handleStart(
   signalPairingSnapshots.set(accountId, session.getSnapshot());
 
   void session.start().catch((err) => {
-    console.error(`[signal] Pairing session failed for ${accountId}:`, String(err));
+    logger.error({ src: "plugin:signal", accountId, error: String(err) }, "Pairing session failed");
+    if (generation !== signalPairingGeneration) return;
     signalPairingSnapshots.set(accountId, session.getSnapshot());
     signalPairingSessions.delete(accountId);
   });
@@ -361,7 +376,7 @@ async function handleCancel(
 
   const session = signalPairingSessions.get(accountId);
   if (session) {
-    session.stop();
+    await session.stop();
     signalPairingSessions.delete(accountId);
   }
   signalPairingSnapshots.delete(accountId);
@@ -448,6 +463,30 @@ export const signalSetupRoutes: Route[] = [
     rawPath: true,
   },
 ];
+
+/** Stops every pairing job and invalidates callbacks captured by old jobs. */
+export async function stopAllSignalPairingSessions(): Promise<void> {
+  signalPairingStartsEnabled = false;
+  signalPairingGeneration += 1;
+  const sessions = [...signalPairingSessions.values()];
+  signalPairingSessions.clear();
+  signalPairingSnapshots.clear();
+  const results = await Promise.allSettled(sessions.map(async (session) => session.stop()));
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) =>
+      result.reason instanceof Error ? result.reason : new Error(String(result.reason))
+    );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Failed to stop all Signal pairing sessions");
+  }
+}
+
+/** Starts a fresh pairing lifecycle after a runtime initializes the plugin. */
+export function enableSignalPairingSessions(): void {
+  signalPairingGeneration += 1;
+  signalPairingStartsEnabled = true;
+}
 
 /**
  * Override plugin-discovery status for Signal when QR-paired auth exists.

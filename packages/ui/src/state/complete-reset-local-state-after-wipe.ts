@@ -10,10 +10,13 @@
  * jsdom (see `complete-reset-local-state-after-wipe.test.ts`).
  *
  * **Atomicity contract:**
- *  - All synchronous callbacks fire in fixed order before the `await`.
- *    React batches those setter calls into a single render commit, so the
- *    UI never observes a partial wipe state mid-cascade.
- *  - `fetchFirstRunOptions` is the only step allowed to fail. Its
+ *  - Connection teardown and renderer credential deletion run before any UI
+ *    callback that could throw. A server-side wipe must never leave credentials
+ *    behind merely because a React/state callback failed afterward.
+ *  - Renderer-storage cleanup is awaited and may fail the reset if a credential
+ *    survives. The remaining synchronous callbacks then fire in fixed order,
+ *    so React batches them into a single render commit.
+ *  - `fetchFirstRunOptions` is the only failure that may degrade. Its
  *    try/catch is in-function: a failed fetch leaves first-run options
  *    stale but does NOT roll back the rest of the wipe (rolling back would
  *    be worse than stale options — the user could still re-fetch on next
@@ -25,8 +28,8 @@
  *    NOT swallow failures or default-fill state — that would mask a broken
  *    pipeline with apparent success.
  *  - The cascade is the sole caller of each deps-record callback. No code
- *    path calls one without the others, so the coupling-guarantee comments
- *    in `useChatLifecycle.ts` (token-clear ↔ markFirstRunReset) hold.
+ *    path calls one without the others, and credential cleanup stays behind
+ *    one awaited barrier.
  */
 import type { AgentStatus, FirstRunOptions } from "../api/client";
 
@@ -44,6 +47,7 @@ export type CompleteResetLocalStateDeps = {
   markFirstRunReset: () => void;
   resetAvatarSelection: () => void;
   clearConversationLists: () => void;
+  clearRendererStorage: () => Promise<void>;
   fetchFirstRunOptions: () => Promise<FirstRunOptions>;
   setFirstRunOptions: (options: FirstRunOptions) => void;
   logResetDebug: (message: string, detail?: Record<string, unknown>) => void;
@@ -54,10 +58,39 @@ export async function completeResetLocalStateAfterServerWipe(
   postResetAgentStatus: AgentStatus | null,
   d: CompleteResetLocalStateDeps,
 ): Promise<void> {
-  d.setAgentStatus(postResetAgentStatus);
-  d.logResetDebug("resetLocalState: client.resetConnection()");
-  d.resetClientConnection();
+  const teardownErrors: unknown[] = [];
+  try {
+    d.logResetDebug("resetLocalState: client.resetConnection()");
+  } catch (error) {
+    // error-policy:J1 reset still attempts the credential barrier when
+    // diagnostics or connection teardown fail at this outer boundary.
+    teardownErrors.push(error);
+  }
+  try {
+    d.resetClientConnection();
+  } catch (error) {
+    // error-policy:J1 renderer credential cleanup is an independent mandatory
+    // postcondition after the server has already completed its destructive wipe.
+    teardownErrors.push(error);
+  }
+  try {
+    d.logResetDebug("resetLocalState: clearing renderer storage");
+  } catch (error) {
+    // error-policy:J1 diagnostics cannot prevent destructive credential cleanup.
+    teardownErrors.push(error);
+  }
+  try {
+    await d.clearRendererStorage();
+  } catch (error) {
+    // error-policy:J1 preserve cleanup failure alongside any connection failure.
+    teardownErrors.push(error);
+  }
+  if (teardownErrors.length === 1) throw teardownErrors[0];
+  if (teardownErrors.length > 1) {
+    throw new AggregateError(teardownErrors, "Renderer reset teardown failed");
+  }
 
+  d.setAgentStatus(postResetAgentStatus);
   d.clearPersistedActiveServer();
   d.clearPersistedAvatarIndex();
   d.setClientBaseUrl(null);

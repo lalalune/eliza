@@ -75,6 +75,56 @@ interface PendingFlow {
 }
 
 const pendingFlows = new Map<string, PendingFlow>();
+const flowGenerations = new Map<string, number>();
+const inFlightFlowRequests = new Map<string, Set<AbortController>>();
+
+function unknownFlowError(): DeviceFlowError {
+  return new DeviceFlowError(
+    "GitHub sign-in flow is unknown or expired. Start a new sign-in.",
+    "unknown_flow",
+    404,
+  );
+}
+
+function flowGeneration(agentKey: string): number {
+  return flowGenerations.get(agentKey) ?? 0;
+}
+
+function beginFlowRequest(agentKey: string): {
+  controller: AbortController;
+  generation: number;
+} {
+  const controller = new AbortController();
+  const requests = inFlightFlowRequests.get(agentKey) ?? new Set();
+  requests.add(controller);
+  inFlightFlowRequests.set(agentKey, requests);
+  return { controller, generation: flowGeneration(agentKey) };
+}
+
+function finishFlowRequest(
+  agentKey: string,
+  controller: AbortController,
+): void {
+  const requests = inFlightFlowRequests.get(agentKey);
+  requests?.delete(controller);
+  if (requests?.size === 0) inFlightFlowRequests.delete(agentKey);
+}
+
+function assertFlowGeneration(agentKey: string, generation: number): void {
+  if (flowGeneration(agentKey) !== generation) throw unknownFlowError();
+}
+
+/** Invalidates every pending device grant owned by one runtime. */
+export function clearDeviceFlowsForAgent(agentKey: string): void {
+  flowGenerations.set(agentKey, flowGeneration(agentKey) + 1);
+  for (const controller of inFlightFlowRequests.get(agentKey) ?? []) {
+    controller.abort();
+  }
+  inFlightFlowRequests.delete(agentKey);
+  for (const [flowId, flow] of pendingFlows) {
+    if (flow.agentKey === agentKey) pendingFlows.delete(flowId);
+  }
+}
 
 interface FlowDeps {
   fetchImpl?: typeof fetch;
@@ -109,6 +159,7 @@ async function postForm(
   form: Record<string, string>,
   label: string,
   fetchImpl: typeof fetch,
+  signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
   let response: Response;
   try {
@@ -119,6 +170,7 @@ async function postForm(
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams(form).toString(),
+      signal,
     });
   } catch (err) {
     // error-policy:J2 context-adding rethrow — a network failure reaching
@@ -181,54 +233,66 @@ export async function startDeviceFlow(options: {
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const now = deps?.now ?? Date.now;
   const randomBytesImpl = deps?.randomBytesImpl ?? randomBytes;
-
-  const payload = await postForm(
-    DEVICE_CODE_URL,
-    { client_id: clientId.trim(), scope: DEFAULT_SCOPE },
-    "GitHub device-code request",
-    fetchImpl,
-  );
-  // GitHub returns 200 for a bad/unregistered client id with an error body.
-  if (typeof payload.error === "string") {
-    throw new DeviceFlowError(
-      `GitHub rejected the device-flow client registration (${payload.error}). ` +
-        "Check GITHUB_OAUTH_CLIENT_ID and that the OAuth app has device flow enabled.",
-      "owner_setup",
-      409,
+  const operation = beginFlowRequest(agentKey);
+  try {
+    const payload = await postForm(
+      DEVICE_CODE_URL,
+      { client_id: clientId.trim(), scope: DEFAULT_SCOPE },
+      "GitHub device-code request",
+      fetchImpl,
+      operation.controller.signal,
     );
-  }
-  const deviceCode = requireString(
-    payload,
-    "device_code",
-    "GitHub device-code",
-  );
-  const userCode = requireString(payload, "user_code", "GitHub device-code");
-  const verificationUri = requireString(
-    payload,
-    "verification_uri",
-    "GitHub device-code",
-  );
-  const intervalSeconds = positiveNumber(payload.interval, 5);
-  const expiresInSeconds = positiveNumber(payload.expires_in, 900);
+    assertFlowGeneration(agentKey, operation.generation);
+    // GitHub returns 200 for a bad/unregistered client id with an error body.
+    if (typeof payload.error === "string") {
+      throw new DeviceFlowError(
+        `GitHub rejected the device-flow client registration (${payload.error}). ` +
+          "Check GITHUB_OAUTH_CLIENT_ID and that the OAuth app has device flow enabled.",
+        "owner_setup",
+        409,
+      );
+    }
+    const deviceCode = requireString(
+      payload,
+      "device_code",
+      "GitHub device-code",
+    );
+    const userCode = requireString(payload, "user_code", "GitHub device-code");
+    const verificationUri = requireString(
+      payload,
+      "verification_uri",
+      "GitHub device-code",
+    );
+    const intervalSeconds = positiveNumber(payload.interval, 5);
+    const expiresInSeconds = positiveNumber(payload.expires_in, 900);
 
-  const nowMs = now();
-  sweepExpired(nowMs);
-  const flowId = randomBytesImpl(24).toString("base64url");
-  pendingFlows.set(flowId, {
-    agentKey,
-    clientId: clientId.trim(),
-    deviceCode,
-    intervalSeconds,
-    nextPollAtMs: nowMs,
-    expiresAtMs: nowMs + expiresInSeconds * 1_000,
-  });
-  return {
-    flowId,
-    userCode,
-    verificationUri,
-    intervalSeconds,
-    expiresInSeconds,
-  };
+    const nowMs = now();
+    sweepExpired(nowMs);
+    assertFlowGeneration(agentKey, operation.generation);
+    const flowId = randomBytesImpl(24).toString("base64url");
+    pendingFlows.set(flowId, {
+      agentKey,
+      clientId: clientId.trim(),
+      deviceCode,
+      intervalSeconds,
+      nextPollAtMs: nowMs,
+      expiresAtMs: nowMs + expiresInSeconds * 1_000,
+    });
+    return {
+      flowId,
+      userCode,
+      verificationUri,
+      intervalSeconds,
+      expiresInSeconds,
+    };
+  } catch (error) {
+    // error-policy:J1 the device-flow operation boundary translates a
+    // lifecycle abort into the same non-oracular unknown-flow response.
+    assertFlowGeneration(agentKey, operation.generation);
+    throw error;
+  } finally {
+    finishFlowRequest(agentKey, operation.controller);
+  }
 }
 
 /**
@@ -253,11 +317,7 @@ export async function pollDeviceFlow(options: {
   // A flow owned by a different agent is reported exactly like a flow that
   // never existed — no oracle for other agents' pending flows.
   if (!flow || flow.agentKey !== agentKey) {
-    throw new DeviceFlowError(
-      "GitHub sign-in flow is unknown or expired. Start a new sign-in.",
-      "unknown_flow",
-      404,
-    );
+    throw unknownFlowError();
   }
   if (nowMs < flow.nextPollAtMs) {
     return {
@@ -270,16 +330,30 @@ export async function pollDeviceFlow(options: {
   }
   flow.nextPollAtMs = nowMs + flow.intervalSeconds * 1_000;
 
-  const payload = await postForm(
-    ACCESS_TOKEN_URL,
-    {
-      client_id: flow.clientId,
-      device_code: flow.deviceCode,
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-    },
-    "GitHub device-token request",
-    fetchImpl,
-  );
+  const operation = beginFlowRequest(agentKey);
+  let payload: Record<string, unknown>;
+  try {
+    payload = await postForm(
+      ACCESS_TOKEN_URL,
+      {
+        client_id: flow.clientId,
+        device_code: flow.deviceCode,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      },
+      "GitHub device-token request",
+      fetchImpl,
+      operation.controller.signal,
+    );
+    assertFlowGeneration(agentKey, operation.generation);
+    if (pendingFlows.get(flowId) !== flow) throw unknownFlowError();
+  } catch (error) {
+    // error-policy:J1 the poll boundary must never expose a token or raw abort
+    // after lifecycle cleanup invalidates the owning agent generation.
+    assertFlowGeneration(agentKey, operation.generation);
+    throw error;
+  } finally {
+    finishFlowRequest(agentKey, operation.controller);
+  }
 
   if (
     typeof payload.access_token === "string" &&
@@ -330,5 +404,10 @@ export async function pollDeviceFlow(options: {
 
 /** Test hook: drop all pending flows so suites are order-independent. */
 export function clearDeviceFlowsForTest(): void {
+  for (const requests of inFlightFlowRequests.values()) {
+    for (const controller of requests) controller.abort();
+  }
   pendingFlows.clear();
+  flowGenerations.clear();
+  inFlightFlowRequests.clear();
 }

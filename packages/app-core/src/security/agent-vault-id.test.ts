@@ -5,12 +5,23 @@
  * derivation. The same install always resolves the same vault, and two
  * different state dirs never collide onto one keychain namespace.
  */
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deriveAgentVaultId,
-  deriveCompatibleVaultTokens,
   keychainAccountForSecretKind,
+  resolveCanonicalStateDir,
 } from "./agent-vault-id.ts";
+
+const ORIGINAL_STATE_DIR = process.env.ELIZA_STATE_DIR;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  if (ORIGINAL_STATE_DIR === undefined) delete process.env.ELIZA_STATE_DIR;
+  else process.env.ELIZA_STATE_DIR = ORIGINAL_STATE_DIR;
+});
 
 describe("deriveAgentVaultId", () => {
   it("is deterministic for a given state dir and prefixed", () => {
@@ -26,29 +37,27 @@ describe("deriveAgentVaultId", () => {
     );
   });
 
-  it("derives current and home-scoped state-root compatibility tokens", () => {
-    const current = deriveAgentVaultId("/Users/x/.local/state/eliza");
-    const tokens = deriveCompatibleVaultTokens(current, {
-      homeDir: "/Users/x",
-      namespace: "eliza",
+  it("uses the resolved path only when the state directory does not exist", () => {
+    const stateDir = "/tmp/eliza-missing-state";
+    process.env.ELIZA_STATE_DIR = stateDir;
+    vi.spyOn(fs, "realpathSync").mockImplementation(() => {
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
     });
 
-    expect(tokens).toContain(current.slice("eliza1-".length));
-    expect(tokens).toContain(
-      deriveAgentVaultId("/Users/x/.eliza").slice("eliza1-".length),
-    );
-    expect(tokens).toHaveLength(2);
+    expect(resolveCanonicalStateDir()).toBe(path.resolve(stateDir));
   });
 
-  it("preserves hyphens inside the fixed-width state token", () => {
-    const token = "AbCdEf0123_-wXyZ";
+  it("surfaces canonicalization failures other than a missing directory", () => {
+    process.env.ELIZA_STATE_DIR = "/tmp/eliza-inaccessible-state";
+    vi.spyOn(fs, "realpathSync").mockImplementation(() => {
+      throw Object.assign(new Error("denied"), { code: "EACCES" });
+    });
 
-    expect(
-      deriveCompatibleVaultTokens(`eliza1-${token}`, {
-        homeDir: "/Users/x",
-        namespace: "eliza",
+    expect(() => resolveCanonicalStateDir()).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_STATE_DIR_CANONICALIZATION_FAILED",
       }),
-    ).toContain(token);
+    );
   });
 });
 

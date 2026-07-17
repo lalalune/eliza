@@ -25,6 +25,11 @@ import type { BootstrapExchangeResult } from "../../api/client-agent";
 import { cn } from "../../lib/utils";
 import { startFreshFirstRunReload } from "../../platform";
 import {
+  BOOTSTRAP_SESSION_STORAGE_KEY,
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "../../state/credential-storage-keys";
+import {
   type TranslationContextValue,
   useTranslation,
 } from "../../state/TranslationContext.hooks";
@@ -49,7 +54,6 @@ import {
 import { SetupField } from "./setup-form-primitives";
 import { SetupStepDivider } from "./setup-step-chrome";
 
-const SESSION_STORAGE_KEY = "eliza_session";
 const MONO_FONT = "'Poppins', Arial, system-ui, sans-serif";
 const BOOTSTRAP_HASH_PARAM = "bootstrap";
 
@@ -145,6 +149,8 @@ export function BootstrapStep({ onAdvance, exchangeFn }: BootstrapStepProps) {
 
   const doExchange = useCallback(
     async (rawToken: string): Promise<void> => {
+      const credentialGeneration = captureRendererCredentialWriteGeneration();
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
       setSubmitState({ phase: "submitting" });
 
       let result: BootstrapExchangeResult;
@@ -178,10 +184,12 @@ export function BootstrapStep({ onAdvance, exchangeFn }: BootstrapStepProps) {
         return;
       }
 
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) return;
+
       // P0 bridge: write session id to sessionStorage. P1 replaces this with
       // an HttpOnly cookie set by the server on the exchange response.
       try {
-        sessionStorage.setItem(SESSION_STORAGE_KEY, result.sessionId);
+        sessionStorage.setItem(BOOTSTRAP_SESSION_STORAGE_KEY, result.sessionId);
       } catch {
         // sessionStorage unavailable (e.g. private browsing on some browsers).
         // Session is still in memory for this page load; startup can advance.

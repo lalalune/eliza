@@ -20,6 +20,8 @@ export interface AnthropicFlow {
   submitCode: (code: string) => void;
   /** Resolves with credentials once submitCode() is called */
   credentials: Promise<OAuthCredentials>;
+  /** Rejects the pending code exchange and releases its PKCE closure. */
+  cancel: (reason?: string) => void;
 }
 
 /**
@@ -29,9 +31,11 @@ export interface AnthropicFlow {
 export async function startAnthropicLogin(): Promise<AnthropicFlow> {
   let authUrl = "";
   let resolveCode: ((code: string) => void) | null = null;
+  let rejectCode: ((error: Error) => void) | null = null;
   let resolveUrlReady: (() => void) | null = null;
-  const codePromise = new Promise<string>((resolve) => {
+  const codePromise = new Promise<string>((resolve, reject) => {
     resolveCode = resolve;
+    rejectCode = reject;
   });
   const urlReady = new Promise<void>((resolve) => {
     resolveUrlReady = resolve;
@@ -51,6 +55,11 @@ export async function startAnthropicLogin(): Promise<AnthropicFlow> {
     authUrl,
     submitCode: (code: string) => resolveCode?.(code),
     credentials,
+    cancel: (reason = "OAuth flow cancelled") => {
+      rejectCode?.(new Error(reason));
+      resolveCode = null;
+      rejectCode = null;
+    },
   };
 }
 

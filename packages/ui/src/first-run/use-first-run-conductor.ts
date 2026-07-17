@@ -77,6 +77,10 @@ import { ACCENT_PRESETS, useAppSelectorShallow } from "../state";
 import { useConversationMessages } from "../state/ConversationMessagesContext.hooks";
 import { preOpenCloudLoginWindow } from "../state/cloud-login-launch";
 import { hasUsableStoredStewardToken } from "../state/cloud-steward-login";
+import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "../state/credential-storage-keys";
 import { startTutorial } from "../tutorial/tutorial-service";
 import { clearFirstRunTranscriptMessages } from "./clear-first-run-transcript";
 import {
@@ -1428,6 +1432,7 @@ export function useFirstRunConductor(): void {
         // construction: native has no document cookie and carries the durable
         // token through the branch above.
         silentCloudEntryRef.current = true;
+        const credentialGeneration = captureRendererCredentialWriteGeneration();
         void (async () => {
           let refreshTimeout: ReturnType<typeof setTimeout> | undefined;
           // error-policy:J4 a failed/timed-out cookie refresh degrades to the
@@ -1442,7 +1447,12 @@ export function useFirstRunConductor(): void {
             }),
           ]);
           if (refreshTimeout) clearTimeout(refreshTimeout);
-          if (cancelled) return;
+          if (
+            cancelled ||
+            !isRendererCredentialWriteAllowed(credentialGeneration)
+          ) {
+            return;
+          }
           if (refreshed?.token) {
             writeStoredStewardToken(refreshed.token);
             try {

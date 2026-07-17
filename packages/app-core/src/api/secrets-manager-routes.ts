@@ -25,10 +25,10 @@ import {
   setSavedLogin,
 } from "@elizaos/vault";
 import {
-  _resetSecretsManagerInstallerForTesting,
   getSecretsManagerInstaller,
   type InstallableBackendId,
   type InstallJobEvent,
+  resetSecretsManagerInstallerForAgentReset,
   type SecretsManagerInstaller,
   type SigninRequest,
 } from "../services/secrets-manager-installer";
@@ -103,18 +103,28 @@ function getInstaller(): SecretsManagerInstaller {
   return getSecretsManagerInstaller(getManager());
 }
 
-/** Test hook: drop the cached manager. Production code must not call this. */
-export function _resetSecretsManagerForTesting(): void {
+/** Drops every facade bound to the vault destroyed by agent reset. */
+export function resetSecretsManagerRouteStateForAgentReset(): void {
   _manager = null;
-  _resetSecretsManagerInstallerForTesting();
+  resetSecretsManagerInstallerForAgentReset();
+}
+
+/** Test hook: drop the cached manager. */
+export function _resetSecretsManagerForTesting(): void {
+  resetSecretsManagerRouteStateForAgentReset();
 }
 
 /** Test hook: inject a manager built around a test vault + exec double. */
 export function _setSecretsManagerForTesting(
   next: SecretsManager | null,
 ): void {
+  resetSecretsManagerInstallerForAgentReset();
   _manager = next;
-  _resetSecretsManagerInstallerForTesting();
+}
+
+/** Test hook: observes which vault facade the routes currently use. */
+export function _getSecretsManagerForTesting(): SecretsManager {
+  return getManager();
 }
 
 const INSTALLABLE_BACKENDS: readonly InstallableBackendId[] = [

@@ -44,6 +44,9 @@ export interface Vault {
 
   /** Aggregate counts. */
   stats(): Promise<VaultStats>;
+
+  /** Permanently closes and removes this vault's owned persistence, if supported. */
+  destroy?(): Promise<void>;
 }
 
 export interface SetOptions {

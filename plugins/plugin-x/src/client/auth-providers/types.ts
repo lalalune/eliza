@@ -25,6 +25,12 @@ export interface TwitterAuthProvider {
    * Implementations should refresh/reauth as needed.
    */
   getAccessToken(): Promise<string>;
+
+  /**
+   * Terminally invalidates the provider and drains authentication work.
+   * Runtime unload/reset uses this barrier before credential storage is wiped.
+   */
+  dispose?(): Promise<void>;
 }
 
 export interface OAuth1Credentials {

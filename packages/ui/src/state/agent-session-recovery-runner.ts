@@ -22,6 +22,11 @@ import {
   exchangeCloudPairToken,
   persistCloudPairApiToken,
 } from "../components/auth/CloudPairRelay";
+import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+  type RendererCredentialWriteGeneration,
+} from "./credential-storage-keys";
 
 const MAX_PAIRING_WAIT_MS = 120_000;
 const DEFAULT_RETRY_AFTER_MS = 5_000;
@@ -68,9 +73,15 @@ export interface RunAgentSessionRecoveryDeps {
   /** Injected pair-token exchange (tests). Defaults to CloudPairRelay's exchange. */
   exchangePairToken?: (token: string) => Promise<string>;
   /** Injected API-key persistence (tests). Defaults to CloudPairRelay's persistence. */
-  persistPairApiToken?: (apiToken: string) => void;
+  persistPairApiToken?: (
+    apiToken: string,
+    generation?: RendererCredentialWriteGeneration,
+  ) => void;
   /** Optional callback after an in-process pair succeeds. */
-  onPairedInProcess?: (apiToken: string) => void | Promise<void>;
+  onPairedInProcess?: (
+    apiToken: string,
+    generation: RendererCredentialWriteGeneration,
+  ) => void | Promise<void>;
 }
 
 const realSleep = (ms: number) =>
@@ -117,6 +128,7 @@ function pairTokenFromRedirectUrl(redirectUrl: string): string | null {
 export async function runAgentSessionRecovery(
   deps: RunAgentSessionRecoveryDeps,
 ): Promise<AgentSessionRecoveryResult> {
+  const credentialGeneration = captureRendererCredentialWriteGeneration();
   const {
     cloudApiBase,
     agentId,
@@ -182,6 +194,13 @@ export async function runAgentSessionRecovery(
 
     const redirectUrl = data.data?.redirectUrl;
     if (redirectUrl) {
+      if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+        return {
+          ok: false,
+          reason: "error",
+          message: "Agent session recovery was cancelled by reset",
+        };
+      }
       // Defense-in-depth (auth-adjacent): only navigate to an absolute http(s)
       // URL. The value comes from the authenticated cloud response, but a
       // full-page navigation must never honor a `javascript:`/`data:` or
@@ -204,8 +223,22 @@ export async function runAgentSessionRecovery(
         }
         try {
           const apiToken = await exchangePairToken(pairToken);
-          persistPairApiToken(apiToken);
-          await onPairedInProcess?.(apiToken);
+          if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+            return {
+              ok: false,
+              reason: "error",
+              message: "Agent session recovery was cancelled by reset",
+            };
+          }
+          persistPairApiToken(apiToken, credentialGeneration);
+          await onPairedInProcess?.(apiToken, credentialGeneration);
+          if (!isRendererCredentialWriteAllowed(credentialGeneration)) {
+            return {
+              ok: false,
+              reason: "error",
+              message: "Agent session recovery was cancelled by reset",
+            };
+          }
           return { ok: true, redirectUrl, mode: "in-process" };
         } catch (err) {
           return {

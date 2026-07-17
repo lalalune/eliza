@@ -8,6 +8,10 @@
 // unauthenticated rather than dialing with a known-dead credential).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  beginRendererCredentialReset,
+  finishRendererCredentialReset,
+} from "./credential-storage-keys";
 import type { PersistedActiveServer } from "./persistence";
 import { applyRestoredConnection } from "./startup-phase-restore";
 
@@ -174,5 +178,38 @@ describe("applyRestoredConnection — cloud Steward token refresh at restore", (
     expect(client.setToken).toHaveBeenCalledWith(nearExpiry);
     // Still-alive token is retained for the useCloudState lifecycle refresh.
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(nearExpiry);
+  });
+
+  it("drops a refresh response invalidated by destructive reset", async () => {
+    const expired = makeJwt(-60);
+    const fresh = makeJwt(3600);
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    let resolveRefresh: ((response: unknown) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+    const client = fakeClient();
+
+    const restorePromise = applyRestoredConnection({
+      restoredActiveServer: cloudServer(),
+      clientRef: client,
+    });
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf("function"));
+    const resetGeneration = beginRendererCredentialReset();
+    try {
+      resolveRefresh?.({
+        ok: true,
+        json: async () => ({ token: fresh }),
+      });
+      await restorePromise;
+
+      expect(client.setToken).not.toHaveBeenCalled();
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
+    } finally {
+      finishRendererCredentialReset(resetGeneration);
+    }
   });
 });

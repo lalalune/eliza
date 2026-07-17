@@ -306,8 +306,8 @@ function brokerSnapshot(): AccountPoolBrokerSnapshot {
     : { accounts: {}, providers: {} };
 }
 
-/** Test-only: drop the cached pool reference between tests. */
-export function _resetAccountsRoutesPoolCache(): void {
+/** Drops the route-local facade so a reset cannot retain pre-wipe accounts. */
+export function resetAccountsRoutesPoolCacheForAgentReset(): void {
   cachedPool = null;
 }
 

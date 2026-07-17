@@ -681,6 +681,11 @@ export async function handleSensitiveRequestRoutes(
   return true;
 }
 
-export function _resetSensitiveRequestsForTesting(): void {
+/** Invalidates every outstanding submit capability during destructive reset. */
+export function resetSensitiveRequestsForAgentReset(): void {
   localSensitiveRequestStore.reset();
+}
+
+export function _resetSensitiveRequestsForTesting(): void {
+  resetSensitiveRequestsForAgentReset();
 }

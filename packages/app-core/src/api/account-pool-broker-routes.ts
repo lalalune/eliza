@@ -29,8 +29,13 @@ const MIN_BROKER_SECRET_LENGTH = 32;
 
 let brokerSingleton: AccountPoolBroker | null = null;
 
-export function __resetAccountPoolBrokerRoutesForTests(): void {
+/** Invalidates every outstanding lease and drops the broker's pool closure. */
+export function closeAccountPoolBrokerForCredentialReset(): void {
   brokerSingleton = null;
+}
+
+export function __resetAccountPoolBrokerRoutesForTests(): void {
+  closeAccountPoolBrokerForCredentialReset();
 }
 
 function brokerEnabled(): boolean {

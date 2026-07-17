@@ -11,15 +11,31 @@
  * defers the hydrate to the post-ready wave and captures a pre-merge baseline
  * (`captureWalletEnvBootBaseline`) so the same precedence holds there too.
  */
-import { logger } from "@elizaos/core";
+import { ElizaError, logger } from "@elizaos/core";
 
+import { hasCompleteStewardEnvironment } from "../services/steward-credentials";
 import { sharedVault } from "../services/vault-mirror";
 import { deriveAgentVaultId } from "./agent-vault-id";
-import type { SecureStoreSecretKind } from "./platform-secure-store";
+import { withCredentialStateMutation } from "./credential-state-lock";
+import type {
+  PlatformSecureStore,
+  SecureStoreSecretKind,
+} from "./platform-secure-store";
 import {
   createNodePlatformSecureStore,
   isWalletOsStoreReadEnabled,
 } from "./platform-secure-store-node";
+import { secureStoreValueOrMissing } from "./secure-store-read";
+
+interface WalletHydrationVault {
+  has(key: string): Promise<boolean>;
+  reveal(key: string, caller: string): Promise<string>;
+  set(
+    key: string,
+    value: string,
+    options: { sensitive: boolean; caller: string },
+  ): Promise<unknown>;
+}
 
 // TDZ-hardening (see also packages/app-core/src/services/vault-mirror.ts).
 // These module-top `const` literals are referenced inside async functions
@@ -50,6 +66,13 @@ function stewardOsPairs(): ReadonlyArray<
   ];
 }
 
+function stewardLaunchEnvKeys(): ReadonlyArray<keyof NodeJS.ProcessEnv> {
+  return [
+    ...stewardOsPairs().map(([envKey]) => envKey),
+    "ELIZA_STEWARD_AGENT_ID",
+  ];
+}
+
 // The hydrate used to run BEFORE config.env merged into process.env, so its
 // "skip keys that already have a value" check naturally meant "skip keys the
 // LAUNCH ENV set" — vault/keystore values beat persisted config, launch env
@@ -68,7 +91,7 @@ export function captureWalletEnvBootBaseline(): void {
   for (const envKey of walletVaultKeys()) {
     if (process.env[envKey]?.trim()) withValue.add(String(envKey));
   }
-  for (const [envKey] of stewardOsPairs()) {
+  for (const envKey of stewardLaunchEnvKeys()) {
     if (process.env[envKey]?.trim()) withValue.add(String(envKey));
   }
   walletEnvBootBaseline = withValue;
@@ -99,37 +122,58 @@ function hasLaunchEnvValue(envKey: keyof NodeJS.ProcessEnv): boolean {
  */
 async function migrateOsStoreWalletKeysIntoVault(
   envKeys: ReadonlyArray<keyof NodeJS.ProcessEnv>,
-): Promise<string[]> {
-  if (envKeys.length === 0) return [];
-  if (!isWalletOsStoreReadEnabled()) return [];
+  options: {
+    readEnabled: boolean;
+    store: PlatformSecureStore;
+    vault: WalletHydrationVault;
+  },
+): Promise<{
+  migrated: string[];
+  values: Array<readonly [keyof NodeJS.ProcessEnv, string]>;
+}> {
+  if (envKeys.length === 0 || !options.readEnabled) {
+    return { migrated: [], values: [] };
+  }
 
-  const store = createNodePlatformSecureStore();
-  if (!(await store.isAvailable())) return [];
-
-  const vault = sharedVault();
+  const { store, vault } = options;
+  if (!(await store.isAvailable())) {
+    throw new ElizaError(
+      "wallet secure store is unavailable during migration",
+      {
+        code: "SECURE_STORE_READ_UNAVAILABLE",
+        context: { operation: "wallet-os-store-migrate" },
+        severity: "fatal",
+      },
+    );
+  }
   const vaultId = deriveAgentVaultId();
   const keychainKindFor: Record<string, SecureStoreSecretKind> = {
     EVM_PRIVATE_KEY: "wallet.evm_private_key",
     SOLANA_PRIVATE_KEY: "wallet.solana_private_key",
   };
   const migrated: string[] = [];
+  const values: Array<readonly [keyof NodeJS.ProcessEnv, string]> = [];
 
   for (const envKey of envKeys) {
     const kind = keychainKindFor[envKey as string];
     if (!kind) continue;
     const got = await store.get(vaultId, kind);
-    if (!got.ok) continue;
-    process.env[envKey] = got.value;
+    const value = secureStoreValueOrMissing(got, {
+      kind,
+      operation: "wallet-os-store-migrate",
+    });
+    if (value === null) continue;
     if (!(await vault.has(envKey as string))) {
-      await vault.set(envKey as string, got.value, {
+      await vault.set(envKey as string, value, {
         sensitive: true,
         caller: "wallet-os-store-migrate",
       });
       migrated.push(String(envKey));
     }
+    values.push([envKey, value]);
   }
 
-  return migrated;
+  return { migrated, values };
 }
 
 /**
@@ -144,15 +188,34 @@ async function migrateOsStoreWalletKeysIntoVault(
  * supplies — by call ordering on pre-merge callers, and via the captured
  * pre-merge baseline (see module header) on the deferred agent boot path.
  */
-export async function hydrateWalletKeysFromNodePlatformSecureStore(): Promise<void> {
+export async function hydrateWalletKeysFromNodePlatformSecureStore(
+  options: {
+    readEnabled?: boolean;
+    secureStore?: PlatformSecureStore;
+    vault?: WalletHydrationVault;
+  } = {},
+): Promise<void> {
+  await withCredentialStateMutation(() =>
+    hydrateWalletKeysFromNodePlatformSecureStoreUnlocked(options),
+  );
+}
+
+async function hydrateWalletKeysFromNodePlatformSecureStoreUnlocked(options: {
+  readEnabled?: boolean;
+  secureStore?: PlatformSecureStore;
+  vault?: WalletHydrationVault;
+}): Promise<void> {
   // ── 1. Vault read for wallet keys ────────────────────────────────
-  const vault = sharedVault();
+  const vault = options.vault ?? sharedVault();
+  const readEnabled = options.readEnabled ?? isWalletOsStoreReadEnabled();
+  const store = options.secureStore ?? createNodePlatformSecureStore();
   const missingWalletKeys: Array<keyof NodeJS.ProcessEnv> = [];
+  const walletValues: Array<readonly [keyof NodeJS.ProcessEnv, string]> = [];
   for (const envKey of walletVaultKeys()) {
     if (hasLaunchEnvValue(envKey)) continue;
     if (await vault.has(envKey as string)) {
       const value = await vault.reveal(envKey as string, "wallet-hydrate-boot");
-      process.env[envKey] = value;
+      walletValues.push([envKey, value]);
       continue;
     }
     missingWalletKeys.push(envKey);
@@ -161,35 +224,46 @@ export async function hydrateWalletKeysFromNodePlatformSecureStore(): Promise<vo
   // ── 2. One-shot migration from OS keystore for any wallet keys
   //      that the vault did not have. ──────────────────────────────
   if (missingWalletKeys.length > 0) {
-    try {
-      const migrated =
-        await migrateOsStoreWalletKeysIntoVault(missingWalletKeys);
-      if (migrated.length > 0) {
-        logger.info(
-          `[wallet][vault] migrated ${migrated.length} key(s) from OS keystore: ${migrated.join(", ")}`,
-        );
-      }
-    } catch (err) {
-      logger.warn(
-        `[wallet][vault] os-store migration failed: ${err instanceof Error ? err.message : String(err)}`,
+    const migration = await migrateOsStoreWalletKeysIntoVault(
+      missingWalletKeys,
+      { readEnabled, store, vault },
+    );
+    walletValues.push(...migration.values);
+    if (migration.migrated.length > 0) {
+      logger.info(
+        `[wallet][vault] migrated ${migration.migrated.length} key(s) from OS keystore: ${migration.migrated.join(", ")}`,
       );
     }
   }
+  for (const [envKey, value] of walletValues) process.env[envKey] = value;
 
   // ── 3. Steward OS-keystore reads (unchanged) ─────────────────────
-  if (!isWalletOsStoreReadEnabled()) return;
-  try {
-    const store = createNodePlatformSecureStore();
-    if (!(await store.isAvailable())) return;
-    const vaultId = deriveAgentVaultId();
-    for (const [envKey, kind] of stewardOsPairs()) {
-      if (hasLaunchEnvValue(envKey)) continue;
-      const got = await store.get(vaultId, kind);
-      if (got.ok) process.env[envKey] = got.value;
-    }
-  } catch (err) {
-    logger.warn(
-      `[wallet][os-store] steward hydrate failed: ${err instanceof Error ? err.message : String(err)}`,
+  if (!readEnabled) return;
+  const launchStewardEnv: NodeJS.ProcessEnv = {};
+  for (const envKey of stewardLaunchEnvKeys()) {
+    if (hasLaunchEnvValue(envKey))
+      launchStewardEnv[envKey] = process.env[envKey];
+  }
+  if (hasCompleteStewardEnvironment(launchStewardEnv)) return;
+  if (!(await store.isAvailable())) {
+    throw new ElizaError(
+      "steward secure store is unavailable during hydration",
+      {
+        code: "SECURE_STORE_READ_UNAVAILABLE",
+        context: { operation: "steward-os-store-hydrate" },
+        severity: "fatal",
+      },
     );
   }
+  const vaultId = deriveAgentVaultId();
+  const stewardValues: Array<readonly [keyof NodeJS.ProcessEnv, string]> = [];
+  for (const [envKey, kind] of stewardOsPairs()) {
+    if (hasLaunchEnvValue(envKey)) continue;
+    const value = secureStoreValueOrMissing(await store.get(vaultId, kind), {
+      kind,
+      operation: "steward-os-store-hydrate",
+    });
+    if (value !== null) stewardValues.push([envKey, value]);
+  }
+  for (const [envKey, value] of stewardValues) process.env[envKey] = value;
 }

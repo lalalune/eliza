@@ -1,11 +1,15 @@
 /** Unit tests for OAuth token resolution in the credential store; uses real temp dirs and env-var manipulation, no live API. */
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ElizaError } from "@elizaos/core";
+import { ElizaError, setAnthropicAccountPoolBridge } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { clearTokenCache, getClaudeOAuthToken } from "../utils/credential-store.js";
+import {
+  clearTokenCache,
+  getClaudeOAuthToken,
+  getClaudeOAuthTokenAsync,
+} from "../utils/credential-store.js";
 
 describe("Anthropic credential store", () => {
   let stateDir: string;
@@ -29,6 +33,7 @@ describe("Anthropic credential store", () => {
   });
 
   afterEach(() => {
+    setAnthropicAccountPoolBridge(null);
     clearTokenCache();
     if (originalStateDir === undefined) {
       delete process.env.ELIZA_STATE_DIR;
@@ -83,6 +88,73 @@ describe("Anthropic credential store", () => {
     );
 
     expect(getClaudeOAuthToken().accessToken).toBe("fresh-app-token");
+  });
+
+  it("does not return warmed env or app credentials after their source is erased", () => {
+    const credentialsDir = join(stateDir, "auth", "anthropic-subscription");
+    const credentialsPath = join(credentialsDir, "default.json");
+    mkdirSync(credentialsDir, { recursive: true });
+    writeFileSync(
+      credentialsPath,
+      JSON.stringify({
+        credentials: {
+          access: "fresh-app-token",
+          expires: Date.now() + 60 * 60 * 1000,
+        },
+      })
+    );
+    expect(getClaudeOAuthToken().accessToken).toBe("fresh-app-token");
+
+    unlinkSync(credentialsPath);
+    expect(getClaudeOAuthToken().accessToken).toBe("stale-env-token");
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_OAUTH_TOKEN;
+    process.env.CLAUDE_CONFIG_DIR = join(stateDir, "missing-claude-store");
+    expect(() => getClaudeOAuthToken()).toThrow("OAuth token");
+  });
+
+  it("does not fall through to a stale env token when app credentials are corrupt", () => {
+    const credentialsDir = join(stateDir, "auth", "anthropic-subscription");
+    mkdirSync(credentialsDir, { recursive: true });
+    writeFileSync(join(credentialsDir, "default.json"), "{not-json");
+
+    try {
+      getClaudeOAuthToken();
+      expect.unreachable("corrupt app credentials must fail closed");
+    } catch (thrown) {
+      expect(thrown).toBeInstanceOf(ElizaError);
+      expect((thrown as ElizaError).code).toBe("CREDENTIALS_CORRUPT");
+    }
+  });
+
+  it("always revalidates a pooled account token after reset and re-onboarding", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_OAUTH_TOKEN;
+    let access = "pre-reset-token";
+    setAnthropicAccountPoolBridge({
+      selectAnthropicSubscription: async () => ({
+        id: "default",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+      getAccessToken: async () => access,
+      markInvalid: async () => undefined,
+      markRateLimited: async () => undefined,
+    });
+
+    expect((await getClaudeOAuthTokenAsync()).accessToken).toBe("pre-reset-token");
+    setAnthropicAccountPoolBridge(null);
+    access = "post-reset-token";
+    setAnthropicAccountPoolBridge({
+      selectAnthropicSubscription: async () => ({
+        id: "default",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+      getAccessToken: async () => access,
+      markInvalid: async () => undefined,
+      markRateLimited: async () => undefined,
+    });
+
+    expect((await getClaudeOAuthTokenAsync()).accessToken).toBe("post-reset-token");
   });
 
   it("throws CREDENTIALS_CORRUPT when ~/.claude/.credentials.json is unparseable, not a silent null", () => {

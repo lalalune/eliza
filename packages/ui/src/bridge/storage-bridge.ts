@@ -100,6 +100,16 @@ const SYNCED_KEYS = new Set([
 // In-memory cache of values from Preferences (for native)
 const preferencesCache = new Map<string, string>();
 
+// Native writes are normally fire-and-forget so synchronous localStorage calls
+// stay fast. Destructive reset is the exception: it advances the generation,
+// drains mutations already inside the native bridge, then removes and verifies
+// every synced key. A queued pre-reset write therefore cannot repopulate a
+// credential after reset has returned.
+let storageMutationGeneration = 0;
+let storageResetInProgress = false;
+let storageResetPromise: Promise<void> | null = null;
+const pendingNativeMutations = new Set<Promise<void>>();
+
 // Flag to track if initial sync has completed
 let initialized = false;
 let storageProxyInstalled = false;
@@ -109,6 +119,44 @@ const PREFERENCE_READ_TIMEOUT_MS = 1_500;
 // doesn't drop critical synced keys (first-run-complete, active-server, …).
 const PREFERENCE_HYDRATION_ATTEMPTS = 6;
 const PREFERENCE_HYDRATION_RETRY_MS = 350;
+
+function trackNativeMutation(operation: Promise<void>): Promise<void> {
+  let tracked: Promise<void>;
+  tracked = operation.finally(() => {
+    pendingNativeMutations.delete(tracked);
+  });
+  pendingNativeMutations.add(tracked);
+  return tracked;
+}
+
+function scheduleSyncedPreferenceMutation(
+  key: string,
+  mutate: (
+    preferences: typeof import("@capacitor/preferences").Preferences,
+  ) => Promise<void>,
+  failureMessage: string,
+): void {
+  const generation = storageMutationGeneration;
+  setTimeout(() => {
+    if (storageResetInProgress || generation !== storageMutationGeneration) {
+      return;
+    }
+    const mutation = trackNativeMutation(
+      loadPreferences().then(async ({ Preferences }) => {
+        if (
+          storageResetInProgress ||
+          generation !== storageMutationGeneration
+        ) {
+          return;
+        }
+        await mutate(Preferences);
+      }),
+    );
+    void mutation.catch((err) => {
+      logger.error({ err, key }, failureMessage);
+    });
+  }, 0);
+}
 
 /**
  * Resolve `true` as soon as the native Preferences plugin answers a call (even
@@ -169,6 +217,12 @@ export async function initializeStorageBridge(): Promise<void> {
     return;
   }
 
+  const hydrationGeneration = storageMutationGeneration;
+  if (storageResetInProgress) {
+    setupStorageProxy();
+    return;
+  }
+
   // The Capacitor Preferences plugin is frequently not yet responsive on the
   // first read during very early WebView startup (the bridge is still wiring
   // up), so a single best-effort pass loses critical session/first-run state —
@@ -190,6 +244,14 @@ export async function initializeStorageBridge(): Promise<void> {
     }
   }
 
+  if (
+    storageResetInProgress ||
+    hydrationGeneration !== storageMutationGeneration
+  ) {
+    setupStorageProxy();
+    return;
+  }
+
   // Load synced keys from Preferences into cache. Hydration stays best-effort so
   // a single stale preference read cannot block first paint.
   const entries = await Promise.all(
@@ -198,6 +260,13 @@ export async function initializeStorageBridge(): Promise<void> {
       async (key) => [key, await readPreferenceWithTimeout(key)] as const,
     ),
   );
+  if (
+    storageResetInProgress ||
+    hydrationGeneration !== storageMutationGeneration
+  ) {
+    setupStorageProxy();
+    return;
+  }
   for (const [key, value] of entries) {
     if (value === null) continue;
     preferencesCache.set(key, value);
@@ -223,7 +292,11 @@ export async function initializeStorageBridge(): Promise<void> {
   // re-hydrates instead of permanently dropping critical synced keys —
   // first-run-complete, active-server, the smoke request — which otherwise
   // strands the user in onboarding or silently skips the QA smoke.
-  if (pluginResponded) {
+  if (
+    pluginResponded &&
+    !storageResetInProgress &&
+    hydrationGeneration === storageMutationGeneration
+  ) {
     initialized = true;
   }
 }
@@ -248,6 +321,9 @@ function setupStorageProxy(): void {
 
   // Override setItem
   window.localStorage.setItem = (key: string, value: string): void => {
+    if (SYNCED_KEYS.has(key) && storageResetInProgress) {
+      return;
+    }
     // Always set in localStorage first
     originalSetItem(key, value);
 
@@ -256,20 +332,11 @@ function setupStorageProxy(): void {
       preferencesCache.set(key, value);
       // Fire and forget on a later task. Some native bridge calls can stall
       // during early WebView startup; localStorage writes must stay sync-fast.
-      setTimeout(() => {
-        loadPreferences()
-          .then(({ Preferences }) => Preferences.set({ key, value }))
-          .catch((err) => {
-            // A dropped synced write silently diverges a critical key
-            // (session/auth/first-run) across restarts — surface it instead
-            // of swallowing. Fire-and-forget scheduling stays; the value is
-            // already in `preferencesCache` for this session.
-            logger.error(
-              { err, key },
-              "[StorageBridge] failed to sync key to Preferences",
-            );
-          });
-      }, 0);
+      scheduleSyncedPreferenceMutation(
+        key,
+        (Preferences) => Preferences.set({ key, value }),
+        "[StorageBridge] failed to sync key to Preferences",
+      );
     }
   };
 
@@ -288,19 +355,12 @@ function setupStorageProxy(): void {
 
     if (SYNCED_KEYS.has(key)) {
       preferencesCache.delete(key);
-      setTimeout(() => {
-        loadPreferences()
-          .then(({ Preferences }) => Preferences.remove({ key }))
-          .catch((err) => {
-            // A dropped synced removal leaves a stale key in Preferences that
-            // out-of-sync-hydrates on the next restart — surface it instead of
-            // swallowing. The in-session cache was already cleared above.
-            logger.error(
-              { err, key },
-              "[StorageBridge] failed to remove key from Preferences",
-            );
-          });
-      }, 0);
+      if (storageResetInProgress) return;
+      scheduleSyncedPreferenceMutation(
+        key,
+        (Preferences) => Preferences.remove({ key }),
+        "[StorageBridge] failed to remove key from Preferences",
+      );
     }
   };
 
@@ -326,14 +386,29 @@ export async function setStorageValue(
   key: string,
   value: string,
 ): Promise<void> {
+  if (SYNCED_KEYS.has(key) && storageResetInProgress) {
+    throw new Error(
+      `Cannot persist ${key} while renderer reset is in progress`,
+    );
+  }
   // Privileged: this is the shell-side persistence helper (session/auth/
   // first-run keys); the view-facing path is the scoped override in
   // DynamicViewLoader's bridge compat, not this function.
   runAsPrivilegedShell(() => window.localStorage.setItem(key, value));
 
   if (isNativePlatform() && SYNCED_KEYS.has(key)) {
-    const { Preferences } = await loadPreferences();
-    await Preferences.set({ key, value });
+    const generation = storageMutationGeneration;
+    await trackNativeMutation(
+      loadPreferences().then(async ({ Preferences }) => {
+        if (
+          storageResetInProgress ||
+          generation !== storageMutationGeneration
+        ) {
+          return;
+        }
+        await Preferences.set({ key, value });
+      }),
+    );
   }
 }
 
@@ -344,9 +419,136 @@ export async function removeStorageValue(key: string): Promise<void> {
   runAsPrivilegedShell(() => window.localStorage.removeItem(key));
 
   if (isNativePlatform() && SYNCED_KEYS.has(key)) {
-    const { Preferences } = await loadPreferences();
-    await Preferences.remove({ key });
+    if (storageResetInProgress) return;
+    const generation = storageMutationGeneration;
+    await trackNativeMutation(
+      loadPreferences().then(async ({ Preferences }) => {
+        if (
+          storageResetInProgress ||
+          generation !== storageMutationGeneration
+        ) {
+          return;
+        }
+        await Preferences.remove({ key });
+      }),
+    );
   }
+}
+
+/**
+ * Removes every renderer key mirrored into Capacitor Preferences and waits for
+ * native deletion to finish. Reset callers use this instead of synchronous
+ * `localStorage.removeItem`: iOS/Android must not rehydrate a stale token or
+ * first-run marker after the server-side wipe has completed.
+ */
+export function clearSyncedStorageForReset(): Promise<void> {
+  if (storageResetPromise) return storageResetPromise;
+
+  const reset = async (): Promise<void> => {
+    storageResetInProgress = true;
+    storageMutationGeneration += 1;
+    const errors: unknown[] = [];
+
+    // A mutation already executing inside Preferences may still land after the
+    // generation changes. Drain it before deletion so removal is the final write.
+    const pendingResults = await Promise.allSettled([
+      ...pendingNativeMutations,
+    ]);
+    for (const result of pendingResults) {
+      if (result.status === "rejected") errors.push(result.reason);
+    }
+
+    const keys = [...SYNCED_KEYS];
+    preferencesCache.clear();
+    if (typeof window !== "undefined") {
+      for (const key of keys) {
+        try {
+          runAsPrivilegedShell(() => window.localStorage.removeItem(key));
+        } catch (error) {
+          // error-policy:J1 reset attempts every independent browser/native key
+          // and reports the complete set of failed deletions at the boundary.
+          errors.push(error);
+        }
+      }
+    }
+
+    if (isNativePlatform()) {
+      const [preferencesResult] = await Promise.allSettled([loadPreferences()]);
+      if (preferencesResult.status === "rejected") {
+        errors.push(preferencesResult.reason);
+      } else {
+        const { Preferences } = preferencesResult.value;
+        const removalResults = await Promise.allSettled(
+          keys.map((key) => Preferences.remove({ key })),
+        );
+        for (const [index, result] of removalResults.entries()) {
+          if (result.status === "rejected") {
+            errors.push(
+              new Error(`Failed to remove native renderer key ${keys[index]}`, {
+                cause: result.reason,
+              }),
+            );
+          }
+        }
+
+        const verificationResults = await Promise.allSettled(
+          keys.map(async (key) => ({
+            key,
+            value: (await Preferences.get({ key })).value,
+          })),
+        );
+        const remaining: string[] = [];
+        for (const [index, result] of verificationResults.entries()) {
+          if (result.status === "rejected") {
+            errors.push(
+              new Error(`Failed to verify native renderer key ${keys[index]}`, {
+                cause: result.reason,
+              }),
+            );
+          } else if (result.value.value !== null) {
+            remaining.push(result.value.key);
+          }
+        }
+        if (remaining.length > 0) {
+          errors.push(
+            new Error(
+              `Native renderer state survived reset: ${remaining.join(", ")}`,
+            ),
+          );
+        }
+      }
+    }
+
+    if (typeof window !== "undefined") {
+      const remaining: string[] = [];
+      for (const key of keys) {
+        try {
+          if (window.localStorage.getItem(key) !== null) remaining.push(key);
+        } catch (error) {
+          // error-policy:J1 verification failures are preserved while every key
+          // is still checked before the destructive reset boundary returns.
+          errors.push(error);
+        }
+      }
+      if (remaining.length > 0) {
+        errors.push(
+          new Error(
+            `Renderer localStorage survived reset: ${remaining.join(", ")}`,
+          ),
+        );
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Synced renderer storage reset failed");
+    }
+  };
+
+  storageResetPromise = reset().finally(() => {
+    storageResetInProgress = false;
+    storageResetPromise = null;
+  });
+  return storageResetPromise;
 }
 
 /**

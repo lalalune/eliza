@@ -156,6 +156,7 @@ export class CodexSdkSession {
   private thread: CodexThread | null = null;
   private turns = 0;
   private chain: Promise<unknown> = Promise.resolve();
+  private terminal = false;
 
   constructor(config: CodexSdkSessionConfig) {
     this.model = config.model?.trim() || DEFAULT_MODEL;
@@ -185,7 +186,16 @@ export class CodexSdkSession {
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
+    if (this.terminal) {
+      return Promise.reject(new Error("[cli-inference:codex-sdk] session permanently disposed"));
+    }
+    const guarded = () => {
+      if (this.terminal) {
+        throw new Error("[cli-inference:codex-sdk] session permanently disposed");
+      }
+      return fn();
+    };
+    const run = this.chain.then(guarded, guarded);
     // error-policy:J5 the chain tail only serializes turns; the REAL result/error
     // is returned to the caller via `run`. Swallowing here just stops a settled
     // tail from raising an unhandled rejection — the caller still sees the error.
@@ -194,6 +204,9 @@ export class CodexSdkSession {
   }
 
   private async sendOnce(body: string, mode: "text" | "route"): Promise<string> {
+    if (this.terminal) {
+      throw new Error("[cli-inference:codex-sdk] session permanently disposed");
+    }
     if (!body.trim()) {
       throw new Error("[cli-inference:codex-sdk] empty prompt body");
     }
@@ -273,7 +286,13 @@ export class CodexSdkSession {
   }
 
   private async start(): Promise<void> {
+    if (this.terminal) {
+      throw new Error("[cli-inference:codex-sdk] session permanently disposed");
+    }
     const { Codex } = this.codexOverride ?? (await loadCodex());
+    if (this.terminal) {
+      throw new Error("[cli-inference:codex-sdk] session permanently disposed");
+    }
     // Drive the system codex binary (not the SDK's bundled-and-often-stale one)
     // when a path is configured, so current models work.
     const codexOptions: Record<string, unknown> = {};
@@ -303,5 +322,12 @@ export class CodexSdkSession {
   dispose(): void {
     this.thread = null;
     this.turns = 0;
+  }
+
+  /** Permanently rejects queued/future turns and waits for active work to end. */
+  async disposePermanently(): Promise<void> {
+    this.terminal = true;
+    this.dispose();
+    await this.chain;
   }
 }

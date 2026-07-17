@@ -38,6 +38,37 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface ProcessEnvBaseline {
+  existed: boolean;
+  value?: string;
+}
+
+const hydratedProcessEnvBaselines = new Map<string, ProcessEnvBaseline>();
+
+function rememberProcessEnvBaseline(key: string): void {
+  if (hydratedProcessEnvBaselines.has(key)) return;
+  const value = process.env[key];
+  hydratedProcessEnvBaselines.set(key, {
+    existed: value !== undefined,
+    ...(value !== undefined ? { value } : {}),
+  });
+}
+
+/** Restores launch-env values replaced by persisted agent configuration. */
+export function resetHydratedConfigProcessEnv(): ReadonlySet<string> {
+  const restored = new Set<string>();
+  for (const [key, baseline] of hydratedProcessEnvBaselines) {
+    restored.add(key);
+    if (baseline.existed && baseline.value !== undefined) {
+      process.env[key] = baseline.value;
+    } else {
+      delete process.env[key];
+    }
+  }
+  hydratedProcessEnvBaselines.clear();
+  return restored;
+}
+
 function resolveConfigWritePath(env: NodeJS.ProcessEnv = process.env): string {
   const persistPath = env.ELIZA_PERSIST_CONFIG_PATH?.trim();
   return persistPath ? resolveUserPath(persistPath) : resolveConfigPath();
@@ -53,6 +84,7 @@ function applyConfigEnvToProcessEnv(entries: Record<string, string>): void {
     // every such call, and downstream `runtime.getSetting()` would hand the
     // sentinel to consumers like plugin-elizacloud, producing 401s.
     if (isVaultRef(value)) continue;
+    rememberProcessEnvBaseline(key);
     process.env[key] = value;
   }
 }
@@ -200,12 +232,35 @@ export function loadElizaConfig(): ElizaConfig {
     process.env.DISCORD_API_TOKEN?.trim() ||
     process.env.DISCORD_BOT_TOKEN?.trim();
   if (discordToken) {
-    process.env.DISCORD_API_TOKEN = discordToken;
-    process.env.DISCORD_BOT_TOKEN = discordToken;
+    applyConfigEnvToProcessEnv({
+      DISCORD_API_TOKEN: discordToken,
+      DISCORD_BOT_TOKEN: discordToken,
+    });
   }
 
   // Keep public-key aliases available when only the private key is configured.
-  syncSolanaPublicKeyEnv(getConfigEnvString(resolved, "SOLANA_PRIVATE_KEY"));
+  const solanaPublicBaseline = process.env.SOLANA_PUBLIC_KEY;
+  const walletPublicBaseline = process.env.WALLET_PUBLIC_KEY;
+  if (
+    syncSolanaPublicKeyEnv(getConfigEnvString(resolved, "SOLANA_PRIVATE_KEY"))
+  ) {
+    if (!hydratedProcessEnvBaselines.has("SOLANA_PUBLIC_KEY")) {
+      hydratedProcessEnvBaselines.set("SOLANA_PUBLIC_KEY", {
+        existed: solanaPublicBaseline !== undefined,
+        ...(solanaPublicBaseline !== undefined
+          ? { value: solanaPublicBaseline }
+          : {}),
+      });
+    }
+    if (!hydratedProcessEnvBaselines.has("WALLET_PUBLIC_KEY")) {
+      hydratedProcessEnvBaselines.set("WALLET_PUBLIC_KEY", {
+        existed: walletPublicBaseline !== undefined,
+        ...(walletPublicBaseline !== undefined
+          ? { value: walletPublicBaseline }
+          : {}),
+      });
+    }
+  }
 
   if (isElizaSettingsDebugEnabled()) {
     const cloud = resolved.cloud as Record<string, unknown> | undefined;
@@ -283,8 +338,7 @@ function stripWalletPrivateKeysFromConfig(config: ElizaConfig): void {
   }
 }
 
-export function saveElizaConfig(config: ElizaConfig): void {
-  const configPath = resolveConfigWritePath();
+function saveElizaConfigAtPath(config: ElizaConfig, configPath: string): void {
   const dir = path.dirname(configPath);
 
   if (!fs.existsSync(dir)) {
@@ -360,6 +414,39 @@ export function saveElizaConfig(config: ElizaConfig): void {
       },
       "[eliza][settings][saveElizaConfig]",
     );
+  }
+}
+
+function removeStaleConfigTempArtifacts(configPath: string): void {
+  const paths = new Set([configPath]);
+  if (fs.existsSync(configPath)) paths.add(fs.realpathSync(configPath));
+
+  for (const sourcePath of paths) {
+    const dir = path.dirname(sourcePath);
+    const prefix = `${path.basename(sourcePath)}.tmp`;
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (name !== prefix && !name.startsWith(`${prefix}.`)) continue;
+      fs.rmSync(path.join(dir, name), { force: true });
+    }
+  }
+}
+
+export function saveElizaConfig(config: ElizaConfig): void {
+  saveElizaConfigAtPath(config, resolveConfigWritePath());
+}
+
+/**
+ * Persists destructive-reset output to both the base config and overlay.
+ * Writing the same scrubbed snapshot to every merge source prevents values
+ * omitted from the overlay from reappearing from the base on the next boot.
+ */
+export function saveElizaConfigForReset(config: ElizaConfig): void {
+  const configPaths = new Set([resolveConfigPath(), resolveConfigWritePath()]);
+  for (const configPath of configPaths) {
+    removeStaleConfigTempArtifacts(configPath);
+    saveElizaConfigAtPath(config, configPath);
+    removeStaleConfigTempArtifacts(configPath);
   }
 }
 

@@ -108,8 +108,18 @@ export {
   applyCanonicalFirstRunConfig,
   applyFirstRunCredentialPersistence,
   clearPersistedFirstRunConfig,
+  FIRST_RUN_RESET_CREDENTIAL_ENV_KEYS,
 } from "./api/provider-switch-config.ts";
 export { RegistryService } from "./api/registry-service.ts";
+export {
+  deleteAgentStateForReset,
+  deleteExternalAgentStateForReset,
+  validateAgentStateResetPath,
+  validateExternalAgentStateResetPaths,
+  validateOwnedResetTarget,
+  validateResetPathComponents,
+  writeAgentStateOwnershipMarker,
+} from "./api/reset-state.ts";
 // Runtime-mode contract (mode resolution, route-visibility gate, remote-mode
 // forwarder). `api/server.ts` enforces it in its own dispatch; the app-core
 // compat pipeline calls the same pre-dispatch hook so every host shares one
@@ -150,6 +160,7 @@ export {
   normalizeWsClientId,
   type PluginConfigMutationRejection,
   persistConversationRoomTitle,
+  resetRuntimeOperationStateForAgentReset,
   resolveCorsOrigin,
   resolveMcpServersRejection,
   resolveMcpTerminalAuthorizationRejection,
@@ -207,13 +218,21 @@ export {
   probeJsonRpcEndpoint,
   TxService,
 } from "./api/tx-service.ts";
-export { getWalletAddresses, initStewardWalletCache } from "./api/wallet.ts";
+export {
+  getWalletAddresses,
+  initStewardWalletCache,
+  resetStewardWalletCache,
+} from "./api/wallet.ts";
 export * from "./api/wallet-capability.ts";
 export * from "./api/workbench-helpers.ts";
 export * from "./awareness/index.ts";
 export { runBenchmark } from "./cli/benchmark.ts";
 export { CharacterSchema } from "./config/character-schema.ts";
-export { loadElizaConfig, saveElizaConfig } from "./config/config.ts";
+export {
+  loadElizaConfig,
+  saveElizaConfig,
+  saveElizaConfigForReset,
+} from "./config/config.ts";
 export * from "./config/index.ts";
 export { resolveUserPath } from "./config/paths.ts";
 // Surface plugin-widgets / plugin-validation / plugin-manager

@@ -25,6 +25,16 @@ interface TurnScript {
   resultText?: string;
   /** Omit the terminal `result` message entirely (simulate a mid-turn death). */
   noResult?: boolean;
+  entered?: () => void;
+  waitFor?: Promise<void>;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }
 
 type ToolHandler = (args: {
@@ -61,6 +71,8 @@ function makeFakeSdk(
       async function* gen() {
         while (turn < scripts.length) {
           const s = scripts[turn++];
+          s.entered?.();
+          if (s.waitFor) await s.waitFor;
           if (s.hang) {
             await new Promise(() => undefined);
           }
@@ -381,6 +393,30 @@ describe("ClaudeSdkSession — serialization", () => {
     const actions = [JSON.parse(r1).action, JSON.parse(r2).action].sort();
     expect(actions).toEqual(["A", "B"]); // both distinct, no cross-contamination
     await session.dispose();
+  });
+
+  it("permanent disposal drains the active turn and rejects queued/future work", async () => {
+    const release = deferred();
+    const entered = deferred();
+    const { session, starts } = makeSession([
+      {
+        text: "active result",
+        entered: entered.resolve,
+        waitFor: release.promise,
+      },
+      { text: "must not run" },
+    ]);
+    const active = session.send("active");
+    await entered.promise;
+    const queued = session.send("queued");
+    const disposal = session.disposePermanently();
+    release.resolve();
+
+    await expect(active).rejects.toThrow();
+    await expect(queued).rejects.toThrow(/permanently disposed/);
+    await disposal;
+    await expect(session.send("future")).rejects.toThrow(/permanently disposed/);
+    expect(starts()).toBe(1);
   });
 });
 

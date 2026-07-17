@@ -2,7 +2,7 @@
  * `eliza auth adopt-codex` — the operator-facing surface for adopting a Codex
  * CLI login (`CODEX_HOME/auth.json`) into the account pool.
  *
- * Adoption is a destructive ownership transfer: the source file is retired so
+ * Adoption is a destructive ownership transfer: the source file is destroyed so
  * the `codex` CLI can no longer refresh the chain (OpenAI refresh tokens are
  * one-time-use; two refreshers revoke the whole grant family). The command
  * therefore requires an explicit `--yes` — without it, it prints exactly what
@@ -25,7 +25,7 @@ export interface AdoptCodexCliResult {
   ok: boolean;
   /** Set on success. */
   accountId?: string;
-  retiredTo?: string;
+  sourceDestroyed?: true;
   organizationId?: string;
   /** Set on failure: the ElizaError code (adopt_codex.*) or "not_confirmed". */
   reason?: string;
@@ -80,7 +80,7 @@ export async function runAuthAdoptCodex(
       `${theme.success("✓")} adopted Codex login as ${theme.command(`openai-codex/${result.accountId}`)}`,
     );
     log(
-      `${theme.success("✓")} source retired to ${theme.command(result.retiredTo)} — the codex CLI can no longer refresh this chain`,
+      `${theme.success("✓")} source credentials destroyed — the codex CLI can no longer refresh this chain`,
     );
     if (result.organizationId) {
       log(`${theme.muted("→")} org ${result.organizationId}`);
@@ -88,7 +88,7 @@ export async function runAuthAdoptCodex(
     return {
       ok: true,
       accountId: result.accountId,
-      retiredTo: result.retiredTo,
+      sourceDestroyed: result.sourceDestroyed,
       ...(result.organizationId
         ? { organizationId: result.organizationId }
         : {}),

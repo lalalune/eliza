@@ -22,6 +22,9 @@ export class TwitterAuth {
   private authenticated = false;
   private profile?: Profile;
   private loggedOut = false;
+  private generation = 0;
+  private readonly authOperations = new Set<Promise<unknown>>();
+  private logoutPromise?: Promise<void>;
 
   private lastAccessToken?: string;
 
@@ -36,13 +39,38 @@ export class TwitterAuth {
     return typeof candidate.getOAuth1Credentials === "function";
   }
 
-  private async ensureClientInitialized(): Promise<void> {
-    if (this.loggedOut) {
-      throw new Error("Twitter API client not initialized");
+  private lifecycleError(): Error {
+    const error = new Error("Twitter authentication is stopped");
+    error.name = "AbortError";
+    return error;
+  }
+
+  private assertActive(generation: number): void {
+    if (this.loggedOut || generation !== this.generation) {
+      throw this.lifecycleError();
     }
+  }
+
+  private async trackAuthOperation<T>(
+    operation: (generation: number) => Promise<T>,
+  ): Promise<T> {
+    const generation = this.generation;
+    this.assertActive(generation);
+    const promise = operation(generation);
+    this.authOperations.add(promise);
+    try {
+      return await promise;
+    } finally {
+      this.authOperations.delete(promise);
+    }
+  }
+
+  private async ensureClientInitialized(generation: number): Promise<void> {
+    this.assertActive(generation);
     if (this.isOAuth1Provider(this.provider)) {
       if (this.v2Client) return;
       const creds = await this.provider.getOAuth1Credentials();
+      this.assertActive(generation);
       this.v2Client = new TwitterApi({
         appKey: creds.appKey,
         appSecret: creds.appSecret,
@@ -55,6 +83,7 @@ export class TwitterAuth {
     }
 
     const token = await this.provider.getAccessToken();
+    this.assertActive(generation);
     if (!this.v2Client || this.lastAccessToken !== token) {
       // OAuth2 user context token: Bearer token
       this.v2Client = new TwitterApi(token);
@@ -67,42 +96,49 @@ export class TwitterAuth {
    * Get the Twitter API v2 client
    */
   async getV2Client(): Promise<TwitterApi> {
-    await this.ensureClientInitialized();
-    if (!this.v2Client) {
-      throw new Error("Twitter API client not initialized");
-    }
-    return this.v2Client;
+    return await this.trackAuthOperation(async (generation) => {
+      await this.ensureClientInitialized(generation);
+      this.assertActive(generation);
+      if (!this.v2Client) {
+        throw new Error("Twitter API client not initialized");
+      }
+      return this.v2Client;
+    });
   }
 
   /**
    * Check if authenticated
    */
   async isLoggedIn(): Promise<boolean> {
-    // error-policy:J4 availability probe — this method's contract is a boolean
-    // "are we authenticated" answer, so any init/verify failure is the designed
-    // false, not a masked read. Callers that need the failure call me() instead.
-    try {
-      await this.ensureClientInitialized();
-    } catch {
-      return false;
-    }
-    if (!this.authenticated || !this.v2Client) {
-      return false;
-    }
+    if (this.loggedOut) return false;
+    return await this.trackAuthOperation(async (generation) => {
+      // error-policy:J4 availability probe — this method's contract is a boolean
+      // "are we authenticated" answer, so any init/verify failure is the designed
+      // false, not a masked read. Callers that need the failure call me() instead.
+      try {
+        await this.ensureClientInitialized(generation);
+      } catch {
+        return false;
+      }
+      if (!this.authenticated || !this.v2Client) {
+        return false;
+      }
 
-    try {
-      // Verify credentials by getting current user
-      const me = await this.v2Client.v2.me();
-      return !!me.data;
-    } catch (error) {
-      // error-policy:J4 availability probe — a failed verify means "not logged
-      // in" for this boolean; log for diagnostics and report the designed false.
-      logger.debug(
-        { error: error instanceof Error ? error.message : String(error) },
-        "[X.TwitterAuth] credential verification failed; reporting not-logged-in",
-      );
-      return false;
-    }
+      try {
+        // Verify credentials by getting current user
+        const me = await this.v2Client.v2.me();
+        this.assertActive(generation);
+        return !!me.data;
+      } catch (error) {
+        // error-policy:J4 availability probe — a failed verify means "not logged
+        // in" for this boolean; log for diagnostics and report the designed false.
+        logger.debug(
+          { error: error instanceof Error ? error.message : String(error) },
+          "[X.TwitterAuth] credential verification failed; reporting not-logged-in",
+        );
+        return false;
+      }
+    });
   }
 
   /**
@@ -113,57 +149,77 @@ export class TwitterAuth {
       return this.profile;
     }
 
-    await this.ensureClientInitialized();
-    if (!this.v2Client) {
-      throw new Error("Not authenticated");
-    }
+    return await this.trackAuthOperation(async (generation) => {
+      await this.ensureClientInitialized(generation);
+      if (!this.v2Client) {
+        throw new Error("Not authenticated");
+      }
 
-    try {
-      const { data: user } = await this.v2Client.v2.me({
-        "user.fields": [
-          "id",
-          "name",
-          "username",
-          "description",
-          "profile_image_url",
-          "public_metrics",
-          "verified",
-          "location",
-          "created_at",
-        ],
-      });
+      try {
+        const { data: user } = await this.v2Client.v2.me({
+          "user.fields": [
+            "id",
+            "name",
+            "username",
+            "description",
+            "profile_image_url",
+            "public_metrics",
+            "verified",
+            "location",
+            "created_at",
+          ],
+        });
+        this.assertActive(generation);
 
-      this.profile = {
-        userId: user.id,
-        username: user.username,
-        name: user.name,
-        biography: user.description,
-        avatar: user.profile_image_url,
-        followersCount: user.public_metrics?.followers_count,
-        followingCount: user.public_metrics?.following_count,
-        isVerified: user.verified,
-        location: user.location || "",
-        joined: user.created_at ? new Date(user.created_at) : undefined,
-      };
+        this.profile = {
+          userId: user.id,
+          username: user.username,
+          name: user.name,
+          biography: user.description,
+          avatar: user.profile_image_url,
+          followersCount: user.public_metrics?.followers_count,
+          followingCount: user.public_metrics?.following_count,
+          isVerified: user.verified,
+          location: user.location || "",
+          joined: user.created_at ? new Date(user.created_at) : undefined,
+        };
 
-      return this.profile;
-    } catch (error) {
-      throw new ElizaError("Failed to fetch authenticated user profile", {
-        code: "X_ME_FETCH_FAILED",
-        cause: error,
-      });
-    }
+        return this.profile;
+      } catch (error) {
+        throw new ElizaError("Failed to fetch authenticated user profile", {
+          code: "X_ME_FETCH_FAILED",
+          cause: error,
+        });
+      }
+    });
   }
 
   /**
    * Logout (clear credentials)
    */
   async logout(): Promise<void> {
+    if (this.logoutPromise) return await this.logoutPromise;
+
+    this.loggedOut = true;
+    this.generation += 1;
     this.v2Client = null;
     this.authenticated = false;
     this.profile = undefined;
     this.lastAccessToken = undefined;
-    this.loggedOut = true;
+    this.logoutPromise = (async () => {
+      const [providerResult] = await Promise.allSettled([
+        this.provider.dispose?.(),
+      ]);
+      await Promise.allSettled([...this.authOperations]);
+      this.v2Client = null;
+      this.authenticated = false;
+      this.profile = undefined;
+      this.lastAccessToken = undefined;
+      if (providerResult.status === "rejected") {
+        throw providerResult.reason;
+      }
+    })();
+    return await this.logoutPromise;
   }
 
   hasToken(): boolean {

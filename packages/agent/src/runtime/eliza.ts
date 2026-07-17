@@ -116,6 +116,7 @@ import {
   createMessageMemory,
   drainAppRoutePluginLoaders,
   E2B_SANDBOX_FACTORY_SERVICE_TYPE,
+  ElizaError,
   EmbeddingDimensionProbeError,
   type Entity,
   type IAgentRuntime,
@@ -186,28 +187,32 @@ async function runVaultBootHydration(): Promise<void> {
     return;
   }
   const bridge = importAppCoreRuntime();
-  // The two serial cost centers (OS-keychain hydrate, vault PGlite cold
-  // start) are timed separately so boot-history telemetry shows the long
-  // pole. Order is load-bearing: the hydrate writes wallet keys into
-  // process.env that runVaultBootstrap then mirrors into the vault.
-  const keychainStartMs = Date.now();
-  try {
-    await bridge.hydrateWalletKeysFromNodePlatformSecureStore();
-  } catch (err) {
-    logger.warn(
-      `[wallet][os-store] deferred boot hydrate skipped: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  const keychainMs = Date.now() - keychainStartMs;
-  // Wallet keys may have just landed in process.env; refresh the derived
-  // public-key mirrors (the boot-path sync ran before hydration).
-  syncSolanaPublicKeyEnv();
+  await bridge.withCredentialStateMutation(async () => {
+    // Hydration, derived caches, and plaintext migration form one transaction:
+    // reset must drain all of them before deleting any credential source.
+    const keychainStartMs = Date.now();
+    let hydrationFailure: ElizaError | null = null;
+    try {
+      await bridge.hydrateWalletKeysFromNodePlatformSecureStore();
+    } catch (error) {
+      // error-policy:J2 Delay the context-adding rethrow until independent vault bootstrap completes.
+      hydrationFailure = new ElizaError("OS secure-store hydration failed", {
+        code: "VAULT_BOOT_SECURE_STORE_HYDRATION_FAILED",
+        cause: error,
+        severity: "fatal",
+      });
+    }
+    const keychainMs = Date.now() - keychainStartMs;
+    syncSolanaPublicKeyEnv();
+    if (!hydrationFailure) await initStewardWalletCache();
 
-  const vaultStartMs = Date.now();
-  const bootResult = await bridge.runVaultBootstrap();
-  logger.info(
-    `[vault-bootstrap] migrated=${bootResult.migrated} failed=${bootResult.failed.length} (keychain=${keychainMs}ms vault-pglite=${Date.now() - vaultStartMs}ms)`,
-  );
+    const vaultStartMs = Date.now();
+    const bootResult = await bridge.runVaultBootstrap();
+    logger.info(
+      `[vault-bootstrap] migrated=${bootResult.migrated} failed=${bootResult.failed.length} (keychain=${keychainMs}ms vault-pglite=${Date.now() - vaultStartMs}ms)`,
+    );
+    if (hydrationFailure) throw hydrationFailure;
+  });
 }
 
 function isBundledMobileRuntime(): boolean {
@@ -260,7 +265,11 @@ import {
   validateRuntimeContext,
 } from "../api/plugin-validation.ts";
 import { listViews } from "../api/views-registry.ts";
-import { getWalletAddresses, syncSolanaPublicKeyEnv } from "../api/wallet.ts";
+import {
+  getWalletAddresses,
+  initStewardWalletCache,
+  syncSolanaPublicKeyEnv,
+} from "../api/wallet.ts";
 import {
   configFileExists,
   type ElizaConfig,
@@ -3626,10 +3635,14 @@ export async function startEliza(
   // autoFetchCloudGithubToken needs the cloud agent id. config.cloud?.agentId
   // is available now; the function falls back to its own skip guards (no cloud
   // key / no managed namespace) when the id is absent this early.
-  const discordAppIdPromise = autoResolveDiscordAppId();
-  const cloudGithubTokenPromise = autoFetchCloudGithubToken(
-    config.cloud?.agentId?.trim(),
+  const credentialBootLookups = importAppCoreRuntime();
+  const discordAppIdPromise = credentialBootLookups.withCredentialStateMutation(
+    autoResolveDiscordAppId,
   );
+  const cloudGithubTokenPromise =
+    credentialBootLookups.withCredentialStateMutation(() =>
+      autoFetchCloudGithubToken(config.cloud?.agentId?.trim()),
+    );
 
   // 2c. Propagate x402 config into process.env
   applyX402ConfigToEnv(config);
@@ -4956,31 +4969,41 @@ export async function startEliza(
       return Promise.resolve([]);
     }
     if (walletInitPromise) return walletInitPromise;
-    walletInitPromise = (async () => {
-      try {
-        const { sharedVault } = await importAppCoreRuntime();
-        const { ensureAgentWallets } = await import("./agent-wallets.ts");
-        const descriptors = await ensureAgentWallets(
-          sharedVault(),
-          agentId,
-          "agent-bootstrap",
-        );
-        const summary = descriptors
-          .map((d) => `${d.chain}:${d.address}`)
-          .join(" ");
-        logger.info(
-          `[agent-wallets] agent="${agentId}" wallets ready (${summary})`,
-        );
-        return descriptors;
-      } catch (err) {
-        // Clear the singleton so the next access retries.
+    const bridge = importAppCoreRuntime();
+    walletInitPromise = bridge
+      .withCredentialStateMutation(async () => {
+        try {
+          const { ensureAgentWallets } = await import("./agent-wallets.ts");
+          const descriptors = await ensureAgentWallets(
+            bridge.sharedVault(),
+            agentId,
+            "agent-bootstrap",
+          );
+          const summary = descriptors
+            .map((d) => `${d.chain}:${d.address}`)
+            .join(" ");
+          logger.info(
+            `[agent-wallets] agent="${agentId}" wallets ready (${summary})`,
+          );
+          return descriptors;
+        } catch (err) {
+          // Clear the singleton so the next access retries.
+          walletInitPromise = null;
+          logger.warn(
+            `[agent-wallets] failed to ensure wallets for agent="${agentId}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return [];
+        }
+      })
+      .catch((err) => {
+        // error-policy:J4 Reset can reject a wallet bootstrap before it enters
+        // the mutation gate; a future explicit wallet access can retry.
         walletInitPromise = null;
         logger.warn(
-          `[agent-wallets] failed to ensure wallets for agent="${agentId}": ${err instanceof Error ? err.message : String(err)}`,
+          `[agent-wallets] credential gate rejected bootstrap for agent="${agentId}": ${err instanceof Error ? err.message : String(err)}`,
         );
         return [];
-      }
-    })();
+      });
     return walletInitPromise;
   };
 
@@ -5150,7 +5173,15 @@ export async function startEliza(
     // writes wallet/steward keys into process.env that the deferred plugin
     // auto-enable and wallet/connector plugins read. Single-flight — a
     // concurrent first-secret-access caller shares this run.
-    await ensureVaultBootHydration();
+    try {
+      await ensureVaultBootHydration();
+    } catch (error) {
+      // error-policy:J4 RECENT_ERRORS exposes vault degradation while independent deferred plugins continue.
+      logger.warn(`[eliza] Vault boot hydration failed: ${formatError(error)}`);
+      runtime.reportError("eliza.vaultBootHydration", error, {
+        phase: "deferred-vault-hydration",
+      });
+    }
     bootTimer.lap("deferred:vault-hydration");
 
     // Join the background trajectory-capture wiring started inside
@@ -5275,7 +5306,7 @@ export async function startEliza(
     // — if no wallet route or signing flow triggers it earlier, wallets are
     // still generated here. The singleton keeps this harmless if already
     // resolved by an earlier caller.
-    void ensureAgentWalletsLazy();
+    await ensureAgentWalletsLazy();
     bootTimer.lap("deferred:autonomy+warmup");
 
     // Same timing reason: validate the intent→action map only once the deferred

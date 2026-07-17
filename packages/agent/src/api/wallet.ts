@@ -8,7 +8,6 @@
  * EVM balance + NFT fetching lives in ./wallet-evm-balance.ts
  */
 import crypto from "node:crypto";
-import fs from "node:fs";
 import { logger } from "@elizaos/core";
 import type {
   KeyValidationResult,
@@ -21,7 +20,6 @@ import type {
 } from "@elizaos/shared";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { resolveStewardCredentialsPath } from "../config/paths.ts";
 import { computeValueUsd } from "./wallet-dex-prices.ts";
 
 type StewardAgentPayload = {
@@ -105,6 +103,7 @@ const SOLANA_SPL_TOKEN_PROGRAM_ID =
 /** Module-level cache for steward wallet addresses (avoids process.env mutation). */
 let stewardAddressCache: { evm: string | null; solana: string | null } | null =
   null;
+let stewardAddressCacheGeneration = 0;
 
 function normalizeWalletSource(
   value: string | undefined,
@@ -505,47 +504,12 @@ export function importWallet(
 export const STEWARD_EVM_ADDRESS_ENV_KEY = "STEWARD_EVM_ADDRESS";
 export const STEWARD_SOLANA_ADDRESS_ENV_KEY = "STEWARD_SOLANA_ADDRESS";
 
-type PersistedStewardCredentials = {
-  apiUrl?: string;
-  tenantId?: string;
-  agentId?: string;
-  apiKey?: string;
-  agentToken?: string;
-};
-
 function normalizeOptionalString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
-}
-
-function readPersistedStewardCredentials(): {
-  apiUrl: string | null;
-  tenantId: string | null;
-  agentId: string | null;
-  apiKey: string | null;
-  agentToken: string | null;
-} | null {
-  const credentialsPath = resolveStewardCredentialsPath();
-  try {
-    if (!fs.existsSync(credentialsPath)) {
-      return null;
-    }
-    const parsed = JSON.parse(
-      fs.readFileSync(credentialsPath, "utf8"),
-    ) as PersistedStewardCredentials;
-    return {
-      apiUrl: normalizeOptionalString(parsed.apiUrl),
-      tenantId: normalizeOptionalString(parsed.tenantId),
-      agentId: normalizeOptionalString(parsed.agentId),
-      apiKey: normalizeOptionalString(parsed.apiKey),
-      agentToken: normalizeOptionalString(parsed.agentToken),
-    };
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -557,29 +521,25 @@ function readPersistedStewardCredentials(): {
  * `getWalletAddresses()` can use them without hitting the network.
  */
 export async function initStewardWalletCache(): Promise<void> {
-  const persisted = readPersistedStewardCredentials();
-  const stewardApiUrl =
-    normalizeOptionalString(process.env.STEWARD_API_URL) ?? persisted?.apiUrl;
+  const generation = stewardAddressCacheGeneration;
+  const stewardApiUrl = normalizeOptionalString(process.env.STEWARD_API_URL);
   if (!stewardApiUrl) return;
 
   const agentId =
     normalizeOptionalString(process.env.STEWARD_AGENT_ID) ||
-    normalizeOptionalString(process.env.ELIZA_STEWARD_AGENT_ID) ||
-    persisted?.agentId ||
-    null;
+    normalizeOptionalString(process.env.ELIZA_STEWARD_AGENT_ID);
 
   if (!agentId) return;
 
   try {
     const headers: Record<string, string> = { Accept: "application/json" };
-    const bearerToken =
-      normalizeOptionalString(process.env.STEWARD_AGENT_TOKEN) ??
-      persisted?.agentToken;
-    const apiKey =
-      normalizeOptionalString(process.env.STEWARD_API_KEY) ?? persisted?.apiKey;
-    const tenantId =
-      normalizeOptionalString(process.env.STEWARD_TENANT_ID) ??
-      persisted?.tenantId;
+    const bearerToken = normalizeOptionalString(
+      process.env.STEWARD_AGENT_TOKEN,
+    );
+    const apiKey = normalizeOptionalString(process.env.STEWARD_API_KEY);
+    const tenantId = normalizeOptionalString(process.env.STEWARD_TENANT_ID);
+
+    if (!bearerToken && !apiKey) return;
 
     if (bearerToken) {
       headers.Authorization = `Bearer ${bearerToken}`;
@@ -612,6 +572,10 @@ export async function initStewardWalletCache(): Promise<void> {
       agent.walletAddresses?.evm?.trim() || agent.walletAddress?.trim() || null;
     const stewardSolana = agent.walletAddresses?.solana?.trim() || null;
 
+    // Reset invalidates fetches that captured credentials before cleanup. A
+    // late network response must never recreate derived wallet state.
+    if (generation !== stewardAddressCacheGeneration) return;
+
     stewardAddressCache = { evm: stewardEvm, solana: stewardSolana };
     if (stewardEvm) {
       process.env[STEWARD_EVM_ADDRESS_ENV_KEY] = stewardEvm;
@@ -637,8 +601,19 @@ export async function initStewardWalletCache(): Promise<void> {
       logger.info(`[wallet] Steward Solana address cached: ${stewardSolana}`);
     }
   } catch (err) {
+    // error-policy:J4 Address caching is optional and a later refresh can retry.
     logger.debug(`[wallet] Steward wallet cache init unavailable: ${err}`);
   }
+}
+
+/** Clears every in-process address derived from credentials removed by reset. */
+export function resetStewardWalletCache(): void {
+  stewardAddressCacheGeneration += 1;
+  stewardAddressCache = null;
+  delete process.env[STEWARD_EVM_ADDRESS_ENV_KEY];
+  delete process.env[STEWARD_SOLANA_ADDRESS_ENV_KEY];
+  delete process.env.SOLANA_PUBLIC_KEY;
+  delete process.env.WALLET_PUBLIC_KEY;
 }
 
 /**

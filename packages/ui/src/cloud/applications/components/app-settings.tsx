@@ -38,6 +38,7 @@ import { Input } from "../../../components/ui/input";
 import { Label } from "../../../components/ui/label";
 import { Switch } from "../../../components/ui/switch";
 import { Textarea } from "../../../components/ui/textarea";
+import { captureRendererCredentialWriteGeneration } from "../../../state/credential-storage-keys";
 import { useCloudT } from "../../shell/CloudI18nProvider";
 import {
   APPS_QUERY_KEY,
@@ -111,10 +112,11 @@ export function AppSettings({ app }: AppSettingsProps) {
   };
 
   const handleRegenerateApiKey = async () => {
+    const credentialGeneration = captureRendererCredentialWriteGeneration();
     setIsRegenerating(true);
     try {
       const apiKey = await regenerateAppApiKey(app.id);
-      storeOneTimeAppApiKey(app.id, apiKey);
+      storeOneTimeAppApiKey(app.id, apiKey, credentialGeneration);
       toast.success(
         t("cloud.appSettings.regenerateSuccess", {
           defaultValue: "API key regenerated",

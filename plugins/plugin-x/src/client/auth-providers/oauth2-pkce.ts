@@ -47,6 +47,11 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
 
   private tokens: StoredOAuth2Tokens | null = null;
   private readonly accountId: string;
+  private readonly abortController = new AbortController();
+  private readonly authOperations = new Set<Promise<unknown>>();
+  private generation = 0;
+  private stopped = false;
+  private disposePromise?: Promise<void>;
 
   constructor(
     private readonly runtime: IAgentRuntime,
@@ -57,7 +62,9 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
         DEFAULT_X_ACCOUNT_ID,
     ),
     private readonly fetchImpl: typeof fetch = fetch,
-    private readonly interactiveLoginFn?: () => Promise<StoredOAuth2Tokens>,
+    private readonly interactiveLoginFn?: (
+      signal: AbortSignal,
+    ) => Promise<StoredOAuth2Tokens>,
   ) {
     this.accountId = resolveRequestedXAccountId(
       runtime,
@@ -96,15 +103,57 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
     );
   }
 
-  private async loadTokens(): Promise<StoredOAuth2Tokens | null> {
-    if (this.tokens) return this.tokens;
-    this.tokens = await this.tokenStore.load();
-    return this.tokens;
+  private lifecycleError(): Error {
+    const error = new Error(
+      `Twitter OAuth provider is stopped (accountId=${this.accountId})`,
+    );
+    error.name = "AbortError";
+    return error;
   }
 
-  private async saveTokens(tokens: StoredOAuth2Tokens): Promise<void> {
+  private assertActive(generation: number): void {
+    if (
+      this.stopped ||
+      this.abortController.signal.aborted ||
+      generation !== this.generation
+    ) {
+      throw this.lifecycleError();
+    }
+  }
+
+  private async trackAuthOperation<T>(
+    operation: (generation: number, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const generation = this.generation;
+    this.assertActive(generation);
+    const promise = operation(generation, this.abortController.signal);
+    this.authOperations.add(promise);
+    try {
+      return await promise;
+    } finally {
+      this.authOperations.delete(promise);
+    }
+  }
+
+  private async loadTokens(
+    generation: number,
+  ): Promise<StoredOAuth2Tokens | null> {
+    this.assertActive(generation);
+    if (this.tokens) return this.tokens;
+    const tokens = await this.tokenStore.load();
+    this.assertActive(generation);
     this.tokens = tokens;
+    return tokens;
+  }
+
+  private async saveTokens(
+    tokens: StoredOAuth2Tokens,
+    generation: number,
+  ): Promise<void> {
+    this.assertActive(generation);
     await this.tokenStore.save(tokens);
+    this.assertActive(generation);
+    this.tokens = tokens;
   }
 
   private buildAuthorizeUrl(opts: {
@@ -125,7 +174,10 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
   private async exchangeCodeForToken(params: {
     code: string;
     codeVerifier: string;
+    generation: number;
+    signal: AbortSignal;
   }): Promise<StoredOAuth2Tokens> {
+    this.assertActive(params.generation);
     const body = formEncode({
       grant_type: "authorization_code",
       client_id: this.clientId,
@@ -138,9 +190,11 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
+      signal: params.signal,
     });
 
     const json = await res.json().catch(() => ({}));
+    this.assertActive(params.generation);
     if (!res.ok) {
       throw new Error(
         `Twitter token exchange failed (${res.status}): ${JSON.stringify(json)}`,
@@ -170,7 +224,10 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
 
   private async refreshAccessToken(
     refreshToken: string,
+    generation: number,
+    signal: AbortSignal,
   ): Promise<StoredOAuth2Tokens> {
+    this.assertActive(generation);
     const body = formEncode({
       grant_type: "refresh_token",
       client_id: this.clientId,
@@ -181,9 +238,11 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
+      signal,
     });
 
     const json = await res.json().catch(() => ({}));
+    this.assertActive(generation);
     if (!res.ok) {
       throw new Error(
         `Twitter token refresh failed (${res.status}): ${JSON.stringify(json)}`,
@@ -211,7 +270,11 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
     };
   }
 
-  private async interactiveLogin(): Promise<StoredOAuth2Tokens> {
+  private async interactiveLogin(
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<StoredOAuth2Tokens> {
+    this.assertActive(generation);
     const verifier = createCodeVerifier();
     const challenge = createCodeChallenge(verifier);
     const state = createState();
@@ -226,9 +289,17 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
     let code: string | undefined;
     try {
       // Preferred UX: loopback callback if redirect URI is loopback.
-      const cb = await waitForLoopbackCallback(this.redirectUri, state);
+      const cb = await waitForLoopbackCallback(
+        this.redirectUri,
+        state,
+        undefined,
+        signal,
+      );
       code = cb.code;
     } catch (e) {
+      // error-policy:J4 loopback binding failures use the explicit paste-URL
+      // setup path; lifecycle cancellation is rethrown by assertActive below.
+      this.assertActive(generation);
       logger.warn(
         `Could not start loopback callback server (will fall back to paste URL): ${e instanceof Error ? e.message : String(e)}`,
       );
@@ -237,7 +308,9 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
     if (!code) {
       const redirected = await promptForRedirectedUrl(
         "Paste the FULL redirected URL here (it contains ?code=...&state=...): ",
+        signal,
       );
+      this.assertActive(generation);
       const parsed = new URL(redirected);
       const parsedCode = parsed.searchParams.get("code");
       const parsedState = parsed.searchParams.get("state");
@@ -248,37 +321,65 @@ export class OAuth2PKCEAuthProvider implements TwitterAuthProvider {
       code = parsedCode;
     }
 
-    return await this.exchangeCodeForToken({ code, codeVerifier: verifier });
+    return await this.exchangeCodeForToken({
+      code,
+      codeVerifier: verifier,
+      generation,
+      signal,
+    });
   }
 
   async getAccessToken(): Promise<string> {
-    const tokens = await this.loadTokens();
-    if (!tokens) {
-      const newTokens = this.interactiveLoginFn
-        ? await this.interactiveLoginFn()
-        : await this.interactiveLogin();
-      await this.saveTokens(newTokens);
-      return newTokens.access_token;
-    }
+    return await this.trackAuthOperation(async (generation, signal) => {
+      const tokens = await this.loadTokens(generation);
+      if (!tokens) {
+        const newTokens = this.interactiveLoginFn
+          ? await this.interactiveLoginFn(signal)
+          : await this.interactiveLogin(generation, signal);
+        this.assertActive(generation);
+        await this.saveTokens(newTokens, generation);
+        return newTokens.access_token;
+      }
 
-    if (!isExpired(tokens)) {
-      return tokens.access_token;
-    }
+      if (!isExpired(tokens)) {
+        this.assertActive(generation);
+        return tokens.access_token;
+      }
 
-    if (!tokens.refresh_token) {
-      // No refresh token available; must re-auth.
-      await this.tokenStore.clear();
+      if (!tokens.refresh_token) {
+        this.assertActive(generation);
+        await this.tokenStore.clear();
+        this.assertActive(generation);
+        this.tokens = null;
+        const newTokens = this.interactiveLoginFn
+          ? await this.interactiveLoginFn(signal)
+          : await this.interactiveLogin(generation, signal);
+        this.assertActive(generation);
+        await this.saveTokens(newTokens, generation);
+        return newTokens.access_token;
+      }
+
+      const refreshed = await this.refreshAccessToken(
+        tokens.refresh_token,
+        generation,
+        signal,
+      );
+      await this.saveTokens(refreshed, generation);
+      return refreshed.access_token;
+    });
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposePromise) return await this.disposePromise;
+
+    this.stopped = true;
+    this.generation += 1;
+    this.abortController.abort(this.lifecycleError());
+    this.disposePromise = (async () => {
+      await Promise.allSettled([...this.authOperations]);
       this.tokens = null;
-      const newTokens = this.interactiveLoginFn
-        ? await this.interactiveLoginFn()
-        : await this.interactiveLogin();
-      await this.saveTokens(newTokens);
-      return newTokens.access_token;
-    }
-
-    const refreshed = await this.refreshAccessToken(tokens.refresh_token);
-    await this.saveTokens(refreshed);
-    return refreshed.access_token;
+    })();
+    return await this.disposePromise;
   }
 }
 

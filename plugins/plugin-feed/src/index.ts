@@ -1,4 +1,5 @@
-import type { Plugin } from "@elizaos/core";
+import type { IAgentRuntime, Plugin } from "@elizaos/core";
+import { clearFeedAuthState } from "./feed-auth";
 
 const feedPlugin: Plugin = {
   name: "@elizaos/plugin-feed",
@@ -52,6 +53,9 @@ const feedPlugin: Plugin = {
       desktopTabEnabled: true,
     },
   ],
+  dispose(runtime: IAgentRuntime) {
+    clearFeedAuthState(runtime);
+  },
 };
 
 export default feedPlugin;

@@ -38,7 +38,11 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadAccount } from "@elizaos/auth/account-storage";
+import {
+  assertAccountAuthWritesEnabled,
+  loadAccount,
+  runWithAccountAuthGeneration,
+} from "@elizaos/auth/account-storage";
 import {
   type AccessTokenOutcome,
   getAccessToken,
@@ -61,6 +65,7 @@ import {
   setCodingAgentSelectorBridge,
 } from "@elizaos/core";
 import type { LinkedAccountProviderId } from "@elizaos/shared/contracts/service-routing";
+import { withCredentialStateMutation } from "../security/credential-state-lock";
 import {
   type AccountPool,
   isAccountSelectableNow,
@@ -423,6 +428,7 @@ async function createCanonicalCodexHome(
   accountId: string,
   record: NonNullable<ReturnType<typeof loadAccount>>,
 ): Promise<MaterializedCodexAuthCandidate> {
+  assertAccountAuthWritesEnabled();
   const refreshToken = record.credentials.refresh;
   if (!refreshToken) {
     throw new ElizaError(
@@ -685,6 +691,7 @@ function materializeRequiredTextFile(
     | "CODEX_ACTIVE_HOME_MATERIALIZATION_FAILED",
   description: string,
 ): void {
+  assertAccountAuthWritesEnabled();
   const tmpPath = `${targetPath}.tmp-${process.pid}-${randomUUID()}`;
   try {
     if (
@@ -823,120 +830,132 @@ function makeBridge(pool: AccountPool): CodingAgentSelectorBridge {
     },
 
     async select(agentType, opts) {
-      const candidates = candidatesFor(agentType);
-      if (candidates.length === 0) return null;
-      for (const providerId of candidates) {
-        // Explicit caller override > the app's per-provider
-        // config.accountStrategies (same live selectionForProvider read the
-        // anthropic/subscription bridges use, so the rotation-strategy picker
-        // steers coding spawns too) > ELIZA_CODING_ACCOUNT_STRATEGY env >
-        // least-used. Strategy only — the llmText route's accountIds pin the
-        // chat brain's account, not coding sub-agents.
-        const strategy =
-          opts?.strategy ??
-          selectionForProvider(providerId).strategy ??
-          getDefaultCodingStrategy();
-        const account = await pool.select({
-          providerId,
-          strategy,
-          ...(opts?.sessionKey ? { sessionKey: opts.sessionKey } : {}),
-          ...(opts?.exclude ? { exclude: opts.exclude } : {}),
-          ...(opts?.model ? { model: opts.model } : {}),
-          // Follow-up pin: a continuing session restricts the pool to its
-          // spawn-time account so an expired session-affinity can't strategy-
-          // drift the subprocess onto a sibling (billing/health stay keyed to
-          // the account actually serving). Null when the pin is unselectable.
-          ...(opts?.accountIds ? { accountIds: opts.accountIds } : {}),
-        });
-        if (!account) continue;
-        let envPatch: Record<string, string>;
-        if (providerId === "openai-codex") {
-          // CODEX_HOME is the refresh authority for a running Codex process.
-          // Reconcile and select its immutable generation before any canonical
-          // refresh can present an already-consumed one-time token.
-          envPatch = { CODEX_HOME: await materializeCodexHome(account.id) };
-        } else {
-          // Claude coding spawns get a bare token the third-party adapter reads
-          // once and cannot refresh, so widen the freshness window to the
-          // expected run duration before injecting it.
-          const resolveOpts =
-            providerId === "anthropic-subscription"
-              ? {
-                  minRemainingMs: claudeMinRemainingMs(
-                    resolveClaudeExpectedRunMs((key) => process.env[key]),
-                  ),
-                }
-              : undefined;
-          let accessToken: string | null = null;
-          let resolveOutcome: AccessTokenOutcome | undefined;
-          let resolveError: unknown;
-          try {
-            resolveOutcome = await getAccessToken(providerId, account.id, {
-              ...resolveOpts,
-              outcome: true,
+      return withCredentialStateMutation(() =>
+        runWithAccountAuthGeneration(async () => {
+          const candidates = candidatesFor(agentType);
+          if (candidates.length === 0) return null;
+          for (const providerId of candidates) {
+            // Explicit caller override > the app's per-provider
+            // config.accountStrategies (same live selectionForProvider read the
+            // anthropic/subscription bridges use, so the rotation-strategy picker
+            // steers coding spawns too) > ELIZA_CODING_ACCOUNT_STRATEGY env >
+            // least-used. Strategy only — the llmText route's accountIds pin the
+            // chat brain's account, not coding sub-agents.
+            const strategy =
+              opts?.strategy ??
+              selectionForProvider(providerId).strategy ??
+              getDefaultCodingStrategy();
+            const account = await pool.select({
+              providerId,
+              strategy,
+              ...(opts?.sessionKey ? { sessionKey: opts.sessionKey } : {}),
+              ...(opts?.exclude ? { exclude: opts.exclude } : {}),
+              ...(opts?.model ? { model: opts.model } : {}),
+              // Follow-up pin: a continuing session restricts the pool to its
+              // spawn-time account so an expired session-affinity can't strategy-
+              // drift the subprocess onto a sibling (billing/health stay keyed to
+              // the account actually serving). Null when the pin is unselectable.
+              ...(opts?.accountIds ? { accountIds: opts.accountIds } : {}),
             });
-            accessToken = resolveOutcome.ok ? resolveOutcome.accessToken : null;
-            // A widened Claude resolve is only a freshness preference. The
-            // default-buffer retry preserves a still-valid shorter-lived token
-            // when proactive refresh is transiently unavailable.
-            if (
-              accessToken === null &&
-              resolveOpts &&
-              resolveOutcome &&
-              !resolveOutcome.ok &&
-              resolveOutcome.kind !== "auth"
-            ) {
-              const stillValid = await getAccessToken(providerId, account.id, {
-                outcome: true,
-              });
-              resolveOutcome = stillValid;
-              if (stillValid.ok) {
-                logger.info(
-                  `[coding-account-bridge] proactive refresh for ${providerId}/${account.id} did not yield a fresh token; using the still-valid shorter-TTL token (a long run may hit the typed expiry signal)`,
+            if (!account) continue;
+            let envPatch: Record<string, string>;
+            if (providerId === "openai-codex") {
+              // CODEX_HOME is the refresh authority for a running Codex process.
+              // Reconcile and select its immutable generation before any canonical
+              // refresh can present an already-consumed one-time token.
+              envPatch = { CODEX_HOME: await materializeCodexHome(account.id) };
+            } else {
+              // Claude coding spawns get a bare token the third-party adapter reads
+              // once and cannot refresh, so widen the freshness window to the
+              // expected run duration before injecting it.
+              const resolveOpts =
+                providerId === "anthropic-subscription"
+                  ? {
+                      minRemainingMs: claudeMinRemainingMs(
+                        resolveClaudeExpectedRunMs((key) => process.env[key]),
+                      ),
+                    }
+                  : undefined;
+              let accessToken: string | null = null;
+              let resolveOutcome: AccessTokenOutcome | undefined;
+              let resolveError: unknown;
+              try {
+                resolveOutcome = await getAccessToken(providerId, account.id, {
+                  ...resolveOpts,
+                  outcome: true,
+                });
+                accessToken = resolveOutcome.ok
+                  ? resolveOutcome.accessToken
+                  : null;
+                // A widened Claude resolve is only a freshness preference. The
+                // default-buffer retry preserves a still-valid shorter-lived token
+                // when proactive refresh is transiently unavailable.
+                if (
+                  accessToken === null &&
+                  resolveOpts &&
+                  resolveOutcome &&
+                  !resolveOutcome.ok &&
+                  resolveOutcome.kind !== "auth"
+                ) {
+                  const stillValid = await getAccessToken(
+                    providerId,
+                    account.id,
+                    {
+                      outcome: true,
+                    },
+                  );
+                  resolveOutcome = stillValid;
+                  if (stillValid.ok) {
+                    logger.info(
+                      `[coding-account-bridge] proactive refresh for ${providerId}/${account.id} did not yield a fresh token; using the still-valid shorter-TTL token (a long run may hit the typed expiry signal)`,
+                    );
+                    accessToken = stillValid.accessToken;
+                  }
+                }
+              } catch (err) {
+                resolveError = err;
+                logger.warn(
+                  `[coding-account-bridge] token resolve failed for ${providerId}/${account.id}: ${String(err)}`,
                 );
-                accessToken = stillValid.accessToken;
+              }
+              if (!accessToken) {
+                // Only flag for re-auth on a genuine auth failure; a transient
+                // network/5xx blip must not pull a healthy account out of rotation.
+                if (accessTokenFailureIsAuth(resolveOutcome, resolveError)) {
+                  await pool.markNeedsReauth(
+                    account.id,
+                    "No valid credential / token refresh failed",
+                    { providerId },
+                  );
+                }
+                continue;
+              }
+              envPatch = await buildEnvPatch(providerId, accessToken);
+              if (Object.keys(envPatch).length === 0) {
+                continue;
               }
             }
-          } catch (err) {
-            resolveError = err;
-            logger.warn(
-              `[coding-account-bridge] token resolve failed for ${providerId}/${account.id}: ${String(err)}`,
+            const source: "oauth" | "api-key" = isSubscriptionProvider(
+              providerId,
+            )
+              ? "oauth"
+              : "api-key";
+            logger.info(
+              `[coding-account-bridge] ${agentType} → ${providerId} account "${account.label}" (${account.id}) via ${strategy}`,
             );
+            return {
+              providerId,
+              accountId: account.id,
+              label: account.label,
+              source,
+              strategy,
+              ...(account.usage ? { usage: account.usage } : {}),
+              envPatch,
+            };
           }
-          if (!accessToken) {
-            // Only flag for re-auth on a genuine auth failure; a transient
-            // network/5xx blip must not pull a healthy account out of rotation.
-            if (accessTokenFailureIsAuth(resolveOutcome, resolveError)) {
-              await pool.markNeedsReauth(
-                account.id,
-                "No valid credential / token refresh failed",
-                { providerId },
-              );
-            }
-            continue;
-          }
-          envPatch = await buildEnvPatch(providerId, accessToken);
-          if (Object.keys(envPatch).length === 0) {
-            continue;
-          }
-        }
-        const source: "oauth" | "api-key" = isSubscriptionProvider(providerId)
-          ? "oauth"
-          : "api-key";
-        logger.info(
-          `[coding-account-bridge] ${agentType} → ${providerId} account "${account.label}" (${account.id}) via ${strategy}`,
-        );
-        return {
-          providerId,
-          accountId: account.id,
-          label: account.label,
-          source,
-          strategy,
-          ...(account.usage ? { usage: account.usage } : {}),
-          envPatch,
-        };
-      }
-      return null;
+          return null;
+        }),
+      );
     },
 
     markRateLimited(
@@ -945,81 +964,95 @@ function makeBridge(pool: AccountPool): CodingAgentSelectorBridge {
       untilMs,
       detail,
     ) {
-      return pool.markRateLimited(accountId, untilMs, detail, { providerId });
+      return withCredentialStateMutation(() =>
+        runWithAccountAuthGeneration(() =>
+          pool.markRateLimited(accountId, untilMs, detail, { providerId }),
+        ),
+      );
     },
     async markNeedsReauth(
       providerId: LinkedAccountProviderId,
       accountId,
       detail,
     ) {
-      // Session-level auth failures can come from an injected token aging out.
-      // Verify the stored credential before evicting the account from rotation.
-      if (providerId === "openai-codex") {
-        await adoptRotatedCodexTokens(accountId);
-      }
-      try {
-        const tokenOutcome = await getAccessToken(providerId, accountId, {
-          outcome: true,
-        });
-        if (tokenOutcome.ok) {
-          const token = tokenOutcome.accessToken;
-          if (isSubscriptionProvider(providerId)) {
-            const record = pool.get(accountId, providerId);
-            await pool.refreshUsage(accountId, token, {
-              providerId,
-              ...(record?.organizationId
-                ? { codexAccountId: record.organizationId }
-                : {}),
+      return withCredentialStateMutation(() =>
+        runWithAccountAuthGeneration(async () => {
+          // Session-level auth failures can come from an injected token aging out.
+          // Verify the stored credential before evicting the account from rotation.
+          if (providerId === "openai-codex") {
+            await adoptRotatedCodexTokens(accountId);
+          }
+          try {
+            const tokenOutcome = await getAccessToken(providerId, accountId, {
+              outcome: true,
             });
-          } else if (isDirectAccountProvider(providerId)) {
-            // #11033 regression fix: a direct-API key resolves offline from
-            // local storage with a never-expires sentinel, so a successful
-            // `getAccessToken` proves NOTHING — a cached-but-revoked key that
-            // just 401'd a session would otherwise be logged "verified" and
-            // kept in rotation forever (doomed failover respawns). Probe it
-            // against the provider; only a real 2xx keeps it, a 401/403 falls
-            // through to markNeedsReauth. A network/timeout blip (status 0)
-            // is inconclusive → leave rotation state to the keep-alive sweep.
-            const probe = await probeDirectApiKey(providerId, token);
-            if (!probe.ok) {
-              if (probe.status === 401 || probe.status === 403) {
-                return pool.markNeedsReauth(accountId, detail, { providerId });
+            if (tokenOutcome.ok) {
+              const token = tokenOutcome.accessToken;
+              if (isSubscriptionProvider(providerId)) {
+                const record = pool.get(accountId, providerId);
+                await pool.refreshUsage(accountId, token, {
+                  providerId,
+                  ...(record?.organizationId
+                    ? { codexAccountId: record.organizationId }
+                    : {}),
+                });
+              } else if (isDirectAccountProvider(providerId)) {
+                // #11033 regression fix: a direct-API key resolves offline from
+                // local storage with a never-expires sentinel, so a successful
+                // `getAccessToken` proves NOTHING — a cached-but-revoked key that
+                // just 401'd a session would otherwise be logged "verified" and
+                // kept in rotation forever (doomed failover respawns). Probe it
+                // against the provider; only a real 2xx keeps it, a 401/403 falls
+                // through to markNeedsReauth. A network/timeout blip (status 0)
+                // is inconclusive → leave rotation state to the keep-alive sweep.
+                const probe = await probeDirectApiKey(providerId, token);
+                if (!probe.ok) {
+                  if (probe.status === 401 || probe.status === 403) {
+                    return pool.markNeedsReauth(accountId, detail, {
+                      providerId,
+                    });
+                  }
+                  logger.info(
+                    `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify was inconclusive (probe status ${probe.status}${probe.error ? `: ${probe.error}` : ""}) — leaving rotation state to the keep-alive sweep`,
+                  );
+                  return;
+                }
               }
               logger.info(
-                `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify was inconclusive (probe status ${probe.status}${probe.error ? `: ${probe.error}` : ""}) — leaving rotation state to the keep-alive sweep`,
+                `[coding-account-bridge] ${providerId}/${accountId} reported an auth failure but its credential verifies — keeping it in rotation (injected token likely expired mid-session)${detail ? `: ${detail}` : ""}`,
+              );
+              return;
+            }
+            if (tokenOutcome.kind !== "auth") {
+              logger.info(
+                `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify did not produce a reauth failure (${tokenOutcome.kind}) — leaving rotation state to the keep-alive sweep`,
+              );
+              return;
+            }
+          } catch (err) {
+            if (!isAuthFailure(err)) {
+              logger.info(
+                `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify hit a transient error (${String(err)}) — leaving rotation state to the keep-alive sweep`,
               );
               return;
             }
           }
-          logger.info(
-            `[coding-account-bridge] ${providerId}/${accountId} reported an auth failure but its credential verifies — keeping it in rotation (injected token likely expired mid-session)${detail ? `: ${detail}` : ""}`,
-          );
-          return;
-        }
-        if (tokenOutcome.kind !== "auth") {
-          logger.info(
-            `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify did not produce a reauth failure (${tokenOutcome.kind}) — leaving rotation state to the keep-alive sweep`,
-          );
-          return;
-        }
-      } catch (err) {
-        if (!isAuthFailure(err)) {
-          logger.info(
-            `[coding-account-bridge] ${providerId}/${accountId} auth-failure verify hit a transient error (${String(err)}) — leaving rotation state to the keep-alive sweep`,
-          );
-          return;
-        }
-      }
-      return pool.markNeedsReauth(accountId, detail, { providerId });
+          return pool.markNeedsReauth(accountId, detail, { providerId });
+        }),
+      );
     },
     async recordUsage(providerId: LinkedAccountProviderId, accountId, result) {
-      // Session end is the natural sync point for tokens a Codex CLI rotated
-      // mid-run — heal the canonical record before the next sweep refreshes
-      // against the consumed one.
-      if (providerId === "openai-codex") {
-        await adoptRotatedCodexTokens(accountId);
-      }
-      return pool.recordCall(accountId, result, { providerId });
+      return withCredentialStateMutation(() =>
+        runWithAccountAuthGeneration(async () => {
+          // Session end is the natural sync point for tokens a Codex CLI rotated
+          // mid-run — heal the canonical record before the next sweep refreshes
+          // against the consumed one.
+          if (providerId === "openai-codex") {
+            await adoptRotatedCodexTokens(accountId);
+          }
+          return pool.recordCall(accountId, result, { providerId });
+        }),
+      );
     },
   };
 }

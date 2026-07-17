@@ -7,6 +7,11 @@
 
 import { shellLocalStorage } from "../surface-realm-channel";
 import type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
+import {
+  assertRendererCredentialWriteAllowed,
+  captureRendererCredentialWriteGeneration,
+  type RendererCredentialWriteGeneration,
+} from "./credential-storage-keys";
 import type { PersistedActiveServer } from "./persistence";
 
 export type { AgentProfile, AgentProfileRegistry } from "./agent-profile-types";
@@ -67,7 +72,7 @@ function migrateFromPersistedActiveServer(): AgentProfileRegistry | null {
   };
 
   // Persist immediately so migration only runs once.
-  shellLocalStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
+  saveAgentProfileRegistry(registry);
   // Leave elizaos:active-server intact for rollback.
   return registry;
 }
@@ -88,7 +93,11 @@ export function loadAgentProfileRegistry(): AgentProfileRegistry {
   }, emptyRegistry());
 }
 
-export function saveAgentProfileRegistry(registry: AgentProfileRegistry): void {
+export function saveAgentProfileRegistry(
+  registry: AgentProfileRegistry,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
+  assertRendererCredentialWriteAllowed(generation);
   tryLocalStorage(() => {
     shellLocalStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
   }, undefined);
@@ -137,15 +146,19 @@ export function getActiveProfile(): AgentProfile | null {
   );
 }
 
-export function setActiveProfileId(id: string): void {
+export function setActiveProfileId(
+  id: string,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
   const registry = loadAgentProfileRegistry();
   if (!registry.profiles.some((p) => p.id === id)) return;
   registry.activeProfileId = id;
-  saveAgentProfileRegistry(registry);
+  saveAgentProfileRegistry(registry, generation);
 }
 
 export function addAgentProfile(
   profile: Omit<AgentProfile, "id" | "createdAt">,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
 ): AgentProfile {
   const registry = loadAgentProfileRegistry();
   const full: AgentProfile = {
@@ -155,7 +168,7 @@ export function addAgentProfile(
   };
   registry.profiles.push(full);
   registry.activeProfileId = full.id;
-  saveAgentProfileRegistry(registry);
+  saveAgentProfileRegistry(registry, generation);
   return full;
 }
 
@@ -177,12 +190,13 @@ function sameApiBase(a: string | undefined, b: string | undefined): boolean {
  */
 export function upsertAndActivateAgentProfile(
   profile: Omit<AgentProfile, "id" | "createdAt">,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
 ): AgentProfile {
   const registry = loadAgentProfileRegistry();
   const existingIdx = registry.profiles.findIndex(
     (p) => p.kind === profile.kind && sameApiBase(p.apiBase, profile.apiBase),
   );
-  if (existingIdx === -1) return addAgentProfile(profile);
+  if (existingIdx === -1) return addAgentProfile(profile, generation);
   const merged: AgentProfile = {
     ...registry.profiles[existingIdx],
     label: profile.label || registry.profiles[existingIdx].label,
@@ -193,17 +207,20 @@ export function upsertAndActivateAgentProfile(
   };
   registry.profiles[existingIdx] = merged;
   registry.activeProfileId = merged.id;
-  saveAgentProfileRegistry(registry);
+  saveAgentProfileRegistry(registry, generation);
   return merged;
 }
 
-export function removeAgentProfile(id: string): void {
+export function removeAgentProfile(
+  id: string,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
+): void {
   const registry = loadAgentProfileRegistry();
   registry.profiles = registry.profiles.filter((p) => p.id !== id);
   if (registry.activeProfileId === id) {
     registry.activeProfileId = registry.profiles[0]?.id ?? null;
   }
-  saveAgentProfileRegistry(registry);
+  saveAgentProfileRegistry(registry, generation);
 }
 
 /**
@@ -217,21 +234,81 @@ export function scrubPersistedAgentProfileTokens(): void {
   const registry = loadAgentProfileRegistry();
   let changed = false;
   registry.profiles = registry.profiles.map((profile) => {
-    if (!profile.accessToken) return profile;
+    if (
+      !profile ||
+      typeof profile !== "object" ||
+      !("accessToken" in profile)
+    ) {
+      return profile;
+    }
     changed = true;
-    const { accessToken, ...rest } = profile;
-    return rest;
+    const scrubbed = { ...profile };
+    delete scrubbed.accessToken;
+    return scrubbed;
   });
   if (changed) saveAgentProfileRegistry(registry);
+}
+
+/**
+ * Strict reset variant: malformed profile data is removed rather than retained,
+ * and the postcondition is verified so a storage failure cannot leave a bearer
+ * token behind while the rest of reset reports success.
+ */
+export function scrubPersistedAgentProfileTokensForReset(): void {
+  if (typeof localStorage === "undefined") return;
+
+  let mustRemoveRegistry = false;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as unknown;
+    mustRemoveRegistry =
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      !("version" in parsed) ||
+      parsed.version !== 1 ||
+      !("profiles" in parsed) ||
+      !Array.isArray(parsed.profiles) ||
+      parsed.profiles.some(
+        (profile) =>
+          !profile || typeof profile !== "object" || Array.isArray(profile),
+      );
+
+    if (!mustRemoveRegistry) {
+      const registry = parsed as AgentProfileRegistry;
+      registry.profiles = registry.profiles.map((profile) => {
+        const scrubbed = { ...profile };
+        delete scrubbed.accessToken;
+        return scrubbed;
+      });
+      shellLocalStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
+    }
+  } catch {
+    // error-policy:J3 corrupt persisted profile data is deleted rather than
+    // interpreted as a valid token-free registry during destructive reset.
+    mustRemoveRegistry = true;
+  }
+
+  if (mustRemoveRegistry) {
+    shellLocalStorage.removeItem(STORAGE_KEY);
+  }
+  if (localStorage.getItem(STORAGE_KEY)?.includes('"accessToken"')) {
+    shellLocalStorage.removeItem(STORAGE_KEY);
+    if (localStorage.getItem(STORAGE_KEY) !== null) {
+      throw new Error("Persisted agent profile token survived renderer reset");
+    }
+  }
 }
 
 export function updateAgentProfile(
   id: string,
   updates: Partial<Omit<AgentProfile, "id" | "createdAt">>,
+  generation: RendererCredentialWriteGeneration = captureRendererCredentialWriteGeneration(),
 ): void {
   const registry = loadAgentProfileRegistry();
   const idx = registry.profiles.findIndex((p) => p.id === id);
   if (idx === -1) return;
   registry.profiles[idx] = { ...registry.profiles[idx], ...updates };
-  saveAgentProfileRegistry(registry);
+  saveAgentProfileRegistry(registry, generation);
 }

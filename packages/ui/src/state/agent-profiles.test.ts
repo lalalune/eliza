@@ -11,6 +11,7 @@ import {
   loadAgentProfileRegistry,
   resolveAgentProfileByQuery,
   scrubPersistedAgentProfileTokens,
+  scrubPersistedAgentProfileTokensForReset,
   upsertAndActivateAgentProfile,
 } from "./agent-profiles";
 
@@ -56,6 +57,47 @@ describe("Agent profile token scrub", () => {
   it("is a safe no-op when no profiles exist", () => {
     expect(() => scrubPersistedAgentProfileTokens()).not.toThrow();
     expect(loadAgentProfileRegistry().profiles).toHaveLength(0);
+  });
+
+  it("strict reset removes malformed registry data that could conceal a token", () => {
+    localStorage.setItem(
+      "elizaos:agent-profiles",
+      JSON.stringify({
+        version: 1,
+        profiles: ["malformed-profile", { accessToken: "surviving-token" }],
+      }),
+    );
+
+    scrubPersistedAgentProfileTokensForReset();
+
+    expect(localStorage.getItem("elizaos:agent-profiles")).toBeNull();
+  });
+
+  it("strict reset preserves valid profile metadata while removing tokens", () => {
+    const profile = addAgentProfile({
+      label: "Cloud Agent",
+      kind: "cloud",
+      apiBase: "https://agent-runtime.example.test",
+      accessToken: "jwt-to-scrub",
+    });
+
+    scrubPersistedAgentProfileTokensForReset();
+
+    expect(loadAgentProfileRegistry()).toEqual(
+      expect.objectContaining({
+        activeProfileId: profile.id,
+        profiles: [
+          expect.objectContaining({
+            id: profile.id,
+            label: "Cloud Agent",
+            apiBase: "https://agent-runtime.example.test",
+          }),
+        ],
+      }),
+    );
+    expect(localStorage.getItem("elizaos:agent-profiles")).not.toContain(
+      "jwt-to-scrub",
+    );
   });
 });
 

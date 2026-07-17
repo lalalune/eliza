@@ -12,7 +12,10 @@ import type {
 	MessageConnectorRegistration,
 	PostConnectorRegistration,
 } from "../types/runtime";
-import { getConnectorAccountManager } from "./account-manager";
+import {
+	getConnectorAccountManager,
+	resetConnectorAccountStateForDestructiveReset,
+} from "./account-manager";
 
 class TestRuntime {
 	private messageConnectors: MessageConnectorRegistration[] = [];
@@ -60,6 +63,17 @@ function makeTarget(source: string): TargetInfo {
 }
 
 describe("ConnectorAccountManager", () => {
+	it("drops standalone and per-runtime fallback managers on destructive reset", () => {
+		const runtime = makeRuntime();
+		const standaloneBefore = getConnectorAccountManager();
+		const runtimeBefore = getConnectorAccountManager(runtime);
+
+		resetConnectorAccountStateForDestructiveReset();
+
+		expect(getConnectorAccountManager()).not.toBe(standaloneBefore);
+		expect(getConnectorAccountManager(runtime)).not.toBe(runtimeBefore);
+	});
+
 	it("does not duplicate an existing MessageConnector source during provider registration", async () => {
 		const runtime = makeRuntime();
 		const existingSendHandler = vi.fn(async () => undefined);

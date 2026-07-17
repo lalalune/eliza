@@ -18,15 +18,26 @@ import {
   setAgentHostBridge,
 } from "@elizaos/agent/runtime/host-bridge";
 import { getBuildVariant, isStoreBuild } from "@elizaos/core";
-import { getAccountPoolBrokerSnapshot } from "../api/account-pool-broker-routes";
+import {
+  closeAccountPoolBrokerForCredentialReset,
+  getAccountPoolBrokerSnapshot,
+} from "../api/account-pool-broker-routes";
 import { resolveAuthorizedRouteRole } from "../api/auth";
 import { handleCloudPairRoute } from "../api/cloud-pair-route";
+import { resetVolatileCredentialStateForAgentReset } from "../api/volatile-credential-reset";
+import {
+  withCredentialStateMutation,
+  withCredentialStateReset,
+  withIndependentCredentialStateMutation,
+} from "../security/credential-state-lock";
 import {
   captureWalletEnvBootBaseline,
   hydrateWalletKeysFromNodePlatformSecureStore,
 } from "../security/hydrate-wallet-keys-from-platform-store";
+import { deleteAgentSecretsFromSecureStores } from "../security/wallet-os-store-actions";
 import {
   applyAccountPoolApiCredentials,
+  closeAccountPoolForCredentialReset,
   getDefaultAccountPool,
   startAccountPoolKeepAlive,
 } from "../services/account-pool";
@@ -60,6 +71,15 @@ export function installAgentHostBridge(): void {
   };
   const bridge: AgentHostBridge = {
     captureWalletEnvBootBaseline,
+    withCredentialStateMutation,
+    withIndependentCredentialStateMutation,
+    withCredentialStateReset,
+    deleteHostCredentialStoresForReset: async () => {
+      closeAccountPoolForCredentialReset();
+      closeAccountPoolBrokerForCredentialReset();
+      resetVolatileCredentialStateForAgentReset();
+      await deleteAgentSecretsFromSecureStores();
+    },
     hydrateWalletKeysFromNodePlatformSecureStore,
     runVaultBootstrap,
     sharedVault,

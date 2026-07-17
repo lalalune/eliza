@@ -38,8 +38,8 @@ import {
   unlinkSync,
 } from "node:fs";
 import path from "node:path";
-import { ElizaError, logger } from "@elizaos/core";
-import { loadAccount, saveAccount } from "../account-storage.js";
+import { ElizaError } from "@elizaos/core";
+import { deleteAccount, loadAccount, saveAccount } from "../account-storage.js";
 
 /** Every failure mode, as the `code` on the thrown {@link ElizaError}. */
 export const ADOPT_CODEX_ERROR_CODES = [
@@ -52,6 +52,7 @@ export const ADOPT_CODEX_ERROR_CODES = [
   "adopt_codex.account_exists",
   "adopt_codex.retire_failed",
   "adopt_codex.pool_write_failed",
+  "adopt_codex.retired_cleanup_failed",
   "adopt_codex.concurrent_refresher",
 ] as const;
 export type AdoptCodexErrorCode = (typeof ADOPT_CODEX_ERROR_CODES)[number];
@@ -134,8 +135,8 @@ export interface AdoptCodexOptions {
 export interface AdoptCodexResult {
   accountId: string;
   organizationId?: string;
-  /** Where the source auth.json was moved to (proof of retirement). */
-  retiredTo: string;
+  /** Confirms that no plaintext ownership-transfer artifact remains. */
+  sourceDestroyed: true;
 }
 
 interface CodexAuthTokens {
@@ -209,6 +210,26 @@ function readRegularFile(filePath: string): string {
     return Buffer.concat(chunks).toString("utf-8");
   } finally {
     closeSync(fd);
+  }
+}
+
+function destroyRetiredSource(
+  retiredTo: string,
+  authPath: string,
+  cause: unknown,
+): void {
+  try {
+    unlinkSync(retiredTo);
+  } catch (cleanupCause) {
+    throw adoptError(
+      "adopt_codex.retired_cleanup_failed",
+      "Codex adoption failed and its retired plaintext source could not be destroyed",
+      { path: authPath, retiredTo },
+      new AggregateError(
+        [cause, cleanupCause],
+        "adoption and retired-source cleanup both failed",
+      ),
+    );
   }
 }
 
@@ -337,9 +358,7 @@ export function adoptCodexCliLogin(
   } catch (err) {
     const restore = restoreRetiredSource(retiredTo, authPath);
     if (!restore.restored) {
-      logger.warn(
-        `[auth] adoptCodexCliLogin: validation failed and the original path is occupied; the retired source remains at ${retiredTo}`,
-      );
+      destroyRetiredSource(retiredTo, authPath, err);
     }
     throw err;
   }
@@ -362,9 +381,14 @@ export function adoptCodexCliLogin(
     }
   })();
   if (sourceReappeared) {
+    destroyRetiredSource(
+      retiredTo,
+      authPath,
+      new Error("a live Codex refresher recreated the source"),
+    );
     throw adoptError(
       "adopt_codex.concurrent_refresher",
-      `A live process recreated ${authPath} during adoption; stop every running codex process and retry. The retired copy remains at ${retiredTo}`,
+      `A live process recreated ${authPath} during adoption; stop every running codex process and retry`,
       { path: authPath, retiredTo },
     );
   }
@@ -389,13 +413,7 @@ export function adoptCodexCliLogin(
   } catch (err) {
     const restore = restoreRetiredSource(retiredTo, authPath);
     if (!restore.restored) {
-      // error-policy:J6 best-effort teardown — the pool write already failed
-      // and the original path is occupied by a fresher login, so the retired
-      // copy stays where it is (surfaced below); the original write failure is
-      // the actionable error and is rethrown.
-      logger.warn(
-        `[auth] adoptCodexCliLogin: pool write failed and the original path is occupied; the retired source remains at ${retiredTo}`,
-      );
+      destroyRetiredSource(retiredTo, authPath, err);
     }
     throw adoptError(
       "adopt_codex.pool_write_failed",
@@ -405,9 +423,23 @@ export function adoptCodexCliLogin(
     );
   }
 
+  try {
+    unlinkSync(retiredTo);
+  } catch (err) {
+    if (existing) saveAccount(existing);
+    else deleteAccount(provider, accountId);
+    const restore = restoreRetiredSource(retiredTo, authPath);
+    throw adoptError(
+      "adopt_codex.retired_cleanup_failed",
+      `Pool adoption was rolled back because the retired plaintext source could not be destroyed`,
+      { path: authPath, retiredTo, restored: restore.restored },
+      err,
+    );
+  }
+
   return {
     accountId,
     ...(tokens.account_id ? { organizationId: tokens.account_id } : {}),
-    retiredTo,
+    sourceDestroyed: true,
   };
 }

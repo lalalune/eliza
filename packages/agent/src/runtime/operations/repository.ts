@@ -399,3 +399,8 @@ export function getDefaultRepository(): FilesystemRuntimeOperationRepository {
   }
   return cachedDefault;
 }
+
+/** Drops all in-memory operation records after destructive state removal. */
+export function resetDefaultRepositoryForAgentReset(): void {
+  cachedDefault = null;
+}

@@ -7,7 +7,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveOAuthDir } from "@elizaos/core";
+import { ElizaError, resolveOAuthDir } from "@elizaos/core";
 import type {
   LifeOpsConnectorMode,
   LifeOpsConnectorSide,
@@ -30,6 +30,118 @@ const HEALTH_OAUTH_SESSION_TTL_MS = 10 * 60 * 1000;
 const ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
 const pendingHealthOAuthSessions = new Map<string, PendingHealthOAuthSession>();
+const healthOAuthAgentGenerations = new Map<string, number>();
+const healthOAuthAgentControllers = new Map<string, Set<AbortController>>();
+const healthTokenGenerations = new Map<string, number>();
+const healthTokenControllers = new Map<string, Set<AbortController>>();
+
+function healthOAuthGeneration(agentId: string): number {
+  return healthOAuthAgentGenerations.get(agentId) ?? 0;
+}
+
+function beginHealthOAuthOperation(
+  agentId: string,
+  expectedGeneration: number,
+): { controller: AbortController; finish: () => void } {
+  if (healthOAuthGeneration(agentId) !== expectedGeneration) {
+    throw new HealthOAuthError(
+      409,
+      "Health OAuth was cancelled by agent reset.",
+    );
+  }
+  const controller = new AbortController();
+  const controllers = healthOAuthAgentControllers.get(agentId) ?? new Set();
+  controllers.add(controller);
+  healthOAuthAgentControllers.set(agentId, controllers);
+  return {
+    controller,
+    finish: () => {
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        healthOAuthAgentControllers.get(agentId) === controllers
+      ) {
+        healthOAuthAgentControllers.delete(agentId);
+      }
+    },
+  };
+}
+
+function assertHealthOAuthGeneration(
+  agentId: string,
+  expectedGeneration: number,
+): void {
+  if (healthOAuthGeneration(agentId) !== expectedGeneration) {
+    throw new HealthOAuthError(
+      409,
+      "Health OAuth was cancelled by agent reset.",
+    );
+  }
+}
+
+function healthTokenGeneration(tokenFile: string): number {
+  return healthTokenGenerations.get(tokenFile) ?? 0;
+}
+
+function beginHealthTokenOperation(
+  tokenFile: string,
+  expectedGeneration: number,
+): { controller: AbortController; finish: () => void } {
+  if (healthTokenGeneration(tokenFile) !== expectedGeneration) {
+    throw new HealthOAuthError(409, "Health credential was disconnected.");
+  }
+  const controller = new AbortController();
+  const controllers = healthTokenControllers.get(tokenFile) ?? new Set();
+  controllers.add(controller);
+  healthTokenControllers.set(tokenFile, controllers);
+  return {
+    controller,
+    finish: () => {
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        healthTokenControllers.get(tokenFile) === controllers
+      ) {
+        healthTokenControllers.delete(tokenFile);
+      }
+    },
+  };
+}
+
+function assertHealthTokenGeneration(
+  tokenFile: string,
+  expectedGeneration: number,
+): void {
+  if (healthTokenGeneration(tokenFile) !== expectedGeneration) {
+    throw new HealthOAuthError(409, "Health credential was disconnected.");
+  }
+}
+
+function invalidateHealthToken(tokenFile: string): void {
+  healthTokenGenerations.set(tokenFile, healthTokenGeneration(tokenFile) + 1);
+  for (const controller of healthTokenControllers.get(tokenFile) ?? []) {
+    controller.abort();
+  }
+  healthTokenControllers.delete(tokenFile);
+}
+
+/** Cancels OAuth callbacks that could otherwise mint tokens after agent stop. */
+export function clearPendingHealthOAuthSessionsForAgent(
+  agentId: string,
+): number {
+  healthOAuthAgentGenerations.set(agentId, healthOAuthGeneration(agentId) + 1);
+  for (const controller of healthOAuthAgentControllers.get(agentId) ?? []) {
+    controller.abort();
+  }
+  healthOAuthAgentControllers.delete(agentId);
+  let removed = 0;
+  for (const [state, session] of pendingHealthOAuthSessions) {
+    if (session.agentId !== agentId) continue;
+    pendingHealthOAuthSessions.delete(state);
+    removed += 1;
+  }
+  return removed;
+}
 
 export class HealthOAuthError extends Error {
   constructor(
@@ -95,6 +207,7 @@ interface PendingHealthOAuthSession {
   codeVerifier: string | null;
   requestedCapabilities: LifeOpsHealthConnectorCapability[];
   createdAt: number;
+  generation: number;
 }
 
 interface HealthTokenResponse {
@@ -337,7 +450,19 @@ function tokenStorageRoot(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 function tokenPath(tokenRef: string, env: NodeJS.ProcessEnv): string {
-  return path.join(tokenStorageRoot(env), tokenRef);
+  const root = path.resolve(tokenStorageRoot(env));
+  const candidate = path.resolve(root, tokenRef);
+  if (candidate === root || !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new ElizaError(
+      "Health token reference is outside the credential store.",
+      {
+        code: "HEALTH_TOKEN_REFERENCE_UNSAFE",
+        context: { tokenRef },
+        severity: "fatal",
+      },
+    );
+  }
+  return candidate;
 }
 
 function writeStoredHealthToken(
@@ -385,12 +510,15 @@ export function deleteStoredHealthToken(
   if (!tokenRef) {
     return;
   }
-  fs.rmSync(tokenPath(tokenRef, env), { force: true });
+  const filePath = tokenPath(tokenRef, env);
+  invalidateHealthToken(filePath);
+  fs.rmSync(filePath, { force: true });
 }
 
 async function exchangeToken(
   session: PendingHealthOAuthSession,
   code: string,
+  signal: AbortSignal,
 ): Promise<HealthTokenResponse> {
   const oauth = providerSpec(session.provider).oauth;
   const body = new URLSearchParams({
@@ -423,7 +551,7 @@ async function exchangeToken(
         : {}),
     },
     body,
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
   });
   const json = (await response.json()) as HealthTokenApiResponse;
   if (!response.ok) {
@@ -448,57 +576,80 @@ export async function refreshStoredHealthToken(
   ) {
     return token;
   }
-  const oauth = providerSpec(token.provider).oauth;
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: token.refreshToken,
-  });
-  if (oauth.tokenRequestStyle === "withings") {
-    body.set("action", "requesttoken");
-    body.set("client_id", token.clientId);
-    if (token.clientSecret) body.set("client_secret", token.clientSecret);
-  } else if (oauth.tokenRequestStyle !== "basic") {
-    body.set("client_id", token.clientId);
-    if (token.clientSecret) body.set("client_secret", token.clientSecret);
+  const resolvedTokenRef = tokenRef ?? tokenRefFor(token);
+  const tokenFile = tokenPath(resolvedTokenRef, process.env);
+  const generation = healthOAuthGeneration(token.agentId);
+  const tokenGeneration = healthTokenGeneration(tokenFile);
+  const operation = beginHealthOAuthOperation(token.agentId, generation);
+  const tokenOperation = beginHealthTokenOperation(tokenFile, tokenGeneration);
+  try {
+    const oauth = providerSpec(token.provider).oauth;
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: token.refreshToken,
+    });
+    if (oauth.tokenRequestStyle === "withings") {
+      body.set("action", "requesttoken");
+      body.set("client_id", token.clientId);
+      if (token.clientSecret) body.set("client_secret", token.clientSecret);
+    } else if (oauth.tokenRequestStyle !== "basic") {
+      body.set("client_id", token.clientId);
+      if (token.clientSecret) body.set("client_secret", token.clientSecret);
+    }
+    const response = await fetch(oauth.tokenUrl, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(oauth.tokenRequestStyle === "basic" && token.clientSecret
+          ? {
+              Authorization: `Basic ${Buffer.from(
+                `${token.clientId}:${token.clientSecret}`,
+              ).toString("base64")}`,
+            }
+          : {}),
+      },
+      body,
+      signal: AbortSignal.any([
+        operation.controller.signal,
+        tokenOperation.controller.signal,
+        AbortSignal.timeout(15_000),
+      ]),
+    });
+    if (!response.ok) {
+      throw new HealthOAuthError(
+        response.status,
+        `${token.provider} token refresh failed`,
+      );
+    }
+    const json = (await response.json()) as HealthTokenApiResponse;
+    const payload = unwrapHealthTokenResponse(json, token.provider);
+    if (!payload.access_token) {
+      throw new HealthOAuthError(502, `${token.provider} token refresh failed`);
+    }
+    const next: StoredHealthConnectorToken = {
+      ...token,
+      accessToken: payload.access_token,
+      refreshToken: payload.refresh_token ?? token.refreshToken,
+      tokenType: payload.token_type ?? token.tokenType,
+      grantedScopes: parseGrantedScopes(token.provider, payload.scope),
+      expiresAt: tokenExpiresAt(payload),
+      updatedAt: new Date().toISOString(),
+    };
+    assertHealthOAuthGeneration(token.agentId, generation);
+    assertHealthTokenGeneration(tokenFile, tokenGeneration);
+    writeStoredHealthToken(resolvedTokenRef, next);
+    return next;
+  } catch (error) {
+    // error-policy:J1 the refresh boundary translates reset/disconnect aborts
+    // into a stable credential lifecycle error before anything is persisted.
+    assertHealthOAuthGeneration(token.agentId, generation);
+    assertHealthTokenGeneration(tokenFile, tokenGeneration);
+    throw error;
+  } finally {
+    tokenOperation.finish();
+    operation.finish();
   }
-  const response = await fetch(oauth.tokenUrl, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-      ...(oauth.tokenRequestStyle === "basic" && token.clientSecret
-        ? {
-            Authorization: `Basic ${Buffer.from(
-              `${token.clientId}:${token.clientSecret}`,
-            ).toString("base64")}`,
-          }
-        : {}),
-    },
-    body,
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
-    throw new HealthOAuthError(
-      response.status,
-      `${token.provider} token refresh failed`,
-    );
-  }
-  const json = (await response.json()) as HealthTokenApiResponse;
-  const payload = unwrapHealthTokenResponse(json, token.provider);
-  if (!payload.access_token) {
-    throw new HealthOAuthError(502, `${token.provider} token refresh failed`);
-  }
-  const next: StoredHealthConnectorToken = {
-    ...token,
-    accessToken: payload.access_token,
-    refreshToken: payload.refresh_token ?? token.refreshToken,
-    tokenType: payload.token_type ?? token.tokenType,
-    grantedScopes: parseGrantedScopes(token.provider, payload.scope),
-    expiresAt: tokenExpiresAt(payload),
-    updatedAt: new Date().toISOString(),
-  };
-  writeStoredHealthToken(tokenRef ?? tokenRefFor(token), next);
-  return next;
 }
 
 export function startHealthConnectorOAuth(args: {
@@ -535,6 +686,7 @@ export function startHealthConnectorOAuth(args: {
         ? [...new Set(args.capabilities)]
         : healthConnectorCapabilities(args.provider),
     createdAt: Date.now(),
+    generation: healthOAuthGeneration(args.agentId),
   });
 
   const authUrl = new URL(oauth.authorizeUrl);
@@ -593,54 +745,74 @@ export async function completeHealthConnectorOAuth(
     throw new HealthOAuthError(400, "Missing health OAuth authorization code.");
   }
 
-  const payload = await exchangeToken(session, code);
-  if (!payload.access_token) {
-    throw new HealthOAuthError(
-      502,
-      `${session.provider} token response missing access token.`,
+  const operation = beginHealthOAuthOperation(
+    session.agentId,
+    session.generation,
+  );
+  try {
+    const payload = await exchangeToken(
+      session,
+      code,
+      operation.controller.signal,
     );
+    if (!payload.access_token) {
+      throw new HealthOAuthError(
+        502,
+        `${session.provider} token response missing access token.`,
+      );
+    }
+    const scopes = parseGrantedScopes(session.provider, payload.scope);
+    const identity =
+      session.provider === "strava" && payload.athlete
+        ? payload.athlete
+        : {
+            userId:
+              payload.user_id ??
+              payload.userid ??
+              callbackUrl.searchParams.get("userid") ??
+              null,
+          };
+    const nowIso = new Date().toISOString();
+    const tokenRef = tokenRefFor(session);
+    const token: StoredHealthConnectorToken = {
+      provider: session.provider,
+      agentId: session.agentId,
+      side: session.side,
+      mode: session.mode,
+      clientId: session.clientId,
+      clientSecret: session.clientSecret,
+      redirectUri: session.redirectUri,
+      accessToken: payload.access_token,
+      refreshToken: payload.refresh_token ?? null,
+      tokenType: payload.token_type ?? "Bearer",
+      grantedScopes: scopes,
+      expiresAt: tokenExpiresAt(payload),
+      identity,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    assertHealthOAuthGeneration(session.agentId, session.generation);
+    writeStoredHealthToken(tokenRef, token);
+    return {
+      agentId: session.agentId,
+      provider: session.provider,
+      side: session.side,
+      mode: session.mode,
+      tokenRef,
+      identity,
+      grantedCapabilities: healthScopesToCapabilities(session.provider, scopes),
+      grantedScopes: scopes,
+      expiresAt: token.expiresAt
+        ? new Date(token.expiresAt).toISOString()
+        : null,
+      hasRefreshToken: Boolean(token.refreshToken),
+    };
+  } catch (error) {
+    // error-policy:J1 the callback boundary translates an agent-reset abort
+    // before the provider response can mint a post-disposal credential.
+    assertHealthOAuthGeneration(session.agentId, session.generation);
+    throw error;
+  } finally {
+    operation.finish();
   }
-  const scopes = parseGrantedScopes(session.provider, payload.scope);
-  const identity =
-    session.provider === "strava" && payload.athlete
-      ? payload.athlete
-      : {
-          userId:
-            payload.user_id ??
-            payload.userid ??
-            callbackUrl.searchParams.get("userid") ??
-            null,
-        };
-  const nowIso = new Date().toISOString();
-  const tokenRef = tokenRefFor(session);
-  const token: StoredHealthConnectorToken = {
-    provider: session.provider,
-    agentId: session.agentId,
-    side: session.side,
-    mode: session.mode,
-    clientId: session.clientId,
-    clientSecret: session.clientSecret,
-    redirectUri: session.redirectUri,
-    accessToken: payload.access_token,
-    refreshToken: payload.refresh_token ?? null,
-    tokenType: payload.token_type ?? "Bearer",
-    grantedScopes: scopes,
-    expiresAt: tokenExpiresAt(payload),
-    identity,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  };
-  writeStoredHealthToken(tokenRef, token);
-  return {
-    agentId: session.agentId,
-    provider: session.provider,
-    side: session.side,
-    mode: session.mode,
-    tokenRef,
-    identity,
-    grantedCapabilities: healthScopesToCapabilities(session.provider, scopes),
-    grantedScopes: scopes,
-    expiresAt: token.expiresAt ? new Date(token.expiresAt).toISOString() : null,
-    hasRefreshToken: Boolean(token.refreshToken),
-  };
 }

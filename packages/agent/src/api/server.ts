@@ -24,8 +24,10 @@ const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
 const MAX_BACKUP_BODY_BYTES = 128 * 1024 * 1024; // 128 MB
 
 import path from "node:path";
+import { runWithAccountAuthGeneration } from "@elizaos/auth/account-storage";
 import {
   type AgentRuntime,
+  ElizaError,
   EventType,
   type IAgentRuntime,
   type IScreenCaptureService,
@@ -330,6 +332,8 @@ import {
   getDefaultHealthChecker,
   getDefaultRepository,
   type RuntimeOperationManager,
+  resetDefaultRepositoryForAgentReset,
+  resetDefaultSecretsManagerForAgentReset,
 } from "../runtime/operations/index.ts";
 import { classifyRegistryPluginRelease } from "../runtime/release-plugin-policy.ts";
 import {
@@ -386,10 +390,12 @@ import {
   normalizeTriggerDraft,
 } from "../triggers/scheduling.ts";
 import { resolveAbsentPluginRouteStub } from "./absent-plugin-route-stubs.ts";
+import { resetAccountsRoutesPoolCacheForAgentReset } from "./accounts-routes.ts";
 import { detectRuntimeModel, resolveProviderFromModel } from "./agent-model.ts";
 import { persistConfigEnv } from "./config-env.ts";
 import { restoreConversationsFromDb as restoreConversationsFromDbImpl } from "./conversation-restore.ts";
 import { wireCoordinatorBridgesWhenReady } from "./coordinator-wiring.ts";
+import { requestMayMutateCredentialState } from "./credential-mutation-request.ts";
 import { createDeliveryDedupeState } from "./delivery-dedupe.ts";
 import { computeCanRespond } from "./health-routes.ts";
 import {
@@ -1623,6 +1629,14 @@ function getOrCreateRuntimeOperationManager(
   return cachedRuntimeOperationManager;
 }
 
+/** Invalidates runtime-operation and route facades after destructive reset. */
+export function resetRuntimeOperationStateForAgentReset(): void {
+  cachedRuntimeOperationManager = null;
+  resetDefaultRepositoryForAgentReset();
+  resetDefaultSecretsManagerForAgentReset();
+  resetAccountsRoutesPoolCacheForAgentReset();
+}
+
 import {
   attachPtySessionWsBridge,
   cancelPendingPtySessionStop,
@@ -2444,6 +2458,7 @@ async function handleRequest(
       removeStateDir: (resolvedState) => {
         fs.rmSync(resolvedState, { recursive: true, force: true });
       },
+      resetRuntimeOperationStateForAgentReset,
       logWarn: (message) => logger.warn(message),
     })
   ) {
@@ -4099,23 +4114,54 @@ export async function startApiServer(opts?: {
   apiLap("pre-createServer (route imports + middleware setup done)");
   const server = http.createServer(async (req, res) => {
     try {
-      await handleRequest(req, res, state, {
-        onRestart,
-        onRuntimeSwapped: () => {
-          bindRuntimeStreams(state.runtime);
-          wireModelRegistrationBroadcast(state.runtime);
-          void wireCoordinatorBridgesWhenReady(state, {
-            wireChatBridge: wireCodingAgentChatBridge,
-            wireWsBridge: wireCodingAgentWsBridge,
-            wireEventRouting: wireCoordinatorEventRouting,
-            wireSwarmSynthesis: wireCodingAgentSwarmSynthesis,
-            context: "restart",
-            logger,
-          });
-        },
-        getAppManager: ensureAppManager,
-      });
+      const dispatch = () =>
+        runWithAccountAuthGeneration(() =>
+          handleRequest(req, res, state, {
+            onRestart,
+            onRuntimeSwapped: () => {
+              bindRuntimeStreams(state.runtime);
+              wireModelRegistrationBroadcast(state.runtime);
+              void wireCoordinatorBridgesWhenReady(state, {
+                wireChatBridge: wireCodingAgentChatBridge,
+                wireWsBridge: wireCodingAgentWsBridge,
+                wireEventRouting: wireCoordinatorEventRouting,
+                wireSwarmSynthesis: wireCodingAgentSwarmSynthesis,
+                context: "restart",
+                logger,
+              });
+            },
+            getAppManager: ensureAppManager,
+          }),
+        );
+      const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      if (requestMayMutateCredentialState(req.method, pathname)) {
+        await getAgentHostBridge().withCredentialStateMutation(async () => {
+          await dispatch();
+          if (!res.writableFinished && !res.destroyed) {
+            await new Promise<void>((resolve) => {
+              const done = () => {
+                res.off("finish", done);
+                res.off("close", done);
+                resolve();
+              };
+              res.once("finish", done);
+              res.once("close", done);
+            });
+          }
+        });
+      } else {
+        await dispatch();
+      }
     } catch (err) {
+      if (
+        err instanceof ElizaError &&
+        err.code === "CREDENTIAL_RESET_IN_PROGRESS" &&
+        !res.headersSent
+      ) {
+        res.setHeader("Retry-After", "1");
+        error(res, "agent_reset_in_progress", 503);
+        return;
+      }
       const msg = err instanceof Error ? err.message : "internal error";
       logger.error({ err }, `[eliza-api] Request handler failed: ${msg}`);
       addLog("error", msg, "api", ["server", "api"]);

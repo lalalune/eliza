@@ -238,6 +238,9 @@ export class ClientBase {
   requestQueue: RequestQueue = new RequestQueue();
 
   profile: TwitterProfile | null = null;
+  private readonly abortController = new AbortController();
+  private stopped = false;
+  private stopPromise?: Promise<void>;
 
   /**
    * Caches a tweet in the database.
@@ -320,6 +323,52 @@ export class ClientBase {
     this.twitterClient = new Client();
   }
 
+  async stop(): Promise<void> {
+    if (this.stopPromise) return await this.stopPromise;
+
+    this.stopped = true;
+    this.abortController.abort(this.lifecycleError());
+    this.stopPromise = (async () => {
+      try {
+        await this.twitterClient.logout();
+      } finally {
+        this.profile = null;
+      }
+    })();
+    return await this.stopPromise;
+  }
+
+  private lifecycleError(): Error {
+    const error = new Error(
+      `X client is stopped (accountId=${this.accountId})`,
+    );
+    error.name = "AbortError";
+    return error;
+  }
+
+  private assertActive(): void {
+    if (this.stopped || this.abortController.signal.aborted) {
+      throw this.lifecycleError();
+    }
+  }
+
+  private async waitForRetry(delayMs: number): Promise<void> {
+    this.assertActive();
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(this.lifecycleError());
+      };
+      const timer = setTimeout(() => {
+        this.abortController.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+      this.abortController.signal.addEventListener("abort", onAbort, {
+        once: true,
+      });
+    });
+  }
+
   private requireProfile(): TwitterProfile {
     if (!this.profile) {
       throw new Error("Twitter profile has not been initialized");
@@ -340,10 +389,12 @@ export class ClientBase {
   }
 
   async init() {
+    this.assertActive();
     this.state = await resolveTwitterAccountConfig(this.runtime, {
       accountId: this.accountId,
       state: this.state,
     });
+    this.assertActive();
     this.accountId = resolveRequestedXAccountId(
       this.runtime,
       this.state,
@@ -363,8 +414,10 @@ export class ClientBase {
           `Initializing Twitter API v2 client for accountId=${this.accountId}`,
         );
         await this.twitterClient.authenticate(provider);
+        this.assertActive();
 
         if (await this.twitterClient.isLoggedIn()) {
+          this.assertActive();
           logger.info(
             `Successfully authenticated with Twitter API v2 for accountId=${this.accountId}`,
           );
@@ -376,6 +429,7 @@ export class ClientBase {
           );
         }
       } catch (error) {
+        this.assertActive();
         lastError = error instanceof Error ? error : new Error(String(error));
         logger.error(
           `Authentication attempt ${retryCount + 1} failed: ${lastError.message}`,
@@ -385,7 +439,7 @@ export class ClientBase {
         if (retryCount < maxRetries) {
           const delay = 2 ** retryCount * 1000; // Exponential backoff
           logger.info(`Retrying in ${delay / 1000} seconds...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          await this.waitForRetry(delay);
         }
       }
     }

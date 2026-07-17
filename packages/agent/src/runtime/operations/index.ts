@@ -29,15 +29,16 @@ export { createHotStrategy, type HotStrategyDeps } from "./reload-hot.ts";
 export {
   FilesystemRuntimeOperationRepository,
   getDefaultRepository,
+  resetDefaultRepositoryForAgentReset,
 } from "./repository.ts";
 export * from "./types.ts";
 export {
-  _resetDefaultSecretsManagerForTesting,
   defaultSecretsManager,
   formatVaultRef,
   isVaultRef,
   parseVaultRef,
   persistProviderApiKey,
+  resetDefaultSecretsManagerForAgentReset,
   resolveConfigEnvForProcess,
   resolveProviderApiKey,
   type VaultLike,

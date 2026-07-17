@@ -157,6 +157,11 @@ type PendingRpcRequest = {
   reject: (error: Error) => void;
 };
 
+type DiscordLocalAuthOperation = {
+  generation: number;
+  signal: AbortSignal;
+};
+
 function parseListSetting(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value
@@ -388,6 +393,8 @@ export class DiscordLocalService extends Service {
 
   private readonly sessionPath = resolveSessionPath();
   private readonly pendingRequests = new Map<string, PendingRpcRequest>();
+  private readonly activeAuthOperations = new Set<Promise<unknown>>();
+  private readonly activeAuthControllers = new Set<AbortController>();
   private readonly channelCache = new Map<string, DiscordLocalChannel>();
   private readonly guildCache = new Map<string, DiscordLocalGuild>();
   private readonly subscribedChannelIds = new Set<string>();
@@ -404,6 +411,9 @@ export class DiscordLocalService extends Service {
   private connected = false;
   private authenticated = false;
   private lastError: string | null = null;
+  private authGeneration = 0;
+  private acceptsAuthOperations = true;
+  private stopped = false;
 
   constructor(runtime?: IAgentRuntime) {
     super(runtime);
@@ -475,6 +485,17 @@ export class DiscordLocalService extends Service {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    const authOperations = this.beginAuthQuiescence();
+    this.closeRpcConnection();
+    // error-policy:J5 The originating setup/data route or restore task observes each rejection; teardown only drains it.
+    await Promise.allSettled(authOperations);
+    this.session = null;
+    this.currentUser = null;
+    this.subscribedChannelIds.clear();
+  }
+
+  private closeRpcConnection(): void {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -482,9 +503,15 @@ export class DiscordLocalService extends Service {
     this.connected = false;
     this.authenticated = false;
     this.connectedIpcPath = null;
-    this.rejectPendingRequests(new Error("Discord local service stopped"));
-    this.socket?.destroy();
+    const stoppedError = new Error("Discord local service stopped");
+    this.rejectPendingRequests(stoppedError);
+    this.readyReject?.(stoppedError);
+    this.readyReject = null;
+    this.readyResolve = null;
+    this.readyPromise = null;
+    const socket = this.socket;
     this.socket = null;
+    socket?.destroy();
   }
 
   isConnected(): boolean {
@@ -532,12 +559,21 @@ export class DiscordLocalService extends Service {
   }
 
   async disconnectSession(): Promise<void> {
-    this.session = null;
-    this.currentUser = null;
-    this.authenticated = false;
-    this.subscribedChannelIds.clear();
-    await fsp.rm(this.sessionPath, { force: true });
-    await this.stop();
+    const authOperations = this.beginAuthQuiescence();
+    this.closeRpcConnection();
+    try {
+      // error-policy:J5 The originating setup/data route observes each rejection; disconnect only drains it.
+      await Promise.allSettled(authOperations);
+      this.session = null;
+      this.currentUser = null;
+      this.authenticated = false;
+      this.subscribedChannelIds.clear();
+      await fsp.rm(this.sessionPath, { force: true });
+    } finally {
+      // Cancel disconnects the current account but leaves the service ready
+      // for a deliberate authorization attempt from the setup UI.
+      this.acceptsAuthOperations = !this.stopped;
+    }
   }
 
   async listGuilds(): Promise<DiscordLocalGuild[]> {
@@ -639,6 +675,7 @@ export class DiscordLocalService extends Service {
   }
 
   private async ensureAuthenticated(): Promise<void> {
+    this.assertAuthOperationsAccepted();
     this.requireConfig();
     if (!this.session) {
       throw new Error("Discord local connector is not authorized");
@@ -687,55 +724,64 @@ export class DiscordLocalService extends Service {
   }
 
   private async exchangeAuthorizationCode(code: string): Promise<void> {
-    const config = this.requireConfig();
-    const body = new URLSearchParams({
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      grant_type: "authorization_code",
-      code,
-    });
+    await this.runAuthOperation(async (operation) => {
+      const config = this.requireConfig();
+      const body = new URLSearchParams({
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        grant_type: "authorization_code",
+        code,
+      });
 
-    const response = await fetch(DISCORD_OAUTH_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
+      const response = await fetch(DISCORD_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+        signal: operation.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Discord OAuth token exchange failed with ${response.status}`);
+      }
+      const json = (await response.json()) as Record<string, unknown>;
+      await this.storeTokenResponse(json, operation);
+      this.authenticated = false;
+      await this.ensureAuthenticated();
     });
-    if (!response.ok) {
-      throw new Error(`Discord OAuth token exchange failed with ${response.status}`);
-    }
-    const json = (await response.json()) as Record<string, unknown>;
-    await this.storeTokenResponse(json);
-    this.authenticated = false;
-    await this.ensureAuthenticated();
   }
 
   private async refreshAccessToken(): Promise<void> {
-    const config = this.requireConfig();
-    if (!this.session?.refreshToken) {
-      throw new Error("Discord local session cannot be refreshed");
-    }
+    await this.runAuthOperation(async (operation) => {
+      const config = this.requireConfig();
+      if (!this.session?.refreshToken) {
+        throw new Error("Discord local session cannot be refreshed");
+      }
 
-    const body = new URLSearchParams({
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: this.session.refreshToken,
-    });
+      const body = new URLSearchParams({
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        grant_type: "refresh_token",
+        refresh_token: this.session.refreshToken,
+      });
 
-    const response = await fetch(DISCORD_OAUTH_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
+      const response = await fetch(DISCORD_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+        signal: operation.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Discord OAuth refresh failed with ${response.status}`);
+      }
+      const json = (await response.json()) as Record<string, unknown>;
+      await this.storeTokenResponse(json, operation);
+      this.authenticated = false;
     });
-    if (!response.ok) {
-      throw new Error(`Discord OAuth refresh failed with ${response.status}`);
-    }
-    const json = (await response.json()) as Record<string, unknown>;
-    await this.storeTokenResponse(json);
-    this.authenticated = false;
   }
 
-  private async storeTokenResponse(json: Record<string, unknown>): Promise<void> {
+  private async storeTokenResponse(
+    json: Record<string, unknown>,
+    operation: DiscordLocalAuthOperation
+  ): Promise<void> {
     const accessToken = typeof json.access_token === "string" ? json.access_token : "";
     if (!accessToken) {
       throw new Error("Discord OAuth token response is missing access_token");
@@ -751,7 +797,7 @@ export class DiscordLocalService extends Service {
     const scopeString =
       typeof json.scope === "string" ? json.scope : (this.connectorConfig?.scopes.join(" ") ?? "");
 
-    this.session = {
+    const nextSession: DiscordLocalSession = {
       accessToken,
       refreshToken,
       expiresAt:
@@ -761,7 +807,60 @@ export class DiscordLocalService extends Service {
         .map((entry) => entry.trim())
         .filter(Boolean),
     };
-    await fsp.writeFile(this.sessionPath, JSON.stringify(this.session, null, 2), "utf8");
+    this.assertAuthOperationCurrent(operation);
+    this.session = nextSession;
+    await fsp.writeFile(this.sessionPath, JSON.stringify(nextSession, null, 2), {
+      encoding: "utf8",
+      signal: operation.signal,
+    });
+  }
+
+  private runAuthOperation<T>(
+    operation: (context: DiscordLocalAuthOperation) => Promise<T>
+  ): Promise<T> {
+    this.assertAuthOperationsAccepted();
+    const controller = new AbortController();
+    const context = {
+      generation: this.authGeneration,
+      signal: controller.signal,
+    };
+    this.activeAuthControllers.add(controller);
+    const activeOperation = Promise.resolve().then(() => {
+      this.assertAuthOperationCurrent(context);
+      return operation(context);
+    });
+    this.activeAuthOperations.add(activeOperation);
+    const removeOperation = () => {
+      this.activeAuthOperations.delete(activeOperation);
+      this.activeAuthControllers.delete(controller);
+    };
+    void activeOperation.then(removeOperation, removeOperation);
+    return activeOperation;
+  }
+
+  private beginAuthQuiescence(): Promise<unknown>[] {
+    this.acceptsAuthOperations = false;
+    this.authGeneration += 1;
+    for (const controller of this.activeAuthControllers) {
+      controller.abort();
+    }
+    return [...this.activeAuthOperations];
+  }
+
+  private assertAuthOperationsAccepted(): void {
+    if (!this.acceptsAuthOperations) {
+      throw new Error("Discord local service is stopped");
+    }
+  }
+
+  private assertAuthOperationCurrent(operation: DiscordLocalAuthOperation): void {
+    if (
+      operation.signal.aborted ||
+      operation.generation !== this.authGeneration ||
+      !this.acceptsAuthOperations
+    ) {
+      throw new Error("Discord local authentication was stopped");
+    }
   }
 
   private async loadSession(): Promise<DiscordLocalSession | null> {
@@ -784,6 +883,7 @@ export class DiscordLocalService extends Service {
   }
 
   private async ensureRpcConnection(): Promise<void> {
+    this.assertAuthOperationsAccepted();
     const config = this.requireConfig();
     if (this.connected && this.socket && !this.socket.destroyed) {
       return;
@@ -829,7 +929,7 @@ export class DiscordLocalService extends Service {
       this.readyReject = null;
       this.readyResolve = null;
       this.readyPromise = null;
-      if (this.session?.accessToken) {
+      if (this.acceptsAuthOperations && this.session?.accessToken) {
         this.scheduleReconnect();
       }
     });
@@ -848,11 +948,17 @@ export class DiscordLocalService extends Service {
   }
 
   private scheduleReconnect(): void {
+    if (!this.acceptsAuthOperations) {
+      return;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
     }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      if (!this.acceptsAuthOperations) {
+        return;
+      }
       void this.ensureAuthenticated().catch((error) => {
         this.lastError = error instanceof Error ? error.message : String(error);
       });
@@ -1525,6 +1631,10 @@ const discordLocalPlugin: Plugin = {
   ],
   services: [DiscordLocalService],
   routes: discordLocalSetupRoutes,
+  async dispose(runtime: IAgentRuntime) {
+    const service = runtime.getService<DiscordLocalService>(DISCORD_LOCAL_SERVICE_NAME);
+    await service?.stop();
+  },
 };
 
 export default discordLocalPlugin;

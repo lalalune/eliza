@@ -7,7 +7,11 @@
 import { getConnectorAccountManager, type IAgentRuntime, logger, type Plugin } from "@elizaos/core";
 import { createWhatsAppConnectorAccountProvider } from "./connector-account-provider";
 import { WhatsAppConnectorService } from "./runtime-service";
-import { whatsappSetupRoutes } from "./setup-routes";
+import {
+  enableWhatsAppPairingSessions,
+  stopAllPairingSessions,
+  whatsappSetupRoutes,
+} from "./setup-routes";
 import { registerWhatsappTriageAdapter } from "./triage-adapter";
 import { WhatsAppWorkflowCredentialProvider } from "./workflow-credential-provider";
 
@@ -32,6 +36,7 @@ const whatsappPlugin: Plugin = {
     connectorKeys: ["whatsapp"],
   },
   init: async (_config: Record<string, string>, runtime: IAgentRuntime) => {
+    enableWhatsAppPairingSessions();
     // Register the WhatsApp provider with the ConnectorAccountManager so the
     // HTTP CRUD surface (packages/agent/src/api/connector-account-routes.ts)
     // can list, create, patch, and delete WhatsApp accounts.
@@ -52,8 +57,23 @@ const whatsappPlugin: Plugin = {
     registerWhatsappTriageAdapter();
   },
   async dispose(runtime: IAgentRuntime) {
+    const errors: Error[] = [];
+    try {
+      await stopAllPairingSessions();
+    } catch (error) {
+      // error-policy:J6 Service teardown still runs before disposal reports every failure.
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
     const svc = runtime.getService<WhatsAppConnectorService>(WhatsAppConnectorService.serviceType);
-    await svc?.stop();
+    try {
+      await svc?.stop();
+    } catch (error) {
+      // error-policy:J6 Disposal aggregates service failure with pairing-session teardown failure.
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Failed to dispose WhatsApp plugin");
+    }
   },
 };
 

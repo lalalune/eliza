@@ -65,6 +65,61 @@ export interface SubscriptionRouteContext extends RouteRequestContext {
 // so retain the live flow in this process-level module across runtime swaps.
 let activeCodexFlow: CodexFlow | undefined;
 let activeCodexFlowTimer: ReturnType<typeof setTimeout> | undefined;
+const subscriptionRouteStates = new Set<SubscriptionRouteState>();
+
+function forgetSubscriptionRouteStateIfIdle(
+  state: SubscriptionRouteState,
+): void {
+  if (!state._anthropicFlow && !state._codexFlow) {
+    subscriptionRouteStates.delete(state);
+  }
+}
+
+/** Cancels legacy subscription flows and clears their PKCE/session state. */
+export function resetSubscriptionOAuthStateForAgentReset(): void {
+  const errors: unknown[] = [];
+  const codexFlows = new Set<CodexFlow>();
+  for (const state of subscriptionRouteStates) {
+    if (state._anthropicFlow) {
+      // error-policy:J5 cancellation intentionally rejects the credentials
+      // promise; this handler observes that expected rejection during reset.
+      void state._anthropicFlow.credentials.catch((error) => {
+        logger.debug(
+          `[api] Anthropic OAuth reset cancellation: ${String(error)}`,
+        );
+      });
+      try {
+        state._anthropicFlow.cancel("Agent reset");
+      } catch (error) {
+        errors.push(error);
+      } finally {
+        delete state._anthropicFlow;
+      }
+    }
+    if (state._codexFlow) codexFlows.add(state._codexFlow);
+    delete state._codexFlow;
+    clearTimeout(state._codexFlowTimer);
+    delete state._codexFlowTimer;
+  }
+  subscriptionRouteStates.clear();
+  if (activeCodexFlow) codexFlows.add(activeCodexFlow);
+  activeCodexFlow = undefined;
+  clearTimeout(activeCodexFlowTimer);
+  activeCodexFlowTimer = undefined;
+  for (const flow of codexFlows) {
+    try {
+      flow.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      "OAuth flows could not all close for reset",
+    );
+  }
+}
 
 export async function handleSubscriptionRoutes(
   ctx: SubscriptionRouteContext,
@@ -81,7 +136,6 @@ export async function handleSubscriptionRoutes(
     loadSubscriptionAuth,
   } = ctx;
   if (!pathname.startsWith("/api/subscription/")) return false;
-
   if (method === "GET" && pathname === "/api/subscription/status") {
     try {
       const { getSubscriptionStatus } = await loadSubscriptionAuth();
@@ -124,6 +178,7 @@ export async function handleSubscriptionRoutes(
       const { startAnthropicLogin } = await loadSubscriptionAuth();
       const flow = await startAnthropicLogin();
       state._anthropicFlow = flow;
+      subscriptionRouteStates.add(state);
       json(res, { authUrl: flow.authUrl });
     } catch (err) {
       logger.error(`[api] Failed to start Anthropic login: ${String(err)}`);
@@ -157,9 +212,13 @@ export async function handleSubscriptionRoutes(
         fetchAnthropicOAuthProfile,
       } = await loadSubscriptionAuth();
       const flow = state._anthropicFlow;
-      const credentials = flow
-        ? (flow.submitCode(body.code), await flow.credentials)
-        : await exchangeAnthropicAuthorizationCode(body.code);
+      let credentials: OAuthCredentials;
+      if (flow) {
+        flow.submitCode(body.code);
+        credentials = await flow.credentials;
+      } else {
+        credentials = await exchangeAnthropicAuthorizationCode(body.code);
+      }
       const profile = await fetchAnthropicOAuthProfile(credentials.access);
       const accountId = profile.accountId ?? crypto.randomUUID();
       saveCredentials("anthropic-subscription", credentials, accountId);
@@ -204,9 +263,11 @@ export async function handleSubscriptionRoutes(
       });
       await applySubscriptionCredentials(state.config);
       delete state._anthropicFlow;
+      forgetSubscriptionRouteStateIfIdle(state);
       json(res, { success: true, expiresAt: credentials.expires });
     } catch (err) {
       delete state._anthropicFlow;
+      forgetSubscriptionRouteStateIfIdle(state);
       logger.error(`[api] Anthropic exchange failed: ${String(err)}`);
       error(res, "Anthropic exchange failed", 500);
     }
@@ -270,6 +331,7 @@ export async function handleSubscriptionRoutes(
 
       const flow = await startCodexLogin();
       state._codexFlow = flow;
+      subscriptionRouteStates.add(state);
       activeCodexFlow = flow;
       state._codexFlowTimer = setTimeout(
         () => {
@@ -282,6 +344,7 @@ export async function handleSubscriptionRoutes(
           }
           delete state._codexFlow;
           delete state._codexFlowTimer;
+          forgetSubscriptionRouteStateIfIdle(state);
           if (activeCodexFlow === flow) activeCodexFlow = undefined;
           activeCodexFlowTimer = undefined;
         },
@@ -369,6 +432,7 @@ export async function handleSubscriptionRoutes(
         delete state._codexFlow;
         clearTimeout(state._codexFlowTimer);
         delete state._codexFlowTimer;
+        forgetSubscriptionRouteStateIfIdle(state);
         activeCodexFlow = undefined;
         clearTimeout(activeCodexFlowTimer);
         activeCodexFlowTimer = undefined;
@@ -382,6 +446,7 @@ export async function handleSubscriptionRoutes(
       delete state._codexFlow;
       clearTimeout(state._codexFlowTimer);
       delete state._codexFlowTimer;
+      forgetSubscriptionRouteStateIfIdle(state);
       activeCodexFlow = undefined;
       clearTimeout(activeCodexFlowTimer);
       activeCodexFlowTimer = undefined;

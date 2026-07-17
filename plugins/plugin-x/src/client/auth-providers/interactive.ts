@@ -15,13 +15,22 @@ export interface OAuthCallbackResult {
   state?: string;
 }
 
+function abortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("Twitter OAuth authorization was stopped");
+  error.name = "AbortError";
+  return error;
+}
+
 function canPrompt(): boolean {
   return !!process.stdin && !!process.stdout && process.stdin.isTTY === true;
 }
 
 export async function promptForRedirectedUrl(
   promptText: string,
+  signal?: AbortSignal,
 ): Promise<string> {
+  if (signal?.aborted) throw abortError(signal);
   if (!canPrompt()) {
     throw new Error(
       "Twitter OAuth requires interactive setup, but stdin is not a TTY. " +
@@ -34,11 +43,23 @@ export async function promptForRedirectedUrl(
     output: process.stdout,
   });
 
-  const question = (q: string) =>
-    new Promise<string>((resolve) => rl.question(q, resolve));
-
   try {
-    const answer = await question(promptText);
+    const answer = await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error, value?: string) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve(value ?? "");
+      };
+      const onAbort = () => {
+        finish(abortError(signal as AbortSignal));
+        rl.close();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      rl.question(promptText, (value) => finish(undefined, value));
+    });
     return answer.trim();
   } finally {
     rl.close();
@@ -49,7 +70,9 @@ export async function waitForLoopbackCallback(
   redirectUri: string,
   expectedState: string,
   timeoutMs = 5 * 60 * 1000,
+  signal?: AbortSignal,
 ): Promise<OAuthCallbackResult> {
+  if (signal?.aborted) throw abortError(signal);
   const url = new URL(redirectUri);
   if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
     throw new Error(
@@ -63,19 +86,22 @@ export async function waitForLoopbackCallback(
 
   return await new Promise<OAuthCallbackResult>((resolve, reject) => {
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
 
     const finish = (err?: Error, value?: OAuthCallbackResult) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (timer) clearTimeout(timer);
       if (err) reject(err);
       else if (value) resolve(value);
       else reject(new Error("OAuth callback finished without result"));
-      try {
+      if (server.listening) {
         server.close();
-      } catch {
-        // ignore
       }
     };
+
+    const onAbort = () => finish(abortError(signal as AbortSignal));
 
     const server = createServer((req, res) => {
       try {
@@ -124,11 +150,11 @@ export async function waitForLoopbackCallback(
       }
     });
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       finish(new Error("Timed out waiting for Twitter OAuth callback"));
     }, timeoutMs);
 
-    server.on("close", () => clearTimeout(timer));
+    signal?.addEventListener("abort", onAbort, { once: true });
     server.once("error", (err: NodeJS.ErrnoException) => {
       // EADDRINUSE / EACCES / etc. should fail fast instead of hanging until timeout.
       const code = err?.code ? ` (${err.code})` : "";
@@ -139,6 +165,10 @@ export async function waitForLoopbackCallback(
       );
     });
     server.listen(port, url.hostname, () => {
+      if (settled) {
+        server.close();
+        return;
+      }
       logger.info(
         `Twitter OAuth callback server listening on http://${url.hostname}:${port}${path}`,
       );

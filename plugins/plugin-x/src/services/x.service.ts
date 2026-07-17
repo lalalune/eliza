@@ -56,6 +56,16 @@ const X_CONNECTOR_CAPABILITIES = [
 const X_USER_ID_PATTERN = /^\d+$/;
 const X_MAX_POST_LENGTH = 280;
 
+class XTeardownError extends Error {
+  constructor(
+    message: string,
+    readonly errors: readonly unknown[],
+  ) {
+    super(message);
+    this.name = "XTeardownError";
+  }
+}
+
 export type XAccountCapability =
   | "x.read"
   | "x.write"
@@ -230,6 +240,7 @@ export class TwitterClientInstance implements ITwitterClient {
   timeline?: TwitterTimelineClient;
   discovery?: TwitterDiscoveryClient;
   readonly accountId: string;
+  private activeStop?: Promise<void>;
 
   constructor(runtime: IAgentRuntime, state: TwitterClientState) {
     this.accountId = resolveRequestedXAccountId(
@@ -302,6 +313,38 @@ export class TwitterClientInstance implements ITwitterClient {
       );
     }
   }
+
+  async stop(): Promise<void> {
+    if (this.activeStop) return await this.activeStop;
+
+    const stop = (async () => {
+      const teardown = [
+        this.client.stop(),
+        this.post?.stop(),
+        this.interaction?.stop(),
+        this.timeline?.stop(),
+        this.discovery?.stop(),
+      ].filter(
+        (operation): operation is Promise<void> => operation !== undefined,
+      );
+      const results = await Promise.allSettled(teardown);
+      const errors = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (errors.length > 0) {
+        throw new XTeardownError(
+          `Failed to stop X account ${this.accountId}`,
+          errors,
+        );
+      }
+    })();
+    this.activeStop = stop;
+    try {
+      await stop;
+    } finally {
+      if (this.activeStop === stop) this.activeStop = undefined;
+    }
+  }
 }
 
 export class XService extends Service {
@@ -317,6 +360,10 @@ export class XService extends Service {
     string,
     Promise<TwitterClientInstance>
   >();
+  private accountStartingClients = new Map<string, TwitterClientInstance>();
+  private lifecycleGeneration = 0;
+  private stopped = false;
+  private stopPromise?: Promise<void>;
 
   static async start(runtime: IAgentRuntime): Promise<XService> {
     const service = new XService();
@@ -365,6 +412,18 @@ export class XService extends Service {
     return normalizeXAccountId(this.defaultAccountId);
   }
 
+  private lifecycleError(): Error {
+    const error = new Error("X service is stopped");
+    error.name = "AbortError";
+    return error;
+  }
+
+  private assertActive(generation = this.lifecycleGeneration): void {
+    if (this.stopped || generation !== this.lifecycleGeneration) {
+      throw this.lifecycleError();
+    }
+  }
+
   private async getTwitterClientForAccount(
     accountIdInput?: unknown,
     options: {
@@ -372,6 +431,8 @@ export class XService extends Service {
       state?: TwitterClientState;
     } = {},
   ): Promise<TwitterClientInstance> {
+    const generation = this.lifecycleGeneration;
+    this.assertActive(generation);
     const runtime = this.runtime;
     if (!runtime) {
       throw new Error("X service runtime is not initialized.");
@@ -381,6 +442,7 @@ export class XService extends Service {
       accountId: accountIdInput,
       state: options.state,
     });
+    this.assertActive(generation);
     const accountId = resolveRequestedXAccountId(
       runtime,
       state,
@@ -399,18 +461,38 @@ export class XService extends Service {
 
     const startPromise = (async () => {
       await validateTwitterConfig(runtime, state);
+      this.assertActive(generation);
       const instance = new TwitterClientInstance(runtime, state);
-      await instance.client.init();
+      this.accountStartingClients.set(accountId, instance);
+      try {
+        await instance.client.init();
+        this.assertActive(generation);
 
-      if (options.startAutonomousClients) {
-        await this.startAutonomousClients(instance);
-      }
+        if (options.startAutonomousClients) {
+          await this.startAutonomousClients(instance);
+          this.assertActive(generation);
+        }
 
-      this.accountClients.set(accountId, instance);
-      if (accountId === this.defaultAccountId) {
-        this.twitterClient = instance;
+        this.accountClients.set(accountId, instance);
+        if (accountId === this.defaultAccountId) {
+          this.twitterClient = instance;
+        }
+        return instance;
+      } catch (error) {
+        // error-policy:J6 a failed account start owns a partially initialized
+        // transport, which must be torn down before the failure is rethrown.
+        try {
+          await instance.stop();
+        } catch (stopError) {
+          throw new XTeardownError(
+            `Failed to initialize and stop X account ${accountId}`,
+            [error, stopError],
+          );
+        }
+        throw error;
+      } finally {
+        this.accountStartingClients.delete(accountId);
       }
-      return instance;
     })();
 
     this.accountClientStarts.set(accountId, startPromise);
@@ -1474,24 +1556,50 @@ export class XService extends Service {
   }
 
   async stop(): Promise<void> {
-    for (const client of this.accountClients.values()) {
-      if (client.post) {
-        await client.post.stop();
+    if (this.stopPromise) return await this.stopPromise;
+
+    this.stopped = true;
+    this.lifecycleGeneration += 1;
+    this.stopPromise = (async () => {
+      const errors: unknown[] = [];
+      const knownClients = new Set([
+        ...this.accountClients.values(),
+        ...this.accountStartingClients.values(),
+        ...(this.twitterClient ? [this.twitterClient] : []),
+      ]);
+      const initialStops = await Promise.allSettled(
+        [...knownClients].map((client) => client.stop()),
+      );
+      for (const result of initialStops) {
+        if (result.status === "rejected") errors.push(result.reason);
       }
 
-      if (client.interaction) {
-        await client.interaction.stop();
+      const startResults = await Promise.allSettled([
+        ...this.accountClientStarts.values(),
+      ]);
+      for (const result of startResults) {
+        if (result.status === "fulfilled" && !knownClients.has(result.value)) {
+          knownClients.add(result.value);
+        }
       }
 
-      if (client.timeline) {
-        await client.timeline.stop();
+      const finalStops = await Promise.allSettled(
+        [...knownClients].map((client) => client.stop()),
+      );
+      for (const result of finalStops) {
+        if (result.status === "rejected") errors.push(result.reason);
       }
 
-      if (client.discovery) {
-        await client.discovery.stop();
-      }
-    }
+      this.accountClients.clear();
+      this.accountStartingClients.clear();
+      this.accountClientStarts.clear();
+      this.twitterClient = undefined;
+      logger.info("X service stopped");
 
-    logger.log("X service stopped");
+      if (errors.length > 0) {
+        throw new XTeardownError("Failed to stop X service cleanly", errors);
+      }
+    })();
+    return await this.stopPromise;
   }
 }

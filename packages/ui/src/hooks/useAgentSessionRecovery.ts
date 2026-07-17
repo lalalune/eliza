@@ -23,6 +23,10 @@ import {
   resolveAgentSessionRecovery,
 } from "../state/agent-session-recovery";
 import { runAgentSessionRecovery } from "../state/agent-session-recovery-runner";
+import {
+  captureRendererCredentialWriteGeneration,
+  isRendererCredentialWriteAllowed,
+} from "../state/credential-storage-keys";
 import { loadPersistedActiveServer } from "../state/persistence";
 
 export type AgentSessionRecoveryStatus =
@@ -102,6 +106,7 @@ export function useAgentSessionRecovery(
     }
 
     setStatus("recovering");
+    const credentialGeneration = captureRendererCredentialWriteGeneration();
     let cancelled = false;
 
     void runAgentSessionRecovery({
@@ -111,6 +116,12 @@ export function useAgentSessionRecovery(
       consumeRedirectInProcess: shouldConsumePairRedirectInProcess(),
       onPairedInProcess: async (apiToken) => {
         const { client } = await import("../api");
+        if (
+          cancelled ||
+          !isRendererCredentialWriteAllowed(credentialGeneration)
+        ) {
+          return;
+        }
         client.setToken(apiToken);
       },
       navigate,

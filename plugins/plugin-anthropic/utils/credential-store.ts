@@ -40,10 +40,6 @@ function getAccountPoolBridge(): AnthropicAccountPoolBridge | undefined {
   return getAnthropicAccountPoolBridge() ?? undefined;
 }
 
-const tokenCache = new Map<string, OAuthToken>();
-const ENV_CACHE_KEY = "__env__";
-const APP_CREDENTIAL_CACHE_KEY = "__app_anthropic_subscription__";
-
 interface AppSubscriptionCredentials {
   credentials?: {
     access?: string;
@@ -59,17 +55,10 @@ interface AppSubscriptionCredentials {
  * can pick a fresh account on cache miss; the sync path falls back to the
  * file/keychain reader.
  */
-export function getClaudeOAuthToken(opts?: { accountId?: string }): OAuthToken {
+export function getClaudeOAuthToken(_opts?: { accountId?: string }): OAuthToken {
   const appToken = readAppManagedAnthropicToken();
   if (appToken) {
-    tokenCache.set(APP_CREDENTIAL_CACHE_KEY, appToken);
     return appToken;
-  }
-
-  const cacheKey = opts?.accountId ?? ENV_CACHE_KEY;
-  const cached = tokenCache.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt - 60_000) {
-    return cached;
   }
 
   const envToken = getEnvVar("CLAUDE_CODE_OAUTH_TOKEN") ?? getEnvVar("ANTHROPIC_OAUTH_TOKEN");
@@ -78,7 +67,6 @@ export function getClaudeOAuthToken(opts?: { accountId?: string }): OAuthToken {
       accessToken: envToken,
       expiresAt: Number.POSITIVE_INFINITY,
     };
-    tokenCache.set(ENV_CACHE_KEY, token);
     return token;
   }
 
@@ -95,7 +83,6 @@ export function getClaudeOAuthToken(opts?: { accountId?: string }): OAuthToken {
     accessToken: credentials.claudeAiOauth.accessToken,
     expiresAt: credentials.claudeAiOauth.expiresAt,
   };
-  tokenCache.set(cacheKey, token);
   return token;
 }
 
@@ -112,7 +99,6 @@ export async function getClaudeOAuthTokenAsync(opts?: {
 }): Promise<OAuthToken> {
   const appToken = readAppManagedAnthropicToken();
   if (appToken) {
-    tokenCache.set(APP_CREDENTIAL_CACHE_KEY, appToken);
     return appToken;
   }
 
@@ -122,7 +108,6 @@ export async function getClaudeOAuthTokenAsync(opts?: {
       accessToken: envToken,
       expiresAt: Number.POSITIVE_INFINITY,
     };
-    tokenCache.set(ENV_CACHE_KEY, token);
     return token;
   }
 
@@ -130,10 +115,6 @@ export async function getClaudeOAuthTokenAsync(opts?: {
   if (bridge) {
     const account = await bridge.selectAnthropicSubscription(opts);
     if (account) {
-      const cached = tokenCache.get(account.id);
-      if (cached && Date.now() < cached.expiresAt - 60_000) {
-        return cached;
-      }
       const access = await bridge.getAccessToken("anthropic-subscription", account.id);
       if (access) {
         const token: OAuthToken = {
@@ -141,7 +122,6 @@ export async function getClaudeOAuthTokenAsync(opts?: {
           expiresAt: account.expiresAt || Number.POSITIVE_INFINITY,
           accountId: account.id,
         };
-        tokenCache.set(account.id, token);
         return token;
       }
     }
@@ -152,15 +132,10 @@ export async function getClaudeOAuthTokenAsync(opts?: {
 
 /**
  * Notify the pool that the supplied account is no longer valid (e.g. 401
- * after refresh) and clear the in-memory cache entry. Returns true when the
- * pool was notified, false when no bridge is installed.
+ * after refresh). Returns true when the pool was notified, false when no
+ * bridge is installed.
  */
 export function reportClaudeOAuthInvalid(accountId: string | undefined, detail?: string): boolean {
-  if (accountId) {
-    tokenCache.delete(accountId);
-  } else {
-    tokenCache.clear();
-  }
   const bridge = getAccountPoolBridge();
   if (!bridge || !accountId) return false;
   void bridge.markInvalid(accountId, detail);
@@ -172,9 +147,6 @@ export function reportClaudeOAuthRateLimited(
   untilMs: number,
   detail?: string
 ): boolean {
-  if (accountId) {
-    tokenCache.delete(accountId);
-  }
   const bridge = getAccountPoolBridge();
   if (!bridge || !accountId) return false;
   void bridge.markRateLimited(accountId, untilMs, detail);
@@ -202,11 +174,7 @@ export function getClaudeOAuthMeta(): ClaudeCredentials["claudeAiOauth"] | null 
 }
 
 export function clearTokenCache(accountId?: string): void {
-  if (accountId) {
-    tokenCache.delete(accountId);
-    return;
-  }
-  tokenCache.clear();
+  void accountId;
 }
 
 function getEnvVar(key: string): string | undefined {
@@ -217,50 +185,66 @@ function getEnvVar(key: string): string | undefined {
 function readAppManagedAnthropicToken(): OAuthToken | null {
   if (typeof process === "undefined") return null;
 
-  const cached = tokenCache.get(APP_CREDENTIAL_CACHE_KEY);
-  if (cached && Date.now() < cached.expiresAt - 60_000) {
-    return cached;
-  }
-
   const { join } = require("node:path") as typeof import("node:path");
   const { homedir } = require("node:os") as typeof import("node:os");
   const { readFileSync } = require("node:fs") as typeof import("node:fs");
   const { resolveStateDir } = require("@elizaos/core") as typeof import("@elizaos/core");
-  const stateDir = resolveStateDir();
+  const authBase = getEnvVar("ELIZA_HOME")?.trim() || resolveStateDir();
   const accountId = getEnvVar("ANTHROPIC_SUBSCRIPTION_ACCOUNT_ID")?.trim() || "default";
   const paths = [
-    join(stateDir, "auth", "anthropic-subscription", `${accountId}.json`),
+    join(authBase, "auth", "anthropic-subscription", `${accountId}.json`),
     join(homedir(), ".eliza", "auth", "anthropic-subscription", `${accountId}.json`),
     join(homedir(), ".eliza", "auth", "anthropic-subscription.json"),
   ];
 
   for (const credentialPath of paths) {
+    let raw: string;
     try {
-      const parsed = JSON.parse(
-        readFileSync(credentialPath, "utf-8")
-      ) as AppSubscriptionCredentials;
-      const access = parsed.credentials?.access?.trim();
-      if (!access) continue;
-      const expires = parsed.credentials?.expires;
-      const token: OAuthToken = {
-        accessToken: access,
-        expiresAt:
-          typeof expires === "number" && Number.isFinite(expires)
-            ? expires
-            : Number.POSITIVE_INFINITY,
-      };
-      if (Date.now() < token.expiresAt - 60_000) {
-        return token;
-      }
-    } catch {
-      // error-policy:J3 untrusted-input sanitizing — this probes a fixed list of
-      // known app-managed credential locations of which at most one exists;
-      // a read/parse miss at one location is the expected "not here" signal and
-      // moves to the next. Exhausting all yields the honest null below.
+      raw = readFileSync(credentialPath, "utf-8");
+    } catch (error) {
+      // error-policy:J3 absent files are an explicit invalid signal for this
+      // candidate path; unreadable files must not downgrade into another token.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new ElizaError("Failed to read app-managed Anthropic credential", {
+        code: "CREDENTIALS_UNREADABLE",
+        cause: error,
+        context: { credentialPath },
+      });
+    }
+
+    let parsed: AppSubscriptionCredentials;
+    try {
+      parsed = JSON.parse(raw) as AppSubscriptionCredentials;
+    } catch (error) {
+      // error-policy:J2 context-adding rethrow — an existing damaged credential
+      // cannot safely fall through to a potentially stale environment token.
+      throw new ElizaError("App-managed Anthropic credential is corrupt", {
+        code: "CREDENTIALS_CORRUPT",
+        cause: error,
+        context: { credentialPath },
+      });
+    }
+
+    const access = parsed.credentials?.access?.trim();
+    if (!access) {
+      throw new ElizaError("App-managed Anthropic credential is missing its access token", {
+        code: "CREDENTIALS_CORRUPT",
+        context: { credentialPath },
+      });
+    }
+    const expires = parsed.credentials?.expires;
+    const token: OAuthToken = {
+      accessToken: access,
+      expiresAt:
+        typeof expires === "number" && Number.isFinite(expires)
+          ? expires
+          : Number.POSITIVE_INFINITY,
+    };
+    if (Date.now() < token.expiresAt - 60_000) {
+      return token;
     }
   }
 
-  tokenCache.delete(APP_CREDENTIAL_CACHE_KEY);
   return null;
 }
 
