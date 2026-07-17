@@ -44,20 +44,32 @@ describe("computeCanRespond", () => {
 });
 
 describe("summarizeServiceHealth", () => {
-  it("separates lifecycle states and fails closed on an unknown service", () => {
+  it("separates lifecycle state from explicit readiness criticality", () => {
     const runtime = {
       getServiceHealth: () => ({
-        database: { status: "registered", instances: 1, hasPromise: true },
-        scheduler: { status: "registering", instances: 0, hasPromise: true },
+        database: {
+          status: "registered",
+          instances: 1,
+          hasPromise: true,
+          blocksReadiness: false,
+        },
+        scheduler: {
+          status: "registering",
+          instances: 0,
+          hasPromise: true,
+          blocksReadiness: true,
+        },
         inbox_migration: {
           status: "failed",
           instances: 0,
           hasPromise: false,
+          blocksReadiness: true,
         },
         inconsistent_unknown: {
           status: "unknown",
           instances: 0,
           hasPromise: false,
+          blocksReadiness: false,
         },
       }),
     } as unknown as AgentRuntime;
@@ -69,6 +81,9 @@ describe("summarizeServiceHealth", () => {
       failed: 2,
       pendingServices: ["scheduler"],
       failures: ["inbox_migration", "inconsistent_unknown"],
+      readinessStatus: "failed",
+      blockingPendingServices: ["scheduler"],
+      blockingFailures: ["inbox_migration"],
     });
   });
 
@@ -80,6 +95,9 @@ describe("summarizeServiceHealth", () => {
       failed: null,
       pendingServices: null,
       failures: null,
+      readinessStatus: null,
+      blockingPendingServices: null,
+      blockingFailures: null,
     });
   });
 });

@@ -187,6 +187,9 @@ export abstract class Service {
 	/** True when multiple implementations may intentionally share this service type. */
 	static allowsMultiple?: boolean;
 
+	/** True when this service must settle successfully before runtime readiness. */
+	static blocksReadiness?: boolean;
+
 	/** Service name */
 	abstract capabilityDescription: string;
 

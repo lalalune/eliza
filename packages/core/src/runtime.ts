@@ -1038,6 +1038,7 @@ export class AgentRuntime implements IAgentRuntime {
 	/** Registration and startup are separated by initPromise, so retain ownership for the later diagnostic boundary. */
 	private servicePluginNames = new WeakMap<ServiceClass, string>();
 	private reportedServiceStartFailures = new WeakSet<ElizaError>();
+	private initializationCompleted = false;
 	public initPromise: Promise<void>;
 	private initResolver:
 		| ((value?: void | PromiseLike<void>) => void)
@@ -2387,9 +2388,11 @@ export class AgentRuntime implements IAgentRuntime {
 		/** Allow running without a persistent database adapter (benchmarks/tests). */
 		allowNoDatabase?: boolean;
 	}): Promise<void> {
+		this.initializationCompleted = false;
 		try {
 			await this._initializeCore(options);
 		} catch (err) {
+			this.initializationCompleted = false;
 			// Always resolve initPromise so eager service starts and stop()
 			// do not hang waiting on a promise that never settles.
 			if (this.initResolver) {
@@ -2398,6 +2401,11 @@ export class AgentRuntime implements IAgentRuntime {
 			}
 			throw err;
 		}
+	}
+
+	/** True only after the runtime's initial plugin batch and database provisioning finish successfully. */
+	hasCompletedInitialization(): boolean {
+		return this.initializationCompleted;
 	}
 
 	private async _initializeCore(options?: {
@@ -2747,6 +2755,10 @@ export class AgentRuntime implements IAgentRuntime {
 				);
 			}
 		}
+
+		// Late plugin registration may run migrations immediately, so publish this
+		// phase transition before releasing services that can install plugins.
+		this.initializationCompleted = true;
 
 		// Resolve init promise to allow services to start
 		if (this.initResolver) {
@@ -4813,6 +4825,7 @@ export class AgentRuntime implements IAgentRuntime {
 			status: "pending" | "registering" | "registered" | "failed" | "unknown";
 			instances: number;
 			hasPromise: boolean;
+			blocksReadiness: boolean;
 		}
 	> {
 		const health: Record<
@@ -4821,15 +4834,27 @@ export class AgentRuntime implements IAgentRuntime {
 				status: "pending" | "registering" | "registered" | "failed" | "unknown";
 				instances: number;
 				hasPromise: boolean;
+				blocksReadiness: boolean;
 			}
 		> = {};
+		const blocksReadiness = (serviceType: ServiceTypeName): boolean =>
+			this.serviceTypes
+				.get(serviceType)
+				?.some((serviceClass) => serviceClass.blocksReadiness === true) ===
+			true;
 
-		// Check all registered services
+		// Closure-backed and host-owned singletons are published directly into
+		// `services`, outside the class lifecycle. Their concrete instance is the
+		// authoritative availability signal even when no registration status exists.
 		for (const [serviceType, instances] of this.services) {
 			health[serviceType] = {
-				status: this.getServiceRegistrationStatus(serviceType),
+				status:
+					instances.length > 0
+						? "registered"
+						: this.getServiceRegistrationStatus(serviceType),
 				instances: instances.length,
 				hasPromise: this.servicePromises.has(serviceType),
+				blocksReadiness: blocksReadiness(serviceType),
 			};
 		}
 
@@ -4840,6 +4865,7 @@ export class AgentRuntime implements IAgentRuntime {
 					status,
 					instances: 0,
 					hasPromise: this.servicePromises.has(serviceType),
+					blocksReadiness: blocksReadiness(serviceType),
 				};
 			}
 		}

@@ -620,6 +620,14 @@ async function migratePluginSchemasIfReady(
     return;
   }
 
+  // Initial plugins migrate as one batch inside AgentRuntime.initialize().
+  // Running a namespaced plugin first can invoke adapter post-migration hooks
+  // that require the core SQL tables, while late installs need DDL before their
+  // services start.
+  if (!runtime.hasCompletedInitialization()) {
+    return;
+  }
+
   const adapter = runtime.adapter;
   if (!adapter || typeof adapter.runPluginMigrations !== "function") {
     return;

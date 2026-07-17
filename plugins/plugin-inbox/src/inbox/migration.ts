@@ -223,6 +223,7 @@ function extractRows(result: unknown): Array<Record<string, unknown>> {
  */
 export class InboxMigrationService extends Service {
   static override readonly serviceType = INBOX_MIGRATION_SERVICE_TYPE;
+  static override readonly blocksReadiness = true;
 
   override capabilityDescription =
     "Non-destructive one-time copy of inbox-triage rows from app_lifeops into app_inbox during the plugin-inbox carve-out.";

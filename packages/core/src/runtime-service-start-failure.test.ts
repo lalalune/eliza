@@ -206,6 +206,26 @@ describe("AgentRuntime service startup observability", () => {
 		);
 	});
 
+	it("treats a directly published singleton instance as registered health", async () => {
+		const runtime = new AgentRuntime({
+			character: createCharacter({ name: "DirectSingletonHealth" }),
+			adapter: new InMemoryDatabaseAdapter(),
+			logLevel: "fatal",
+		});
+		runtimes.push(runtime);
+		await runtime.initialize();
+
+		const serviceType = "direct_singleton_health";
+		runtime.services.set(serviceType, [new WorkingMultipleService(runtime)]);
+
+		expect(runtime.getServiceHealth()[serviceType]).toEqual({
+			status: "registered",
+			instances: 1,
+			hasPromise: false,
+			blocksReadiness: false,
+		});
+	});
+
 	it("does not publish a service whose send-handler finalization fails", async () => {
 		finalizationStopCalls = 0;
 		let originalSendCalls = 0;

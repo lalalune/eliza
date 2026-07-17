@@ -21,6 +21,7 @@ export const SCHEDULED_TASK_SEED_SERVICE_TYPE =
 
 export class ScheduledTaskSeedService extends Service {
   static override readonly serviceType = SCHEDULED_TASK_SEED_SERVICE_TYPE;
+  static override readonly blocksReadiness = true;
 
   override capabilityDescription =
     "Seeds registered default scheduled-task packs after the runner service is ready.";

@@ -483,14 +483,12 @@ type CoreStaticPluginRegistration = {
   load: () => Promise<unknown>;
 };
 
-// Blocking-phase loaders. These two plugins each need a bespoke loader (the
-// required SQL adapter with a workspace-source fallback; the local-inference
-// pre-init hook), so they are the only descriptor rows whose `load` is not the
-// generic optional loader. Their membership + required-ness is derived from
-// BLOCKING_CORE_PLUGINS (the single source of truth for the blocking set) rather
-// than re-listed here — buildBlockingStaticRegistrations() below asserts the two
-// stay in lockstep so a change to BLOCKING_CORE_PLUGINS can't silently orphan a
-// loader or register a plugin with no loader.
+// Blocking-phase loaders. SQL and local inference keep their specialized
+// bootstrap loaders; boot-contract plugins reuse the bundle-safe optional
+// importer but are required to resolve because their services own readiness.
+// Membership remains derived from BLOCKING_CORE_PLUGINS, and the fail-loud
+// guard below prevents a new blocking declaration from silently lacking a
+// loader.
 const BLOCKING_STATIC_PLUGIN_LOADERS: Readonly<
   Record<string, { required: boolean; load: () => Promise<unknown> }>
 > = {
@@ -498,6 +496,14 @@ const BLOCKING_STATIC_PLUGIN_LOADERS: Readonly<
   "@elizaos/plugin-local-inference": {
     required: false,
     load: () => getPluginLocalEmbedding(),
+  },
+  "@elizaos/plugin-scheduling": {
+    required: true,
+    load: () => getOptionalPlugin("@elizaos/plugin-scheduling"),
+  },
+  "@elizaos/plugin-inbox": {
+    required: true,
+    load: () => getOptionalPlugin("@elizaos/plugin-inbox"),
   },
 };
 
@@ -537,7 +543,9 @@ function buildDeferredStaticRegistrations(): CoreStaticPluginRegistration[] {
   // (#12089 item 3). Per-plugin variance (short-name registry key, mobile skip)
   // comes from the declared OPTIONAL_STATIC_PLUGIN_OVERRIDES beside that list,
   // not from hand-written rows here.
-  return OPTIONAL_STATIC_PLUGIN_REGISTRATIONS.map((packageName) => {
+  return OPTIONAL_STATIC_PLUGIN_REGISTRATIONS.filter(
+    (packageName) => !BLOCKING_CORE_PLUGINS.includes(packageName),
+  ).map((packageName) => {
     const override = OPTIONAL_STATIC_PLUGIN_OVERRIDES[packageName];
     const load = override?.skipOnMobile
       ? () =>
@@ -757,8 +765,8 @@ export async function ensureCloudCoreStaticPluginsRegistered(): Promise<void> {
  * touches `loadSinglePlugin`. Memoized so repeated calls are free.
  *
  * Startup is intentionally two-phase:
- * - blocking: only the database and local-inference pre-init hooks needed for
- *   runtime readiness;
+ * - blocking: database/model setup plus declared durable boot contracts needed
+ *   for runtime readiness;
  * - deferred: provider/feature modules that should not hold the API ready gate.
  *
  * Set ELIZA_BLOCK_DEFERRED_PLUGIN_IMPORTS=1 to restore the legacy behavior and

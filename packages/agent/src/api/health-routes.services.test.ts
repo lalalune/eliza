@@ -20,6 +20,7 @@ const ROUTE_FAILURE_SERVICE_TYPE = "health_route_failure_service";
 
 class RouteFailureService extends Service {
   static override readonly serviceType = ROUTE_FAILURE_SERVICE_TYPE;
+  static override readonly blocksReadiness = true;
 
   override capabilityDescription = "Fails so the health route can expose it.";
 
@@ -116,6 +117,7 @@ describe("service health route", () => {
 
     class RouteBarrierService extends Service {
       static override readonly serviceType = "health_route_barrier_service";
+      static override readonly blocksReadiness = true;
 
       override capabilityDescription =
         "Holds startup so the health route can expose the registering state.";
@@ -202,6 +204,82 @@ describe("service health route", () => {
         services: expect.objectContaining({
           status: "healthy",
           pendingServices: [],
+        }),
+      }),
+    );
+  });
+
+  it("reports an optional service failure without blocking runtime readiness", async () => {
+    class OptionalRouteFailureService extends Service {
+      static override readonly serviceType =
+        "health_route_optional_failure_service";
+
+      override capabilityDescription =
+        "Fails without owning a runtime boot invariant.";
+
+      static override async start(): Promise<OptionalRouteFailureService> {
+        throw new Error("optional health route startup failure");
+      }
+
+      override async stop(): Promise<void> {}
+    }
+
+    const runtime = new AgentRuntime({
+      character: createCharacter({ name: "OptionalServiceFailure" }),
+      adapter: new InMemoryDatabaseAdapter(),
+      logLevel: "fatal",
+    });
+    runtimes.push(runtime);
+    await runtime.initialize();
+    await Promise.all(
+      runtime
+        .getRegisteredServiceTypes()
+        .map((serviceType) => runtime.getServiceLoadPromise(serviceType)),
+    );
+    await runtime.registerPlugin({
+      name: "optional-service-failure-plugin",
+      description: "Registers a non-readiness service that fails startup.",
+      services: [OptionalRouteFailureService],
+    });
+    await expect(
+      runtime.getServiceLoadPromise(OptionalRouteFailureService.serviceType),
+    ).rejects.toMatchObject({ code: "SERVICE_START_FAILED" });
+
+    const res = {} as http.ServerResponse;
+    const json = vi.fn<HealthRouteContext["json"]>();
+    await expect(
+      handleHealthRoutes({
+        req: {} as http.IncomingMessage,
+        res,
+        method: "GET",
+        pathname: "/api/health",
+        url: new URL("http://localhost/api/health"),
+        state: {
+          runtime,
+          config: {},
+          agentState: "running",
+          agentName: "OptionalServiceFailure",
+          model: undefined,
+          startedAt: Date.now(),
+          startup: { phase: "ready", attempt: 1 },
+          plugins: [],
+          pendingRestartReasons: [],
+          connectorHealthMonitor: null,
+        },
+        json,
+        error: vi.fn<HealthRouteContext["error"]>(),
+      }),
+    ).resolves.toBe(true);
+
+    expect(json).toHaveBeenCalledWith(
+      res,
+      expect.objectContaining({
+        ready: true,
+        services: expect.objectContaining({
+          status: "failed",
+          readinessStatus: "healthy",
+          failures: [OptionalRouteFailureService.serviceType],
+          blockingFailures: [],
         }),
       }),
     );

@@ -79,8 +79,9 @@ export const UNBUNDLED_OPTIONAL_PLUGINS: readonly string[] = [
 ];
 
 /**
- * The single ordered source of truth for the optional (deferred-phase) static
- * plugin registrations the runtime installs at boot. Both the bundle-manifest
+ * The single ordered source of truth for bundleable optional static plugin
+ * registrations the runtime installs at boot. The runtime partitions entries
+ * promoted by `BLOCKING_CORE_PLUGINS` from the deferred remainder. Both the bundle-manifest
  * layer (`OPTIONAL_STATIC_PLUGIN_PACKAGES`, which decides mobile-bundleability)
  * and the runtime descriptor table (`CORE_STATIC_PLUGIN_REGISTRATIONS` in
  * `eliza.ts`, which decides what actually registers into `STATIC_ELIZA_PLUGINS`)
@@ -88,8 +89,8 @@ export const UNBUNDLED_OPTIONAL_PLUGINS: readonly string[] = [
  * hand-mirrored parallel lists that silently drifted (a plugin added to one but
  * not the other became either non-bundleable or bundled-but-never-registered).
  *
- * Order is bundled-first then unbundled; the deferred boot phase iterates this
- * order, but registration only populates the name-keyed `STATIC_ELIZA_PLUGINS`
+ * Order is bundled-first then unbundled; each boot phase preserves this order,
+ * but registration only populates the name-keyed `STATIC_ELIZA_PLUGINS`
  * map (capability winners are decided later by the model router / plugin
  * resolver, not by this order), so order is a stable-diff / log-sequence
  * concern, not a behavioral one.

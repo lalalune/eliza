@@ -479,6 +479,9 @@ export type ServiceHealthSummary =
       failed: null;
       pendingServices: null;
       failures: null;
+      readinessStatus: null;
+      blockingPendingServices: null;
+      blockingFailures: null;
     }
   | {
       status: "healthy" | "starting" | "failed";
@@ -487,6 +490,9 @@ export type ServiceHealthSummary =
       failed: number;
       pendingServices: string[];
       failures: string[];
+      readinessStatus: "healthy" | "starting" | "failed";
+      blockingPendingServices: string[];
+      blockingFailures: string[];
     };
 
 /** Summarize concrete runtime service state for machine-readable boot probes. */
@@ -501,6 +507,9 @@ export function summarizeServiceHealth(
       failed: null,
       pendingServices: null,
       failures: null,
+      readinessStatus: null,
+      blockingPendingServices: null,
+      blockingFailures: null,
     };
   }
 
@@ -514,6 +523,9 @@ export function summarizeServiceHealth(
     failed: 0,
     pendingServices: [],
     failures: [],
+    readinessStatus: "healthy",
+    blockingPendingServices: [],
+    blockingFailures: [],
   };
 
   for (const [serviceType, health] of Object.entries(
@@ -526,19 +538,33 @@ export function summarizeServiceHealth(
     if (health.status === "failed" || health.status === "unknown") {
       summary.failed += 1;
       summary.failures.push(serviceType);
+      if (health.blocksReadiness) {
+        summary.blockingFailures.push(serviceType);
+      }
       continue;
     }
     if (health.status === "pending" || health.status === "registering") {
       summary.pending += 1;
       summary.pendingServices.push(serviceType);
+      if (health.blocksReadiness) {
+        summary.blockingPendingServices.push(serviceType);
+      }
     }
   }
   summary.failures.sort();
   summary.pendingServices.sort();
+  summary.blockingFailures.sort();
+  summary.blockingPendingServices.sort();
   summary.status =
     summary.failed > 0
       ? "failed"
       : summary.pending > 0
+        ? "starting"
+        : "healthy";
+  summary.readinessStatus =
+    summary.blockingFailures.length > 0
+      ? "failed"
+      : summary.blockingPendingServices.length > 0
         ? "starting"
         : "healthy";
   return summary;
@@ -661,13 +687,11 @@ export async function handleHealthRoutes(
       }
     }
 
-    // Registration is the runtime's declaration that a service belongs in this
-    // process; optional capabilities stay unregistered. Until the service
-    // contract grows an explicit criticality tier, pending or failed registered
-    // services must fail readiness rather than recreate a false-healthy boot.
+    // Optional and deferred capabilities remain visible in the service summary,
+    // while services that declare a boot contract hold readiness until settled.
     const ready =
       runtime !== null &&
-      services.status === "healthy" &&
+      services.readinessStatus === "healthy" &&
       state.agentState !== "starting" &&
       state.agentState !== "restarting";
 

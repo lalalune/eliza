@@ -46,6 +46,15 @@ const sameMembers = (a: readonly string[], b: readonly string[]) => {
 };
 
 describe("CORE_PLUGIN_PROFILE_METADATA drift guard", () => {
+  it("blocks readiness on durable scheduling and inbox boot contracts", () => {
+    expect(BLOCKING_CORE_PLUGINS).toEqual([
+      "@elizaos/plugin-sql",
+      "@elizaos/plugin-local-inference",
+      "@elizaos/plugin-scheduling",
+      "@elizaos/plugin-inbox",
+    ]);
+  });
+
   it("derives DESKTOP_ONLY_PLUGINS from the metadata table (unchanged membership)", () => {
     sameMembers(DESKTOP_ONLY_PLUGINS, ["agent-orchestrator", "coding-tools"]);
     sameMembers(

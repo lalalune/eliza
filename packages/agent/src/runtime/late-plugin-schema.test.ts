@@ -20,6 +20,8 @@ import { drizzle, type PgliteDatabase } from "drizzle-orm/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 import { INBOX_MIGRATION_SERVICE_TYPE } from "../../../../plugins/plugin-inbox/src/inbox/migration.ts";
 import { inboxPlugin } from "../../../../plugins/plugin-inbox/src/plugin.ts";
+import { plugin as sqlPlugin } from "../../../../plugins/plugin-sql/src/index.ts";
+import { PgliteDatabaseAdapter } from "../../../../plugins/plugin-sql/src/pglite/adapter.ts";
 import { RuntimeMigrator } from "../../../../plugins/plugin-sql/src/runtime-migrator/runtime-migrator.ts";
 import * as sqlSchema from "../../../../plugins/plugin-sql/src/schema/index.ts";
 import { installRuntimePluginLifecycle } from "./plugin-lifecycle.ts";
@@ -27,6 +29,11 @@ import { installRuntimePluginLifecycle } from "./plugin-lifecycle.ts";
 const CONCURRENT_SCHEMA_PLUGIN = "concurrent-late-schema-plugin";
 const concurrentSchema = pgSchema("app_concurrent_late");
 const concurrentProbeTable = concurrentSchema.table("probe", {
+  value: text("value").notNull(),
+});
+const BOOT_SCHEMA_PLUGIN = "boot-schema-ordering-plugin";
+const bootSchema = pgSchema("app_boot_schema_ordering");
+const bootProbeTable = bootSchema.table("probe", {
   value: text("value").notNull(),
 });
 
@@ -112,6 +119,54 @@ describe("late plugin schema ordering", () => {
       await rm(dataDir, { recursive: true, force: true });
       dataDir = null;
     }
+  });
+
+  it("keeps initial schemas in the core migration batch before post-migration hooks", async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), "eliza-boot-schema-order-"));
+    const agentId = stringToUuid("boot-schema-ordering-integration");
+    const character = createCharacter({
+      id: agentId,
+      name: "BootSchemaOrderingIntegration",
+    });
+
+    runtime = new AgentRuntime({
+      character,
+      plugins: [
+        {
+          name: BOOT_SCHEMA_PLUGIN,
+          description: "Namespaced schema registered during initial boot.",
+          schema: { bootProbeTable },
+        },
+      ],
+      settings: { PGLITE_DATA_DIR: dataDir },
+      logLevel: "fatal",
+    });
+    installRuntimePluginLifecycle(runtime);
+
+    await runtime.registerPlugin(sqlPlugin);
+    await runtime.initialize();
+
+    expect(runtime.adapter).toBeInstanceOf(PgliteDatabaseAdapter);
+    if (!(runtime.adapter instanceof PgliteDatabaseAdapter)) {
+      throw new Error("Expected the SQL plugin to register a PGlite adapter");
+    }
+    const tableRows = await runtime.adapter.db.execute(sql`
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE (table_schema = 'public' AND table_name = 'memories')
+         OR (table_schema = 'app_boot_schema_ordering' AND table_name = 'probe')
+      ORDER BY table_schema, table_name
+    `);
+    expect(tableRows.rows).toEqual([
+      {
+        table_schema: "app_boot_schema_ordering",
+        table_name: "probe",
+      },
+      {
+        table_schema: "public",
+        table_name: "memories",
+      },
+    ]);
   });
 
   it("materializes app_inbox before starting InboxMigrationService", async () => {

@@ -349,14 +349,16 @@ export const LEAN_CHAT_EXCLUDED_PLUGINS: readonly string[] = [
 ];
 
 /**
- * Core plugins that must be imported and registered before the runtime can be
- * considered ready. Keep this list intentionally small: everything else in
- * CORE_PLUGINS should load in the deferred phase so slow feature/provider
- * imports do not block API readiness.
+ * Plugins that must be imported and registered before the runtime can be
+ * considered ready. Keep this list intentionally small: database setup and
+ * local inference establish the base runtime, while scheduling and inbox own
+ * durable boot-time seed/migration contracts that readiness must not outrun.
  */
 export const BLOCKING_CORE_PLUGINS: readonly string[] = [
   "@elizaos/plugin-sql", // required database adapter
   "@elizaos/plugin-local-inference", // pre-init local model/embedding handler wiring
+  "@elizaos/plugin-scheduling", // runner + default-pack seed must settle before readiness
+  "@elizaos/plugin-inbox", // app_inbox schema + legacy-row migration must settle before readiness
 ];
 
 /**

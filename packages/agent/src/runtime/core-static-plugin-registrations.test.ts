@@ -8,7 +8,7 @@
  * pair likewise hand-mirrored BLOCKING_CORE_PLUGINS.
  *
  * The table is now DERIVED:
- *   - deferred rows  <- OPTIONAL_STATIC_PLUGIN_REGISTRATIONS (+ declared overrides)
+ *   - deferred rows  <- OPTIONAL_STATIC_PLUGIN_REGISTRATIONS minus the blocking set
  *   - blocking rows  <- BLOCKING_CORE_PLUGINS (+ declared bespoke loaders)
  *
  * These tests assert the derivation wiring holds and that the old hand-written
@@ -105,12 +105,13 @@ describe("descriptor table derivation (eliza.ts source guard, #12089 item 3)", (
     expect(source).toContain("...buildDeferredStaticRegistrations()");
   });
 
-  it("derives deferred rows from OPTIONAL_STATIC_PLUGIN_REGISTRATIONS", () => {
-    // buildDeferredStaticRegistrations() maps over the single source of truth.
+  it("derives deferred rows from optional registrations minus blocking plugins", () => {
+    // Bundleability remains one list; the phase partition excludes entries
+    // whose durable boot contracts promote them into the blocking set.
     const source = elizaSource();
-    expect(source).toMatch(
-      /OPTIONAL_STATIC_PLUGIN_REGISTRATIONS\.map\(\(packageName\)/,
-    );
+    expect(source).toContain("OPTIONAL_STATIC_PLUGIN_REGISTRATIONS.filter(");
+    expect(source).toContain("!BLOCKING_CORE_PLUGINS.includes(packageName)");
+    expect(source).toMatch(/\.map\(\(packageName\) => \{/);
     expect(source).toContain("OPTIONAL_STATIC_PLUGIN_OVERRIDES");
   });
 
@@ -125,7 +126,7 @@ describe("descriptor table derivation (eliza.ts source guard, #12089 item 3)", (
     );
   });
 
-  it("declares a bespoke blocking loader for every BLOCKING_CORE_PLUGINS entry", () => {
+  it("declares a blocking loader for every BLOCKING_CORE_PLUGINS entry", () => {
     // Text-assert the loader map covers the blocking set so the fail-loud guard
     // never actually trips at boot on the current lists. Scope the scan to the
     // BLOCKING_STATIC_PLUGIN_LOADERS object so a stray package mention elsewhere

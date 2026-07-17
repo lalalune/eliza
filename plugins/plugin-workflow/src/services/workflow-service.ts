@@ -12,7 +12,7 @@
  * EmbeddedWorkflowService; credential resolution goes through the registered
  * WorkflowCredentialStore.
  */
-import { type IAgentRuntime, logger, Service } from '@elizaos/core';
+import { ElizaError, type IAgentRuntime, logger, Service } from '@elizaos/core';
 import type {
   NodeDefinition,
   NodeSearchResult,
@@ -302,9 +302,19 @@ export class WorkflowService extends Service {
     const credentials = workflowSettings?.credentials;
 
     const service = new WorkflowService(runtime);
-    const embedded =
-      (runtime.getService(EMBEDDED_WORKFLOW_SERVICE_TYPE) as EmbeddedWorkflowService | null) ??
-      (await EmbeddedWorkflowService.start(runtime));
+    let embedded = runtime.getService<EmbeddedWorkflowService>(EMBEDDED_WORKFLOW_SERVICE_TYPE);
+    if (!embedded && runtime.hasService(EMBEDDED_WORKFLOW_SERVICE_TYPE)) {
+      const loaded = await runtime.getServiceLoadPromise(EMBEDDED_WORKFLOW_SERVICE_TYPE);
+      if (!(loaded instanceof EmbeddedWorkflowService)) {
+        throw new ElizaError('Registered embedded workflow service has the wrong implementation', {
+          code: 'WORKFLOW_EMBEDDED_SERVICE_TYPE_MISMATCH',
+          context: { serviceType: EMBEDDED_WORKFLOW_SERVICE_TYPE },
+          severity: 'fatal',
+        });
+      }
+      embedded = loaded;
+    }
+    embedded ??= await EmbeddedWorkflowService.start(runtime);
     service.serviceConfig = {
       apiKey: 'embedded',
       host: 'in-process',

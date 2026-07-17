@@ -259,6 +259,7 @@ describe("schema-bearing plugin registration", () => {
   it("runs plugin migrations after a schema plugin registers against a ready adapter", async () => {
     const runtime = createTestRuntime();
     installRuntimePluginLifecycle(runtime);
+    vi.spyOn(runtime, "hasCompletedInitialization").mockReturnValue(true);
     const runPluginMigrations = vi.fn(async () => {});
 
     runtime.registerDatabaseAdapter({
@@ -309,6 +310,7 @@ describe("schema-bearing plugin registration", () => {
   it("skips schema migration while the adapter is not ready", async () => {
     const runtime = createTestRuntime();
     installRuntimePluginLifecycle(runtime);
+    vi.spyOn(runtime, "hasCompletedInitialization").mockReturnValue(true);
     const runPluginMigrations = vi.fn(async () => {});
 
     runtime.registerDatabaseAdapter({
@@ -332,6 +334,7 @@ describe("schema-bearing plugin registration", () => {
   it("rolls back plugin components when schema migration fails", async () => {
     const runtime = createTestRuntime();
     installRuntimePluginLifecycle(runtime);
+    vi.spyOn(runtime, "hasCompletedInitialization").mockReturnValue(true);
     const runPluginMigrations = vi.fn(async () => {
       throw new Error("migration failed");
     });

@@ -445,6 +445,7 @@ interface RunnerCacheEntry {
  */
 export class ScheduledTaskRunnerService extends Service {
   static override serviceType = SERVICE_TYPE;
+  static override blocksReadiness = true;
 
   override capabilityDescription =
     "Long-lived ScheduledTask runner host. Builds the runner from the runtime-injected deps provider (or the built-in default deps) once per agent and caches it with a rebindable clock; the scheduler tick reads the cached runner instead of reconstructing it every minute.";
