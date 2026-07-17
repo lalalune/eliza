@@ -1,10 +1,6 @@
 /**
- * `ensureSubscriptionCli` (#16518): the device-login CLI bootstrap must work
- * for a NON-ROOT service user — a user-prefix npm install under the eliza
- * state dir (never `-g`, never /usr/lib/node_modules), a structured
- * prerequisite error when installation is impossible, no guaranteed-to-fail
- * reinstall on every OAuth attempt (cooldown-cached failure), and the tools
- * bin dir made visible to the later bare `spawn("codex"|"claude")`.
+ * Exercises the subscription CLI bootstrap with deterministic install, failure,
+ * cooldown, PATH, and concurrency seams rather than invoking npm or OAuth.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -94,6 +90,64 @@ describe("ensureSubscriptionCli (#16518)", () => {
     expect(installs).toBe(1);
   });
 
+  it("serializes distinct CLI installs that mutate the shared prefix", async () => {
+    const installed = new Set<string>();
+    const events: string[] = [];
+    let activeInstalls = 0;
+    let maxActiveInstalls = 0;
+    let releaseClaudeInstall: (() => void) | undefined;
+    let notifyClaudeInstallStarted: (() => void) | undefined;
+    const claudeInstallGate = new Promise<void>((resolve) => {
+      releaseClaudeInstall = resolve;
+    });
+    const claudeInstallStarted = new Promise<void>((resolve) => {
+      notifyClaudeInstallStarted = resolve;
+    });
+    const isAvailable = async (command: string) => installed.has(command);
+    const runInstall = async (args: string[]) => {
+      const packageName = args.at(-1);
+      const command = packageName === "@openai/codex" ? "codex" : "claude";
+      activeInstalls += 1;
+      maxActiveInstalls = Math.max(maxActiveInstalls, activeInstalls);
+      events.push(`start:${command}`);
+      try {
+        if (command === "claude") {
+          notifyClaudeInstallStarted?.();
+          await claudeInstallGate;
+        }
+        installed.add(command);
+        events.push(`end:${command}`);
+      } finally {
+        activeInstalls -= 1;
+      }
+    };
+
+    const claude = ensureSubscriptionCli("anthropic-subscription", {
+      isAvailable,
+      runInstall,
+    });
+    const codex = ensureSubscriptionCli("openai-codex", {
+      isAvailable,
+      runInstall,
+    });
+    await claudeInstallStarted;
+
+    expect(events).toEqual(["start:claude"]);
+    expect(maxActiveInstalls).toBe(1);
+    releaseClaudeInstall?.();
+    await expect(Promise.all([claude, codex])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(events).toEqual([
+      "start:claude",
+      "end:claude",
+      "start:codex",
+      "end:codex",
+    ]);
+    expect(maxActiveInstalls).toBe(1);
+  });
+
   it("makes the tools bin dir visible on PATH for the later bare spawn, idempotently", async () => {
     await ensureSubscriptionCli("openai-codex", {
       isAvailable: async () => true,
@@ -113,12 +167,13 @@ describe("ensureSubscriptionCli (#16518)", () => {
   });
 
   it("a failed install throws a structured prerequisite error with actionable context", async () => {
+    const cause = new Error(
+      "EACCES: permission denied, mkdir '/usr/lib/node_modules'",
+    );
     const attempt = ensureSubscriptionCli("anthropic-subscription", {
       isAvailable: async () => false,
       runInstall: async () => {
-        throw new Error(
-          "EACCES: permission denied, mkdir '/usr/lib/node_modules'",
-        );
+        throw cause;
       },
     });
     await expect(attempt).rejects.toBeInstanceOf(ElizaError);
@@ -129,7 +184,8 @@ describe("ensureSubscriptionCli (#16518)", () => {
         packageName: "@anthropic-ai/claude-code",
         prefix: expectedPrefix,
       });
-      expect(String(error.context?.cause)).toContain("EACCES");
+      expect(String(error.context?.causeMessage)).toContain("EACCES");
+      expect(error.cause).toBe(cause);
     });
   });
 

@@ -91,7 +91,9 @@ async function commandAvailable(command: string): Promise<boolean> {
   return false;
 }
 
-const SUBSCRIPTION_CLI_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
+// Both vendors ship platform binaries larger than 200 MB, so a cold install
+// must tolerate ordinary registry throughput without leaving npm unbounded.
+const SUBSCRIPTION_CLI_INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 /**
  * A structurally failed install (no npm, unwritable state dir) is remembered
  * so every OAuth attempt doesn't re-run a guaranteed-to-fail npm install
@@ -103,13 +105,19 @@ const subscriptionCliInstallFailures = new Map<
   string,
   { error: ElizaError; retryAt: number }
 >();
-/** Coalesce simultaneous OAuth starts so only one npm process runs per CLI. */
+/** Coalesce simultaneous OAuth starts for the same CLI. */
 const subscriptionCliInstallsInFlight = new Map<string, Promise<void>>();
+/**
+ * Both packages share one npm prefix, so every mutation of its package lock and
+ * node_modules tree must run in one process-local critical section.
+ */
+let subscriptionCliInstallQueue: Promise<void> = Promise.resolve();
 
-/** Test hook: forget cached install state between tests. */
+/** Test hook: forget cached install state after all callers have settled. */
 export function __clearSubscriptionCliInstallFailures(): void {
   subscriptionCliInstallFailures.clear();
   subscriptionCliInstallsInFlight.clear();
+  subscriptionCliInstallQueue = Promise.resolve();
 }
 
 /**
@@ -128,6 +136,7 @@ function prependToProcessPath(dir: string): void {
   process.env.PATH = current ? `${dir}${path.delimiter}${current}` : dir;
 }
 
+/** Ensure the requested device-login CLI is executable from the agent process. */
 export async function ensureSubscriptionCli(
   providerId: "anthropic-subscription" | "openai-codex",
   deps: {
@@ -149,7 +158,10 @@ export async function ensureSubscriptionCli(
     ".bin",
   );
   prependToProcessPath(binDir);
-  if (await isAvailable(command)) return;
+  if (await isAvailable(command)) {
+    subscriptionCliInstallFailures.delete(command);
+    return;
+  }
 
   const cached = subscriptionCliInstallFailures.get(command);
   if (cached && now() < cached.retryAt) {
@@ -158,83 +170,91 @@ export async function ensureSubscriptionCli(
 
   const inFlight = subscriptionCliInstallsInFlight.get(command);
   if (inFlight) return inFlight;
-  let resolveInstall!: () => void;
-  let rejectInstall!: (error: unknown) => void;
-  const install = new Promise<void>((resolve, reject) => {
-    resolveInstall = resolve;
-    rejectInstall = reject;
-  });
-  // error-policy:J5 -- the leader throws this error directly and concurrent
-  // followers observe it through `install`; suppress only an unobserved copy.
-  void install.catch(() => undefined);
-  subscriptionCliInstallsInFlight.set(command, install);
 
   const packageName =
     providerId === "openai-codex"
       ? "@openai/codex"
       : "@anthropic-ai/claude-code";
   const prefix = subscriptionCliInstallPrefix();
-  logger.info(
-    `[accounts] Installing missing ${command} CLI for device login into ${prefix}`,
-  );
   const runInstall =
     deps.runInstall ??
     ((args: string[]) =>
       execFileAsync("npm", args, {
         timeout: SUBSCRIPTION_CLI_INSTALL_TIMEOUT_MS,
       }));
-  try {
-    await mkdir(prefix, { recursive: true });
-    // A user-prefix install, never `-g`: no writes under /usr/lib/node_modules,
-    // works for any service user that owns the eliza state dir.
-    await runInstall([
-      "install",
-      "--prefix",
-      prefix,
-      "--no-fund",
-      "--no-audit",
-      packageName,
-    ]);
-  } catch (cause) {
-    const error = new ElizaError(
-      `The ${command} CLI required for device login could not be installed`,
-      {
-        code: "SUBSCRIPTION_CLI_INSTALL_FAILED",
-        context: {
-          command,
-          packageName,
-          prefix,
-          cause: cause instanceof Error ? cause.message : String(cause),
+  const install = subscriptionCliInstallQueue.then(async () => {
+    // Another queued install or an operator may have supplied the CLI while
+    // this request waited for the shared prefix.
+    if (await isAvailable(command)) {
+      subscriptionCliInstallFailures.delete(command);
+      return;
+    }
+
+    logger.info(
+      `[accounts] Installing missing ${command} CLI for device login into ${prefix}`,
+    );
+    try {
+      await mkdir(prefix, { recursive: true });
+      // A user-prefix install, never `-g`: no writes under /usr/lib/node_modules,
+      // works for any service user that owns the eliza state dir.
+      await runInstall([
+        "install",
+        "--prefix",
+        prefix,
+        "--no-fund",
+        "--no-audit",
+        packageName,
+      ]);
+    } catch (cause) {
+      // error-policy:J2 Preserve the npm or filesystem failure for diagnostics.
+      const error = new ElizaError(
+        `The ${command} CLI required for device login could not be installed`,
+        {
+          code: "SUBSCRIPTION_CLI_INSTALL_FAILED",
+          cause,
+          context: {
+            command,
+            packageName,
+            prefix,
+            causeMessage:
+              cause instanceof Error ? cause.message : String(cause),
+          },
+          severity: "ephemeral",
         },
-      },
-    );
-    subscriptionCliInstallFailures.set(command, {
-      error,
-      retryAt: now() + SUBSCRIPTION_CLI_RETRY_COOLDOWN_MS,
-    });
-    subscriptionCliInstallsInFlight.delete(command);
-    rejectInstall(error);
-    throw error;
-  }
-  if (!(await isAvailable(command))) {
-    const error = new ElizaError(
-      `${command} CLI installation completed but is not on PATH`,
-      {
-        code: "SUBSCRIPTION_CLI_NOT_ON_PATH",
-        context: { command, packageName, prefix, binDir },
-      },
-    );
-    subscriptionCliInstallFailures.set(command, {
-      error,
-      retryAt: now() + SUBSCRIPTION_CLI_RETRY_COOLDOWN_MS,
-    });
-    subscriptionCliInstallsInFlight.delete(command);
-    rejectInstall(error);
-    throw error;
-  }
-  subscriptionCliInstallFailures.delete(command);
-  subscriptionCliInstallsInFlight.delete(command);
-  resolveInstall();
+      );
+      subscriptionCliInstallFailures.set(command, {
+        error,
+        retryAt: now() + SUBSCRIPTION_CLI_RETRY_COOLDOWN_MS,
+      });
+      throw error;
+    }
+    if (!(await isAvailable(command))) {
+      const error = new ElizaError(
+        `${command} CLI installation completed but is not on PATH`,
+        {
+          code: "SUBSCRIPTION_CLI_NOT_ON_PATH",
+          context: { command, packageName, prefix, binDir },
+          severity: "fatal",
+        },
+      );
+      subscriptionCliInstallFailures.set(command, {
+        error,
+        retryAt: now() + SUBSCRIPTION_CLI_RETRY_COOLDOWN_MS,
+      });
+      throw error;
+    }
+    subscriptionCliInstallFailures.delete(command);
+  });
+  subscriptionCliInstallsInFlight.set(command, install);
+  const releaseInstall = () => {
+    if (subscriptionCliInstallsInFlight.get(command) === install) {
+      subscriptionCliInstallsInFlight.delete(command);
+    }
+  };
+  // error-policy:J5 Callers observe the rejection through `install`; the
+  // queue tail consumes only its sequencing copy so the next CLI can proceed.
+  subscriptionCliInstallQueue = install.then(releaseInstall, releaseInstall);
+  return install;
 }
 
 function requestUsesLocalRoot(req: RouteRequestContext["req"]): boolean {
@@ -1266,8 +1286,10 @@ async function handleOAuthRoutes(
           : {}),
       });
     } catch (err) {
+      // error-policy:J1 Translate the OAuth transport boundary to an HTTP error.
       logger.error(
-        `[accounts] Failed to start ${providerId} OAuth flow: ${String(err)}`,
+        { err, providerId },
+        `[accounts] Failed to start ${providerId} OAuth flow`,
       );
       // A missing/uninstallable device-login CLI is an actionable prerequisite
       // failure (#16518), not an opaque 500 — surface the structured message so
