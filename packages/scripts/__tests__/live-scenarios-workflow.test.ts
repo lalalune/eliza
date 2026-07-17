@@ -223,7 +223,7 @@ test("keeps retired no-op workflow entry points absent", () => {
   expect(auditSource).not.toContain("scenario-matrix.yml");
 
   const workflowReadme = readFileSync(workflowReadmePath, "utf8");
-  expect(workflowReadme).toContain("tracked in #16449");
+  expect(workflowReadme).toContain("tracked in #16448");
   expect(workflowReadme).not.toContain("packages/inference/voice-bench");
 });
 
