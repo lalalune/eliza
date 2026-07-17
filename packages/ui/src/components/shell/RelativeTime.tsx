@@ -76,7 +76,7 @@ function RelativeTimeImpl({
       className={className}
       dateTime={iso}
       data-testid={testId}
-      title={short && iso ? date.toLocaleString() : undefined}
+      title={short && iso ? date.toLocaleString("en-US") : undefined}
     >
       {label}
     </time>
