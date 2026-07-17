@@ -40,11 +40,39 @@ async function expectLauncherPage(page: Page) {
   await expect(main.getByText("dynamic view smoke surface")).toHaveCount(0);
 }
 
-function dynamicViewHarnessPath(view: ViewCase): string {
-  // `/apps/:viewId` is the shell's explicit remote-view route. A plugin's
-  // declared path may intentionally overlap a builtin/native surface (contacts,
-  // phone, wallet), which would test the builtin router instead of the loader.
-  return `/apps/${encodeURIComponent(view.id)}`;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function installDynamicViewHarnessRoute(
+  page: Page,
+  view: ViewCase,
+): Promise<string> {
+  // A unique nested path bypasses builtin and in-process app registrations that
+  // intentionally own the plugin's public route. Rewriting the server's real
+  // declaration keeps the production router and loader path under test.
+  const harnessPath = `/apps/__lifecycle/${encodeURIComponent(view.id)}`;
+  await page.route(
+    (url) => url.pathname === "/api/views",
+    async (route) => {
+      const response = await route.fetch();
+      const payload: unknown = await response.json();
+      if (!isRecord(payload) || !Array.isArray(payload.views)) {
+        throw new Error("View registry fixture must return a views array");
+      }
+      let matched = false;
+      const views = payload.views.map((entry) => {
+        if (!isRecord(entry) || entry.id !== view.id) return entry;
+        matched = true;
+        return { ...entry, path: harnessPath };
+      });
+      if (!matched) {
+        throw new Error(`View registry fixture is missing "${view.id}"`);
+      }
+      await route.fulfill({ response, json: { ...payload, views } });
+    },
+  );
+  return harnessPath;
 }
 
 test.describe("registered plugin view lifecycle coverage", () => {
@@ -55,8 +83,9 @@ test.describe("registered plugin view lifecycle coverage", () => {
       installPageDiagnosticsGuard(page);
       await seedAppStorage(page);
       await installDefaultAppRoutes(page);
+      const harnessPath = await installDynamicViewHarnessRoute(page, view);
 
-      await openAppPath(page, dynamicViewHarnessPath(view));
+      await openAppPath(page, harnessPath);
       await expectLoadedView(page, view, "initial open");
 
       await openAppPath(page, "/views");
@@ -66,7 +95,7 @@ test.describe("registered plugin view lifecycle coverage", () => {
         `${view.id} ${view.viewType} after unmount`,
       );
 
-      await openAppPath(page, dynamicViewHarnessPath(view));
+      await openAppPath(page, harnessPath);
       await expectLoadedView(page, view, "reopen");
 
       await page.reload({ waitUntil: "domcontentloaded" });

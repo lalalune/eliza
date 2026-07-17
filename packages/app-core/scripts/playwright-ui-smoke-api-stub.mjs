@@ -1497,11 +1497,11 @@ function SmokeView() {
   );
 }
 
-export { SmokeView as ${exportName} };
-export default SmokeView;
-export async function interact(capability, params = {}) {
+async function interact(capability, params = {}) {
   return { ok: true, viewId: viewMeta.id, viewType: viewMeta.viewType, capability, params };
 }
+
+export { SmokeView as ${exportName}, SmokeView as default, interact };
 `;
 }
 
@@ -1620,11 +1620,11 @@ function SmokeView() {
   );
 }
 
-export { SmokeView as ${exportName} };
-export default SmokeView;
-export async function interact(capability, params = {}) {
+async function interact(capability, params = {}) {
   return { ok: true, viewId: viewMeta.id, viewType: viewMeta.viewType, capability, params };
 }
+
+export { SmokeView as ${exportName}, SmokeView as default, interact };
 `;
 }
 
@@ -1653,11 +1653,11 @@ function SmokeView() {
   );
 }
 
-export { SmokeView as ${exportName} };
-export default SmokeView;
-export async function interact(capability, params = {}) {
+async function interact(capability, params = {}) {
   return { ok: true, viewId: viewMeta.id, viewType: viewMeta.viewType, capability, params };
 }
+
+export { SmokeView as ${exportName}, SmokeView as default, interact };
 `;
 }
 

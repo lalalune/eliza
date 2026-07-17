@@ -106,6 +106,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+type HostExternalFactory = (
+  hostImport: (specifier: string) => Promise<Record<string, unknown>>,
+) => Promise<Record<string, unknown>>;
+
+function isHostExternalFactoryModule(
+  value: unknown,
+): value is { default: HostExternalFactory } {
+  return isRecord(value) && typeof value.default === "function";
+}
+
 describe("smoke view bundle provenance over HTTP (#15791)", () => {
   it("advertises canonical view capability objects", async () => {
     const bundleRoot = await emptyBundleRoot();
@@ -181,6 +191,33 @@ describe("smoke view bundle provenance over HTTP (#15791)", () => {
     expect(provenance).toBe("synthesized-generic");
     expect(body).toContain("eliza-view-bundle-provenance: synthesized-generic");
     expect(body).toContain("InventoryView");
+  });
+
+  it("serves synthesized host-external bundles as executable factories", async () => {
+    const bundleRoot = await emptyBundleRoot();
+    const { child, port } = await bootStub({
+      ELIZA_UI_SMOKE_VIEW_BUNDLE_ROOT: bundleRoot,
+    });
+    running = child;
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/views/wallet/bundle.js?hostExternalRuntime=1&hostExternalSpecifiers=react`,
+    );
+    expect(response.status).toBe(200);
+
+    const source = await response.text();
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+    const wrapped: unknown = await import(moduleUrl);
+    if (!isHostExternalFactoryModule(wrapped)) {
+      throw new Error("Synthesized bundle must export a host factory");
+    }
+    const namespace = await wrapped.default(async (specifier) => {
+      expect(specifier).toBe("react");
+      return { default: { createElement: () => null } };
+    });
+
+    expect(namespace.InventoryView).toEqual(expect.any(Function));
+    expect(namespace.default).toBe(namespace.InventoryView);
+    expect(namespace.interact).toEqual(expect.any(Function));
   });
 
   it("audit mode serves a present real bundle with exact identity headers", async () => {
