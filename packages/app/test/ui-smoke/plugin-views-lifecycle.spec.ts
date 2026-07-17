@@ -17,7 +17,7 @@ async function expectLoadedView(page: Page, view: ViewCase, phase: string) {
   const viewRoot = page.locator("main").first();
   await expect(viewRoot).toBeVisible({ timeout: 60_000 });
   const readyView = viewRoot.locator(
-    `[data-testid="dynamic-view-loader"][data-view-id="${view.id}"][data-view-type="${view.viewType}"][data-view-state="ready"]`,
+    `[data-testid="dynamic-view-loader"][data-view-id="${view.id}"][data-view-type="${view.viewType}"][data-view-loader-state="mounted"]`,
   );
   await expect(
     readyView,
@@ -40,6 +40,13 @@ async function expectLauncherPage(page: Page) {
   await expect(main.getByText("dynamic view smoke surface")).toHaveCount(0);
 }
 
+function dynamicViewHarnessPath(view: ViewCase): string {
+  // `/apps/:viewId` is the shell's explicit remote-view route. A plugin's
+  // declared path may intentionally overlap a builtin/native surface (contacts,
+  // phone, wallet), which would test the builtin router instead of the loader.
+  return `/apps/${encodeURIComponent(view.id)}`;
+}
+
 test.describe("registered plugin view lifecycle coverage", () => {
   for (const view of VIEW_CASES) {
     test(`${view.id} ${view.viewType} loads, unmounts, reopens, and reloads cleanly`, async ({
@@ -49,7 +56,7 @@ test.describe("registered plugin view lifecycle coverage", () => {
       await seedAppStorage(page);
       await installDefaultAppRoutes(page);
 
-      await openAppPath(page, view.path);
+      await openAppPath(page, dynamicViewHarnessPath(view));
       await expectLoadedView(page, view, "initial open");
 
       await openAppPath(page, "/views");
@@ -59,7 +66,7 @@ test.describe("registered plugin view lifecycle coverage", () => {
         `${view.id} ${view.viewType} after unmount`,
       );
 
-      await openAppPath(page, view.path);
+      await openAppPath(page, dynamicViewHarnessPath(view));
       await expectLoadedView(page, view, "reopen");
 
       await page.reload({ waitUntil: "domcontentloaded" });

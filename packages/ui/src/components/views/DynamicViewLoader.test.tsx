@@ -177,7 +177,8 @@ describe("DynamicViewLoader", () => {
     const readyView = screen.getByTestId("dynamic-view-loader");
     expect(readyView.getAttribute("data-view-id")).toBe("remote.panel");
     expect(readyView.getAttribute("data-view-type")).toBe("gui");
-    expect(readyView.getAttribute("data-view-state")).toBe("ready");
+    expect(readyView.getAttribute("data-view-loader-state")).toBe("mounted");
+    expect(readyView.hasAttribute("data-view-state")).toBe(false);
     expect(importBundle).toHaveBeenCalledWith(bundleUrl);
     expect(importBundle).not.toHaveBeenCalledWith(
       expect.stringContaining("/api/views/remote.panel/bundle.js"),
@@ -192,6 +193,46 @@ describe("DynamicViewLoader", () => {
     expect(surface?.style.paddingInlineEnd).toBe(
       "var(--eliza-continuous-chat-side-clearance, 0px)",
     );
+  });
+
+  it("does not expose a mounted marker while the bundle import is pending", async () => {
+    let resolveImport:
+      | ((module: { default: () => ReactElement }) => void)
+      | undefined;
+    window.__ELIZA_DYNAMIC_VIEW_BUNDLE_IMPORT__ = vi.fn(
+      () =>
+        new Promise<{ default: () => ReactElement }>((resolveImportPromise) => {
+          resolveImport = resolveImportPromise;
+        }),
+    );
+
+    render(
+      <DynamicViewLoader
+        bundleUrl="/api/views/pending/bundle.js"
+        viewId="pending.view"
+      />,
+    );
+
+    expect(screen.getByText("Loading view…")).toBeTruthy();
+    expect(screen.queryByTestId("dynamic-view-loader")).toBeNull();
+    expect(
+      document.querySelector('[data-view-loader-state="mounted"]'),
+    ).toBeNull();
+
+    await act(async () => {
+      resolveImport?.({
+        default: function PendingPanel() {
+          return <div>Pending panel mounted</div>;
+        },
+      });
+    });
+
+    await screen.findByText("Pending panel mounted");
+    expect(
+      screen
+        .getByTestId("dynamic-view-loader")
+        .getAttribute("data-view-loader-state"),
+    ).toBe("mounted");
   });
 
   it("does not reserve chat clearance owned by an enclosing shell", async () => {
@@ -240,6 +281,11 @@ describe("DynamicViewLoader", () => {
     );
     expect(importBundle).not.toHaveBeenCalled();
     expect(screen.queryByText("Host realm bundle loaded")).toBeNull();
+    expect(
+      screen
+        .getByTestId("dynamic-view-loader")
+        .getAttribute("data-view-loader-state"),
+    ).toBe("loading");
   });
 
   it("fails closed when sandboxed iframe views omit frameUrl", () => {
@@ -267,6 +313,9 @@ describe("DynamicViewLoader", () => {
       screen.queryByTestId("sandboxed-view-frame-sandboxed.panel"),
     ).toBeNull();
     expect(importBundle).not.toHaveBeenCalled();
+    expect(
+      document.querySelector('[data-view-loader-state="mounted"]'),
+    ).toBeNull();
   });
 
   it("registers remote view interact handlers after the bundle loads", async () => {
@@ -325,6 +374,12 @@ describe("DynamicViewLoader", () => {
 
     render(<DynamicViewLoader bundleUrl={bundleUrl} viewId="window.manager" />);
     await screen.findByText("Window manager state");
+
+    const serializedStates = document.querySelectorAll("[data-view-state]");
+    expect(serializedStates).toHaveLength(1);
+    expect(
+      JSON.parse(serializedStates[0]?.getAttribute("data-view-state") ?? ""),
+    ).toEqual({ viewId: "window.manager", open: true });
 
     const { dispatchViewInteract } = await import("./view-interact-registry");
     await dispatchViewInteract(
@@ -883,23 +938,29 @@ describe("DynamicViewLoader", () => {
     const secondInteract = vi.fn(async () => ({ version: "second" }));
     const firstUrl = "https://capability.example.test/assets/first.js";
     const secondUrl = "https://capability.example.test/assets/second.js";
+    let resolveSecond:
+      | ((module: {
+          default: () => ReactElement;
+          interact: typeof secondInteract;
+        }) => void)
+      | undefined;
 
-    window.__ELIZA_DYNAMIC_VIEW_BUNDLE_IMPORT__ = vi.fn(async (url) => {
+    window.__ELIZA_DYNAMIC_VIEW_BUNDLE_IMPORT__ = vi.fn((url) => {
       if (url === firstUrl) {
-        return {
+        return Promise.resolve({
           default: function FirstPanel() {
             return <div>First dynamic panel</div>;
           },
           interact: firstInteract,
           cleanup: cleanupFirst,
-        };
+        });
       }
-      return {
-        default: function SecondPanel() {
-          return <div>Second dynamic panel</div>;
-        },
-        interact: secondInteract,
-      };
+      return new Promise<{
+        default: () => ReactElement;
+        interact: typeof secondInteract;
+      }>((resolveImport) => {
+        resolveSecond = resolveImport;
+      });
     });
 
     const rendered = render(
@@ -911,6 +972,11 @@ describe("DynamicViewLoader", () => {
       />,
     );
     await screen.findByText("First dynamic panel");
+    expect(
+      screen
+        .getByTestId("dynamic-view-loader")
+        .getAttribute("data-view-loader-state"),
+    ).toBe("mounted");
 
     rendered.rerender(
       <DynamicViewLoader
@@ -920,6 +986,26 @@ describe("DynamicViewLoader", () => {
         surface={AGENT_SURFACE_MANIFEST}
       />,
     );
+
+    // The new identity must not inherit either the previous marker or its DOM
+    // while the replacement import is still unresolved.
+    expect(screen.queryByText("First dynamic panel")).toBeNull();
+    expect(screen.getByText("Loading view…")).toBeTruthy();
+    expect(screen.queryByTestId("dynamic-view-loader")).toBeNull();
+    expect(
+      document.querySelector(
+        '[data-view-id="replace.second"][data-view-loader-state="mounted"]',
+      ),
+    ).toBeNull();
+
+    await act(async () => {
+      resolveSecond?.({
+        default: function SecondPanel() {
+          return <div>Second dynamic panel</div>;
+        },
+        interact: secondInteract,
+      });
+    });
     await screen.findByText("Second dynamic panel");
 
     const { dispatchViewInteract } = await import("./view-interact-registry");
@@ -972,6 +1058,9 @@ describe("DynamicViewLoader", () => {
 
     await screen.findByText("Failed to load view");
     expect(screen.getByText("View ID: broken.view")).toBeTruthy();
+    expect(
+      document.querySelector('[data-view-loader-state="mounted"]'),
+    ).toBeNull();
   });
 
   it("shows the recoverable card (never a blank screen) when the bundle import rejects, and Retry re-imports", async () => {
@@ -1007,6 +1096,9 @@ describe("DynamicViewLoader", () => {
       screen.getByText("Failed to fetch dynamically imported module"),
     ).toBeTruthy();
     expect(container.textContent).not.toBe("");
+    expect(
+      document.querySelector('[data-view-loader-state="mounted"]'),
+    ).toBeNull();
 
     await act(async () => {
       retry.click();
@@ -1015,6 +1107,11 @@ describe("DynamicViewLoader", () => {
     // Retry actually re-attempts the import — the fixed bundle mounts.
     await screen.findByText("Network recovered v2");
     expect(screen.queryByText("Failed to load view")).toBeNull();
+    expect(
+      screen
+        .getByTestId("dynamic-view-loader")
+        .getAttribute("data-view-loader-state"),
+    ).toBe("mounted");
     expect(window.__ELIZA_DYNAMIC_VIEW_BUNDLE_IMPORT__).toHaveBeenCalledTimes(
       2,
     );
@@ -1049,6 +1146,16 @@ describe("DynamicViewLoader", () => {
     const retry = await screen.findByRole("button", { name: /retry/i });
     expect(screen.getByText("Failed to load view")).toBeTruthy();
     expect(screen.getByRole("button", { name: /back to views/i })).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("dynamic-view-loader")
+          .getAttribute("data-view-loader-state"),
+      ).toBe("error"),
+    );
+    expect(
+      document.querySelector('[data-view-loader-state="mounted"]'),
+    ).toBeNull();
 
     await act(async () => {
       retry.click();
@@ -1057,6 +1164,11 @@ describe("DynamicViewLoader", () => {
     // Second import returns a component that renders cleanly.
     await screen.findByText("Recovered panel v2");
     expect(screen.queryByText("Failed to load view")).toBeNull();
+    expect(
+      screen
+        .getByTestId("dynamic-view-loader")
+        .getAttribute("data-view-loader-state"),
+    ).toBe("mounted");
     consoleError.mockRestore();
   });
 

@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __resetDynamicViewLoaderCacheForTests,
@@ -43,10 +49,59 @@ describe("DynamicViewLoader sandboxed iframe document contract", () => {
     expect(frame.getAttribute("sandbox")?.split(" ")).toContain(
       "allow-scripts",
     );
-    const readyView = screen.getByTestId("dynamic-view-loader");
-    expect(readyView.getAttribute("data-view-id")).toBe("sandboxed.view");
-    expect(readyView.getAttribute("data-view-state")).toBe("ready");
+    const loadedView = screen.getByTestId("dynamic-view-loader");
+    expect(loadedView.getAttribute("data-view-id")).toBe("sandboxed.view");
+    expect(loadedView.getAttribute("data-view-loader-state")).toBe("loading");
+    expect(loadedView.hasAttribute("data-view-state")).toBe(false);
+
+    fireEvent.load(frame);
+
+    expect(loadedView.getAttribute("data-view-loader-state")).toBe("loaded");
     expect(importBundle).not.toHaveBeenCalled();
+  });
+
+  it("reports a frame load failure as error and retries from loading", async () => {
+    render(
+      <DynamicViewLoader
+        frameUrl="/api/views/failing.frame/frame.html"
+        viewId="failing.frame"
+        surface={{ isolation: "sandboxed-iframe" }}
+      />,
+    );
+
+    const frame = screen.getByTestId("sandboxed-view-frame-failing.frame");
+    const loader = screen.getByTestId("dynamic-view-loader");
+    expect(loader.getAttribute("data-view-loader-state")).toBe("loading");
+
+    fireEvent.error(frame);
+
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("dynamic-view-loader")
+          .getAttribute("data-view-loader-state"),
+      ).toBe("error"),
+    );
+    expect(screen.getByText("Failed to load view")).toBeTruthy();
+    expect(
+      screen.queryByTestId("sandboxed-view-frame-failing.frame"),
+    ).toBeNull();
+    expect(
+      document.querySelector('[data-view-loader-state="loaded"]'),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("dynamic-view-loader")
+          .getAttribute("data-view-loader-state"),
+      ).toBe("loading"),
+    );
+    expect(
+      screen.getByTestId("sandboxed-view-frame-failing.frame"),
+    ).toBeTruthy();
   });
 
   it("fails closed when a sandboxed-iframe view only has a JavaScript bundleUrl", () => {
@@ -66,6 +121,7 @@ describe("DynamicViewLoader sandboxed iframe document contract", () => {
     expect(
       screen.queryByTestId("sandboxed-view-frame-broken.sandbox"),
     ).toBeNull();
+    expect(screen.queryByTestId("dynamic-view-loader")).toBeNull();
     expect(importBundle).not.toHaveBeenCalled();
   });
 });

@@ -1,11 +1,10 @@
 // @vitest-environment jsdom
 //
-// Startup priming of the /api/auth/me probe (primeAuthStatusProbe): the
-// restore phase starts the probe while the backend polling/hydration phases
-// run, and the hook's activation reuses that result instead of serializing a
-// fresh probe after first paint. Real useAuthStatus + authMe modules under
-// test; only global fetch (the network boundary) is stubbed. The shared
-// module snapshot is reset per test via the __resetAuthStatusForTests seam.
+// Startup auth-probe coordination: restoration primes /api/auth/me alongside
+// hydration, while an out-of-band session change waits out any obsolete probe
+// before fetching again. Real useAuthStatus + authMe modules under test; only
+// global fetch (the network boundary) is stubbed. The shared module snapshot is
+// reset per test via the __resetAuthStatusForTests seam.
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +13,7 @@ import {
   __setAuthStatusForTests,
   isAuthenticatedNow,
   primeAuthStatusProbe,
+  refreshAuthStatus,
   subscribeAuthStatus,
   useAuthStatus,
 } from "./useAuthStatus";
@@ -141,6 +141,39 @@ describe("primeAuthStatusProbe + activation reuse", () => {
       expect(result.current.state.phase).toBe("authenticated"),
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs a post-session probe after an in-flight pre-session request settles", async () => {
+    let resolvePreSessionProbe: (response: Response) => void = () => {};
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolvePreSessionProbe = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(jsonResponse(200, AUTH_ME_BODY));
+
+    const { result } = renderHook(() => useAuthStatus({ pollIntervalMs: 0 }));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    let refreshPromise: Promise<void> | undefined;
+    act(() => {
+      refreshPromise = refreshAuthStatus();
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvePreSessionProbe(
+        jsonResponse(401, { reason: "remote_auth_required" }),
+      );
+      await refreshPromise;
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(result.current.state.phase).toBe("authenticated"),
+    );
   });
 
   it("refetch() still forces a real probe after a primed result", async () => {

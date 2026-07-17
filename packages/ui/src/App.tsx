@@ -2190,6 +2190,7 @@ export function App() {
     skip:
       !isShellPaintableNow ||
       isPopout ||
+      bootstrapOwnsSurface ||
       (isAgentlessCloudOrigin &&
         firstRunOwnsLoginSurface(startupCoordinator.phase, firstRunComplete)),
   });

@@ -26,7 +26,7 @@ import {
 } from "@elizaos/core";
 import { logger } from "@elizaos/logger";
 import { dispatchNavigateViewEvent } from "@elizaos/shared/events";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { shellLocalStorage } from "../../surface-realm-channel";
 import { resolveSandboxTokens } from "./sandbox-policy";
 import {
@@ -143,6 +143,10 @@ interface SandboxedViewFrameProps {
   /** Extra sandbox tokens to union with the safe default; validated (never defeats the sandbox). */
   sandboxExtra?: readonly string[];
   title: string;
+  /** Reports that the framed document reached the browser load event. */
+  onLoad?: () => void;
+  /** Reports a browser-level frame load failure to the owning loader. */
+  onError?: () => void;
 }
 
 /**
@@ -158,6 +162,8 @@ export function SandboxedViewFrame({
   srcDoc,
   sandboxExtra,
   title,
+  onLoad,
+  onError,
 }: SandboxedViewFrameProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const resolvedManifest: ResolvedSurfaceManifest = useMemo(
@@ -174,6 +180,19 @@ export function SandboxedViewFrame({
     () => createSandboxHostFacilities(viewId),
     [viewId],
   );
+
+  // A direct listener observes the frame element itself; relying on bubbling is
+  // unsafe because iframe load/error events do not bubble through the document.
+  useLayoutEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    if (onLoad) frame.addEventListener("load", onLoad);
+    if (onError) frame.addEventListener("error", onError);
+    return () => {
+      if (onLoad) frame.removeEventListener("load", onLoad);
+      if (onError) frame.removeEventListener("error", onError);
+    };
+  }, [onError, onLoad]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {

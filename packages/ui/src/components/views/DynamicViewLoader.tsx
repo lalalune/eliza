@@ -17,6 +17,11 @@
  * Standard capabilities (get-text, get-state, refresh, focus-element,
  * click-element, fill-input) are handled by the loader itself even when the
  * module has no interact export.
+ *
+ * Loader lifecycle uses `data-view-loader-state`; `data-view-state` remains
+ * exclusively plugin-owned serialized state. A host view reaches `mounted`
+ * only after its subtree commits, while a sandbox reaches `loaded` only after
+ * the iframe load event.
  */
 
 import {
@@ -122,6 +127,32 @@ interface ViewBundleModule {
     params?: Record<string, unknown>,
   ) => Promise<unknown>;
   cleanup?: () => void | Promise<void>;
+}
+
+interface LoadedViewBundle {
+  requestKey: string;
+  module: ViewBundleModule;
+}
+
+type HostViewLifecycle =
+  | { identity: string; phase: "mounted" }
+  | { identity: string; phase: "error" };
+
+type FrameViewLifecycle =
+  | { identity: string; phase: "loaded" }
+  | { identity: string; phase: "error"; error: Error };
+
+interface ViewMountedSignalProps {
+  identity: string;
+  onMounted: (identity: string) => void;
+}
+
+/** Reports only after the plugin subtree has committed inside its boundary. */
+function ViewMountedSignal({ identity, onMounted }: ViewMountedSignalProps) {
+  useLayoutEffect(() => {
+    onMounted(identity);
+  }, [identity, onMounted]);
+  return null;
 }
 
 interface ViewBundleCacheEntry {
@@ -1307,12 +1338,19 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
   // and talks to the shell only through the postMessage broker, so the in-realm
   // bundle-load / interact-registry path below is skipped for it.
   const isSandboxed = resolvedManifest.isolation === "sandboxed-iframe";
-  const [bundle, setBundle] = useState<ViewBundleModule | null>(null);
+  const [loadedBundle, setLoadedBundle] = useState<LoadedViewBundle | null>(
+    null,
+  );
   const [loadError, setLoadError] = useState<Error | null>(null);
   // Incrementing this key invalidates the module cache entry and forces a
   // fresh import. Used by the dev-mode ETag poller when the bundle changes,
   // and by the `refresh` standard capability.
   const [reloadKey, setReloadKey] = useState(0);
+  const bundleRequestKey = `${bundleUrl ?? ""}\u0000${componentExport}\u0000${reloadKey}`;
+  // A prop transition must stop exposing the previous module immediately,
+  // before the load effect gets its post-commit opportunity to clear state.
+  const bundle =
+    loadedBundle?.requestKey === bundleRequestKey ? loadedBundle.module : null;
   const dynamicLoadingAllowed = isDynamicViewLoadingAllowed();
   // Ref to the container div so standard capabilities (get-text, focus-element, get-state)
   // can query the DOM.
@@ -1323,22 +1361,23 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
   const viewIdRef = useRef(viewId);
   viewIdRef.current = viewId;
 
-  // reloadKey is intentionally a dependency: bumping it via the
-  // standard `refresh` capability or the dev-mode ETag poller must
-  // re-run this effect to invalidate the module cache.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey is a manual cache-bust trigger
+  // bundleRequestKey includes reloadKey, so refresh/HMR retries acquire a new
+  // lease even when the URL and named export themselves stay unchanged.
   useEffect(() => {
     if (!dynamicLoadingAllowed || isSandboxed || !bundleUrl) return;
 
     let cancelled = false;
     const lease = acquireBundleModule(bundleUrl, componentExport);
 
-    setBundle(null);
+    setLoadedBundle(null);
     setLoadError(null);
     void lease.promise
       .then((nextBundle) => {
         if (!cancelled) {
-          setBundle(nextBundle);
+          setLoadedBundle({
+            requestKey: bundleRequestKey,
+            module: nextBundle,
+          });
         }
       })
       .catch((err) => {
@@ -1357,10 +1396,10 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
     };
   }, [
     bundleUrl,
+    bundleRequestKey,
     componentExport,
     dynamicLoadingAllowed,
     isSandboxed,
-    reloadKey,
   ]);
 
   // Register this view's interact handler whenever the bundle is loaded.
@@ -1465,6 +1504,44 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
     setReloadKey((k) => k + 1);
   }, [bundleUrl, componentExport]);
 
+  const hostRenderIdentity = `${viewId}\u0000${viewType}\u0000${bundleRequestKey}`;
+  const frameRenderIdentity = `${viewId}\u0000${viewType}\u0000${frameUrl ?? ""}\u0000${reloadKey}`;
+  const [hostLifecycle, setHostLifecycle] = useState<HostViewLifecycle | null>(
+    null,
+  );
+  const [frameLifecycle, setFrameLifecycle] =
+    useState<FrameViewLifecycle | null>(null);
+  const hostLoaderState =
+    hostLifecycle?.identity === hostRenderIdentity
+      ? hostLifecycle.phase
+      : "mounting";
+  const frameLoaderState =
+    frameLifecycle?.identity === frameRenderIdentity
+      ? frameLifecycle.phase
+      : "loading";
+  const reportHostMounted = useCallback((identity: string) => {
+    setHostLifecycle({ identity, phase: "mounted" });
+  }, []);
+  const reportHostRenderError = useCallback(
+    (_error: Error) => {
+      setHostLifecycle({ identity: hostRenderIdentity, phase: "error" });
+    },
+    [hostRenderIdentity],
+  );
+  const reportFrameLoaded = useCallback(() => {
+    setFrameLifecycle({ identity: frameRenderIdentity, phase: "loaded" });
+  }, [frameRenderIdentity]);
+  const reportFrameError = useCallback(() => {
+    setFrameLifecycle({
+      identity: frameRenderIdentity,
+      phase: "error",
+      error: new Error(`Sandboxed view "${viewId}" failed to load its frame.`),
+    });
+  }, [frameRenderIdentity, viewId]);
+  const recoverFrame = useCallback(() => {
+    setReloadKey((k) => k + 1);
+  }, []);
+
   // iOS App Store and Google Play builds cannot load remote JS or HTML frame
   // documents at runtime; both execute plugin-provided code.
   if (!dynamicLoadingAllowed) {
@@ -1495,14 +1572,28 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
         data-testid="dynamic-view-loader"
         data-view-id={viewId}
         data-view-type={viewType}
-        data-view-state="ready"
+        data-view-loader-state={frameLoaderState}
       >
-        <SandboxedViewFrame
-          viewId={viewId}
-          surface={surface}
-          src={frameUrl}
-          title={viewId}
-        />
+        {frameLoaderState === "error" &&
+        frameLifecycle?.identity === frameRenderIdentity &&
+        frameLifecycle.phase === "error" ? (
+          <ViewErrorState
+            viewId={viewId}
+            error={frameLifecycle.error}
+            onRetry={recoverFrame}
+            onBack={navigateToViews}
+          />
+        ) : (
+          <SandboxedViewFrame
+            key={frameRenderIdentity}
+            viewId={viewId}
+            surface={surface}
+            src={frameUrl}
+            title={viewId}
+            onLoad={reportFrameLoaded}
+            onError={reportFrameError}
+          />
+        )}
       </div>
     );
   }
@@ -1558,14 +1649,14 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
       data-testid="dynamic-view-loader"
       data-view-id={viewId}
       data-view-type={viewType}
-      data-view-state="ready"
+      data-view-loader-state={hostLoaderState}
     >
       <AgentSurfaceProvider viewId={viewId} viewType={viewType}>
-        {/* Keyed by bundleUrl+reloadKey so a successful reload (refresh
-            capability / dev HMR / Retry) remounts the boundary with cleared
-            state instead of staying latched on a stale render crash. */}
+        {/* Keying by the full render identity clears a latched crash whenever
+            the bundle, export, retry generation, or owning view changes. */}
         <ErrorBoundary
-          key={`${bundleUrl}:${reloadKey}`}
+          key={hostRenderIdentity}
+          onError={reportHostRenderError}
           fallback={(error, resetErrorBoundary) => (
             <ViewErrorState
               viewId={viewId}
@@ -1586,6 +1677,10 @@ export const DynamicViewLoader = memo(function DynamicViewLoader({
               spatial plugin content scrolls above the chat affordance. */}
           <SpatialSurface reserveChatClearance={reserveChatClearance}>
             <View {...viewProps} />
+            <ViewMountedSignal
+              identity={hostRenderIdentity}
+              onMounted={reportHostMounted}
+            />
           </SpatialSurface>
         </ErrorBoundary>
         <AgentElementOverlay />

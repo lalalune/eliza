@@ -89,8 +89,9 @@ export function needsBootstrapSession(): boolean {
   try {
     return !sessionStorage.getItem("eliza_session");
   } catch {
-    // Storage can be unavailable in privacy mode. Requiring bootstrap is the
-    // fail-closed branch; skipping it could expose a shell with no bearer.
+    // error-policy:J4 storage can be unavailable in privacy mode. Requiring
+    // bootstrap is the explicit fail-closed surface; skipping it could expose
+    // a shell with no bearer.
     return true;
   }
 }
