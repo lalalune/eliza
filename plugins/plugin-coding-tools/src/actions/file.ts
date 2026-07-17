@@ -260,7 +260,19 @@ export const fileAction: Action = {
   contexts: [...CODING_TOOLS_CONTEXTS],
   contextGate: { anyOf: [...CODING_TOOLS_CONTEXTS] },
   roleGate: { minRole: "ADMIN" },
-  similes: ["FILE_OPERATION", "FILE_IO"],
+  // Stage-1 models routinely hint file work with invented names like
+  // FILES_READ / FILES_LIST; the retrieval layer resolves simile hints to this
+  // parent, so carrying the family here keeps those hints from going dead.
+  similes: [
+    "FILE_OPERATION",
+    "FILE_IO",
+    "FILES_READ",
+    "FILES_LIST",
+    "FILE_READ",
+    "FILE_LIST",
+    "READ_FILE",
+    "LIST_FILES",
+  ],
   description:
     "FILE action: read/write/edit/grep/glob/ls. Use target=device for device filesystem reads/writes/ls. Workspace paths absolute unless op defaults to session cwd.",
   descriptionCompressed:

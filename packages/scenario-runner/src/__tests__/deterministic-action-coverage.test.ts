@@ -70,7 +70,13 @@ const IMPORTED_CORE_PLUGINS: Record<string, Plugin> = {
 /** Expected action names for each imported core plugin (verified against live imports). */
 const CORE_ACTION_SURFACE: Record<string, readonly string[]> = {
   "@elizaos/plugin-app-control": ["APP", "BACKGROUND", "VIEWS"],
-  "@elizaos/plugin-coding-tools": ["FILE", "SHELL", "WORKTREE"],
+  "@elizaos/plugin-coding-tools": [
+    "FILE",
+    "SHELL",
+    "WEB_FETCH",
+    "WEB_SEARCH",
+    "WORKTREE",
+  ],
   "@elizaos/plugin-commands": [
     "COMMANDS_COMMAND",
     "COMPACT_COMMAND",
@@ -193,6 +199,10 @@ const KNOWN_UNCOVERED: readonly string[] = [
   // current runtime action surface without registering them as top-level actions.
   "CLOSE_ALL_VIEWS",
   "CLOSE_VIEW",
+  // Coding web research actions need deterministic network fixtures before
+  // they can join the keyless scenario-covered action set.
+  "WEB_FETCH",
+  "WEB_SEARCH",
   // New speaker-diarization action; no deterministic keyless scenario yet.
   "IDENTIFY_SPEAKER",
   // New on-device transcription actions; no deterministic keyless scenario yet.
