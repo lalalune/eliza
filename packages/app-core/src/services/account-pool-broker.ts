@@ -297,6 +297,17 @@ function normalizeReportCause(
   return null;
 }
 
+// Consumer diagnostics are classification hints, not trusted display text.
+// Only server-derived categories may cross into persistent usage/health state,
+// which is later exposed in account APIs and owner-visible logs.
+function persistenceSafeReportErrorCode(
+  report: AccountPoolBrokerReportRequest,
+): string {
+  const cause = normalizeReportCause(report);
+  if (cause) return cause.reason;
+  return typeof report.httpStatus === "number" ? "http_error" : "error";
+}
+
 function lastReportedStatusFromReport(
   report: AccountPoolBrokerReportRequest,
   atMs: number,
@@ -491,7 +502,9 @@ export class AccountPoolBroker {
         ...(report.latencyMs !== undefined
           ? { latencyMs: report.latencyMs }
           : {}),
-        ...(report.errorCode ? { errorCode: report.errorCode } : {}),
+        ...(!report.ok
+          ? { errorCode: persistenceSafeReportErrorCode(report) }
+          : {}),
         ...(report.model ? { model: report.model } : {}),
       },
       { providerId: lease.providerId },
@@ -533,7 +546,7 @@ export class AccountPoolBroker {
       await this.pool.markRateLimited(
         lease.accountId,
         retryUntilMs(this.now(), report.retryAfterMs),
-        report.errorCode ?? "rate_limited",
+        persistenceSafeReportErrorCode(report),
         { providerId: lease.providerId },
       );
       this.deleteLease(lease);
@@ -543,7 +556,7 @@ export class AccountPoolBroker {
     if (reportIsAuthFailure(report)) {
       await this.pool.markNeedsReauth(
         lease.accountId,
-        report.errorCode ?? "auth_failed",
+        persistenceSafeReportErrorCode(report),
         { providerId: lease.providerId },
       );
       this.deleteLease(lease);

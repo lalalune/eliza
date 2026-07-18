@@ -173,6 +173,84 @@ describe("AccountPoolBroker observability", () => {
     );
   });
 
+  it.each([
+    {
+      httpStatus: 429,
+      errorCode: "quota exceeded SENTINEL_DIAGNOSTIC_SHOULD_NOT_SURFACE",
+      expectedCode: "http_429",
+      mutation: "markRateLimited" as const,
+    },
+    {
+      httpStatus: 401,
+      errorCode: "refresh revoked SENTINEL_DIAGNOSTIC_SHOULD_NOT_SURFACE",
+      expectedCode: "http_401",
+      mutation: "markNeedsReauth" as const,
+    },
+  ])("forwards only classified $expectedCode diagnostics to $mutation", async ({
+    httpStatus,
+    errorCode,
+    expectedCode,
+    mutation,
+  }) => {
+    const recordCall = vi.fn(async () => {});
+    const markRateLimited = vi.fn(async () => {});
+    const markNeedsReauth = vi.fn(async () => {});
+    const pool = {
+      select: vi.fn(async () => account()),
+      recordCall,
+      markHealthy: vi.fn(async () => {}),
+      markRateLimited,
+      markNeedsReauth,
+      list: vi.fn(() => [account()]),
+    } as unknown as AccountPool;
+    const broker = new AccountPoolBroker({
+      pool,
+      now: () => 10_000,
+      idGenerator: () => "lease-primary",
+      tokenResolver: async () => ({
+        accessToken: "access",
+        accessExpiresAt: 20_000,
+      }),
+    });
+    await broker.lease({
+      providerId: "anthropic-subscription",
+      sessionKey: "session",
+    });
+
+    await broker.report({
+      leaseId: "lease-primary",
+      ok: false,
+      httpStatus,
+      errorCode,
+    });
+
+    expect(recordCall).toHaveBeenCalledWith(
+      "primary",
+      expect.objectContaining({ errorCode: expectedCode }),
+      { providerId: "anthropic-subscription" },
+    );
+    if (mutation === "markRateLimited") {
+      expect(markRateLimited).toHaveBeenCalledWith(
+        "primary",
+        expect.anything(),
+        expectedCode,
+        { providerId: "anthropic-subscription" },
+      );
+    } else {
+      expect(markNeedsReauth).toHaveBeenCalledWith("primary", expectedCode, {
+        providerId: "anthropic-subscription",
+      });
+    }
+    const healthMutation =
+      mutation === "markRateLimited" ? markRateLimited : markNeedsReauth;
+    expect(JSON.stringify(healthMutation.mock.calls)).not.toContain(
+      "SENTINEL_DIAGNOSTIC_SHOULD_NOT_SURFACE",
+    );
+    expect(JSON.stringify(recordCall.mock.calls)).not.toContain(
+      "SENTINEL_DIAGNOSTIC_SHOULD_NOT_SURFACE",
+    );
+  });
+
   it("records failover only for a different account within sixty seconds", async () => {
     let now = 1_000;
     let nextAccountId = "a";
