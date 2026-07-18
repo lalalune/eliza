@@ -18,6 +18,7 @@ import {
 } from "../services/account-pool.js";
 import {
   __resetAccountPoolBrokerRoutesForTests,
+  getAccountPoolBrokerSnapshot,
   handleAccountPoolBrokerRoute,
 } from "./account-pool-broker-routes.js";
 
@@ -175,6 +176,25 @@ afterEach(() => {
 });
 
 describe("account-pool broker route auth", () => {
+  it("distinguishes an unavailable broker from a live broker with no activity", async () => {
+    expect(getAccountPoolBrokerSnapshot()).toBeNull();
+
+    const res = fakeRes();
+    await handleAccountPoolBrokerRoute(
+      fakeReq("/internal/account-pool/v1/health", {
+        method: "GET",
+        auth: `Bearer ${SECRET}`,
+      }),
+      res.res,
+    );
+
+    expect(res.status()).toBe(200);
+    expect(getAccountPoolBrokerSnapshot()).toEqual({
+      accounts: {},
+      providers: {},
+    });
+  });
+
   it("is absent unless explicitly enabled with a strong bearer secret", async () => {
     delete process.env.ELIZA_ACCOUNT_POOL_BROKER_ENABLED;
     const res = fakeRes();
