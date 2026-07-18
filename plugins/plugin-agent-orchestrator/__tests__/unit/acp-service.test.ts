@@ -699,10 +699,14 @@ describe("AcpService", () => {
         runtime({}, { ACPX_SUB_AGENT_ROUTER: router }),
       );
       await service.start();
+      // SKILLS.md is written only into orchestrator-owned isolated scratch
+      // (096cb58f3a2), so the broker advertisement must be asserted there —
+      // spawn isolated and read from the session's own workdir.
       const promise = service.spawnSession({
         name: "broker-spawn",
         agentType: "codex",
         workdir: dir,
+        isolateWorkdir: true,
       });
       await waitForSpawn(reg);
       reg.proc.stdout.emit(
@@ -712,12 +716,12 @@ describe("AcpService", () => {
         ),
       );
       closeOk(reg);
-      await promise;
+      const result = await promise;
 
-      expect(readFileSync(join(dir, "SKILLS.md"), "utf8")).toContain(
+      expect(readFileSync(join(result.workdir, "SKILLS.md"), "utf8")).toContain(
         "Parent Eliza Agent",
       );
-      expect(readFileSync(join(dir, "AGENTS.md"), "utf8")).toContain(
+      expect(readFileSync(join(result.workdir, "AGENTS.md"), "utf8")).toContain(
         "Asking the parent Eliza agent to act",
       );
     } finally {
