@@ -299,11 +299,8 @@ function brokerAccountKey(
   return `${providerId}:${accountId}`;
 }
 
-function brokerSnapshot(): AccountPoolBrokerSnapshot {
-  const getter = getAgentHostBridge().getAccountPoolBrokerSnapshot;
-  return typeof getter === "function"
-    ? getter()
-    : { accounts: {}, providers: {} };
+function brokerSnapshot(): AccountPoolBrokerSnapshot | null {
+  return getAgentHostBridge().getAccountPoolBrokerSnapshot();
 }
 
 /** Test-only: drop the cached pool reference between tests. */
@@ -918,7 +915,7 @@ async function handleListAllAccounts(
     // so the UI can label the active row without re-deriving policy. Guarded
     // because older host bridges may not implement selectionState.
     const selection = pool.selectionState?.(providerId, strategy);
-    const providerBroker = broker.providers[providerId];
+    const providerBroker = broker?.providers[providerId];
     const lastSelection = providerBroker?.lastSelection
       ? {
           accountId: providerBroker.lastSelection.accountId,
@@ -939,24 +936,32 @@ async function handleListAllAccounts(
       runtimeEligibility: runtimeEligibilityForProvider(providerId),
       accounts: linkedConfigs.map((cfg) => {
         const brokerAccount =
-          broker.accounts[brokerAccountKey(providerId, cfg.id)];
+          broker?.accounts[brokerAccountKey(providerId, cfg.id)];
         return {
           ...cfg,
           hasCredential: onDiskSet.has(cfg.id),
-          observability: {
-            activeLeaseCount: brokerAccount
-              ? brokerAccount.activeLeaseCount
-              : 0,
-            lastLeaseAt: brokerAccount?.lastLeaseAt ?? null,
-            servedLastRequest: lastSelection?.accountId === cfg.id,
-          },
+          ...(broker
+            ? {
+                observability: {
+                  activeLeaseCount: brokerAccount
+                    ? brokerAccount.activeLeaseCount
+                    : 0,
+                  lastLeaseAt: brokerAccount?.lastLeaseAt ?? null,
+                  servedLastRequest: lastSelection?.accountId === cfg.id,
+                },
+              }
+            : {}),
         };
       }),
       ...(selection ? { selection } : {}),
-      observability: {
-        lastSelection,
-        recentFailovers,
-      },
+      ...(broker
+        ? {
+            observability: {
+              lastSelection,
+              recentFailovers,
+            },
+          }
+        : {}),
     };
   });
   json(res, { providers });

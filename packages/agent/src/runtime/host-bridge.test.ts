@@ -26,6 +26,7 @@ describe("agent host bridge (downward injection seam)", () => {
 
     // Mirrors the mobile `app-core-runtime.cjs` stub behavior exactly.
     expect(bridge.getDefaultAccountPool()).toBeNull();
+    expect(bridge.getAccountPoolBrokerSnapshot()).toBeNull();
     await expect(bridge.runVaultBootstrap()).resolves.toEqual({
       migrated: 0,
       failed: [],

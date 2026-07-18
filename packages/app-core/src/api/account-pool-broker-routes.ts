@@ -74,8 +74,8 @@ function broker(): AccountPoolBroker {
   return brokerSingleton;
 }
 
-export function getAccountPoolBrokerSnapshot(): AccountPoolBrokerSnapshot {
-  return brokerSingleton?.snapshot() ?? { accounts: {}, providers: {} };
+export function getAccountPoolBrokerSnapshot(): AccountPoolBrokerSnapshot | null {
+  return brokerSingleton?.snapshot() ?? null;
 }
 
 function sendBrokerJson(

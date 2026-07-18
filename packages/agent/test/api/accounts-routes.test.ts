@@ -566,7 +566,7 @@ describe("accounts routes provider-scoped account resolution", () => {
     expect(JSON.stringify(codex)).not.toContain("accessToken");
   });
 
-  it("returns explicit empty observability when the broker has no state", async () => {
+  it("returns explicit empty observability when the loaded broker has no state", async () => {
     const personal = linkedAccount("openai-codex", {
       id: "personal",
       label: "Personal",
@@ -618,6 +618,40 @@ describe("accounts routes provider-scoped account resolution", () => {
           servedLastRequest: false,
         },
       }),
+    ]);
+  });
+
+  it("omits observability when the host has no live broker", async () => {
+    const personal = linkedAccount("openai-codex", {
+      id: "personal",
+      label: "Personal",
+    });
+    poolMock.list.mockImplementation((providerId?: string) =>
+      providerId === "openai-codex" ? [personal] : [],
+    );
+    poolMock.selectionState.mockReturnValue(undefined);
+    setAgentHostBridge({
+      ...defaultAgentHostBridge,
+      getDefaultAccountPool: () => poolMock,
+    });
+    _resetAccountsRoutesPoolCache();
+    const ctx = createContext({ method: "GET", pathname: "/api/accounts" });
+
+    expect(await handleAccountsRoutes(ctx)).toBe(true);
+
+    const response = ctx.body as {
+      providers: Array<{
+        providerId: string;
+        observability?: unknown;
+        accounts: Array<{ id: string; observability?: unknown }>;
+      }>;
+    };
+    const codex = response.providers.find(
+      (entry) => entry.providerId === "openai-codex",
+    );
+    expect(codex).not.toHaveProperty("observability");
+    expect(codex?.accounts).toEqual([
+      expect.not.objectContaining({ observability: expect.anything() }),
     ]);
   });
 
