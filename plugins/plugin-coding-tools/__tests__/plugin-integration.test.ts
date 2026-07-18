@@ -65,6 +65,8 @@ describe("@elizaos/plugin-coding-tools — plugin export shape", () => {
     const fileAction = (codingToolsPlugin.actions ?? []).find(
       (action) => action.name === "FILE",
     );
+    // LIST_FILES also describes stored media, so core treats the cross-parent
+    // claim as ambiguous and lets semantic retrieval choose the relevant action.
     expect(fileAction?.similes).toEqual([
       "FILE_OPERATION",
       "FILE_IO",

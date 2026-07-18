@@ -168,11 +168,8 @@ describe("action catalogue and retrieval", () => {
 	});
 
 	it("drops a simile claimed by multiple parents instead of first-writer-wins (#16561)", () => {
-		// The live collision this locks: LIST_FILES was a simile on BOTH the
-		// coding-tools FILE action and the stored-media FILES action; catalog
-		// order is alphabetical, so the earlier parent silently stole the
-		// other's intent. An ambiguous simile must not route at all — the
-		// planner then falls back to keyword/BM25 scoring over both parents.
+		// LIST_FILES describes both filesystem operations and stored media; exact
+		// routing must not let alphabetical catalog order choose between them.
 		const catalog = buildActionCatalog([
 			{
 				name: "FILE",
@@ -186,6 +183,12 @@ describe("action catalogue and retrieval", () => {
 				similes: ["LIST_FILES", "RECENT_FILES"],
 				tags: ["media"],
 			},
+			{
+				name: "ARCHIVE",
+				description: "List files retained in an archive.",
+				similes: ["LIST_FILES"],
+				tags: ["archive"],
+			},
 			...actions,
 		]);
 		const response = retrieveActions({
@@ -193,9 +196,13 @@ describe("action catalogue and retrieval", () => {
 			messageText: "totally unrelated message",
 			candidateActions: ["LIST_FILES"],
 		});
-		// Neither parent may claim the ambiguous hint via the exact stage.
+		// No parent may claim the ambiguous hint via the exact stage.
 		for (const result of response.results) {
-			if (result.name === "FILE" || result.name === "FILES") {
+			if (
+				result.name === "FILE" ||
+				result.name === "FILES" ||
+				result.name === "ARCHIVE"
+			) {
 				expect(result.matchedBy).not.toContain("exact");
 			}
 		}

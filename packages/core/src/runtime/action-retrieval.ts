@@ -995,8 +995,7 @@ function hasOnlyOperationTokens(tokens: Set<string>): boolean {
 	return true;
 }
 
-/** Once-per-process dedupe for the ambiguous-simile warn — the resolver runs
- *  on every retrieval and the catalog is stable within a process. */
+// Catalogs are stable within a process, while retrieval runs for every turn.
 const warnedAmbiguousSimiles = new Set<string>();
 
 function resolveSimileParentHints(
@@ -1008,12 +1007,7 @@ function resolveSimileParentHints(
 	}
 	const parentNames = new Set(parents.map((parent) => parent.normalizedName));
 	const parentBySimile = new Map<string, string>();
-	// A simile claimed by MORE than one parent is ambiguous and must not route
-	// at all (#16561): first-writer-wins silently steals the intent from the
-	// other parent (catalog order is alphabetical, not semantic — e.g. a
-	// LIST_FILES simile on both a file-ops action and a stored-media action).
-	// The warn dedupes per process: this resolver runs on every retrieval.
-	const ambiguousSimiles = new Set<string>();
+	const parentsBySimile = new Map<string, Set<string>>();
 	for (const parent of parents) {
 		const ownSimiles = new Set(
 			[
@@ -1026,27 +1020,30 @@ function resolveSimileParentHints(
 			}),
 		);
 		for (const normalized of ownSimiles) {
-			const claimedBy = parentBySimile.get(normalized);
-			if (claimedBy !== undefined && claimedBy !== parent.normalizedName) {
-				if (!warnedAmbiguousSimiles.has(normalized)) {
-					warnedAmbiguousSimiles.add(normalized);
-					logger.warn(
-						{
-							src: "action-retrieval",
-							simile: normalized,
-							parents: [claimedBy, parent.normalizedName],
-						},
-						"simile claimed by multiple parents — dropped from routing as ambiguous",
-					);
-				}
-				ambiguousSimiles.add(normalized);
-				continue;
-			}
-			parentBySimile.set(normalized, parent.normalizedName);
+			const claimedBy = parentsBySimile.get(normalized) ?? new Set<string>();
+			claimedBy.add(parent.normalizedName);
+			parentsBySimile.set(normalized, claimedBy);
 		}
 	}
-	for (const normalized of ambiguousSimiles) {
-		parentBySimile.delete(normalized);
+	for (const [normalized, claimedBy] of parentsBySimile) {
+		if (claimedBy.size === 1) {
+			const [parentName] = claimedBy;
+			if (parentName) parentBySimile.set(normalized, parentName);
+			continue;
+		}
+		// Exact routing would let catalog order choose among semantically distinct
+		// parents. Dropping the hint preserves keyword/BM25 retrieval over all of them.
+		if (!warnedAmbiguousSimiles.has(normalized)) {
+			warnedAmbiguousSimiles.add(normalized);
+			logger.warn(
+				{
+					src: "action-retrieval",
+					simile: normalized,
+					parents: [...claimedBy].sort(),
+				},
+				"simile claimed by multiple parents — dropped from routing as ambiguous",
+			);
+		}
 	}
 	return candidateActions.flatMap((actionName) => {
 		if (parentNames.has(actionName)) {
