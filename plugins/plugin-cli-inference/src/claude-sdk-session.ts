@@ -183,6 +183,7 @@ type SdkMessage = {
 };
 type SdkQuery = AsyncIterable<SdkMessage> & {
   interrupt?: () => Promise<void>;
+  close?: () => void;
 };
 type SdkQueryFn = (options: {
   prompt: AsyncIterable<SdkUserMessage>;
@@ -579,7 +580,7 @@ export class ClaudeSdkSession {
       this.query = null;
       this.iterator = null;
       this.feed = null;
-      stale?.interrupt?.().catch(() => {});
+      if (stale) await this.closeQuery(stale);
       throw new ProviderApiError("[cli-inference:sdk] session disposed during start", {
         retryable: true,
       });
@@ -598,6 +599,10 @@ export class ClaudeSdkSession {
     let timer: NodeJS.Timeout | undefined;
     try {
       const startEpoch = this.epoch;
+      if (this.turnTimeoutMs === 0) {
+        await this.start(startEpoch);
+        return;
+      }
       await Promise.race([
         this.start(startEpoch),
         new Promise<never>((_, reject) => {
@@ -613,13 +618,70 @@ export class ClaudeSdkSession {
         }),
       ]);
     } catch (error) {
-      // error-policy:J2 context-adding rethrow — dispose (bumping the epoch so
-      // a late-resolving start tears itself down), then rethrow unchanged.
+      // error-policy:J2 context-adding rethrow — disposal bumps the epoch so a
+      // late start tears itself down; the cause preserves the provider failure.
       await this.dispose();
-      throw error;
+      const cause = error instanceof Error ? error : new Error(String(error));
+      throw new ProviderApiError(`[cli-inference:sdk] session start failed: ${cause.message}`, {
+        ...(error instanceof ProviderApiError && error.statusCode !== undefined
+          ? { statusCode: error.statusCode }
+          : {}),
+        retryable: error instanceof ProviderApiError ? error.retryable : false,
+        cause,
+      });
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  private async interruptWithBudget(query: SdkQuery): Promise<void> {
+    if (!query.interrupt) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        query.interrupt(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            logger.warn(
+              {
+                src: "cli-inference:sdk",
+                model: this.model,
+                mode: this.mode,
+              },
+              `[cli-inference:sdk] abandoning interrupt of a wedged session after ${DISPOSE_INTERRUPT_BUDGET_MS}ms`
+            );
+            resolve();
+          }, DISPOSE_INTERRUPT_BUDGET_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      // error-policy:J6 best-effort teardown — references are already cleared;
+      // retain a diagnostic without replacing the failure that caused cleanup.
+      logger.debug(
+        { src: "cli-inference:sdk", model: this.model, mode: this.mode, error },
+        "[cli-inference:sdk] session interrupt failed during teardown"
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async closeQuery(query: SdkQuery): Promise<void> {
+    if (query.close) {
+      try {
+        query.close();
+        return;
+      } catch (error) {
+        // error-policy:J6 best-effort teardown — a force-close failure falls
+        // through to the bounded interrupt path and remains observable.
+        logger.warn(
+          { src: "cli-inference:sdk", model: this.model, mode: this.mode, error },
+          "[cli-inference:sdk] force-closing the SDK query failed"
+        );
+      }
+    }
+    await this.interruptWithBudget(query);
   }
 
   private async nextWithTurnTimeout(): Promise<IteratorResult<SdkMessage>> {
@@ -809,32 +871,6 @@ export class ClaudeSdkSession {
     this.turns = 0;
     this.pendingDecision = null;
     this.pendingEnvelope = null;
-    if (q?.interrupt) {
-      let timer: NodeJS.Timeout | undefined;
-      try {
-        await Promise.race([
-          q.interrupt(),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(() => {
-              logger.warn(
-                {
-                  src: "cli-inference:sdk",
-                  model: this.model,
-                  mode: this.mode,
-                },
-                `[cli-inference:sdk] abandoning interrupt of a wedged session after ${DISPOSE_INTERRUPT_BUDGET_MS}ms`
-              );
-              resolve();
-            }, DISPOSE_INTERRUPT_BUDGET_MS);
-            timer.unref?.();
-          }),
-        ]);
-      } catch {
-        // error-policy:J6 best-effort teardown — interrupting an already-dead
-        // query on dispose; failure here does not matter (the session is discarded).
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    }
+    if (q) await this.closeQuery(q);
   }
 }

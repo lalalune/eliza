@@ -35,7 +35,7 @@ type ToolHandler = (args: {
 /** Build a fake SdkModule that replays `scripts` turn-by-turn over one warm query. */
 function makeFakeSdk(
   scripts: TurnScript[],
-  fakeOpts: { interrupt?: () => Promise<void> } = {}
+  fakeOpts: { interrupt?: () => Promise<void>; close?: () => void } = {}
 ): {
   sdk: SdkModule;
   starts: () => number;
@@ -90,6 +90,7 @@ function makeFakeSdk(
       return {
         [Symbol.asyncIterator]: () => iter,
         interrupt: fakeOpts.interrupt ?? (async () => {}),
+        ...(fakeOpts.close ? { close: fakeOpts.close } : {}),
       } as unknown as ReturnType<SdkModule["query"]>;
     },
   };
@@ -108,10 +109,12 @@ function makeSession(
     turnTimeoutMs?: number;
     subprocessEnv?: Record<string, string | undefined>;
     interrupt?: () => Promise<void>;
+    close?: () => void;
   } = {}
 ) {
   const { sdk, starts, queryOptions } = makeFakeSdk(scripts, {
     interrupt: opts.interrupt,
+    close: opts.close,
   });
   const session = new ClaudeSdkSession({
     model: "test-model",
@@ -231,6 +234,20 @@ describe("ClaudeSdkSession — TEXT mode", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("force-closes the real SDK query shape instead of leaving its subprocess warm", async () => {
+    const close = vi.fn();
+    const interrupt = vi.fn(async () => undefined);
+    const { session } = makeSession([{ text: "done", subtype: "success" }], {
+      close,
+      interrupt,
+    });
+
+    expect(await session.send("hi")).toBe("done");
+    await session.dispose();
+    expect(close).toHaveBeenCalledOnce();
+    expect(interrupt).not.toHaveBeenCalled();
   });
 
   it("explicit turnTimeoutMs 0 opts out to an unbounded turn (#16553)", async () => {
@@ -423,5 +440,30 @@ describe("start-path timeout (#16553)", () => {
     releaseStart?.();
     await new Promise((res) => setTimeout(res, 20));
     expect(inner.query).toBeNull();
+  });
+
+  it("keeps startup unbounded when the operator explicitly sets a zero budget", async () => {
+    const { session } = makeSession([{ text: "started", subtype: "success" }], {
+      turnTimeoutMs: 0,
+    });
+    const inner = session as unknown as { start: (...args: unknown[]) => Promise<void> };
+    const realStart = inner.start.bind(session);
+    let releaseStart: (() => void) | undefined;
+    inner.start = async (...args: unknown[]) => {
+      await new Promise<void>((resolve) => {
+        releaseStart = resolve;
+      });
+      await realStart(...args);
+    };
+
+    let settled = false;
+    const turn = session.send("hi").finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    releaseStart?.();
+    await expect(turn).resolves.toBe("started");
+    await session.dispose();
   });
 });
