@@ -214,6 +214,43 @@ describe("accounts routes provider-scoped account resolution", () => {
     expect(invalid.status).toBe(400);
   });
 
+  it("rejects cross-provider credential replacement before any write", async () => {
+    const unknown = createContext({
+      method: "POST",
+      pathname: "/api/accounts/not-real",
+      body: {
+        source: "api-key",
+        label: "Unknown",
+        apiKey: "sk-test-unknown",
+      },
+    });
+    expect(await handleAccountsRoutes(unknown)).toBe(true);
+    expect(unknown.status).toBe(400);
+
+    poolMock.get.mockReturnValue(null);
+    poolMock.list.mockReturnValue([
+      linkedAccount("anthropic-api", { id: "shared-replacement" }),
+    ]);
+    const replacement = createContext({
+      method: "POST",
+      pathname: "/api/accounts/openai-api",
+      body: {
+        source: "api-key",
+        label: "OpenAI work",
+        apiKey: "sk-test-openai-key",
+        replaceAccountId: "shared-replacement",
+      },
+    });
+
+    expect(await handleAccountsRoutes(replacement)).toBe(true);
+    expect(replacement.status).toBe(400);
+    expect(replacement.body).toEqual({
+      error: "Replacement account belongs to a different provider",
+    });
+    expect(saveAccount).not.toHaveBeenCalled();
+    expect(poolMock.upsert).not.toHaveBeenCalled();
+  });
+
   it("deletes both pool metadata and the matching credential", async () => {
     const ctx = createContext({
       method: "DELETE",
