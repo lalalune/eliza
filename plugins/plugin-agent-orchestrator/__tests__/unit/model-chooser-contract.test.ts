@@ -198,7 +198,11 @@ const AUTH_KEYS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_MODEL",
   "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
   "OPENAI_MODEL",
+  "OPENAI_SMALL_MODEL",
+  "OPENAI_MEDIUM_MODEL",
+  "OPENAI_LARGE_MODEL",
   "CODEX_HOME",
   "CEREBRAS_API_KEY",
   "OPENCODE_MODEL",
@@ -466,7 +470,7 @@ describe("model-chooser contract: claude auth resolution", () => {
 });
 
 describe("model-chooser contract: codex auth resolution", () => {
-  it("subscription (per-account CODEX_HOME) — injects CODEX_HOME, DROPS OPENAI_API_KEY + OPENAI_MODEL", async () => {
+  it("subscription (per-account CODEX_HOME) — injects CODEX_HOME, drops the inherited OpenAI API tuple", async () => {
     const { injected, dropped } = await resolveSpawnAuth({
       agentType: "codex",
       selection: {
@@ -480,23 +484,32 @@ describe("model-chooser contract: codex auth resolution", () => {
       },
       parentEnv: {
         OPENAI_API_KEY: "sk-openai-parent-should-drop",
+        OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
         OPENAI_MODEL: "gpt-5.3-codex", // API-tier model rejected under ChatGPT auth
       },
     });
     expect(injected.CODEX_HOME).toBe("/tmp/auth/_codex-home/acc-personal");
-    // Both must be dropped: the api key overrides the per-account login, the
-    // API-tier model is rejected under ChatGPT-account auth.
+    // All three must be dropped: the API key overrides the per-account login,
+    // the endpoint belongs to that key's auth tuple, and the API-tier model is
+    // rejected under ChatGPT-account auth.
     expect(dropped).toContain("OPENAI_API_KEY");
+    expect(dropped).toContain("OPENAI_BASE_URL");
     expect(dropped).toContain("OPENAI_MODEL");
   });
 
-  it("api-key (no pool) — keeps forwarded OPENAI_API_KEY, no CODEX_HOME injected", async () => {
+  it("api-key (no pool) — keeps the forwarded key + compatible endpoint tuple", async () => {
     const { injected, dropped } = await resolveSpawnAuth({
       agentType: "codex",
       selection: null,
-      parentEnv: { OPENAI_API_KEY: "sk-openai-real-key" },
+      parentEnv: {
+        OPENAI_API_KEY: "sk-openai-real-key",
+        OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
+      },
     });
     expect(injected.OPENAI_API_KEY).toBe("sk-openai-real-key");
+    expect(injected.OPENAI_BASE_URL).toBe(
+      "https://compatible-parent.invalid/v1",
+    );
     expect(dropped).toContain("CODEX_HOME");
   });
 
@@ -571,6 +584,27 @@ describe("model-chooser contract: elizaos + pi-agent are single-auth (bridge NOT
       expect(dropped).toContain("CODEX_HOME");
     });
   }
+
+  it("elizaos receives the OpenAI endpoint and every tier through production buildEnv", async () => {
+    const { injected } = await resolveSpawnAuth({
+      agentType: "elizaos",
+      selection: null,
+      parentEnv: {
+        OPENAI_API_KEY: "sk-openai-compatible",
+        OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
+        OPENAI_SMALL_MODEL: "proxy-small",
+        OPENAI_MEDIUM_MODEL: "proxy-medium",
+        OPENAI_LARGE_MODEL: "proxy-large",
+      },
+    });
+    expect(injected).toMatchObject({
+      OPENAI_API_KEY: "sk-openai-compatible",
+      OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
+      OPENAI_SMALL_MODEL: "proxy-small",
+      OPENAI_MEDIUM_MODEL: "proxy-medium",
+      OPENAI_LARGE_MODEL: "proxy-large",
+    });
+  });
 });
 
 // ===========================================================================
@@ -632,12 +666,19 @@ describe("model-chooser contract: resolved-tuple snapshot matrix", () => {
         strategy: "least-used",
         envPatch: { CODEX_HOME: "/x/_codex-home/p" },
       },
-      parentEnv: { OPENAI_API_KEY: "sk-drop", OPENAI_MODEL: "gpt-5.3-codex" },
+      parentEnv: {
+        OPENAI_API_KEY: "sk-drop",
+        OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
+        OPENAI_MODEL: "gpt-5.3-codex",
+      },
     });
     await record("codex/api-key", {
       agentType: "codex",
       selection: null,
-      parentEnv: { OPENAI_API_KEY: "sk-keep" },
+      parentEnv: {
+        OPENAI_API_KEY: "sk-keep",
+        OPENAI_BASE_URL: "https://compatible-parent.invalid/v1",
+      },
     });
     await record("opencode/cerebras", {
       agentType: "opencode",
@@ -670,7 +711,7 @@ describe("model-chooser contract: resolved-tuple snapshot matrix", () => {
       "claude/subscription": ["CLAUDE_CODE_OAUTH_TOKEN"],
       "claude/api-key": ["ANTHROPIC_API_KEY"],
       "codex/subscription": ["CODEX_HOME"],
-      "codex/api-key": ["OPENAI_API_KEY"],
+      "codex/api-key": ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
       "opencode/cerebras": ["CEREBRAS_API_KEY", "OPENCODE_MODEL"],
       "elizaos/native": ["ANTHROPIC_API_KEY"],
     });
@@ -680,7 +721,11 @@ describe("model-chooser contract: resolved-tuple snapshot matrix", () => {
       "ANTHROPIC_API_KEY",
     );
     expect(matrix["codex/subscription"]?.dropped).toEqual(
-      expect.arrayContaining(["OPENAI_API_KEY", "OPENAI_MODEL"]),
+      expect.arrayContaining([
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+      ]),
     );
     // The cross-leak guard: a Cerebras opencode spawn never carries Anthropic/OpenAI keys.
     expect(matrix["opencode/cerebras"]?.dropped).toEqual(

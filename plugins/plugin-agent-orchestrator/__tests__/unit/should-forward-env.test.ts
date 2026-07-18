@@ -230,11 +230,13 @@ describe("forwardableSubAgentEnv", () => {
       OPENAI_API_KEY: "sk-y",
       OPENAI_BASE_URL: "http://127.0.0.1:9292/v1",
       OPENAI_SMALL_MODEL: "proxy-oai-small",
+      OPENAI_MEDIUM_MODEL: "proxy-oai-medium",
       OPENAI_LARGE_MODEL: "proxy-oai-large",
     });
     expect(out.OPENAI_API_KEY).toBe("sk-y");
     expect(out.OPENAI_BASE_URL).toBe("http://127.0.0.1:9292/v1");
     expect(out.OPENAI_SMALL_MODEL).toBe("proxy-oai-small");
+    expect(out.OPENAI_MEDIUM_MODEL).toBe("proxy-oai-medium");
     expect(out.OPENAI_LARGE_MODEL).toBe("proxy-oai-large");
     expect(out.ELIZA_VAULT_PASSPHRASE).toBeUndefined();
     expect(out.ELIZA_TERMINAL_RUN_TOKEN).toBeUndefined();

@@ -94,13 +94,13 @@ import {
   type SessionStoreBackend,
 } from "./session-store.js";
 import { buildSkillsManifest } from "./skill-manifest.js";
-import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
-  canonicalForwardedEnvKey,
   forwardableSubAgentEnv as applySubAgentEnvPolicy,
+  canonicalForwardedEnvKey,
   isCloudKeyForwardingOptIn,
   isDeniedSubAgentEnvKey,
 } from "./sub-agent-env-policy.js";
+import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
   appendSubagentStdout,
   isSubagentStdoutLoggingEnabled,
@@ -4095,6 +4095,18 @@ export class AcpService extends Service {
           "Dropped OPENAI_API_KEY for codex sub-agent in favor of subscription CODEX_HOME",
         );
       }
+      if (env.OPENAI_BASE_URL) {
+        // The endpoint and credential are one auth tuple. Once a selected
+        // subscription CODEX_HOME wins over the parent's API key, its endpoint
+        // must win too; otherwise a compatible-endpoint parent can redirect or
+        // break the selected ChatGPT account. Gateway mode deliberately runs
+        // later and may replace both with its own scoped endpoint/token tuple.
+        delete env.OPENAI_BASE_URL;
+        this.log(
+          "debug",
+          "Dropped inherited OPENAI_BASE_URL for codex subscription sub-agent",
+        );
+      }
       if (env.OPENAI_MODEL) {
         // A forwarded API-tier model (e.g. gpt-5.3-codex) is rejected by Codex
         // under ChatGPT-account auth ("model is not supported when using Codex
@@ -4459,7 +4471,8 @@ export class AcpService extends Service {
     data?: unknown,
   ): void {
     const loggerFn = this.logger[level] as
-      ((message: string, data?: unknown) => void) | undefined;
+      | ((message: string, data?: unknown) => void)
+      | undefined;
     loggerFn?.call(this.logger, `[AcpService] ${message}`, data);
   }
 

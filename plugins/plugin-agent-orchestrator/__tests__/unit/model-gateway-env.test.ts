@@ -382,6 +382,31 @@ describe("gateway mode ON — spawned sub-agent env", () => {
     expectNoRawKeyInDump(env);
   });
 
+  it("codex subscription spawn: gateway tuple replaces the inherited endpoint last", async () => {
+    setRawProviderKeys();
+    process.env.OPENAI_BASE_URL = "https://compatible-parent.invalid/v1";
+    enableGateway();
+    const { runtime: rt } = runtime();
+    const service = new AcpService(rt);
+    await service.start();
+    await service.spawnSession({
+      name: "codex-gw-subscription",
+      agentType: "codex",
+      workdir: "/tmp/acp-test",
+      customCredentials: {
+        CODEX_HOME: "/tmp/auth/_codex-home/gateway-account",
+      },
+    });
+    const env = firstNativeClient().opts.env ?? {};
+    await service.stop();
+
+    expect(env.CODEX_HOME).toBe("/tmp/auth/_codex-home/gateway-account");
+    expect(env.OPENAI_BASE_URL).toBe(GATEWAY_URL);
+    expect(env.OPENAI_API_KEY).toBe(GATEWAY_TOKEN);
+    expect(JSON.stringify(env)).not.toContain("compatible-parent.invalid");
+    expectNoRawKeyInDump(env);
+  });
+
   it("opencode spawn: OPENCODE_CONFIG_CONTENT routes through the gateway, raw keys excluded", async () => {
     setRawProviderKeys();
     enableGateway();

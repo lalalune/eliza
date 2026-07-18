@@ -94,6 +94,7 @@ export const SUB_AGENT_PROVIDER_ENV_KEYS = [
   // silently talk to api.openai.com with default tier models.
   "OPENAI_BASE_URL",
   "OPENAI_SMALL_MODEL",
+  "OPENAI_MEDIUM_MODEL",
   "OPENAI_LARGE_MODEL",
   "CEREBRAS_API_KEY",
   "CEREBRAS_BASE_URL",
