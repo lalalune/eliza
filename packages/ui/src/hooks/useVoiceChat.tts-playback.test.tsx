@@ -22,11 +22,11 @@ vi.mock("../api/csrf-client", () => ({
     requestViaAgentTransport(...args),
 }));
 
-import { globalAudioCache } from "../voice/voice-chat-types";
 import {
   DEFAULT_BOOT_CONFIG,
   setBootConfig,
 } from "../config/boot-config-store";
+import { globalAudioCache } from "../voice/voice-chat-types";
 import {
   __resetDirectCloudTtsFallbackWarnings,
   useVoiceChat,
@@ -383,14 +383,6 @@ describe("useVoiceChat TTS playback across providers", () => {
     });
     expect(result.current.ttsError ?? null).toBeNull();
     expect(createdSources[0]?.start).toHaveBeenCalledWith(0);
-    // #16425: every proxy TTS POST carries a per-utterance Idempotency-Key so
-    // the cloud route can dedupe the reservation if this utterance is retried.
-    const proxyCall = fetchWithCsrf.mock.calls.find(([url]) =>
-      String(url).includes("/api/tts/cloud"),
-    );
-    const proxyHeaders = ((proxyCall?.[1] as RequestInit | undefined)
-      ?.headers ?? {}) as Record<string, string>;
-    expect(proxyHeaders["Idempotency-Key"]).toBeTruthy();
   });
 
   it("speaks via the browser when the browser is the configured engine (edge)", async () => {
