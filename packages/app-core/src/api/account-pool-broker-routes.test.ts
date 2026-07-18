@@ -193,6 +193,9 @@ describe("account-pool broker route auth", () => {
       accounts: {},
       providers: {},
     });
+
+    delete process.env.ELIZA_ACCOUNT_POOL_BROKER_ENABLED;
+    expect(getAccountPoolBrokerSnapshot()).toBeNull();
   });
 
   it("is absent unless explicitly enabled with a strong bearer secret", async () => {
