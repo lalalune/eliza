@@ -1,5 +1,10 @@
 /** Verifies the plugin registers its routes and auto-registers the Google plugin dependency when absent. Deterministic vitest with a stubbed runtime plugin registrar. */
-import type { IAgentRuntime, Plugin } from "@elizaos/core";
+import {
+  AgentRuntime,
+  createCharacter,
+  type IAgentRuntime,
+  type Plugin,
+} from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getDeviceId, resetCachedDeviceId } from "./lifeops/device-identity.js";
 import {
@@ -120,18 +125,10 @@ describe("LifeOps Google plugin registration", () => {
     expect(getDeviceId({ ELIZA_DEVICE_ID: "device-before-dispose" })).toBe(
       "device-before-dispose",
     );
-    const runtime = {
-      agentId: "agent-1",
-      getTasks: vi.fn(async () => []),
-      deleteTask: vi.fn(async () => undefined),
-      unregisterTaskWorker: vi.fn(),
-      logger: {
-        debug: vi.fn(),
-        error: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-      },
-    } as unknown as IAgentRuntime;
+    const runtime = new AgentRuntime({
+      character: createCharacter({ name: "LifeOps disposal test" }),
+      logLevel: "fatal",
+    });
 
     await personalAssistantPlugin.dispose?.(runtime);
 

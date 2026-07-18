@@ -151,7 +151,15 @@ describe("deleteAgentSecretsFromSecureStores", () => {
     await expect(deleteAgentSecretsFromSecureStores(options)).rejects.toThrow(
       "metadata deletion failed",
     );
-    expect(mocks.store.delete).toHaveBeenCalledTimes(7);
+    expect(mocks.events).toEqual([
+      "os:wallet.evm_private_key",
+      "os:wallet.solana_private_key",
+      "os:steward.api_url",
+      "os:steward.tenant_id",
+      "os:steward.agent_id",
+      "os:steward.api_key",
+      "os:steward.agent_token",
+    ]);
     expect(mocks.vault.has).not.toHaveBeenCalled();
     expect(mocks.vault.remove).not.toHaveBeenCalled();
     for (const key of SECRET_ENV_KEYS) {
@@ -183,6 +191,7 @@ describe("deleteAgentSecretsFromSecureStores", () => {
 
   it("fails closed when a vault entry remains after removal", async () => {
     mocks.vault.remove.mockImplementation(async (key: string) => {
+      mocks.events.push(`vault-remove:${key}`);
       if (key !== "ELIZAOS_CLOUD_API_KEY") vaultKeys.delete(key);
     });
 
@@ -192,7 +201,17 @@ describe("deleteAgentSecretsFromSecureStores", () => {
       code: "WALLET_RESET_VAULT_DELETE_INCOMPLETE",
     });
 
-    expect(mocks.vault.remove).toHaveBeenCalledTimes(7);
+    expect(
+      mocks.events.filter((event) => event.startsWith("vault-remove:")),
+    ).toEqual([
+      "vault-remove:EVM_PRIVATE_KEY",
+      "vault-remove:ELIZAOS_CLOUD_API_KEY",
+      "vault-remove:providers.openai.api-key",
+      "vault-remove:OPENAI_API_KEY.profile.work",
+      "vault-remove:_meta.OPENAI_API_KEY",
+      "vault-remove:agent.test.wallet.evm",
+      "vault-remove:_routing.config",
+    ]);
     expect(mocks.resetWalletCache).not.toHaveBeenCalled();
     for (const key of SECRET_ENV_KEYS) {
       expect(process.env[key]).toBe(`test-${key}`);

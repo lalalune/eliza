@@ -7,7 +7,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { IAgentRuntime } from "@elizaos/core";
+import { AgentRuntime } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import discordLocalPlugin, { DiscordLocalService } from "../index";
 
@@ -52,7 +52,7 @@ describe("DiscordLocalService auth quiescence", () => {
   let stateDir: string;
   let previousStateDir: string | undefined;
   let service: DiscordLocalService;
-  let runtime: IAgentRuntime;
+  let runtime: AgentRuntime;
 
   beforeEach(async () => {
     stateDir = await mkdtemp(path.join(os.tmpdir(), "discord-auth-stop-"));
@@ -60,18 +60,19 @@ describe("DiscordLocalService auth quiescence", () => {
     process.env.ELIZA_STATE_DIR = stateDir;
     vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
 
-    const settings = new Map<string, string>([
-      ["DISCORD_LOCAL_CLIENT_ID", "client-id"],
-      ["DISCORD_LOCAL_CLIENT_SECRET", "client-secret"],
-    ]);
-    runtime = {
-      getSetting: (key: string) => settings.get(key),
-      getService: () => service,
-    } as unknown as IAgentRuntime;
+    runtime = new AgentRuntime({
+      logLevel: "fatal",
+      settings: {
+        DISCORD_LOCAL_CLIENT_ID: "client-id",
+        DISCORD_LOCAL_CLIENT_SECRET: "client-secret",
+      },
+    });
     service = new DiscordLocalService(runtime);
+    vi.spyOn(runtime, "getService").mockReturnValue(service);
   });
 
   afterEach(async () => {
+    await runtime.stop({ fast: true });
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     if (previousStateDir === undefined) {

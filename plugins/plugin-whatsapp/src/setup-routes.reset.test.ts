@@ -3,7 +3,13 @@
  * The pairing transport and runtime are deterministic; no real account or network is used.
  */
 
-import type { IAgentRuntime, RouteRequest, RouteResponse } from "@elizaos/core";
+import {
+  AgentRuntime,
+  type IAgentRuntime,
+  type RouteRequest,
+  type RouteResponse,
+  Service,
+} from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type PairingEvent = {
@@ -37,6 +43,31 @@ class FakePairingSession {
     if (event.status) this.status = event.status;
     this.options.onEvent(event);
   }
+}
+
+class FakeConnectorSetupService extends Service {
+  static override serviceType = "connector-setup";
+  override capabilityDescription = "Connector setup state for WhatsApp route tests";
+  readonly config: Record<string, unknown> = {
+    connectors: {} as Record<string, unknown>,
+  };
+  readonly getConfig = vi.fn(() => this.config);
+  readonly persistConfig = vi.fn((_config: Record<string, unknown>) => undefined);
+  readonly updateConfig = vi.fn((updater: (config: Record<string, unknown>) => void) =>
+    updater(this.config)
+  );
+  readonly registerEscalationChannel = vi.fn((_channelName: string) => true);
+  readonly setOwnerContact = vi.fn(
+    (_update: { source: string; channelId?: string; entityId?: string; roomId?: string }) => true
+  );
+  readonly getWorkspaceDir = vi.fn(() => "/tmp/eliza-whatsapp-workspace");
+  readonly broadcastWs = vi.fn((_data: object) => undefined);
+
+  static override async start(runtime: IAgentRuntime): Promise<FakeConnectorSetupService> {
+    return new FakeConnectorSetupService(runtime);
+  }
+
+  override async stop(): Promise<void> {}
 }
 
 function sanitizeAccountId(raw: string): string {
@@ -91,62 +122,64 @@ afterEach(() => {
 describe("WhatsApp setup route reset quiescence", () => {
   it("waits for session stop, rejects late events, and prevents starts after disposal", async () => {
     const { stopAllPairingSessions, whatsappSetupRoutes } = await loadSetupRoutes();
-    const config = { connectors: {} as Record<string, unknown> };
-    const setupService = {
-      getConfig: vi.fn(() => config),
-      persistConfig: vi.fn(),
-      updateConfig: vi.fn((updater: (value: typeof config) => void) => updater(config)),
-      registerEscalationChannel: vi.fn(() => true),
-      setOwnerContact: vi.fn(() => true),
-      getWorkspaceDir: vi.fn(() => "/tmp/eliza-whatsapp-workspace"),
-      broadcastWs: vi.fn(),
-    };
-    const runtime = {
-      getService: vi.fn((name: string) => (name === "connector-setup" ? setupService : null)),
-    } as unknown as IAgentRuntime;
-    const pairRoute = whatsappSetupRoutes.find(
-      (route) => route.type === "POST" && route.path === "/api/whatsapp/pair"
+    const runtime = new AgentRuntime({ logLevel: "fatal" });
+    await runtime.initialize({ allowNoDatabase: true, skipMigrations: true });
+    await runtime.registerService(FakeConnectorSetupService);
+    const registeredService = await runtime.getServiceLoadPromise(
+      FakeConnectorSetupService.serviceType
     );
-    if (!pairRoute) throw new Error("WhatsApp pairing route is not registered");
+    if (!(registeredService instanceof FakeConnectorSetupService)) {
+      throw new Error("Connector setup test service did not register with AgentRuntime");
+    }
+    const setupService = registeredService;
 
-    const initialResponse = createResponse();
-    await pairRoute.handler(
-      { body: { accountId: "default" } } as RouteRequest,
-      initialResponse,
-      runtime
-    );
-    expect(initialResponse.statusCode).toBe(200);
-    const session = FakePairingSession.instances[0];
-    const allowStop = deferred();
-    session.stop.mockImplementation(async () => allowStop.promise);
+    try {
+      const pairRoute = whatsappSetupRoutes.find(
+        (route) => route.type === "POST" && route.path === "/api/whatsapp/pair"
+      );
+      if (!pairRoute) throw new Error("WhatsApp pairing route is not registered");
 
-    let disposeSettled = false;
-    const dispose = stopAllPairingSessions().then(() => {
-      disposeSettled = true;
-    });
-    await Promise.resolve();
-    expect(disposeSettled).toBe(false);
+      const initialResponse = createResponse();
+      await pairRoute.handler(
+        { body: { accountId: "default" } } as RouteRequest,
+        initialResponse,
+        runtime
+      );
+      expect(initialResponse.statusCode).toBe(200);
+      const session = FakePairingSession.instances[0];
+      const allowStop = deferred();
+      session.stop.mockImplementation(async () => allowStop.promise);
 
-    session.emit({
-      type: "whatsapp-status",
-      accountId: "default",
-      status: "connected",
-      phoneNumber: "+15555550123",
-    });
-    expect(setupService.updateConfig).not.toHaveBeenCalled();
-    expect(setupService.setOwnerContact).not.toHaveBeenCalled();
-    expect(setupService.broadcastWs).not.toHaveBeenCalled();
+      let disposeSettled = false;
+      const dispose = stopAllPairingSessions().then(() => {
+        disposeSettled = true;
+      });
+      await Promise.resolve();
+      expect(disposeSettled).toBe(false);
 
-    allowStop.resolve();
-    await dispose;
+      session.emit({
+        type: "whatsapp-status",
+        accountId: "default",
+        status: "connected",
+        phoneNumber: "+15555550123",
+      });
+      expect(setupService.updateConfig).not.toHaveBeenCalled();
+      expect(setupService.setOwnerContact).not.toHaveBeenCalled();
+      expect(setupService.broadcastWs).not.toHaveBeenCalled();
 
-    const rejectedResponse = createResponse();
-    await pairRoute.handler(
-      { body: { accountId: "default" } } as RouteRequest,
-      rejectedResponse,
-      runtime
-    );
-    expect(rejectedResponse.statusCode).toBe(503);
-    expect(FakePairingSession.instances).toHaveLength(1);
+      allowStop.resolve();
+      await dispose;
+
+      const rejectedResponse = createResponse();
+      await pairRoute.handler(
+        { body: { accountId: "default" } } as RouteRequest,
+        rejectedResponse,
+        runtime
+      );
+      expect(rejectedResponse.statusCode).toBe(503);
+      expect(FakePairingSession.instances).toHaveLength(1);
+    } finally {
+      await runtime.stop({ fast: true });
+    }
   });
 });

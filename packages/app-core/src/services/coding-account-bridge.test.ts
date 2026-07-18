@@ -188,9 +188,10 @@ describe("coding-account-bridge", () => {
     await setUsage("anthropic-subscription", "spare", 5);
     const bridge = getCodingAgentSelectorBridge();
 
-    // Unconfigured: least-used default.
+    // Anthropic subscriptions drain the soonest-resetting usage window by
+    // default so weekly capacity is consumed before it expires.
     const unconfigured = await bridge?.select("claude");
-    expect(unconfigured?.strategy).toBe("least-used");
+    expect(unconfigured?.strategy).toBe("drain-soonest-reset");
     expect(unconfigured?.accountId).toBe("spare");
 
     // The picker writes config.accountStrategies — selection must follow it.
@@ -208,12 +209,13 @@ describe("coding-account-bridge", () => {
     expect(explicit?.strategy).toBe("least-used");
     expect(explicit?.accountId).toBe("spare");
 
-    // The env var stays a fallback: used when no config, beaten by config.
+    // The provider default precedes the generic env fallback, while an explicit
+    // per-provider config still overrides both.
     configureDefaultAccountPoolSelection();
     process.env.ELIZA_CODING_ACCOUNT_STRATEGY = "priority";
     const envFallback = await bridge?.select("claude");
-    expect(envFallback?.strategy).toBe("priority");
-    expect(envFallback?.accountId).toBe("primary");
+    expect(envFallback?.strategy).toBe("drain-soonest-reset");
+    expect(envFallback?.accountId).toBe("spare");
     configureDefaultAccountPoolSelection({
       accountStrategies: { "anthropic-subscription": "least-used" },
     });
@@ -604,14 +606,22 @@ describe("coding-account-bridge", () => {
     getDefaultAccountPool();
     const bridge = getCodingAgentSelectorBridge();
     const sessionKey = "sess-drift";
-    const spawn = await bridge?.select("claude", { sessionKey });
+    const spawn = await bridge?.select("claude", {
+      sessionKey,
+      strategy: "least-used",
+    });
     const spawnId = spawn?.accountId;
     expect(spawnId).toBeTruthy();
     // Affinity holds the next two selects (attempts 2 and 3 of 3)…
     const followUps: Array<string | undefined> = [];
     for (let i = 0; i < 3; i += 1) {
       followUps.push(
-        (await bridge?.select("claude", { sessionKey }))?.accountId,
+        (
+          await bridge?.select("claude", {
+            sessionKey,
+            strategy: "least-used",
+          })
+        )?.accountId,
       );
     }
     expect(followUps[0]).toBe(spawnId);

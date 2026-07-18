@@ -162,7 +162,11 @@ describe("primeAuthStatusProbe + activation reuse", () => {
   });
 
   it("keeps an established session active while refetch revalidates it", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, AUTH_ME_BODY));
+    let requestCount = 0;
+    fetchMock.mockImplementationOnce(async () => {
+      requestCount += 1;
+      return jsonResponse(200, AUTH_ME_BODY);
+    });
 
     const { result } = renderHook(() => useAuthStatus({ pollIntervalMs: 0 }));
     await waitFor(() =>
@@ -170,17 +174,17 @@ describe("primeAuthStatusProbe + activation reuse", () => {
     );
 
     let resolveRevalidation: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          resolveRevalidation = resolve;
-        }),
-    );
+    fetchMock.mockImplementationOnce(() => {
+      requestCount += 1;
+      return new Promise<Response>((resolve) => {
+        resolveRevalidation = resolve;
+      });
+    });
 
     act(() => {
       result.current.refetch();
     });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(requestCount).toBe(2));
     expect(result.current.state.phase).toBe("authenticated");
     expect(isAuthenticatedNow()).toBe(true);
 

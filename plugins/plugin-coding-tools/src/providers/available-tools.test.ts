@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import type { IAgentRuntime, Memory } from "@elizaos/core";
+import { describe, expect, it } from "vitest";
 import { availableToolsProvider } from "./available-tools.js";
 
 describe("availableToolsProvider", () => {
@@ -10,7 +10,13 @@ describe("availableToolsProvider", () => {
     );
 
     expect(result.text).toContain("# Native coding tools");
-    for (const tool of ["FILE", "SHELL", "WEB_FETCH", "WEB_SEARCH", "WORKTREE"]) {
+    for (const tool of [
+      "FILE",
+      "SHELL",
+      "WEB_FETCH",
+      "WEB_SEARCH",
+      "WORKTREE",
+    ]) {
       expect(result.text).toContain(`- ${tool}`);
       expect(result.data?.codingTools).toContain(tool);
     }

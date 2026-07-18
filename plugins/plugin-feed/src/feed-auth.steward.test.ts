@@ -1,4 +1,4 @@
-import type { IAgentRuntime } from "@elizaos/core";
+import { AgentRuntime, createCharacter } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearFeedAuthState,
@@ -33,6 +33,32 @@ function baseConfig(overrides: Partial<FeedConfig> = {}): FeedConfig {
 function authHeader(init: RequestInit | undefined): string | undefined {
   const headers = (init?.headers ?? {}) as Record<string, string>;
   return headers.Authorization;
+}
+
+type FeedCharacterSecrets = NonNullable<AgentRuntime["character"]["secrets"]>;
+type FeedSettingsSecrets = NonNullable<
+  NonNullable<AgentRuntime["character"]["settings"]>["secrets"]
+>;
+
+function createFeedRuntime(name: string): {
+  runtime: AgentRuntime;
+  characterSecrets: FeedCharacterSecrets;
+  settingsSecrets: FeedSettingsSecrets;
+} {
+  const runtime = new AgentRuntime({
+    character: createCharacter({
+      name,
+      settings: { secrets: {} },
+      secrets: {},
+    }),
+    logLevel: "fatal",
+  });
+  const characterSecrets = runtime.character.secrets;
+  const settingsSecrets = runtime.character.settings?.secrets;
+  if (!characterSecrets || !settingsSecrets) {
+    throw new Error("feed test runtime did not retain its credential stores");
+  }
+  return { runtime, characterSecrets, settingsSecrets };
 }
 
 afterEach(() => {
@@ -109,17 +135,8 @@ describe("proxyFeedRequest — Steward-first auto-login", () => {
   });
 
   it("plugin disposal clears cached sessions and every in-process mirror", async () => {
-    const character = {
-      settings: { secrets: {} as Record<string, string> },
-      secrets: {} as Record<string, string>,
-    };
-    const runtime = {
-      character,
-      setSetting(key: string, value: string) {
-        character.settings.secrets[key] = value;
-        character.secrets[key] = value;
-      },
-    } as unknown as IAgentRuntime;
+    const { runtime, characterSecrets, settingsSecrets } =
+      createFeedRuntime("Feed disposal test");
     persistFeedCredential(
       runtime,
       "FEED_AGENT_SECRET",
@@ -147,17 +164,17 @@ describe("proxyFeedRequest — Steward-first auto-login", () => {
     await proxyFeedRequest(config, "GET", "/api/posts");
     expect(authCalls).toBe(1);
     expect(process.env.FEED_AGENT_SESSION_TOKEN).toBe("agent-session-1");
-    expect(character.secrets.FEED_AGENT_SESSION_TOKEN).toBe("agent-session-1");
+    expect(characterSecrets.FEED_AGENT_SESSION_TOKEN).toBe("agent-session-1");
 
     await feedPlugin.dispose?.(runtime);
 
     expect(process.env.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
     expect(process.env.FEED_AGENT_SESSION_EXPIRES_AT).toBeUndefined();
     expect(process.env.FEED_AGENT_SECRET).toBeUndefined();
-    expect(character.secrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
-    expect(character.secrets.FEED_AGENT_SECRET).toBeUndefined();
-    expect(character.settings.secrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
-    expect(character.settings.secrets.FEED_AGENT_SECRET).toBeUndefined();
+    expect(characterSecrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
+    expect(characterSecrets.FEED_AGENT_SECRET).toBeUndefined();
+    expect(settingsSecrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
+    expect(settingsSecrets.FEED_AGENT_SECRET).toBeUndefined();
 
     await proxyFeedRequest(config, "GET", "/api/posts");
     expect(authCalls).toBe(2);
@@ -166,17 +183,9 @@ describe("proxyFeedRequest — Steward-first auto-login", () => {
   });
 
   it("does not persist an authentication response that arrives after disposal", async () => {
-    const character = {
-      settings: { secrets: {} as Record<string, string> },
-      secrets: {} as Record<string, string>,
-    };
-    const runtime = {
-      character,
-      setSetting(key: string, value: string) {
-        character.settings.secrets[key] = value;
-        character.secrets[key] = value;
-      },
-    } as unknown as IAgentRuntime;
+    const { runtime, characterSecrets } = createFeedRuntime(
+      "Feed late-auth test",
+    );
     const response = deferred<Response>();
     const entered = deferred<void>();
     vi.spyOn(globalThis, "fetch").mockImplementation((url) => {
@@ -205,24 +214,14 @@ describe("proxyFeedRequest — Steward-first auto-login", () => {
 
     await expect(request).rejects.toThrow(/cancelled by agent reset/);
     expect(process.env.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
-    expect(character.secrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
+    expect(characterSecrets.FEED_AGENT_SESSION_TOKEN).toBeUndefined();
   });
 
   it("isolates runtime ownership and restores a launch credential baseline", () => {
     const original = process.env.FEED_AGENT_SESSION_TOKEN;
     process.env.FEED_AGENT_SESSION_TOKEN = "launch-token";
-    const first = {
-      character: {
-        settings: { secrets: {} as Record<string, string> },
-        secrets: {} as Record<string, string>,
-      },
-    } as unknown as IAgentRuntime;
-    const second = {
-      character: {
-        settings: { secrets: {} as Record<string, string> },
-        secrets: {} as Record<string, string>,
-      },
-    } as unknown as IAgentRuntime;
+    const { runtime: first } = createFeedRuntime("Feed owner one");
+    const { runtime: second } = createFeedRuntime("Feed owner two");
     try {
       persistFeedCredential(first, "FEED_AGENT_SESSION_TOKEN", "first", true);
       persistFeedCredential(second, "FEED_AGENT_SESSION_TOKEN", "second", true);

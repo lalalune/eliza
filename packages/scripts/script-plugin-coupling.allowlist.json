@@ -197,6 +197,11 @@
     "reason": "facewear software-readiness gate; also asserts the removed plugin-smartglasses is gone"
   },
   {
+    "file": "scripts/cuda-continuity.mjs",
+    "tokens": ["plugins/plugin-local-inference"],
+    "reason": "CUDA continuity proves the native llama.cpp gitlink at the exact repository HEAD; that source provenance is inherently tied to the local-inference plugin's native checkout"
+  },
+  {
     "file": "scripts/generate-view-heroes.mjs",
     "tokens": [
       "plugins/plugin-app-control",

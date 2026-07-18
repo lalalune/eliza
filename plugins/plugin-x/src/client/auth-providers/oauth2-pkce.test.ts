@@ -1,6 +1,6 @@
 /** OAuth teardown races are exercised with delayed token endpoints and stores so reset cannot be followed by a late credential write. */
-import type { IAgentRuntime } from "@elizaos/core";
-import { describe, expect, it, vi } from "vitest";
+import { AgentRuntime } from "@elizaos/core/node";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TwitterClientState } from "../../types";
 import { OAuth2PKCEAuthProvider } from "./oauth2-pkce";
 import type { StoredOAuth2Tokens, TokenStore } from "./token-store";
@@ -19,12 +19,20 @@ function deferred<T>(): {
   return { promise, resolve, reject };
 }
 
-function runtime(): IAgentRuntime {
-  return {
-    agentId: "agent-1",
-    getSetting: () => undefined,
-  } as IAgentRuntime;
+const activeRuntimes = new Set<AgentRuntime>();
+
+function runtime(): AgentRuntime {
+  const instance = new AgentRuntime({ logLevel: "fatal" });
+  activeRuntimes.add(instance);
+  return instance;
 }
+
+afterEach(async () => {
+  await Promise.all(
+    [...activeRuntimes].map((instance) => instance.stop({ fast: true })),
+  );
+  activeRuntimes.clear();
+});
 
 const state: TwitterClientState = {
   accountId: "primary",

@@ -58,6 +58,15 @@ describe("wallet and steward secure-store hydration", () => {
   });
 
   it("surfaces an enabled but unavailable backend", async () => {
+    const probes: string[] = [];
+    mocks.vault.has.mockImplementation(async (key: string) => {
+      probes.push(`vault:${key}`);
+      return false;
+    });
+    mocks.store.isAvailable.mockImplementation(async () => {
+      probes.push("store:availability");
+      return false;
+    });
     const hydration = hydrateWalletKeysFromNodePlatformSecureStore({
       readEnabled: true,
       secureStore: mocks.store,
@@ -67,8 +76,11 @@ describe("wallet and steward secure-store hydration", () => {
     await expect(hydration).rejects.toThrowError(
       expect.objectContaining({ code: "SECURE_STORE_READ_UNAVAILABLE" }),
     );
-    expect(mocks.vault.has).toHaveBeenCalledTimes(2);
-    expect(mocks.store.isAvailable).toHaveBeenCalled();
+    expect(probes).toEqual([
+      "vault:EVM_PRIVATE_KEY",
+      "vault:SOLANA_PRIVATE_KEY",
+      "store:availability",
+    ]);
     expect(mocks.store.get).not.toHaveBeenCalled();
   });
 
