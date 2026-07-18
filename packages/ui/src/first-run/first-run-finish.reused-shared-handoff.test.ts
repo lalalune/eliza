@@ -40,6 +40,18 @@ import {
 
 const SHARED_AGENT_BASE =
   "https://staging.elizacloud.ai/api/v1/eliza/agents/cad3c071";
+const STEWARD_TOKEN_KEY = "steward_session_token";
+
+function makeJwt(expSecondsFromNow: number): string {
+  const encode = (value: unknown) =>
+    btoa(JSON.stringify(value))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode({
+    exp: Math.floor(Date.now() / 1000) + expSecondsFromNow,
+  })}.sig`;
+}
 
 const clientMock = vi.hoisted(() => ({
   selectOrProvisionCloudAgent: vi.fn(),
@@ -155,6 +167,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
   clientMock.getCloudStatus.mockResolvedValue(null);
+  clientMock.getBaseUrl.mockReturnValue("");
   clientMock.getRestAuthToken.mockReturnValue(null);
 });
 
@@ -346,7 +359,20 @@ describe("listOrAutoProvisionCloudAgent / runFirstRunFinish routing", () => {
         },
       ],
     });
-    mockSelection(false, { bridgeUrl: "https://cad3c071.elizacloud.ai" });
+    clientMock.selectOrProvisionCloudAgent.mockImplementationOnce(
+      async (request: { authToken: string }) => {
+        if (request.authToken !== "fresh-client-token") {
+          throw new Error("renderer Cloud token was not forwarded");
+        }
+        return {
+          agentId: "cad3c071",
+          apiBase: SHARED_AGENT_BASE,
+          bridgeUrl: "https://cad3c071.elizacloud.ai",
+          requiresAgentPairing: false,
+          created: false,
+        };
+      },
+    );
     const authWindow = { close: vi.fn() } as unknown as Window;
     const p = ports();
     p.preOpenWindow = () => authWindow;
@@ -363,13 +389,42 @@ describe("listOrAutoProvisionCloudAgent / runFirstRunFinish routing", () => {
       requireClientAuth: true,
     });
     expect(outcome.kind).toBe("done");
-    expect(clientMock.selectOrProvisionCloudAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ authToken: "fresh-client-token" }),
-    );
   });
 
   it("does not list or provision when required client auth returns no token", async () => {
     window.localStorage.clear();
+    clientMock.getCloudStatus.mockResolvedValue({ connected: true });
+    const p = ports();
+
+    const outcome = await listOrAutoProvisionCloudAgent(draft(), p);
+
+    expect(p.handleCloudLogin).toHaveBeenCalledWith(null, {
+      requireClientAuth: true,
+    });
+    expect(outcome.kind).toBe("needs-cloud-login");
+    expect(clientMock.getCloudCompatAgents).not.toHaveBeenCalled();
+    expect(clientMock.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not list or provision with only a local agent REST bearer", async () => {
+    window.localStorage.clear();
+    clientMock.getBaseUrl.mockReturnValue("http://127.0.0.1:2508");
+    clientMock.getRestAuthToken.mockReturnValue("local-agent-token");
+    clientMock.getCloudStatus.mockResolvedValue({ connected: true });
+    const p = ports();
+
+    const outcome = await listOrAutoProvisionCloudAgent(draft(), p);
+
+    expect(p.handleCloudLogin).toHaveBeenCalledWith(null, {
+      requireClientAuth: true,
+    });
+    expect(outcome.kind).toBe("needs-cloud-login");
+    expect(clientMock.getCloudCompatAgents).not.toHaveBeenCalled();
+    expect(clientMock.selectOrProvisionCloudAgent).not.toHaveBeenCalled();
+  });
+
+  it("requires renderer reauthentication when the stored Steward JWT is expired", async () => {
+    window.localStorage.setItem(STEWARD_TOKEN_KEY, makeJwt(-60));
     clientMock.getCloudStatus.mockResolvedValue({ connected: true });
     const p = ports();
 
