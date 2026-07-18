@@ -258,8 +258,8 @@ describe("Anthropic cache injection — segmented user content", () => {
   });
 });
 
-describe("Anthropic cache injection — caller providerOptions survive verbatim", () => {
-  it("preserves openrouter.promptCacheKey and arbitrary provider keys alongside injected cacheControl", async () => {
+describe("Anthropic cache injection — caller providerOptions reach the correct wire fields", () => {
+  it("maps openrouter.promptCacheKey to sticky routing while preserving arbitrary provider keys", async () => {
     const { generateText } = mockModules();
     const { handleTextLarge } = await import("../models/text");
 
@@ -274,9 +274,10 @@ describe("Anthropic cache injection — caller providerOptions survive verbatim"
 
     const call = generateText.mock.calls[0][0] as Record<string, unknown>;
     const providerOpts = call.providerOptions as Record<string, unknown>;
-    // Caller keys survive unchanged into the serialized request.
+    // OpenRouter's AI SDK provider spreads call-level options onto the request
+    // body, so the adapter must use the API's snake-case routing field.
     expect(providerOpts.openrouter).toEqual({
-      promptCacheKey: "caller-key-123",
+      session_id: "caller-key-123",
     });
     expect(providerOpts.gateway).toEqual({ caching: "auto" });
     expect(providerOpts.customProvider).toEqual({
@@ -326,10 +327,32 @@ describe("Anthropic cache injection — caller providerOptions survive verbatim"
     expect(cc0?.cacheControl).toEqual({ type: "ephemeral" });
     expect(cc1?.cacheControl).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(content[2]?.providerOptions).toBeUndefined();
-    // Caller-supplied openrouter option survives.
+    // The cache key becomes OpenRouter's sticky-routing field.
     expect((call.providerOptions as Record<string, unknown>).openrouter).toEqual({
-      promptCacheKey: "multi-bp",
+      session_id: "multi-bp",
     });
+  });
+
+  it("rejects invalid or conflicting cache routing keys before sending a request", async () => {
+    const { generateText } = mockModules();
+    const { handleTextLarge } = await import("../models/text");
+
+    for (const openrouter of [
+      { promptCacheKey: "" },
+      { promptCacheKey: "x".repeat(257) },
+      { promptCacheKey: "cache-a", session_id: "cache-b" },
+    ]) {
+      await expect(
+        handleTextLarge(createRuntime(), {
+          prompt: "hello",
+          providerOptions: { openrouter },
+        } as never)
+      ).rejects.toMatchObject({
+        name: "ElizaError",
+        code: "OPENROUTER_INVALID_PROMPT_CACHE_KEY",
+      });
+    }
+    expect(generateText).not.toHaveBeenCalled();
   });
 });
 

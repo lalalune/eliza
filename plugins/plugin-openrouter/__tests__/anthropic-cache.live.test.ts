@@ -94,6 +94,8 @@ function cacheParams() {
     // remaining independent of structured-output behavior.
     tools: [],
     providerOptions: {
+      // OpenRouter uses this as the sticky-routing session_id so both calls
+      // reach the upstream endpoint that owns the provider-side cache entry.
       openrouter: { promptCacheKey: `eliza-15966-${runNonce}` },
       anthropic: {
         cacheSystem: false,

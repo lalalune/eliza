@@ -83,6 +83,7 @@ type ChatAttachment = {
 
 interface OpenRouterPromptCacheOptions {
   promptCacheKey?: string;
+  session_id?: unknown;
 }
 
 interface AnthropicCacheControl {
@@ -241,6 +242,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isAnthropicModel(modelName: string): boolean {
   return modelName.toLowerCase().startsWith("anthropic/");
+}
+
+function invalidPromptCacheKey(message: string, context: Record<string, unknown>): never {
+  throw new ElizaError(message, {
+    code: "OPENROUTER_INVALID_PROMPT_CACHE_KEY",
+    context,
+    severity: "fatal",
+  });
+}
+
+// Stable routing matters because provider-side cache entries do not follow a
+// conversation when OpenRouter selects another upstream endpoint.
+function buildOpenRouterWireOptions(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const { promptCacheKey, ...wireOptions } = value;
+  if (promptCacheKey === undefined) return wireOptions;
+  if (
+    typeof promptCacheKey !== "string" ||
+    promptCacheKey.trim().length === 0 ||
+    promptCacheKey.length > 256
+  ) {
+    return invalidPromptCacheKey(
+      "Invalid openrouter.promptCacheKey: expected a non-empty string of at most 256 characters",
+      { promptCacheKey }
+    );
+  }
+
+  if (wireOptions.session_id !== undefined && wireOptions.session_id !== promptCacheKey) {
+    return invalidPromptCacheKey(
+      "Invalid OpenRouter cache routing options: promptCacheKey and session_id must match",
+      { promptCacheKey, sessionId: wireOptions.session_id }
+    );
+  }
+
+  return { ...wireOptions, session_id: promptCacheKey };
 }
 
 // AI SDK `providerOptions` is typed `Record<string, JSONObject>`, so the
@@ -891,9 +928,7 @@ function buildGenerateParams(
     anthropic: _,
     ...restProviderOptions
   } = rawProviderOptions ?? {};
-  const openrouterOptions: Record<string, unknown> = {
-    ...(rawOpenrouterOptions ?? {}),
-  };
+  const openrouterOptions = buildOpenRouterWireOptions(rawOpenrouterOptions) ?? {};
 
   // Anthropic-local planner fields are consumed here and must never reach the wire.
   const wireAnthropicOptions = isAnthropic

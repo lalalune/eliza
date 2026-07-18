@@ -115,7 +115,7 @@ Settings are read via `runtime.getSetting(key)` first, then `process.env[key]`. 
 - **Embedding dimension validation:** The embedding handler validates the configured dimension against `VECTOR_DIMS` from `@elizaos/core`. Mismatches throw immediately — no silent truncation.
 - **Embedding input truncation:** Inputs over ~32 000 characters (~8 000 tokens) are truncated with a warning rather than failing.
 - **Structured output:** Pass `responseSchema` (JSON Schema object) to any text handler to get parsed JSON back. The handler wraps it into the AI SDK `output` field and calls `JSON.parse` on the response.
-- **Prompt caching:** Pass `providerOptions: { openrouter: { promptCacheKey: "<key>" } }` to text handlers; it is forwarded to OpenRouter's `prompt_cache_key` for prefix caching on supported backends.
+- **Prompt caching:** Pass `providerOptions: { openrouter: { promptCacheKey: "<key>" } }` to text handlers; the adapter sends it as OpenRouter's `session_id` so repeated calls stay on the upstream endpoint that owns the provider-side cache entry.
 - **Audio transcription:** `ModelType.TRANSCRIPTION` posts base64 audio to OpenRouter's `/audio/transcriptions` endpoint. Supported inputs are URL strings, `Buffer`, `Blob` / `File`, core `{ audioUrl, prompt? }`, and local `{ audio, model?, language?, temperature?, format?, mimeType? }` objects.
 - **`@openrouter/ai-sdk-provider` + `ai` SDK:** The plugin wraps `@openrouter/ai-sdk-provider ^2.0.0` and uses `ai ^6.0.30`. Both are runtime dependencies, not peer deps.
 

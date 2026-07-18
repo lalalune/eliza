@@ -242,7 +242,8 @@ describe("OpenRouter native text plumbing", () => {
     expect(providerOptions).toBeDefined();
     const openrouterOpts = providerOptions.openrouter as Record<string, unknown>;
     expect(openrouterOpts).toBeDefined();
-    expect(openrouterOpts.promptCacheKey).toBe("v5:abc123");
+    expect(openrouterOpts.session_id).toBe("v5:abc123");
+    expect(openrouterOpts.promptCacheKey).toBeUndefined();
     expect(openrouterOpts.prompt_cache_key).toBe("v5:abc123");
     expect(providerOptions.anthropic).toEqual({ cacheControl: { type: "ephemeral" } });
     expect(providerOptions.openai).toEqual({
