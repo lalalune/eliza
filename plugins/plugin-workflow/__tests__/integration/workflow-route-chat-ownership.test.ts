@@ -389,7 +389,7 @@ describe('local workflow route/chat ownership and lifecycle', () => {
     expect(canceledDraft.values).toMatchObject({ status: 'needs_clarification' });
     const canceled = await runChatAction(
       harness.runtime,
-      { action: 'cancel' },
+      { action: 'cancel_draft' },
       LINKED_OWNER_ENTITY_ID
     );
     expect(canceled).toMatchObject({

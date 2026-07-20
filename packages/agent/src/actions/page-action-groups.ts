@@ -236,12 +236,14 @@ function prepareAliasedChildParameters(
   message: Memory,
 ): ActionParameters {
   const declaredNames = new Set(
-    (action.parameters ?? []).map((parameter) => parameter.name),
+    action.parameters?.map((parameter) => parameter.name),
   );
   const parameters: ActionParameters = {};
-  for (const [key, value] of Object.entries(explicit ?? {})) {
-    if (action.allowAdditionalParameters || declaredNames.has(key)) {
-      parameters[key] = value;
+  if (explicit) {
+    for (const [key, value] of Object.entries(explicit)) {
+      if (action.allowAdditionalParameters || declaredNames.has(key)) {
+        parameters[key] = value;
+      }
     }
   }
   parameters.action = discriminator;
@@ -323,7 +325,10 @@ export const pageDelegateAction: PageActionGroup = {
 
     const childContexts = PAGE_CONTEXTS[page];
     let childAction = findChildAction(runtime, requestedAction, childContexts);
-    let childParameters = params.parameters ?? {};
+    let childParameters: ActionParameters = {};
+    if (params.parameters) {
+      childParameters = params.parameters;
+    }
     let aliasedDiscriminator: string | undefined;
     if (childAction) {
       aliasedDiscriminator = readAliasedDiscriminator(

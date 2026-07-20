@@ -67,7 +67,7 @@ export const pendingDraftProvider: Provider = {
           (questions ? `Clarifications still required:\n${questions}\n\n` : '') +
           '**REQUIRED**: Any user message about this draft MUST trigger the WORKFLOW action.\n' +
           'Answer clarifications with action=create and a resolutions array of { paramPath, value }.\n' +
-          'Cancel with action=cancel. Send modifications back through action=create as resolutions.\n' +
+          'Cancel with action=cancel_draft. Send modifications back through action=create as resolutions.\n' +
           'The action reloads the draft from this conversation — do not send a draft parameter.\n' +
           'You MUST include WORKFLOW in your actions.',
         data: {

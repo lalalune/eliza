@@ -5,7 +5,7 @@
  *   list          — list deployed workflows for the current user
  *   get           — fetch one deployed workflow definition by id
  *   create        — generate + deploy a new workflow from a seed prompt
- *   cancel        — discard the pending workflow draft in this conversation
+ *   cancel_draft  — discard the pending workflow draft in this conversation
  *   modify        — load a deployed workflow into the draft editor by id
  *   activate      — activate a workflow by id
  *   deactivate    — deactivate a workflow by id
@@ -73,7 +73,7 @@ const WORKFLOW_OPS = [
   'search',
   'get',
   'create',
-  'cancel',
+  'cancel_draft',
   'modify',
   'activate',
   'deactivate',
@@ -116,17 +116,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
+  return (
+    isRecord(value) &&
+    typeof value.name === 'string' &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every(isRecord) &&
+    isRecord(value.connections)
+  );
+}
+
 function readWorkflowDraft(value: unknown): WorkflowDefinition | undefined {
-  if (
-    !isRecord(value) ||
-    typeof value.name !== 'string' ||
-    !Array.isArray(value.nodes) ||
-    !value.nodes.every(isRecord) ||
-    !isRecord(value.connections)
-  ) {
-    return undefined;
-  }
-  return value as unknown as WorkflowDefinition;
+  return isWorkflowDefinition(value) ? value : undefined;
 }
 
 function readClarificationResolutions(
@@ -368,10 +369,8 @@ async function handleCreate(
           text: 'Clarification resolutions must be an array of { paramPath, value } entries.',
         };
       }
-      const resolutionResult = applyResolutions(
-        draft as unknown as Record<string, unknown>,
-        resolutions
-      );
+      const mutableDraft: Record<string, unknown> = { ...draft };
+      const resolutionResult = applyResolutions(mutableDraft, resolutions);
       if (!resolutionResult.ok) {
         return {
           success: false,
@@ -385,11 +384,8 @@ async function handleCreate(
       const freeFormCount = resolutions.filter(
         (resolution) => resolution.paramPath.length === 0
       ).length;
-      pruneResolvedClarifications(
-        draft as unknown as Record<string, unknown>,
-        resolvedPaths,
-        freeFormCount
-      );
+      pruneResolvedClarifications(mutableDraft, resolvedPaths, freeFormCount);
+      Object.assign(draft, mutableDraft);
     }
     if (name) {
       draft.name = name;
@@ -546,7 +542,7 @@ async function handleCancelPendingDraft(
   } catch (err) {
     // error-policy:J1 action-boundary translation returns cache failures as a failed tool result.
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn({ src: 'plugin:workflow:action:cancel' }, message);
+    logger.warn({ src: 'plugin:workflow:action:cancel-draft' }, message);
     return { success: false, text: message };
   }
 }
@@ -1034,17 +1030,17 @@ export const workflowAction: Action = {
   ],
   description:
     'Manage workflows (automations). Action-based dispatch - provide an `action` parameter:\n' +
-    '  list, get, create, cancel, modify, activate, deactivate, toggle_active, delete, run, executions, revisions, restore, diagnose, eval_samples.\n' +
+    '  list, get, create, cancel_draft, modify, activate, deactivate, toggle_active, delete, run, executions, revisions, restore, diagnose, eval_samples.\n' +
     'For creating/updating scheduled triggers (including promoting a task to a workflow), use the TRIGGER action.',
   descriptionCompressed:
-    'workflow/automation list|get|create|cancel|modify|activate|deactivate|toggle_active|delete|run|executions|revisions|restore|diagnose|eval_samples',
+    'workflow/automation list|get|create|cancel_draft|modify|activate|deactivate|toggle_active|delete|run|executions|revisions|restore|diagnose|eval_samples',
   routingHint:
     'workflow lifecycle create/list/get/modify/activate/deactivate/run/delete/history -> call WORKFLOW directly with action=<operation>. Never wrap WORKFLOW in PAGE_DELEGATE and never invent WORKFLOW_CREATE or CREATE_WORKFLOW.',
   parameters: [
     {
       name: 'action',
       description:
-        'Operation: list, get, search, create, cancel, modify, activate, deactivate, toggle_active, delete, run, executions, revisions, restore, diagnose, eval_samples.',
+        'Operation: list, get, search, create, cancel_draft, modify, activate, deactivate, toggle_active, delete, run, executions, revisions, restore, diagnose, eval_samples.',
       required: true,
       schema: { type: 'string' as const, enum: [...WORKFLOW_OPS] },
     },
@@ -1151,7 +1147,7 @@ export const workflowAction: Action = {
         return handleGetWorkflow(service, params, ownerEntityId, callback);
       case 'create':
         return handleCreate(runtime, message, service, params, ownerEntityId, callback);
-      case 'cancel':
+      case 'cancel_draft':
         return handleCancelPendingDraft(runtime, message, ownerEntityId, callback);
       case 'modify':
         return handleModify(service, params, ownerEntityId, callback);

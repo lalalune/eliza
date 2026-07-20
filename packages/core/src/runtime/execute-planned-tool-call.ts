@@ -591,8 +591,10 @@ function flattenUndeclaredParametersEnvelope(
 	action: Action,
 	args: Record<string, unknown>,
 ): Record<string, unknown> {
-	const declaredParameters = action.parameters ?? [];
-	if (declaredParameters.some((parameter) => parameter.name === "parameters")) {
+	const declaredParameters = action.parameters;
+	if (
+		declaredParameters?.some((parameter) => parameter.name === "parameters")
+	) {
 		return args;
 	}
 
@@ -600,7 +602,7 @@ function flattenUndeclaredParametersEnvelope(
 	if (!isPlainRecord(nested)) return args;
 
 	const declaredNames = new Set(
-		declaredParameters.map((parameter) => parameter.name),
+		declaredParameters?.map((parameter) => parameter.name),
 	);
 	const nestedEntries = Object.entries(nested);
 	if (nestedEntries.some(([key]) => !declaredNames.has(key))) return args;

@@ -847,10 +847,12 @@ describe('automation vocabulary (#16570)', () => {
     expect(workflowAction.descriptionCompressed?.toLowerCase()).toContain('automation');
   });
 
-  test('the delete op the vocabulary routes to actually exists', () => {
+  test('routes automation cancellation to lifecycle ops without colliding with draft cancellation', () => {
     const opParam = (workflowAction.parameters ?? []).find((p) => p.name === 'action');
     const allowed = (opParam?.schema as { enum?: string[] } | undefined)?.enum ?? [];
     expect(allowed).toContain('delete');
     expect(allowed).toContain('deactivate');
+    expect(allowed).toContain('cancel_draft');
+    expect(allowed).not.toContain('cancel');
   });
 });
