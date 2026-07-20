@@ -12,7 +12,7 @@ import type { ComposerAttachmentSource } from "./contract";
 const HASH = "a".repeat(64);
 
 describe("normalizeComposerAttachment — happy paths", () => {
-  it("inline bytes → a data: URL (persisted to the store on send)", () => {
+  it("inline bytes → a data: URL for the send adapter to materialize", () => {
     const r = normalizeComposerAttachment("att1", {
       source: "inline",
       mimeType: "image/png",
@@ -39,7 +39,7 @@ describe("normalizeComposerAttachment — happy paths", () => {
     if (r.ok) expect(r.attachment.mimeType).toBe("image/jpeg");
   });
 
-  it("remote http(s) URL is kept for server-side SSRF rehost", () => {
+  it("remote http(s) URL is kept for server-side SSRF ingest", () => {
     const r = normalizeComposerAttachment("att1", {
       source: "remote",
       url: "https://cdn.test/photo.png",
@@ -56,11 +56,13 @@ describe("normalizeComposerAttachment — happy paths", () => {
     const r = normalizeComposerAttachment("att1", {
       source: "stored",
       url: `/api/media/${HASH}.png`,
+      name: "photo.png",
     });
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.attachment.kind).toBe("stored");
       expect(r.attachment.status).toBe("ready");
+      expect(r.attachment.name).toBe("photo.png");
     }
   });
 });
@@ -96,6 +98,41 @@ describe("normalizeComposerAttachment — rejections", () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("invalid-input");
+  });
+
+  it("rejects impossible base64 lengths and malformed percent data", () => {
+    expect(
+      normalizeComposerAttachment("a", {
+        source: "inline",
+        mimeType: "image/png",
+        bytesBase64: "AAAAA",
+      }),
+    ).toEqual(expect.objectContaining({ ok: false, reason: "invalid-input" }));
+    expect(
+      normalizeComposerAttachment("a", {
+        source: "data-url",
+        dataUrl: "data:text/plain,%ZZ",
+      }),
+    ).toEqual(expect.objectContaining({ ok: false, reason: "invalid-input" }));
+  });
+
+  it("rejects malformed optional mime types for URL sources", () => {
+    for (const source of [
+      {
+        source: "remote" as const,
+        url: "https://example.test/a",
+        mimeType: "bad",
+      },
+      {
+        source: "stored" as const,
+        url: `/api/media/${"a".repeat(64)}.png`,
+        mimeType: "bad",
+      },
+    ]) {
+      expect(normalizeComposerAttachment("a", source)).toEqual(
+        expect.objectContaining({ ok: false, reason: "invalid-input" }),
+      );
+    }
   });
 
   it("blocks obviously-private remote hosts (first-line SSRF guard)", () => {

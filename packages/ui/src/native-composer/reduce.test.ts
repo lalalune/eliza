@@ -216,6 +216,62 @@ describe("send", () => {
     expect(flushed.state.deferred).toHaveLength(0);
   });
 
+  it("dedupes an offline callback and rejects a competing deferred send", () => {
+    const { state, results } = run(
+      [
+        seed,
+        { type: "send", opId: "s1" },
+        { type: "send", opId: "s1" },
+        { type: "send", opId: "s2" },
+      ],
+      offline,
+    );
+    expect(results.map((result) => result.status)).toEqual([
+      "applied",
+      "deferred",
+      "duplicate",
+      "rejected",
+    ]);
+    if (results[3].status === "rejected") {
+      expect(results[3].reason).toBe("send-in-flight");
+    }
+    expect(state.deferred.map(({ operation }) => operation.opId)).toEqual([
+      "s1",
+    ]);
+  });
+
+  it("captures the submitted draft and preserves edits made before completion", () => {
+    let state = initialComposerState();
+    for (const op of [
+      seed,
+      { type: "send", opId: "s" } as const,
+      { type: "text.insert", opId: "later", text: " again" } as const,
+    ]) {
+      state = applyComposerOperation(state, op, ctx).state;
+    }
+    expect(state.sending?.draft.text).toBe("hi");
+    expect(state.draft.text).toBe("hi again");
+    const resolved = resolveSend(state, "s", {
+      ok: true,
+      messageId: "m1",
+    });
+    expect(resolved.draft.text).toBe("hi again");
+  });
+
+  it("replays the captured offline draft without overwriting later edits", () => {
+    let state = initialComposerState();
+    for (const op of [
+      seed,
+      { type: "send", opId: "s" } as const,
+      { type: "text.insert", opId: "later", text: " again" } as const,
+    ]) {
+      state = applyComposerOperation(state, op, offline).state;
+    }
+    const flushed = flushDeferredOperations(state, ctx);
+    expect(flushed.state.sending?.draft.text).toBe("hi");
+    expect(flushed.state.draft.text).toBe("hi again");
+  });
+
   it("resolveSend success clears the draft; failure keeps it", () => {
     const { state } = run([seed, { type: "send", opId: "s" }]);
     const ok = resolveSend(state, "s", { ok: true, messageId: "m1" });
@@ -254,6 +310,35 @@ describe("cancellation", () => {
     expect(state.draft.focused).toBe(true);
     expect(state.draft.keyboard).toBe("shown");
   });
+
+  it("cancel scope=draft does not cancel an active send", () => {
+    const { state } = run([
+      { type: "text.set", opId: "t", text: "hi" },
+      { type: "send", opId: "s" },
+      { type: "cancel", opId: "c", scope: "draft" },
+    ]);
+    expect(state.sending?.opId).toBe("s");
+    expect(state.sending?.draft.text).toBe("hi");
+    expect(state.draft.text).toBe("");
+  });
+
+  it("cancel scope=send removes an offline replay reservation", () => {
+    const { state } = run(
+      [
+        { type: "text.set", opId: "t", text: "hi" },
+        { type: "send", opId: "s" },
+        { type: "cancel", opId: "c", scope: "send" },
+      ],
+      offline,
+    );
+    expect(state.deferred).toHaveLength(0);
+    const stale = applyComposerOperation(
+      state,
+      { type: "send", opId: "s" },
+      offline,
+    );
+    expect(stale.result.status).toBe("duplicate");
+  });
 });
 
 describe("voice handoff + focus", () => {
@@ -283,6 +368,15 @@ describe("voice handoff + focus", () => {
   });
 
   it("focus.set updates focus + keyboard", () => {
+    const { state } = run([
+      { type: "focus.set", opId: "f1", focused: true },
+      { type: "focus.set", opId: "f2", focused: false },
+    ]);
+    expect(state.draft.focused).toBe(false);
+    expect(state.draft.keyboard).toBe("hidden");
+  });
+
+  it("focus.set defaults to shown while focused", () => {
     const { state } = run([{ type: "focus.set", opId: "f", focused: true }]);
     expect(state.draft.focused).toBe(true);
     expect(state.draft.keyboard).toBe("shown");

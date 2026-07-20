@@ -41,8 +41,8 @@ export type KeyboardVisibility = "shown" | "hidden";
 
 /**
  * How a native shell hands over one attachment, in media-store vocabulary only.
- * `inline`/`data-url` carry bytes to persist; `remote` is an http(s) URL the
- * server rehosts through the SSRF guard; `stored` is already in the store. No
+ * `inline`/`data-url` carry bytes to persist; `remote` is an http(s) URL that a
+ * server adapter must ingest through the SSRF guard; `stored` is already in the store. No
  * variant carries a file id — the store is content-addressed by sha256 and a
  * second-store handle is unrepresentable here by design.
  */
@@ -196,10 +196,11 @@ export interface ComposerOperationStream {
 
 /**
  * A resolved attachment reference in the draft, in media-store vocabulary. An
- * `inline`/`data-url` source normalizes to a `data:` URL the existing outgoing
- * pipeline persists to the content-addressed store on send; `remote` is rehosted
- * SSRF-guarded server-side; `stored` passes through. `kind` records that routing.
- * No field is a file id.
+ * `inline`/`data-url` source normalizes to a `data:` URL; `remote` remains marked
+ * for an authenticated, SSRF-guarded server ingest; `stored` passes through.
+ * The normalizer does not claim that the current chat-send payload accepts URLs:
+ * a platform send adapter must materialize these forms before submission.
+ * `kind` records that routing. No field is a file id.
  */
 export interface ComposerAttachment {
   id: string;
@@ -211,7 +212,7 @@ export interface ComposerAttachment {
   kind: "inline" | "remote" | "stored";
   /**
    * `ready` = usable as-is; `pending-rehost` = a remote URL awaiting server-side
-   * SSRF rehost on send. There is no `failed` success-substitute: a source that
+   * SSRF ingest before send. There is no `failed` success-substitute: a source that
    * fails validation never becomes an attachment (the op is rejected instead).
    */
   status: "ready" | "pending-rehost";

@@ -21,6 +21,18 @@ describe("createComposerBridgeClient — boundary + events", () => {
     }
   });
 
+  it("degrades an unusable batch envelope to one invalid-input result", () => {
+    const client = createComposerBridgeClient();
+    expect(
+      client.dispatchRawStream({ schema: "wrong", operations: [] }),
+    ).toEqual([
+      expect.objectContaining({
+        status: "rejected",
+        reason: "invalid-input",
+      }),
+    ]);
+  });
+
   it("emits draft.changed + focus.changed for a focus op", () => {
     const client = createComposerBridgeClient();
     const events: ComposerEvent[] = [];
@@ -51,6 +63,26 @@ describe("createComposerBridgeClient — boundary + events", () => {
     if (sendResult && sendResult.type === "send.result")
       expect(sendResult.outcome.ok).toBe(true);
     expect(client.getDraft().text).toBe(""); // cleared on successful send
+  });
+
+  it("ignores a stale or duplicated send completion", () => {
+    const client = createComposerBridgeClient();
+    const events: ComposerEvent[] = [];
+    client.subscribe((event) => events.push(event));
+    client.dispatchRaw({ type: "text.set", opId: "t", text: "hi" });
+    client.dispatchRaw({ type: "send", opId: "s" });
+
+    client.completeSend("stale", { ok: true, messageId: "wrong" });
+    expect(client.getDraft().text).toBe("hi");
+    expect(events.filter((event) => event.type === "send.result")).toHaveLength(
+      0,
+    );
+
+    client.completeSend("s", { ok: true, messageId: "m1" });
+    client.completeSend("s", { ok: true, messageId: "m1" });
+    expect(events.filter((event) => event.type === "send.result")).toHaveLength(
+      1,
+    );
   });
 });
 

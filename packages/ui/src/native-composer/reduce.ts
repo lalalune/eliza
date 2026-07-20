@@ -33,6 +33,7 @@ import {
   type ComposerRejectReason,
   type DispatchResult,
   emptyComposerDraft,
+  type SendOperation,
   type SendOutcome,
 } from "./contract";
 
@@ -92,8 +93,20 @@ export function defaultApplyContext(
 export interface ComposerBridgeState {
   draft: ComposerDraft;
   processed: Set<string>;
-  deferred: ComposerOperation[];
-  sending: { opId: string } | null;
+  deferred: DeferredComposerSend[];
+  sending: ActiveComposerSend | null;
+}
+
+/** A queued send owns the exact draft that existed when the shell submitted. */
+export interface DeferredComposerSend {
+  operation: SendOperation;
+  draft: ComposerDraft;
+}
+
+/** The immutable payload snapshot owned by the active transport request. */
+export interface ActiveComposerSend {
+  opId: string;
+  draft: ComposerDraft;
 }
 
 export function initialComposerState(): ComposerBridgeState {
@@ -265,8 +278,7 @@ export function applyComposerOperation(
       );
     }
     case "focus.set": {
-      const keyboard =
-        op.keyboard ?? (op.focused ? "shown" : state.draft.keyboard);
+      const keyboard = op.keyboard ?? (op.focused ? "shown" : "hidden");
       return commitApplied(
         state,
         op.opId,
@@ -303,10 +315,24 @@ export function applyComposerOperation(
     }
     case "cancel": {
       if (op.scope === "send") {
-        // Aborting a send is idempotent even with nothing in flight.
-        return commitApplied(state, op.opId, limits, state.draft, {
-          sending: null,
-        });
+        // A deferred send is a send reservation too. Cancelling it must remove
+        // the queued replay, otherwise reconnect would submit after the shell
+        // had already reported cancellation to the user.
+        let processed = state.processed;
+        for (const deferred of state.deferred) {
+          processed = markProcessed(
+            processed,
+            deferred.operation.opId,
+            limits.maxProcessedOpIds,
+          );
+        }
+        return commitApplied(
+          { ...state, deferred: [], processed },
+          op.opId,
+          limits,
+          state.draft,
+          { sending: null },
+        );
       }
       // scope === "draft": clear the body, keep focus/keyboard so the input stays live.
       const cleared: ComposerDraft = {
@@ -315,7 +341,7 @@ export function applyComposerOperation(
         keyboard: state.draft.keyboard,
         revision: state.draft.revision + 1,
       };
-      return commitApplied(state, op.opId, limits, cleared, { sending: null });
+      return commitApplied(state, op.opId, limits, cleared);
     }
     case "send": {
       if (isDraftEmpty(state.draft))
@@ -327,15 +353,37 @@ export function applyComposerOperation(
           "send-in-flight",
           "a send is already in flight",
         );
+      const deferred = state.deferred[0];
+      if (deferred) {
+        if (deferred.operation.opId === op.opId) {
+          return {
+            state,
+            result: { status: "duplicate", opId: op.opId, draft: state.draft },
+          };
+        }
+        return rejected(
+          state,
+          op.opId,
+          "send-in-flight",
+          "a send is already deferred",
+        );
+      }
       if (!online) {
-        // Queue for replay on reconnect; not marked processed until it applies.
+        // Snapshot the payload now. Later offline edits belong to the next
+        // draft and must not silently rewrite the already-submitted message.
         return {
-          state: { ...state, deferred: [...state.deferred, op] },
+          state: {
+            ...state,
+            deferred: [
+              ...state.deferred,
+              { operation: op, draft: state.draft },
+            ],
+          },
           result: { status: "deferred", opId: op.opId, draft: state.draft },
         };
       }
       return commitApplied(state, op.opId, limits, state.draft, {
-        sending: { opId: op.opId },
+        sending: { opId: op.opId, draft: state.draft },
       });
     }
   }
@@ -371,6 +419,11 @@ export function resolveSend(
 ): ComposerBridgeState {
   if (!state.sending || state.sending.opId !== opId) return state;
   if (!outcome.ok) return { ...state, sending: null };
+  // Typing may continue while transport is in flight. Only clear the draft if
+  // it is still the exact revision that this send captured.
+  if (state.draft.revision !== state.sending.draft.revision) {
+    return { ...state, sending: null };
+  }
   return {
     ...state,
     sending: null,
@@ -391,10 +444,15 @@ export function flushDeferredOperations(
   const queue = state.deferred;
   let next: ComposerBridgeState = { ...state, deferred: [] };
   const results: DispatchResult[] = [];
-  for (const op of queue) {
-    const step = applyComposerOperation(next, op, ctx);
-    next = step.state;
-    results.push(step.result);
+  for (const deferred of queue) {
+    const liveDraft = next.draft;
+    const step = applyComposerOperation(
+      { ...next, draft: deferred.draft },
+      deferred.operation,
+      ctx,
+    );
+    next = { ...step.state, draft: liveDraft };
+    results.push({ ...step.result, draft: liveDraft });
   }
   return { state: next, results };
 }

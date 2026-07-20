@@ -40,6 +40,7 @@ import {
   type ComposerLimits,
   DEFAULT_COMPOSER_CAPABILITIES,
   DEFAULT_COMPOSER_LIMITS,
+  type DeferredComposerSend,
   flushDeferredOperations,
   initialComposerState,
   resolveSend,
@@ -52,7 +53,7 @@ export interface ComposerBridgeSnapshot {
   /** The dedupe ledger, so a post-reload duplicate op still no-ops. */
   processedOpIds: string[];
   /** The offline send queue, so a deferred send still replays after reload. */
-  deferred: ComposerOperation[];
+  deferred: DeferredComposerSend[];
 }
 
 export interface ComposerBridgeClientOptions {
@@ -145,7 +146,26 @@ export function createComposerBridgeClient(
       return applyDecoded(decoded.operation);
     },
     dispatchRawStream(raw) {
-      const { operations, rejected } = decodeComposerOperationStream(raw);
+      let decoded: ReturnType<typeof decodeComposerOperationStream>;
+      try {
+        decoded = decodeComposerOperationStream(raw);
+      } catch (error) {
+        // error-policy:J3 untrusted-input sanitizing — an unusable native batch
+        // is one explicit invalid result; it must not tear down the composer.
+        return [
+          {
+            status: "rejected",
+            opId: "",
+            reason: "invalid-input",
+            message:
+              error instanceof Error
+                ? error.message
+                : "composer operation stream is invalid",
+            draft: state.draft,
+          },
+        ];
+      }
+      const { operations, rejected } = decoded;
       const results: DispatchResult[] = [];
       // Preserve source order: rejected ops surface as invalid-input in place.
       let opIdx = 0;
@@ -171,6 +191,9 @@ export function createComposerBridgeClient(
       return applyDecoded(op);
     },
     completeSend(opId, outcome) {
+      // Native callbacks may be duplicated or arrive after cancellation. Only
+      // the active reservation owns the result event and draft transition.
+      if (state.sending?.opId !== opId) return;
       state = resolveSend(state, opId, outcome);
       emit({ type: "send.result", opId, outcome });
       emit({ type: "draft.changed", draft: state.draft });

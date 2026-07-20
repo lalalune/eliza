@@ -1,15 +1,15 @@
 /**
  * Normalizes a decoded {@link ComposerAttachmentSource} into a
  * {@link ComposerAttachment} expressed purely in the existing content-addressed
- * media store's vocabulary — a `data:` URL (persisted to the store on send by the
- * outgoing pipeline in `api/media-runtime.ts`), a remote http(s) URL flagged for
- * server-side SSRF-guarded rehost, or an already-stored `/api/media/<hash>` URL.
+ * media store's vocabulary — a `data:` URL, a remote http(s) URL flagged for
+ * server-side SSRF-guarded ingest, or an already-stored `/api/media/<hash>` URL.
  *
  * This is the "route attachments through the existing store, add no second store"
  * seam on the renderer side: it produces no file id and no bespoke handle, only a
- * URL the existing send path already knows how to persist. Oversized or malformed
- * bytes are rejected with a typed reason (never a fabricated attachment), so a bad
- * source stops here instead of becoming a broken tile downstream.
+ * URL a send adapter can materialize through the authenticated media boundary.
+ * This normalizer does not itself persist or fetch bytes. Oversized or malformed
+ * bytes are rejected with a typed reason (never a fabricated attachment), so a
+ * bad source stops here instead of becoming a broken tile downstream.
  *
  * The private-host check on `remote` is a fast first-line guard for obvious
  * loopback/RFC-1918 literals; it is NOT the authority. The server's DNS-pinned
@@ -57,6 +57,9 @@ function base64ByteLength(base64: string): number | null {
   const cleaned = base64.replace(/\s+/g, "");
   if (cleaned.length === 0) return 0;
   if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(cleaned)) return null;
+  // A base64 payload can omit padding, but a length congruent to 1 mod 4 can
+  // never encode complete bytes. Buffer.from would silently accept it.
+  if (cleaned.replace(/=+$/, "").length % 4 === 1) return null;
   const padding = cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0;
   return Math.floor((cleaned.length * 3) / 4) - padding;
 }
@@ -93,8 +96,13 @@ function dataUrlByteLength(dataUrl: string): number | null {
   const header = dataUrl.slice("data:".length, comma);
   const payload = dataUrl.slice(comma + 1);
   if (/;base64/i.test(header)) return base64ByteLength(payload);
-  // Percent/plain-encoded payloads are at most their encoded length in bytes.
-  return payload.length;
+  try {
+    return new TextEncoder().encode(decodeURIComponent(payload)).byteLength;
+  } catch {
+    // error-policy:J3 untrusted-input sanitizing — malformed percent escapes
+    // are an explicit invalid data URL, never accepted for later persistence.
+    return null;
+  }
 }
 
 /**
@@ -161,6 +169,8 @@ export function normalizeComposerAttachment(
       };
     }
     case "remote": {
+      if (source.mimeType && !isWellFormedMime(source.mimeType))
+        return reject("invalid-input", `malformed mime: ${source.mimeType}`);
       let parsed: URL;
       try {
         parsed = new URL(source.url);
@@ -184,12 +194,14 @@ export function normalizeComposerAttachment(
           ...(source.mimeType ? { mimeType: source.mimeType } : {}),
           ...(source.name ? { name: source.name } : {}),
           kind: "remote",
-          // Awaits the server's SSRF-guarded rehost on send; not yet in the store.
+          // Awaits the server's SSRF-guarded ingest; not yet in the store.
           status: "pending-rehost",
         },
       };
     }
     case "stored": {
+      if (source.mimeType && !isWellFormedMime(source.mimeType))
+        return reject("invalid-input", `malformed mime: ${source.mimeType}`);
       const name = source.url.startsWith(STORED_MEDIA_PREFIX)
         ? source.url.slice(STORED_MEDIA_PREFIX.length).split(/[?#]/)[0]
         : "";
@@ -201,6 +213,7 @@ export function normalizeComposerAttachment(
           id,
           url: source.url,
           ...(source.mimeType ? { mimeType: source.mimeType } : {}),
+          ...(source.name ? { name: source.name } : {}),
           kind: "stored",
           status: "ready",
         },

@@ -1,9 +1,9 @@
 /**
  * `eliza.native-composer/v1` — the one typed composer-bridge contract shared by
  * the iOS, Android, desktop, and web shells. Types + schema (`contract`), boundary
- * decoder (`decode`), attachment normalization into the existing media store
- * (`attachments`), the pure state machine (`reduce`), and the renderer-side
- * client that wires them together (`client`).
+ * decoder (`decode`), attachment normalization into the existing media-store
+ * vocabulary (`attachments`), the pure state machine (`reduce`), and the
+ * renderer-side client that wires them together (`client`).
  */
 
 export {
@@ -67,6 +67,7 @@ export {
   decodeComposerOperationStream,
 } from "./decode";
 export {
+  type ActiveComposerSend,
   applyComposerOperation,
   type ComposerApplyContext,
   type ComposerBridgeState,
@@ -74,6 +75,7 @@ export {
   type ComposerLimits,
   DEFAULT_COMPOSER_CAPABILITIES,
   DEFAULT_COMPOSER_LIMITS,
+  type DeferredComposerSend,
   defaultApplyContext,
   flushDeferredOperations,
   initialComposerState,
