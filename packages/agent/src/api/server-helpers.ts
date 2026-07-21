@@ -15,9 +15,12 @@ import {
   type Content,
   ContentType,
   createMessageMemory,
+  fetchRemoteMedia,
   logger,
   MESSAGE_SOURCE_CLIENT_CHAT,
   type Media,
+  nodeLookupFn,
+  nodePinnedFetch,
   sendJsonError,
   type UUID,
   validateUuid,
@@ -31,6 +34,7 @@ import {
 import {
   CHAT_UPLOAD_MIME_TYPES,
   MAX_CHAT_UPLOAD_ATTACHMENTS as MAX_CHAT_IMAGES,
+  MAX_CHAT_MEDIA_RAW_BYTES,
   MAX_CHAT_IMAGE_BASE64_BYTES as MAX_IMAGE_DATA_BYTES,
   MAX_CHAT_ATTACHMENT_NAME_LENGTH as MAX_IMAGE_NAME_LENGTH,
   MAX_CHAT_MEDIA_BASE64_BYTES as MAX_MEDIA_DATA_BYTES,
@@ -54,9 +58,15 @@ import {
   type PluginManagerLike,
 } from "../services/plugin-manager-types.ts";
 import { extractCompatTextContent } from "./compat-utils.ts";
-import { persistImageThumbnail, persistMediaBytes } from "./media-store.ts";
+import {
+  handleMediaRouteRequest,
+  mediaFileNameFromUrl,
+  persistImageThumbnail,
+  persistMediaBytes,
+} from "./media-store.ts";
 import { isBlockedObjectKey } from "./server-helpers-config.ts";
 import type {
+  ChatAttachmentInput,
   ChatAttachmentWithData,
   ChatImageAttachment,
   ServerState,
@@ -484,6 +494,245 @@ export function cloneWithoutBlockedObjectKeys<T>(value: T): T {
 // aliased to the historical local names) so the UI composer enforces the exact
 // same numbers pre-send and the two sides cannot drift.
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const DATA_URL_RE = /^data:([^,]*),([\s\S]*)$/;
+
+export type MaterializeChatAttachmentsResult =
+  | { ok: true; images: ChatImageAttachment[] | undefined }
+  | { ok: false; status: 400 | 413 | 422; error: string };
+
+function attachmentNameFromUrl(url: string): string {
+  try {
+    const name = new URL(url).pathname.split("/").pop()?.trim();
+    return name ? decodeURIComponent(name) : "attachment";
+  } catch {
+    // error-policy:J3 untrusted-input sanitizing — the caller reports the URL
+    // as invalid; this display-only fallback never makes it valid.
+    return "attachment";
+  }
+}
+
+function normalizedAttachmentMime(value: string | undefined): string {
+  return (value ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+function materializeDataUrl(
+  dataUrl: string,
+  name: string | undefined,
+): MaterializeChatAttachmentsResult {
+  const match = DATA_URL_RE.exec(dataUrl.trim());
+  if (!match) return { ok: false, status: 400, error: "Invalid data URL" };
+  const header = match[1] ?? "";
+  const payload = match[2] ?? "";
+  const tokens = header.split(";");
+  const mimeType = normalizedAttachmentMime(tokens.shift());
+  if (!mimeType) {
+    return { ok: false, status: 400, error: "Data URL requires a MIME type" };
+  }
+  const isBase64 = tokens.some(
+    (token) => token.trim().toLowerCase() === "base64",
+  );
+  if (isBase64) {
+    const compact = payload.replace(/\s+/g, "");
+    if (!compact || !BASE64_RE.test(compact)) {
+      return { ok: false, status: 400, error: "Invalid base64 data URL" };
+    }
+    return {
+      ok: true,
+      images: [{ data: compact, mimeType, name: name ?? "attachment" }],
+    };
+  }
+  try {
+    const data = Buffer.from(decodeURIComponent(payload), "utf8").toString(
+      "base64",
+    );
+    return {
+      ok: true,
+      images: [{ data, mimeType, name: name ?? "attachment" }],
+    };
+  } catch {
+    // error-policy:J3 malformed percent encoding is explicit invalid input.
+    return {
+      ok: false,
+      status: 400,
+      error: "Invalid percent-encoded data URL",
+    };
+  }
+}
+
+/**
+ * Materialize native composer attachment sources at the authenticated chat-send
+ * boundary. Remote URLs use the DNS-pinned SSRF fetcher; stored URLs are read
+ * only through the strict content-addressed media route. The returned byte
+ * shape then follows the exact existing validation and persistence path.
+ */
+export async function materializeChatAttachmentInputs(
+  inputs: ChatAttachmentInput[] | null | undefined,
+): Promise<MaterializeChatAttachmentsResult> {
+  if (!inputs?.length) return { ok: true, images: undefined };
+  if (inputs.length > MAX_CHAT_IMAGES) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Too many attachments (max ${MAX_CHAT_IMAGES})`,
+    };
+  }
+
+  const images: ChatImageAttachment[] = [];
+  for (const input of inputs) {
+    if (!input || typeof input !== "object") {
+      return {
+        ok: false,
+        status: 400,
+        error: "Each attachment must be an object",
+      };
+    }
+    if (!("source" in input)) {
+      images.push(input as ChatImageAttachment);
+      continue;
+    }
+
+    switch (input.source) {
+      case "inline":
+        if (
+          typeof input.bytesBase64 !== "string" ||
+          typeof input.mimeType !== "string" ||
+          (input.name !== undefined && typeof input.name !== "string")
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Inline attachment fields are invalid",
+          };
+        }
+        images.push({
+          data: input.bytesBase64,
+          mimeType: input.mimeType,
+          name: input.name ?? "attachment",
+        });
+        break;
+      case "data-url": {
+        if (
+          typeof input.dataUrl !== "string" ||
+          (input.name !== undefined && typeof input.name !== "string")
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Data URL attachment fields are invalid",
+          };
+        }
+        const materialized = materializeDataUrl(input.dataUrl, input.name);
+        if (!materialized.ok) return materialized;
+        images.push(...(materialized.images ?? []));
+        break;
+      }
+      case "remote": {
+        if (
+          typeof input.url !== "string" ||
+          (input.mimeType !== undefined &&
+            typeof input.mimeType !== "string") ||
+          (input.name !== undefined && typeof input.name !== "string")
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Remote attachment fields are invalid",
+          };
+        }
+        let fetched: Awaited<ReturnType<typeof fetchRemoteMedia>>;
+        try {
+          fetched = await fetchRemoteMedia({
+            url: input.url,
+            maxBytes: MAX_CHAT_MEDIA_RAW_BYTES,
+            lookupFn: nodeLookupFn,
+            pinnedFetchImpl: nodePinnedFetch,
+          });
+        } catch (error) {
+          // error-policy:J1 authenticated transport boundary translation — a
+          // blocked, oversized, or unreachable remote source is a failed input.
+          return {
+            ok: false,
+            status: 422,
+            error: `Remote attachment could not be fetched: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          };
+        }
+        const mimeType = normalizedAttachmentMime(
+          fetched.contentType ?? input.mimeType,
+        );
+        if (!mimeType) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Remote attachment has no MIME type",
+          };
+        }
+        images.push({
+          data: fetched.buffer.toString("base64"),
+          mimeType,
+          name:
+            input.name ?? fetched.fileName ?? attachmentNameFromUrl(input.url),
+        });
+        break;
+      }
+      case "stored": {
+        if (
+          typeof input.url !== "string" ||
+          (input.mimeType !== undefined &&
+            typeof input.mimeType !== "string") ||
+          (input.name !== undefined && typeof input.name !== "string")
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Stored attachment fields are invalid",
+          };
+        }
+        const fileName = mediaFileNameFromUrl(input.url);
+        if (!fileName) {
+          return { ok: false, status: 400, error: "Invalid stored media URL" };
+        }
+        const head = handleMediaRouteRequest(input.url, "HEAD");
+        if (head.status !== 200) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Stored media was not found",
+          };
+        }
+        const size = Number(head.headers["Content-Length"] ?? 0);
+        if (Number.isFinite(size) && size > MAX_CHAT_MEDIA_RAW_BYTES) {
+          return {
+            ok: false,
+            status: 413,
+            error: "Stored attachment is too large",
+          };
+        }
+        const stored = handleMediaRouteRequest(input.url, "GET");
+        if (stored.status !== 200 || !stored.body) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Stored media was not found",
+          };
+        }
+        const mimeType = normalizedAttachmentMime(
+          stored.headers["Content-Type"] ?? input.mimeType,
+        );
+        images.push({
+          data: stored.body.toString("base64"),
+          mimeType,
+          name: input.name ?? fileName,
+        });
+        break;
+      }
+      default:
+        return { ok: false, status: 400, error: "Unknown attachment source" };
+    }
+  }
+  return { ok: true, images };
+}
 
 /**
  * True when a syntactically-valid base64 string decodes to zero bytes. `BASE64_RE`

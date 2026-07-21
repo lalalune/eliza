@@ -32,13 +32,13 @@ import { androidNativeAgentTransportForUrl } from "./android-native-agent-transp
 import type {
   AccountConnectRequest,
   ChatActionResultSummary,
+  ChatAttachmentInput,
   ChatFailureKind,
   ChatTokenUsage,
   ChatToolCallEvent,
   ChatTurnStatus,
   ConnectionStateInfo,
   ConversationChannelType,
-  ImageAttachment,
   LocalInferenceChatMetadata,
   WebSocketConnectionState,
   WsEventHandler,
@@ -1798,7 +1798,7 @@ export class ElizaClient {
     onToken: (token: string, accumulatedText?: string) => void,
     channelType: ConversationChannelType = "DM",
     signal?: AbortSignal,
-    images?: ImageAttachment[],
+    images?: ChatAttachmentInput[],
     metadata?: Record<string, unknown>,
     /** Additive: in-flight phase changes (thinking / streaming / running_action
      *  / waking …). Omitting it leaves the token/done/error behaviour unchanged. */

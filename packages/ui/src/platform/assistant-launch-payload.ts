@@ -21,6 +21,7 @@ export const ASSISTANT_LAUNCH_SOURCES = new Set([
   "android-assist",
   "assistant-entry",
   "ios-app-shortcuts",
+  "ios-app-intents",
   "macos-shortcuts",
   "macos-siri",
   "siri",

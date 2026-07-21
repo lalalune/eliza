@@ -26,7 +26,11 @@
  * the shapes and never re-validates them.
  */
 
-import { normalizeComposerAttachment } from "./attachments";
+import { MAX_CHAT_UPLOAD_ATTACHMENTS } from "@elizaos/shared/chat-upload-limits";
+import {
+  DEFAULT_MAX_ATTACHMENT_BYTES,
+  normalizeComposerAttachment,
+} from "./attachments";
 import {
   type ComposerDraft,
   type ComposerOperation,
@@ -61,8 +65,8 @@ export const DEFAULT_COMPOSER_CAPABILITIES: ComposerCapabilities = {
 
 export const DEFAULT_COMPOSER_LIMITS: ComposerLimits = {
   maxTextLength: 100_000,
-  maxAttachments: 10,
-  maxAttachmentBytes: 50 * 1024 * 1024,
+  maxAttachments: MAX_CHAT_UPLOAD_ATTACHMENTS,
+  maxAttachmentBytes: DEFAULT_MAX_ATTACHMENT_BYTES,
   maxProcessedOpIds: 512,
 };
 

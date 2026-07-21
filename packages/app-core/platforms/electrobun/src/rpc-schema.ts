@@ -42,6 +42,10 @@ import type {
   LaunchSnapshot,
 } from "./launch/types";
 import type {
+  NativeComposerOperationStream,
+  NativeComposerRendererEventInput,
+} from "./native-composer-host";
+import type {
   TraceEvent,
   TraceRecordEventParams,
   TraceSearchParams,
@@ -1669,6 +1673,14 @@ export type ElizaDesktopRPCSchema = {
         params: LocalAgentStreamRequestOptions;
         response: LocalAgentStreamOpen;
       };
+      nativeComposerDrainOperations: {
+        params: undefined;
+        response: NativeComposerOperationStream;
+      };
+      nativeComposerPublishEvent: {
+        params: NativeComposerRendererEventInput;
+        response: { ok: true };
+      };
       desktopOpenLogsFolder: { params: undefined; response: undefined };
       desktopCreateBugReportBundle: {
         params: {
@@ -2427,6 +2439,7 @@ export type ElizaDesktopRPCSchema = {
 
       // Share target
       shareTargetReceived: { url: string; text?: string };
+      nativeComposerOperationStream: NativeComposerOperationStream;
 
       // Location push events
       locationUpdate: {
@@ -2832,6 +2845,7 @@ export const PUSH_CHANNEL_TO_RPC_MESSAGE: Record<string, string> = {
   "contextMenu:saveAsCommand": "contextMenuSaveAsCommand",
   apiBaseUpdate: "apiBaseUpdate",
   shareTargetReceived: "shareTargetReceived",
+  "native-composer:operationStream": "nativeComposerOperationStream",
   "location:update": "locationUpdate",
   "desktop:updateAvailable": "desktopUpdateAvailable",
   "desktop:updateReady": "desktopUpdateReady",

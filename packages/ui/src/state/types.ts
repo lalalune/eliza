@@ -25,6 +25,7 @@ import type {
   BscTransferExecuteResponse,
   CatalogSkill,
   CharacterData,
+  ChatAttachmentInput,
   ChatTokenUsage,
   CodingAgentSession,
   Conversation,
@@ -750,8 +751,10 @@ export interface AppActions {
     options?: {
       channelType?: ConversationChannelType;
       conversationId?: string | null;
-      images?: ImageAttachment[];
+      images?: ChatAttachmentInput[];
       metadata?: Record<string, unknown>;
+      /** Stable idempotency key for native/system callers replaying a send. */
+      clientMessageId?: string;
     },
   ) => Promise<void>;
 

@@ -90,6 +90,24 @@ describe("normalizeComposerAttachment — rejections", () => {
     if (!r.ok) expect(r.reason).toBe("invalid-input");
   });
 
+  it("rejects unsupported media and overlong names before send", () => {
+    expect(
+      normalizeComposerAttachment("att1", {
+        source: "inline",
+        mimeType: "application/x-msdownload",
+        bytesBase64: "AAAA",
+      }),
+    ).toEqual(expect.objectContaining({ ok: false, reason: "unsupported" }));
+    expect(
+      normalizeComposerAttachment("att1", {
+        source: "inline",
+        mimeType: "text/plain",
+        bytesBase64: "AAAA",
+        name: "a".repeat(256),
+      }),
+    ).toEqual(expect.objectContaining({ ok: false, reason: "invalid-input" }));
+  });
+
   it("rejects non-base64 inline bytes", () => {
     const r = normalizeComposerAttachment("att1", {
       source: "inline",

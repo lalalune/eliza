@@ -13,6 +13,7 @@ import type {
   AccountConnectRequest,
   ApiError,
   ChatActionResultSummary,
+  ChatAttachmentInput,
   ChatFailureKind,
   ChatTokenUsage,
   ChatToolCallEvent,
@@ -38,7 +39,6 @@ import type {
   DocumentsResponse,
   DocumentUpdateResult,
   DocumentUploadResult,
-  ImageAttachment,
   LocalInferenceChatMetadata,
   McpMarketplaceResult,
   McpRegistryServerDetail,
@@ -475,7 +475,7 @@ declare module "./client-base" {
       id: string,
       text: string,
       channelType?: ConversationChannelType,
-      images?: ImageAttachment[],
+      images?: ChatAttachmentInput[],
       metadata?: Record<string, unknown>,
     ): Promise<{
       text: string;
@@ -501,7 +501,7 @@ declare module "./client-base" {
       onToken: (token: string, accumulatedText?: string) => void,
       channelType?: ConversationChannelType,
       signal?: AbortSignal,
-      images?: ImageAttachment[],
+      images?: ChatAttachmentInput[],
       metadata?: Record<string, unknown>,
       /** Additive: in-flight phase changes for the rich status indicator. */
       onStatus?: (status: ChatTurnStatus) => void,

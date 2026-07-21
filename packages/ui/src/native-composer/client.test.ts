@@ -117,6 +117,25 @@ describe("createComposerBridgeClient — reload durability", () => {
     expect(after.getState().sending?.opId).toBe("s");
     expect(after.getState().deferred).toHaveLength(0);
   });
+
+  it("snapshots an in-flight send as replayable instead of falsely processed", () => {
+    const before = createComposerBridgeClient();
+    before.dispatchRaw({ type: "text.set", opId: "text", text: "hello" });
+    before.dispatchRaw({ type: "send", opId: "send" });
+
+    const snapshot = before.serialize();
+    expect(snapshot.processedOpIds).not.toContain("send");
+    expect(snapshot.deferred).toEqual([
+      {
+        operation: { type: "send", opId: "send" },
+        draft: expect.objectContaining({ text: "hello" }),
+      },
+    ]);
+
+    const after = createComposerBridgeClient({ online: false, snapshot });
+    after.setOnline(true);
+    expect(after.getState().sending?.opId).toBe("send");
+  });
 });
 
 describe("createComposerBridgeClient — batch replay", () => {

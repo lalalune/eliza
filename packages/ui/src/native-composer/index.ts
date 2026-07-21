@@ -81,3 +81,11 @@ export {
   initialComposerState,
   resolveSend,
 } from "./reduce";
+export {
+  acknowledgeNativeComposerOperation,
+  dispatchNativeComposerOperation,
+  dispatchNativeComposerRendererEvent,
+  drainNativeComposerOperations,
+  NATIVE_COMPOSER_OPERATION_EVENT,
+  NATIVE_COMPOSER_RENDERER_EVENT,
+} from "./transport";

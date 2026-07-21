@@ -96,13 +96,17 @@ import {
   getErrorMessage,
   hasBlockedObjectKeyDeep,
   isWalletActionRequiredIntent,
+  materializeChatAttachmentInputs,
   maybeAugmentChatMessageWithWalletContext,
   normalizeIncomingChatPrompt,
   resolveAppUserName,
   trimWalletProgressPrefix,
   validateChatImages,
 } from "./server-helpers.ts";
-import type { ChatImageAttachment } from "./server-types.ts";
+import type {
+  ChatAttachmentInput,
+  ChatImageAttachment,
+} from "./server-types.ts";
 
 export type { ChatImageAttachment, LogEntry };
 
@@ -2247,7 +2251,7 @@ export async function readChatRequestPayload(
   const body = await helpers.readJsonBody<{
     text?: string;
     channelType?: string;
-    images?: ChatImageAttachment[];
+    images?: ChatAttachmentInput[];
     language?: string;
     source?: string;
     metadata?: Record<string, unknown>;
@@ -2255,7 +2259,15 @@ export async function readChatRequestPayload(
     streamProtocol?: string;
   }>(req, res, { maxBytes });
   if (!body) return null;
-  const normalizedPrompt = normalizeIncomingChatPrompt(body.text, body.images);
+  const materialized = await materializeChatAttachmentInputs(body.images);
+  if (!materialized.ok) {
+    helpers.error(res, materialized.error, materialized.status);
+    return null;
+  }
+  const normalizedPrompt = normalizeIncomingChatPrompt(
+    body.text,
+    materialized.images,
+  );
   if (!normalizedPrompt) {
     helpers.error(res, "text is required");
     return null;
@@ -2265,13 +2277,13 @@ export async function readChatRequestPayload(
     helpers.error(res, "channelType is invalid", 400);
     return null;
   }
-  const imageValidationError = validateChatImages(body.images);
+  const imageValidationError = validateChatImages(materialized.images);
   if (imageValidationError) {
     helpers.error(res, imageValidationError, 400);
     return null;
   }
-  const images = Array.isArray(body.images)
-    ? (body.images as ChatImageAttachment[]).map((img) => ({
+  const images = Array.isArray(materialized.images)
+    ? materialized.images.map((img) => ({
         ...img,
         mimeType: img.mimeType.toLowerCase(),
       }))

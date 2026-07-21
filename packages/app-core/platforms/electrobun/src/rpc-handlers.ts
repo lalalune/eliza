@@ -123,6 +123,10 @@ import {
 import { getSwabbleManager } from "./native/swabble";
 import { getTalkModeManager } from "./native/talkmode";
 import {
+  drainNativeComposerOperations,
+  publishNativeComposerEvent,
+} from "./native-composer-host";
+import {
   buildDynamicViewRpcHandlers,
   buildNotificationRpcHandlers,
   buildWindowRpcHandlers,
@@ -714,6 +718,9 @@ export function buildBunRpcHandlers({
         "localAgentStreamRequest is not yet available: the desktop IPC streaming leg lands with its child-side consumer (#12180 phase 4).",
       );
     },
+    nativeComposerDrainOperations: async () => drainNativeComposerOperations(),
+    nativeComposerPublishEvent: async (params) =>
+      publishNativeComposerEvent(params),
 
     // ---- Renderer diagnostics ----
     rendererReportDiagnostic: async (

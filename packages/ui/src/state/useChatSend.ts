@@ -12,6 +12,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
 import type { Conversation, CustomActionDef } from "../api";
 import {
   type ChatActionResultSummary,
+  type ChatAttachmentInput,
   type ChatToolCallEvent,
   type ChatTurnStatus,
   type CodingAgentSession,
@@ -19,6 +20,7 @@ import {
   type ConversationMessage,
   client,
   type ImageAttachment,
+  type MessageAttachment,
   type MessageAttachmentContentType,
 } from "../api";
 import { isLimitedCloudAgentApiBase } from "../api/app-shell-capabilities";
@@ -583,7 +585,7 @@ export interface QueuedChatSend {
   rawInput: string;
   channelType: ConversationChannelType;
   conversationId?: string | null;
-  images?: ImageAttachment[];
+  images?: ChatAttachmentInput[];
   metadata?: Record<string, unknown>;
   /**
    * Idempotency key for this logical turn. Minted once on the first attempt and
@@ -607,6 +609,66 @@ export interface QueuedChatSend {
   };
   resolve: () => void;
   reject: (error: unknown) => void;
+}
+
+function isByteBackedChatAttachment(
+  attachment: ChatAttachmentInput,
+): attachment is ImageAttachment {
+  return "data" in attachment;
+}
+
+function attachmentPreview(
+  attachment: ChatAttachmentInput,
+  id: string,
+): MessageAttachment {
+  if (isByteBackedChatAttachment(attachment)) {
+    return {
+      id,
+      url: `data:${attachment.mimeType};base64,${attachment.data}`,
+      contentType: optimisticAttachmentKind(attachment.mimeType),
+      ...(attachment.name ? { title: attachment.name } : {}),
+      mimeType: attachment.mimeType,
+      source: MESSAGE_SOURCE_CLIENT_CHAT,
+      ...(attachment.transcriptId
+        ? { transcriptId: attachment.transcriptId }
+        : {}),
+      ...(attachment.thumbnail
+        ? {
+            thumbnailUrl: `data:${attachment.thumbnail.mimeType};base64,${attachment.thumbnail.data}`,
+          }
+        : {}),
+    };
+  }
+  if (!("source" in attachment)) {
+    throw new Error("Chat attachment input has no byte or source payload");
+  }
+
+  let mimeType: string | undefined;
+  let url: string;
+  switch (attachment.source) {
+    case "inline":
+      mimeType = attachment.mimeType;
+      url = `data:${attachment.mimeType};base64,${attachment.bytesBase64}`;
+      break;
+    case "data-url":
+      mimeType = attachment.dataUrl.slice(5).split(/[;,]/, 1)[0] || undefined;
+      url = attachment.dataUrl;
+      break;
+    case "remote":
+    case "stored":
+      mimeType = attachment.mimeType;
+      url = attachment.url;
+      break;
+  }
+  return {
+    id,
+    url,
+    ...(mimeType
+      ? { contentType: optimisticAttachmentKind(mimeType), mimeType }
+      : {}),
+    ...(attachment.name ? { title: attachment.name } : {}),
+    source: MESSAGE_SOURCE_CLIENT_CHAT,
+  };
 }
 
 // ── Deps interface ──────────────────────────────────────────────────
@@ -1451,7 +1513,7 @@ export function useChatSend(deps: UseChatSendDeps) {
       let convRoomId: string | null = null;
 
       let text = hasAttachedImages
-        ? rawText || "Please review the attached image."
+        ? rawText || "Please review the attached file."
         : rawText;
       if (rawText) {
         let commandResult: { handled: boolean; rewrittenText?: string };
@@ -1488,20 +1550,9 @@ export function useChatSend(deps: UseChatSendDeps) {
       // Those calls can take seconds on a cold cloud agent; clearing the composer
       // first and waiting to add this row made the user's message look lost.
       const optimisticAttachments = imagesToSend?.length
-        ? imagesToSend.map((img, i) => ({
-            id: `${userMsgId}-img-${i}`,
-            url: `data:${img.mimeType};base64,${img.data}`,
-            contentType: optimisticAttachmentKind(img.mimeType),
-            ...(img.name ? { title: img.name } : {}),
-            mimeType: img.mimeType,
-            source: MESSAGE_SOURCE_CLIENT_CHAT,
-            ...(img.transcriptId ? { transcriptId: img.transcriptId } : {}),
-            ...(img.thumbnail
-              ? {
-                  thumbnailUrl: `data:${img.thumbnail.mimeType};base64,${img.thumbnail.data}`,
-                }
-              : {}),
-          }))
+        ? imagesToSend.map((attachment, i) =>
+            attachmentPreview(attachment, `${userMsgId}-img-${i}`),
+          )
         : undefined;
       const optimisticUserMessage: ConversationMessage = {
         id: userMsgId,
@@ -2131,7 +2182,11 @@ export function useChatSend(deps: UseChatSendDeps) {
             // say exactly why the server rejected it, because resending the
             // same payload unchanged would fail identically.
             if (rawText) setChatInput(rawText);
-            if (imagesToSend?.length) setChatPendingImages([...imagesToSend]);
+            const restorableImages = imagesToSend?.filter(
+              isByteBackedChatAttachment,
+            );
+            if (restorableImages?.length)
+              setChatPendingImages(restorableImages);
             const restored =
               rawText && imagesToSend?.length
                 ? "Your text and attachments were restored to the input."
@@ -2322,8 +2377,10 @@ export function useChatSend(deps: UseChatSendDeps) {
       options?: {
         channelType?: ConversationChannelType;
         conversationId?: string | null;
-        images?: ImageAttachment[];
+        images?: ChatAttachmentInput[];
         metadata?: Record<string, unknown>;
+        /** Stable idempotency key for native/system callers replaying a send. */
+        clientMessageId?: string;
       },
     ) => {
       const hasAttachedImages = Boolean(options?.images?.length);
@@ -2366,6 +2423,7 @@ export function useChatSend(deps: UseChatSendDeps) {
             options?.conversationId ?? activeConversationIdRef.current ?? null,
           images: options?.images,
           metadata: buildChatViewMetadata(tab, metadata),
+          clientMessageId: options?.clientMessageId,
           resolve,
           reject,
         });

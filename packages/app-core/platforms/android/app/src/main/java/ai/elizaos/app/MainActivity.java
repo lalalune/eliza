@@ -1,3 +1,5 @@
+/** Hosts the Capacitor WebView and registers elizaOS Android bridge plugins. */
+
 package ai.elizaos.app;
 
 import android.Manifest;
@@ -87,6 +89,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(ElizaVoicePlugin.class);
         registerPlugin(ResourceProbePlugin.class);
         registerPlugin(GlassBridgePlugin.class);
+        registerPlugin(NativeComposerPlugin.class);
         super.onCreate(savedInstanceState);
 
         // Replace the auto-registered community PushNotifications plugin with

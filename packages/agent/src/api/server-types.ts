@@ -39,6 +39,7 @@ export interface TelegramAccountAuthSessionLike {
 export type {
   AgentAutomationMode,
   AgentStartupDiagnostics,
+  ChatAttachmentInput,
   ChatImageAttachment,
   ConversationAutomationType,
   ConversationMetadata,

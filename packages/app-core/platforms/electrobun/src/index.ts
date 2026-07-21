@@ -104,6 +104,10 @@ import {
 import { getPermissionManager } from "./native/permissions";
 import { getRemotePluginHost } from "./native/remote-plugin-host";
 import { checkWebGpuSupport } from "./native/webgpu-browser-support";
+import {
+  enqueueNativeComposerOperations,
+  nativeComposerOperationsFromDeepLink,
+} from "./native-composer-host";
 import { getPersistedDeployment } from "./persisted-deployment";
 import { printElectrobunDevSettingsBanner } from "./print-electrobun-dev-settings-banner";
 import {
@@ -2315,6 +2319,22 @@ async function forwardDeepLinkToRenderer(url: string): Promise<void> {
   // Assistant/Siri/Shortcuts links deliberately stay renderer-owned. LifeOps
   // requests must go through the normal chat/runtime planner, which persists
   // ScheduledTask records instead of creating native macOS-only state.
+  try {
+    const operations = nativeComposerOperationsFromDeepLink(url);
+    if (operations.length > 0) {
+      sendToActiveRenderer(
+        "nativeComposerOperationStream",
+        enqueueNativeComposerOperations(operations),
+      );
+    }
+  } catch (error) {
+    // error-policy:J4 the renderer still receives the original deep link and
+    // renders its existing reviewable fallback; the native byte handoff is
+    // visibly unavailable and logged instead of silently dropping a file.
+    logger.warn(
+      `[NativeComposer] Could not materialize deep-link attachment: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   sendToActiveRenderer("shareTargetReceived", { url });
 }
 

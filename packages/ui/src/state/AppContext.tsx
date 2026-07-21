@@ -93,6 +93,7 @@ import { useFirstRunState } from "./useFirstRunState";
 import { useLifecycleState } from "./useLifecycleState";
 import { useLogsState } from "./useLogsState";
 import { useMiscUiState } from "./useMiscUiState";
+import { useNativeComposerBridge } from "./useNativeComposerBridge";
 import { useNavigationState } from "./useNavigationState";
 import { usePairingState } from "./usePairingState";
 import { usePluginsSkillsState } from "./usePluginsSkillsState";
@@ -1163,6 +1164,14 @@ function AppProviderInner({
     handleRenameConversation,
     suggestConversationTitle,
   } = chatCallbacks;
+
+  useNativeComposerBridge({
+    sendChatText,
+    setChatInput,
+    setChatPendingImages,
+    setChatReplyTarget,
+    interruptActiveChatPipeline,
+  });
 
   // In-chat first-run interception: a first-run-scoped choice pick (reserved
   // `__first_run__:` prefix) is consumed by the active onboarding conductor and

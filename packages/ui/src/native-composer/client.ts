@@ -1,17 +1,16 @@
 /**
  * The renderer-side composer-bridge client: the one object a native shell talks
  * to. It decodes raw operations at the boundary, folds them through the reducer,
- * emits typed {@link ComposerEvent}s back to the shell, and persists the draft +
- * idempotency ledger so state survives app backgrounding, window reload, and
- * transport reconnect.
+ * emits typed {@link ComposerEvent}s back to the shell, and exposes a durable
+ * snapshot of the draft + idempotency ledger for a host persistence adapter.
  *
  * Durability model:
  *   - `serialize()` / `hydrate()` round-trip the draft, the processed-`opId`
  *     ledger, and the offline send queue as plain JSON. Restoring them after a
  *     reload is what makes a re-delivered operation still dedupe (idempotency)
  *     and an offline send still replay (offline recovery). The in-flight
- *     `sending` marker is intentionally NOT persisted — a reload has no live
- *     request to resume, so the send is re-driven by a fresh op or its result.
+ *     `sending` marker becomes a deferred send in the snapshot — a reload has no
+ *     live request to resume, so the same idempotent operation must be re-driven.
  *   - `setOnline(true)` flushes the deferred queue and reports each replay.
  *
  * The client never throws on bad native input: a malformed raw operation becomes
@@ -221,11 +220,22 @@ export function createComposerBridgeClient(
       };
     },
     serialize() {
+      const activeSend = state.sending;
       return {
         schema: NATIVE_COMPOSER_SCHEMA,
         draft: state.draft,
-        processedOpIds: [...state.processed],
-        deferred: state.deferred,
+        processedOpIds: [...state.processed].filter(
+          (opId) => opId !== activeSend?.opId,
+        ),
+        deferred: activeSend
+          ? [
+              {
+                operation: { type: "send", opId: activeSend.opId },
+                draft: activeSend.draft,
+              },
+              ...state.deferred,
+            ]
+          : state.deferred,
       };
     },
   };

@@ -6,9 +6,11 @@
 
 import type {
   ChatFailureKind,
+  ChatImageAttachment,
   ChatToolCallEvent,
   ChatTurnStatus,
   LinkedAccountProviderId,
+  ChatAttachmentInput as SharedChatAttachmentInput,
 } from "@elizaos/shared";
 import type { NativeToolCallEvent } from "./client-types-cloud";
 import type {
@@ -78,7 +80,7 @@ export interface UiSpecBlock {
 export type ContentBlock = TextBlock | ConfigFormBlock | UiSpecBlock;
 
 /** An image attachment to send with a chat message. */
-export interface ImageAttachment {
+export interface ImageAttachment extends ChatImageAttachment {
   /** Base64-encoded image data (no data URL prefix). */
   data: string;
   mimeType: string;
@@ -96,6 +98,9 @@ export interface ImageAttachment {
    */
   transcriptId?: string;
 }
+
+/** Attachment input accepted by the real chat-send boundary. */
+export type ChatAttachmentInput = ImageAttachment | SharedChatAttachmentInput;
 
 /**
  * Media kind for a rendered message attachment. Values match `@elizaos/core`

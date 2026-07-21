@@ -41,22 +41,12 @@ export type KeyboardVisibility = "shown" | "hidden";
 
 /**
  * How a native shell hands over one attachment, in media-store vocabulary only.
- * `inline`/`data-url` carry bytes to persist; `remote` is an http(s) URL that a
- * server adapter must ingest through the SSRF guard; `stored` is already in the store. No
- * variant carries a file id — the store is content-addressed by sha256 and a
- * second-store handle is unrepresentable here by design.
+ * The wire shape is shared with the authenticated chat API so the composer does
+ * not need a translation-only duplicate contract.
  */
-export type ComposerAttachmentSource =
-  | {
-      source: "inline";
-      mimeType: string;
-      /** Raw bytes, base64 with no `data:` prefix. */
-      bytesBase64: string;
-      name?: string;
-    }
-  | { source: "data-url"; dataUrl: string; name?: string }
-  | { source: "remote"; url: string; mimeType?: string; name?: string }
-  | { source: "stored"; url: string; mimeType?: string; name?: string };
+export type { ChatAttachmentSource as ComposerAttachmentSource } from "@elizaos/shared";
+
+import type { ChatAttachmentSource } from "@elizaos/shared";
 
 /** A reply/quote target the composer threads onto the outgoing message. */
 export interface ComposerReplyContext {
@@ -105,7 +95,7 @@ export interface AttachmentAddOperation extends ComposerOperationBase {
   type: "attachment.add";
   /** Stable attachment id so a duplicate add and a later remove are addressable. */
   attachmentId: string;
-  attachment: ComposerAttachmentSource;
+  attachment: ChatAttachmentSource;
 }
 
 /** Remove a previously-added attachment by its id. */
@@ -198,9 +188,8 @@ export interface ComposerOperationStream {
  * A resolved attachment reference in the draft, in media-store vocabulary. An
  * `inline`/`data-url` source normalizes to a `data:` URL; `remote` remains marked
  * for an authenticated, SSRF-guarded server ingest; `stored` passes through.
- * The normalizer does not claim that the current chat-send payload accepts URLs:
- * a platform send adapter must materialize these forms before submission.
- * `kind` records that routing. No field is a file id.
+ * The authenticated chat-send boundary materializes these forms before message
+ * construction. `kind` records that routing. No field is a file id.
  */
 export interface ComposerAttachment {
   id: string;

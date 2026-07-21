@@ -1,3 +1,8 @@
+/**
+ * Routes Siri and Shortcuts intents into stable elizaOS deep links, staging
+ * composer operations only for chat-facing destinations.
+ */
+
 import AppIntents
 import Foundation
 import UIKit
@@ -8,14 +13,30 @@ private enum ElizaAppIntentRouter {
     private static let source = "ios-app-intents"
 
     @MainActor
-    static func open(path: String, action: String? = nil, text: String? = nil, extraItems: [URLQueryItem] = []) {
-        guard let url = makeURL(path: path, action: action, text: text, extraItems: extraItems) else {
-            return
+    static func open(path: String, action: String? = nil, text: String? = nil, extraItems: [URLQueryItem] = []) throws {
+        let launchId = UUID().uuidString
+        guard let url = makeURL(
+            path: path,
+            action: action,
+            text: text,
+            launchId: launchId,
+            extraItems: extraItems
+        ) else {
+            throw URLError(.badURL)
         }
+        try NativeComposerPlugin.enqueue(
+            composerOperations(path: path, text: text, launchId: launchId)
+        )
         UIApplication.shared.open(url, options: [:], completionHandler: nil)
     }
 
-    private static func makeURL(path: String, action: String?, text: String?, extraItems: [URLQueryItem]) -> URL? {
+    private static func makeURL(
+        path: String,
+        action: String?,
+        text: String?,
+        launchId: String,
+        extraItems: [URLQueryItem]
+    ) -> URL? {
         var components = URLComponents()
         components.scheme = scheme
 
@@ -28,7 +49,10 @@ private enum ElizaAppIntentRouter {
             components.path = "/" + parts[1]
         }
 
-        var items = [URLQueryItem(name: "source", value: source)]
+        var items = [
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "assistant.launchId", value: launchId),
+        ]
         if let action = normalized(action) {
             items.append(URLQueryItem(name: "action", value: action))
         }
@@ -38,6 +62,41 @@ private enum ElizaAppIntentRouter {
         items.append(contentsOf: extraItems.filter { normalized($0.value) != nil })
         components.queryItems = items
         return components.url
+    }
+
+    private static func composerOperations(
+        path: String,
+        text: String?,
+        launchId: String
+    ) -> [[String: Any]] {
+        let composerPath = path == "assistant" || path == "voice" || path == "chat" || path.hasPrefix("chat/")
+        guard composerPath else { return [] }
+        var operations: [[String: Any]] = []
+        let at = Date().timeIntervalSince1970 * 1000
+        if let text = normalized(text) {
+            operations.append([
+                "type": "text.set",
+                "opId": "\(launchId):text",
+                "at": at,
+                "text": text,
+            ])
+        }
+        if path == "voice" || path == "chat/voice" {
+            operations.append([
+                "type": "voice.handoff",
+                "opId": "\(launchId):voice",
+                "at": at,
+                "phase": "start",
+            ])
+        }
+        operations.append([
+            "type": "focus.set",
+            "opId": "\(launchId):focus",
+            "at": at,
+            "focused": true,
+            "keyboard": "shown",
+        ])
+        return operations
     }
 
     private static func normalized(_ value: String?) -> String? {
@@ -57,7 +116,7 @@ struct AskElizaIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        ElizaAppIntentRouter.open(path: "assistant", action: "ask", text: prompt)
+        try ElizaAppIntentRouter.open(path: "assistant", action: "ask", text: prompt)
         return .result()
     }
 }
@@ -70,7 +129,7 @@ struct StartElizaVoiceIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        ElizaAppIntentRouter.open(
+        try ElizaAppIntentRouter.open(
             path: "voice",
             action: "voice",
             extraItems: [URLQueryItem(name: "voice", value: "1")]
@@ -87,7 +146,7 @@ struct OpenElizaDailyBriefIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        ElizaAppIntentRouter.open(path: "lifeops/daily-brief", action: "lifeops.daily-brief")
+        try ElizaAppIntentRouter.open(path: "lifeops/daily-brief", action: "lifeops.daily-brief")
         return .result()
     }
 }
@@ -103,7 +162,7 @@ struct CreateElizaTaskIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        ElizaAppIntentRouter.open(path: "lifeops/task/new", action: "lifeops.create", text: task)
+        try ElizaAppIntentRouter.open(path: "lifeops/task/new", action: "lifeops.create", text: task)
         return .result()
     }
 }
@@ -119,7 +178,7 @@ struct DraftElizaSmartReplyIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        ElizaAppIntentRouter.open(path: "chat", action: "smart-reply", text: context)
+        try ElizaAppIntentRouter.open(path: "chat", action: "smart-reply", text: context)
         return .result()
     }
 }

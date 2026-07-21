@@ -265,3 +265,24 @@ export interface ChatImageAttachment {
    */
   thumbnail?: { data: string; mimeType: string };
 }
+
+/**
+ * A chat attachment handed to the authenticated send boundary by a native
+ * composer. The server materializes every variant into {@link ChatImageAttachment}
+ * before message construction: remote URLs pass through the SSRF guard and all
+ * bytes land in the existing content-addressed media store. A separate file id
+ * or native-only store is deliberately unrepresentable.
+ */
+export type ChatAttachmentSource =
+  | {
+      source: "inline";
+      mimeType: string;
+      bytesBase64: string;
+      name?: string;
+    }
+  | { source: "data-url"; dataUrl: string; name?: string }
+  | { source: "remote"; url: string; mimeType?: string; name?: string }
+  | { source: "stored"; url: string; mimeType?: string; name?: string };
+
+/** Additive input accepted by chat sends from web and native composers. */
+export type ChatAttachmentInput = ChatImageAttachment | ChatAttachmentSource;
