@@ -132,6 +132,20 @@ describe("SCHEDULED_TASK action", () => {
   it("rejects malformed LLM-supplied gate structure before writing a row (#11791)", async () => {
     runtimeResult = await createLifeOpsTestRuntime();
     const { runtime } = runtimeResult;
+    const beforeList = await scheduledTaskAction.handler?.(
+      runtime,
+      ownerMessage(runtime.agentId, "list scheduled tasks"),
+      undefined,
+      { parameters: { subaction: "list" } },
+      undefined,
+      [],
+    );
+    const beforeTasks = (
+      beforeList?.data as { tasks?: ScheduledTask[] } | undefined
+    )?.tasks;
+    if (!beforeTasks)
+      throw new Error("baseline list did not return scheduled tasks");
+    const beforeTaskIds = beforeTasks.map((task) => task.taskId).sort();
 
     const result = await scheduledTaskAction.handler?.(
       runtime,
@@ -173,7 +187,8 @@ describe("SCHEDULED_TASK action", () => {
     );
     const tasks = (listed?.data as { tasks?: ScheduledTask[] } | undefined)
       ?.tasks;
-    expect(tasks).toHaveLength(0);
+    if (!tasks) throw new Error("final list did not return scheduled tasks");
+    expect(tasks.map((task) => task.taskId).sort()).toEqual(beforeTaskIds);
   });
 
   it("get returns NOT_FOUND for an unknown taskId", async () => {

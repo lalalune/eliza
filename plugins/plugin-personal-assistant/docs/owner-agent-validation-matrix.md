@@ -9,8 +9,8 @@
 
 The static/code-level split is already validated (see the issue body and
 `docs/lifeops-cleanup-review.md`). The remaining work is **live** validation
-with real accounts, devices, and OAuth/provider state. This doc + the
-credential-gated harness (`test/owner-agent-permission-matrix.integration.test.ts`)
+with real accounts, devices, and OAuth/provider state. This doc plus the
+deterministic harness (`test/owner-agent-permission-matrix.integration.test.ts`)
 cover the parts that can be exercised repeatably; the native-device items
 (iOS/macOS/Android) are tracked separately because they cannot run in CI.
 
@@ -72,15 +72,14 @@ registered-surface inventory.
 
 ## 3. Account / device / scope / env prerequisites
 
-The credential-gated harness runs against a local PGLite-backed runtime with no
+The deterministic harness runs against a local PGLite-backed runtime with no
 external accounts. The **live connector smoke** (send/read/sync against real
-providers) and the **native-device** items require the identities below. Provide
-them, set `LIFEOPS_PERMISSION_MATRIX=1`, and (for the live-LLM journeys)
-`ELIZA_LIVE_TEST=1` plus a provider key.
+providers) and the **native-device** items require the identities below. For
+live-LLM journeys, set `ELIZA_LIVE_TEST=1` and provide a model-provider key.
 
 | Surface | OWNER identity | AGENT identity | Required scopes / env | Run gate |
 |---|---|---|---|---|
-| Google Calendar | OWNER Google acct, Calendar enabled | Separate AGENT Google acct or non-owner grant | `google.calendar.read` / `.write` (OAuth) | `LIFEOPS_PERMISSION_MATRIX=1` + live OAuth |
+| Google Calendar | OWNER Google acct, Calendar enabled | Separate AGENT Google acct or non-owner grant | `google.calendar.read` / `.write` (OAuth) | provider live lane + live OAuth |
 | Gmail / inbox | OWNER Gmail | AGENT Gmail | `google.gmail.triage` / `.send` / `.manage` | as above |
 | Telegram | OWNER Telegram | AGENT Telegram | `@elizaos/plugin-telegram` configured | as above |
 | Discord | OWNER Discord | AGENT Discord | `DISCORD_BOT_TOKEN` (`@elizaos/plugin-discord`) | as above |
@@ -88,10 +87,10 @@ them, set `LIFEOPS_PERMISSION_MATRIX=1`, and (for the live-LLM journeys)
 | WhatsApp | OWNER WhatsApp | AGENT WhatsApp | `ELIZA_WHATSAPP_ACCESS_TOKEN`, `ELIZA_WHATSAPP_PHONE_NUMBER_ID` | as above |
 | X | OWNER X | AGENT X | `@elizaos/plugin-x` configured | as above |
 | iMessage | OWNER macOS bridge | n/a | macOS host; `ELIZA_IMESSAGE_BACKEND` | native (not CI) |
-| Phone / SMS / voice | Twilio number | recipient allowlist | `@elizaos/plugin-phone/twilio` env | `LIFEOPS_PERMISSION_MATRIX=1` |
+| Phone / SMS / voice | Twilio number | recipient allowlist | `@elizaos/plugin-phone/twilio` env | provider live lane |
 | Health | Apple Health / Google Fit / Fitbit / Oura / Strava / Withings | n/a | per-provider OAuth / `ELIZA_HEALTHKIT_CLI_PATH`, `ELIZA_GOOGLE_FIT_ACCESS_TOKEN` | native / live OAuth |
 | Blocker / focus | macOS SelfControl / admin | n/a | `SELFCONTROL_HOSTS_FILE_PATH` | native (not CI) |
-| Finances | Gmail billing corpus / CSV / Plaid sandbox | n/a | CSV fixture or sandbox creds | `LIFEOPS_PERMISSION_MATRIX=1` |
+| Finances | Gmail billing corpus / CSV / Plaid sandbox | n/a | CSV fixture or sandbox creds | provider or sandbox lane |
 
 > Native iOS/macOS/Android permission flows (HealthKit, Family Controls, Usage
 > Access, SelfControl admin) are **out of scope for CI** and must be exercised
@@ -101,28 +100,19 @@ them, set `LIFEOPS_PERMISSION_MATRIX=1`, and (for the live-LLM journeys)
 
 ## 4. Repeatable run instructions
 
-### Credential-free (default CI) — proves clean skip
+### Credential-free (default CI) — exercises the permission matrix
 
-The permission-matrix harness is gated behind `LIFEOPS_PERMISSION_MATRIX`. With
-the flag unset it skips cleanly (one skipped suite, zero failures), so the
-default suite stays green without any accounts:
+The permission-matrix harness uses a real `AgentRuntime`, PGlite, synthetic
+roles, and locally persisted fake connector grants. It requires no provider
+accounts and runs in the default integration lane:
 
 ```bash
-# Runs in the integration lane; skips when LIFEOPS_PERMISSION_MATRIX is unset.
 bun run --cwd plugins/plugin-personal-assistant test:integration
 ```
 
-### Credential-backed — exercises the matrix
-
-```bash
-LIFEOPS_PERMISSION_MATRIX=1 \
-  bun run --cwd plugins/plugin-personal-assistant test:integration
-```
-
-With the flag set, the harness boots a real `AgentRuntime` + PGLite + the
-LifeOps schema, establishes genuine OWNER and non-owner identities via
-`setEntityRole`, and asserts all nine states across the planned-tool gate, the
-handler guard, and the owner-side grant resolution — no role mocks.
+It establishes genuine OWNER and non-owner identities via `setEntityRole` and
+asserts all nine states across the planned-tool gate, the handler guard, and
+owner-side grant resolution — no role mocks.
 
 ### Live connector smoke (real providers)
 
@@ -130,7 +120,7 @@ Add the provider accounts/env from §3, then run the existing live connector
 suites (each `describeIf`-gates on its own credentials and skips otherwise):
 
 ```bash
-ELIZA_LIVE_TEST=1 LIFEOPS_PERMISSION_MATRIX=1 \
+ELIZA_LIVE_TEST=1 \
   bun run --cwd plugins/plugin-personal-assistant test:background-real
 ```
 
@@ -160,7 +150,7 @@ the PR/issue** per [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 | Finances | _attach_ | n/a | pending sandbox data |
 
 > The harness in this PR satisfies the role-gate / grant-selection rows
-> deterministically (run it with `LIFEOPS_PERMISSION_MATRIX=1`). The remaining
-> rows require the live accounts/devices from §3 and are filled in as those are
-> provisioned. Any bug discovered while exercising the matrix gets a linked
-> issue/PR before #8833 is closed.
+> deterministically in the default integration lane. The remaining rows require
+> the live accounts/devices from §3 and are filled in as those are provisioned.
+> Any bug discovered while exercising the matrix gets a linked issue/PR before
+> #8833 is closed.

@@ -1,29 +1,45 @@
 /**
  * Verifies changed Vitest files are grouped by their real package config while
- * root-level tests retain the root config and report namespace, harness tests
- * prefer the vitest.harness.config.ts convention, and groups run from the
- * owning package directory (nested configs declare cwd-relative includes).
+ * root-level tests retain the root config and report namespace. Explicit
+ * package lanes preserve specialty setup, and JSON accounting proves every
+ * requested file executes at least one passing assertion.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { mergeLcovReports } from "../merge-lcov-reports.mjs";
 import {
+  buildChangedVitestArgs,
   findNearestPackageDir,
   findNearestVitestConfig,
   groupChangedVitestTests,
   normalizeLcovReport,
+  validateChangedTestResults,
 } from "../run-changed-vitest-coverage.mjs";
+import {
+  composeChangedCoverageConfig,
+  loadChangedCoverageConfig,
+} from "../vitest.changed-coverage.config";
+import { serializeChangedTestResults } from "../vitest.changed-test-reporter.mjs";
 
 const roots: string[] = [];
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+);
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
@@ -42,7 +58,15 @@ function fixture(): string {
   );
   writeFileSync(path.join(root, "root.test.ts"), "");
   writeFileSync(path.join(nestedDir, "feature.test.ts"), "");
+  writeFileSync(path.join(nestedDir, "second.test.ts"), "");
   return root;
+}
+
+function writeFixtureFile(root: string, relativePath: string, content = "") {
+  const filePath = path.join(root, relativePath);
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, content);
+  return filePath;
 }
 
 describe("changed Vitest coverage grouping", () => {
@@ -56,6 +80,7 @@ describe("changed Vitest coverage grouping", () => {
 
     const groups = groupChangedVitestTests(root, [
       "packages/feature/src/nested/feature.test.ts",
+      "packages/feature/src/nested/second.test.ts",
       "root.test.ts",
     ]);
     expect(groups).toHaveLength(2);
@@ -66,8 +91,13 @@ describe("changed Vitest coverage grouping", () => {
       expect.arrayContaining([
         path.join(root, "root.test.ts"),
         path.join(root, "packages/feature/src/nested/feature.test.ts"),
+        path.join(root, "packages/feature/src/nested/second.test.ts"),
       ]),
     );
+    expect(
+      groups.find((group) => group.configDir.endsWith("packages/feature"))
+        ?.tests,
+    ).toHaveLength(2);
   });
 
   test("prefers vitest.harness.config.ts for *.harness.test.ts files", () => {
@@ -144,6 +174,133 @@ describe("changed Vitest coverage grouping", () => {
     );
   });
 
+  test("routes LifeOps quality gates and unit tests through their canonical configs", () => {
+    const root = fixture();
+    writeFixtureFile(
+      root,
+      "packages/benchmarks/lifeops-quality/vitest.gate.config.ts",
+      "export default {};",
+    );
+    writeFixtureFile(
+      root,
+      "packages/benchmarks/lifeops-quality/vitest.unit.config.ts",
+      "export default {};",
+    );
+    writeFixtureFile(
+      root,
+      "packages/benchmarks/lifeops-quality/timeliness/timeliness.gate.test.ts",
+    );
+    writeFixtureFile(
+      root,
+      "packages/benchmarks/lifeops-quality/timeliness/oracle.test.ts",
+    );
+
+    expect(
+      path.relative(
+        root,
+        findNearestVitestConfig(
+          root,
+          "packages/benchmarks/lifeops-quality/timeliness/timeliness.gate.test.ts",
+        ),
+      ),
+    ).toBe("packages/benchmarks/lifeops-quality/vitest.gate.config.ts");
+    expect(
+      path.relative(
+        root,
+        findNearestVitestConfig(
+          root,
+          "packages/benchmarks/lifeops-quality/timeliness/oracle.test.ts",
+        ),
+      ),
+    ).toBe("packages/benchmarks/lifeops-quality/vitest.unit.config.ts");
+  });
+
+  test("routes browser-extension tests through the DOM-aware unit config", () => {
+    const root = fixture();
+    writeFixtureFile(
+      root,
+      "packages/browser-extension/vitest.extension.config.ts",
+      "export default {};",
+    );
+    writeFixtureFile(
+      root,
+      "packages/browser-extension/src/dom-actions.test.ts",
+    );
+
+    expect(
+      path.relative(
+        root,
+        findNearestVitestConfig(
+          root,
+          "packages/browser-extension/src/dom-actions.test.ts",
+        ),
+      ),
+    ).toBe("packages/browser-extension/vitest.extension.config.ts");
+  });
+
+  test("preserves both personal-assistant integration lanes", () => {
+    const root = fixture();
+    writeFixtureFile(
+      root,
+      "plugins/plugin-personal-assistant/vitest.src-integration.config.ts",
+      "export default {};",
+    );
+    writeFixtureFile(
+      root,
+      "packages/test/vitest/integration.config.ts",
+      "export default {};",
+    );
+    writeFixtureFile(
+      root,
+      "plugins/plugin-personal-assistant/src/lifeops/scheduled-task/scheduler.integration.test.ts",
+    );
+    writeFixtureFile(
+      root,
+      "plugins/plugin-personal-assistant/test/scheduled-task-action.integration.test.ts",
+    );
+    writeFixtureFile(
+      root,
+      "plugins/plugin-personal-assistant/test/owner-agent-permission-matrix.integration.test.ts",
+    );
+    writeFixtureFile(
+      root,
+      "plugins/plugin-personal-assistant/test/payments-action.integration.test.ts",
+    );
+
+    const selected = [
+      "plugins/plugin-personal-assistant/src/lifeops/scheduled-task/scheduler.integration.test.ts",
+      "plugins/plugin-personal-assistant/test/scheduled-task-action.integration.test.ts",
+      "plugins/plugin-personal-assistant/test/owner-agent-permission-matrix.integration.test.ts",
+    ].map((testPath) =>
+      path.relative(root, findNearestVitestConfig(root, testPath)),
+    );
+    expect(selected).toEqual([
+      "plugins/plugin-personal-assistant/vitest.src-integration.config.ts",
+      "plugins/plugin-personal-assistant/vitest.src-integration.config.ts",
+      "packages/test/vitest/integration.config.ts",
+    ]);
+    const groups = groupChangedVitestTests(root, [
+      "plugins/plugin-personal-assistant/test/owner-agent-permission-matrix.integration.test.ts",
+      "plugins/plugin-personal-assistant/test/payments-action.integration.test.ts",
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.every((group) => group.packageDir === root)).toBe(true);
+    expect(groups.every((group) => group.tests.length === 1)).toBe(true);
+    expect(new Set(groups.map((group) => group.reportDir)).size).toBe(2);
+    expect(new Set(groups.map((group) => group.testResultsPath)).size).toBe(2);
+    expect(
+      groups.every((group) =>
+        buildChangedVitestArgs(group).includes("--pool=threads"),
+      ),
+    ).toBe(true);
+    const packageGroup = groupChangedVitestTests(root, [
+      "plugins/plugin-personal-assistant/test/scheduled-task-action.integration.test.ts",
+    ])[0];
+    expect(buildChangedVitestArgs(packageGroup)).not.toContain(
+      "--pool=threads",
+    );
+  });
+
   test("runs a nested config from the owning package directory", () => {
     // Mirrors packages/test/harness/vitest.config.ts: the config sits below
     // the package root and its include patterns resolve against the package
@@ -178,6 +335,287 @@ describe("changed Vitest coverage grouping", () => {
     expect(() => findNearestVitestConfig(root, "../outside.test.ts")).toThrow(
       "escapes the repository",
     );
+  });
+
+  test("preserves package aliases before comprehensive workspace source aliases", () => {
+    const packageAlias = {
+      find: /^@elizaos\/shared$/,
+      replacement: "/test/shared-stub.ts",
+    };
+    const config = composeChangedCoverageConfig(
+      {
+        resolve: {
+          alias: [packageAlias],
+          conditions: ["browser"],
+        },
+        test: {
+          coverage: {
+            exclude: ["generated/**"],
+          },
+        },
+      },
+      repoRoot,
+    );
+    const aliases = config.resolve?.alias;
+    expect(Array.isArray(aliases)).toBe(true);
+    if (!Array.isArray(aliases)) {
+      throw new Error("Expected changed coverage aliases to use array order");
+    }
+
+    expect(aliases[0]).toEqual(packageAlias);
+    const sharedSourceAlias = aliases.find(
+      (entry, index) =>
+        index > 0 &&
+        typeof entry === "object" &&
+        entry !== null &&
+        "find" in entry &&
+        entry.find instanceof RegExp &&
+        entry.find.test("@elizaos/shared"),
+    );
+    expect(sharedSourceAlias).toBeDefined();
+    expect(sharedSourceAlias).toMatchObject({
+      replacement: path.join(repoRoot, "packages/shared/src/index.ts"),
+    });
+    const exportedSourceTargets = [
+      ["@elizaos/security/kms", "packages/security/src/kms/index.ts"],
+      ["@elizaos/app-core/registry", "packages/app-core/src/registry/index.ts"],
+      [
+        "@elizaos/registry/first-party",
+        "packages/registry/src/first-party/index.ts",
+      ],
+      [
+        "@elizaos/shared/steward-session-client",
+        "packages/shared/src/steward-session-client/index.ts",
+      ],
+      [
+        "@elizaos/plugin-remote-manifest/worker-runtime",
+        "packages/plugin-remote-manifest/src/worker-runtime/index.ts",
+      ],
+      [
+        "@elizaos/scenario-runner/schema",
+        "packages/scenario-runner/schema/index.js",
+      ],
+      ["@elizaos/ui/button", "packages/ui/src/components/ui/button.tsx"],
+      [
+        "@elizaos/plugin-edge-tts/node",
+        "plugins/plugin-edge-tts/src/index.node.ts",
+      ],
+    ] as const;
+    for (const [specifier, relativeTarget] of exportedSourceTargets) {
+      const alias = aliases.find(
+        (entry) =>
+          typeof entry === "object" &&
+          entry !== null &&
+          "find" in entry &&
+          (entry.find instanceof RegExp
+            ? entry.find.test(specifier)
+            : entry.find === specifier ||
+              specifier.startsWith(`${entry.find}/`)),
+      );
+      expect(alias, `${specifier} must have a source alias`).toBeDefined();
+      if (!alias || typeof alias !== "object" || !("find" in alias)) {
+        throw new Error(`Missing source alias for ${specifier}`);
+      }
+      const resolved = specifier.replace(alias.find, alias.replacement);
+      expect(resolved).toBe(path.join(repoRoot, relativeTarget));
+      expect(existsSync(resolved) && statSync(resolved).isFile()).toBe(true);
+    }
+    expect(config.resolve?.conditions).toEqual(["browser", "eliza-source"]);
+    expect(config.test?.coverage?.exclude).toEqual([
+      "generated/**",
+      "**/dist/**",
+      "**/*.d.ts",
+    ]);
+  });
+
+  test("loads extensionless TypeScript config dependencies through Vite", async () => {
+    // packages/agent imports `packages/test/vitest/default.config` without a
+    // file extension. This is valid in a Vite config graph but fails when the
+    // package config is loaded through native Node ESM.
+    const changedTest = path.join(
+      repoRoot,
+      "packages/agent/src/api/chat-augmentation.test.ts",
+    );
+    const config = await loadChangedCoverageConfig(
+      { command: "serve", mode: "test" },
+      {
+        ELIZA_CHANGED_VITEST_CONFIG: path.join(
+          repoRoot,
+          "packages/agent/vitest.config.ts",
+        ),
+        ELIZA_CHANGED_VITEST_REPO_ROOT: repoRoot,
+        ELIZA_CHANGED_VITEST_TESTS: JSON.stringify([changedTest]),
+      },
+    );
+
+    expect(config.root).toBe(path.join(repoRoot, "packages/agent"));
+    expect(config.test?.environment).toBe("node");
+    expect(config.test?.include).toEqual(["src/api/chat-augmentation.test.ts"]);
+    expect(config.test?.exclude).toEqual([]);
+  });
+
+  test("anchors exact changed-file includes to a config's test root", async () => {
+    const changedTest = path.join(
+      repoRoot,
+      "plugins/__tests__/setup-routes-contract.test.ts",
+    );
+    const config = await loadChangedCoverageConfig(
+      { command: "serve", mode: "test" },
+      {
+        ELIZA_CHANGED_VITEST_CONFIG: path.join(
+          repoRoot,
+          "plugins/__tests__/vitest.config.ts",
+        ),
+        ELIZA_CHANGED_VITEST_REPO_ROOT: repoRoot,
+        ELIZA_CHANGED_VITEST_TESTS: JSON.stringify([changedTest]),
+      },
+    );
+
+    expect(config.test?.root).toBe(path.join(repoRoot, "plugins/__tests__"));
+    expect(config.test?.include).toEqual(["setup-routes-contract.test.ts"]);
+    expect(config.test?.exclude).toEqual([]);
+  });
+
+  test("clears fork-only execArgv for isolated thread coverage", () => {
+    const forkConfig = {
+      test: { execArgv: ["--max-old-space-size=4096"] },
+    };
+    const config = composeChangedCoverageConfig(forkConfig, repoRoot, [], true);
+    expect(config.test?.execArgv).toEqual([]);
+    expect(
+      composeChangedCoverageConfig(forkConfig, repoRoot).test?.execArgv,
+    ).toEqual(["--max-old-space-size=4096"]);
+  });
+
+  test("accepts duplicate file results when at least one assertion passes", () => {
+    const root = fixture();
+    const testPath = path.join(root, "root.test.ts");
+    const resultsPath = writeFixtureFile(
+      root,
+      "coverage/vitest/root/vitest-results.json",
+      JSON.stringify({
+        testResults: [
+          {
+            name: testPath,
+            assertionResults: [{ status: "skipped" }],
+          },
+          {
+            name: testPath,
+            assertionResults: [{ status: "passed" }],
+          },
+        ],
+      }),
+    );
+
+    expect(() =>
+      validateChangedTestResults(root, [testPath], resultsPath),
+    ).not.toThrow();
+  });
+
+  test("serializes only module paths and terminal assertion states", () => {
+    const report = serializeChangedTestResults(
+      [
+        {
+          moduleId: "/repo/example.test.ts",
+          children: {
+            *allTests() {
+              yield { result: () => ({ state: "passed", errors: ["large"] }) };
+              yield { result: () => ({ state: "skipped" }) };
+            },
+          },
+        },
+      ],
+      [{ stack: "large unhandled error" }],
+      "passed",
+    );
+
+    expect(report).toEqual({
+      reason: "passed",
+      unhandledErrorCount: 1,
+      testResults: [
+        {
+          name: "/repo/example.test.ts",
+          assertionResults: [{ status: "passed" }, { status: "skipped" }],
+        },
+      ],
+    });
+  });
+
+  test("rejects missing and all-skipped changed files", () => {
+    const root = fixture();
+    const skippedTest = path.join(root, "root.test.ts");
+    const missingTest = path.join(
+      root,
+      "packages/feature/src/nested/feature.test.ts",
+    );
+    const resultsPath = writeFixtureFile(
+      root,
+      "coverage/vitest/root/vitest-results.json",
+      JSON.stringify({
+        testResults: [
+          {
+            name: skippedTest,
+            assertionResults: [{ status: "skipped" }],
+          },
+        ],
+      }),
+    );
+
+    expect(() =>
+      validateChangedTestResults(root, [skippedTest], resultsPath),
+    ).toThrow("executed no passing tests");
+    expect(() =>
+      validateChangedTestResults(root, [skippedTest, missingTest], resultsPath),
+    ).toThrow("executed no passing tests");
+    writeFileSync(
+      resultsPath,
+      JSON.stringify({
+        testResults: [
+          {
+            name: skippedTest,
+            assertionResults: [{ status: "passed" }],
+          },
+        ],
+      }),
+    );
+    expect(() =>
+      validateChangedTestResults(root, [skippedTest, missingTest], resultsPath),
+    ).toThrow("did not discover changed test file");
+  });
+
+  test("rejects malformed, missing, and unexpected JSON file results", () => {
+    const root = fixture();
+    const expectedTest = path.join(root, "root.test.ts");
+    const unexpectedTest = path.join(
+      root,
+      "packages/feature/src/nested/feature.test.ts",
+    );
+    const resultsPath = path.join(
+      root,
+      "coverage/vitest/root/vitest-results.json",
+    );
+
+    expect(() =>
+      validateChangedTestResults(root, [expectedTest], resultsPath),
+    ).toThrow("produced no JSON results");
+    writeFixtureFile(root, "coverage/vitest/root/vitest-results.json", "{}");
+    expect(() =>
+      validateChangedTestResults(root, [expectedTest], resultsPath),
+    ).toThrow("JSON results are malformed");
+    writeFileSync(
+      resultsPath,
+      JSON.stringify({
+        testResults: [
+          {
+            name: unexpectedTest,
+            assertionResults: [{ status: "passed" }],
+          },
+        ],
+      }),
+    );
+    expect(() =>
+      validateChangedTestResults(root, [expectedTest], resultsPath),
+    ).toThrow("executed an unexpected changed-coverage file");
   });
 
   test("union-merges per-group LCOV reports so any-group coverage counts once per file", () => {
