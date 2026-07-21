@@ -123,6 +123,10 @@ import {
 import { getSwabbleManager } from "./native/swabble";
 import { getTalkModeManager } from "./native/talkmode";
 import {
+  publishNativeTranscriptStream,
+  readNativeTranscriptViewModel,
+} from "./native-transcript-host";
+import {
   buildDynamicViewRpcHandlers,
   buildNotificationRpcHandlers,
   buildWindowRpcHandlers,
@@ -694,6 +698,11 @@ export function buildBunRpcHandlers({
       };
     },
     desktopHttpRequest,
+    nativeTranscriptPublishStream: async (params) =>
+      publishNativeTranscriptStream(params),
+    nativeTranscriptReadViewModel: async () => ({
+      view: readNativeTranscriptViewModel(),
+    }),
 
     // ---- Local-agent IPC transport (#12180 / #12355) ----
     // Buffered agent request routed over the child stdio bridge (no loopback
