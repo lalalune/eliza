@@ -1,3 +1,8 @@
+/**
+ * Hosts the iOS Capacitor WebView with startup tracing and app-local bridge
+ * plugins that cannot be discovered through generated package metadata.
+ */
+
 import Capacitor
 import WebKit
 
@@ -17,6 +22,10 @@ class ElizaBridgeViewController: CAPBridgeViewController {
 
     override func capacitorDidLoad() {
         super.capacitorDidLoad()
+        // App-local plugins are not present in Capacitor's generated package
+        // class list. Explicit registration keeps the native queue reachable
+        // when an App Intent resumes an already-running WebView.
+        bridge?.registerPluginInstance(NativeComposerPlugin())
         NSLog("[ElizaStartupTrace] iOS startupTraceId=%@", ElizaStartupTrace.currentId)
     }
 }
