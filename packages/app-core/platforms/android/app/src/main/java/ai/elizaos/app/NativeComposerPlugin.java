@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 import org.json.JSONException;
 
@@ -51,14 +52,15 @@ public class NativeComposerPlugin extends Plugin {
 
     public static void enqueueOperations(Context context, List<JSObject> operations) {
         if (operations.isEmpty()) return;
+        List<JSObject> deliveries = wrapDeliveries(operations);
         synchronized (QUEUE_LOCK) {
             List<JSObject> queued = readQueue(context);
-            queued.addAll(operations);
+            queued.addAll(deliveries);
             writeQueue(context, queued);
         }
         NativeComposerPlugin plugin = activePlugin;
         if (plugin != null) {
-            plugin.notifyListeners("operationStream", envelope(operations));
+            plugin.notifyListeners("operationStream", envelope(deliveries));
         }
     }
 
@@ -68,11 +70,52 @@ public class NativeComposerPlugin extends Plugin {
             List<JSObject> drained;
             synchronized (QUEUE_LOCK) {
                 drained = readQueue(getContext());
-                getPreferences(getContext()).edit().remove(QUEUE_KEY).commit();
             }
             call.resolve(envelope(drained));
         } catch (IllegalStateException error) {
             call.reject("Could not drain native composer operations", error);
+        }
+    }
+
+    @PluginMethod
+    public void acknowledgeOperation(PluginCall call) {
+        if (!SCHEMA.equals(call.getString("schema"))) {
+            call.reject("Unsupported native composer schema");
+            return;
+        }
+        JSObject acknowledgment = call.getObject("acknowledgment");
+        String deliveryId = acknowledgment == null ? null : acknowledgment.getString("deliveryId");
+        String disposition = acknowledgment == null ? null : acknowledgment.getString("disposition");
+        String resultStatus = acknowledgment == null ? null : acknowledgment.getString("resultStatus");
+        if (
+            deliveryId == null || deliveryId.isEmpty() ||
+            (!"persisted".equals(disposition) && !"rejected".equals(disposition)) ||
+            resultStatus == null || resultStatus.isEmpty()
+        ) {
+            call.reject("Native composer acknowledgment is invalid");
+            return;
+        }
+        try {
+            boolean removed;
+            synchronized (QUEUE_LOCK) {
+                List<JSObject> queued = readQueue(getContext());
+                int before = queued.size();
+                queued.removeIf(delivery -> deliveryId.equals(delivery.getString("deliveryId")));
+                removed = queued.size() != before;
+                if (removed) {
+                    boolean committed = queued.isEmpty()
+                        ? getPreferences(getContext()).edit().remove(QUEUE_KEY).commit()
+                        : commitQueue(getContext(), queued);
+                    if (!committed) {
+                        throw new IllegalStateException("Could not persist native composer acknowledgment");
+                    }
+                }
+            }
+            JSObject result = new JSObject();
+            result.put("removed", removed);
+            call.resolve(result);
+        } catch (IllegalStateException error) {
+            call.reject("Could not acknowledge native composer operation", error);
         }
     }
 
@@ -106,6 +149,17 @@ public class NativeComposerPlugin extends Plugin {
         return envelope;
     }
 
+    private static List<JSObject> wrapDeliveries(List<JSObject> operations) {
+        List<JSObject> deliveries = new ArrayList<>();
+        for (JSObject operation : operations) {
+            JSObject delivery = new JSObject();
+            delivery.put("deliveryId", UUID.randomUUID().toString());
+            delivery.put("operation", operation);
+            deliveries.add(delivery);
+        }
+        return deliveries;
+    }
+
     private static SharedPreferences getPreferences(Context context) {
         return context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
@@ -116,9 +170,21 @@ public class NativeComposerPlugin extends Plugin {
         if (serialized == null) return operations;
         try {
             JSArray values = new JSArray(serialized);
+            boolean changed = false;
             for (int index = 0; index < values.length(); index++) {
-                operations.add(JSObject.fromJSONObject(values.getJSONObject(index)));
+                JSObject value = JSObject.fromJSONObject(values.getJSONObject(index));
+                if (
+                    value.getString("deliveryId") != null &&
+                    !value.getString("deliveryId").isEmpty() &&
+                    value.has("operation")
+                ) {
+                    operations.add(value);
+                } else {
+                    operations.add(wrapDeliveries(Arrays.asList(value)).get(0));
+                    changed = true;
+                }
             }
+            if (changed) writeQueue(context, operations);
             return operations;
         } catch (JSONException error) {
             throw new IllegalStateException("Native composer operation queue is corrupt", error);
@@ -126,14 +192,17 @@ public class NativeComposerPlugin extends Plugin {
     }
 
     private static void writeQueue(Context context, List<JSObject> operations) {
+        if (!commitQueue(context, operations)) {
+            throw new IllegalStateException("Could not persist native composer operation queue");
+        }
+    }
+
+    private static boolean commitQueue(Context context, List<JSObject> operations) {
         JSArray values = new JSArray();
         for (JSObject operation : operations) values.put(operation);
-        boolean committed = getPreferences(context)
+        return getPreferences(context)
             .edit()
             .putString(QUEUE_KEY, values.toString())
             .commit();
-        if (!committed) {
-            throw new IllegalStateException("Could not persist native composer operation queue");
-        }
     }
 }

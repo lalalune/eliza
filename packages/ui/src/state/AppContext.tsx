@@ -1171,6 +1171,7 @@ function AppProviderInner({
     setChatPendingImages,
     setChatReplyTarget,
     interruptActiveChatPipeline,
+    onPersistenceError: (message) => setActionNotice(message, "error", 8_000),
   });
 
   // In-chat first-run interception: a first-run-scoped choice pick (reserved

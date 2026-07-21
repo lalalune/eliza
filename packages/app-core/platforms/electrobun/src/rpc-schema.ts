@@ -42,6 +42,7 @@ import type {
   LaunchSnapshot,
 } from "./launch/types";
 import type {
+  NativeComposerOperationAcknowledgmentInput,
   NativeComposerOperationStream,
   NativeComposerRendererEventInput,
 } from "./native-composer-host";
@@ -1676,6 +1677,10 @@ export type ElizaDesktopRPCSchema = {
       nativeComposerDrainOperations: {
         params: undefined;
         response: NativeComposerOperationStream;
+      };
+      nativeComposerAcknowledgeOperation: {
+        params: NativeComposerOperationAcknowledgmentInput;
+        response: { removed: boolean };
       };
       nativeComposerPublishEvent: {
         params: NativeComposerRendererEventInput;

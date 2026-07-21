@@ -15,6 +15,7 @@ public class NativeComposerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "NativeComposer"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "drainOperations", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "acknowledgeOperation", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "publishEvent", returnType: CAPPluginReturnPromise),
     ]
 
@@ -36,16 +37,19 @@ public class NativeComposerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     static func enqueue(_ operations: [[String: Any]]) throws {
         guard !operations.isEmpty else { return }
+        let deliveries = operations.map { operation in
+            ["deliveryId": UUID().uuidString, "operation": operation] as [String: Any]
+        }
         do {
             queueLock.lock()
             defer { queueLock.unlock() }
             var queuedOperations = try readQueuedOperations()
-            queuedOperations.append(contentsOf: operations)
+            queuedOperations.append(contentsOf: deliveries)
             try writeQueuedOperations(queuedOperations)
         }
         activePlugin?.notifyListeners(
             "operationStream",
-            data: ["schema": schema, "operations": operations]
+            data: ["schema": schema, "operations": deliveries]
         )
     }
 
@@ -56,11 +60,52 @@ public class NativeComposerPlugin: CAPPlugin, CAPBridgedPlugin {
                 Self.queueLock.lock()
                 defer { Self.queueLock.unlock() }
                 operations = try Self.readQueuedOperations()
-                Self.sharedDefaults.removeObject(forKey: Self.queueKey)
             }
             call.resolve(["schema": Self.schema, "operations": operations])
         } catch {
             call.reject("Could not drain native composer operations: \(error.localizedDescription)")
+        }
+    }
+
+    @objc public func acknowledgeOperation(_ call: CAPPluginCall) {
+        guard call.getString("schema") == Self.schema else {
+            call.reject("Unsupported native composer schema")
+            return
+        }
+        guard
+            let acknowledgment = call.getObject("acknowledgment"),
+            let deliveryId = acknowledgment["deliveryId"] as? String,
+            !deliveryId.isEmpty,
+            let disposition = acknowledgment["disposition"] as? String,
+            disposition == "persisted" || disposition == "rejected",
+            let resultStatus = acknowledgment["resultStatus"] as? String,
+            !resultStatus.isEmpty
+        else {
+            call.reject("Native composer acknowledgment is invalid")
+            return
+        }
+        do {
+            let removed: Bool
+            do {
+                Self.queueLock.lock()
+                defer { Self.queueLock.unlock() }
+                var operations = try Self.readQueuedOperations()
+                let before = operations.count
+                operations.removeAll { operation in
+                    operation["deliveryId"] as? String == deliveryId
+                }
+                removed = operations.count != before
+                if removed {
+                    if operations.isEmpty {
+                        Self.sharedDefaults.removeObject(forKey: Self.queueKey)
+                    } else {
+                        try Self.writeQueuedOperations(operations)
+                    }
+                }
+            }
+            call.resolve(["removed": removed])
+        } catch {
+            call.reject("Could not acknowledge native composer operation: \(error.localizedDescription)")
         }
     }
 
@@ -106,7 +151,22 @@ public class NativeComposerPlugin: CAPPlugin, CAPBridgedPlugin {
                 userInfo: [NSLocalizedDescriptionKey: "native composer operation queue is corrupt"]
             )
         }
-        return operations
+        var changed = false
+        let deliveries = operations.map { operation -> [String: Any] in
+            if
+                let deliveryId = operation["deliveryId"] as? String,
+                !deliveryId.isEmpty,
+                operation["operation"] != nil
+            {
+                return operation
+            }
+            changed = true
+            return ["deliveryId": UUID().uuidString, "operation": operation]
+        }
+        if changed {
+            try writeQueuedOperations(deliveries)
+        }
+        return deliveries
     }
 
     private static func writeQueuedOperations(_ operations: [[String: Any]]) throws {

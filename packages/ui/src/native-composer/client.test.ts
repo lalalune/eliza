@@ -6,9 +6,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createComposerBridgeClient } from "./client";
+import {
+  createComposerBridgeClient,
+  decodeComposerBridgeSnapshot,
+} from "./client";
 import type { ComposerEvent } from "./contract";
 import { NATIVE_COMPOSER_SCHEMA } from "./contract";
+import { DEFAULT_COMPOSER_LIMITS } from "./reduce";
 
 describe("createComposerBridgeClient — boundary + events", () => {
   it("degrades malformed raw input to invalid-input, never throws", () => {
@@ -87,6 +91,122 @@ describe("createComposerBridgeClient — boundary + events", () => {
 });
 
 describe("createComposerBridgeClient — reload durability", () => {
+  it("strictly validates persisted snapshots before hydration", () => {
+    const valid = createComposerBridgeClient().serialize();
+    expect(decodeComposerBridgeSnapshot(valid)).toEqual({
+      ok: true,
+      snapshot: valid,
+    });
+    expect(
+      decodeComposerBridgeSnapshot({
+        ...valid,
+        draft: { ...valid.draft, revision: -1 },
+      }),
+    ).toEqual({ ok: false, message: "snapshot draft is invalid" });
+    expect(
+      decodeComposerBridgeSnapshot({
+        ...valid,
+        deferred: [
+          {
+            operation: { type: "text.set", opId: "not-a-send", text: "x" },
+            draft: valid.draft,
+          },
+        ],
+      }),
+    ).toEqual({ ok: false, message: "snapshot deferred send is invalid" });
+  });
+
+  it("accepts empty reply previews and mention labels like the live decoder", () => {
+    const client = createComposerBridgeClient();
+    client.dispatchRaw({
+      type: "reply.set",
+      opId: "reply",
+      reply: { messageId: "message", preview: "" },
+    });
+    client.dispatchRaw({
+      type: "mention.add",
+      opId: "mention",
+      mention: { id: "user", label: "" },
+    });
+
+    expect(decodeComposerBridgeSnapshot(client.serialize())).toEqual({
+      ok: true,
+      snapshot: client.serialize(),
+    });
+  });
+
+  it("rejects valid-shaped snapshots that exceed reducer limits", () => {
+    const base = createComposerBridgeClient().serialize();
+    const stored = {
+      id: "attachment",
+      url: `/api/media/${"a".repeat(64)}.png`,
+      kind: "stored" as const,
+      status: "ready" as const,
+    };
+    const limits = {
+      ...DEFAULT_COMPOSER_LIMITS,
+      maxTextLength: 4,
+      maxAttachments: 1,
+      maxAttachmentBytes: 2,
+      maxIdLength: 4,
+      maxMetadataLength: 4,
+      maxMentions: 1,
+      maxProcessedOpIds: 1,
+    };
+    const invalidSnapshots = [
+      { ...base, draft: { ...base.draft, text: "12345" } },
+      {
+        ...base,
+        draft: { ...base.draft, attachments: [stored, { ...stored, id: "b" }] },
+      },
+      { ...base, processedOpIds: ["one", "two"] },
+      {
+        ...base,
+        deferred: [
+          { operation: { type: "send", opId: "one" }, draft: base.draft },
+          { operation: { type: "send", opId: "two" }, draft: base.draft },
+        ],
+      },
+      { ...base, processedOpIds: ["12345"] },
+      {
+        ...base,
+        draft: {
+          ...base.draft,
+          reply: { messageId: "one", preview: "12345" },
+        },
+      },
+      {
+        ...base,
+        draft: {
+          ...base.draft,
+          mentions: [
+            { id: "one", label: "" },
+            { id: "two", label: "" },
+          ],
+        },
+      },
+      {
+        ...base,
+        draft: {
+          ...base.draft,
+          attachments: [
+            {
+              id: "one",
+              url: "data:text/plain;base64,QUJD",
+              mimeType: "text/plain",
+              kind: "inline",
+              status: "ready",
+            },
+          ],
+        },
+      },
+    ];
+
+    for (const snapshot of invalidSnapshots) {
+      expect(decodeComposerBridgeSnapshot(snapshot, limits).ok).toBe(false);
+    }
+  });
+
   it("preserves idempotency across a serialize/hydrate reload", () => {
     const before = createComposerBridgeClient();
     before.dispatchRaw({ type: "text.insert", opId: "dup", text: "x" });

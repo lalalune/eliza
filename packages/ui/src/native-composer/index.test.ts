@@ -15,6 +15,7 @@ describe("@elizaos/ui/native-composer barrel", () => {
     expect(typeof api.normalizeComposerAttachment).toBe("function");
     expect(typeof api.applyComposerOperation).toBe("function");
     expect(typeof api.createComposerBridgeClient).toBe("function");
+    expect(typeof api.decodeComposerBridgeSnapshot).toBe("function");
     expect(typeof api.emptyComposerDraft).toBe("function");
   });
 

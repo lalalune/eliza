@@ -243,6 +243,7 @@ export type ComposerRejectReason =
   | "invalid-input"
   | "oversized"
   | "unsupported"
+  | "send-failed"
   | "no-active-composer"
   | "empty-send"
   | "send-in-flight";

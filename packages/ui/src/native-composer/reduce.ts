@@ -54,6 +54,16 @@ export interface ComposerLimits {
   maxTextLength: number;
   maxAttachments: number;
   maxAttachmentBytes: number;
+  /** Cap identifiers retained in durable queues and idempotency state. */
+  maxIdLength: number;
+  /** Cap reply previews, mention labels, and other non-message text. */
+  maxMetadataLength: number;
+  /** Cap structured mentions independently of their rendered text. */
+  maxMentions: number;
+  /** One send can own the composer at a time, including while offline. */
+  maxDeferredSends: number;
+  /** Remote URLs are metadata; inline data URLs use the byte cap instead. */
+  maxRemoteUrlLength: number;
   /** Cap on the dedupe ledger; the oldest ids evict past this (see note below). */
   maxProcessedOpIds: number;
 }
@@ -67,6 +77,11 @@ export const DEFAULT_COMPOSER_LIMITS: ComposerLimits = {
   maxTextLength: 100_000,
   maxAttachments: MAX_CHAT_UPLOAD_ATTACHMENTS,
   maxAttachmentBytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+  maxIdLength: 512,
+  maxMetadataLength: 10_000,
+  maxMentions: 512,
+  maxDeferredSends: 1,
+  maxRemoteUrlLength: 16_384,
   maxProcessedOpIds: 512,
 };
 
@@ -182,6 +197,15 @@ export function applyComposerOperation(
 
   const { limits, capabilities, online } = ctx;
 
+  if (op.opId.length > limits.maxIdLength) {
+    return rejected(
+      state,
+      op.opId,
+      "oversized",
+      "operation id exceeds max length",
+    );
+  }
+
   // Compute the mutation (or a rejection) per op type; commit the processed-ledger
   // update only for the paths that actually apply.
   switch (op.type) {
@@ -207,6 +231,24 @@ export function applyComposerOperation(
       );
     }
     case "attachment.add": {
+      if (op.attachmentId.length > limits.maxIdLength)
+        return rejected(
+          state,
+          op.opId,
+          "oversized",
+          "attachment id exceeds max length",
+        );
+      if (
+        (op.attachment.source === "remote" ||
+          op.attachment.source === "stored") &&
+        op.attachment.url.length > limits.maxRemoteUrlLength
+      )
+        return rejected(
+          state,
+          op.opId,
+          "oversized",
+          "attachment URL exceeds max length",
+        );
       if (!capabilities.attach)
         return rejected(
           state,
@@ -242,6 +284,13 @@ export function applyComposerOperation(
       );
     }
     case "attachment.remove": {
+      if (op.attachmentId.length > limits.maxIdLength)
+        return rejected(
+          state,
+          op.opId,
+          "oversized",
+          "attachment id exceeds max length",
+        );
       const attachments = state.draft.attachments.filter(
         (a) => a.id !== op.attachmentId,
       );
@@ -253,6 +302,17 @@ export function applyComposerOperation(
       );
     }
     case "reply.set":
+      if (
+        op.reply.messageId.length > limits.maxIdLength ||
+        (op.reply.authorId?.length ?? 0) > limits.maxIdLength ||
+        (op.reply.preview?.length ?? 0) > limits.maxMetadataLength
+      )
+        return rejected(
+          state,
+          op.opId,
+          "oversized",
+          "reply metadata exceeds max length",
+        );
       return commitApplied(
         state,
         op.opId,
@@ -267,6 +327,17 @@ export function applyComposerOperation(
         bumpDraft(state.draft, { reply: null }),
       );
     case "mention.add": {
+      if (
+        op.mention.id.length > limits.maxIdLength ||
+        op.mention.label.length > limits.maxMetadataLength ||
+        state.draft.mentions.length >= limits.maxMentions
+      )
+        return rejected(
+          state,
+          op.opId,
+          "oversized",
+          "mention metadata exceeds composer limits",
+        );
       const token = `@${op.mention.label} `;
       const text = state.draft.text + token;
       if (text.length > limits.maxTextLength)

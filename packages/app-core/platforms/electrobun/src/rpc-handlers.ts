@@ -123,6 +123,7 @@ import {
 import { getSwabbleManager } from "./native/swabble";
 import { getTalkModeManager } from "./native/talkmode";
 import {
+  acknowledgeNativeComposerOperation,
   drainNativeComposerOperations,
   publishNativeComposerEvent,
 } from "./native-composer-host";
@@ -719,6 +720,8 @@ export function buildBunRpcHandlers({
       );
     },
     nativeComposerDrainOperations: async () => drainNativeComposerOperations(),
+    nativeComposerAcknowledgeOperation: async (params) =>
+      acknowledgeNativeComposerOperation(params),
     nativeComposerPublishEvent: async (params) =>
       publishNativeComposerEvent(params),
 

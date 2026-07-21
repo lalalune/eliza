@@ -16,7 +16,9 @@ export {
   type ComposerBridgeClient,
   type ComposerBridgeClientOptions,
   type ComposerBridgeSnapshot,
+  type ComposerBridgeSnapshotDecodeResult,
   createComposerBridgeClient,
+  decodeComposerBridgeSnapshot,
 } from "./client";
 export {
   type AttachmentAddOperation,
@@ -86,6 +88,9 @@ export {
   dispatchNativeComposerOperation,
   dispatchNativeComposerRendererEvent,
   drainNativeComposerOperations,
+  NATIVE_COMPOSER_ACKNOWLEDGMENT_EVENT,
   NATIVE_COMPOSER_OPERATION_EVENT,
   NATIVE_COMPOSER_RENDERER_EVENT,
+  type NativeComposerOperationAcknowledgment,
+  type NativeComposerOperationDelivery,
 } from "./transport";

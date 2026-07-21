@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  acknowledgeNativeComposerOperation,
   drainNativeComposerOperations,
   enqueueNativeComposerOperations,
   NATIVE_COMPOSER_SCHEMA,
@@ -101,12 +102,45 @@ describe("nativeComposerOperationsFromDeepLink", () => {
 });
 
 describe("native composer host state", () => {
-  it("drains queued operations exactly once", () => {
+  it("redelivers queued operations until the renderer acknowledges them", () => {
     enqueueNativeComposerOperations([{ type: "text.set", opId: "one" }]);
-    expect(drainNativeComposerOperations()).toEqual({
-      schema: NATIVE_COMPOSER_SCHEMA,
-      operations: [{ type: "text.set", opId: "one" }],
-    });
+    const first = drainNativeComposerOperations();
+    expect(first.schema).toBe(NATIVE_COMPOSER_SCHEMA);
+    expect(first.operations).toEqual([
+      {
+        deliveryId: expect.any(String),
+        operation: { type: "text.set", opId: "one" },
+      },
+    ]);
+    expect(drainNativeComposerOperations()).toEqual(first);
+    const delivery = first.operations[0] as { deliveryId: string };
+    expect(
+      acknowledgeNativeComposerOperation({
+        schema: NATIVE_COMPOSER_SCHEMA,
+        acknowledgment: {
+          deliveryId: delivery.deliveryId,
+          disposition: "persisted",
+          resultStatus: "applied",
+        },
+      }),
+    ).toEqual({ removed: true });
+    expect(drainNativeComposerOperations().operations).toEqual([]);
+  });
+
+  it("disposes an invalid frame only after a typed renderer rejection", () => {
+    const enqueued = enqueueNativeComposerOperations([{ malformed: true }]);
+    const delivery = enqueued.operations[0] as { deliveryId: string };
+    expect(
+      acknowledgeNativeComposerOperation({
+        schema: NATIVE_COMPOSER_SCHEMA,
+        acknowledgment: {
+          deliveryId: delivery.deliveryId,
+          disposition: "rejected",
+          resultStatus: "invalid-input",
+          reason: "operation type is missing",
+        },
+      }),
+    ).toEqual({ removed: true });
     expect(drainNativeComposerOperations().operations).toEqual([]);
   });
 

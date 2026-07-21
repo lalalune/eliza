@@ -28,7 +28,22 @@ export interface NativeComposerRendererEventInput {
   event: unknown;
 }
 
-const operationQueue: unknown[] = [];
+export interface NativeComposerDelivery {
+  deliveryId: string;
+  operation: unknown;
+}
+
+export interface NativeComposerOperationAcknowledgmentInput {
+  schema: string;
+  acknowledgment: {
+    deliveryId: string;
+    disposition: "persisted" | "rejected";
+    resultStatus: string;
+    reason?: string;
+  };
+}
+
+const operationQueue: NativeComposerDelivery[] = [];
 const latestRendererEvents = new Map<string, unknown>();
 const COMPOSER_EVENT_TYPES = new Set([
   "draft.changed",
@@ -186,16 +201,47 @@ export function nativeComposerOperationsFromDeepLink(url: string): unknown[] {
 export function enqueueNativeComposerOperations(
   operations: readonly unknown[],
 ): NativeComposerOperationStream {
-  operationQueue.push(...operations);
-  return { schema: NATIVE_COMPOSER_SCHEMA, operations: [...operations] };
+  const deliveries = operations.map((operation) => ({
+    deliveryId: randomUUID(),
+    operation,
+  }));
+  operationQueue.push(...deliveries);
+  return { schema: NATIVE_COMPOSER_SCHEMA, operations: deliveries };
 }
 
-/** Atomically drain operations that arrived before the renderer subscribed. */
+/** Peek operations; they remain queued until renderer persistence is acknowledged. */
 export function drainNativeComposerOperations(): NativeComposerOperationStream {
   return {
     schema: NATIVE_COMPOSER_SCHEMA,
-    operations: operationQueue.splice(0),
+    operations: structuredClone(operationQueue),
   };
+}
+
+/** Remove one host delivery only after the renderer reports a final disposition. */
+export function acknowledgeNativeComposerOperation(
+  input: NativeComposerOperationAcknowledgmentInput,
+): { removed: boolean } {
+  if (input.schema !== NATIVE_COMPOSER_SCHEMA) {
+    throw new Error(`unsupported native composer schema: ${input.schema}`);
+  }
+  const { acknowledgment } = input;
+  if (
+    !acknowledgment ||
+    typeof acknowledgment.deliveryId !== "string" ||
+    acknowledgment.deliveryId.length === 0 ||
+    (acknowledgment.disposition !== "persisted" &&
+      acknowledgment.disposition !== "rejected") ||
+    typeof acknowledgment.resultStatus !== "string" ||
+    acknowledgment.resultStatus.length === 0
+  ) {
+    throw new Error("native composer acknowledgment is invalid");
+  }
+  const index = operationQueue.findIndex(
+    ({ deliveryId }) => deliveryId === acknowledgment.deliveryId,
+  );
+  if (index < 0) return { removed: false };
+  operationQueue.splice(index, 1);
+  return { removed: true };
 }
 
 /** Validate and retain the renderer's latest event of each discriminant. */

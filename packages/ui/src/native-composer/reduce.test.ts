@@ -84,6 +84,39 @@ describe("text + mentions + reply", () => {
     expect(state.draft.text).toBe("");
     expect(state.draft.revision).toBe(0);
   });
+
+  it("rejects oversized ids and structured metadata", () => {
+    const small: ComposerApplyContext = {
+      ...ctx,
+      limits: {
+        ...DEFAULT_COMPOSER_LIMITS,
+        maxIdLength: 2,
+        maxMetadataLength: 2,
+        maxMentions: 1,
+      },
+    };
+    const { results } = run(
+      [
+        { type: "text.set", opId: "long", text: "x" },
+        {
+          type: "reply.set",
+          opId: "r",
+          reply: { messageId: "m", preview: "long" },
+        },
+        {
+          type: "mention.add",
+          opId: "m",
+          mention: { id: "id", label: "long" },
+        },
+      ],
+      small,
+    );
+    expect(results).toEqual([
+      expect.objectContaining({ status: "rejected", reason: "oversized" }),
+      expect.objectContaining({ status: "rejected", reason: "oversized" }),
+      expect.objectContaining({ status: "rejected", reason: "oversized" }),
+    ]);
+  });
 });
 
 describe("attachments", () => {

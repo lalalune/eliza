@@ -25,6 +25,18 @@ const mainSrc = readFileSync(
   join(import.meta.dirname, "..", "src", "main.tsx"),
   "utf8",
 );
+const storageBridgeSrc = readFileSync(
+  join(
+    import.meta.dirname,
+    "..",
+    "..",
+    "ui",
+    "src",
+    "bridge",
+    "storage-bridge.ts",
+  ),
+  "utf8",
+);
 
 /** The main boot path: from the bridges checkpoint to the platform init. */
 function mainBridgesRegion(): string {
@@ -65,5 +77,17 @@ describe("main() boot order", () => {
     expect(mount).toBeGreaterThan(-1);
     expect(storageAwait).toBeLessThan(mount);
     expect(fusedWake).toBeLessThan(mount);
+  });
+
+  it("hydrates every platform's native-composer snapshot before the hook can mount", () => {
+    const region = mainBridgesRegion();
+    expect(region.indexOf("await initializeStorageBridge()")).toBeLessThan(
+      region.indexOf("mountReactApp()"),
+    );
+    for (const platform of ["ios", "android", "desktop", "web"]) {
+      expect(storageBridgeSrc).toContain(
+        `eliza:native-composer:v1:snapshot:${platform}`,
+      );
+    }
   });
 });

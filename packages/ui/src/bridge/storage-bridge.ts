@@ -72,6 +72,13 @@ const SYNCED_KEYS = new Set([
   // foreground can rehydrate the same conversation even after the
   // WKWebView localStorage was purged under memory pressure.
   "eliza:chat:activeConversationId",
+  // The native composer owns a durable reducer snapshot per shell platform.
+  // Keeping these in the existing Preferences mirror preserves native drafts,
+  // duplicate-op ids, and deferred sends if WKWebView storage is purged.
+  "eliza:native-composer:v1:snapshot:ios",
+  "eliza:native-composer:v1:snapshot:android",
+  "eliza:native-composer:v1:snapshot:desktop",
+  "eliza:native-composer:v1:snapshot:web",
   "eliza:ios-local-agent:conversations:v1",
   "eliza:ios-local-agent:active-model:v1",
   "eliza:ios-local-agent:assignments:v1",

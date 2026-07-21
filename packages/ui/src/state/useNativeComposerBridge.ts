@@ -5,6 +5,7 @@
  * attachments into the single content-addressed media store.
  */
 
+import { logger } from "@elizaos/logger";
 import { useEffect, useRef } from "react";
 import type { ChatAttachmentInput, ImageAttachment } from "../api";
 import { dispatchChatOpen } from "../events";
@@ -12,15 +13,62 @@ import {
   acknowledgeNativeComposerOperation,
   type ComposerAttachment,
   type ComposerBridgeClient,
+  type ComposerBridgeSnapshot,
   type ComposerDraft,
   type ComposerOperation,
   createComposerBridgeClient,
+  decodeComposerBridgeSnapshot,
   decodeComposerOperation,
   dispatchNativeComposerRendererEvent,
   drainNativeComposerOperations,
   NATIVE_COMPOSER_OPERATION_EVENT,
+  type NativeComposerOperationDelivery,
 } from "../native-composer";
+import {
+  type FrontendPlatform,
+  getFrontendPlatform,
+} from "../platform/platform-guards";
+import { shellLocalStorage } from "../surface-realm-channel";
 import type { ChatReplyTarget } from "./ChatComposerContext.hooks";
+
+const NATIVE_COMPOSER_SNAPSHOT_STORAGE_PREFIX =
+  "eliza:native-composer:v1:snapshot";
+
+export function nativeComposerSnapshotStorageKey(
+  platform: FrontendPlatform = getFrontendPlatform(),
+): string {
+  return `${NATIVE_COMPOSER_SNAPSHOT_STORAGE_PREFIX}:${platform}`;
+}
+
+export type NativeComposerSnapshotReadResult =
+  | { status: "empty" }
+  | { status: "loaded"; snapshot: ComposerBridgeSnapshot }
+  | { status: "invalid"; message: string };
+
+/** Parse and validate a persisted snapshot before the reducer trusts it. */
+export function decodePersistedNativeComposerSnapshot(
+  serialized: string | null,
+): NativeComposerSnapshotReadResult {
+  if (serialized === null) return { status: "empty" };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(serialized);
+  } catch (error) {
+    // error-policy:J3 A corrupt local-storage value is explicit invalid input;
+    // it is removed by the storage boundary instead of becoming reducer state.
+    return {
+      status: "invalid",
+      message:
+        error instanceof Error
+          ? `stored native composer snapshot is not JSON: ${error.message}`
+          : "stored native composer snapshot is not JSON",
+    };
+  }
+  const decoded = decodeComposerBridgeSnapshot(raw);
+  return decoded.ok
+    ? { status: "loaded", snapshot: decoded.snapshot }
+    : { status: "invalid", message: decoded.message };
+}
 
 export interface NativeComposerBridgeOptions {
   sendChatText: (
@@ -35,6 +83,93 @@ export interface NativeComposerBridgeOptions {
   setChatPendingImages: (images: ImageAttachment[]) => void;
   setChatReplyTarget: (target: ChatReplyTarget | null) => void;
   interruptActiveChatPipeline: () => void;
+  onPersistenceError?: (message: string) => void;
+}
+
+interface NativeComposerSession {
+  client: ComposerBridgeClient;
+  storageKey: string;
+  initialPersistenceError: string | null;
+  durableOpIds: Set<string>;
+}
+
+function initializeSession(): NativeComposerSession {
+  const storageKey = nativeComposerSnapshotStorageKey();
+  let snapshot: ComposerBridgeSnapshot | undefined;
+  let initialPersistenceError: string | null = null;
+  if (typeof window !== "undefined") {
+    try {
+      const decoded = decodePersistedNativeComposerSnapshot(
+        window.localStorage.getItem(storageKey),
+      );
+      if (decoded.status === "loaded") {
+        snapshot = decoded.snapshot;
+      } else if (decoded.status === "invalid") {
+        initialPersistenceError = decoded.message;
+        logger.error(
+          { storageKey, message: decoded.message },
+          "[NativeComposer] Ignoring invalid persisted snapshot",
+        );
+        try {
+          shellLocalStorage.removeItem(storageKey);
+        } catch (error) {
+          // error-policy:J6 Removing corrupt local state is best-effort; the
+          // strict decoder still prevents it from reaching the reducer.
+          logger.warn(
+            { error, storageKey },
+            "[NativeComposer] Could not remove invalid persisted snapshot",
+          );
+        }
+      }
+    } catch (error) {
+      // error-policy:J4 A blocked storage read degrades to a fresh composer and
+      // is surfaced to the user; live native operations remain usable.
+      initialPersistenceError = "Native composer recovery is unavailable.";
+      logger.error(
+        { error, storageKey },
+        "[NativeComposer] Could not read persisted snapshot",
+      );
+    }
+  }
+  return {
+    storageKey,
+    initialPersistenceError,
+    durableOpIds: new Set([
+      ...(snapshot?.processedOpIds ?? []),
+      ...(snapshot?.deferred.map(({ operation }) => operation.opId) ?? []),
+    ]),
+    client: createComposerBridgeClient({
+      online: typeof navigator === "undefined" ? true : navigator.onLine,
+      ...(snapshot ? { snapshot } : {}),
+    }),
+  };
+}
+
+function persistSession(
+  session: NativeComposerSession,
+  options: NativeComposerBridgeOptions,
+): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const snapshot = session.client.serialize();
+    shellLocalStorage.setItem(session.storageKey, JSON.stringify(snapshot));
+    session.durableOpIds = new Set([
+      ...snapshot.processedOpIds,
+      ...snapshot.deferred.map(({ operation }) => operation.opId),
+    ]);
+    return true;
+  } catch (error) {
+    // error-policy:J4 The composer stays live in memory when platform storage
+    // is blocked, but the user is told reload/offline recovery is unavailable.
+    logger.error(
+      { error, storageKey: session.storageKey },
+      "[NativeComposer] Could not persist composer state",
+    );
+    options.onPersistenceError?.(
+      "Native composer recovery could not be saved on this device.",
+    );
+    return false;
+  }
 }
 
 function inlineAttachmentToImage(
@@ -129,6 +264,31 @@ function mirrorDraft(
   }
 }
 
+function mirrorHydratedDraft(
+  draft: ComposerDraft,
+  options: NativeComposerBridgeOptions,
+): void {
+  // Empty bridge fields must not erase the active conversation's independently
+  // persisted draft. Native mutations already mirrored clears before reload;
+  // hydration only has work when the native snapshot owns actual content.
+  if (draft.text.length > 0) options.setChatInput(draft.text);
+  if (draft.attachments.length > 0) {
+    options.setChatPendingImages(
+      draft.attachments
+        .map(inlineAttachmentToImage)
+        .filter((image): image is ImageAttachment => image !== null),
+    );
+  }
+  if (draft.reply) {
+    options.setChatReplyTarget({
+      messageId: draft.reply.messageId,
+      senderName: draft.reply.authorId ?? "Message",
+      snippet: draft.reply.preview ?? "",
+    });
+  }
+  if (draft.focused) dispatchChatOpen();
+}
+
 async function sendNativeDraft(
   client: ComposerBridgeClient,
   operation: Extract<ComposerOperation, { type: "send" }>,
@@ -157,7 +317,7 @@ async function sendNativeDraft(
     // materialization failures into the typed native send result.
     client.completeSend(operation.opId, {
       ok: false,
-      reason: "unsupported",
+      reason: "send-failed",
       message: error instanceof Error ? error.message : String(error),
     });
   }
@@ -169,17 +329,42 @@ export function useNativeComposerBridge(
 ): void {
   const optionsRef = useRef(options);
   optionsRef.current = options;
-  const clientRef = useRef<ComposerBridgeClient | null>(null);
-  if (!clientRef.current) {
-    clientRef.current = createComposerBridgeClient({
-      online: typeof navigator === "undefined" ? true : navigator.onLine,
-    });
-  }
+  const sessionRef = useRef<NativeComposerSession | null>(null);
+  if (!sessionRef.current) sessionRef.current = initializeSession();
 
   useEffect(() => {
-    const client = clientRef.current;
-    if (!client) return;
-    const unsubscribe = client.subscribe(dispatchNativeComposerRendererEvent);
+    const session = sessionRef.current;
+    if (!session) return;
+    const { client } = session;
+    if (session.initialPersistenceError) {
+      optionsRef.current.onPersistenceError?.(
+        `Native composer recovery was reset: ${session.initialPersistenceError}`,
+      );
+      session.initialPersistenceError = null;
+    }
+    mirrorHydratedDraft(client.getDraft(), optionsRef.current);
+    const pendingDurableAcknowledgments = new Map<
+      NativeComposerOperationDelivery,
+      "applied" | "deferred" | "duplicate"
+    >();
+    const acknowledgePersistedDeliveries = (): void => {
+      for (const [delivery, resultStatus] of pendingDurableAcknowledgments) {
+        acknowledgeNativeComposerOperation(delivery, {
+          disposition: "persisted",
+          resultStatus,
+        });
+      }
+      pendingDurableAcknowledgments.clear();
+    };
+    const persistAndAcknowledge = (): boolean => {
+      const persisted = persistSession(session, optionsRef.current);
+      if (persisted) acknowledgePersistedDeliveries();
+      return persisted;
+    };
+    const unsubscribe = client.subscribe((event) => {
+      dispatchNativeComposerRendererEvent(event);
+      persistAndAcknowledge();
+    });
     const activeSends = new Set<string>();
 
     const driveSend = (
@@ -194,36 +379,62 @@ export function useNativeComposerBridge(
       );
     };
 
-    const consume = (raw: unknown): void => {
-      const decoded = decodeComposerOperation(raw);
+    const consume = (delivery: NativeComposerOperationDelivery): void => {
+      const decoded = decodeComposerOperation(delivery.operation);
       if (!decoded.ok) {
-        client.dispatchRaw(raw);
+        client.dispatchRaw(delivery.operation);
+        acknowledgeNativeComposerOperation(delivery, {
+          disposition: "rejected",
+          resultStatus: "invalid-input",
+          reason: decoded.error.message,
+        });
         return;
       }
       const result = client.dispatchOperation(decoded.operation);
-      if (result.status !== "applied") return;
-      mirrorDraft(result.draft, decoded.operation, optionsRef.current);
-      if (decoded.operation.type === "send") {
-        driveSend(decoded.operation);
+      if (result.status === "rejected") {
+        acknowledgeNativeComposerOperation(delivery, {
+          disposition: "rejected",
+          resultStatus: result.status,
+          reason: result.reason,
+        });
+      } else if (session.durableOpIds.has(decoded.operation.opId)) {
+        acknowledgeNativeComposerOperation(delivery, {
+          disposition: "persisted",
+          resultStatus: result.status,
+        });
+      } else {
+        pendingDurableAcknowledgments.set(delivery, result.status);
+        persistAndAcknowledge();
+      }
+      if (result.status === "applied") {
+        mirrorDraft(result.draft, decoded.operation, optionsRef.current);
+        if (decoded.operation.type === "send") {
+          driveSend(decoded.operation);
+        }
       }
     };
 
     const onOperation = (event: Event): void => {
-      const raw = (event as CustomEvent<unknown>).detail;
-      acknowledgeNativeComposerOperation(raw);
-      consume(raw);
+      consume((event as CustomEvent<NativeComposerOperationDelivery>).detail);
     };
     window.addEventListener(NATIVE_COMPOSER_OPERATION_EVENT, onOperation);
     for (const raw of drainNativeComposerOperations()) consume(raw);
     const onOnline = (): void => {
       client.setOnline(true);
+      persistAndAcknowledge();
       const active = client.getState().sending;
       if (active) driveSend({ type: "send", opId: active.opId });
     };
-    const onOffline = (): void => client.setOnline(false);
+    const onOffline = (): void => {
+      client.setOnline(false);
+      persistAndAcknowledge();
+    };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
     client.setOnline(navigator.onLine);
+    persistAndAcknowledge();
+    const active = client.getState().sending;
+    if (active) driveSend({ type: "send", opId: active.opId });
     return () => {
       unsubscribe();
       window.removeEventListener(NATIVE_COMPOSER_OPERATION_EVENT, onOperation);
