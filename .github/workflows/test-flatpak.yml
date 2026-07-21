@@ -12,6 +12,7 @@ on:
       - 'packages/shared/**'
       - 'package.json'
       - 'bun.lock'
+      - 'packages/scripts/verify-packaged-cli.mjs'
       - '.github/workflows/test-flatpak.yml'
   workflow_dispatch:
 

@@ -249,8 +249,17 @@ interface WorkflowJob {
   steps?: WorkflowStep[];
 }
 
+interface WorkflowPathTrigger {
+  branches?: string[];
+  paths?: string[];
+}
+
 interface Workflow {
   jobs?: Record<string, WorkflowJob>;
+  on?: {
+    pull_request?: WorkflowPathTrigger;
+    push?: WorkflowPathTrigger;
+  };
 }
 
 function workflow(path: string): Workflow {
@@ -313,6 +322,18 @@ function expectStepBefore(
 }
 
 describe("package workflows", () => {
+  test("package builds rerun when the shared verifier changes", () => {
+    const verifier = "packages/scripts/verify-packaged-cli.mjs";
+    const snap = workflow(".github/workflows/snap-build-test.yml");
+    const flatpak = workflow(".github/workflows/test-flatpak.yml");
+
+    expect(snap.on?.push?.paths).toContain(verifier);
+    expect(snap.on?.pull_request?.paths).toContain(verifier);
+    expect(flatpak.on?.pull_request?.paths).toContain(verifier);
+    expect(flatpak.on?.pull_request?.branches).toContain("develop");
+    expect(flatpak.on?.pull_request?.branches).toContain("main");
+  });
+
   test("Snap and Flatpak validation use terminal fail-closed checks", () => {
     const snap = expectFailClosedSmoke(
       ".github/workflows/snap-build-test.yml",
