@@ -17,6 +17,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -82,6 +83,11 @@ describe("matchesRuntimeVariant", () => {
 
   it("rejects an arch variant when the target arch differs", () => {
     expect(matchesRuntimeVariant("linux-x64", "linux", "arm64")).toBe(false);
+  });
+
+  it("normalizes x86_64 variants to x64", () => {
+    expect(matchesRuntimeVariant("linux-x86_64", "linux", "x64")).toBe(true);
+    expect(matchesRuntimeVariant("linux-x86_64", "linux", "arm64")).toBe(false);
   });
 
   it("treats a universal-arch variant as arch-agnostic", () => {
@@ -205,6 +211,89 @@ describe("shouldKeepPackageRelativePath", () => {
         "x64",
       ),
     ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "build/koffi/linux_loong64/koffi.node",
+        "linux",
+        "arm64",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "build/koffi/linux_riscv64d/koffi.node",
+        "linux",
+        "arm64",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "build/koffi/linux_armhf/koffi.node",
+        "linux",
+        "arm64",
+      ),
+    ).toBe(false);
+  });
+
+  it("gates fb-dotslash embedded executables on the platform", () => {
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux-musl.aarch64/dotslash",
+        "linux",
+        "arm64",
+        "fb-dotslash",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux-musl.x86_64/dotslash",
+        "linux",
+        "x64",
+        "fb-dotslash",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux-musl.x86_64/dotslash",
+        "linux",
+        "arm64",
+        "fb-dotslash",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/macos/dotslash",
+        "linux",
+        "arm64",
+        "fb-dotslash",
+      ),
+    ).toBe(false);
+  });
+
+  it("gates hermes compiler executables on the platform", () => {
+    expect(
+      shouldKeepPackageRelativePath(
+        "hermesc/linux64-bin/hermesc",
+        "linux",
+        "x64",
+        "hermes-compiler",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "hermesc/linux64-bin/hermesc",
+        "linux",
+        "arm64",
+        "hermes-compiler",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "hermesc/osx-bin/hermesc",
+        "darwin",
+        "arm64",
+        "hermes-compiler",
+      ),
+    ).toBe(true);
   });
 
   it("gates ffprobe-static bin variants on the platform", () => {
@@ -460,7 +549,7 @@ describe("normalizeResolvedPackage", () => {
 
     const resolved = normalizeResolvedPackage(dir);
     expect(resolved).not.toBeNull();
-    expect(resolved?.packageJsonPath).toBe(manifestPath);
+    expect(resolved?.packageJsonPath).toBe(realpathSync(manifestPath));
   });
 
   it("returns null for a directory with no manifest and no tracked workspace match", () => {
