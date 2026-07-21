@@ -846,6 +846,36 @@ describe("OrchestratorTaskService — lifecycle", () => {
     );
   });
 
+  it("does not let an in-flight room-message send failure overwrite completion", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+    let markSendStarted!: () => void;
+    const sendStarted = new Promise<void>((resolve) => {
+      markSendStarted = resolve;
+    });
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    vi.spyOn(acp, "sendToSession").mockImplementation(async () => {
+      markSendStarted();
+      await sendGate;
+      throw new Error("late send failure");
+    });
+
+    const posting = service.postUserMessage(taskId, "please continue");
+    await sendStarted;
+    acp.emit(sessionId, "task_complete", { response: "completed meanwhile" });
+    await settleStatus(service, taskId, "validating");
+    releaseSend();
+    const result = must(await posting, "post result");
+    await service.stop();
+
+    expect(result.failedTo).toHaveLength(1);
+    const after = must(await service.getTask(taskId), "after");
+    expect(must(after.sessions[0], "session").status).toBe("completed");
+    expect(after.status).toBe("validating");
+  });
+
   it("reports ACP-unavailable delivery failures for live sessions", async () => {
     const { service, store } = makeServiceWithStore();
     const task = await service.createTask(createInput());
@@ -1743,6 +1773,65 @@ describe("OrchestratorTaskService — task status guards", () => {
     );
   });
 
+  it("does not let an in-flight direct stop failure overwrite completion", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+    let markStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    vi.spyOn(acp, "stopSession").mockImplementation(async () => {
+      markStopStarted();
+      await stopGate;
+      throw new Error("late stop failure");
+    });
+
+    const stopping = service.stopTaskAgent(taskId, sessionId);
+    await stopStarted;
+    acp.emit(sessionId, "task_complete", { response: "completed meanwhile" });
+    await settleStatus(service, taskId, "validating");
+    releaseStop();
+    await expect(stopping).resolves.toBe(true);
+    await service.stop();
+
+    const after = must(await service.getTask(taskId), "after");
+    expect(must(after.sessions[0], "session").status).toBe("completed");
+    expect(after.status).toBe("validating");
+  });
+
+  it("does not let an in-flight bulk-stop failure overwrite completion", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+    let markStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    vi.spyOn(acp, "stopSession").mockImplementation(async () => {
+      markStopStarted();
+      await stopGate;
+      throw new Error("late bulk-stop failure");
+    });
+
+    const pausing = service.pauseTask(taskId);
+    await stopStarted;
+    acp.emit(sessionId, "task_complete", { response: "completed meanwhile" });
+    await settleStatus(service, taskId, "validating");
+    releaseStop();
+    await expect(pausing).resolves.not.toBeNull();
+    await service.stop();
+
+    const after = must(await service.getTask(taskId), "after");
+    expect(must(after.sessions[0], "session").status).toBe("completed");
+    expect(after.status).toBe("validating");
+    expect(after.paused).toBe(true);
+  });
+
   it("does not mark a direct stop successful when ACP is unavailable", async () => {
     const { service, store } = makeServiceWithStore();
     const task = await service.createTask(createInput());
@@ -2492,6 +2581,86 @@ describe("OrchestratorTaskService — restart reconstruction (#13771)", () => {
 // verification can finish (validateTask requires `validating`), and spend
 // nothing from the crash-retry budget.
 describe("OrchestratorTaskService — post-completion teardown race (#13830 audit)", () => {
+  it("keeps stopped as the first terminal result across late error, completion, and duplicate stop events", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+
+    acp.emit(sessionId, "stopped");
+    acp.emit(sessionId, "error", {
+      failureKind: "session_state_lost",
+      message: "late transport error",
+    });
+    acp.emit(sessionId, "task_complete", { response: "late delivery" });
+    acp.emit(sessionId, "stopped");
+    await service.stop();
+
+    const after = must(await service.getTask(taskId), "after");
+    const session = must(after.sessions[0], "session");
+    expect(session.status).toBe("stopped");
+    expect(session.stoppedAt).toBeTypeOf("number");
+    expect(session.taskDelivered).not.toBe(true);
+    expect(session.completionSummary).toBeNull();
+    expect(after.status).toBe("active");
+    expect(
+      after.events?.filter((event) =>
+        ["session_error_retrying", "task_failed"].includes(event.eventType),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("keeps errored as the first terminal result across duplicate error, completion, and stop events", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+    const error = {
+      failureKind: "session_state_lost",
+      message: "session state lost",
+    };
+
+    acp.emit(sessionId, "error", error);
+    acp.emit(sessionId, "error", error);
+    acp.emit(sessionId, "task_complete", { response: "late delivery" });
+    acp.emit(sessionId, "stopped");
+    await service.stop();
+
+    const after = must(await service.getTask(taskId), "after");
+    const session = must(after.sessions[0], "session");
+    expect(session.status).toBe("errored");
+    expect(session.taskDelivered).not.toBe(true);
+    expect(session.completionSummary).toBeNull();
+    expect(after.status).toBe("active");
+    expect(
+      after.events?.filter(
+        (event) => event.eventType === "session_error_retrying",
+      ),
+    ).toHaveLength(1);
+    expect(
+      after.events?.filter((event) => event.eventType === "task_failed"),
+    ).toHaveLength(0);
+  });
+
+  it("keeps completed as the first terminal result across duplicate completion, error, and stop events", async () => {
+    const { service, acp, taskId, sessionId } = await withSpawnedSession();
+
+    acp.emit(sessionId, "task_complete", { response: "first delivery" });
+    acp.emit(sessionId, "task_complete", { response: "late replacement" });
+    acp.emit(sessionId, "error", {
+      failureKind: "session_state_lost",
+      message: "late transport error",
+    });
+    acp.emit(sessionId, "stopped");
+    await service.stop();
+
+    const after = must(await service.getTask(taskId), "after");
+    const session = must(after.sessions[0], "session");
+    expect(session.status).toBe("completed");
+    expect(session.taskDelivered).toBe(true);
+    expect(session.completionSummary).toBe("first delivery");
+    expect(after.status).toBe("validating");
+    expect(
+      after.events?.filter((event) =>
+        ["session_error_retrying", "task_failed"].includes(event.eventType),
+      ),
+    ).toHaveLength(0);
+  });
+
   it("drops a late session error after task_complete: task stays validating, session stays completed", async () => {
     const { service, acp, taskId, sessionId } = await withSpawnedSession();
     await drive(acp, sessionId, "task_complete", { response: "shipped" });

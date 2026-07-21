@@ -64,11 +64,16 @@ import {
 import {
   accountMetaFromSessionMetadata,
   assessCodingAccountReadiness,
+  type CodingAccountMeta,
   type CodingAccountReadiness,
   classifyAccountFailure,
   getCodingAccountBridge,
   hasHealthyPooledAccount,
+  POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+  POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+  recoveryAccountMetaFromSessionMetadata,
   resolveCodingAccountStrategy,
+  retainPooledAccountRecoveryRequirement,
 } from "./coding-account-selection.js";
 import {
   envelopeCorrection,
@@ -190,6 +195,7 @@ import { buildSkillsManifest } from "./skill-manifest.js";
 import {
   readSmithersDurableRunLink,
   runDurableTask,
+  SMITHERS_DURABLE_RUN_METADATA_KEY,
   type SmithersDurableRunLink,
   smithersDurableRunMetadata,
 } from "./smithers-task-integration.js";
@@ -483,8 +489,195 @@ const SESSION_ERROR_STATUSES: ReadonlySet<string> = new Set([
   "errored",
 ]);
 
+// These events can arrive after teardown because ACP callbacks and transport
+// shutdown are independent. They remain useful timeline evidence but must not
+// revive or rewrite a terminal durable session.
+const TERMINAL_MONOTONIC_GUARDED_EVENTS: ReadonlySet<string> = new Set([
+  "ready",
+  "reconnected",
+  "tool_running",
+  "blocked",
+  "login_required",
+  "task_complete",
+  "stopped",
+]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function errorChainHasCode(error: unknown, code: string): boolean {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  for (
+    let inspected = 0;
+    pending.length > 0 && inspected < 32;
+    inspected += 1
+  ) {
+    const current = pending.pop();
+    if (!isRecord(current) || seen.has(current)) continue;
+    seen.add(current);
+    if (current.code === code) return true;
+    if (Object.hasOwn(current, "cause")) pending.push(current.cause);
+    if (current instanceof AggregateError) pending.push(...current.errors);
+  }
+  return false;
+}
+
+function smithersRunKey(link: SmithersDurableRunLink): string {
+  return JSON.stringify([
+    link.tenantId,
+    link.orchestratorTaskId,
+    link.taskId,
+    link.runId,
+  ]);
+}
+
+function smithersRunIdentityMatches(
+  left: SmithersDurableRunLink,
+  right: SmithersDurableRunLink,
+): boolean {
+  return (
+    left.tenantId === right.tenantId &&
+    left.orchestratorTaskId === right.orchestratorTaskId &&
+    left.taskId === right.taskId &&
+    left.runId === right.runId
+  );
+}
+
+function smithersRunContractMatches(
+  left: SmithersDurableRunLink,
+  right: SmithersDurableRunLink,
+): boolean {
+  return (
+    smithersRunIdentityMatches(left, right) &&
+    left.version === right.version &&
+    left.initialPrompt === right.initialPrompt &&
+    left.approvalPreset === right.approvalPreset &&
+    left.model === right.model &&
+    left.timeoutMs === right.timeoutMs &&
+    left.maxTurns === right.maxTurns &&
+    left.keepAliveAfterComplete === right.keepAliveAfterComplete
+  );
+}
+
+function isTerminalSmithersRun(link: SmithersDurableRunLink): boolean {
+  return link.state === "completed" || link.state === "superseded";
+}
+
+function sessionMetadataTaskIdMatches(
+  metadata: Record<string, unknown> | undefined,
+  ownerTaskId: string | undefined,
+): boolean {
+  if (!Object.hasOwn(metadata ?? {}, "taskId")) return true;
+  const taskId = metadata?.taskId;
+  return (
+    typeof taskId === "string" &&
+    taskId.trim().length > 0 &&
+    taskId === ownerTaskId
+  );
+}
+
+function typedSessionAccount(
+  session: OrchestratorTaskSession | undefined,
+): CodingAccountMeta | null {
+  if (!session) return null;
+  const rawProviderId = session.accountProviderId;
+  const rawAccountId = session.accountId;
+  if (rawProviderId === undefined && rawAccountId === undefined) return null;
+  const providerId =
+    typeof rawProviderId === "string" ? rawProviderId.trim() : "";
+  const accountId = typeof rawAccountId === "string" ? rawAccountId.trim() : "";
+  if (!providerId || !accountId) {
+    throw new ElizaError(
+      "Smithers recovery found incomplete pooled-account attribution",
+      {
+        code: "SMITHERS_RECOVERY_ACCOUNT_METADATA_INVALID",
+        context: { sessionId: session.sessionId },
+        severity: "fatal",
+      },
+    );
+  }
+  return {
+    providerId,
+    accountId,
+    label:
+      (typeof session.accountLabel === "string"
+        ? session.accountLabel.trim()
+        : "") || accountId,
+    source: providerId.endsWith("-api") ? "api-key" : "oauth",
+    strategy: "least-used",
+  };
+}
+
+function validatedMetadataAccounts(
+  metadata: Record<string, unknown> | undefined,
+  context: { source: "acp" | "task"; sessionId: string | undefined },
+): CodingAccountMeta[] {
+  const recovery = recoveryAccountMetaFromSessionMetadata(metadata);
+  const attributed = accountMetaFromSessionMetadata(metadata);
+  const fields = [
+    {
+      key: POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+      value: recovery,
+    },
+    { key: "account", value: attributed },
+  ] as const;
+  for (const field of fields) {
+    if (Object.hasOwn(metadata ?? {}, field.key) && !field.value) {
+      throw new ElizaError(
+        "Smithers recovery found malformed pooled-account metadata",
+        {
+          code: "SMITHERS_RECOVERY_ACCOUNT_METADATA_INVALID",
+          context: { ...context, field: field.key },
+          severity: "fatal",
+        },
+      );
+    }
+  }
+  return fields
+    .map((field) => field.value)
+    .filter((account): account is CodingAccountMeta => account !== null);
+}
+
+function smithersRecoveryAccount(candidate: {
+  acpSession?: SessionInfo;
+  taskSession?: OrchestratorTaskSession;
+}): CodingAccountMeta | null {
+  const accounts = [
+    ...validatedMetadataAccounts(candidate.acpSession?.metadata, {
+      source: "acp",
+      sessionId: candidate.acpSession?.id,
+    }),
+    ...validatedMetadataAccounts(candidate.taskSession?.metadata, {
+      source: "task",
+      sessionId: candidate.taskSession?.sessionId,
+    }),
+    typedSessionAccount(candidate.taskSession),
+  ].filter((account): account is CodingAccountMeta => account !== null);
+  const required = accounts[0];
+  if (!required) return null;
+  if (
+    accounts.some(
+      (account) =>
+        account.providerId !== required.providerId ||
+        account.accountId !== required.accountId,
+    )
+  ) {
+    throw new ElizaError(
+      "Smithers recovery found conflicting pooled-account attribution",
+      {
+        code: "SMITHERS_RECOVERY_ACCOUNT_METADATA_INVALID",
+        context: {
+          accountRefs: accounts.map(
+            (account) => `${account.providerId}/${account.accountId}`,
+          ),
+        },
+        severity: "fatal",
+      },
+    );
+  }
+  return required;
 }
 
 const ADMISSION_PRIORITIES: readonly OrchestratorTaskPriority[] = [
@@ -929,6 +1122,15 @@ export class OrchestratorTaskService extends Service {
   // EVERY session event (`ready`, `tool_running`, ...) forever — one line per
   // event, per session. We warn once per session and stay silent after.
   private readonly recordFailureWarned = new Set<string>();
+  // ACP callbacks are synchronous, but applying an event is asynchronous. A
+  // per-session FIFO keeps account switches and terminal transitions ahead of
+  // usage frames emitted after them while allowing unrelated sessions to run
+  // concurrently.
+  private readonly sessionMutationQueues = new Map<string, Promise<void>>();
+  // A usage frame must never cross a failed account-attribution write and bill
+  // the previously selected subscription. A successful switch repairs the
+  // boundary; a clear keeps usage quarantined until that restoration happens.
+  private readonly blockedAccountAttribution = new Set<string>();
   // Tasks with an auto-goal-verify pass in flight. ACP can emit `task_complete`
   // from two sites for one turn; without this guard both runs read the same
   // attempt counter across the model `await` and double-send a correction.
@@ -1063,7 +1265,70 @@ export class OrchestratorTaskService extends Service {
 
   private subscribeToAcp(acp: AcpService): void {
     this.unsubscribe = acp.onSessionEvent((sessionId, event, data) => {
-      void this.onSessionEvent(sessionId, event, data);
+      void this.enqueueSessionEvent(sessionId, event, data);
+    });
+  }
+
+  private enqueueSessionEvent(
+    sessionId: string,
+    event: string,
+    data: unknown,
+  ): Promise<void> {
+    return this.serializeSessionMutation(sessionId, () =>
+      this.onSessionEvent(sessionId, event, data),
+    ).catch((error) => {
+      // error-policy:J7 onSessionEvent is the normal persistence boundary;
+      // this observes an unexpected boundary failure so one bad event cannot
+      // poison the FIFO or become an unhandled rejection.
+      this.runtime.reportError("OrchestratorTask.sessionEventQueue", error, {
+        sessionId,
+        event,
+      });
+    });
+  }
+
+  /**
+   * Serializes every read-modify-write that can change one durable session.
+   * ACP events and external attach refreshes share this boundary so an attach
+   * cannot apply a stale non-terminal snapshot after a terminal callback wins.
+   */
+  private serializeSessionMutation<T>(
+    sessionId: string,
+    mutation: () => Promise<T>,
+  ): Promise<T> {
+    const previous =
+      this.sessionMutationQueues.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(mutation);
+    const tail = run.then(
+      () => undefined,
+      // error-policy:J5 the returned `run` promise is observed by the attach
+      // caller or event boundary; only the queue-continuation tail is silenced.
+      () => undefined,
+    );
+    this.sessionMutationQueues.set(sessionId, tail);
+    void tail.then(() => {
+      if (this.sessionMutationQueues.get(sessionId) === tail) {
+        this.sessionMutationQueues.delete(sessionId);
+      }
+    });
+    return run;
+  }
+
+  /**
+   * Async send/stop/recovery operations may settle after an ACP terminal event;
+   * re-read inside the shared FIFO so their stale outcome cannot replace it.
+   */
+  private updateNonTerminalSession(
+    sessionId: string,
+    patch: Partial<OrchestratorTaskSession>,
+  ): Promise<boolean> {
+    return this.serializeSessionMutation(sessionId, async () => {
+      const current = (await this.store.findSession(sessionId))?.session;
+      if (!current || TERMINAL_TASK_SESSION_STATUSES.has(current.status)) {
+        return false;
+      }
+      await this.store.updateSession(sessionId, patch);
+      return true;
     });
   }
 
@@ -1101,6 +1366,9 @@ export class OrchestratorTaskService extends Service {
   async stop(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    await Promise.all(this.sessionMutationQueues.values());
+    this.sessionMutationQueues.clear();
+    this.blockedAccountAttribution.clear();
     if (this.admissionReconcileTimer) {
       clearInterval(this.admissionReconcileTimer);
       this.admissionReconcileTimer = undefined;
@@ -1111,6 +1379,7 @@ export class OrchestratorTaskService extends Service {
   private queueSmithersRecovery(acp: AcpService): void {
     if (
       typeof acp.listSessions !== "function" ||
+      typeof acp.spawnSessionForDurableRecovery !== "function" ||
       typeof acp.prepareSessionForDurableRecovery !== "function" ||
       typeof acp.updateSessionMetadata !== "function"
     ) {
@@ -1163,29 +1432,108 @@ export class OrchestratorTaskService extends Service {
     const taskDocs = (
       await Promise.all(taskRecords.map((task) => this.store.getTask(task.id)))
     ).filter((doc): doc is OrchestratorTaskDocument => doc !== null);
-    const acpById = new Map(
-      acpSessions.map((session) => [session.id, session]),
-    );
-    const taskSessionById = new Map(
-      taskDocs.flatMap((doc) =>
-        doc.sessions.map((session) => [session.sessionId, session] as const),
-      ),
-    );
+    const acpById = new Map<string, SessionInfo>();
+    const ambiguousAcpSessionIds = new Set<string>();
+    for (const session of acpSessions) {
+      if (acpById.has(session.id)) ambiguousAcpSessionIds.add(session.id);
+      else acpById.set(session.id, session);
+    }
+    const taskSessionById = new Map<
+      string,
+      { ownerTaskId: string; session: OrchestratorTaskSession }
+    >();
+    const ambiguousTaskSessionIds = new Set<string>();
+    for (const doc of taskDocs) {
+      for (const session of doc.sessions) {
+        if (taskSessionById.has(session.sessionId)) {
+          ambiguousTaskSessionIds.add(session.sessionId);
+        } else {
+          taskSessionById.set(session.sessionId, {
+            ownerTaskId: doc.task.id,
+            session,
+          });
+        }
+      }
+    }
+    const runtimeTenantId = String(this.runtime.agentId);
 
     type Candidate = {
       link: SmithersDurableRunLink;
       acpSession?: SessionInfo;
       taskSession?: OrchestratorTaskSession;
+      ownerTaskId?: string;
+      associationAmbiguous?: boolean;
     };
     const candidates = new Map<string, Candidate>();
+    const observedContracts = new Map<string, SmithersDurableRunLink>();
+    const blocked = new Set<string>();
+    const terminal = new Set<string>();
+    const skippedKeys = new Set<string>();
+    const reject = (key: string): void => {
+      blocked.add(key);
+      skippedKeys.add(key);
+      candidates.delete(key);
+    };
     const consider = (candidate: Candidate): void => {
+      const key = smithersRunKey(candidate.link);
       if (
-        candidate.link.state === "completed" ||
-        candidate.link.state === "superseded"
+        candidate.link.tenantId !== runtimeTenantId ||
+        candidate.associationAmbiguous === true ||
+        candidate.ownerTaskId !== candidate.link.orchestratorTaskId ||
+        (candidate.taskSession !== undefined &&
+          candidate.taskSession.taskId !== candidate.ownerTaskId) ||
+        !sessionMetadataTaskIdMatches(
+          candidate.acpSession?.metadata,
+          candidate.ownerTaskId,
+        ) ||
+        !sessionMetadataTaskIdMatches(
+          candidate.taskSession?.metadata,
+          candidate.ownerTaskId,
+        )
       ) {
+        reject(key);
         return;
       }
-      const key = `${candidate.link.tenantId}\u0000${candidate.link.taskId}\u0000${candidate.link.runId}`;
+      const acpLink = readSmithersDurableRunLink(
+        candidate.acpSession?.metadata,
+      );
+      const taskLink = readSmithersDurableRunLink(
+        candidate.taskSession?.metadata,
+      );
+      if (
+        (Object.hasOwn(
+          candidate.acpSession?.metadata ?? {},
+          SMITHERS_DURABLE_RUN_METADATA_KEY,
+        ) &&
+          !acpLink) ||
+        (Object.hasOwn(
+          candidate.taskSession?.metadata ?? {},
+          SMITHERS_DURABLE_RUN_METADATA_KEY,
+        ) &&
+          !taskLink) ||
+        (acpLink && !smithersRunContractMatches(candidate.link, acpLink)) ||
+        (taskLink && !smithersRunContractMatches(candidate.link, taskLink))
+      ) {
+        reject(key);
+        return;
+      }
+      const observed = observedContracts.get(key);
+      if (observed && !smithersRunContractMatches(observed, candidate.link)) {
+        reject(key);
+        return;
+      }
+      observedContracts.set(key, candidate.link);
+      if (blocked.has(key)) return;
+      if (isTerminalSmithersRun(candidate.link)) {
+        terminal.add(key);
+        skippedKeys.add(key);
+        candidates.delete(key);
+        return;
+      }
+      if (terminal.has(key)) {
+        skippedKeys.add(key);
+        return;
+      }
       const prior = candidates.get(key);
       const candidateTime =
         candidate.acpSession?.createdAt.getTime() ??
@@ -1201,10 +1549,19 @@ export class OrchestratorTaskService extends Service {
     for (const session of acpSessions) {
       const link = readSmithersDurableRunLink(session.metadata);
       if (!link) continue;
+      const taskOwner = taskSessionById.get(session.id);
+      const metadataTaskId =
+        typeof session.metadata?.taskId === "string"
+          ? session.metadata.taskId
+          : undefined;
       consider({
         link,
         acpSession: session,
-        taskSession: taskSessionById.get(session.id),
+        taskSession: taskOwner?.session,
+        ownerTaskId: taskOwner?.ownerTaskId ?? metadataTaskId,
+        associationAmbiguous:
+          ambiguousAcpSessionIds.has(session.id) ||
+          ambiguousTaskSessionIds.has(session.id),
       });
     }
     for (const doc of taskDocs) {
@@ -1214,13 +1571,17 @@ export class OrchestratorTaskService extends Service {
         consider({
           link,
           taskSession: session,
+          ownerTaskId: doc.task.id,
           acpSession: acpById.get(session.sessionId),
+          associationAmbiguous:
+            ambiguousAcpSessionIds.has(session.sessionId) ||
+            ambiguousTaskSessionIds.has(session.sessionId),
         });
       }
     }
 
     let recovered = 0;
-    let skipped = 0;
+    let skipped = skippedKeys.size;
     const failures: unknown[] = [];
     for (const candidate of candidates.values()) {
       const task = await this.store.getTask(candidate.link.orchestratorTaskId);
@@ -1259,6 +1620,51 @@ export class OrchestratorTaskService extends Service {
     return { recovered, skipped };
   }
 
+  private async clearFailedSmithersRecoveryAccountAttribution(candidate: {
+    link: SmithersDurableRunLink;
+    acpSession?: SessionInfo;
+    taskSession?: OrchestratorTaskSession;
+  }): Promise<void> {
+    const { link } = candidate;
+    const requiredAccount = smithersRecoveryAccount(candidate);
+    if (!requiredAccount) return;
+
+    const task = await this.store.getTask(link.orchestratorTaskId);
+    if (!task) return;
+    for (const session of task.sessions) {
+      await this.serializeSessionMutation(session.sessionId, async () => {
+        const current = (await this.store.findSession(session.sessionId))
+          ?.session;
+        const sessionLink = readSmithersDurableRunLink(current?.metadata);
+        if (
+          !current ||
+          sessionLink?.tenantId !== link.tenantId ||
+          sessionLink.orchestratorTaskId !== link.orchestratorTaskId ||
+          sessionLink.taskId !== link.taskId ||
+          sessionLink.runId !== link.runId
+        ) {
+          return;
+        }
+        const currentIsTerminal = TERMINAL_TASK_SESSION_STATUSES.has(
+          current.status,
+        );
+        await this.store.updateSession(session.sessionId, {
+          accountProviderId: undefined,
+          accountId: undefined,
+          accountLabel: undefined,
+          ...(session.sessionId === candidate.taskSession?.sessionId &&
+          !currentIsTerminal
+            ? { status: "errored", stoppedAt: Date.now() }
+            : {}),
+          metadata: retainPooledAccountRecoveryRequirement(
+            current.metadata,
+            requiredAccount,
+          ),
+        });
+      });
+    }
+  }
+
   private async recoverOneSmithersRun(
     acp: AcpService,
     candidate: {
@@ -1269,31 +1675,89 @@ export class OrchestratorTaskService extends Service {
   ): Promise<void> {
     const { link } = candidate;
     let session = candidate.acpSession;
-    if (!session) {
-      const persisted = candidate.taskSession;
-      if (!persisted) {
-        throw new Error(`Smithers run ${link.runId} has no persisted session`);
-      }
-      const spawned = await acp.spawnSession({
-        agentType: persisted.framework,
-        workdir: persisted.workdir,
-        model: link.model,
-        approvalPreset: link.approvalPreset,
-        metadata: {
-          ...persisted.metadata,
-          taskId: link.orchestratorTaskId,
-          ...smithersDurableRunMetadata(link),
-        },
-      });
-      session = await acp.getSession(spawned.sessionId);
+    let prepared: SpawnResult;
+    try {
+      const requiredAccount = smithersRecoveryAccount(candidate);
       if (!session) {
-        throw new Error(
-          `Recovery spawn ${spawned.sessionId} was not persisted by ACP`,
-        );
+        const persisted = candidate.taskSession;
+        if (!persisted) {
+          throw new Error(
+            `Smithers run ${link.runId} has no persisted session`,
+          );
+        }
+        const spawned = await acp.spawnSessionForDurableRecovery({
+          agentType: persisted.framework,
+          workdir: persisted.workdir,
+          model: link.model,
+          approvalPreset: link.approvalPreset,
+          metadata: {
+            ...persisted.metadata,
+            taskId: link.orchestratorTaskId,
+            ...(requiredAccount
+              ? {
+                  [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: requiredAccount,
+                }
+              : {}),
+            ...smithersDurableRunMetadata(link),
+          },
+        });
+        session = await acp.getSession(spawned.sessionId);
+        if (!session) {
+          throw new Error(
+            `Recovery spawn ${spawned.sessionId} was not persisted by ACP`,
+          );
+        }
+      } else if (requiredAccount) {
+        await acp.updateSessionMetadata(session.id, {
+          [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: requiredAccount,
+        });
+        session = await acp.getSession(session.id);
+        if (!session) {
+          throw new Error(
+            `Recovery session ${candidate.acpSession?.id} disappeared while pinning its pooled account`,
+          );
+        }
       }
-    }
 
-    const prepared = await acp.prepareSessionForDurableRecovery(session.id);
+      prepared = await acp.prepareSessionForDurableRecovery(session.id);
+    } catch (cause) {
+      // error-policy:J2 recovery adds durable run context after clearing any
+      // stale pooled-account billing identity retained by a failed credential pin.
+      if (errorChainHasCode(cause, POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE)) {
+        try {
+          await this.clearFailedSmithersRecoveryAccountAttribution(candidate);
+        } catch (clearCause) {
+          // error-policy:J2 preserve both the credential refusal and the failed
+          // durable attribution cleanup; either one alone is incomplete evidence.
+          throw new ElizaError(
+            "Smithers recovery could not clear unavailable account attribution",
+            {
+              code: "SMITHERS_RECOVERY_ACCOUNT_CLEAR_FAILED",
+              cause: new AggregateError([cause, clearCause]),
+              context: {
+                tenantId: link.tenantId,
+                taskId: link.taskId,
+                runId: link.runId,
+              },
+              severity: "fatal",
+            },
+          );
+        }
+      }
+      throw new ElizaError(
+        "Smithers recovery could not prepare its ACP session",
+        {
+          code: "SMITHERS_RECOVERY_SESSION_PREPARE_FAILED",
+          cause,
+          context: {
+            tenantId: link.tenantId,
+            taskId: link.taskId,
+            runId: link.runId,
+          },
+          severity: "ephemeral",
+        },
+      );
+    }
     const preparedSession = await acp.getSession(prepared.sessionId);
     if (!preparedSession) {
       throw new Error(
@@ -1395,16 +1859,51 @@ export class OrchestratorTaskService extends Service {
     const ids = new Set([...acpById.keys(), ...taskById.keys()]);
     const writes: Promise<unknown>[] = [];
     for (const sessionId of ids) {
-      const persisted =
-        readSmithersDurableRunLink(acpById.get(sessionId)?.metadata) ??
-        readSmithersDurableRunLink(taskById.get(sessionId)?.metadata);
+      const acpMetadata = acpById.get(sessionId)?.metadata;
+      const taskMetadata = taskById.get(sessionId)?.metadata;
+      const acpLink = readSmithersDurableRunLink(acpMetadata);
+      const taskLink = readSmithersDurableRunLink(taskMetadata);
+      const persistedLinks = [acpLink, taskLink].filter(
+        (link): link is SmithersDurableRunLink => link !== undefined,
+      );
+      const persisted = persistedLinks.find(
+        (link) => smithersRunKey(link) === smithersRunKey(activeLink),
+      );
+      if (!persisted) continue;
+      const taskSession = taskById.get(sessionId);
       if (
-        !persisted ||
-        persisted.tenantId !== activeLink.tenantId ||
-        persisted.taskId !== activeLink.taskId ||
-        persisted.runId !== activeLink.runId
+        (Object.hasOwn(acpMetadata ?? {}, SMITHERS_DURABLE_RUN_METADATA_KEY) &&
+          !acpLink) ||
+        (Object.hasOwn(taskMetadata ?? {}, SMITHERS_DURABLE_RUN_METADATA_KEY) &&
+          !taskLink) ||
+        !sessionMetadataTaskIdMatches(
+          acpMetadata,
+          activeLink.orchestratorTaskId,
+        ) ||
+        !sessionMetadataTaskIdMatches(
+          taskMetadata,
+          activeLink.orchestratorTaskId,
+        ) ||
+        (taskSession !== undefined &&
+          taskSession.taskId !== activeLink.orchestratorTaskId) ||
+        persistedLinks.some(
+          (link) => !smithersRunContractMatches(link, activeLink),
+        )
       ) {
-        continue;
+        throw new ElizaError(
+          "Smithers recovery found immutable run-contract drift while synchronizing copies",
+          {
+            code: "SMITHERS_RECOVERY_CONTRACT_MISMATCH",
+            context: {
+              tenantId: activeLink.tenantId,
+              orchestratorTaskId: activeLink.orchestratorTaskId,
+              taskId: activeLink.taskId,
+              runId: activeLink.runId,
+              sessionId,
+            },
+            severity: "fatal",
+          },
+        );
       }
       const next: SmithersDurableRunLink =
         sessionId === activeSessionId
@@ -1453,7 +1952,6 @@ export class OrchestratorTaskService extends Service {
     const listeners = this.changeListeners.get(taskId);
     if (!listeners) return;
     for (const listener of listeners) {
-      // A broken subscriber must never break a write path.
       try {
         listener();
       } catch {
@@ -1488,6 +1986,9 @@ export class OrchestratorTaskService extends Service {
     } catch (err) {
       // error-policy:J1 ACP event boundary translation — persistence failures
       // are surfaced to the agent so it can retry or escalate the session.
+      if (event === "account_switched" || event === "account_cleared") {
+        this.blockedAccountAttribution.add(sessionId);
+      }
       this.runtime.reportError("OrchestratorTask.recordSessionEvent", err, {
         sessionId,
         event,
@@ -1514,6 +2015,15 @@ export class OrchestratorTaskService extends Service {
     data: unknown,
   ): Promise<void> {
     const record = isRecord(data) ? data : {};
+    if (TERMINAL_MONOTONIC_GUARDED_EVENTS.has(event)) {
+      const prior = (await this.store.findSession(sessionId))?.session;
+      if (prior && TERMINAL_TASK_SESSION_STATUSES.has(prior.status)) {
+        if (ADMISSION_DRAIN_EVENTS.has(event) && this.admissionQueueEnabled()) {
+          void this.drainAdmissionQueue();
+        }
+        return;
+      }
+    }
     switch (event) {
       case "ready":
       case "reconnected":
@@ -1651,17 +2161,13 @@ export class OrchestratorTaskService extends Service {
             message,
           );
         }
-        // A late error for a session that already delivered its result is a
-        // teardown race (the process dropped its state AFTER task_complete
-        // posted), not a work failure — the router suppresses its respawn for
-        // exactly this case (router-loop-guard `state_lost` completion claim).
-        // It must not overwrite the `completed` session record with `errored`,
-        // inflate the crash-retry budget, or knock a `validating` task back to
-        // `active` mid-verification (that aborts validateTask — status is no
-        // longer `validating` — and wedges the task with no live worker). The
+        // Account health still observes a late error, but the first terminal
+        // event owns the durable session result. Transport callbacks can race
+        // after any clean stop, completion, cancellation, or prior error; none
+        // may rewrite that result or replay crash-budget/task transitions. The
         // raw event is already on the task timeline via recordSessionEvent.
         const prior = (await this.store.findSession(sessionId))?.session;
-        if (prior?.status === "completed") break;
+        if (prior && TERMINAL_TASK_SESSION_STATUSES.has(prior.status)) break;
         await this.store.updateSession(sessionId, {
           status: "errored",
           stoppedAt: Date.now(),
@@ -1679,6 +2185,24 @@ export class OrchestratorTaskService extends Service {
         });
         break;
       case "usage_update": {
+        const found = await this.store.findSession(sessionId);
+        const carriesRecoveryPin = Object.hasOwn(
+          found?.session.metadata ?? {},
+          POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+        );
+        if (
+          this.blockedAccountAttribution.has(sessionId) ||
+          carriesRecoveryPin
+        ) {
+          throw new ElizaError(
+            "Usage attribution is blocked until the session account is durably reconciled",
+            {
+              code: "ORCHESTRATOR_ACCOUNT_ATTRIBUTION_UNRESOLVED",
+              context: { taskId, sessionId },
+              severity: "fatal",
+            },
+          );
+        }
         const usage = parseUsage(data);
         if (usage) await this.recordUsage(taskId, sessionId, usage);
         break;
@@ -1690,13 +2214,75 @@ export class OrchestratorTaskService extends Service {
         // rate-limit/reauth marks land on it — not the spawn-time account.
         const providerId = str(record.providerId);
         const accountId = str(record.accountId);
-        if (providerId && accountId) {
-          await this.store.updateSession(sessionId, {
-            accountProviderId: providerId,
-            accountId,
-            accountLabel: str(record.label) ?? accountId,
+        if (!providerId || !accountId) {
+          throw new ElizaError("Malformed account_switched session event", {
+            code: "ORCHESTRATOR_ACCOUNT_EVENT_INVALID",
+            context: { taskId, sessionId },
+            severity: "fatal",
           });
         }
+        const found = await this.store.findSession(sessionId);
+        const prior = found?.session;
+        const account = {
+          providerId,
+          accountId,
+          label: str(record.label) ?? accountId,
+          source: str(record.source) ?? "oauth",
+          strategy: str(record.strategy) ?? "least-used",
+        };
+        const metadata: Record<string, unknown> = {
+          ...(prior?.metadata ?? {}),
+          account,
+        };
+        delete metadata[POOLED_ACCOUNT_RECOVERY_METADATA_KEY];
+        await this.store.updateSession(sessionId, {
+          accountProviderId: providerId,
+          accountId,
+          accountLabel: account.label,
+          metadata,
+        });
+        this.blockedAccountAttribution.delete(sessionId);
+        break;
+      }
+      case "account_cleared": {
+        // Durable recovery could not re-resolve the previously selected pooled
+        // account. Remove it from live billing/health attribution while keeping
+        // a non-secret recovery pin so a later boot cannot use host auth.
+        const providerId = str(record.providerId);
+        const accountId = str(record.accountId);
+        if (!providerId || !accountId) {
+          throw new ElizaError("Malformed account_cleared session event", {
+            code: "ORCHESTRATOR_ACCOUNT_EVENT_INVALID",
+            context: { taskId, sessionId },
+            severity: "fatal",
+          });
+        }
+        const found = await this.store.findSession(sessionId);
+        const prior = found?.session;
+        const requiredAccount = {
+          providerId,
+          accountId,
+          label: str(record.label) ?? accountId,
+          source: str(record.source) ?? "oauth",
+          strategy: str(record.strategy) ?? "least-used",
+        };
+        await this.store.updateSession(sessionId, {
+          accountProviderId: undefined,
+          accountId: undefined,
+          accountLabel: undefined,
+          // Losing the required account terminates a live session, but a late
+          // recovery callback cannot replace an earlier terminal outcome. The
+          // pin and quarantine still apply so no later usage can fall through
+          // to host credentials or stale billing attribution.
+          ...(prior && TERMINAL_TASK_SESSION_STATUSES.has(prior.status)
+            ? {}
+            : { status: "errored", stoppedAt: Date.now() }),
+          metadata: retainPooledAccountRecoveryRequirement(
+            prior?.metadata,
+            requiredAccount,
+          ),
+        });
+        this.blockedAccountAttribution.add(sessionId);
         break;
       }
       default:
@@ -3986,11 +4572,28 @@ export class OrchestratorTaskService extends Service {
     try {
       // Reactivate the kept-alive session so the corrective turn lands on a
       // non-terminal record, then re-dispatch through the goal envelope.
-      await this.store.updateSession(sessionId, {
-        status: "ready",
-        taskDelivered: false,
-        stoppedAt: undefined,
-      });
+      const reopened = await this.serializeSessionMutation(
+        sessionId,
+        async () => {
+          const current = (await this.store.findSession(sessionId))?.session;
+          if (current?.status !== "completed") return false;
+          await this.store.updateSession(sessionId, {
+            status: "ready",
+            taskDelivered: false,
+            stoppedAt: undefined,
+          });
+          return true;
+        },
+      );
+      if (!reopened) {
+        throw new ElizaError(
+          "Corrective turn cannot reopen a session whose completion no longer owns the terminal result",
+          {
+            code: "ORCHESTRATOR_CORRECTIVE_SESSION_NOT_COMPLETED",
+            context: { taskId, sessionId },
+          },
+        );
+      }
       await this.sendToTaskAgent(
         taskId,
         sessionId,
@@ -4197,7 +4800,7 @@ export class OrchestratorTaskService extends Service {
       if (active.length > 0) {
         for (const session of active) {
           failedTo.push({ sessionId: session.sessionId, error });
-          await this.store.updateSession(session.sessionId, {
+          await this.updateNonTerminalSession(session.sessionId, {
             status: "send_failed",
           });
         }
@@ -4228,7 +4831,7 @@ export class OrchestratorTaskService extends Service {
           // structured failedTo result and the session marked send_failed.
           const error = err instanceof Error ? err.message : String(err);
           failedTo.push({ sessionId: session.sessionId, error });
-          await this.store.updateSession(session.sessionId, {
+          await this.updateNonTerminalSession(session.sessionId, {
             status: "send_failed",
           });
           this.log("warn", "relay to active session failed", {
@@ -5128,11 +5731,11 @@ export class OrchestratorTaskService extends Service {
    * sessions, so `resolveTaskId` returns undefined, the event bridge drops
    * their events, and DTOs read `0/0 agents` with no token attribution.
    *
-   * Idempotent: attaching the same sessionId twice is a no-op (the store's
-   * `addSession` also upserts by sessionId). If the task doesn't exist, returns
-   * `false`; direct-prompt callers may degrade without a widget, while the
-   * Smithers path must abort before graph execution because it requires this
-   * durable recovery owner.
+   * Idempotent: attaching the same sessionId twice refreshes only the live ACP
+   * fields while preserving orchestration counters and accumulated usage. If
+   * the task doesn't exist, returns `false`; direct-prompt callers may degrade
+   * without a widget, while the Smithers path must abort before graph execution
+   * because it requires this durable recovery owner.
    *
    * Only advances the task status to `active` for a non-terminal session; a
    * session that's already `completed` / `stopped` / `error` on arrival gets
@@ -5142,19 +5745,82 @@ export class OrchestratorTaskService extends Service {
     taskId: string,
     input: AttachSessionInput,
   ): Promise<boolean> {
+    return this.serializeSessionMutation(input.sessionId, () =>
+      this.attachSessionSerialized(taskId, input),
+    );
+  }
+
+  private async attachSessionSerialized(
+    taskId: string,
+    input: AttachSessionInput,
+  ): Promise<boolean> {
     const doc = await this.store.getTask(taskId);
     if (!doc) return false;
-    // Idempotent short-circuit — already indexed against THIS task.
-    if (this.sessionTaskIndex.get(input.sessionId) === taskId) {
-      const existing = doc.sessions.find(
-        (s) => s.sessionId === input.sessionId,
-      );
-      if (existing) return true;
-    }
     const account = accountMetaFromSessionMetadata(input.metadata);
     const ts = nowIso();
     const now = Date.now();
-    const originalTask = input.originalTask ?? doc.task.goal;
+    const existing = doc.sessions.find(
+      (session) => session.sessionId === input.sessionId,
+    );
+    const existingIsTerminal =
+      existing !== undefined &&
+      TERMINAL_TASK_SESSION_STATUSES.has(existing.status);
+    const originalTask =
+      input.originalTask ?? existing?.originalTask ?? doc.task.goal;
+    const metadata: Record<string, unknown> = existingIsTerminal
+      ? { ...(existing?.metadata ?? {}) }
+      : {
+          ...(existing?.metadata ?? {}),
+          ...(input.metadata ?? {}),
+          ...(input.durableRun
+            ? smithersDurableRunMetadata(input.durableRun)
+            : {}),
+        };
+    if (account && !existingIsTerminal) {
+      delete metadata[POOLED_ACCOUNT_RECOVERY_METADATA_KEY];
+    }
+    if (existing) {
+      const effectiveStatus = existingIsTerminal
+        ? existing.status
+        : input.status;
+      await this.store.updateSession(input.sessionId, {
+        framework: input.agentType,
+        ...(input.providerSource
+          ? { providerSource: input.providerSource }
+          : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(!existingIsTerminal && account
+          ? {
+              accountProviderId: account.providerId,
+              accountId: account.accountId,
+              accountLabel: account.label,
+            }
+          : {}),
+        label: input.label ?? existing.label,
+        originalTask,
+        ...(input.goalPrompt ? { goalPrompt: input.goalPrompt } : {}),
+        workdir: input.workdir,
+        ...(input.repo ? { repo: input.repo } : {}),
+        status: effectiveStatus,
+        lastActivityAt: now,
+        stoppedAt: existingIsTerminal
+          ? existing.stoppedAt
+          : TERMINAL_TASK_SESSION_STATUSES.has(effectiveStatus)
+            ? now
+            : undefined,
+        metadata,
+      });
+      this.sessionTaskIndex.set(input.sessionId, taskId);
+      await this.bindTaskWorkdir(taskId, doc.task, input.workdir, input.repo, {
+        allowRebind:
+          Boolean(doc.task.boundWorkdir) &&
+          doc.task.boundWorkdir !== input.workdir,
+      });
+      if (!TERMINAL_TASK_SESSION_STATUSES.has(effectiveStatus)) {
+        await this.advanceTaskStatus(taskId, "session_active");
+      }
+      return true;
+    }
     const session: OrchestratorTaskSession = {
       id: randomUUID(),
       taskId,
@@ -5193,12 +5859,7 @@ export class OrchestratorTaskService extends Service {
       cacheTokens: 0,
       costUsd: 0,
       usageState: "unavailable",
-      metadata: {
-        ...(input.metadata ?? {}),
-        ...(input.durableRun
-          ? smithersDurableRunMetadata(input.durableRun)
-          : {}),
-      },
+      metadata,
       createdAt: ts,
       updatedAt: ts,
     };
@@ -5231,15 +5892,17 @@ export class OrchestratorTaskService extends Service {
     sessionId: string,
     link: SmithersDurableRunLink,
   ): Promise<boolean> {
-    const found = await this.store.findSession(sessionId);
-    if (!found) return false;
-    await this.store.updateSession(sessionId, {
-      metadata: {
-        ...found.session.metadata,
-        ...smithersDurableRunMetadata(link),
-      },
+    return this.serializeSessionMutation(sessionId, async () => {
+      const found = await this.store.findSession(sessionId);
+      if (!found) return false;
+      await this.store.updateSession(sessionId, {
+        metadata: {
+          ...found.session.metadata,
+          ...smithersDurableRunMetadata(link),
+        },
+      });
+      return true;
     });
-    return true;
   }
 
   async sendToTaskAgent(
@@ -5274,20 +5937,24 @@ export class OrchestratorTaskService extends Service {
     } catch (err) {
       // error-policy:J2 mark the session send_failed for observability, then
       // rethrow the original failure so the caller sees it.
-      await this.store.updateSession(sessionId, { status: "send_failed" });
+      await this.updateNonTerminalSession(sessionId, {
+        status: "send_failed",
+      });
       throw err;
     }
     return true;
   }
 
   async stopTaskAgent(taskId: string, sessionId: string): Promise<boolean> {
-    const doc = await this.store.getTask(taskId);
-    if (!doc) return false;
-    const session = doc.sessions.find((s) => s.sessionId === sessionId);
-    if (!session) return false;
+    const found = await this.store.findSession(sessionId);
+    if (!found || found.taskId !== taskId) return false;
+    if (TERMINAL_TASK_SESSION_STATUSES.has(found.session.status)) return true;
     const acp = this.acp();
     if (!acp) {
-      await this.store.updateSession(sessionId, { status: "stop_failed" });
+      const marked = await this.updateNonTerminalSession(sessionId, {
+        status: "stop_failed",
+      });
+      if (!marked) return true;
       // Route through the transition table: a task that already reached a
       // terminal state (done/failed/archived) but still holds a live keepAlive
       // session whose stop we can't attempt must NOT be stomped to `interrupted`
@@ -5300,13 +5967,15 @@ export class OrchestratorTaskService extends Service {
       await acp.stopSession(sessionId);
     } catch (err) {
       // error-policy:J2 mark the session stop_failed for observability, then
-      // rethrow the original failure so the caller sees it.
-      await this.store.updateSession(sessionId, {
+      // rethrow the original failure so the caller sees it. A terminal event
+      // that won while the stop was in flight already satisfied the request.
+      const marked = await this.updateNonTerminalSession(sessionId, {
         status: "stop_failed",
       });
+      if (!marked) return true;
       throw err;
     }
-    await this.store.updateSession(sessionId, {
+    await this.updateNonTerminalSession(sessionId, {
       status: "stopped",
       stoppedAt: Date.now(),
     });
@@ -5524,13 +6193,14 @@ export class OrchestratorTaskService extends Service {
     if (active.length === 0) return;
     const acp = this.acp();
     if (!acp) {
-      await Promise.all(
+      const marked = await Promise.all(
         active.map((session) =>
-          this.store.updateSession(session.sessionId, {
+          this.updateNonTerminalSession(session.sessionId, {
             status: "stop_failed",
           }),
         ),
       );
+      if (!marked.some(Boolean)) return;
       await this.advanceTaskStatus(doc.task.id, "interrupted");
       throw new RecoveryConflictError(
         "ACP service unavailable; cannot stop active sessions",
@@ -5544,14 +6214,21 @@ export class OrchestratorTaskService extends Service {
         } catch (err) {
           // error-policy:J1 collect per-session stop failures; the loop throws a
           // structured RecoveryConflictError afterward when any session failed.
+          // A terminal callback that won while stop was pending supersedes the
+          // operational failure and already removed the session from liveness.
           const error = err instanceof Error ? err.message : String(err);
-          failures.push({ sessionId: session.sessionId, error });
-          await this.store.updateSession(session.sessionId, {
-            status: "stop_failed",
-          });
+          const marked = await this.updateNonTerminalSession(
+            session.sessionId,
+            {
+              status: "stop_failed",
+            },
+          );
+          if (marked) {
+            failures.push({ sessionId: session.sessionId, error });
+          }
           return;
         }
-        await this.store.updateSession(session.sessionId, {
+        await this.updateNonTerminalSession(session.sessionId, {
           status: "stopped",
           stoppedAt: Date.now(),
         });

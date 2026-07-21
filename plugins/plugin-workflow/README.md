@@ -22,6 +22,12 @@ No workflow-specific env vars are required. The plugin's `EmbeddedWorkflowServic
 
 The `WORKFLOW` umbrella action is defined in this plugin (`src/actions/workflow.ts`) and dispatches op-based commands (`create`, `modify`, `activate`, `deactivate`, `toggle_active`, `delete`, `executions`) to this plugin's services.
 
+## Execution durability
+
+Every run commits a pending execution row before Smithers starts. That row carries a database-backed owner lease whose lifetime exceeds the configured Smithers workflow deadline; the owner heartbeats it and renews it immediately before every node dispatch. Recovery workers atomically claim only expired leases, so replicas remain fenced even when their default Smithers SQLite files are host-local. Schedule tasks also carry the stable schedule-node identity in both the execution claim and idempotency key, so one schedule cannot run or suppress a sibling schedule branch.
+
+Crash recovery is **at-least-once after the prior owner is known dead**, not a claim of universal exactly-once delivery. Smithers reuses completed durable node results where its backend is shared, while the outer lease prevents a takeover during the maximum legal in-flight node window. Connectors that require exactly-once effects must still send their execution/node idempotency token to the remote system, because no local engine can atomically commit an arbitrary remote side effect and its local completion record.
+
 ## RAG Pipeline (workflow generation from natural language)
 
 1. **Extract keywords** from the user request.
@@ -59,7 +65,7 @@ The standard plugin `routes` (`src/routes/index.ts`) are mounted under the plugi
 - `GET    /workflow/executions` · `/workflow/executions/:id` — list (workflowId/status/limit/cursor) + detail
 - `GET    /workflow/nodes` · `/workflow/nodes/available` · `/workflow/nodes/:type`
 - `POST   /workflow/workflows/validate`
-- `GET/POST/PUT/PATCH/DELETE /workflow/webhooks/:path` — trigger-node webhooks
+- `GET/POST/PUT/PATCH/DELETE /workflow/webhooks/:path` — centrally authenticated trigger-node callbacks; these are not public webhook endpoints
 
 ## Development
 
@@ -72,4 +78,3 @@ bun run lint
 ```
 
 Lint/format is [Biome 2.x](https://biomejs.dev). TypeScript 6+. ESM only.
-

@@ -363,6 +363,13 @@ export interface BridgeRequest {
   params?: Record<string, unknown>;
 }
 
+export interface WorkflowProxyRequestOptions {
+  /** Per-operation deadline selected by the authenticated Cloud boundary. */
+  timeoutMs?: number;
+  /** Untrusted inbound headers; only workflow protocol metadata is retained. */
+  protocolHeaders?: HeadersInit;
+}
+
 /**
  * JSON-RPC error code for a shared-runtime turn rejected by the credit
  * reserve. REST callers (shared-rest-adapter, the messages/stream route)
@@ -3932,12 +3939,11 @@ export class ElizaSandboxService {
     "refresh",
   ]);
 
-  // Anchored regex: only the agent's known plugin-workflow surface is forwarded.
-  // Source of truth: plugins/plugin-workflow/src/plugin-routes.ts.
-  // Intentionally additive paths (executions/:id, :id/run) are forwarded too so
-  // the cloud surface is ready when the plugin mounts them; until then the
-  // agent will respond 404 and the cloud relays that 404 unchanged.
+  // The anchored allowlist mirrors plugin-workflow's rawPath route table. It
+  // prevents this narrow proxy from becoming arbitrary access to the agent API.
   private static readonly ALLOWED_WORKFLOW_PATH_PATTERNS: readonly RegExp[] = [
+    /^status$/,
+    /^runtime\/start$/,
     /^workflows$/,
     /^workflows\/generate$/,
     /^workflows\/resolve-clarification$/,
@@ -3945,9 +3951,11 @@ export class ElizaSandboxService {
     /^workflows\/[a-zA-Z0-9_-]{1,128}\/activate$/,
     /^workflows\/[a-zA-Z0-9_-]{1,128}\/deactivate$/,
     /^workflows\/[a-zA-Z0-9_-]{1,128}\/run$/,
-    /^executions$/,
+    /^workflows\/[a-zA-Z0-9_-]{1,128}\/executions$/,
+    /^workflows\/[a-zA-Z0-9_-]{1,128}\/evaluation-samples$/,
+    /^workflows\/[a-zA-Z0-9_-]{1,128}\/revisions$/,
+    /^workflows\/[a-zA-Z0-9_-]{1,128}\/revisions\/[a-zA-Z0-9_-]{1,128}\/restore$/,
     /^executions\/[a-zA-Z0-9_-]{1,128}$/,
-    /^status$/,
   ];
 
   private static readonly ALLOWED_WORKFLOW_QUERY_PARAMS = new Set([
@@ -3955,6 +3963,22 @@ export class ElizaSandboxService {
     "cursor",
     "status",
     "workflowId",
+    "include",
+  ]);
+
+  private static readonly ALLOWED_WORKFLOW_PROTOCOL_HEADERS = new Set([
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "baggage",
+    "content-encoding",
+    "content-type",
+    "idempotency-key",
+    "traceparent",
+    "tracestate",
+    "x-eliza-trace-id",
+    "x-idempotency-key",
+    "x-request-id",
   ]);
 
   async proxyWorkflowRequest(
@@ -3962,8 +3986,9 @@ export class ElizaSandboxService {
     orgId: string,
     workflowPath: string,
     method: "GET" | "POST" | "PUT" | "DELETE",
-    body?: string | null,
+    body?: BodyInit | null,
     query?: string,
+    options: WorkflowProxyRequestOptions = {},
   ): Promise<Response | null> {
     if (!ElizaSandboxService.ALLOWED_WORKFLOW_PATH_PATTERNS.some((re) => re.test(workflowPath))) {
       logger.warn("[agent-sandbox] Rejected workflow proxy: invalid path", {
@@ -4006,29 +4031,29 @@ export class ElizaSandboxService {
       return null;
     }
 
-    try {
-      const fullPath = `/api/workflow/${workflowPath}${sanitizedQuery ? `?${sanitizedQuery}` : ""}`;
-      const headers: Record<string, string> = { Accept: "application/json" };
-      if (method !== "GET" && method !== "DELETE") {
-        headers["Content-Type"] = "application/json";
+    const fullPath = `/api/workflow/${workflowPath}${sanitizedQuery ? `?${sanitizedQuery}` : ""}`;
+    // Cloud credentials terminate before the tenant runtime. The container
+    // receives its own trusted token from fetchAgentApi plus only transport
+    // metadata needed for tracing, negotiation, and request idempotency.
+    const headers = new Headers({ Accept: "application/json" });
+    const inboundHeaders = new Headers(options.protocolHeaders);
+    for (const [name, value] of inboundHeaders) {
+      if (ElizaSandboxService.ALLOWED_WORKFLOW_PROTOCOL_HEADERS.has(name)) {
+        headers.set(name, value);
       }
-      const fetchOptions: RequestInit = {
-        method,
-        headers,
-        signal: AbortSignal.timeout(30_000),
-      };
-      if ((method === "POST" || method === "PUT") && body != null) {
-        fetchOptions.body = body;
-      }
-      return await this.fetchAgentApi(rec, fullPath, fetchOptions);
-    } catch (error) {
-      logger.warn("[agent-sandbox] Workflow proxy request failed", {
-        agentId,
-        workflowPath,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
     }
+    if (method !== "GET" && method !== "DELETE" && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
+    const fetchOptions: RequestInit = {
+      method,
+      headers,
+      signal: AbortSignal.timeout(options.timeoutMs ?? 30_000),
+    };
+    if ((method === "POST" || method === "PUT") && body != null) {
+      fetchOptions.body = body;
+    }
+    return await this.fetchAgentApi(rec, fullPath, fetchOptions);
   }
 
   async proxyWalletRequest(

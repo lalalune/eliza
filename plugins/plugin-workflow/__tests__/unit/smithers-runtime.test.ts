@@ -149,6 +149,27 @@ describe('runWorkflowWithSmithers (in-process Smithers engine)', () => {
     expect(result.sideEffectHappened).toBe(false);
   }, 60_000);
 
+  it('waits for non-cooperative node work before a service-stop abort returns', async () => {
+    const { result } = await runCase('service-stop-drain');
+
+    expect(result.code).toBe('SMITHERS_WORKFLOW_ABORTED');
+    expect(result.nodeWorkFinished).toBe(true);
+    expect(Number(result.elapsedMs)).toBeGreaterThanOrEqual(1_400);
+  }, 60_000);
+
+  it('preserves typed node failures across the Smithers subprocess boundary', async () => {
+    const { result } = await runCase('typed-node-error');
+
+    expect(result.code).toBe('WORKFLOW_NODE_TYPED_FAILURE');
+    expect(result.context).toEqual({ boundary: 'fixture' });
+  }, 60_000);
+
+  it('surfaces the fatal parallel branch instead of an intentionally continued failure', async () => {
+    const { result } = await runCase('parallel-fatal-error');
+
+    expect(result.code).toBe('FATAL_BRANCH_FAILURE');
+  }, 60_000);
+
   it('delivers workflow results larger than the subprocess pipe buffer without truncation', async () => {
     const { result } = await runCase('large-result');
 

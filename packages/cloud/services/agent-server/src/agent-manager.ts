@@ -1,11 +1,14 @@
-// Runs the hosted agent-server agent manager boundary for cloud runtime containers.
+/** Hosts lifecycle, message, and event boundaries for Cloud agent runtimes. */
 import {
   AgentRuntime,
   ChannelType,
   createMessageMemory,
   type IAgentRuntime,
+  type JsonValue,
   mergeCharacterDefaults,
   type Plugin,
+  type RolesWorldMetadata,
+  recordOwnerGrant,
   stringToUuid,
 } from "@elizaos/core";
 import sqlPlugin from "@elizaos/plugin-sql";
@@ -375,22 +378,61 @@ export class AgentManager {
    *   When provided, `senderName` personalizes the connection's userName,
    *   `platformName` sets the message source (e.g. "telegram"), and `chatId`
    *   is stored in connection metadata for future proactive reply routing.
+   * @param authenticatedUserId - End-user identity asserted by the Cloud auth
+   *   boundary. Internal transport authentication alone cannot grant OWNER.
    */
   async handleMessage(
     agentId: string,
     userId: string,
     text: string,
     metadata?: MessageMetadata,
+    authenticatedUserId?: string,
   ) {
     this.inFlight++;
     try {
       const rt = this.getRuntime(agentId);
-      const uid = stringToUuid(userId);
-      const roomId = stringToUuid(`${agentId}:${userId}`);
-      const worldId = stringToUuid(`server:${process.env.SERVER_NAME}`);
+      const normalizedUserId = userId.trim();
+      const authenticatedPrincipal =
+        authenticatedUserId?.trim() === normalizedUserId;
       const source = resolveSource(metadata);
-      const userName = resolveUserName(userId, metadata);
+      const userName = resolveUserName(normalizedUserId, metadata);
       const connMeta = buildConnectionMetadata(metadata);
+      const identityNamespace = authenticatedPrincipal
+        ? "cloud"
+        : connMeta?.platformName
+          ? `connector:${connMeta.platformName}`
+          : "internal";
+      // Authenticated Cloud principals retain their canonical entity id so
+      // chat and workflow HTTP ownership resolve identically. Every other
+      // transport is namespaced by agent and origin, preventing a connector
+      // sender from colliding with a Cloud account that uses the same raw id.
+      const uid = authenticatedPrincipal
+        ? stringToUuid(normalizedUserId)
+        : stringToUuid(
+            `agent-server:${agentId}:${identityNamespace}:user:${normalizedUserId}`,
+          );
+      const roomId = stringToUuid(
+        `agent-server:${agentId}:${identityNamespace}:room:${normalizedUserId}`,
+      );
+      // A per-identity world prevents both cross-user role overwrites and
+      // cross-transport history sharing on a multi-agent server.
+      const worldId = stringToUuid(
+        `agent-server:${agentId}:${identityNamespace}:world:${normalizedUserId}`,
+      );
+      const worldMetadata: Record<string, JsonValue> = {
+        ...(connMeta ?? {}),
+      };
+      // Internal transport auth proves only that a trusted service sent the
+      // request. OWNER is granted solely when the Cloud auth boundary also
+      // forwards the same end-user principal; gateway senders remain
+      // unprivileged until an explicit account linkage grants them a role.
+      if (authenticatedPrincipal) {
+        const ownerMetadata: RolesWorldMetadata = {
+          ownership: { ownerId: uid },
+        };
+        recordOwnerGrant(ownerMetadata, uid);
+        Object.assign(worldMetadata, ownerMetadata);
+      }
 
       if (metadata) {
         // senderName and chatId excluded (PII — phone numbers, display names)
@@ -400,19 +442,15 @@ export class AgentManager {
         });
       }
 
-      // The intersection narrows the cast to only the extra `metadata`
-      // field so the compiler still checks the standard fields.
       await rt.ensureConnection({
         entityId: uid,
         roomId,
         worldId,
         userName,
         source,
-        channelId: `${agentId}-${userId}`,
+        channelId: `${agentId}-${identityNamespace}-${normalizedUserId}`,
         type: ChannelType.DM,
-        ...(connMeta && { metadata: connMeta }),
-      } as Parameters<typeof rt.ensureConnection>[0] & {
-        metadata?: Record<string, string>;
+        metadata: worldMetadata,
       });
 
       const mem = createMessageMemory({

@@ -4,9 +4,9 @@
  * Boots the plugin's relative and raw route tables through the real production
  * dispatcher (`tryHandleRuntimePluginRoute`) over a loopback `http.createServer`
  * — exercising the real auth gate, JSON body parsing, query/param parsing, and
- * handler dispatch — with a faked `WorkflowService` standing in for the only
- * external dependency. No mocked `json`/`status`: every assertion is on a real
- * HTTP response (status + parsed body).
+ * handler dispatch. CRUD tests use a deterministic WorkflowService protocol
+ * peer; webhook coverage uses the real AgentRuntime, embedded engine, Smithers
+ * execution, and PGlite persistence. Every assertion is on a real HTTP response.
  */
 
 import { afterEach, describe, expect, test } from 'bun:test';
@@ -16,8 +16,11 @@ import type { AgentRuntime } from '@elizaos/core';
 
 import { tryHandleRuntimePluginRoute } from '../../../../packages/agent/src/api/runtime-plugin-routes';
 import { workflowRoutePlugin } from '../../src/plugin-routes';
+import { embeddedWebhookRoutes } from '../../src/routes/embedded-webhooks';
 import { workflowRoutes } from '../../src/routes/index';
+import type { WorkflowDefinition, WorkflowExecution } from '../../src/types';
 import { createValidWorkflow, createWorkflowResponse } from '../fixtures/workflows';
+import { makeEmbeddedHarness } from './embedded-harness';
 
 const servers: http.Server[] = [];
 const OWNER_ENTITY_ID = 'route-owner-test';
@@ -132,7 +135,7 @@ function makeRuntime(
 
 async function startServer(
   runtime: AgentRuntime,
-  isAuthorized: () => boolean = () => true
+  authorizeRequest: (request: http.IncomingMessage) => boolean = () => true
 ): Promise<string> {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -143,7 +146,7 @@ async function startServer(
       pathname: url.pathname,
       url,
       runtime,
-      isAuthorized,
+      isAuthorized: () => authorizeRequest(req),
     });
     if (!handled && !res.headersSent) {
       res.statusCode = 404;
@@ -154,6 +157,37 @@ async function startServer(
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
+}
+
+function authenticatedWebhookWorkflow(): WorkflowDefinition {
+  return {
+    name: 'Authenticated webhook workflow',
+    nodes: [
+      {
+        id: 'webhook',
+        name: 'Webhook',
+        type: 'workflows-nodes-base.webhook',
+        typeVersion: 2,
+        position: [0, 0],
+        parameters: { path: 'authenticated-hook', httpMethod: 'POST' },
+      },
+      {
+        id: 'set',
+        name: 'Set Response',
+        type: 'workflows-nodes-base.set',
+        typeVersion: 3.4,
+        position: [200, 0],
+        parameters: {
+          assignments: { assignments: [{ name: 'handled', value: true }] },
+        },
+      },
+    ],
+    connections: {
+      Webhook: {
+        main: [[{ node: 'Set Response', type: 'main', index: 0 }]],
+      },
+    },
+  };
 }
 
 async function postJson(base: string, path: string, body: unknown) {
@@ -308,6 +342,68 @@ describe('plugin-workflow routes (real dispatch)', () => {
     expect(list.status).toBe(401);
     expect((await list.json()) as { error: string }).toMatchObject({ error: 'Unauthorized' });
   });
+
+  test('auth-gates a real active webhook before returning its execution output', async () => {
+    const harness = await makeEmbeddedHarness(`webhook-route-${crypto.randomUUID()}`);
+    try {
+      await harness.runtime.registerPlugin({
+        name: 'workflow',
+        description: 'Authenticated workflow webhook route integration',
+        routes: embeddedWebhookRoutes,
+      });
+      const workflow = await harness.workflow.createWorkflow(authenticatedWebhookWorkflow());
+      await harness.workflow.activateWorkflow(workflow.id);
+      const authorization = 'Bearer workflow-webhook-test-secret';
+      const base = await startServer(
+        harness.runtime,
+        (request) => request.headers.authorization === authorization
+      );
+
+      const denied = await postJson(base, '/workflow/webhooks/authenticated-hook', {
+        payload: 'denied',
+      });
+
+      expect(denied.status).toBe(401);
+      expect((await denied.json()) as { error: string }).toEqual({ error: 'Unauthorized' });
+      expect((await harness.workflow.listExecutions({ workflowId: workflow.id })).data).toEqual([]);
+
+      const authorized = await fetch(`${base}/workflow/webhooks/authenticated-hook`, {
+        method: 'POST',
+        headers: {
+          authorization,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ payload: 'authorized' }),
+      });
+      expect(authorized.status).toBe(200);
+      const body = (await authorized.json()) as {
+        success: boolean;
+        data: WorkflowExecution;
+      };
+      const setRuns = body.data.data?.resultData?.runData?.['Set Response'] as
+        | Array<{
+            data?: {
+              main?: Array<Array<{ json?: Record<string, unknown> }>>;
+            };
+          }>
+        | undefined;
+      const output = setRuns?.[0]?.data?.main?.[0]?.[0]?.json;
+
+      expect(body.success).toBe(true);
+      expect(body.data).toMatchObject({
+        workflowId: workflow.id,
+        mode: 'webhook',
+        status: 'success',
+        finished: true,
+      });
+      expect(output).toMatchObject({ payload: 'authorized', handled: true });
+      expect(
+        (await harness.workflow.listExecutions({ workflowId: workflow.id })).data
+      ).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  }, 60_000);
 
   test('returns 404 for an unknown route path', async () => {
     const base = await startServer(makeRuntime());

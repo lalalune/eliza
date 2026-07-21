@@ -7,9 +7,11 @@ import {
   type IAgentRuntime,
   type Memory,
   type Provider,
+  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import { WORKFLOW_SERVICE_TYPE, type WorkflowService } from '../services/index';
+import { getLocalOwnerEntityId } from '../utils/context';
 
 function getWorkflowSearchQuery(message: Memory): string | null {
   const text = typeof message.content.text === 'string' ? message.content.text.trim() : '';
@@ -35,6 +37,7 @@ export const activeWorkflowsProvider: Provider = {
   roleGate: { minRole: 'ADMIN' },
 
   get: async (runtime: IAgentRuntime, _message: Memory, _state: State) => {
+    let ownerEntityId = getLocalOwnerEntityId(runtime);
     try {
       const service = runtime.getService<WorkflowService>(WORKFLOW_SERVICE_TYPE);
 
@@ -46,11 +49,11 @@ export const activeWorkflowsProvider: Provider = {
         };
       }
 
-      const userId = _message.entityId;
+      ownerEntityId = (await resolveCanonicalOwnerIdForMessage(runtime, _message)) ?? ownerEntityId;
       const searchQuery = getWorkflowSearchQuery(_message);
       const workflows = searchQuery
-        ? await service.searchWorkflows(searchQuery, userId)
-        : await service.listWorkflows(userId);
+        ? await service.searchWorkflows(searchQuery, ownerEntityId)
+        : await service.listWorkflows(ownerEntityId);
 
       if (workflows.length === 0) {
         return {
@@ -94,7 +97,10 @@ export const activeWorkflowsProvider: Provider = {
       const wrapped = new ElizaError('Failed to load active workflows', {
         code: 'WORKFLOW_PROVIDER_ACTIVE_LOAD_FAILED',
         cause: error,
-        context: { entityId: _message.entityId },
+        context: {
+          canonicalOwnerId: ownerEntityId,
+          messageEntityId: _message.entityId,
+        },
         severity: 'ephemeral',
       });
       await runtime.reportError('WorkflowProvider.active', wrapped);

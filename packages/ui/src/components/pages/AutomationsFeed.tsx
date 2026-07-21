@@ -20,6 +20,7 @@ import {
   Workflow,
 } from "lucide-react";
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -102,6 +103,7 @@ const FILTER_ICONS: Record<FeedFilter, ReactNode> = {
   inactive: <CircleSlash className="h-3.5 w-3.5" aria-hidden />,
 };
 const NEW_AUTOMATION_LINK_ID = "__new__";
+const FILTER_ORDER = Object.keys(FILTER_LABELS) as FeedFilter[];
 
 /** Namespaces cached rows by the currently selected local or Cloud agent. */
 export function automationListCacheKey(baseUrl: string): string {
@@ -235,11 +237,13 @@ export function AutomationsFeed({
   const [runError, setRunError] = useState<{
     workflowId: string;
     message: string;
+    retryMode: "run" | "refresh";
   } | null>(null);
   const [workflowRouteIssue, setWorkflowRouteIssue] =
     useState<WorkflowRouteIssue | null>(null);
   const runningWorkflowIdsRef = useRef(new Set<string>());
   const activeCacheKeyRef = useRef(cacheKey);
+  const refreshGenerationRef = useRef(0);
   const [runningWorkflowIds, setRunningWorkflowIds] = useState<
     ReadonlySet<string>
   >(() => new Set());
@@ -292,9 +296,18 @@ export function AutomationsFeed({
   );
 
   const refresh = useCallback(
-    async (options?: { silent?: boolean }) => {
+    async (options?: {
+      silent?: boolean;
+      clearRunErrorForWorkflowId?: string;
+    }) => {
       const requestCacheKey = cacheKey;
-      if (activeCacheKeyRef.current === requestCacheKey) {
+      const requestApiBaseUrl = client.baseUrl;
+      const requestGeneration = ++refreshGenerationRef.current;
+      const isCurrentRequest = () =>
+        refreshGenerationRef.current === requestGeneration &&
+        activeCacheKeyRef.current === requestCacheKey &&
+        automationListCacheKey(client.baseUrl) === requestCacheKey;
+      if (isCurrentRequest()) {
         if (!options?.silent) setLoading(true);
         setError(null);
         setWorkflowRouteIssue(null);
@@ -320,16 +333,22 @@ export function AutomationsFeed({
           ...res,
           automations: mergeUnifiedTasks(res.automations, scheduled.tasks),
         };
+        if (!isCurrentRequest()) return;
         setCached(requestCacheKey, merged);
-        if (activeCacheKeyRef.current === requestCacheKey) {
-          setDataState({ cacheKey: requestCacheKey, data: merged });
+        setDataState({ cacheKey: requestCacheKey, data: merged });
+        if (options?.clearRunErrorForWorkflowId) {
+          setRunError((current) =>
+            current?.workflowId === options.clearRunErrorForWorkflowId
+              ? null
+              : current,
+          );
         }
       } catch (e) {
         // error-policy:J4 this view boundary converts capability and load
         // failures into explicit unavailable, upgrade, or retryable states.
         if (isApiError(e) && e.code === "workflow_requires_dedicated") {
-          const agentId = cloudAgentIdFromApiBase(client.baseUrl);
-          if (agentId && activeCacheKeyRef.current === requestCacheKey) {
+          const agentId = cloudAgentIdFromApiBase(requestApiBaseUrl);
+          if (agentId && isCurrentRequest()) {
             setDataState({ cacheKey: requestCacheKey, data: null });
             invalidate(requestCacheKey);
             setWorkflowRouteIssue({
@@ -344,7 +363,7 @@ export function AutomationsFeed({
         // must remain distinct from a successful empty list so users know why
         // workflows cannot be created or run here.
         if (isApiError(e) && e.status === 404) {
-          if (activeCacheKeyRef.current === requestCacheKey) {
+          if (isCurrentRequest()) {
             setDataState({ cacheKey: requestCacheKey, data: null });
             invalidate(requestCacheKey);
             setWorkflowRouteIssue({
@@ -355,7 +374,7 @@ export function AutomationsFeed({
           }
           return;
         }
-        if (activeCacheKeyRef.current === requestCacheKey) {
+        if (isCurrentRequest()) {
           setError(
             e instanceof Error
               ? e.message
@@ -365,7 +384,7 @@ export function AutomationsFeed({
           );
         }
       } finally {
-        if (activeCacheKeyRef.current === requestCacheKey) {
+        if (isCurrentRequest()) {
           setLoading(false);
         }
       }
@@ -388,32 +407,58 @@ export function AutomationsFeed({
 
   const runWorkflowNow = useCallback(
     async (workflowId: string) => {
-      if (runningWorkflowIdsRef.current.has(workflowId)) return;
-      runningWorkflowIdsRef.current.add(workflowId);
+      const requestCacheKey = cacheKey;
+      const runKey = `${requestCacheKey}:${workflowId}`;
+      if (
+        activeCacheKeyRef.current !== requestCacheKey ||
+        automationListCacheKey(client.baseUrl) !== requestCacheKey ||
+        runningWorkflowIdsRef.current.has(runKey)
+      ) {
+        return;
+      }
+      runningWorkflowIdsRef.current.add(runKey);
+      refreshGenerationRef.current += 1;
       setRunningWorkflowIds(new Set(runningWorkflowIdsRef.current));
-      setRunError(null);
+      setRunError((current) =>
+        current?.workflowId === workflowId ? null : current,
+      );
       try {
         await client.runWorkflowDefinition(workflowId);
-        await refresh();
+        if (
+          activeCacheKeyRef.current === requestCacheKey &&
+          automationListCacheKey(client.baseUrl) === requestCacheKey
+        ) {
+          await refresh({ clearRunErrorForWorkflowId: workflowId });
+        }
       } catch (e) {
         // error-policy:J4 run-now is a user interaction boundary; a failed
         // execution remains distinct from a feed-load failure so its retry
         // repeats the operation the user asked for.
-        setRunError({
-          workflowId,
-          message:
-            e instanceof Error
-              ? e.message
-              : t("automationsfeed.runError", {
-                  defaultValue: "Failed to run automation.",
-                }),
-        });
+        if (
+          activeCacheKeyRef.current === requestCacheKey &&
+          automationListCacheKey(client.baseUrl) === requestCacheKey
+        ) {
+          const ambiguousCompletion =
+            isApiError(e) &&
+            (e.code === "agent_timeout" || e.kind === "timeout");
+          setRunError({
+            workflowId,
+            retryMode: ambiguousCompletion ? "refresh" : "run",
+            message: ambiguousCompletion
+              ? "The run did not confirm completion before the timeout. It may still be processing; refresh its status before trying again."
+              : e instanceof Error
+                ? e.message
+                : t("automationsfeed.runError", {
+                    defaultValue: "Failed to run automation.",
+                  }),
+          });
+        }
       } finally {
-        runningWorkflowIdsRef.current.delete(workflowId);
+        runningWorkflowIdsRef.current.delete(runKey);
         setRunningWorkflowIds(new Set(runningWorkflowIdsRef.current));
       }
     },
-    [refresh, t],
+    [cacheKey, refresh, t],
   );
 
   const automations = useMemo(
@@ -479,7 +524,10 @@ export function AutomationsFeed({
       runError
         ? {
             kind: "error",
-            title: "Run failed",
+            title:
+              runError.retryMode === "refresh"
+                ? "Run status unknown"
+                : "Run failed",
             message: runError.message,
           }
         : null,
@@ -537,6 +585,29 @@ export function AutomationsFeed({
       inactive: allRows.filter((r) => !r.active).length,
     }),
     [allRows],
+  );
+  const handleFilterKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      const currentIndex = FILTER_ORDER.indexOf(filter);
+      let nextIndex: number | null = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        nextIndex = (currentIndex + 1) % FILTER_ORDER.length;
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        nextIndex =
+          (currentIndex - 1 + FILTER_ORDER.length) % FILTER_ORDER.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = FILTER_ORDER.length - 1;
+      }
+      if (nextIndex === null) return;
+      event.preventDefault();
+      const nextFilter = FILTER_ORDER[nextIndex];
+      if (!nextFilter) return;
+      setFilter(nextFilter);
+      document.getElementById(`automations-filter-${nextFilter}`)?.focus();
+    },
+    [filter],
   );
 
   const overviewStats = useMemo(
@@ -633,9 +704,16 @@ export function AutomationsFeed({
   if (editor.kind === "workflow") {
     return (
       <WorkflowEditorLoader
+        key={`${cacheKey}:${editor.workflowId ?? NEW_AUTOMATION_LINK_ID}`}
+        requestCacheKey={cacheKey}
         workflowId={editor.workflowId}
         onSaved={() => {
-          void refresh();
+          if (
+            activeCacheKeyRef.current === cacheKey &&
+            automationListCacheKey(client.baseUrl) === cacheKey
+          ) {
+            void refresh();
+          }
         }}
         onCancel={() => setEditor({ kind: "none" })}
       />
@@ -660,7 +738,7 @@ export function AutomationsFeed({
               aria-label={t("automationsfeed.addAutomation", {
                 defaultValue: "Add automation",
               })}
-              className="h-9 w-9 rounded-md text-muted-strong hover:bg-bg-hover hover:text-txt"
+              className="h-11 w-11 rounded-md text-muted-strong hover:bg-bg-hover hover:text-txt sm:h-9 sm:w-9"
               onClick={() => setEditor({ kind: "task", taskId: null })}
               {...newAutomationAction.agentProps}
             >
@@ -694,8 +772,13 @@ export function AutomationsFeed({
                 </div>
 
                 {/* Filter chips */}
-                <div className="flex flex-wrap gap-1.5">
-                  {(Object.keys(FILTER_LABELS) as FeedFilter[]).map((key) => (
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="tablist"
+                  aria-label="Filter automations"
+                  onKeyDown={handleFilterKeyDown}
+                >
+                  {FILTER_ORDER.map((key) => (
                     <FilterChipButton
                       key={key}
                       filter={key}
@@ -731,14 +814,32 @@ export function AutomationsFeed({
             {runErrorIssue && runError && rows.length > 0 && (
               <WorkflowServiceIssuePanel
                 issue={runErrorIssue}
-                onRetry={() => void runWorkflowNow(runError.workflowId)}
+                onRetry={() => {
+                  if (runError.retryMode === "refresh")
+                    void refresh({
+                      clearRunErrorForWorkflowId: runError.workflowId,
+                    });
+                  else void runWorkflowNow(runError.workflowId);
+                }}
                 onUpgrade={openDedicatedUpgrade}
-                actionLabel="Run again"
+                actionLabel={
+                  runError.retryMode === "refresh"
+                    ? "Refresh status"
+                    : "Run again"
+                }
               />
             )}
 
             {/* Feed — flat, no card/border; rows separate by whitespace. */}
-            <PagePanel variant="inset" className="p-0">
+            <PagePanel
+              id="automations-feed-panel"
+              role={data ? "tabpanel" : undefined}
+              aria-labelledby={
+                data ? `automations-filter-${filter}` : undefined
+              }
+              variant="inset"
+              className="p-0"
+            >
               {(loading || dataState.cacheKey !== cacheKey) && !data ? (
                 <ListSkeleton rows={6} className="p-3" />
               ) : workflowServiceIssue && rows.length === 0 ? (
@@ -793,7 +894,9 @@ export function AutomationsFeed({
                       }}
                       isRunning={
                         row.source.workflowId
-                          ? runningWorkflowIds.has(row.source.workflowId)
+                          ? runningWorkflowIds.has(
+                              `${cacheKey}:${row.source.workflowId}`,
+                            )
                           : false
                       }
                       onOpen={() => {
@@ -874,7 +977,7 @@ function WorkflowServiceIssuePanel({
       {upgradeAgentId ? (
         <Button
           size="sm"
-          className="shrink-0"
+          className="min-h-11 shrink-0 sm:min-h-8"
           onClick={() => onUpgrade(upgradeAgentId)}
         >
           <Rocket className="h-4 w-4" aria-hidden />
@@ -884,7 +987,7 @@ function WorkflowServiceIssuePanel({
         <Button
           variant="outline"
           size="sm"
-          className="shrink-0"
+          className="min-h-11 shrink-0 sm:min-h-8"
           onClick={onRetry}
         >
           {actionLabel}
@@ -945,13 +1048,17 @@ function FilterChipButton({
   return (
     <Button
       ref={ref}
+      id={`automations-filter-${filter}`}
+      role="tab"
       onClick={() => onSelect(filter)}
-      aria-current={isActive ? "true" : undefined}
+      aria-selected={isActive}
+      aria-controls="automations-feed-panel"
+      tabIndex={isActive ? 0 : -1}
       variant="ghost"
       size="sm"
       // Borderless text tab (#10710): active reads as accent text on a faint
       // wash; the count renders as plain text and hides at zero.
-      className={`h-auto gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+      className={`h-auto min-h-11 gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors sm:min-h-8 ${
         isActive
           ? "bg-accent/10 text-accent-muted dark:text-accent"
           : "text-muted-strong hover:bg-bg-accent/40"
@@ -991,6 +1098,10 @@ function FeedRowItem({
     ? "text-accent-muted dark:text-accent"
     : "text-muted-strong";
   const workflowId = row.source.workflowId ?? row.source.id;
+  const isRunBusy =
+    isRunning ||
+    row.lastRunStatus === "running" ||
+    row.lastRunStatus === "waiting";
   const openAction = useAgentElement<HTMLButtonElement>({
     id: `open-${row.kind}-${row.source.workflowId ?? row.source.taskId ?? row.key}`,
     role: "button",
@@ -1009,15 +1120,10 @@ function FeedRowItem({
     label: `Run ${row.title} now`,
     group: "workflow-actions",
     description: "Run this workflow once and refresh the automation dashboard",
-    status:
-      isRunning ||
-      row.lastRunStatus === "running" ||
-      row.lastRunStatus === "waiting"
-        ? "busy"
-        : isWorkflow
-          ? "active"
-          : "inactive",
-    onActivate: onRunNow,
+    status: isRunBusy ? "busy" : isWorkflow ? "active" : "inactive",
+    onActivate: () => {
+      if (!isRunBusy) onRunNow();
+    },
   });
   const lastRunLabel =
     row.lastRunStatus === "error" && row.lastRunError
@@ -1105,15 +1211,15 @@ function FeedRowItem({
             name: row.title,
             defaultValue: "Run {{name}} now",
           })}
-          aria-busy={isRunning}
-          disabled={isRunning}
+          aria-busy={isRunBusy}
+          disabled={isRunBusy}
           onClick={onRunNow}
           variant="ghost"
           size="icon-sm"
-          className="h-7 w-7 rounded-sm p-1.5 text-muted-strong transition-colors hover:bg-bg-accent"
+          className="h-11 w-11 rounded-sm p-1.5 text-muted-strong transition-colors hover:bg-bg-accent sm:h-7 sm:w-7"
           {...runAction.agentProps}
         >
-          {isRunning ? (
+          {isRunBusy ? (
             <Spinner size={14} aria-hidden />
           ) : (
             <PlayCircle className="h-3.5 w-3.5" aria-hidden />
@@ -1237,10 +1343,12 @@ function AutomationEmptyIllustration() {
 }
 
 function WorkflowEditorLoader({
+  requestCacheKey,
   workflowId,
   onSaved,
   onCancel,
 }: {
+  requestCacheKey: string;
   workflowId: string | null;
   onSaved: () => void;
   onCancel: () => void;
@@ -1250,7 +1358,7 @@ function WorkflowEditorLoader({
   // without hitting the API. Otherwise fetch the definition to edit.
   const fetchState = useFetchData<WorkflowDefinition | null>(
     async () => (workflowId ? client.getWorkflowDefinition(workflowId) : null),
-    [workflowId],
+    [requestCacheKey, workflowId],
   );
 
   if (fetchState.status === "error") {

@@ -4,7 +4,7 @@
  * runtime or service boundary is mocked.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { type Memory, type State, stringToUuid } from '@elizaos/core';
+import { ChannelType, type Memory, type State, stringToUuid } from '@elizaos/core';
 import { sql } from 'drizzle-orm';
 import { getPendingWorkflowDraftScope } from '../../../src/lib/pending-workflow-draft';
 import { activeWorkflowsProvider } from '../../../src/providers/activeWorkflows';
@@ -195,7 +195,7 @@ describe('workflow providers with real runtime services', () => {
     expect(result.data).toEqual({ workflows: [], searchQuery: query });
   });
 
-  test('scopes persisted workflows by the message entity', async () => {
+  test('uses the configured canonical owner when the message entity differs', async () => {
     await createOwnedWorkflow(harness, 'Owner workflow');
 
     const result = await activeWorkflowsProvider.get(
@@ -205,10 +205,56 @@ describe('workflow providers with real runtime services', () => {
     );
 
     expect(result.values).toEqual({
-      hasWorkflows: false,
-      workflowCount: 0,
+      hasWorkflows: true,
+      workflowCount: 1,
       workflowSearchQuery: 'List workflows',
     });
+    expect(result.text).toContain('Owner workflow');
+  });
+
+  test('resolves both providers through the message room linked to its owning world', async () => {
+    const linkedHarness = await makeEmbeddedHarness(`provider-linked-${crypto.randomUUID()}`);
+    try {
+      await registerWorkflowService(linkedHarness);
+      const worldId = stringToUuid('workflow-provider-linked-world');
+      const roomId = stringToUuid('workflow-provider-linked-room');
+      await linkedHarness.runtime.createWorld({
+        id: worldId,
+        name: 'Linked owner world',
+        agentId: linkedHarness.runtime.agentId,
+        metadata: { ownership: { ownerId: USER_ID } },
+      });
+      await linkedHarness.runtime.ensureRoomExists({
+        id: roomId,
+        name: 'Linked owner room',
+        agentId: linkedHarness.runtime.agentId,
+        source: 'workflow-provider-test',
+        type: ChannelType.GROUP,
+        worldId,
+      });
+      const workflowId = await createOwnedWorkflow(linkedHarness, 'Linked owner workflow');
+      await linkedHarness.workflow.executeWorkflow(workflowId, { mode: 'manual' });
+      const linkedMessage = message('List workflows', OTHER_USER_ID, roomId);
+
+      const active = await activeWorkflowsProvider.get(
+        linkedHarness.runtime,
+        linkedMessage,
+        state()
+      );
+      const status = await workflowStatusProvider.get(
+        linkedHarness.runtime,
+        linkedMessage,
+        state()
+      );
+
+      expect(active.text).toContain('Linked owner workflow');
+      expect(active.values).toMatchObject({ hasWorkflows: true, workflowCount: 1 });
+      expect(status.text).toContain('Linked owner workflow');
+      expect(status.text).toContain('success');
+      expect(status.values).toEqual({ workflowCount: 1 });
+    } finally {
+      await linkedHarness.close();
+    }
   });
 
   test('surfaces a stopped workflow service as an observable provider failure', async () => {
@@ -229,7 +275,11 @@ describe('workflow providers with real runtime services', () => {
       triggerData: { source: 'provider-test' },
     });
 
-    const result = await workflowStatusProvider.get(harness.runtime, message(), state());
+    const result = await workflowStatusProvider.get(
+      harness.runtime,
+      message('Show workflow status', OTHER_USER_ID),
+      state()
+    );
 
     expect(result.text).toContain('Executable workflow');
     expect(result.text).toContain('success');

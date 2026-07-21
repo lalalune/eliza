@@ -317,10 +317,10 @@ describe("TASKS:create attaches spawned sessions to the minted task thread", () 
   });
 
   it("does NOT falsely promote the minted task to active for a single-turn create (real service)", async () => {
-    // Drive the real sequence — task mint → spawn → attach → prompt → stopped
-    // event — against a REAL OrchestratorTaskService. The early attach makes
-    // the work recoverable, while the terminal event still has to clear the
-    // live-session count when the one-shot turn closes.
+    // Drive the real sequence — task mint → spawn → attach → prompt → completion
+    // → stopped event — against a REAL OrchestratorTaskService. The early attach
+    // makes the work recoverable, while completion remains authoritative when
+    // transport teardown reports a later stop.
     const acp = statefulAcp();
     const store = new OrchestratorTaskStore({ backend: "memory" });
     const taskService = new OrchestratorTaskService(
@@ -364,11 +364,12 @@ describe("TASKS:create attaches spawned sessions to the minted task thread", () 
     expect(detail?.sessionCount).toBe(1);
     // The finished single-turn session is indexed for history/attribution but
     // is no longer live. Its task_complete event advances the durable task to
-    // validating, the same state the real ACP terminal event produces.
+    // validating, and the later stopped event cannot downgrade that stronger
+    // terminal state.
     expect(detail?.activeSessionCount).toBe(0);
     expect(detail?.status).not.toBe("active");
     expect(detail?.status).toBe("validating");
-    expect(detail?.sessions[0]?.status).toBe("stopped");
+    expect(detail?.sessions[0]?.status).toBe("completed");
     expect(detail?.sessions[0]?.stoppedAt).toBeTypeOf("number");
   });
 });

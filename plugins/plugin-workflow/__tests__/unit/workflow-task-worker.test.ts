@@ -117,7 +117,7 @@ describe('EmbeddedWorkflowService trigger task scheduling', () => {
       expect(task.metadata?.workflowId).toBe(created.id);
       expect(task.metadata?.kind).toBe(WORKFLOW_TASK_KIND);
       expect(task.metadata?.updateInterval).toBe(5000);
-      expect(String(task.metadata?.idempotencyKey)).toMatch(new RegExp(`^${created.id}:\\d+$`));
+      expect(task.metadata?.scheduleNodeId).toBe('sched');
       expect(task.metadata?.trigger).toMatchObject({
         kind: 'workflow',
         workflowId: created.id,
@@ -126,6 +126,9 @@ describe('EmbeddedWorkflowService trigger task scheduling', () => {
         intervalMs: 5000,
       });
       expect(typeof task.metadata?.trigger?.nextRunAtMs).toBe('number');
+      expect(task.metadata?.idempotencyKey).toBe(
+        `${created.id}:sched:${Math.floor(Number(task.metadata?.trigger?.nextRunAtMs) / 60_000)}`
+      );
       expect(task.tags).toContain('queue');
       expect(task.tags).toContain('repeat');
       expect(task.tags).toContain('trigger');

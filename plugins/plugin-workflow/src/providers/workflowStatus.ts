@@ -8,9 +8,11 @@ import {
   logger,
   type Memory,
   type Provider,
+  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import { WORKFLOW_SERVICE_TYPE, type WorkflowService } from '../services/index';
+import { getLocalOwnerEntityId } from '../utils/context';
 
 export const workflowStatusProvider: Provider = {
   name: 'workflow_status',
@@ -20,6 +22,7 @@ export const workflowStatusProvider: Provider = {
   roleGate: { minRole: 'ADMIN' },
 
   get: async (runtime: IAgentRuntime, _message: Memory, _state: State) => {
+    let ownerEntityId = getLocalOwnerEntityId(runtime);
     try {
       const service = runtime.getService<WorkflowService>(WORKFLOW_SERVICE_TYPE);
 
@@ -35,10 +38,9 @@ export const workflowStatusProvider: Provider = {
         };
       }
 
-      // Get workflows for the user
-      const userId = _message.entityId;
+      ownerEntityId = (await resolveCanonicalOwnerIdForMessage(runtime, _message)) ?? ownerEntityId;
 
-      const workflows = await service.listWorkflows(userId);
+      const workflows = await service.listWorkflows(ownerEntityId);
 
       if (workflows.length === 0) {
         return {
@@ -57,7 +59,7 @@ export const workflowStatusProvider: Provider = {
 
         // Try to get last execution (if possible)
         try {
-          const executions = await service.getWorkflowExecutions(workflow.id, 1);
+          const executions = await service.getWorkflowExecutions(workflow.id, 1, ownerEntityId);
           if (executions.length > 0) {
             const lastExec = executions[0];
             const execEmoji =
@@ -70,7 +72,7 @@ export const workflowStatusProvider: Provider = {
           const wrapped = new ElizaError('Failed to load workflow executions', {
             code: 'WORKFLOW_PROVIDER_EXECUTIONS_LOAD_FAILED',
             cause: error,
-            context: { workflowId: workflow.id, entityId: userId },
+            context: { workflowId: workflow.id, entityId: ownerEntityId },
             severity: 'ephemeral',
           });
           await runtime.reportError('WorkflowProvider.status.executions', wrapped);
@@ -93,7 +95,10 @@ export const workflowStatusProvider: Provider = {
       const wrapped = new ElizaError('Failed to load workflow status', {
         code: 'WORKFLOW_PROVIDER_STATUS_LOAD_FAILED',
         cause: error,
-        context: { entityId: _message.entityId },
+        context: {
+          canonicalOwnerId: ownerEntityId,
+          messageEntityId: _message.entityId,
+        },
         severity: 'ephemeral',
       });
       await runtime.reportError('WorkflowProvider.status', wrapped);

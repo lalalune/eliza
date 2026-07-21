@@ -15,12 +15,13 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { WorkflowDefinition } from "../../api/client-types-chat";
 import type {
   AutomationItem,
   AutomationListResponse,
 } from "../../api/client-types-config";
 import { ApiError } from "../../api/client-types-core";
-import { invalidate } from "../../hooks/resource-cache";
+import { getCached, invalidate, setCached } from "../../hooks/resource-cache";
 import { AutomationsFeed, automationListCacheKey } from "./AutomationsFeed";
 
 const DEFAULT_AGENT_BASE =
@@ -34,6 +35,7 @@ const clientMock = vi.hoisted(() => ({
   listAutomations: vi.fn(),
   listScheduledTasks: vi.fn(),
   applyScheduledTask: vi.fn(),
+  getWorkflowDefinition: vi.fn(),
   runWorkflowDefinition: vi.fn(),
 }));
 const openExternalUrlMock = vi.hoisted(() => vi.fn(async () => undefined));
@@ -44,6 +46,14 @@ vi.mock("../../api", () => ({
 
 vi.mock("../../utils/openExternalUrl", () => ({
   openExternalUrl: openExternalUrlMock,
+}));
+
+vi.mock("./WorkflowEditor", () => ({
+  WorkflowEditor: ({ initial }: { initial?: WorkflowDefinition | null }) => (
+    <div data-testid="workflow-editor-stub">
+      {initial?.name ?? "New workflow"}
+    </div>
+  ),
 }));
 
 function automationItem(
@@ -125,11 +135,25 @@ function responseFixture(): AutomationListResponse {
   };
 }
 
+function workflowDefinition(
+  overrides: Partial<WorkflowDefinition> = {},
+): WorkflowDefinition {
+  return {
+    id: "workflow-1",
+    name: "Nightly review",
+    active: true,
+    nodes: [],
+    connections: {},
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   window.location.hash = "#automations";
   clientMock.baseUrl = DEFAULT_AGENT_BASE;
   clientMock.listAutomations.mockResolvedValue(responseFixture());
   clientMock.listScheduledTasks.mockResolvedValue({ tasks: [] });
+  clientMock.getWorkflowDefinition.mockResolvedValue(workflowDefinition());
   clientMock.runWorkflowDefinition.mockResolvedValue({ id: "execution-1" });
 });
 
@@ -233,6 +257,78 @@ describe("AutomationsFeed", () => {
     expect(await screen.findByText("Agent B private workflow")).toBeTruthy();
   });
 
+  it("discards an editor response from the previously selected agent", async () => {
+    let finishFirstEditor: ((workflow: WorkflowDefinition) => void) | undefined;
+    const firstEditor = new Promise<WorkflowDefinition>((resolve) => {
+      finishFirstEditor = resolve;
+    });
+    clientMock.getWorkflowDefinition.mockImplementation(() => {
+      const requestBase = clientMock.baseUrl;
+      return requestBase === DEFAULT_AGENT_BASE
+        ? firstEditor
+        : Promise.resolve(
+            workflowDefinition({ name: "Agent B editor workflow" }),
+          );
+    });
+    const { rerender } = render(<AutomationsFeed />);
+
+    const title = await screen.findByText("Nightly review");
+    const openButton = title.closest("button");
+    if (!openButton) throw new Error("Workflow row button was not rendered");
+    fireEvent.click(openButton);
+    await waitFor(() => {
+      expect(clientMock.getWorkflowDefinition).toHaveBeenCalledTimes(1);
+    });
+
+    clientMock.baseUrl = SECOND_AGENT_BASE;
+    rerender(<AutomationsFeed />);
+
+    expect(await screen.findByText("Agent B editor workflow")).toBeTruthy();
+    await act(async () => {
+      finishFirstEditor?.(
+        workflowDefinition({ name: "Agent A stale editor workflow" }),
+      );
+    });
+    expect(screen.queryByText("Agent A stale editor workflow")).toBeNull();
+    expect(screen.getByText("Agent B editor workflow")).toBeTruthy();
+  });
+
+  it("does not publish a stale run failure or refresh across an agent switch", async () => {
+    let failFirstRun: ((reason: Error) => void) | undefined;
+    clientMock.runWorkflowDefinition.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        failFirstRun = reject;
+      }),
+    );
+    const secondResponse = responseFixture();
+    secondResponse.automations = [
+      automationItem({
+        id: "agent-b-automation",
+        workflowId: "agent-b-workflow",
+        title: "Agent B private workflow",
+      }),
+    ];
+    clientMock.listAutomations
+      .mockResolvedValueOnce(responseFixture())
+      .mockResolvedValue(secondResponse);
+    const { rerender } = render(<AutomationsFeed />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Run Nightly review now" }),
+    );
+    clientMock.baseUrl = SECOND_AGENT_BASE;
+    rerender(<AutomationsFeed />);
+    expect(await screen.findByText("Agent B private workflow")).toBeTruthy();
+
+    await act(async () => {
+      failFirstRun?.(new Error("stale Agent A run failure"));
+    });
+    expect(screen.queryByText("Run failed")).toBeNull();
+    expect(screen.queryByText("Run status unknown")).toBeNull();
+    expect(screen.queryByText("stale Agent A run failure")).toBeNull();
+    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+  });
+
   it("prevents duplicate run requests while a workflow execution is pending", async () => {
     let finishRun: ((value: { id: string }) => void) | undefined;
     clientMock.runWorkflowDefinition.mockReturnValueOnce(
@@ -279,6 +375,156 @@ describe("AutomationsFeed", () => {
       expect(clientMock.listAutomations).toHaveBeenCalledTimes(2),
     );
     expect(screen.queryByText("Run failed")).toBeNull();
+  });
+
+  it("preserves one workflow's failure while another workflow refreshes successfully", async () => {
+    clientMock.runWorkflowDefinition.mockImplementation(
+      async (workflowId: string) => {
+        if (workflowId === "workflow-1") {
+          throw new Error("Nightly review failed");
+        }
+        return { id: "execution-2" };
+      },
+    );
+    render(<AutomationsFeed />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Run Nightly review now" }),
+    );
+    expect(await screen.findByText("Nightly review failed")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Run Broken workflow now" }),
+    );
+    await waitFor(() => {
+      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    });
+
+    expect(screen.getByText("Run failed")).toBeTruthy();
+    expect(screen.getByText("Nightly review failed")).toBeTruthy();
+  });
+
+  it("refreshes status instead of repeating a run whose timeout is ambiguous", async () => {
+    clientMock.runWorkflowDefinition.mockRejectedValueOnce(
+      new ApiError({
+        kind: "http",
+        path: "/api/workflow/workflows/workflow-1/run",
+        status: 504,
+        code: "agent_timeout",
+        message: "Agent did not start responding in time.",
+      }),
+    );
+    render(<AutomationsFeed />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Run Nightly review now" }),
+    );
+
+    expect(await screen.findByText("Run status unknown")).toBeTruthy();
+    expect(screen.getByText(/may still be processing/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+
+    await waitFor(() => {
+      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Run status unknown")).toBeNull();
+    });
+    expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a post-run refresh when an older silent revalidation resolves last", async () => {
+    const cachedResponse = responseFixture();
+    cachedResponse.automations = [automationItem({ title: "Cached workflow" })];
+    setCached(automationListCacheKey(DEFAULT_AGENT_BASE), cachedResponse);
+
+    let resolveStaleRefresh:
+      | ((value: AutomationListResponse) => void)
+      | undefined;
+    const staleResponse = responseFixture();
+    staleResponse.automations = [
+      automationItem({ title: "Stale silent workflow" }),
+    ];
+    const freshResponse = responseFixture();
+    freshResponse.automations = [
+      automationItem({ title: "Fresh post-run workflow" }),
+    ];
+    clientMock.listAutomations
+      .mockReturnValueOnce(
+        new Promise<AutomationListResponse>((resolve) => {
+          resolveStaleRefresh = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(freshResponse);
+
+    render(<AutomationsFeed />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Run Cached workflow now" }),
+    );
+    expect(await screen.findByText("Fresh post-run workflow")).toBeTruthy();
+    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveStaleRefresh?.(staleResponse);
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Stale silent workflow")).toBeNull();
+    expect(screen.getByText("Fresh post-run workflow")).toBeTruthy();
+    expect(
+      getCached<AutomationListResponse>(
+        automationListCacheKey(DEFAULT_AGENT_BASE),
+      )?.data.automations[0]?.title,
+    ).toBe("Fresh post-run workflow");
+  });
+
+  it.each([
+    "running",
+    "waiting",
+  ] as const)("disables Run now while the persisted execution is %s", async (status) => {
+    const response = responseFixture();
+    response.automations = [
+      automationItem({
+        lastExecution: {
+          status,
+          startedAt: "2026-06-20T14:00:00.000Z",
+        },
+      }),
+    ];
+    clientMock.listAutomations.mockResolvedValue(response);
+    render(<AutomationsFeed />);
+
+    const runButton = await screen.findByRole("button", {
+      name: "Run Nightly review now",
+    });
+    expect(runButton.hasAttribute("disabled")).toBe(true);
+    expect(runButton.getAttribute("aria-busy")).toBe("true");
+    fireEvent.click(runButton);
+    expect(clientMock.runWorkflowDefinition).not.toHaveBeenCalled();
+  });
+
+  it("exposes the filters as keyboard-navigable selected tabs", async () => {
+    render(<AutomationsFeed />);
+
+    await screen.findByText("Nightly review");
+    expect(
+      screen.getByRole("tablist", { name: "Filter automations" }),
+    ).toBeTruthy();
+    const allTab = screen.getByRole("tab", { name: /All/i });
+    const promptsTab = screen.getByRole("tab", { name: /Prompts/i });
+    expect(allTab.getAttribute("aria-selected")).toBe("true");
+    expect(promptsTab.getAttribute("aria-selected")).toBe("false");
+
+    allTab.focus();
+    fireEvent.keyDown(allTab, { key: "ArrowRight" });
+
+    expect(promptsTab.getAttribute("aria-selected")).toBe("true");
+    expect(promptsTab.getAttribute("tabindex")).toBe("0");
+    expect(document.activeElement).toBe(promptsTab);
+    expect(screen.getByRole("tabpanel").getAttribute("aria-labelledby")).toBe(
+      promptsTab.id,
+    );
   });
 
   it("renders the uniform ViewHeader with a centered title and bare-icon back", async () => {

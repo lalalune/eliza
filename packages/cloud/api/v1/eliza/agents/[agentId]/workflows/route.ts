@@ -8,11 +8,11 @@ import {
 
 const app = new Hono<AppEnv>();
 
-app.options("/", () => handleWorkflowProxyOptions());
+app.options("/", (c) => handleWorkflowProxyOptions(c.req.header("origin")));
 
 for (const method of ["GET", "POST"] as const) {
   app.on(method, "/", async (c) =>
-    handleWorkflowProxyRequest(c.req.raw, c.req.param("agentId")!, "", c),
+    handleWorkflowProxyRequest(c.req.raw, c.req.param("agentId"), "", c),
   );
 }
 

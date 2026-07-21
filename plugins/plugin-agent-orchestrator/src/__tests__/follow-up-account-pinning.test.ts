@@ -14,9 +14,13 @@ import type {
   IAgentRuntime,
 } from "@elizaos/core";
 import { setCodingAgentSelectorBridge } from "@elizaos/core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AcpService } from "../services/acp-service.js";
-import type { CodingAccountMeta } from "../services/coding-account-selection.js";
+import {
+  type CodingAccountMeta,
+  POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+  POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+} from "../services/coding-account-selection.js";
 import { InMemorySessionStore } from "../services/session-store.js";
 import type { SessionInfo } from "../services/types.js";
 
@@ -78,11 +82,11 @@ function makeBridge(opts: { healthyIds: string[] }) {
   return { bridge, calls };
 }
 
-function makeRuntime(): IAgentRuntime {
+function makeRuntime(settings: Record<string, string> = {}): IAgentRuntime {
   return {
     agentId: "00000000-0000-4000-8000-00000000acp1",
     logger: { debug() {}, info() {}, warn() {}, error() {} },
-    getSetting: () => undefined,
+    getSetting: (key: string) => settings[key],
   } as never;
 }
 
@@ -118,6 +122,7 @@ describe("follow-up prompt account pinning (cli transport)", () => {
 
   afterEach(() => {
     setCodingAgentSelectorBridge(null);
+    vi.restoreAllMocks();
   });
 
   it("re-resolves the SPAWN-TIME account when both accounts are healthy (no drift)", async () => {
@@ -194,21 +199,171 @@ describe("follow-up prompt account pinning (cli transport)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("returns undefined when neither the pinned account nor a failover is available", async () => {
+  it("fails closed when neither the pinned account nor a failover is available", async () => {
     const { bridge } = makeBridge({ healthyIds: [] });
     setCodingAgentSelectorBridge(bridge);
     const session = makeSession();
     await store.create(session);
 
-    const env = await (
-      service as unknown as CredentialResolver
-    ).accountCredentialsForSession(session);
-
-    expect(env).toBeUndefined();
+    await expect(
+      (service as unknown as CredentialResolver).accountCredentialsForSession(
+        session,
+      ),
+    ).rejects.toMatchObject({
+      code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+    });
     // No failover happened, so the session must stay keyed to A.
     const sessionAccount = session.metadata?.account;
     expect(sessionAccount).toBeDefined();
     if (!sessionAccount) throw new Error("Expected the session account pin");
     expect((sessionAccount as CodingAccountMeta).accountId).toBe("acct-a");
+  });
+
+  it("restores durable attribution only after the pinned account is materialized and persisted", async () => {
+    const { bridge } = makeBridge({ healthyIds: ["acct-a"] });
+    setCodingAgentSelectorBridge(bridge);
+    const session: SessionInfo = {
+      ...makeSession(),
+      metadata: {
+        [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
+      },
+    };
+    await store.create(session);
+    const events: Array<{ event: string; data: unknown }> = [];
+    service.onSessionEvent((sessionId, event, data) => {
+      if (sessionId === session.id) events.push({ event, data });
+    });
+
+    const env = await (
+      service as unknown as CredentialResolver
+    ).accountCredentialsForSession(session);
+
+    expect(env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("token-acct-a");
+    const stored = await store.get(session.id);
+    expect(stored?.metadata?.account).toEqual(ACCOUNT_A);
+    expect(
+      stored?.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY],
+    ).toBeUndefined();
+    expect(events).toContainEqual({
+      event: "account_switched",
+      data: {
+        ...ACCOUNT_A,
+        reason: "durable_recovery_restored",
+      },
+    });
+  });
+
+  it("does not inject credentials or emit restored attribution when the durable restamp fails", async () => {
+    const { bridge } = makeBridge({ healthyIds: ["acct-a"] });
+    setCodingAgentSelectorBridge(bridge);
+    const session: SessionInfo = {
+      ...makeSession(),
+      metadata: {
+        [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
+      },
+    };
+    await store.create(session);
+    const events: string[] = [];
+    service.onSessionEvent((sessionId, event) => {
+      if (sessionId === session.id) events.push(event);
+    });
+    vi.spyOn(store, "update").mockRejectedValueOnce(
+      new Error("durable account write failed"),
+    );
+
+    await expect(
+      (service as unknown as CredentialResolver).accountCredentialsForSession(
+        session,
+      ),
+    ).rejects.toThrow("durable account write failed");
+
+    expect(session.metadata?.account).toBeUndefined();
+    expect(session.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY]).toEqual(
+      ACCOUNT_A,
+    );
+    expect(events).not.toContain("account_switched");
+  });
+
+  it("clears stale live attribution when an already-attached native recovery account is unavailable", async () => {
+    const healthyIds: string[] = [];
+    const { bridge } = makeBridge({ healthyIds });
+    setCodingAgentSelectorBridge(bridge);
+    const session: SessionInfo = {
+      ...makeSession(),
+      metadata: {
+        account: { ...ACCOUNT_A },
+        [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
+      },
+    };
+    await store.create(session);
+    (
+      service as unknown as { nativeClients: Map<string, unknown> }
+    ).nativeClients.set(session.id, {
+      closeSession: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+    });
+    const events: Array<{ event: string; data: unknown }> = [];
+    service.onSessionEvent((sessionId, event, data) => {
+      if (sessionId === session.id) events.push({ event, data });
+    });
+
+    await expect(
+      service.prepareSessionForDurableRecovery(session.id),
+    ).rejects.toMatchObject({
+      code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+    });
+
+    const stored = await store.get(session.id);
+    expect(stored?.status).toBe("errored");
+    expect(stored?.metadata?.account).toBeUndefined();
+    expect(stored?.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY]).toEqual(
+      ACCOUNT_A,
+    );
+    expect(events).toContainEqual({
+      event: "account_cleared",
+      data: {
+        ...ACCOUNT_A,
+        reason: "durable_recovery_unavailable",
+      },
+    });
+
+    expect(
+      (
+        service as unknown as { nativeClients: Map<string, unknown> }
+      ).nativeClients.has(session.id),
+    ).toBe(false);
+  });
+
+  it.each([
+    "native",
+    "cli",
+  ] as const)("translates %s credential-resolution failures without leaving the session busy", async (transportMode) => {
+    const { bridge } = makeBridge({ healthyIds: [] });
+    setCodingAgentSelectorBridge(bridge);
+    const promptStore = new InMemorySessionStore();
+    const promptService = new AcpService(
+      makeRuntime({ ELIZA_ACP_TRANSPORT: transportMode }),
+      { store: promptStore },
+    );
+    (promptService as unknown as { started: boolean }).started = true;
+    const session: SessionInfo = {
+      ...makeSession(),
+      metadata: {
+        transportMode,
+        [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
+      },
+    };
+    await promptStore.create(session);
+    const events: string[] = [];
+    promptService.onSessionEvent((sessionId, event) => {
+      if (sessionId === session.id) events.push(event);
+    });
+
+    await expect(
+      promptService.sendPrompt(session.id, "continue"),
+    ).rejects.toThrow(/unavailable for durable recovery/);
+
+    expect((await promptStore.get(session.id))?.status).toBe("errored");
+    expect(events).toContain("error");
   });
 });

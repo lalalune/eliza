@@ -29,7 +29,7 @@ const AGENT_ID = stringToUuid("trigger-runtime-test-agent");
 interface WorkflowDispatchCall {
   workflowId: string;
   payload?: Record<string, unknown>;
-  options?: { idempotencyKey?: string };
+  options?: { idempotencyKey?: string; scheduleNodeId?: string };
 }
 
 interface PromptMessageCall {
@@ -46,10 +46,18 @@ interface MockRuntimeHandle {
   updatedTasks: Array<{ id: UUID; patch: Partial<Task> }>;
   warnings: unknown[][];
   notifyCalls: Array<Record<string, unknown>>;
+  reportedErrors: Array<{
+    scope: string;
+    error: unknown;
+    context: Record<string, unknown> | undefined;
+  }>;
   setDispatchResult: (
-    result: { ok: true; executionId?: string } | { ok: false; error: string },
+    result:
+      | { ok: true; executionId?: string; dedup?: boolean }
+      | { ok: false; error: string; dedup?: boolean },
   ) => void;
   setWorkflowServicePresent: (present: boolean) => void;
+  setNotificationFailure: (error: Error | null) => void;
 }
 
 function makeRuntime(): MockRuntimeHandle {
@@ -59,6 +67,8 @@ function makeRuntime(): MockRuntimeHandle {
   const updatedTasks: Array<{ id: UUID; patch: Partial<Task> }> = [];
   const warnings: unknown[][] = [];
   const notifyCalls: Array<Record<string, unknown>> = [];
+  const reportedErrors: MockRuntimeHandle["reportedErrors"] = [];
+  let notificationFailure: Error | null = null;
 
   const messageService = {
     async handleMessage(
@@ -81,12 +91,14 @@ function makeRuntime(): MockRuntimeHandle {
   const notificationService = {
     async notify(input: Record<string, unknown>) {
       notifyCalls.push(input);
+      if (notificationFailure) throw notificationFailure;
     },
   };
   let dispatchResult: {
     ok: boolean;
     executionId?: string;
     error?: string;
+    dedup?: boolean;
   } = { ok: true, executionId: "exec-1" };
   let workflowServicePresent = true;
 
@@ -94,7 +106,7 @@ function makeRuntime(): MockRuntimeHandle {
     async execute(
       workflowId: string,
       payload?: Record<string, unknown>,
-      options?: { idempotencyKey?: string },
+      options?: { idempotencyKey?: string; scheduleNodeId?: string },
     ) {
       dispatchCalls.push({ workflowId, payload, options });
       return dispatchResult;
@@ -119,6 +131,11 @@ function makeRuntime(): MockRuntimeHandle {
       if (name === ServiceType.NOTIFICATION) return notificationService;
       return null;
     },
+    reportError: vi.fn(
+      (scope: string, error: unknown, context?: Record<string, unknown>) => {
+        reportedErrors.push({ scope, error, context });
+      },
+    ),
     deleteTask: vi.fn(async (id: UUID) => {
       deletedTaskIds.push(id);
     }),
@@ -135,11 +152,15 @@ function makeRuntime(): MockRuntimeHandle {
     updatedTasks,
     warnings,
     notifyCalls,
+    reportedErrors,
     setDispatchResult: (result) => {
       dispatchResult = result;
     },
     setWorkflowServicePresent: (present) => {
       workflowServicePresent = present;
+    },
+    setNotificationFailure: (error) => {
+      notificationFailure = error;
     },
   };
 }
@@ -171,6 +192,8 @@ function makeTriggerTask(
     runCount?: number;
     maxRuns?: number;
     kindOverride?: "workflow" | "prompt";
+    scheduleNodeId?: string;
+    idempotencyKey?: string;
   } = {},
 ): Task {
   const draft = makeDraft(draftOverrides);
@@ -193,6 +216,12 @@ function makeTriggerTask(
     metadata: {
       updatedAt: Date.now(),
       updateInterval: 60_000,
+      ...(options.scheduleNodeId
+        ? { scheduleNodeId: options.scheduleNodeId }
+        : {}),
+      ...(options.idempotencyKey
+        ? { idempotencyKey: options.idempotencyKey }
+        : {}),
       trigger,
     },
   } as unknown as Task;
@@ -211,7 +240,13 @@ describe("executeTriggerTask", () => {
   });
 
   it("dispatches a workflow-kind interval trigger from the scheduler", async () => {
-    const task = makeTriggerTask({ triggerType: "interval" });
+    const task = makeTriggerTask(
+      { triggerType: "interval" },
+      {
+        scheduleNodeId: "schedule-node-a",
+        idempotencyKey: "wf-1:schedule-node-a:initial",
+      },
+    );
     const before = readTriggerConfig(task);
     expect(before?.runCount).toBe(0);
 
@@ -224,6 +259,10 @@ describe("executeTriggerTask", () => {
     expect(result.executionId).toBe("exec-1");
     expect(handle.dispatchCalls).toHaveLength(1);
     expect(handle.dispatchCalls[0]?.workflowId).toBe("wf-1");
+    expect(handle.dispatchCalls[0]?.options).toEqual({
+      idempotencyKey: "wf-1:schedule-node-a:initial",
+      scheduleNodeId: "schedule-node-a",
+    });
 
     // runCount incremented on the persisted metadata.
     expect(handle.updatedTasks).toHaveLength(1);
@@ -233,6 +272,46 @@ describe("executeTriggerTask", () => {
     } as Task);
     expect(persisted?.runCount).toBe(1);
     expect(persisted?.lastStatus).toBe("success");
+    const persistedMetadata = handle.updatedTasks[0]?.patch.metadata as
+      | Record<string, unknown>
+      | undefined;
+    const nextRunAtMs = persisted?.nextRunAtMs;
+    expect(persistedMetadata?.scheduleNodeId).toBe("schedule-node-a");
+    expect(persistedMetadata?.idempotencyKey).toBe(
+      `wf-1:schedule-node-a:${Math.floor((nextRunAtMs ?? 0) / 60_000)}`,
+    );
+  });
+
+  it("records an accepted duplicate delivery as skipped without a second completion notice", async () => {
+    handle.setDispatchResult({
+      ok: true,
+      executionId: "existing-execution",
+      dedup: true,
+    });
+    const task = makeTriggerTask(
+      { triggerType: "interval" },
+      {
+        scheduleNodeId: "schedule-node-a",
+        idempotencyKey: "wf-1:schedule-node-a:initial",
+      },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result).toMatchObject({
+      status: "skipped",
+      executionId: "existing-execution",
+      taskDeleted: false,
+    });
+    expect(handle.notifyCalls).toHaveLength(0);
+    const persisted = readTriggerConfig({
+      ...task,
+      metadata: handle.updatedTasks[0]?.patch.metadata,
+    } as Task);
+    expect(persisted?.lastStatus).toBe("skipped");
+    expect(persisted?.runCount).toBe(1);
   });
 
   it("emits a low-priority completion notification on a successful run (#10697)", async () => {
@@ -272,6 +351,23 @@ describe("executeTriggerTask", () => {
     expect(notif.category).toBe("workflow");
     expect(notif.priority).toBe("high");
     expect(notif.groupKey).toBe(`trigger:${task.id}`);
+  });
+
+  it("reports notification delivery failure without changing a successful workflow run", async () => {
+    handle.setNotificationFailure(new Error("notification rail unavailable"));
+    const task = makeTriggerTask({ triggerType: "interval" });
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result.status).toBe("success");
+    await vi.waitFor(() => expect(handle.reportedErrors).toHaveLength(1));
+    expect(handle.reportedErrors[0]).toMatchObject({
+      scope: "TriggerRuntime.successNotification",
+      context: { taskId: task.id },
+    });
+    expect(handle.warnings).toHaveLength(1);
   });
 
   it("dispatches a workflow-kind cron trigger and recomputes the next schedule", async () => {

@@ -1,7 +1,7 @@
 /**
- * Conversation-context helpers for workflow actions. Ownership tag names carry
- * both user and agent identities so they remain tenant-safe even when a client
- * points at a shared workflow backend that is not the embedded store.
+ * Conversation-context helpers for workflow actions. Ownership tags encode the
+ * complete immutable owner and agent identities so renames and shared-backend
+ * tenants cannot change or collide with authorization state.
  */
 import {
   type IAgentRuntime,
@@ -9,7 +9,6 @@ import {
   resolveCanonicalOwnerId,
   type State,
   stringToUuid,
-  type UUID,
 } from '@elizaos/core';
 
 /**
@@ -41,12 +40,23 @@ export function buildConversationContext(message: Memory, state: State | undefin
 }
 
 export async function getUserTagName(runtime: IAgentRuntime, userId: string): Promise<string> {
-  const entity = await runtime.getEntityById(userId as UUID);
-  const shortId = userId.replace(/-/g, '').slice(0, 8);
+  const ownerScopeId = stringToUuid(userId.trim()).replace(/-/g, '');
+  const agentScopeId = stringToUuid(runtime.agentId).replace(/-/g, '');
+  return `eliza_owner_${ownerScopeId}_agent_${agentScopeId}`;
+}
+
+/**
+ * Detects the previous display-name + truncated-owner tag shape for this exact
+ * agent and owner candidate. A match is migration evidence only: the truncated
+ * owner segment is never sufficient authorization to read a workflow.
+ */
+export function isPotentialLegacyUserTag(
+  runtime: IAgentRuntime,
+  userId: string,
+  tagName: string
+): boolean {
+  const ownerPrefix = userId.trim().replace(/-/g, '').slice(0, 8);
   const agentScopeId = runtime.agentId.replace(/-/g, '');
-  const name = entity?.names?.[0];
-  // ElizaOS default name is "User" + UUID — not useful for a tag
-  const isRealName = name && !name.includes(userId.slice(0, 8));
-  const userTag = isRealName ? `${name}_${shortId}` : `user_${shortId}`;
-  return `${userTag}_agent_${agentScopeId}`;
+  if (!ownerPrefix || !agentScopeId) return false;
+  return tagName.endsWith(`_${ownerPrefix}_agent_${agentScopeId}`);
 }

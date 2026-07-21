@@ -1,8 +1,8 @@
 /**
  * Exercises workflow crash recovery with real PGlite persistence and the real
- * Smithers worker. The first worker is killed after an HTTP side effect is
- * durable; a fresh service instance must finish the same execution without
- * issuing that HTTP request again.
+ * Smithers worker. Stopping the owning service after an HTTP side effect is
+ * durable must cancel its worker, release the execution lease, and let a fresh
+ * service finish the same execution without issuing that side effect again.
  */
 import { expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -11,15 +11,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { stringToUuid } from '@elizaos/core';
+import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import * as dbSchema from '../../src/db/schema';
-import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
 import {
-  resolveSmithersDbPath,
-  runWorkflowWithSmithers,
-  type SmithersExecutionPlan,
-} from '../../src/services/smithers-runtime';
-import type { WorkflowDefinition, WorkflowExecution } from '../../src/types/index';
+  __setWorkflowHttpTransportForTests,
+  EmbeddedWorkflowService,
+} from '../../src/services/embedded-workflow-service';
+import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
+import type { WorkflowExecution } from '../../src/types/index';
+
+async function waitForCondition(predicate: () => boolean, description: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
 
 async function waitForFinishedExecution(
   service: EmbeddedWorkflowService,
@@ -48,7 +57,15 @@ test('startup resumes a killed execution without duplicating its persisted side 
   } as never;
   const server = createServer();
   let sideEffectCalls = 0;
-  server.on('request', (_request, response) => {
+  let holdCalls = 0;
+  server.on('request', (request, response) => {
+    if (request.url === '/hold') {
+      holdCalls += 1;
+      if (holdCalls === 1) return;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ resumed: true }));
+      return;
+    }
     sideEffectCalls += 1;
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ created: sideEffectCalls }));
@@ -58,14 +75,19 @@ test('startup resumes a killed execution without duplicating its persisted side 
   if (!address || typeof address === 'string') throw new Error('test server did not bind');
 
   const workflowId = `crash-recovery-${crypto.randomUUID()}`;
-  const executionId = `execution-${crypto.randomUUID()}`;
   const smithersDbPath = resolveSmithersDbPath(agentId, workflowId);
   let firstService: EmbeddedWorkflowService | undefined;
   let recoveredService: EmbeddedWorkflowService | undefined;
 
   try {
+    // The production policy rejects loopback. This real local-server harness
+    // opts into private-network access through the guarded transport seam.
+    __setWorkflowHttpTransportForTests(runtime, {
+      fetchImpl: globalThis.fetch,
+      policy: { allowPrivateNetwork: true },
+    });
     firstService = await EmbeddedWorkflowService.start(runtime);
-    const created = await firstService.createWorkflow({
+    await firstService.createWorkflow({
       id: workflowId,
       name: 'Crash recovery',
       nodes: [
@@ -90,11 +112,22 @@ test('startup resumes a killed execution without duplicating its persisted side 
           },
         },
         {
+          id: 'hold',
+          name: 'Hold Until Restart',
+          type: 'workflows-nodes-base.httpRequest',
+          typeVersion: 4.2,
+          position: [400, 0],
+          parameters: {
+            method: 'GET',
+            url: `http://127.0.0.1:${address.port}/hold`,
+          },
+        },
+        {
           id: 'finish',
           name: 'Finish',
           type: 'workflows-nodes-base.set',
           typeVersion: 3.4,
-          position: [400, 0],
+          position: [600, 0],
           parameters: {
             assignments: { assignments: [{ name: 'finished', value: true }] },
           },
@@ -105,76 +138,47 @@ test('startup resumes a killed execution without duplicating its persisted side 
           main: [[{ node: 'Create Once', type: 'main', index: 0 }]],
         },
         'Create Once': {
+          main: [[{ node: 'Hold Until Restart', type: 'main', index: 0 }]],
+        },
+        'Hold Until Restart': {
           main: [[{ node: 'Finish', type: 'main', index: 0 }]],
         },
       },
     });
-    const workflow = created as WorkflowDefinition;
-    const pending: WorkflowExecution = {
-      id: executionId,
-      workflowId,
-      mode: 'manual',
-      status: 'running',
-      finished: false,
-      startedAt: new Date().toISOString(),
-      customData: {
-        smithersResumeState: { version: 1, workflow },
-      },
-    };
-    await db.insert(dbSchema.embeddedExecutions).values({
-      agentId,
-      id: executionId,
-      workflowId,
-      status: 'running',
-      mode: 'manual',
-      finished: false,
-      startedAt: pending.startedAt,
-      stoppedAt: null,
-      execution: pending,
-      idempotencyKey: null,
-    });
 
-    const plan: SmithersExecutionPlan = {
-      enabledNodes: workflow.nodes,
-      startNodes: ['Manual Trigger'],
-      incoming: {
-        'Create Once': [
-          { source: 'Manual Trigger', sourceOutputIndex: 0, destinationInputIndex: 0 },
-        ],
-        Finish: [{ source: 'Create Once', sourceOutputIndex: 0, destinationInputIndex: 0 }],
-      },
-    };
-    const controller = new AbortController();
-    await expect(
-      runWorkflowWithSmithers({
-        tenantId: agentId,
-        workflow,
-        executionId,
-        pending,
-        mode: 'manual',
-        plan,
-        signal: controller.signal,
-        runNode: async (node, _inputData, signal) => {
-          if (node.name === 'Manual Trigger') return [[{ json: { started: true } }]];
-          if (node.name === 'Create Once') {
-            const response = await fetch(`http://127.0.0.1:${address.port}/side-effect`, {
-              method: 'POST',
-              signal,
-            });
-            return [[{ json: (await response.json()) as Record<string, unknown> }]];
-          }
-          return new Promise((_resolve, reject) => {
-            const onAbort = (): void => reject(signal.reason ?? new Error('aborted'));
-            if (signal.aborted) onAbort();
-            else signal.addEventListener('abort', onAbort, { once: true });
-            queueMicrotask(() => controller.abort());
-          });
-        },
-      })
-    ).rejects.toMatchObject({ code: 'SMITHERS_WORKFLOW_ABORTED' });
+    const interruptedRun = firstService.executeWorkflow(workflowId).then(
+      (execution) => ({ execution }),
+      (error: unknown) => ({ error })
+    );
+    await waitForCondition(() => holdCalls === 1, 'the post-side-effect node to start');
+    const inFlight = (await firstService.listExecutions({ workflowId })).data[0];
+    if (!inFlight) throw new Error('in-flight workflow execution was not persisted');
+    const executionId = inFlight.id;
     expect(sideEffectCalls).toBe(1);
 
     await firstService.stop();
+    const interrupted = await interruptedRun;
+    expect('error' in interrupted).toBe(true);
+    if (!('error' in interrupted)) throw new Error('workflow unexpectedly completed during stop');
+    expect(interrupted.error).toMatchObject({ code: 'SMITHERS_WORKFLOW_ABORTED' });
+
+    const releasedRows = await db
+      .select()
+      .from(dbSchema.embeddedExecutions)
+      .where(eq(dbSchema.embeddedExecutions.id, executionId));
+    expect(releasedRows[0]).toMatchObject({
+      status: 'running',
+      finished: false,
+      executionOwnerId: null,
+    });
+    const executionCountAfterStop = (await firstService.listExecutions({ workflowId })).data.length;
+    await expect(firstService.executeWorkflow(workflowId)).rejects.toMatchObject({
+      code: 'WORKFLOW_SERVICE_STOPPED',
+    });
+    expect((await firstService.listExecutions({ workflowId })).data).toHaveLength(
+      executionCountAfterStop
+    );
+
     recoveredService = await EmbeddedWorkflowService.start(runtime);
     const recovered = await waitForFinishedExecution(recoveredService, executionId);
 
@@ -185,18 +189,21 @@ test('startup resumes a killed execution without duplicating its persisted side 
       finished: true,
     });
     expect(sideEffectCalls).toBe(1);
+    expect(holdCalls).toBe(2);
     expect(Object.keys(recovered.data?.resultData?.runData ?? {}).sort()).toEqual([
       'Create Once',
       'Finish',
+      'Hold Until Restart',
       'Manual Trigger',
     ]);
     expect(recovered.data?.resultData?.engine).toMatchObject({
       provider: 'smithers',
-      nodes: 3,
-      started: 3,
-      finished: 3,
+      nodes: 4,
+      started: 4,
+      finished: 4,
     });
   } finally {
+    __setWorkflowHttpTransportForTests(runtime, undefined);
     await recoveredService?.stop();
     await firstService?.stop();
     server.closeAllConnections?.();

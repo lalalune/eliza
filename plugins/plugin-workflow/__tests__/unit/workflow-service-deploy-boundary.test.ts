@@ -10,6 +10,7 @@ import { WorkflowApiError, type WorkflowDefinition } from '../../src/types/index
 import { getLocalOwnerEntityId, getUserTagName } from '../../src/utils/context';
 
 const USER_ID = '00000000-0000-4000-8000-000000000002';
+const COLLIDING_USER_ID = '00000000-0000-4000-8000-000000000003';
 
 function workflow(id?: string): WorkflowDefinition {
   return {
@@ -108,6 +109,177 @@ async function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('WorkflowService deployment boundary', () => {
+  test('coalesces omitted and explicit default throw behavior for the same manual run', async () => {
+    let releaseFirstRun: (() => void) | undefined;
+    let invocation = 0;
+    const executeWorkflow = mock(async (workflowId: string) => {
+      invocation += 1;
+      const executionId = `execution-${invocation}`;
+      if (invocation === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstRun = resolve;
+        });
+      }
+      return {
+        id: executionId,
+        workflowId,
+        mode: 'manual' as const,
+        status: 'success' as const,
+        finished: true,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        stoppedAt: '2026-01-01T00:00:01.000Z',
+      };
+    });
+    const { service } = await harness({ executeWorkflow });
+
+    const first = service.runWorkflow('workflow-owned', undefined, USER_ID);
+    const duplicate = service.runWorkflow('workflow-owned', { throwOnError: true }, USER_ID);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    releaseFirstRun?.();
+    const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
+    expect(duplicateResult.id).toBe(firstResult.id);
+
+    const next = await service.runWorkflow('workflow-owned', undefined, USER_ID);
+    expect(next.id).toBe('execution-2');
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
+  });
+
+  test('keeps concurrent manual runs with distinct semantic inputs independent', async () => {
+    let releaseFirstRun: (() => void) | undefined;
+    let invocation = 0;
+    const executeWorkflow = mock(async (workflowId: string) => {
+      invocation += 1;
+      const executionId = `execution-${invocation}`;
+      if (invocation === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstRun = resolve;
+        });
+      }
+      return {
+        id: executionId,
+        workflowId,
+        mode: 'manual' as const,
+        status: 'success' as const,
+        finished: true,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        stoppedAt: '2026-01-01T00:00:01.000Z',
+      };
+    });
+    const { service } = await harness({ executeWorkflow });
+    const base = {
+      triggerData: { source: 'chat' },
+      idempotencyKey: 'request-1',
+      throwOnError: false,
+    };
+
+    const runs = [
+      service.runWorkflow('workflow-owned', base, USER_ID),
+      service.runWorkflow('workflow-owned', { ...base, triggerData: { source: 'ui' } }, USER_ID),
+      service.runWorkflow('workflow-owned', { ...base, idempotencyKey: 'request-2' }, USER_ID),
+      service.runWorkflow('workflow-owned', { ...base, throwOnError: true }, USER_ID),
+    ];
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(4);
+    releaseFirstRun?.();
+    const results = await Promise.all(runs);
+    expect(new Set(results.map((result) => result.id)).size).toBe(4);
+  });
+
+  test('coalesces trigger data whose object keys have equivalent meaning', async () => {
+    let releaseFirstRun: (() => void) | undefined;
+    const executeWorkflow = mock(async (workflowId: string) => {
+      await new Promise<void>((resolve) => {
+        releaseFirstRun = resolve;
+      });
+      return {
+        id: 'execution-1',
+        workflowId,
+        mode: 'manual' as const,
+        status: 'success' as const,
+        finished: true,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        stoppedAt: '2026-01-01T00:00:01.000Z',
+      };
+    });
+    const { service } = await harness({ executeWorkflow });
+
+    const first = service.runWorkflow(
+      'workflow-owned',
+      { triggerData: { source: 'chat', payload: { first: 1, second: 2 } } },
+      USER_ID
+    );
+    const equivalent = service.runWorkflow(
+      'workflow-owned',
+      { triggerData: { payload: { second: 2, first: 1 }, source: 'chat' } },
+      USER_ID
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    releaseFirstRun?.();
+    const [firstResult, equivalentResult] = await Promise.all([first, equivalent]);
+    expect(equivalentResult.id).toBe(firstResult.id);
+  });
+
+  test('does not coalesce concurrent manual runs across owner scopes', async () => {
+    let releaseLocalRun: (() => void) | undefined;
+    let invocation = 0;
+    const executeWorkflow = mock(async (workflowId: string) => {
+      invocation += 1;
+      const executionId = `execution-${invocation}`;
+      if (invocation === 1) {
+        await new Promise<void>((resolve) => {
+          releaseLocalRun = resolve;
+        });
+      }
+      return {
+        id: executionId,
+        workflowId,
+        mode: 'manual' as const,
+        status: 'success' as const,
+        finished: true,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        stoppedAt: '2026-01-01T00:00:01.000Z',
+      };
+    });
+    const { service } = await harness({ executeWorkflow });
+
+    const localOwnerRun = service.runWorkflow('workflow-owned');
+    const explicitOwnerRun = service.runWorkflow('workflow-owned', undefined, USER_ID);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
+    releaseLocalRun?.();
+    const [localResult, explicitResult] = await Promise.all([localOwnerRun, explicitOwnerRun]);
+    expect(localResult.id).not.toBe(explicitResult.id);
+  });
+
+  test('clears a failed manual run so an explicit retry can execute', async () => {
+    const executeWorkflow = mock()
+      .mockRejectedValueOnce(new Error('Smithers unavailable'))
+      .mockResolvedValueOnce({
+        id: 'execution-retry',
+        workflowId: 'workflow-owned',
+        mode: 'manual' as const,
+        status: 'success' as const,
+        finished: true,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        stoppedAt: '2026-01-01T00:00:01.000Z',
+      });
+    const { service } = await harness({ executeWorkflow });
+
+    await expect(service.runWorkflow('workflow-owned', undefined, USER_ID)).rejects.toThrow(
+      'Smithers unavailable'
+    );
+    const retried = await service.runWorkflow('workflow-owned', undefined, USER_ID);
+
+    expect(retried.id).toBe('execution-retry');
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
+  });
+
   test('shows only the untagged fixed system default to the canonical local owner', async () => {
     const untaggedDefault = {
       ...workflow(DEVICE_HEALTH_CHECK_WORKFLOW_ID),
@@ -156,6 +328,34 @@ describe('WorkflowService deployment boundary', () => {
     const visible = await service.listWorkflows(getLocalOwnerEntityId(runtime()));
 
     expect(visible).toEqual([]);
+  });
+
+  test('fails closed without authorizing either owner candidate for a truncated legacy tag', async () => {
+    const legacyTag = {
+      id: 'tag-legacy-owner',
+      name: 'Previous Name_00000000_agent_00000000000040008000000000000001',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const legacyWorkflow = {
+      ...workflow('workflow-legacy-owner'),
+      active: false,
+      tags: [legacyTag],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      versionId: 'version-legacy-owner',
+    };
+    const { service } = await harness({
+      listTags: mock(async () => ({ data: [legacyTag] })),
+      listWorkflows: mock(async () => ({ data: [legacyWorkflow] })),
+    });
+
+    await expect(service.listWorkflows(USER_ID)).rejects.toMatchObject({
+      code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+    });
+    await expect(service.listWorkflows(COLLIDING_USER_ID)).rejects.toMatchObject({
+      code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+    });
   });
 
   test('fills an owner execution page across foreign-only backend pages', async () => {

@@ -189,6 +189,8 @@ export interface WorkflowExecution {
       error?: {
         message: string;
         stack?: string;
+        code?: string;
+        context?: Record<string, unknown>;
       };
     };
     executionData?: {

@@ -1,23 +1,15 @@
 /**
- * Exercises Cloud workflow capability responses and trusted principal forwarding.
- * External services are replaced with deterministic route-boundary fixtures.
+ * Exercises Cloud workflow capability, lifecycle routing, and tenant-boundary
+ * behavior. External control-plane services are deterministic boundary fixtures.
  */
-import {
-  afterAll,
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  mock,
-  test,
-} from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { Hono } from "hono";
 import * as authActual from "@/lib/auth";
-import * as redisFactoryActual from "@/lib/cache/redis-factory";
 import * as billingGateActual from "@/lib/services/agent-billing-gate";
 import * as elizaSandboxActual from "@/lib/services/eliza-sandbox";
 import * as provisioningJobsActual from "@/lib/services/provisioning-jobs";
 import * as workerHealthActual from "@/lib/services/provisioning-worker-health";
-import type { AppContext } from "@/types/cloud-worker-env";
+import type { AppContext, AppEnv } from "@/types/cloud-worker-env";
 
 const requireAuth = mock(async () => ({
   user: { id: "user-1", organization_id: "org-1" },
@@ -37,7 +29,20 @@ type AgentFixture = {
 const getAgent = mock<
   (_agentId: string, _organizationId: string) => Promise<AgentFixture | null>
 >(async () => ({ id: "agent-1", execution_tier: "shared" }));
-const buildRedisClient = mock((_env: unknown) => null as unknown);
+const proxyWorkflowRequest = mock<
+  (
+    agentId: string,
+    organizationId: string,
+    workflowPath: string,
+    method: "GET" | "POST" | "PUT" | "DELETE",
+    body?: BodyInit | null,
+    query?: string,
+    options?: {
+      timeoutMs?: number;
+      protocolHeaders?: HeadersInit;
+    },
+  ) => Promise<Response | null>
+>(async () => null);
 const checkAgentCreditGate = mock(async (_organizationId: string) => ({
   allowed: true,
 }));
@@ -53,16 +58,12 @@ mock.module("@/lib/auth", () => ({
   requireAuthOrApiKeyWithOrg: requireAuth,
 }));
 
-mock.module("@/lib/cache/redis-factory", () => ({
-  ...redisFactoryActual,
-  buildRedisClient,
-}));
-
 mock.module("@/lib/services/eliza-sandbox", () => ({
   ...elizaSandboxActual,
   elizaSandboxService: {
     ...elizaSandboxActual.elizaSandboxService,
     getAgent,
+    proxyWorkflowRequest,
   },
 }));
 
@@ -86,12 +87,76 @@ mock.module("@/lib/services/provisioning-worker-health", () => ({
 }));
 
 const {
+  handleWorkflowProxyOptions,
   handleWorkflowProxyRequest,
+  workflowContainerPath,
   workflowProxyTimeoutMs,
   workflowRuntimeUnavailableResponse,
 } = await import("../v1/eliza/agents/[agentId]/workflows/_shared");
+const { default: legacyWorkflowCollectionRoute } = await import(
+  "../v1/agents/[agentId]/workflows/route"
+);
+const { default: legacyWorkflowDetailRoute } = await import(
+  "../v1/agents/[agentId]/workflows/[workflowId]/route"
+);
+const { default: legacyWorkflowRunRoute } = await import(
+  "../v1/agents/[agentId]/workflows/[workflowId]/run/route"
+);
+const { default: legacyWorkflowExecutionRoute } = await import(
+  "../v1/agents/[agentId]/workflows/executions/[executionId]/route"
+);
 
-const originalFetch = globalThis.fetch;
+const legacyWorkflowApi = new Hono<AppEnv>();
+legacyWorkflowApi.route(
+  "/api/v1/agents/:agentId/workflows",
+  legacyWorkflowCollectionRoute,
+);
+legacyWorkflowApi.route(
+  "/api/v1/agents/:agentId/workflows/:workflowId/run",
+  legacyWorkflowRunRoute,
+);
+legacyWorkflowApi.route(
+  "/api/v1/agents/:agentId/workflows/executions/:executionId",
+  legacyWorkflowExecutionRoute,
+);
+legacyWorkflowApi.route(
+  "/api/v1/agents/:agentId/workflows/:workflowId",
+  legacyWorkflowDetailRoute,
+);
+
+const ALLOWLISTED_PROXY_HEADERS = {
+  accept: "application/json",
+  "accept-encoding": "identity",
+  "accept-language": "en-US",
+  baggage: "workflow=test",
+  "content-encoding": "identity",
+  "content-type": "application/json",
+  "idempotency-key": "workflow-request-1",
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  tracestate: "eliza=test",
+  "x-eliza-trace-id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "x-idempotency-key": "workflow-request-legacy-1",
+  "x-request-id": "request-1",
+} as const;
+
+const PRIVATE_PROXY_HEADERS = {
+  authorization: "Bearer cloud-access-token",
+  cookie: "session=cloud-session",
+  "proxy-authorization": "Basic cloud-proxy-secret",
+  "x-api-key": "cloud-api-key",
+  "x-eliza-organization-id": "spoofed-org",
+  "x-eliza-user-id": "spoofed-user",
+  "x-payment": "cloud-payment-proof",
+  "x-private-token": "future-cloud-credential",
+  "x-server-token": "spoofed-server-secret",
+  "x-wallet-address": "0xcaller",
+  "x-wallet-signature": "wallet-signature",
+  "x-wallet-timestamp": "1234567890",
+} as const;
+
+function credentialRichWorkflowHeaders(): HeadersInit {
+  return { ...ALLOWLISTED_PROXY_HEADERS, ...PRIVATE_PROXY_HEADERS };
+}
 
 beforeEach(() => {
   requireAuth.mockClear();
@@ -100,8 +165,8 @@ beforeEach(() => {
   checkProvisioningWorkerHealth.mockClear();
   enqueueAgentWakeOnce.mockClear();
   triggerImmediate.mockClear();
-  buildRedisClient.mockReset();
-  buildRedisClient.mockImplementation(() => null as unknown);
+  proxyWorkflowRequest.mockReset();
+  proxyWorkflowRequest.mockImplementation(async () => null);
   getAgent.mockImplementation(async () => ({
     id: "agent-1",
     execution_tier: "shared" as const,
@@ -115,13 +180,8 @@ beforeEach(() => {
   triggerImmediate.mockImplementation(async () => undefined);
 });
 
-afterEach(() => {
-  globalThis.fetch = originalFetch;
-});
-
 afterAll(() => {
   mock.module("@/lib/auth", () => authActual);
-  mock.module("@/lib/cache/redis-factory", () => redisFactoryActual);
   mock.module("@/lib/services/agent-billing-gate", () => billingGateActual);
   mock.module("@/lib/services/eliza-sandbox", () => elizaSandboxActual);
   mock.module("@/lib/services/provisioning-jobs", () => provisioningJobsActual);
@@ -142,22 +202,20 @@ function workflowRequest(headers?: HeadersInit): Request {
   );
 }
 
-function installLiveRedisAssignment() {
-  const redisGet = mock(async (key: string) => {
-    if (key === "agent:agent-1:server") return "server-1";
-    if (key === "server:server-1:url") return "https://agent-server.test";
-    return null;
-  });
-  buildRedisClient.mockImplementation(() => ({ get: redisGet }) as unknown);
-  return redisGet;
+async function legacyWorkflowRequest(
+  path: string,
+  init?: RequestInit,
+  env: Record<string, unknown> = {},
+): Promise<Response> {
+  return await legacyWorkflowApi.request(
+    `https://api.example.test${path}`,
+    init,
+    env,
+  );
 }
 
 describe("workflow capability responses", () => {
   test("returns an explicit, non-automatic upgrade path for shared agents", async () => {
-    const redisGet = installLiveRedisAssignment();
-    const fetchRequest = mock(async () => Response.json({ ok: true }));
-    globalThis.fetch = fetchRequest as unknown as typeof fetch;
-
     const response = await handleWorkflowProxyRequest(
       workflowRequest(),
       "agent-1",
@@ -182,9 +240,7 @@ describe("workflow capability responses", () => {
         endpoint: "/api/v1/eliza/agents/agent-1/upgrade-tier",
       },
     });
-    expect(buildRedisClient).not.toHaveBeenCalled();
-    expect(redisGet).not.toHaveBeenCalled();
-    expect(fetchRequest).not.toHaveBeenCalled();
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
   });
 
   test("distinguishes a dedicated runtime outage from an upgrade requirement", async () => {
@@ -259,15 +315,11 @@ describe("workflow capability responses", () => {
       bridge_url: "https://stale-bridge.example.test",
       health_url: "https://stale-health.example.test",
     }));
-    const redisGet = installLiveRedisAssignment();
-    const fetchRequest = mock(async () => Response.json({ ok: true }));
-    globalThis.fetch = fetchRequest as unknown as typeof fetch;
-
     const response = await handleWorkflowProxyRequest(
       workflowRequest(),
       "agent-1",
       "",
-      context({ AGENT_SERVER_SHARED_SECRET: "server-secret" }),
+      context(),
     );
 
     expect(response.status).toBe(503);
@@ -278,9 +330,7 @@ describe("workflow capability responses", () => {
     });
     expect(checkAgentCreditGate).toHaveBeenCalledWith("org-1");
     expect(enqueueAgentWakeOnce).toHaveBeenCalledTimes(1);
-    expect(buildRedisClient).not.toHaveBeenCalled();
-    expect(redisGet).not.toHaveBeenCalled();
-    expect(fetchRequest).not.toHaveBeenCalled();
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
   });
 
   test("does not let a stale sleeping assignment bypass the credit gate", async () => {
@@ -296,10 +346,6 @@ describe("workflow capability responses", () => {
       balance: 0,
       error: "Insufficient credits",
     }));
-    const redisGet = installLiveRedisAssignment();
-    const fetchRequest = mock(async () => Response.json({ ok: true }));
-    globalThis.fetch = fetchRequest as unknown as typeof fetch;
-
     const response = await handleWorkflowProxyRequest(
       workflowRequest(),
       "agent-1",
@@ -315,9 +361,38 @@ describe("workflow capability responses", () => {
     });
     expect(enqueueAgentWakeOnce).not.toHaveBeenCalled();
     expect(triggerImmediate).not.toHaveBeenCalled();
-    expect(buildRedisClient).not.toHaveBeenCalled();
-    expect(redisGet).not.toHaveBeenCalled();
-    expect(fetchRequest).not.toHaveBeenCalled();
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "error",
+    "provisioning",
+    "pending",
+    "deletion_pending",
+    "deletion_failed",
+  ])("does not wake a dedicated-lazy runtime in %s state", async (status) => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-lazy" as const,
+      status,
+      bridge_url: null,
+      health_url: null,
+    }));
+
+    const response = await handleWorkflowProxyRequest(
+      workflowRequest(),
+      "agent-1",
+      "",
+      context(),
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      code: "workflow_runtime_unavailable",
+      currentExecutionTier: "dedicated-lazy",
+    });
+    expect(checkAgentCreditGate).not.toHaveBeenCalled();
+    expect(enqueueAgentWakeOnce).not.toHaveBeenCalled();
   });
 
   test("encodes agent IDs in the upgrade endpoint", async () => {
@@ -344,60 +419,328 @@ describe("workflow proxy timeout budgets", () => {
     expect(workflowProxyTimeoutMs("POST", "workflow-1/activate")).toBe(120_000);
     expect(workflowProxyTimeoutMs("GET", "workflow-1/run")).toBe(120_000);
   });
+
+  test("translates an upstream deadline into a retryable 504", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    proxyWorkflowRequest.mockImplementation(async () => {
+      throw new DOMException("The operation timed out", "TimeoutError");
+    });
+
+    const response = await handleWorkflowProxyRequest(
+      new Request(
+        "https://api.example.test/api/v1/eliza/agents/agent-1/workflows/workflow-1/run",
+        {
+          method: "POST",
+          headers: { origin: "https://localhost" },
+        },
+      ),
+      "agent-1",
+      "workflow-1/run",
+      context(),
+    );
+
+    expect(response.status).toBe(504);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      success: false,
+      code: "agent_timeout",
+      error:
+        "Agent did not start responding in time. The workflow may still be processing; retry shortly.",
+      retryable: true,
+    });
+    expect(response.headers.get("Retry-After")).toBe("5");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://localhost",
+    );
+    expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
+      "true",
+    );
+    expect(response.headers.get("Vary")).toBe("Origin");
+  });
+
+  test("reflects a trusted app origin on workflow preflight", () => {
+    const response = handleWorkflowProxyOptions("https://localhost");
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://localhost",
+    );
+    expect(response.headers.get("Access-Control-Allow-Credentials")).toBe(
+      "true",
+    );
+    expect(response.headers.get("Vary")).toBe("Origin");
+  });
 });
 
-describe("workflow principal forwarding", () => {
-  test("overwrites caller identity headers with the authenticated principal", async () => {
+describe("legacy Cloud SDK workflow routes", () => {
+  test.each([
+    ["GET", "/api/v1/agents/agent-1/workflows"],
+    ["POST", "/api/v1/agents/agent-1/workflows"],
+    ["GET", "/api/v1/agents/agent-1/workflows/workflow-1"],
+    ["PUT", "/api/v1/agents/agent-1/workflows/workflow-1"],
+    ["DELETE", "/api/v1/agents/agent-1/workflows/workflow-1"],
+    ["POST", "/api/v1/agents/agent-1/workflows/workflow-1/run"],
+    ["GET", "/api/v1/agents/agent-1/workflows/executions/execution-1"],
+  ])("%s %s uses the canonical shared-tier capability response", async (method, path) => {
+    const response = await legacyWorkflowRequest(path, { method });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "workflow_requires_dedicated",
+      capability: "workflows",
+      upgradeRequired: true,
+    });
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
+  });
+
+  test("preserves trusted app-origin CORS on legacy preflight and responses", async () => {
+    const origin = "https://localhost";
+    const preflight = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows",
+      { method: "OPTIONS", headers: { origin } },
+    );
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows",
+      { headers: { origin } },
+    );
+
+    for (const result of [preflight, response]) {
+      expect(result.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+      expect(result.headers.get("Access-Control-Allow-Credentials")).toBe(
+        "true",
+      );
+      expect(result.headers.get("Vary")).toBe("Origin");
+    }
+    expect(preflight.status).toBe(204);
+    expect(response.status).toBe(409);
+  });
+
+  test("keeps legacy requests inside the authenticated organization", async () => {
+    getAgent.mockImplementation(async () => null);
+
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/foreign-agent/workflows",
+      { headers: { origin: "https://localhost" } },
+    );
+
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      success: false,
+      error: "Agent not found",
+    });
+    expect(getAgent).toHaveBeenCalledWith("foreign-agent", "org-1");
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://localhost",
+    );
+  });
+
+  test("rejects invalid workflow path segments before runtime lookup", async () => {
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows/workflow.with.dots",
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      success: false,
+      code: "invalid_workflow_path",
+      error: "Invalid agent or workflow path.",
+    });
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
+  });
+
+  test("credit-gates sleeping runtimes before a legacy SDK request can wake them", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-lazy" as const,
+      status: "sleeping",
+      bridge_url: null,
+      health_url: null,
+    }));
+    checkAgentCreditGate.mockImplementation(async () => ({
+      allowed: false,
+      balance: 0,
+      error: "Insufficient credits",
+    }));
+
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows",
+    );
+
+    expect(response.status).toBe(402);
+    expect(await response.json()).toMatchObject({
+      code: "insufficient_credits",
+      currentBalance: 0,
+    });
+    expect(enqueueAgentWakeOnce).not.toHaveBeenCalled();
+  });
+
+  test("forwards a run to the canonical container with the long-run deadline", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    proxyWorkflowRequest.mockImplementation(async () =>
+      Response.json({ execution: { id: "execution-1" } }),
+    );
+
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows/workflow-1/run",
+      {
+        method: "POST",
+        headers: credentialRichWorkflowHeaders(),
+        body: JSON.stringify({ triggerData: { source: "sdk" } }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const call = proxyWorkflowRequest.mock.calls[0];
+    expect(call?.slice(0, 4)).toEqual([
+      "agent-1",
+      "org-1",
+      "workflows/workflow-1/run",
+      "POST",
+    ]);
+    expect(
+      JSON.parse(new TextDecoder().decode(call?.[4] as ArrayBuffer)),
+    ).toEqual({
+      triggerData: { source: "sdk" },
+    });
+    expect(call?.[5]).toBe("");
+    expect(call?.[6]?.timeoutMs).toBe(10 * 60_000);
+  });
+
+  test("returns the canonical retryable timeout contract for a legacy run", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    proxyWorkflowRequest.mockImplementation(async () => {
+      throw new DOMException("The operation timed out", "TimeoutError");
+    });
+
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows/workflow-1/run",
+      {
+        method: "POST",
+        headers: { origin: "https://localhost" },
+      },
+    );
+
+    expect(response.status).toBe(504);
+    expect(response.headers.get("Retry-After")).toBe("5");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://localhost",
+    );
+    expect(await response.json()).toMatchObject({
+      success: false,
+      code: "agent_timeout",
+      retryable: true,
+    });
+  });
+
+  test("maps legacy execution lookup to the container execution route", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    proxyWorkflowRequest.mockImplementation(async () =>
+      Response.json({ execution: { id: "execution-1" } }),
+    );
+
+    const response = await legacyWorkflowRequest(
+      "/api/v1/agents/agent-1/workflows/executions/execution-1?include=output",
+    );
+
+    expect(response.status).toBe(200);
+    expect(proxyWorkflowRequest.mock.calls[0]?.slice(0, 6)).toEqual([
+      "agent-1",
+      "org-1",
+      "executions/execution-1",
+      "GET",
+      undefined,
+      "include=output",
+    ]);
+  });
+});
+
+describe("workflow dedicated-container routing", () => {
+  test.each([
+    ["", "workflows"],
+    ["status", "status"],
+    ["runtime/start", "runtime/start"],
+    ["generate", "workflows/generate"],
+    ["resolve-clarification", "workflows/resolve-clarification"],
+    ["workflow-1", "workflows/workflow-1"],
+    ["workflow-1/activate", "workflows/workflow-1/activate"],
+    ["workflow-1/deactivate", "workflows/workflow-1/deactivate"],
+    ["workflow-1/run", "workflows/workflow-1/run"],
+    ["workflow-1/executions", "workflows/workflow-1/executions"],
+    [
+      "workflow-1/evaluation-samples",
+      "workflows/workflow-1/evaluation-samples",
+    ],
+    ["workflow-1/revisions", "workflows/workflow-1/revisions"],
+    [
+      "workflow-1/revisions/version-1/restore",
+      "workflows/workflow-1/revisions/version-1/restore",
+    ],
+    ["executions/execution-1", "executions/execution-1"],
+  ])("maps Cloud suffix %s to plugin route %s", (suffix, expected) => {
+    expect(workflowContainerPath(suffix)).toBe(expected);
+  });
+
+  test("passes request bytes and protocol metadata to the sandbox boundary", async () => {
     getAgent.mockImplementation(async () => ({
       id: "agent-1",
       execution_tier: "dedicated-always" as const,
     }));
-    const redisGet = mock(async (key: string) => {
-      if (key === "agent:agent-1:server") return "server-1";
-      if (key === "server:server-1:url") return "https://agent-server.test";
-      return null;
-    });
-    buildRedisClient.mockImplementation(() => ({ get: redisGet }) as unknown);
-    const fetchRequest = mock(
-      async (_input: RequestInfo | URL, _init?: RequestInit) =>
-        Response.json({ ok: true }),
+    proxyWorkflowRequest.mockImplementation(async () =>
+      Response.json({ ok: true }),
     );
-    globalThis.fetch = fetchRequest as unknown as typeof fetch;
 
     const response = await handleWorkflowProxyRequest(
       new Request(
         "https://api.example.test/api/v1/eliza/agents/agent-1/workflows/resolve-clarification",
         {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-eliza-user-id": "spoofed-user",
-            "x-eliza-organization-id": "spoofed-org",
-          },
+          headers: credentialRichWorkflowHeaders(),
           body: JSON.stringify({ draft: {}, resolutions: [] }),
         },
       ),
       "agent-1",
       "resolve-clarification",
-      context({ AGENT_SERVER_SHARED_SECRET: "server-secret" }),
+      context(),
     );
 
     expect(response.status).toBe(200);
-    expect(fetchRequest).toHaveBeenCalledTimes(1);
-    const call = fetchRequest.mock.calls as unknown as Array<
-      [RequestInfo | URL, RequestInit]
-    >;
-    expect(String(call[0]?.[0])).toBe(
-      "https://agent-server.test/agents/agent-1/workflows/resolve-clarification",
-    );
-    expect(call[0]?.[1].method).toBe("POST");
+    const call = proxyWorkflowRequest.mock.calls[0];
+    expect(call?.slice(0, 4)).toEqual([
+      "agent-1",
+      "org-1",
+      "workflows/resolve-clarification",
+      "POST",
+    ]);
     expect(
-      JSON.parse(new TextDecoder().decode(call[0]?.[1].body as ArrayBuffer)),
-    ).toEqual({ draft: {}, resolutions: [] });
-    const forwardedHeaders = new Headers(call[0]?.[1].headers);
-    expect(forwardedHeaders.get("x-server-token")).toBe("server-secret");
-    expect(forwardedHeaders.get("x-eliza-user-id")).toBe("user-1");
-    expect(forwardedHeaders.get("x-eliza-organization-id")).toBe("org-1");
+      JSON.parse(new TextDecoder().decode(call?.[4] as ArrayBuffer)),
+    ).toEqual({
+      draft: {},
+      resolutions: [],
+    });
+    expect(call?.[6]?.timeoutMs).toBe(5 * 60_000);
+    expect(new Headers(call?.[6]?.protocolHeaders).get("x-eliza-user-id")).toBe(
+      "spoofed-user",
+    );
   });
 
   test("forwards the evaluation-samples suffix and query without a body", async () => {
@@ -405,17 +748,9 @@ describe("workflow principal forwarding", () => {
       id: "agent-1",
       execution_tier: "dedicated-always" as const,
     }));
-    const redisGet = mock(async (key: string) => {
-      if (key === "agent:agent-1:server") return "server-1";
-      if (key === "server:server-1:url") return "https://agent-server.test";
-      return null;
-    });
-    buildRedisClient.mockImplementation(() => ({ get: redisGet }) as unknown);
-    const fetchRequest = mock(
-      async (_input: RequestInfo | URL, _init?: RequestInit) =>
-        Response.json({ workflowId: "workflow-1" }),
+    proxyWorkflowRequest.mockImplementation(async () =>
+      Response.json({ workflowId: "workflow-1" }),
     );
-    globalThis.fetch = fetchRequest as unknown as typeof fetch;
 
     const response = await handleWorkflowProxyRequest(
       new Request(
@@ -423,20 +758,81 @@ describe("workflow principal forwarding", () => {
       ),
       "agent-1",
       "workflow-1/evaluation-samples",
-      context({ AGENT_SERVER_SHARED_SECRET: "server-secret" }),
+      context(),
     );
 
     expect(response.status).toBe(200);
-    const call = fetchRequest.mock.calls as unknown as Array<
-      [RequestInfo | URL, RequestInit]
-    >;
-    expect(String(call[0]?.[0])).toBe(
-      "https://agent-server.test/agents/agent-1/workflows/workflow-1/evaluation-samples?limit=7",
+    expect(proxyWorkflowRequest.mock.calls[0]?.slice(0, 6)).toEqual([
+      "agent-1",
+      "org-1",
+      "workflows/workflow-1/evaluation-samples",
+      "GET",
+      undefined,
+      "limit=7",
+    ]);
+  });
+
+  test("lists and runs a chat-created workflow through the Cloud boundary", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    const chatCreatedWorkflow = {
+      id: "chat-workflow-1",
+      name: "Created in chat",
+      active: false,
+    };
+    proxyWorkflowRequest.mockImplementation(
+      async (_agentId, _organizationId, workflowPath, method) => {
+        if (workflowPath === "workflows" && method === "GET") {
+          return Response.json({ workflows: [chatCreatedWorkflow] });
+        }
+        if (
+          workflowPath === "workflows/chat-workflow-1/run" &&
+          method === "POST"
+        ) {
+          return Response.json({
+            execution: {
+              id: "execution-1",
+              workflowId: chatCreatedWorkflow.id,
+              status: "success",
+            },
+          });
+        }
+        return Response.json({ error: "unexpected route" }, { status: 404 });
+      },
     );
-    expect(call[0]?.[1].method).toBe("GET");
-    expect(call[0]?.[1].body).toBeUndefined();
-    const forwardedHeaders = new Headers(call[0]?.[1].headers);
-    expect(forwardedHeaders.get("x-eliza-user-id")).toBe("user-1");
-    expect(forwardedHeaders.get("x-eliza-organization-id")).toBe("org-1");
+
+    const listed = await handleWorkflowProxyRequest(
+      workflowRequest(),
+      "agent-1",
+      "",
+      context(),
+    );
+    expect(listed.status).toBe(200);
+    expect((await listed.json()) as Record<string, unknown>).toEqual({
+      workflows: [chatCreatedWorkflow],
+    });
+
+    const ran = await handleWorkflowProxyRequest(
+      new Request(
+        "https://api.example.test/api/v1/eliza/agents/agent-1/workflows/chat-workflow-1/run",
+        { method: "POST" },
+      ),
+      "agent-1",
+      "chat-workflow-1/run",
+      context(),
+    );
+    expect(ran.status).toBe(200);
+    expect(await ran.json()).toMatchObject({
+      execution: { workflowId: "chat-workflow-1", status: "success" },
+    });
+    expect(
+      proxyWorkflowRequest.mock.calls.map((call) => call.slice(0, 4)),
+    ).toEqual([
+      ["agent-1", "org-1", "workflows", "GET"],
+      ["agent-1", "org-1", "workflows/chat-workflow-1/run", "POST"],
+    ]);
   });
 });

@@ -12,7 +12,7 @@
  * EmbeddedWorkflowService; credential resolution goes through the registered
  * WorkflowCredentialStore.
  */
-import { ElizaError, type IAgentRuntime, logger, Service } from '@elizaos/core';
+import { ElizaError, type IAgentRuntime, logger, Service, stableStringify } from '@elizaos/core';
 import type {
   NodeDefinition,
   NodeSearchResult,
@@ -41,7 +41,7 @@ import {
   searchNodes,
 } from '../utils/catalog';
 import { CATALOG_CLARIFICATION_SUFFIX, isCatalogClarification } from '../utils/clarification';
-import { getLocalOwnerEntityId, getUserTagName } from '../utils/context';
+import { getLocalOwnerEntityId, getUserTagName, isPotentialLegacyUserTag } from '../utils/context';
 import { resolveCredentials } from '../utils/credentialResolver';
 import { buildWorkflowEvaluationSuite } from '../utils/evaluation-samples';
 import {
@@ -306,6 +306,7 @@ export class WorkflowService extends Service {
 
   private apiClient: WorkflowDefinitionClient | null = null;
   private serviceConfig: WorkflowServiceConfig | null = null;
+  private readonly manualRunsInFlight = new Map<string, Promise<WorkflowExecution>>();
 
   static async start(runtime: IAgentRuntime): Promise<WorkflowService> {
     logger.info({ src: 'plugin:workflow:service:main' }, 'Starting Workflow Service...');
@@ -357,6 +358,7 @@ export class WorkflowService extends Service {
     logger.info({ src: 'plugin:workflow:service:main' }, 'Stopping Workflow Service...');
     this.apiClient = null;
     this.serviceConfig = null;
+    this.manualRunsInFlight.clear();
     logger.info({ src: 'plugin:workflow:service:main' }, 'Workflow Service stopped');
   }
 
@@ -1073,6 +1075,27 @@ export class WorkflowService extends Service {
       const tagsResponse = await client.listTags();
       const userTag = tagsResponse.data.find((t) => t.name === tagName);
 
+      // Legacy tags contain only the first eight owner-id characters and a
+      // mutable display name. They are useful for detecting upgrade fallout,
+      // but treating them as ownership proof would preserve the collision bug
+      // this tag version removes. Surface an explicit migration state instead
+      // of making previously-owned workflows look like a healthy empty list.
+      const legacyTagIds = new Set(
+        tagsResponse.data
+          .filter((tag) => isPotentialLegacyUserTag(this.runtime, userId, tag.name))
+          .map((tag) => tag.id)
+      );
+      const hasLegacyWorkflow = workflowsResponse.data.some((workflow) =>
+        workflow.tags?.some((tag) => legacyTagIds.has(tag.id))
+      );
+      if (hasLegacyWorkflow) {
+        throw new ElizaError('Workflow ownership tags require an explicit migration', {
+          code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+          context: { userId, agentId: this.runtime.agentId },
+          severity: 'ephemeral',
+        });
+      }
+
       // The install-time health check predates user tags and must remain usable
       // after an upgrade. Its fixed system id is visible only to this agent's
       // canonical local owner; all other rows still require an exact owner tag.
@@ -1163,14 +1186,41 @@ export class WorkflowService extends Service {
     },
     userId?: string
   ): Promise<WorkflowExecution> {
-    if (userId) await this.assertWorkflowOwned(workflowId, userId);
-    const client = this.getClient();
-    return client.executeWorkflow(workflowId, {
-      mode: options?.mode ?? 'manual',
+    const mode = options?.mode ?? 'manual';
+    const execute = async () => {
+      if (userId) await this.assertWorkflowOwned(workflowId, userId);
+      return this.getClient().executeWorkflow(workflowId, {
+        mode,
+        triggerData: options?.triggerData,
+        idempotencyKey: options?.idempotencyKey,
+        throwOnError: options?.throwOnError,
+      });
+    };
+    if (mode !== 'manual') return execute();
+
+    // Manual runs are synchronous at the HTTP/action boundary. Coalesce only
+    // exact semantic duplicates so transport retries cannot repeat side effects
+    // while callers with distinct payloads or execution behavior remain independent.
+    const ownerId = userId?.trim() || getLocalOwnerEntityId(this.runtime);
+    const inFlightKey = stableStringify({
+      ownerId,
+      workflowId,
       triggerData: options?.triggerData,
       idempotencyKey: options?.idempotencyKey,
-      throwOnError: options?.throwOnError,
+      throwOnError: options?.throwOnError ?? true,
     });
+    const existing = this.manualRunsInFlight.get(inFlightKey);
+    if (existing) return existing;
+
+    const execution = execute();
+    this.manualRunsInFlight.set(inFlightKey, execution);
+    try {
+      return await execution;
+    } finally {
+      if (this.manualRunsInFlight.get(inFlightKey) === execution) {
+        this.manualRunsInFlight.delete(inFlightKey);
+      }
+    }
   }
 
   async getWorkflowExecutions(

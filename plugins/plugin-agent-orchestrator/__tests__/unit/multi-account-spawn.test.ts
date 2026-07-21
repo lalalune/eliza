@@ -109,6 +109,11 @@ vi.mock("node:child_process", () => ({
 }));
 
 import { AcpService } from "../../src/services/acp-service.js";
+import {
+  POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+  POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+  POOLED_ACCOUNT_UNAVAILABLE_CODE,
+} from "../../src/services/coding-account-selection.js";
 
 const BRIDGE_SYMBOL = CODING_AGENT_SELECTOR_BRIDGE_SYMBOL;
 
@@ -123,7 +128,7 @@ interface FakeSelection {
 
 function installBridge(byAgent: Record<string, FakeSelection | null>) {
   const selectMock = vi.fn(
-    async (agentType: string) => byAgent[agentType] ?? null,
+    async (agentType: string, _opts?: unknown) => byAgent[agentType] ?? null,
   );
   (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
     describe: () => ({}),
@@ -256,6 +261,145 @@ describe("multi-account coding-agent spawn", () => {
     }
   });
 
+  it.each([
+    "revoked",
+    "materialization failure",
+  ] as const)("fails durable recovery closed after %s even if host auth is valid", async (failureMode) => {
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const hostCodexHome = fs.mkdtempSync(
+      path.join(os.tmpdir(), "acp-host-codex-auth-"),
+    );
+    fs.writeFileSync(
+      path.join(hostCodexHome, "auth.json"),
+      JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: "valid-host-access",
+          refresh_token: "valid-host-refresh",
+        },
+      }),
+      { mode: 0o600 },
+    );
+    process.env.CODEX_HOME = hostCodexHome;
+    process.env.OPENAI_API_KEY = "valid-host-api-key";
+
+    let recoveryFailure = false;
+    const select = vi.fn(
+      async (_agentType: string, opts?: { accountIds?: string[] }) => {
+        if (recoveryFailure && failureMode === "materialization failure") {
+          throw new Error("could not materialize linked CODEX_HOME");
+        }
+        if (
+          recoveryFailure ||
+          opts?.accountIds?.includes("acc-linked") === false
+        ) {
+          return null;
+        }
+        return {
+          providerId: "openai-codex",
+          accountId: "acc-linked",
+          label: "Linked",
+          source: "oauth" as const,
+          strategy: "least-used",
+          envPatch: {
+            CODEX_HOME: "/tmp/auth/_codex-home/acc-linked/generation",
+          },
+        };
+      },
+    );
+    (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
+      describe: () => ({ codex: [{ total: 1, enabled: 0, healthy: 0 }] }),
+      select,
+      markRateLimited: vi.fn(async () => undefined),
+      markNeedsReauth: vi.fn(async () => undefined),
+      recordUsage: vi.fn(async () => undefined),
+    };
+
+    const service = new AcpService(runtime());
+    try {
+      await service.start();
+      const first = await service.spawnSession({
+        name: "codex-recovery-pin",
+        agentType: "codex",
+        workdir: "/tmp/acp-test",
+      });
+      expect(firstNativeClient().opts.env?.CODEX_HOME).toContain(
+        "_codex-home/acc-linked",
+      );
+      expect(firstNativeClient().opts.env?.CODEX_HOME).not.toBe(hostCodexHome);
+      await service.stop();
+
+      recoveryFailure = true;
+      await service.start();
+      await expect(
+        service.prepareSessionForDurableRecovery(first.sessionId),
+      ).rejects.toMatchObject({
+        code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+      });
+
+      // The required-account check runs before a replacement child can inherit
+      // either valid host credential, so only the original linked client exists.
+      expect(nativeClientMock.instances).toHaveLength(1);
+      expect(select.mock.calls.at(-1)?.[1]).toMatchObject({
+        accountIds: ["acc-linked"],
+      });
+      const failed = await service.getSession(first.sessionId);
+      expect(failed?.status).toBe("errored");
+      expect(failed?.metadata?.account).toBeUndefined();
+      expect(
+        failed?.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY],
+      ).toMatchObject({
+        providerId: "openai-codex",
+        accountId: "acc-linked",
+      });
+      await expect(
+        service.prepareSessionForDurableRecovery(first.sessionId),
+      ).rejects.toMatchObject({
+        code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+      });
+      expect(nativeClientMock.instances).toHaveLength(1);
+    } finally {
+      await service.stop();
+      fs.rmSync(hostCodexHome, { recursive: true, force: true });
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
+  it("leaves strategy precedence to the bridge so app config can beat the env fallback", async () => {
+    const previous = process.env.ELIZA_CODING_ACCOUNT_STRATEGY;
+    process.env.ELIZA_CODING_ACCOUNT_STRATEGY = "priority";
+    const select = installBridge({
+      claude: {
+        providerId: "anthropic-subscription",
+        accountId: "app-config-choice",
+        label: "App config choice",
+        source: "oauth",
+        strategy: "least-used",
+        envPatch: { CLAUDE_CODE_OAUTH_TOKEN: "app-config-token" },
+      },
+    });
+    const service = new AcpService(runtime());
+    try {
+      await service.start();
+      await service.spawnSession({
+        name: "strategy-precedence",
+        agentType: "claude",
+        workdir: "/tmp/acp-test",
+      });
+      expect(select).toHaveBeenCalledTimes(1);
+      expect(select.mock.calls[0]?.[1]).not.toHaveProperty("strategy");
+    } finally {
+      await service.stop();
+      if (previous === undefined)
+        delete process.env.ELIZA_CODING_ACCOUNT_STRATEGY;
+      else process.env.ELIZA_CODING_ACCOUNT_STRATEGY = previous;
+    }
+  });
+
   it("injects the pooled CEREBRAS_API_KEY for an opencode spawn", async () => {
     // opencode pool-rotates across cerebras-api accounts; the bridge injects
     // CEREBRAS_API_KEY which buildOpencodeSpawnConfig reads to target Cerebras.
@@ -305,6 +449,57 @@ describe("multi-account coding-agent spawn", () => {
       (result.metadata as Record<string, unknown>)?.account,
     ).toBeUndefined();
     await service.stop();
+  });
+
+  it("preserves host-auth behavior when the installed bridge confirms zero linked accounts", async () => {
+    const select = installBridge({ claude: null });
+    const service = new AcpService(runtime());
+    await service.start();
+    const result = await service.spawnSession({
+      name: "claude-empty-pool",
+      agentType: "claude",
+      workdir: "/tmp/acp-test",
+    });
+
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(
+      firstNativeClient().opts.env?.CLAUDE_CODE_OAUTH_TOKEN,
+    ).toBeUndefined();
+    expect(result.metadata?.account).toBeUndefined();
+    await service.stop();
+  });
+
+  it("fails a fresh spawn closed when linked accounts exist but none is selectable", async () => {
+    (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
+      describe: () => ({
+        claude: [
+          {
+            providerId: "anthropic-subscription",
+            total: 2,
+            enabled: 2,
+            healthy: 0,
+          },
+        ],
+      }),
+      select: vi.fn(async () => null),
+      markRateLimited: vi.fn(async () => undefined),
+      markNeedsReauth: vi.fn(async () => undefined),
+      recordUsage: vi.fn(async () => undefined),
+    };
+    const service = new AcpService(runtime());
+    try {
+      await service.start();
+      await expect(
+        service.spawnSession({
+          name: "claude-exhausted-pool",
+          agentType: "claude",
+          workdir: "/tmp/acp-test",
+        }),
+      ).rejects.toMatchObject({ code: POOLED_ACCOUNT_UNAVAILABLE_CODE });
+      expect(nativeClientMock.instances).toHaveLength(0);
+    } finally {
+      await service.stop();
+    }
   });
 
   it("does not consult the bridge for non-multi-account agent types", async () => {

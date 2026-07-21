@@ -8,6 +8,7 @@ import {
   registerWorkflowDispatchService,
   WORKFLOW_DISPATCH_SERVICE_TYPE,
 } from '../../src/services/workflow-dispatch';
+import type { WorkflowExecution } from '../../src/types/index';
 
 // `mock.module` replaces the module globally for the rest of the bun-test run,
 // so preserve every real `@elizaos/core` export and swap in a complete spy
@@ -26,7 +27,17 @@ mock.module('@elizaos/core', () => ({
   },
 }));
 
-type FakeExecution = { id?: string };
+function fakeExecution(id: string, overrides: Partial<WorkflowExecution> = {}): WorkflowExecution {
+  return {
+    id,
+    workflowId: 'wf-1',
+    mode: 'trigger',
+    status: 'success',
+    finished: true,
+    startedAt: '2026-07-20T00:00:00.000Z',
+    ...overrides,
+  };
+}
 
 function makeRuntime(service: unknown = null) {
   const services = new Map<string, unknown>();
@@ -37,21 +48,35 @@ function makeRuntime(service: unknown = null) {
 }
 
 function makeEmbeddedService() {
+  const executeWorkflow = mock(
+    async (
+      workflowId: string,
+      options: {
+        mode: string;
+        triggerData: Record<string, unknown>;
+        idempotencyKey?: string;
+        scheduleNodeId?: string;
+      }
+    ): Promise<WorkflowExecution> =>
+      fakeExecution(`${workflowId}:${options.idempotencyKey ?? 'fresh'}`, {
+        workflowId,
+      })
+  );
   return {
-    executeWorkflow: mock(
+    executeWorkflow,
+    executeWorkflowWithDedup: mock(
       async (
         workflowId: string,
         options: {
           mode: string;
           triggerData: Record<string, unknown>;
           idempotencyKey?: string;
+          scheduleNodeId?: string;
         }
-      ): Promise<FakeExecution> => ({
-        id: `${workflowId}:${options.idempotencyKey ?? 'fresh'}`,
-      })
+      ) => ({ execution: await executeWorkflow(workflowId, options), dedup: false })
     ),
     findExecutionByIdempotencyKey: mock(
-      async (_workflowId: string, _idempotencyKey: string) => null as FakeExecution | null
+      async (_workflowId: string, _idempotencyKey: string) => null as WorkflowExecution | null
     ),
   };
 }
@@ -86,27 +111,32 @@ describe('workflow dispatch service', () => {
     const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
 
     await expect(
-      dispatch.execute(' wf-1 ', {
-        __idempotencyKey: 'tick-1',
-        source: 'schedule',
-      })
+      dispatch.execute(
+        ' wf-1 ',
+        {
+          __idempotencyKey: 'tick-1',
+          source: 'schedule',
+        },
+        { scheduleNodeId: 'schedule-a' }
+      )
     ).resolves.toEqual({
       ok: true,
       executionId: 'wf-1:tick-1',
     });
     expect(embedded.findExecutionByIdempotencyKey).toHaveBeenCalledWith('wf-1', 'tick-1');
-    expect(embedded.executeWorkflow).toHaveBeenCalledWith('wf-1', {
+    expect(embedded.executeWorkflowWithDedup).toHaveBeenCalledWith('wf-1', {
       mode: 'trigger',
       triggerData: { source: 'schedule' },
       idempotencyKey: 'tick-1',
+      scheduleNodeId: 'schedule-a',
     });
   });
 
   it('returns a dedup result for an existing idempotency row', async () => {
     const embedded = makeEmbeddedService();
-    embedded.findExecutionByIdempotencyKey.mockImplementation(async () => ({
-      id: 'existing-execution',
-    }));
+    embedded.findExecutionByIdempotencyKey.mockImplementation(async () =>
+      fakeExecution('existing-execution')
+    );
     const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
 
     await expect(dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' })).resolves.toEqual({
@@ -114,7 +144,86 @@ describe('workflow dispatch service', () => {
       executionId: 'existing-execution',
       dedup: true,
     });
-    expect(embedded.executeWorkflow).not.toHaveBeenCalled();
+    expect(embedded.executeWorkflowWithDedup).not.toHaveBeenCalled();
+  });
+
+  it('preserves a persisted terminal failure when a scheduled delivery is retried', async () => {
+    const embedded = makeEmbeddedService();
+    embedded.findExecutionByIdempotencyKey.mockImplementation(async () =>
+      fakeExecution('failed-execution', {
+        status: 'error',
+        data: {
+          resultData: {
+            error: { message: 'HTTP node rejected the request' },
+          },
+        },
+      })
+    );
+    const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
+
+    await expect(dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' })).resolves.toEqual({
+      ok: false,
+      error: 'HTTP node rejected the request',
+      executionId: 'failed-execution',
+      dedup: true,
+    });
+    expect(embedded.executeWorkflowWithDedup).not.toHaveBeenCalled();
+  });
+
+  it('accepts an in-flight durable execution without launching a second side effect', async () => {
+    const embedded = makeEmbeddedService();
+    embedded.findExecutionByIdempotencyKey.mockImplementation(async () =>
+      fakeExecution('running-execution', {
+        status: 'running',
+        finished: false,
+      })
+    );
+    const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
+
+    await expect(dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' })).resolves.toEqual({
+      ok: true,
+      executionId: 'running-execution',
+      dedup: true,
+    });
+    expect(embedded.executeWorkflowWithDedup).not.toHaveBeenCalled();
+  });
+
+  it('propagates a database-claim dedup result when the fast lookup raced', async () => {
+    const embedded = makeEmbeddedService();
+    embedded.executeWorkflowWithDedup.mockImplementation(async () => ({
+      execution: fakeExecution('claimed-by-another-runtime'),
+      dedup: true,
+    }));
+    const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
+
+    await expect(dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' })).resolves.toEqual({
+      ok: true,
+      executionId: 'claimed-by-another-runtime',
+      dedup: true,
+    });
+  });
+
+  it('preserves a failed database-claim result when the fast lookup raced', async () => {
+    const embedded = makeEmbeddedService();
+    embedded.executeWorkflowWithDedup.mockImplementation(async () => ({
+      execution: fakeExecution('failed-race-winner', {
+        status: 'crashed',
+        data: {
+          resultData: {
+            error: { message: 'Smithers worker exited unexpectedly' },
+          },
+        },
+      }),
+      dedup: true,
+    }));
+    const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
+
+    await expect(dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' })).resolves.toEqual({
+      ok: false,
+      error: 'Smithers worker exited unexpectedly',
+      executionId: 'failed-race-winner',
+      dedup: true,
+    });
   });
 
   it('collapses concurrent dispatches with the same idempotency key', async () => {
@@ -125,7 +234,7 @@ describe('workflow dispatch service', () => {
     const embedded = makeEmbeddedService();
     embedded.executeWorkflow.mockImplementation(async () => {
       await gate;
-      return { id: 'execution-1' };
+      return fakeExecution('execution-1');
     });
     const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
 
@@ -136,6 +245,29 @@ describe('workflow dispatch service', () => {
     await expect(Promise.all([first, second])).resolves.toEqual([
       { ok: true, executionId: 'execution-1' },
       { ok: true, executionId: 'execution-1', dedup: true },
+    ]);
+    expect(embedded.executeWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a coalesced failed caller as deduped without rerunning the workflow', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const embedded = makeEmbeddedService();
+    embedded.executeWorkflow.mockImplementation(async () => {
+      await gate;
+      throw new Error('engine offline');
+    });
+    const dispatch = createWorkflowDispatchService(makeRuntime(embedded) as never);
+
+    const first = dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' });
+    const second = dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-1' });
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { ok: false, error: 'engine offline' },
+      { ok: false, error: 'engine offline', dedup: true },
     ]);
     expect(embedded.executeWorkflow).toHaveBeenCalledTimes(1);
   });

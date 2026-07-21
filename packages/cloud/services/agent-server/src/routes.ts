@@ -528,7 +528,8 @@ export function createRoutes(manager: AgentManager, sharedSecret: string) {
         return denial;
       }
       const raw = body as Record<string, unknown>;
-      const userId = typeof raw.userId === "string" ? raw.userId : undefined;
+      const userId =
+        typeof raw.userId === "string" ? raw.userId.trim() : undefined;
       const text = typeof raw.text === "string" ? raw.text : undefined;
       if (!userId || !text) {
         set.status = 400;
@@ -540,6 +541,18 @@ export function createRoutes(manager: AgentManager, sharedSecret: string) {
       const senderName =
         typeof raw.senderName === "string" ? raw.senderName : undefined;
       const chatId = typeof raw.chatId === "string" ? raw.chatId : undefined;
+      const authenticatedUserId =
+        headers["x-eliza-user-id"]?.trim() ||
+        headers["X-Eliza-User-Id"]?.trim() ||
+        undefined;
+
+      // The forwarded principal is produced by the authenticated Cloud edge.
+      // Reject disagreement instead of letting the body select which identity
+      // receives the world's OWNER grant.
+      if (authenticatedUserId && authenticatedUserId !== userId.trim()) {
+        set.status = 403;
+        return { error: "Message user does not match authenticated principal" };
+      }
 
       // Keeps metadata undefined (not {}) when no fields present,
       // so handleMessage's gated debug log doesn't fire on plain requests.
@@ -558,6 +571,7 @@ export function createRoutes(manager: AgentManager, sharedSecret: string) {
           userId,
           text,
           metadata,
+          authenticatedUserId,
         );
         return { response };
       } catch (err: unknown) {

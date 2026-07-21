@@ -336,7 +336,21 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
             "workflows",
             "GET",
             null,
-            "limit=2&drop=ignored",
+            "limit=2&include=output&drop=ignored",
+            {
+              timeoutMs: 120_000,
+              protocolHeaders: {
+                Accept: "application/vnd.eliza.workflow+json",
+                Authorization: "Bearer cloud-token",
+                Cookie: "cloud-session=secret",
+                "Idempotency-Key": "workflow-request-1",
+                Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "X-Api-Key": "cloud-api-key",
+                "X-Eliza-Organization-Id": "org-spoof",
+                "X-Eliza-User-Id": "user-spoof",
+                "X-Request-Id": "request-1",
+              },
+            },
           );
           await sandboxService.proxyWalletRequest(
             sandbox.id,
@@ -361,7 +375,7 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
     }
 
     expect(requests.map(({ url }) => url)).toEqual([
-      "https://eliza-staging-1.elizacloud.ai/api/workflow/workflows?limit=2",
+      "https://eliza-staging-1.elizacloud.ai/api/workflow/workflows?limit=2&include=output",
       "https://eliza-staging-1.elizacloud.ai/api/wallet/balances?limit=1",
       "https://eliza-staging-1.elizacloud.ai/api/lifeops/schedule/observations?timezone=UTC",
     ]);
@@ -371,12 +385,86 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
       expect(request.headers.get("x-forwarded-proto")).toBe("https");
     }
     expect(requests[0]?.method).toBe("GET");
-    expect(requests[0]?.headers.get("accept")).toBe("application/json");
+    expect(requests[0]?.headers.get("accept")).toBe("application/vnd.eliza.workflow+json");
+    expect(requests[0]?.headers.get("idempotency-key")).toBe("workflow-request-1");
+    expect(requests[0]?.headers.get("traceparent")).toBe(
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    );
+    expect(requests[0]?.headers.get("x-request-id")).toBe("request-1");
+    expect(requests[0]?.headers.get("cookie")).toBeNull();
+    expect(requests[0]?.headers.get("x-eliza-organization-id")).toBeNull();
+    expect(requests[0]?.headers.get("x-eliza-user-id")).toBeNull();
     expect(requests[1]?.method).toBe("GET");
     expect(requests[2]?.method).toBe("POST");
     expect(requests[2]?.headers.get("accept")).toBe("application/json");
     expect(requests[2]?.headers.get("content-type")).toBe("application/json");
     expect(requests[2]?.body).toBe('{"refresh":true}');
+  });
+
+  test("accepts every raw plugin-workflow route and rejects paths outside that surface", async () => {
+    enterWorkerRuntime();
+    const findRunningSandboxSpy = spyOn(
+      agentSandboxesRepository,
+      "findRunningSandbox",
+    ).mockResolvedValue(sandbox as never);
+    const requestedPaths: string[] = [];
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      requestedPaths.push(new URL(String(input)).pathname);
+      return Response.json({ ok: true });
+    });
+    const routes = [
+      ["status", "GET"],
+      ["runtime/start", "POST"],
+      ["workflows", "GET"],
+      ["workflows", "POST"],
+      ["workflows/generate", "POST"],
+      ["workflows/resolve-clarification", "POST"],
+      ["workflows/workflow-1", "GET"],
+      ["workflows/workflow-1", "PUT"],
+      ["workflows/workflow-1", "DELETE"],
+      ["workflows/workflow-1/activate", "POST"],
+      ["workflows/workflow-1/deactivate", "POST"],
+      ["workflows/workflow-1/run", "POST"],
+      ["workflows/workflow-1/executions", "GET"],
+      ["executions/execution-1", "GET"],
+      ["workflows/workflow-1/revisions", "GET"],
+      ["workflows/workflow-1/revisions/version-1/restore", "POST"],
+      ["workflows/workflow-1/evaluation-samples", "GET"],
+    ] as const;
+
+    try {
+      await runWithCloudBindings(
+        {
+          ELIZA_CLOUD_AGENT_BASE_DOMAIN: "staging.elizacloud.ai",
+          AGENT_ROUTER_ORIGIN_HOST: "eliza-staging-1.elizacloud.ai",
+        },
+        async () => {
+          const sandboxService = new ElizaSandboxService();
+          for (const [path, method] of routes) {
+            const response = await sandboxService.proxyWorkflowRequest(
+              sandbox.id,
+              "org-1",
+              path,
+              method,
+              method === "POST" || method === "PUT" ? "{}" : null,
+              "limit=5",
+            );
+            expect(response?.status).toBe(200);
+          }
+          const rejected = await sandboxService.proxyWorkflowRequest(
+            sandbox.id,
+            "org-1",
+            "workflows/workflow-1/unknown",
+            "GET",
+          );
+          expect(rejected?.status).toBe(400);
+        },
+      );
+    } finally {
+      findRunningSandboxSpy.mockRestore();
+    }
+
+    expect(requestedPaths).toEqual(routes.map(([path]) => `/api/workflow/${path}`));
   });
 
   test("keeps non-Worker API traffic on the existing direct runtime target", async () => {

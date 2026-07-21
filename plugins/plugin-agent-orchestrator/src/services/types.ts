@@ -48,6 +48,7 @@ export type SessionEventName =
   | "plan"
   | "reconnected"
   | "account_switched"
+  | "account_cleared"
   | string;
 
 /**

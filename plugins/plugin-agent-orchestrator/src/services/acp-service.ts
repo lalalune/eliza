@@ -56,9 +56,13 @@ import {
 import {
   accountMetaFromSessionMetadata,
   type CodingAccountMeta,
-  diagnoseCodingAccountFallback,
+  configuredCodingAccountCount,
   isTokenExpiryText,
-  resolveCodingAccountStrategy,
+  POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+  POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+  POOLED_ACCOUNT_UNAVAILABLE_CODE,
+  recoveryAccountMetaFromSessionMetadata,
+  retainPooledAccountRecoveryRequirement,
   selectCodingAccount,
 } from "./coding-account-selection.js";
 import { readConfigEnvKey, readConfigMcpServers } from "./config-env.js";
@@ -172,6 +176,10 @@ type RuntimeLike = IAgentRuntime & {
   getSetting?: (key: string) => string | undefined | null;
 };
 type RuntimeLogger = NonNullable<RuntimeLike["logger"]>;
+type SpawnAccountPolicy = {
+  /** Durable recovery must authenticate as this exact pooled account. */
+  requiredAccount: CodingAccountMeta;
+};
 type ProcessRecord = {
   proc: ChildProcessWithoutNullStreams;
   stderr: string;
@@ -1590,6 +1598,37 @@ export class AcpService extends Service {
   }
 
   async spawnSession(opts: SpawnOptions): Promise<SpawnResult> {
+    const carriesRecoveryPin = Object.hasOwn(
+      opts.metadata ?? {},
+      POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+    );
+    return this.spawnSessionWithAccountPolicy(
+      opts,
+      carriesRecoveryPin
+        ? this.accountPolicyForDurableRecovery(opts.metadata)
+        : undefined,
+    );
+  }
+
+  /**
+   * Reconstruct a missing durable-recovery transport without weakening a prior
+   * pooled-account boundary. Ordinary host-auth sessions still use the normal
+   * fallback; sessions carrying an account identity must resolve that exact
+   * account before any child process is created.
+   */
+  async spawnSessionForDurableRecovery(
+    opts: SpawnOptions,
+  ): Promise<SpawnResult> {
+    return this.spawnSessionWithAccountPolicy(
+      opts,
+      this.accountPolicyForDurableRecovery(opts.metadata),
+    );
+  }
+
+  private async spawnSessionWithAccountPolicy(
+    opts: SpawnOptions,
+    accountPolicy?: SpawnAccountPolicy,
+  ): Promise<SpawnResult> {
     this.ensureStarted();
     const id = randomUUID();
     const name = opts.name?.trim() || id;
@@ -1682,18 +1721,41 @@ export class AcpService extends Service {
           ? normalizeClaudeAcpModelId(opts.model)
           : opts.model;
 
-      // Multi-account selection: pick the least-used (default) linked subscription
-      // for this agent type and inject its credentials into the spawn env so the
-      // sub-agent authenticates AS that account. Returns null (and we keep the
-      // single-account behavior) when no accounts are linked.
-      const accountStrategy = resolveCodingAccountStrategy(
-        this.setting("ELIZA_CODING_ACCOUNT_STRATEGY"),
-      );
+      // Multi-account selection injects the selected account's credentials into
+      // the child. Strategy resolution belongs to the app-core bridge, where app
+      // config can outrank the process-level fallback. Durable recovery also pins
+      // the prior account id and fails closed below if it cannot be resolved.
       const resolvedAccount = await selectCodingAccount(agentType, {
         sessionKey: id,
-        ...(accountStrategy ? { strategy: accountStrategy } : {}),
+        ...(accountPolicy
+          ? {
+              accountIds: [accountPolicy.requiredAccount.accountId],
+              strict: true,
+            }
+          : {}),
         ...(spawnModel ? { model: spawnModel } : {}),
       });
+      if (
+        accountPolicy &&
+        (!resolvedAccount ||
+          resolvedAccount.meta.providerId !==
+            accountPolicy.requiredAccount.providerId ||
+          resolvedAccount.meta.accountId !==
+            accountPolicy.requiredAccount.accountId)
+      ) {
+        throw new ElizaError(
+          `Pooled account ${accountPolicy.requiredAccount.providerId}/${accountPolicy.requiredAccount.accountId} is unavailable for durable recovery`,
+          {
+            code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+            context: {
+              agentType,
+              providerId: accountPolicy.requiredAccount.providerId,
+              accountId: accountPolicy.requiredAccount.accountId,
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
       const customCredentials = resolvedAccount
         ? {
             ...(opts.customCredentials ?? {}),
@@ -1710,16 +1772,16 @@ export class AcpService extends Service {
           strategy: resolvedAccount.meta.strategy,
         });
       } else {
-        // A degraded pool must not hard-fail a spawn, but it must not degrade
-        // invisibly either (#9960). Warn loudly only when accounts are connected
-        // yet none are healthy — a benign empty pool stays quiet.
-        const fallbackWarning = diagnoseCodingAccountFallback(agentType);
-        if (fallbackWarning) {
-          this.log("warn", "coding account pool degraded to single-account", {
-            sessionId: id,
-            agentType,
-            detail: fallbackWarning,
-          });
+        const configuredAccounts = configuredCodingAccountCount(agentType);
+        if (configuredAccounts !== null && configuredAccounts > 0) {
+          throw new ElizaError(
+            `No configured pooled account is available for ${agentType}`,
+            {
+              code: POOLED_ACCOUNT_UNAVAILABLE_CODE,
+              context: { sessionId: id, agentType, configuredAccounts },
+              severity: "ephemeral",
+            },
+          );
         }
       }
 
@@ -1747,6 +1809,12 @@ export class AcpService extends Service {
         transportMode: this.transportMode,
         slotClass,
       };
+      if (accountPolicy) {
+        // A successful exact-account materialization restores live attribution.
+        // Keeping the recovery marker would make later prompts treat a healthy
+        // session as still quarantined and leave task usage unattributed.
+        delete mergedMetadata[POOLED_ACCOUNT_RECOVERY_METADATA_KEY];
+      }
       const session: SessionInfo = {
         id,
         name,
@@ -2061,7 +2129,23 @@ export class AcpService extends Service {
     // session's selected-account credentials (the native transport keeps the
     // spawn-time client, which already has them) and the per-session git index
     // env that keeps same-repo sessions from sharing one mutable index file.
-    const promptCredentials = await this.accountCredentialsForSession(session);
+    let promptCredentials: Record<string, string> | undefined;
+    try {
+      promptCredentials = await this.accountCredentialsForSession(session);
+    } catch (err) {
+      // error-policy:J1 CLI prompt credential boundary — a failed account pin
+      // is persisted as a terminal prompt failure before the original error is
+      // surfaced; callers must never observe a session stuck in `busy`.
+      const message = errorMessage(err);
+      await this.store.updateStatus(sessionId, "errored", message);
+      this.emitSessionEvent(sessionId, "error", {
+        message,
+        ...this.authFailureFields(message, session.agentType),
+      });
+      void this.revokeModelLease(sessionId, "cli_prompt:credential_error");
+      this.turnOutputBuffers.delete(sessionId);
+      throw err;
+    }
     const promptEnv: Record<string, string> = {
       ...(opts.env ?? {}),
       ...(this.gitIndexEnvForSession(session) ?? {}),
@@ -2428,23 +2512,146 @@ export class AcpService extends Service {
     };
   }
 
+  private accountPolicyForDurableRecovery(
+    metadata: Record<string, unknown> | undefined,
+  ): SpawnAccountPolicy | undefined {
+    const attributed = accountMetaFromSessionMetadata(metadata);
+    const retained = recoveryAccountMetaFromSessionMetadata(metadata);
+    const hasAttributedValue = Object.hasOwn(metadata ?? {}, "account");
+    const hasRetainedValue = Object.hasOwn(
+      metadata ?? {},
+      POOLED_ACCOUNT_RECOVERY_METADATA_KEY,
+    );
+    if (
+      (hasAttributedValue && !attributed) ||
+      (hasRetainedValue && !retained) ||
+      (attributed &&
+        retained &&
+        (attributed.providerId !== retained.providerId ||
+          attributed.accountId !== retained.accountId))
+    ) {
+      throw new ElizaError(
+        "Durable recovery found invalid or conflicting pooled-account metadata",
+        {
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+          context: { hasAttributedValue, hasRetainedValue },
+          severity: "fatal",
+        },
+      );
+    }
+    const requiredAccount = retained ?? attributed;
+    return requiredAccount ? { requiredAccount } : undefined;
+  }
+
+  private async clearUnavailableRecoveryAccount(
+    session: SessionInfo,
+    requiredAccount: CodingAccountMeta,
+    message: string,
+  ): Promise<void> {
+    const metadata = retainPooledAccountRecoveryRequirement(
+      session.metadata,
+      requiredAccount,
+    );
+    await this.store.update(session.id, {
+      metadata,
+      status: "errored",
+      lastError: message,
+      lastActivityAt: new Date(),
+    });
+    session.metadata = metadata;
+    void this.revokeModelLease(
+      session.id,
+      "durable_recovery:account_unavailable",
+    );
+    this.emitSessionEvent(session.id, "account_cleared", {
+      ...requiredAccount,
+      reason: "durable_recovery_unavailable",
+    });
+  }
+
+  private async clearUnavailableRecoveryAccountAfterFailure(
+    session: SessionInfo,
+    requiredAccount: CodingAccountMeta,
+    cause: unknown,
+  ): Promise<void> {
+    try {
+      await this.clearUnavailableRecoveryAccount(
+        session,
+        requiredAccount,
+        errorMessage(cause),
+      );
+    } catch (clearCause) {
+      // error-policy:J2 both failures are required to diagnose a recovery whose
+      // credential refusal was followed by a persistence failure.
+      throw new ElizaError(
+        "Durable recovery could not clear unavailable account attribution",
+        {
+          code: "ACP_POOLED_ACCOUNT_RECOVERY_CLEAR_FAILED",
+          cause: new AggregateError([cause, clearCause]),
+          context: {
+            sessionId: session.id,
+            providerId: requiredAccount.providerId,
+            accountId: requiredAccount.accountId,
+          },
+          severity: "fatal",
+        },
+      );
+    }
+  }
+
   async reattachSession(sessionId: string): Promise<SpawnResult> {
     const session = await this.requireSession(sessionId);
-    if (session.pid && isPidAlive(session.pid)) {
+    if (
+      !TERMINAL_SESSION_STATUSES.has(session.status) &&
+      session.pid &&
+      isPidAlive(session.pid)
+    ) {
       await this.store.updateStatus(sessionId, "ready");
       return toSpawnResult({ ...session, status: "ready" });
     }
-    const respawn = await this.spawnSession({
-      name: session.name ?? session.id,
-      agentType: session.agentType,
-      workdir: session.workdir,
-      approvalPreset: session.approvalPreset,
-      metadata: { ...session.metadata, reattachedFrom: session.id },
-      model:
-        typeof session.metadata?.[ACP_METADATA_SPAWN_MODEL] === "string"
-          ? session.metadata[ACP_METADATA_SPAWN_MODEL]
-          : undefined,
-    });
+    const accountPolicy = this.accountPolicyForDurableRecovery(
+      session.metadata,
+    );
+    let respawn: SpawnResult;
+    try {
+      respawn = await this.spawnSessionWithAccountPolicy(
+        {
+          name: session.name ?? session.id,
+          agentType: session.agentType,
+          workdir: session.workdir,
+          approvalPreset: session.approvalPreset,
+          metadata: { ...session.metadata, reattachedFrom: session.id },
+          model:
+            typeof session.metadata?.[ACP_METADATA_SPAWN_MODEL] === "string"
+              ? session.metadata[ACP_METADATA_SPAWN_MODEL]
+              : undefined,
+        },
+        accountPolicy,
+      );
+    } catch (cause) {
+      // error-policy:J2 recovery adds the session/account boundary and preserves
+      // the selection failure after durably removing stale live attribution.
+      if (
+        accountPolicy &&
+        cause instanceof ElizaError &&
+        cause.code === POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE
+      ) {
+        await this.clearUnavailableRecoveryAccountAfterFailure(
+          session,
+          accountPolicy.requiredAccount,
+          cause,
+        );
+      }
+      throw new ElizaError("ACP session reattach failed", {
+        code:
+          cause instanceof ElizaError
+            ? cause.code
+            : "ACP_SESSION_REATTACH_FAILED",
+        cause,
+        context: { sessionId },
+        severity: cause instanceof ElizaError ? cause.severity : "ephemeral",
+      });
+    }
     await this.store.update(sessionId, {
       status: "stopped",
       lastActivityAt: new Date(),
@@ -2465,14 +2672,83 @@ export class AcpService extends Service {
     sessionId: string,
   ): Promise<SpawnResult> {
     const session = await this.requireSession(sessionId);
-    if (this.transportMode === "native") {
-      if (this.nativeClients.has(sessionId)) return toSpawnResult(session);
+    if (TERMINAL_SESSION_STATUSES.has(session.status)) {
       return this.reattachSession(sessionId);
     }
+    if (this.transportMode === "native") {
+      if (this.nativeClients.has(sessionId)) {
+        const requiredAccount = recoveryAccountMetaFromSessionMetadata(
+          session.metadata,
+        );
+        if (requiredAccount) {
+          try {
+            await this.accountCredentialsForSession(session);
+          } catch (cause) {
+            // error-policy:J2 an already-attached native client is still bound
+            // by the durable account pin. Clear stale live attribution before
+            // surfacing an unavailable-account failure, matching reattach/CLI.
+            if (
+              cause instanceof ElizaError &&
+              cause.code === POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE
+            ) {
+              await this.stopNativeClient(session.id);
+              await this.clearUnavailableRecoveryAccountAfterFailure(
+                session,
+                requiredAccount,
+                cause,
+              );
+            }
+            throw cause;
+          }
+        }
+        return toSpawnResult(session);
+      }
+      return this.reattachSession(sessionId);
+    }
+    const accountPolicy = this.accountPolicyForDurableRecovery(
+      session.metadata,
+    );
     if (
       session.acpxSessionId &&
       (await this.hasAcpxSessionState(session.acpxSessionId))
     ) {
+      if (accountPolicy) {
+        const metadata = {
+          ...(session.metadata ?? {}),
+          [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: accountPolicy.requiredAccount,
+        };
+        await this.store.update(session.id, { metadata });
+        session.metadata = metadata;
+        try {
+          await this.accountCredentialsForSession(session);
+        } catch (cause) {
+          // error-policy:J2 validate a reused CLI session at the durable boundary
+          // and preserve the pinned-account failure after clearing attribution.
+          if (
+            cause instanceof ElizaError &&
+            cause.code === POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE
+          ) {
+            await this.clearUnavailableRecoveryAccountAfterFailure(
+              session,
+              accountPolicy.requiredAccount,
+              cause,
+            );
+          }
+          throw new ElizaError(
+            "Persisted ACP session is not credential-ready for durable recovery",
+            {
+              code:
+                cause instanceof ElizaError
+                  ? cause.code
+                  : "ACP_DURABLE_RECOVERY_CREDENTIAL_CHECK_FAILED",
+              cause,
+              context: { sessionId },
+              severity:
+                cause instanceof ElizaError ? cause.severity : "ephemeral",
+            },
+          );
+        }
+      }
       return toSpawnResult(session);
     }
     return this.reattachSession(sessionId);
@@ -2903,10 +3179,9 @@ export class AcpService extends Service {
     opts: SendOptions,
     startedAt: number,
   ): Promise<PromptResult> {
-    const { client, protocolSessionId } = await this.ensureNativeClientAttached(
-      session,
-      opts,
-    );
+    let client: NativeAcpClient | undefined;
+    let protocolSessionId =
+      session.acpxSessionId ?? session.agentSessionId ?? session.id;
     let finalText = "";
     let eventStopReason: string | undefined;
     const capturedToolOutputs = new Set<string>();
@@ -2923,9 +3198,12 @@ export class AcpService extends Service {
       eventStopReason = handled.stopReason ?? eventStopReason;
     };
     this.nativePromptSessionIds.add(session.id);
-    client.setEventHandler(previousOnAcp);
-    client.setTimeoutMs(opts.timeoutMs ?? this.sessionTimeoutMs);
     try {
+      const attached = await this.ensureNativeClientAttached(session, opts);
+      client = attached.client;
+      protocolSessionId = attached.protocolSessionId;
+      client.setEventHandler(previousOnAcp);
+      client.setTimeoutMs(opts.timeoutMs ?? this.sessionTimeoutMs);
       const result = await client.prompt(protocolSessionId, text);
       const stopReason = result.stopReason;
       const cancelled =
@@ -3005,7 +3283,19 @@ export class AcpService extends Service {
         };
       }
       await this.store.updateStatus(session.id, "errored", message);
-      this.emitSessionEvent(session.id, "error", { message });
+      this.emitSessionEvent(session.id, "error", {
+        message,
+        ...this.authFailureFields(message, session.agentType),
+      });
+      void this.revokeModelLease(session.id, "native_prompt:error");
+      if (!client) {
+        // Session setup failures are not model responses. Preserve the
+        // fail-closed rejection contract after recording the terminal state;
+        // callers use the rejection to stop recovery instead of treating the
+        // empty PromptResult as an agent turn.
+        this.turnOutputBuffers.delete(session.id);
+        throw err;
+      }
       return {
         sessionId: session.id,
         response: finalText,
@@ -3017,7 +3307,7 @@ export class AcpService extends Service {
         error: message,
       };
     } finally {
-      client.setEventHandler((event, protocolSessionId) => {
+      client?.setEventHandler((event, protocolSessionId) => {
         this.handleAcpEvent(
           event,
           session.id,
@@ -3059,28 +3349,17 @@ export class AcpService extends Service {
       };
     }
 
+    let client: NativeAcpClient | undefined;
     try {
       await this.mintModelLease(session.id, session.agentType, opts.timeoutMs, {
         rollbackSessionOnFailure: false,
       });
-    } catch (err) {
-      // error-policy:J2 context-adding rethrow — reconnect lease refusal must
-      // persist on the existing session before the caller observes the failure.
-      const message = errorMessage(err);
-      await this.store.updateStatus(session.id, "errored", message);
-      this.emitSessionEvent(session.id, "error", {
-        message,
-        ...this.authFailureFields(message, session.agentType),
-      });
-      throw err;
-    }
-    const promptCredentials = await this.accountCredentialsForSession(session);
-    const promptEnv: Record<string, string> = {
-      ...(opts.env ?? {}),
-      ...(this.gitIndexEnvForSession(session) ?? {}),
-    };
-    let client: NativeAcpClient | undefined;
-    try {
+      const promptCredentials =
+        await this.accountCredentialsForSession(session);
+      const promptEnv: Record<string, string> = {
+        ...(opts.env ?? {}),
+        ...(this.gitIndexEnvForSession(session) ?? {}),
+      };
       const attached = await this.attachNativeClientWithManagedCodexFallback({
         sessionId: session.id,
         session,
@@ -3108,18 +3387,22 @@ export class AcpService extends Service {
         acpxSessionId: nativeSession.sessionId,
       });
       return { client, protocolSessionId: nativeSession.sessionId };
-    } catch (err) {
-      // error-policy:J6 best-effort teardown of a failed restart reattach; the
-      // attach failure itself is persisted and thrown below.
+    } catch (cause) {
+      // error-policy:J2 the prompt boundary owns terminal persistence; this
+      // helper adds reconnect context while preserving credential, lease, or
+      // transport attachment failures for that boundary to translate.
+      // error-policy:J6 best-effort teardown of a partially attached client.
       await client?.close().catch(() => undefined);
       this.nativeClients.delete(session.id);
-      const message = errorMessage(err);
-      await this.store.updateStatus(session.id, "errored", message);
-      this.emitSessionEvent(session.id, "error", {
-        message,
-        ...this.authFailureFields(message, session.agentType),
-      });
-      throw new Error(message);
+      throw new ElizaError(
+        `Native ACP session attachment failed: ${errorMessage(cause)}`,
+        {
+          code: "ACP_NATIVE_SESSION_ATTACH_FAILED",
+          cause,
+          context: { sessionId: session.id, agentType: session.agentType },
+          severity: "ephemeral",
+        },
+      );
     }
   }
 
@@ -3947,29 +4230,86 @@ export class AcpService extends Service {
    * when the pinned account is no longer selectable (rate-limited /
    * needs-reauth / disabled / token resolve failed) does this deliberately
    * fail over to a fresh pick — and then re-stamps the session so every
-   * account-keyed consumer follows the credential actually injected. Returns
-   * undefined when the session has no linked account and no account is
-   * available.
+   * account-keyed consumer follows the credential actually injected. A session
+   * with no linked account returns undefined; a linked session with no eligible
+   * account throws so buildEnv can never fall through to host credentials.
    */
   private async accountCredentialsForSession(
     session: SessionInfo,
   ): Promise<Record<string, string> | undefined> {
-    const meta: CodingAccountMeta | null = accountMetaFromSessionMetadata(
+    const recoveryAccount = recoveryAccountMetaFromSessionMetadata(
       session.metadata,
     );
+    const meta: CodingAccountMeta | null =
+      recoveryAccount ?? accountMetaFromSessionMetadata(session.metadata);
     if (!meta) return undefined;
     const pinned = await selectCodingAccount(session.agentType, {
       sessionKey: session.id,
       accountIds: [meta.accountId],
+      ...(recoveryAccount ? { strict: true } : {}),
     });
-    if (pinned) return pinned.selection.envPatch;
+    if (pinned) {
+      if (
+        recoveryAccount &&
+        (pinned.meta.providerId !== recoveryAccount.providerId ||
+          pinned.meta.accountId !== recoveryAccount.accountId)
+      ) {
+        throw new ElizaError(
+          `Pooled account ${recoveryAccount.providerId}/${recoveryAccount.accountId} resolved to a different account during durable recovery`,
+          {
+            code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+            context: {
+              sessionId: session.id,
+              expectedProviderId: recoveryAccount.providerId,
+              expectedAccountId: recoveryAccount.accountId,
+              actualProviderId: pinned.meta.providerId,
+              actualAccountId: pinned.meta.accountId,
+            },
+            severity: "fatal",
+          },
+        );
+      }
+      if (recoveryAccount) {
+        await this.restampSessionAccount(session, pinned.meta, {
+          reason: "durable_recovery_restored",
+        });
+      }
+      return pinned.selection.envPatch;
+    }
+    if (recoveryAccount) {
+      throw new ElizaError(
+        `Pooled account ${meta.providerId}/${meta.accountId} is unavailable for durable recovery`,
+        {
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+          context: {
+            sessionId: session.id,
+            providerId: meta.providerId,
+            accountId: meta.accountId,
+          },
+          severity: "ephemeral",
+        },
+      );
+    }
     // Exclude the dud explicitly: it may still be pool-selectable (only its
     // token resolve failed), and re-picking it here would just re-fail.
     const failover = await selectCodingAccount(session.agentType, {
       sessionKey: session.id,
       exclude: [meta.accountId],
     });
-    if (!failover) return undefined;
+    if (!failover) {
+      throw new ElizaError(
+        `No pooled account is available for session ${session.id}`,
+        {
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+          context: {
+            sessionId: session.id,
+            providerId: meta.providerId,
+            accountId: meta.accountId,
+          },
+          severity: "ephemeral",
+        },
+      );
+    }
     this.log("warn", "coding account failed over on follow-up prompt", {
       sessionId: session.id,
       previous: meta.accountId,
@@ -3991,26 +4331,25 @@ export class AcpService extends Service {
   private async restampSessionAccount(
     session: SessionInfo,
     meta: CodingAccountMeta,
+    opts: { reason?: string } = {},
   ): Promise<void> {
-    const metadata = { ...(session.metadata ?? {}), account: meta };
+    const metadata: Record<string, unknown> = {
+      ...(session.metadata ?? {}),
+      account: meta,
+    };
+    delete metadata[POOLED_ACCOUNT_RECOVERY_METADATA_KEY];
+    // Credential injection and billing attribution are one boundary: do not
+    // return credentials or announce a switch until the exact serving account
+    // is durable. A failed write propagates and the child is never prompted.
+    await this.store.update(session.id, { metadata });
     session.metadata = metadata;
-    try {
-      await this.store.update(session.id, { metadata });
-    } catch (err) {
-      // error-policy:J7 the failover credential is already resolved and must
-      // reach the subprocess; a failed durable re-stamp only degrades the NEXT
-      // prompt's pin back to the stale account, so warn instead of failing the
-      // prompt.
-      this.log("warn", "failed to persist failover account on session", {
-        sessionId: session.id,
-        accountId: meta.accountId,
-        error: errorMessage(err),
-      });
-    }
     this.emitSessionEvent(session.id, "account_switched", {
       providerId: meta.providerId,
       accountId: meta.accountId,
       label: meta.label,
+      source: meta.source,
+      strategy: meta.strategy,
+      ...(opts.reason ? { reason: opts.reason } : {}),
     });
   }
 

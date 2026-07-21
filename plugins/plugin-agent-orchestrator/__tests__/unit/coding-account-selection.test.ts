@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   accountMetaFromSessionMetadata,
   classifyAccountFailure,
+  configuredCodingAccountCount,
   diagnoseCodingAccountFallback,
   getCodingAccountBridge,
   isMultiAccountAgentType,
@@ -78,6 +79,16 @@ describe("accountMetaFromSessionMetadata", () => {
     expect(
       accountMetaFromSessionMetadata({ account: { providerId: 1 } }),
     ).toBeNull();
+    expect(
+      accountMetaFromSessionMetadata({
+        account: { providerId: "   ", accountId: "acc-1" },
+      }),
+    ).toBeNull();
+    expect(
+      accountMetaFromSessionMetadata({
+        account: { providerId: "openai-codex", accountId: "\t" },
+      }),
+    ).toBeNull();
   });
 });
 
@@ -143,6 +154,29 @@ describe("selectCodingAccount", () => {
       }),
     };
     expect(await selectCodingAccount("codex", {})).toBeNull();
+  });
+});
+
+describe("configuredCodingAccountCount", () => {
+  it("sums linked accounts and rejects malformed availability", () => {
+    (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
+      describe: () => ({
+        codex: [
+          { providerId: "openai-codex", total: 2, enabled: 1, healthy: 1 },
+          { providerId: "openai-api", total: 3, enabled: 3, healthy: 2 },
+        ],
+      }),
+    };
+    expect(configuredCodingAccountCount("codex")).toBe(5);
+
+    (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
+      describe: () => ({
+        codex: [{ providerId: "openai-codex", total: -1 }],
+      }),
+    };
+    expect(() => configuredCodingAccountCount("codex")).toThrowError(
+      expect.objectContaining({ code: "ACP_POOLED_ACCOUNT_UNAVAILABLE" }),
+    );
   });
 });
 

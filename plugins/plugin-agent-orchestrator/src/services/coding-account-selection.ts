@@ -6,7 +6,9 @@
  * the parent-context bridge — it reads the contract off a `globalThis` symbol
  * rather than importing app-core. When no pool/accounts are configured the
  * bridge is absent and every helper here no-ops, leaving the single-account
- * behavior untouched.
+ * behavior untouched. Ordinary selection never throws; durable recovery can
+ * opt into strict mode so a credential-materialization failure remains visible
+ * and cannot be mistaken for permission to inherit host credentials.
  */
 
 import { isTokenExpiryText } from "@elizaos/auth";
@@ -16,6 +18,7 @@ import {
   type CodingAgentSelection,
   type CodingAgentSelectorBridge,
   type CodingProviderAvailability,
+  ElizaError,
   getCodingAgentSelectorBridge,
   logger,
 } from "@elizaos/core";
@@ -45,6 +48,20 @@ export interface ResolvedCodingAccount {
 }
 
 /**
+ * Non-secret recovery pin retained after an unavailable pooled account is
+ * removed from live billing attribution. Durable recovery reads this key so a
+ * later restart cannot reinterpret the session as an unpooled host-auth spawn.
+ */
+export const POOLED_ACCOUNT_RECOVERY_METADATA_KEY = "pooledAccountRecovery";
+
+/** Typed failure raised before a recovery spawn can inherit host credentials. */
+export const POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE =
+  "ACP_POOLED_ACCOUNT_RECOVERY_UNAVAILABLE";
+
+/** A configured account pool could not supply an account for a fresh spawn. */
+export const POOLED_ACCOUNT_UNAVAILABLE_CODE = "ACP_POOLED_ACCOUNT_UNAVAILABLE";
+
+/**
  * Agent types that authenticate per pooled account. claude and codex are
  * first-party CLIs; opencode pool-rotates across `cerebras-api` accounts (the
  * one backend it resolves from a pooled key — its injected CEREBRAS_API_KEY is
@@ -60,6 +77,46 @@ export function isMultiAccountAgentType(agentType: string): boolean {
 
 export function getCodingAccountBridge(): CodingAgentSelectorBridge | null {
   return getCodingAgentSelectorBridge();
+}
+
+/**
+ * Return the number of linked accounts for a multi-account agent, or null when
+ * no pool bridge applies. A bridge inspection failure throws because callers
+ * must not interpret an unknown pool as permission to inherit host credentials.
+ */
+export function configuredCodingAccountCount(agentType: string): number | null {
+  if (!isMultiAccountAgentType(agentType)) return null;
+  const bridge = getCodingAccountBridge();
+  if (!bridge) return null;
+  try {
+    const described = bridge.describe();
+    const rows = described[agentType.toLowerCase()] ?? [];
+    if (
+      !Array.isArray(rows) ||
+      rows.some(
+        (row) =>
+          !row ||
+          typeof row !== "object" ||
+          !Number.isSafeInteger(row.total) ||
+          row.total < 0,
+      )
+    ) {
+      throw new TypeError("Coding-account availability is malformed");
+    }
+    return rows.reduce((sum, row) => sum + row.total, 0);
+  } catch (cause) {
+    // error-policy:J2 account-pool inspection is part of the spawn credential
+    // boundary; preserve the bridge failure so the caller fails closed.
+    throw new ElizaError(
+      `Could not verify the configured pooled accounts for ${agentType}`,
+      {
+        code: POOLED_ACCOUNT_UNAVAILABLE_CODE,
+        cause,
+        context: { agentType },
+        severity: "ephemeral",
+      },
+    );
+  }
 }
 
 export function resolveCodingAccountStrategy(
@@ -92,7 +149,8 @@ function toMeta(selection: CodingAccountSelection): CodingAccountMeta {
 /**
  * Pick an account for a coding sub-agent. Returns null (single-account
  * fallback) when the bridge is absent, the agent type is not multi-account, or
- * no eligible account exists. Never throws.
+ * no eligible account exists. `strict` preserves bridge failures for durable
+ * recovery; ordinary calls retain the designed single-account degradation.
  */
 export async function selectCodingAccount(
   agentType: string,
@@ -104,15 +162,31 @@ export async function selectCodingAccount(
     accountIds?: string[];
     /** Requested model/display name for model-scoped weekly buckets. */
     model?: string;
+    /** Recovery boundaries preserve selector/materialization failures. */
+    strict?: boolean;
   } = {},
 ): Promise<ResolvedCodingAccount | null> {
   if (!isMultiAccountAgentType(agentType)) return null;
   const bridge = getCodingAccountBridge();
   if (!bridge) return null;
+  const { strict, ...bridgeOpts } = opts;
   let selection: CodingAccountSelection | null = null;
   try {
-    selection = await bridge.select(agentType, opts);
-  } catch {
+    selection = await bridge.select(agentType, bridgeOpts);
+  } catch (cause) {
+    if (strict) {
+      // error-policy:J2 durable recovery must retain the bridge/materialization
+      // failure instead of converting it into the ordinary host-auth fallback.
+      throw new ElizaError(
+        `Pooled account selection failed for ${agentType} durable recovery`,
+        {
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+          cause,
+          context: { agentType, accountIds: opts.accountIds },
+          severity: "ephemeral",
+        },
+      );
+    }
     // error-policy:J4 designed degrade — a select fault degrades to
     // single-account (null); the degraded-vs-benign distinction is surfaced to
     // operators by diagnoseCodingAccountFallback (#9960), not swallowed here.
@@ -338,21 +412,55 @@ export async function reportCodingAccountFailure(
   }
 }
 
-/** Read the account descriptor previously stamped onto a session's metadata. */
-export function accountMetaFromSessionMetadata(
-  metadata: Record<string, unknown> | undefined,
-): CodingAccountMeta | null {
-  const account = metadata?.account;
+function codingAccountMeta(value: unknown): CodingAccountMeta | null {
+  const account = value;
   if (!account || typeof account !== "object") return null;
   const a = account as Record<string, unknown>;
   if (typeof a.providerId !== "string" || typeof a.accountId !== "string") {
     return null;
   }
+  const providerId = a.providerId.trim();
+  const accountId = a.accountId.trim();
+  if (!providerId || !accountId) return null;
+  const label = typeof a.label === "string" ? a.label.trim() : "";
+  const source = typeof a.source === "string" ? a.source.trim() : "";
+  const strategy = typeof a.strategy === "string" ? a.strategy.trim() : "";
   return {
-    providerId: a.providerId,
-    accountId: a.accountId,
-    label: typeof a.label === "string" ? a.label : a.accountId,
-    source: typeof a.source === "string" ? a.source : "oauth",
-    strategy: typeof a.strategy === "string" ? a.strategy : "least-used",
+    providerId,
+    accountId,
+    label: label || accountId,
+    source: source || (providerId.endsWith("-api") ? "api-key" : "oauth"),
+    strategy: strategy || "least-used",
   };
+}
+
+/** Read the account descriptor previously stamped onto a session's metadata. */
+export function accountMetaFromSessionMetadata(
+  metadata: Record<string, unknown> | undefined,
+): CodingAccountMeta | null {
+  return codingAccountMeta(metadata?.account);
+}
+
+/** Read the fail-closed pooled-account pin retained for durable recovery. */
+export function recoveryAccountMetaFromSessionMetadata(
+  metadata: Record<string, unknown> | undefined,
+): CodingAccountMeta | null {
+  return codingAccountMeta(metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY]);
+}
+
+/**
+ * Remove live account attribution while retaining the non-secret identity that
+ * every later recovery attempt must pin. This prevents a revoked account from
+ * becoming an implicit host-auth session on the next restart.
+ */
+export function retainPooledAccountRecoveryRequirement(
+  metadata: Record<string, unknown> | undefined,
+  meta: CodingAccountMeta,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {
+    ...(metadata ?? {}),
+    [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: meta,
+  };
+  delete next.account;
+  return next;
 }

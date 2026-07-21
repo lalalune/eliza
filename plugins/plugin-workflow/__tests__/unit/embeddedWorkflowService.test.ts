@@ -9,6 +9,7 @@ import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import * as dbSchema from '../../src/db/schema';
 import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
+import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
 import { WorkflowService } from '../../src/services/workflow-service';
 
 function runtime(
@@ -200,6 +201,129 @@ describe('EmbeddedWorkflowService', () => {
     await service.stop();
     await embedded.stop();
     await harness.close();
+  }, 60_000);
+
+  test('stop waits for admitted reads and rejects them before they can create recovery work', async () => {
+    const harness = await persistentRuntime();
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    const workflow = await service.createWorkflow({
+      name: 'Admission barrier',
+      nodes: [
+        {
+          id: 'manual',
+          name: 'Manual Trigger',
+          type: 'workflows-nodes-base.manualTrigger',
+          typeVersion: 1,
+          position: [0, 0],
+          parameters: {},
+        },
+      ],
+      connections: {},
+    });
+    const internal = service as unknown as {
+      getStoredWorkflow: (id: string) => Promise<unknown>;
+    };
+    const getStoredWorkflow = internal.getStoredWorkflow.bind(service);
+    let enterRead: (() => void) | undefined;
+    let releaseRead: (() => void) | undefined;
+    const readEntered = new Promise<void>((resolve) => {
+      enterRead = resolve;
+    });
+    const readReleased = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    internal.getStoredWorkflow = async (id) => {
+      enterRead?.();
+      await readReleased;
+      return getStoredWorkflow(id);
+    };
+
+    const runResult = service.executeWorkflow(workflow.id).then(
+      (execution) => ({ execution }),
+      (error: unknown) => ({ error })
+    );
+    await readEntered;
+    let stopFinished = false;
+    const stopResult = service.stop().then(() => {
+      stopFinished = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(stopFinished).toBe(false);
+
+    releaseRead?.();
+    await stopResult;
+    const result = await runResult;
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) throw new Error('stopped workflow admission unexpectedly executed');
+    expect(result.error).toMatchObject({ code: 'WORKFLOW_SERVICE_STOPPED' });
+    expect((await service.listExecutions({ workflowId: workflow.id })).data).toHaveLength(0);
+
+    await harness.close();
+  }, 60_000);
+
+  test('stop surfaces a failed durable lease handoff instead of claiming clean shutdown', async () => {
+    const harness = await persistentRuntime();
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    const workflow = await service.createWorkflow({
+      name: 'Failed shutdown handoff',
+      nodes: [
+        {
+          id: 'manual',
+          name: 'Manual Trigger',
+          type: 'workflows-nodes-base.manualTrigger',
+          typeVersion: 1,
+          position: [0, 0],
+          parameters: {},
+        },
+        {
+          id: 'wait',
+          name: 'Wait',
+          type: 'workflows-nodes-base.wait',
+          typeVersion: 1.1,
+          position: [200, 0],
+          parameters: { amount: 60, unit: 'seconds' },
+        },
+      ],
+      connections: {
+        'Manual Trigger': { main: [[{ node: 'Wait', type: 'main', index: 0 }]] },
+      },
+    });
+    const smithersDbPath = resolveSmithersDbPath(harness.runtime.agentId, workflow.id);
+    const runResult = service.executeWorkflow(workflow.id).then(
+      (execution) => ({ execution }),
+      (error: unknown) => ({ error })
+    );
+
+    const deadline = Date.now() + 15_000;
+    while ((await service.listExecutions({ workflowId: workflow.id })).data.length === 0) {
+      if (Date.now() >= deadline) throw new Error('workflow pending row was not persisted');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const internal = service as unknown as {
+      deferOwnedExecutionRecovery: (executionId: string, delayMs: number) => Promise<void>;
+    };
+    internal.deferOwnedExecutionRecovery = async () => {
+      throw new Error('database lease update failed');
+    };
+
+    await expect(service.stop()).rejects.toMatchObject({
+      errors: [
+        expect.objectContaining({
+          code: 'WORKFLOW_SHUTDOWN_LEASE_RELEASE_FAILED',
+        }),
+      ],
+    });
+    const result = await runResult;
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) throw new Error('workflow unexpectedly completed during stop');
+    expect(result.error).toMatchObject({ code: 'WORKFLOW_SHUTDOWN_LEASE_RELEASE_FAILED' });
+
+    await harness.close();
+    await Promise.all([
+      rm(smithersDbPath, { force: true }),
+      rm(`${smithersDbPath}-wal`, { force: true }),
+      rm(`${smithersDbPath}-shm`, { force: true }),
+    ]);
   }, 60_000);
 
   test('seeds and runs the no-LLM device health check workflow by default', async () => {
@@ -553,7 +677,7 @@ describe('EmbeddedWorkflowService', () => {
       import { join } from 'node:path';
       import { PGlite } from '@electric-sql/pglite';
       import { drizzle } from 'drizzle-orm/pglite';
-      import { EmbeddedWorkflowService } from './src/services/embedded-workflow-service.ts';
+      import { __setWorkflowHttpTransportForTests, EmbeddedWorkflowService } from './src/services/embedded-workflow-service.ts';
       import * as dbSchema from './src/db/schema.ts';
       const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-child-'));
       const client = new PGlite({ dataDir: join(dir, 'pglite') });
@@ -561,11 +685,14 @@ describe('EmbeddedWorkflowService', () => {
       const runtime = { agentId: 'agent-test', db, getSetting: () => null, getService: () => null };
       const service = await EmbeddedWorkflowService.start(runtime);
       try {
-        globalThis.fetch = async (url, options) =>
-          new Response(JSON.stringify({ ok: true, url: String(url), method: options?.method ?? 'GET' }), {
+        __setWorkflowHttpTransportForTests(runtime, {
+          lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+          pinnedFetchImpl: async ({ url, init }) =>
+          new Response(JSON.stringify({ ok: true, url: String(url), method: init.method ?? 'GET' }), {
             headers: { 'content-type': 'application/json' },
             status: 200,
-          });
+          }),
+        });
         const created = await service.createWorkflow({
           name: 'P0 smoke',
           nodes: [
@@ -585,6 +712,7 @@ describe('EmbeddedWorkflowService', () => {
         if (item?.body?.ok !== true) throw new Error('Expected HTTP response body to be preserved');
         console.log('RESULT:' + JSON.stringify({ status: execution.status, item }));
       } finally {
+        __setWorkflowHttpTransportForTests(runtime, undefined);
         await service.stop();
         await client.close();
         await rm(dir, { recursive: true, force: true });
@@ -602,6 +730,172 @@ describe('EmbeddedWorkflowService', () => {
     expect(stderr).not.toContain('HTTP Request node requires');
     expect(exitCode).toBe(0);
   }, 60_000);
+
+  test('executes only the reachable manual, schedule, or webhook branch for each mode', async () => {
+    const pluginRoot = join(import.meta.dir, '../..');
+    const resultDir = await mkdtemp(join(tmpdir(), 'embedded-workflows-trigger-modes-result-'));
+    const resultPath = join(resultDir, 'result.json');
+    const script = `
+      import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      import { PGlite } from '@electric-sql/pglite';
+      import { drizzle } from 'drizzle-orm/pglite';
+      import { EmbeddedWorkflowService } from './src/services/embedded-workflow-service.ts';
+      import * as dbSchema from './src/db/schema.ts';
+      const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-trigger-modes-'));
+      const client = new PGlite({ dataDir: join(dir, 'pglite') });
+      const db = drizzle(client, { schema: dbSchema });
+      const tasks = [];
+      const runtime = {
+        agentId: 'agent-trigger-modes',
+        character: { settings: {} },
+        db,
+        getSetting: (key) => key === 'WORKFLOW_SEED_DEFAULTS' ? false : null,
+        getService: () => null,
+        createTask: async (task) => tasks.push(task),
+        getTasks: async () => tasks,
+        deleteTask: async () => {},
+      };
+      const service = await EmbeddedWorkflowService.start(runtime);
+      try {
+        const created = await service.createWorkflow({
+          name: 'Mode-isolated branches',
+          nodes: [
+            { id: 'manual', name: 'Manual Trigger', type: 'workflows-nodes-base.manualTrigger', typeVersion: 1, position: [0, 0], parameters: {} },
+            { id: 'manual-set', name: 'Manual Output', type: 'workflows-nodes-base.set', typeVersion: 3.4, position: [200, 0], parameters: { assignments: { assignments: [{ name: 'branch', value: 'manual' }] } } },
+            { id: 'schedule-a', name: 'Schedule Trigger A', type: 'workflows-nodes-base.scheduleTrigger', typeVersion: 1.2, position: [0, 200], parameters: { intervalMs: 60000 } },
+            { id: 'schedule-a-set', name: 'Schedule Output A', type: 'workflows-nodes-base.set', typeVersion: 3.4, position: [200, 200], parameters: { assignments: { assignments: [{ name: 'branch', value: 'schedule-a' }] } } },
+            { id: 'schedule-b', name: 'Schedule Trigger B', type: 'workflows-nodes-base.scheduleTrigger', typeVersion: 1.2, position: [0, 300], parameters: { intervalMs: 60000 } },
+            { id: 'schedule-b-set', name: 'Schedule Output B', type: 'workflows-nodes-base.set', typeVersion: 3.4, position: [200, 300], parameters: { assignments: { assignments: [{ name: 'branch', value: 'schedule-b' }] } } },
+            { id: 'webhook', name: 'Webhook Trigger', type: 'workflows-nodes-base.webhook', typeVersion: 2, position: [0, 500], parameters: { path: 'mode-test', httpMethod: 'POST' } },
+            { id: 'webhook-set', name: 'Webhook Output', type: 'workflows-nodes-base.set', typeVersion: 3.4, position: [200, 500], parameters: { assignments: { assignments: [{ name: 'branch', value: 'webhook' }] } } },
+          ],
+          connections: {
+            'Manual Trigger': { main: [[{ node: 'Manual Output', type: 'main', index: 0 }]] },
+            'Schedule Trigger A': { main: [[{ node: 'Schedule Output A', type: 'main', index: 0 }]] },
+            'Schedule Trigger B': { main: [[{ node: 'Schedule Output B', type: 'main', index: 0 }]] },
+            'Webhook Trigger': { main: [[{ node: 'Webhook Output', type: 'main', index: 0 }]] },
+          },
+        });
+
+        const manual = await service.executeWorkflow(created.id, { mode: 'manual' });
+        await service.activateWorkflow(created.id);
+        const scheduleTasks = tasks.filter((task) => task.metadata?.scheduleNodeId);
+        const scheduleA = scheduleTasks.find((task) => task.metadata.scheduleNodeId === 'schedule-a');
+        const scheduleB = scheduleTasks.find((task) => task.metadata.scheduleNodeId === 'schedule-b');
+        if (!scheduleA || !scheduleB) throw new Error('Expected one armed task per schedule node');
+        const scheduleAFirst = await service.executeWorkflowWithDedup(created.id, {
+          mode: 'trigger',
+          scheduleNodeId: scheduleA.metadata.scheduleNodeId,
+          idempotencyKey: scheduleA.metadata.idempotencyKey,
+        });
+        const scheduleADuplicate = await service.executeWorkflowWithDedup(created.id, {
+          mode: 'trigger',
+          scheduleNodeId: scheduleA.metadata.scheduleNodeId,
+          idempotencyKey: scheduleA.metadata.idempotencyKey,
+        });
+        const scheduleBFirst = await service.executeWorkflowWithDedup(created.id, {
+          mode: 'trigger',
+          scheduleNodeId: scheduleB.metadata.scheduleNodeId,
+          idempotencyKey: scheduleB.metadata.idempotencyKey,
+        });
+        const scheduleDebug = await service.executeWorkflow(created.id, { mode: 'trigger' });
+        const staleSchedule = await service.executeWorkflow(created.id, {
+          mode: 'trigger',
+          scheduleNodeId: 'removed-schedule-node',
+          throwOnError: false,
+        });
+        const webhook = await service.executeWebhook('mode-test', { requestId: 'request-1' }, 'POST');
+        const keys = (execution) => Object.keys(execution.data?.resultData?.runData ?? {}).sort();
+        await writeFile(process.env.WORKFLOW_MODE_RESULT_PATH, JSON.stringify({
+          manual: { status: manual.status, nodes: keys(manual) },
+          scheduleA: { status: scheduleAFirst.execution.status, nodes: keys(scheduleAFirst.execution), dedup: scheduleAFirst.dedup, executionId: scheduleAFirst.execution.id },
+          scheduleADuplicate: { executionId: scheduleADuplicate.execution.id, dedup: scheduleADuplicate.dedup },
+          scheduleB: { status: scheduleBFirst.execution.status, nodes: keys(scheduleBFirst.execution), dedup: scheduleBFirst.dedup },
+          scheduleDebug: { status: scheduleDebug.status, nodes: keys(scheduleDebug) },
+          staleSchedule: { status: staleSchedule.status, error: staleSchedule.data?.resultData?.error?.message },
+          scheduleTasks: scheduleTasks.map((task) => ({ scheduleNodeId: task.metadata.scheduleNodeId, idempotencyKey: task.metadata.idempotencyKey })),
+          webhook: { status: webhook.status, nodes: keys(webhook) },
+        }));
+      } finally {
+        await service.stop();
+        await client.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    `;
+
+    try {
+      const proc = Bun.spawn([process.execPath, '-e', script], {
+        cwd: pluginRoot,
+        env: {
+          ...process.env,
+          WORKFLOW_MODE_RESULT_PATH: resultPath,
+          WORKFLOW_DIAGNOSTICS_ENABLED: 'false',
+        },
+        stdout: 'ignore',
+        stderr: 'pipe',
+      });
+      const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+
+      expect(stderr).toBe('');
+      expect(exitCode).toBe(0);
+      const result = JSON.parse(await readFile(resultPath, 'utf8')) as Record<
+        string,
+        | {
+            status?: string;
+            nodes?: string[];
+            dedup?: boolean;
+            executionId?: string;
+            error?: string;
+          }
+        | Array<{ scheduleNodeId: string; idempotencyKey: string }>
+      >;
+      expect(result.manual).toEqual({
+        status: 'success',
+        nodes: ['Manual Output', 'Manual Trigger'],
+      });
+      expect(result.scheduleA).toMatchObject({
+        status: 'success',
+        nodes: ['Schedule Output A', 'Schedule Trigger A'],
+        dedup: false,
+      });
+      expect(result.scheduleADuplicate).toMatchObject({ dedup: true });
+      expect((result.scheduleADuplicate as { executionId?: string }).executionId).toBe(
+        (result.scheduleA as { executionId?: string }).executionId
+      );
+      expect(result.scheduleB).toEqual({
+        status: 'success',
+        nodes: ['Schedule Output B', 'Schedule Trigger B'],
+        dedup: false,
+      });
+      expect(result.scheduleDebug).toEqual({
+        status: 'success',
+        nodes: [
+          'Schedule Output A',
+          'Schedule Output B',
+          'Schedule Trigger A',
+          'Schedule Trigger B',
+        ],
+      });
+      expect(result.staleSchedule).toMatchObject({
+        status: 'error',
+        error: expect.stringContaining('unknown schedule node'),
+      });
+      const scheduleTasks = result.scheduleTasks as Array<{
+        scheduleNodeId: string;
+        idempotencyKey: string;
+      }>;
+      expect(scheduleTasks).toHaveLength(2);
+      expect(new Set(scheduleTasks.map((task) => task.idempotencyKey)).size).toBe(2);
+      expect(result.webhook).toEqual({
+        status: 'success',
+        nodes: ['Webhook Output', 'Webhook Trigger'],
+      });
+    } finally {
+      await rm(resultDir, { recursive: true, force: true });
+    }
+  }, 90_000);
 
   test('persists workflows across embedded service restarts', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-persist-'));

@@ -181,6 +181,7 @@ export function getTriggerLimit(runtime?: IAgentRuntime): number {
 interface WorkflowDispatchOptionsLike {
   triggerData?: Record<string, unknown>;
   idempotencyKey?: string;
+  scheduleNodeId?: string;
 }
 
 interface WorkflowDispatchServiceLike {
@@ -205,6 +206,22 @@ function readTaskIdempotencyKey(task: Task): string | undefined {
   const meta = task.metadata as Record<string, unknown> | undefined;
   const key = meta?.idempotencyKey;
   return typeof key === "string" && key.length > 0 ? key : undefined;
+}
+
+function readTaskScheduleNodeId(task: Task): string | undefined {
+  const value = taskMetadata(task).scheduleNodeId;
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function buildWorkflowTaskIdempotencyKey(
+  workflowId: string,
+  scheduleIdentity: string,
+  nextRunAtMs: number,
+): string {
+  const minuteBucket = Math.floor(nextRunAtMs / 60_000);
+  return `${workflowId}:${encodeURIComponent(scheduleIdentity)}:${minuteBucket}`;
 }
 
 /**
@@ -247,7 +264,10 @@ async function dispatchWorkflow(
   task: Task,
   trigger: WorkflowTriggerConfig,
   event?: TriggerExecutionOptions["event"],
-): Promise<{ ok: true; executionId?: string } | { ok: false; error: string }> {
+): Promise<
+  | { ok: true; executionId?: string; dedup?: boolean }
+  | { ok: false; error: string; dedup?: boolean }
+> {
   if (!trigger.workflowId) {
     return { ok: false, error: "workflow trigger missing workflowId" };
   }
@@ -268,6 +288,7 @@ async function dispatchWorkflow(
     };
   }
   const idempotencyKey = readTaskIdempotencyKey(task);
+  const scheduleNodeId = readTaskScheduleNodeId(task);
   const payload = event
     ? {
         eventKind: event.kind,
@@ -276,10 +297,19 @@ async function dispatchWorkflow(
     : {};
   const result = await svc.execute(trigger.workflowId, payload, {
     idempotencyKey,
+    scheduleNodeId,
   });
   return result.ok
-    ? { ok: true, executionId: result.executionId }
-    : { ok: false, error: result.error ?? "workflow execution failed" };
+    ? {
+        ok: true,
+        executionId: result.executionId,
+        ...(result.dedup ? { dedup: true } : {}),
+      }
+    : {
+        ok: false,
+        error: result.error ?? "workflow execution failed",
+        ...(result.dedup ? { dedup: true } : {}),
+      };
 }
 
 interface AutonomyRoomService {
@@ -421,6 +451,12 @@ export async function executeTriggerTask(
     // Only workflow dispatch carries an execution id; prompt dispatch types it
     // as `undefined`, so this reads `string | undefined` without a cast.
     workflowExecutionId = result.executionId;
+    if ("dedup" in result && result.dedup) {
+      // A duplicate scheduler delivery was accepted by the durable execution
+      // boundary but did not perform new work. Record it as skipped so it can
+      // advance the task schedule without emitting a second completion notice.
+      status = "skipped";
+    }
   } else {
     status = "error";
     errorMessage = result.error;
@@ -454,7 +490,24 @@ export async function executeTriggerTask(
           error: errorMessage,
         },
       })
-      .catch(() => {});
+      .catch((error) => {
+        // error-policy:J5 notification delivery is supplemental after the
+        // trigger failure is recorded below; observe it without replacing the
+        // original workflow failure presented to the scheduler.
+        runtime.reportError?.("TriggerRuntime.failureNotification", error, {
+          taskId: task.id,
+          triggerId: trigger.triggerId,
+        });
+        runtime.logger.warn(
+          {
+            src: "trigger-runtime",
+            taskId: task.id,
+            triggerId: trigger.triggerId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to deliver automation failure notification",
+        );
+      });
   }
 
   if (status === "success") {
@@ -488,7 +541,26 @@ export async function executeTriggerTask(
           workflowExecutionId,
         },
       })
-      .catch(() => {});
+      .catch((error) => {
+        // error-policy:J5 notification delivery is supplemental after the
+        // successful trigger result is recorded below; observe it without
+        // turning completed workflow work into a failed scheduler result.
+        runtime.reportError?.("TriggerRuntime.successNotification", error, {
+          taskId: task.id,
+          triggerId: trigger.triggerId,
+          workflowExecutionId,
+        });
+        runtime.logger.warn(
+          {
+            src: "trigger-runtime",
+            taskId: task.id,
+            triggerId: trigger.triggerId,
+            workflowExecutionId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to deliver automation completion notification",
+        );
+      });
   }
 
   const finishedAt = Date.now();
@@ -556,10 +628,16 @@ export async function executeTriggerTask(
     metadataToPersist.trigger.workflowId &&
     typeof metadataToPersist.trigger.nextRunAtMs === "number"
   ) {
-    const minuteBucket = Math.floor(
-      metadataToPersist.trigger.nextRunAtMs / 60_000,
+    const scheduleIdentity =
+      typeof metadataToPersist.scheduleNodeId === "string" &&
+      metadataToPersist.scheduleNodeId.trim().length > 0
+        ? metadataToPersist.scheduleNodeId.trim()
+        : metadataToPersist.trigger.triggerId;
+    metadataToPersist.idempotencyKey = buildWorkflowTaskIdempotencyKey(
+      metadataToPersist.trigger.workflowId,
+      scheduleIdentity,
+      metadataToPersist.trigger.nextRunAtMs,
     );
-    metadataToPersist.idempotencyKey = `${metadataToPersist.trigger.workflowId}:${minuteBucket}`;
   } else {
     delete metadataToPersist.idempotencyKey;
   }

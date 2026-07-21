@@ -178,7 +178,167 @@ describe("account_switched re-keys usage + health attribution", () => {
     await service.stop();
   });
 
-  it("ignores a malformed account_switched payload (record stays keyed as-is)", async () => {
+  it("serializes a usage frame behind the durable account switch", async () => {
+    const { bridge, usage } = makeRecordingBridge();
+    setCodingAgentSelectorBridge(bridge);
+    const fake = makeFakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const { sessionId } = await seedTaskWithSession(store);
+    const updateSession = store.updateSession.bind(store);
+    let releaseSwitchWrite: (() => void) | undefined;
+    const switchWriteGate = new Promise<void>((resolve) => {
+      releaseSwitchWrite = resolve;
+    });
+    let markSwitchWriteStarted: (() => void) | undefined;
+    const switchWriteStarted = new Promise<void>((resolve) => {
+      markSwitchWriteStarted = resolve;
+    });
+    vi.spyOn(store, "updateSession").mockImplementation(
+      async (targetSessionId, patch) => {
+        if (patch.accountId === "acct-b") {
+          markSwitchWriteStarted?.();
+          await switchWriteGate;
+        }
+        await updateSession(targetSessionId, patch);
+      },
+    );
+    const service = new OrchestratorTaskService(
+      makeRuntime(fake.service) as never,
+      { store },
+    );
+    await service.start();
+
+    fake.emit(sessionId, "account_switched", {
+      providerId: "anthropic-subscription",
+      accountId: "acct-b",
+      label: "B",
+    });
+    fake.emit(sessionId, "usage_update", {
+      inputTokens: 100,
+      outputTokens: 50,
+      state: "measured",
+    });
+
+    await switchWriteStarted;
+    expect(usage).toHaveLength(0);
+    releaseSwitchWrite?.();
+    await service.stop();
+
+    expect(usage).toEqual([
+      {
+        providerId: "anthropic-subscription",
+        accountId: "acct-b",
+      },
+    ]);
+  });
+
+  it("blocks usage after a failed account switch write until attribution is repaired", async () => {
+    const { bridge, usage } = makeRecordingBridge();
+    setCodingAgentSelectorBridge(bridge);
+    const fake = makeFakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const { sessionId } = await seedTaskWithSession(store);
+    const updateSession = store.updateSession.bind(store);
+    let rejectFirstSwitch = true;
+    vi.spyOn(store, "updateSession").mockImplementation(
+      async (targetSessionId, patch) => {
+        if (rejectFirstSwitch && patch.accountId === "acct-b") {
+          rejectFirstSwitch = false;
+          throw new Error("account attribution write failed");
+        }
+        await updateSession(targetSessionId, patch);
+      },
+    );
+    const runtime = makeRuntime(fake.service);
+    const service = new OrchestratorTaskService(runtime as never, { store });
+    await service.start();
+
+    fake.emit(sessionId, "account_switched", {
+      providerId: "anthropic-subscription",
+      accountId: "acct-b",
+      label: "B",
+    });
+    fake.emit(sessionId, "usage_update", {
+      inputTokens: 100,
+      outputTokens: 50,
+      state: "measured",
+    });
+    await vi.waitFor(() => {
+      expect(runtime.reportError).toHaveBeenCalledTimes(2);
+    });
+    expect(usage).toHaveLength(0);
+
+    fake.emit(sessionId, "account_switched", {
+      providerId: "anthropic-subscription",
+      accountId: "acct-b",
+      label: "B",
+    });
+    fake.emit(sessionId, "usage_update", {
+      inputTokens: 25,
+      outputTokens: 10,
+      state: "measured",
+    });
+    await service.stop();
+
+    expect(usage).toEqual([
+      {
+        providerId: "anthropic-subscription",
+        accountId: "acct-b",
+      },
+    ]);
+  });
+
+  it("quarantines usage while an unavailable account recovery pin is retained", async () => {
+    const { bridge, usage } = makeRecordingBridge();
+    setCodingAgentSelectorBridge(bridge);
+    const fake = makeFakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const { sessionId } = await seedTaskWithSession(store);
+    const runtime = makeRuntime(fake.service);
+    const service = new OrchestratorTaskService(runtime as never, { store });
+    await service.start();
+
+    fake.emit(sessionId, "account_cleared", {
+      providerId: "anthropic-subscription",
+      accountId: "acct-a",
+      label: "A",
+    });
+    fake.emit(sessionId, "usage_update", {
+      inputTokens: 100,
+      outputTokens: 50,
+      state: "measured",
+    });
+    await vi.waitFor(() => {
+      expect(runtime.reportError).toHaveBeenCalledTimes(1);
+    });
+    expect(usage).toHaveLength(0);
+    const quarantined = await store.findSession(sessionId);
+    expect(quarantined?.session.accountId).toBeUndefined();
+    expect(quarantined?.session.metadata.pooledAccountRecovery).toMatchObject({
+      accountId: "acct-a",
+    });
+
+    fake.emit(sessionId, "account_switched", {
+      providerId: "anthropic-subscription",
+      accountId: "acct-b",
+      label: "B",
+    });
+    fake.emit(sessionId, "usage_update", {
+      inputTokens: 25,
+      outputTokens: 10,
+      state: "measured",
+    });
+    await service.stop();
+
+    expect(usage).toEqual([
+      {
+        providerId: "anthropic-subscription",
+        accountId: "acct-b",
+      },
+    ]);
+  });
+
+  it("rejects a malformed account_switched payload (record stays keyed as-is)", async () => {
     const { bridge } = makeRecordingBridge();
     setCodingAgentSelectorBridge(bridge);
     const fake = makeFakeAcp();

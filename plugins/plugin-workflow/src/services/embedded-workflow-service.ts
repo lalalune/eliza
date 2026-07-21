@@ -17,6 +17,8 @@ import { statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, totalmem, uptime } from 'node:os';
 import {
   ElizaError,
+  fetchWithSsrfGuard,
+  type GuardedFetchOptions,
   type IAgentRuntime,
   logger,
   Service,
@@ -26,7 +28,7 @@ import {
   type UUID,
 } from '@elizaos/core';
 import { detectHostCapabilities } from '@elizaos/shared';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, lte, or, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import {
   embeddedCredentials,
@@ -47,7 +49,11 @@ import type {
   WorkflowTag,
 } from '../types/index';
 import { WorkflowApiError } from '../types/index';
-import { runWorkflowWithSmithers, type SmithersExecutionPlan } from './smithers-runtime';
+import {
+  resolveSmithersTimeoutMs,
+  runWorkflowWithSmithers,
+  type SmithersExecutionPlan,
+} from './smithers-runtime';
 
 export const EMBEDDED_WORKFLOW_SERVICE_TYPE = 'embedded_workflow_service';
 
@@ -74,6 +80,10 @@ const WORKFLOW_TASK_TAG = 'workflow';
  */
 const LEGACY_WORKFLOW_RUN_TASK_NAME = 'workflow.run';
 const LEGACY_WORKFLOW_WEBHOOK_TASK_NAME = 'workflow.webhook';
+
+// Workflow node output is persisted and can also enter later model context, so
+// one public endpoint must not be able to consume the agent process's memory.
+const WORKFLOW_HTTP_MAX_RESPONSE_BYTES = 1_048_576;
 
 type WorkflowExecuteMode = WorkflowExecution['mode'];
 
@@ -160,16 +170,24 @@ interface ExecuteOptions {
    */
   triggerData?: Record<string, unknown>;
   /**
-   * Optional idempotency key. Persisted alongside the resulting
-   * execution row so the dispatch layer can detect duplicates and
-   * short-circuit re-runs (e.g. minute-bucketed schedule fires).
+   * Optional idempotency key. The service atomically claims the key with a
+   * durable pending row before execution, then returns that row to duplicate
+   * callers (e.g. minute-bucketed schedule fires).
    */
   idempotencyKey?: string;
+  /** Stable identity of the schedule node whose task fired. Omitted only for
+   * explicit debug runs that intentionally exercise every schedule branch. */
+  scheduleNodeId?: string;
   /**
    * When false, failed manual/debug runs are returned as persisted error
    * executions instead of being thrown away as route-level exceptions.
    */
   throwOnError?: boolean;
+}
+
+export interface WorkflowExecutionClaimResult {
+  execution: WorkflowExecution;
+  dedup: boolean;
 }
 
 const SMITHERS_RESUME_STATE_KEY = 'smithersResumeState';
@@ -187,8 +205,28 @@ interface IncomingConnection {
 
 const EMBEDDED_HOST = 'embedded://local';
 const DEFAULT_SCHEDULE_INTERVAL_MS = 60_000;
+const EXECUTION_LEASE_HEARTBEAT_MS = 10_000;
+const EXECUTION_RECOVERY_POLL_MS = 1_000;
+const EXECUTION_RECOVERY_RETRY_MS = 30_000;
+const EXECUTION_LEASE_DEADLINE_GRACE_MS = 30_000;
 export const DEVICE_HEALTH_CHECK_WORKFLOW_ID = 'system-device-health-check';
 const DEVICE_HEALTH_CHECK_RUN_KEY = `${DEVICE_HEALTH_CHECK_WORKFLOW_ID}:initial`;
+
+type WorkflowHttpTransport = Pick<
+  GuardedFetchOptions,
+  'fetchImpl' | 'lookupFn' | 'pinnedFetchImpl' | 'policy'
+>;
+
+const workflowHttpTransportsForTests = new WeakMap<IAgentRuntime, WorkflowHttpTransport>();
+
+/** Test seam for exercising the real SSRF guard with deterministic DNS and transport. */
+export function __setWorkflowHttpTransportForTests(
+  runtime: IAgentRuntime,
+  transport: WorkflowHttpTransport | undefined
+): void {
+  if (transport) workflowHttpTransportsForTests.set(runtime, transport);
+  else workflowHttpTransportsForTests.delete(runtime);
+}
 
 /**
  * Persistent, once-per-install marker recording that the default workflow was
@@ -221,6 +259,7 @@ const WORKFLOW_AGENT_SCOPE_INDEXES = [
   'idx_embedded_executions_agent_status',
   'idx_embedded_executions_agent_started_at',
   'idx_embedded_executions_agent_idempotency_key',
+  'idx_embedded_executions_agent_recovery_lease',
   'idx_embedded_credentials_agent_type',
   'idx_embedded_tags_agent_name',
 ] as const;
@@ -238,6 +277,21 @@ function cloneJson<T>(value: T): T {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function waitForDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -420,13 +474,22 @@ function shouldSeedDefaultWorkflows(runtime: IAgentRuntime): boolean {
 
 /**
  * Build the per-dispatch idempotency key used to dedup back-to-back
- * scheduled fires for the same workflow within the same minute. Shared
- * by `armSchedules` (which writes it into the task metadata) and
- * `WorkflowDispatchService.execute` (which looks it up before running).
+ * scheduled fires for the same workflow node within the same minute. The
+ * node identity keeps sibling schedules independent even when both are due
+ * in one bucket.
  */
-export function buildScheduleIdempotencyKey(workflowId: string, nextRunAtMs: number): string {
+export function buildScheduleIdempotencyKey(
+  workflowId: string,
+  scheduleNodeId: string,
+  nextRunAtMs: number
+): string {
   const minuteBucket = Math.floor(nextRunAtMs / 60_000);
-  return `${workflowId}:${minuteBucket}`;
+  return `${workflowId}:${encodeURIComponent(scheduleNodeId)}:${minuteBucket}`;
+}
+
+function resolveScheduleNodeId(workflowId: string, node: WorkflowNode): string {
+  const explicit = typeof node.id === 'string' ? node.id.trim() : '';
+  return explicit || stringToUuid(`${workflowId}:schedule:${node.name}`);
 }
 
 function resolveScheduleIntervalMs(parameters: Record<string, unknown>): number {
@@ -653,8 +716,82 @@ function evaluateConditions(
   return combinator === 'or' ? results.some(Boolean) : results.every(Boolean);
 }
 
+function workflowHttpResponseTooLarge(actualBytes?: number): ElizaError {
+  return new ElizaError(
+    `Workflow HTTP response exceeds maximum size of ${WORKFLOW_HTTP_MAX_RESPONSE_BYTES} bytes`,
+    {
+      code: 'WORKFLOW_HTTP_RESPONSE_TOO_LARGE',
+      context: {
+        maxBytes: WORKFLOW_HTTP_MAX_RESPONSE_BYTES,
+        ...(actualBytes === undefined ? {} : { actualBytes }),
+      },
+    }
+  );
+}
+
+async function readResponseTextWithLimit(response: Response): Promise<string> {
+  const declaredLength = response.headers.get('content-length');
+  if (declaredLength) {
+    const parsedLength = Number.parseInt(declaredLength, 10);
+    if (Number.isFinite(parsedLength) && parsedLength > WORKFLOW_HTTP_MAX_RESPONSE_BYTES) {
+      const error = workflowHttpResponseTooLarge(parsedLength);
+      try {
+        await response.body?.cancel(error);
+      } catch (cancelError) {
+        // error-policy:J6 the size violation is authoritative; body cancellation
+        // is best-effort transport teardown and must not replace that failure.
+        logger.warn(
+          {
+            src: 'plugin:workflow:http',
+            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          },
+          'failed to cancel oversized workflow HTTP response'
+        );
+      }
+      throw error;
+    }
+  }
+
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > WORKFLOW_HTTP_MAX_RESPONSE_BYTES) {
+        throw workflowHttpResponseTooLarge(totalBytes);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch (cancelError) {
+      // error-policy:J6 the read/size error remains authoritative; cancelling
+      // the upstream response is best-effort transport teardown.
+      logger.warn(
+        {
+          src: 'plugin:workflow:http',
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        },
+        'failed to cancel workflow HTTP response after a body read failure'
+      );
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
 async function parseResponseBody(response: Response): Promise<unknown> {
-  const text = await response.text();
+  const text = await readResponseTextWithLimit(response);
   if (!text) return null;
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('application/json')) {
@@ -926,16 +1063,26 @@ function createHttpRequestNode(): INodeType {
           }
         }
 
-        const response = await fetch(url, requestOptions);
-        const body = await parseResponseBody(response);
-        output.push({
-          json: {
-            statusCode: response.status,
-            headers: Object.fromEntries(response.headers.entries()),
-            body,
-          } as INodeExecutionData['json'],
-          pairedItem: { item: itemIndex },
+        const runtime = this.getRuntime?.();
+        const guarded = await fetchWithSsrfGuard({
+          url,
+          init: requestOptions,
+          signal: this.getAbortSignal?.(),
+          ...(runtime ? workflowHttpTransportsForTests.get(runtime) : undefined),
         });
+        try {
+          const body = await parseResponseBody(guarded.response);
+          output.push({
+            json: {
+              statusCode: guarded.response.status,
+              headers: Object.fromEntries(guarded.response.headers.entries()),
+              body,
+            } as INodeExecutionData['json'],
+            pairedItem: { item: itemIndex },
+          });
+        } finally {
+          await guarded.release();
+        }
       }
 
       return [output];
@@ -1639,6 +1786,17 @@ export class EmbeddedWorkflowService extends Service {
   private schemaReady: Promise<void> | null = null;
   private readonly recoveryController = new AbortController();
   private recoveryPromise: Promise<void> | null = null;
+  private readonly executionController = new AbortController();
+  private shutdownReason: ElizaError | null = null;
+  private readonly activeAdmissionSettlements = new Set<Promise<void>>();
+  private readonly activeExecutionSettlements = new Set<Promise<void>>();
+  private readonly shutdownCleanupErrors: unknown[] = [];
+  private readonly executionOwnerId = randomUUID();
+  // A takeover cannot become eligible while a delegated node may still be in
+  // flight: Smithers kills the run at its workflow deadline, and this outer
+  // lease extends one teardown grace beyond that maximum.
+  private readonly executionLeaseDurationMs =
+    resolveSmithersTimeoutMs() + EXECUTION_LEASE_DEADLINE_GRACE_MS;
 
   static async start(runtime: IAgentRuntime): Promise<EmbeddedWorkflowService> {
     const service = new EmbeddedWorkflowService(runtime);
@@ -1658,12 +1816,30 @@ export class EmbeddedWorkflowService extends Service {
   }
 
   override async stop(): Promise<void> {
-    // Scheduling lives in core's TaskService. Tasks persist across restart;
-    // only a startup recovery worker is owned in-process.
+    const reason =
+      this.shutdownReason ??
+      new ElizaError('Embedded workflow service stopped', {
+        code: 'WORKFLOW_SERVICE_STOPPED',
+        severity: 'ephemeral',
+      });
+    this.shutdownReason = reason;
     if (!this.recoveryController.signal.aborted) {
-      this.recoveryController.abort(new Error('Embedded workflow service stopped'));
+      this.recoveryController.abort(reason);
+    }
+    if (!this.executionController.signal.aborted) {
+      this.executionController.abort(reason);
     }
     await this.recoveryPromise;
+    // Active runs settle cooperatively after cancellation. Their persisted rows
+    // are released without becoming terminal so a replacement service can
+    // immediately recover the same Smithers execution id.
+    await Promise.all([...this.activeAdmissionSettlements, ...this.activeExecutionSettlements]);
+    if (this.shutdownCleanupErrors.length > 0) {
+      throw new AggregateError(
+        this.shutdownCleanupErrors,
+        'Embedded workflow service could not release every active execution for recovery'
+      );
+    }
   }
 
   get host(): string {
@@ -1704,6 +1880,25 @@ export class EmbeddedWorkflowService extends Service {
       });
     }
     return agentId;
+  }
+
+  private assertAcceptingExecutions(): void {
+    if (this.shutdownReason) throw this.shutdownReason;
+  }
+
+  private async trackExecutionAdmission<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertAcceptingExecutions();
+    const operationPromise = operation();
+    const settlement = operationPromise.then(
+      () => undefined,
+      () => undefined
+    );
+    this.activeAdmissionSettlements.add(settlement);
+    try {
+      return await operationPromise;
+    } finally {
+      this.activeAdmissionSettlements.delete(settlement);
+    }
   }
 
   /**
@@ -1811,13 +2006,29 @@ export class EmbeddedWorkflowService extends Service {
             "started_at" text NOT NULL,
             "stopped_at" text,
             "execution" jsonb NOT NULL,
-            "idempotency_key" text
+            "idempotency_key" text,
+            "execution_owner_id" text,
+            "execution_lease_expires_at" timestamp with time zone
           )
         `);
-          // Online migration: add idempotency_key to pre-existing tables.
+          // These additive columns keep rolling upgrades compatible with
+          // execution rows written before durable claims and leases existed.
           await tx.execute(sql`
           ALTER TABLE "workflow"."embedded_executions"
           ADD COLUMN IF NOT EXISTS "idempotency_key" text
+        `);
+          await tx.execute(sql`
+          ALTER TABLE "workflow"."embedded_executions"
+          ADD COLUMN IF NOT EXISTS "execution_owner_id" text
+        `);
+          await tx.execute(sql`
+          ALTER TABLE "workflow"."embedded_executions"
+          ADD COLUMN IF NOT EXISTS "execution_lease_expires_at" timestamp with time zone
+        `);
+          await tx.execute(sql`
+          ALTER TABLE "workflow"."embedded_executions"
+          ALTER COLUMN "execution_lease_expires_at" TYPE timestamp with time zone
+          USING "execution_lease_expires_at"::timestamp with time zone
         `);
           await tx.execute(sql`
           CREATE TABLE IF NOT EXISTS "workflow"."embedded_credentials" (
@@ -1924,6 +2135,7 @@ export class EmbeddedWorkflowService extends Service {
             `CREATE INDEX IF NOT EXISTS "idx_embedded_executions_agent_status" ON "workflow"."embedded_executions" ("agent_id", "status")`,
             `CREATE INDEX IF NOT EXISTS "idx_embedded_executions_agent_started_at" ON "workflow"."embedded_executions" ("agent_id", "started_at")`,
             `CREATE INDEX IF NOT EXISTS "idx_embedded_executions_agent_idempotency_key" ON "workflow"."embedded_executions" ("agent_id", "idempotency_key")`,
+            `CREATE INDEX IF NOT EXISTS "idx_embedded_executions_agent_recovery_lease" ON "workflow"."embedded_executions" ("agent_id", "finished", "status", "execution_lease_expires_at")`,
             `CREATE INDEX IF NOT EXISTS "idx_embedded_credentials_agent_type" ON "workflow"."embedded_credentials" ("agent_id", "type")`,
             `CREATE UNIQUE INDEX IF NOT EXISTS "idx_embedded_tags_agent_name" ON "workflow"."embedded_tags" ("agent_id", "name")`,
           ] as const;
@@ -2308,14 +2520,60 @@ export class EmbeddedWorkflowService extends Service {
   }
 
   async executeWorkflow(id: string, options: ExecuteOptions = {}): Promise<WorkflowExecution> {
-    const entry = await this.getStoredWorkflow(id);
-    return this.runWorkflow(
-      entry.workflow,
-      options.mode ?? 'manual',
-      options.triggerData,
-      options.idempotencyKey,
-      options.throwOnError ?? true
-    );
+    const result = await this.executeWorkflowWithDedup(id, options);
+    return result.execution;
+  }
+
+  /**
+   * Execute a workflow while reporting whether a durable idempotency claim
+   * already existed. The pending row is committed under a transaction-scoped
+   * advisory lock before Smithers can perform any node side effects.
+   */
+  executeWorkflowWithDedup(
+    id: string,
+    options: ExecuteOptions = {}
+  ): Promise<WorkflowExecutionClaimResult> {
+    return this.trackExecutionAdmission(async () => {
+      const entry = await this.getStoredWorkflow(id);
+      this.assertAcceptingExecutions();
+      const mode = options.mode ?? 'manual';
+      const throwOnError = options.throwOnError ?? true;
+      if (!options.idempotencyKey) {
+        return {
+          execution: await this.runWorkflow(
+            entry.workflow,
+            mode,
+            options.triggerData,
+            undefined,
+            throwOnError,
+            options.scheduleNodeId
+          ),
+          dedup: false,
+        };
+      }
+
+      const claim = await this.claimIdempotentExecution(
+        entry.workflow,
+        mode,
+        options.triggerData,
+        options.idempotencyKey,
+        options.scheduleNodeId
+      );
+      if (!claim.claimed) {
+        return { execution: claim.execution, dedup: true };
+      }
+
+      return {
+        execution: await this.executePendingWorkflow(
+          entry.workflow,
+          claim.execution,
+          options.triggerData,
+          options.idempotencyKey,
+          throwOnError
+        ),
+        dedup: false,
+      };
+    });
   }
 
   /**
@@ -2345,68 +2603,75 @@ export class EmbeddedWorkflowService extends Service {
     return row ? cloneJson(row.execution) : null;
   }
 
-  async executeWebhook(
+  executeWebhook(
     path: string,
     payload: Record<string, unknown>,
     method = 'POST'
   ): Promise<WorkflowExecution> {
-    await this.ensureSchema();
-    const normalizedPath = normalizeWebhookPath(path);
-    const normalizedMethod = method.toUpperCase();
-    const rows = await this.getDb()
-      .select()
-      .from(embeddedWorkflows)
-      .where(
-        and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.active, true))
-      );
+    return this.trackExecutionAdmission(async () => {
+      await this.ensureSchema();
+      const normalizedPath = normalizeWebhookPath(path);
+      const normalizedMethod = method.toUpperCase();
+      const rows = await this.getDb()
+        .select()
+        .from(embeddedWorkflows)
+        .where(
+          and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.active, true))
+        );
+      this.assertAcceptingExecutions();
 
-    for (const row of rows) {
-      const workflow = cloneJson(row.workflow);
-      const webhookNode = workflow.nodes.find((node) => {
-        if (node.disabled || node.type !== 'workflows-nodes-base.webhook') return false;
-        const nodePath = normalizeWebhookPath(node.parameters.path);
-        const nodeMethod = readString(node.parameters.httpMethod, 'POST').toUpperCase();
-        return nodePath === normalizedPath && nodeMethod === normalizedMethod;
-      });
-      if (!webhookNode) continue;
-      webhookNode.parameters = {
-        ...webhookNode.parameters,
-        __embeddedPayload: {
-          ...payload,
-          headers: isRecord(payload.headers) ? payload.headers : {},
-          method: normalizedMethod,
-          path: normalizedPath,
-        },
-      };
-      return this.runWorkflow(workflow, 'webhook');
-    }
+      for (const row of rows) {
+        const workflow = cloneJson(row.workflow);
+        const webhookNode = workflow.nodes.find((node) => {
+          if (node.disabled || node.type !== 'workflows-nodes-base.webhook') return false;
+          const nodePath = normalizeWebhookPath(node.parameters.path);
+          const nodeMethod = readString(node.parameters.httpMethod, 'POST').toUpperCase();
+          return nodePath === normalizedPath && nodeMethod === normalizedMethod;
+        });
+        if (!webhookNode) continue;
+        webhookNode.parameters = {
+          ...webhookNode.parameters,
+          __embeddedPayload: {
+            ...payload,
+            headers: isRecord(payload.headers) ? payload.headers : {},
+            method: normalizedMethod,
+            path: normalizedPath,
+          },
+        };
+        return this.runWorkflow(workflow, 'webhook');
+      }
 
-    throw new WorkflowApiError(`Webhook not found: ${normalizedMethod} /${normalizedPath}`, 404);
+      throw new WorkflowApiError(`Webhook not found: ${normalizedMethod} /${normalizedPath}`, 404);
+    });
   }
 
-  async triggerSchedulesOnce(workflowId?: string): Promise<WorkflowExecution[]> {
-    // Fire scheduled workflows once on demand (used by tests / debug). Reads
-    // active workflows directly from the DB rather than from in-process state
-    // because scheduling state now lives in core's task table.
-    const executions: WorkflowExecution[] = [];
-    if (workflowId) {
-      const entry = await this.getStoredWorkflow(workflowId);
-      if (!entry.workflow.active) return executions;
-      executions.push(await this.runWorkflow(entry.workflow, 'trigger'));
+  triggerSchedulesOnce(workflowId?: string): Promise<WorkflowExecution[]> {
+    return this.trackExecutionAdmission(async () => {
+      // Fire scheduled workflows once on demand (used by tests / debug). Reads
+      // active workflows directly from the DB rather than from in-process state
+      // because scheduling state now lives in core's task table.
+      const executions: WorkflowExecution[] = [];
+      if (workflowId) {
+        const entry = await this.getStoredWorkflow(workflowId);
+        this.assertAcceptingExecutions();
+        if (!entry.workflow.active) return executions;
+        executions.push(await this.runWorkflow(entry.workflow, 'trigger'));
+        return executions;
+      }
+      await this.ensureSchema();
+      const rows = await this.getDb()
+        .select()
+        .from(embeddedWorkflows)
+        .where(
+          and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.active, true))
+        );
+      this.assertAcceptingExecutions();
+      for (const row of rows) {
+        const wf = cloneJson(row.workflow);
+        executions.push(await this.runWorkflow(wf, 'trigger'));
+      }
       return executions;
-    }
-    await this.ensureSchema();
-    const rows = await this.getDb()
-      .select()
-      .from(embeddedWorkflows)
-      .where(
-        and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.active, true))
-      );
-    for (const row of rows) {
-      const wf = cloneJson(row.workflow);
-      executions.push(await this.runWorkflow(wf, 'trigger'));
-    }
-    return executions;
+    });
   }
 
   private async captureWorkflowRevision(
@@ -2483,7 +2748,7 @@ export class EmbeddedWorkflowService extends Service {
       }
       if (caps.requiresInbound && !host.inbound) {
         issues.push(
-          `${node.name} needs an inbound public webhook; host '${host.label}' can't receive — pair Eliza Cloud or enable plugin-tunnel`
+          `${node.name} needs an authenticated, reachable inbound webhook; host '${host.label}' can't receive — pair Eliza Cloud or enable plugin-tunnel`
         );
       }
       if (caps.requiresLongRunning && !host.longRunning) {
@@ -2847,8 +3112,8 @@ export class EmbeddedWorkflowService extends Service {
    *  node on the workflow. Idempotent: existing tasks for this workflow
    *  are removed first so the task set always reflects the current
    *  workflow definition. Each task carries an idempotency key derived
-   *  from `(workflowId, nextRunAt-minute-bucket)` so that simultaneous
-   *  fires within the same minute deduplicate at dispatch. */
+   *  from `(workflowId, scheduleNodeId, nextRunAt-minute-bucket)` so that
+   *  retries deduplicate without suppressing a sibling schedule. */
   private async armSchedules(workflowId: string): Promise<void> {
     await this.clearSchedules(workflowId);
     if (typeof this.runtime.createTask !== 'function') return;
@@ -2863,11 +3128,12 @@ export class EmbeddedWorkflowService extends Service {
       const intervalMs = resolveScheduleIntervalMs(node.parameters);
       const trigger = this.buildScheduleTrigger(workflowId, entry.workflow.name, intervalMs);
       const nextRunAtMs = nowMs + intervalMs;
+      const scheduleNodeId = resolveScheduleNodeId(workflowId, node);
       const triggerWithSchedule: TriggerConfig = {
         ...trigger,
         nextRunAtMs,
       };
-      const idempotencyKey = buildScheduleIdempotencyKey(workflowId, nextRunAtMs);
+      const idempotencyKey = buildScheduleIdempotencyKey(workflowId, scheduleNodeId, nextRunAtMs);
       await this.runtime.createTask({
         agentId: this.runtime.agentId,
         name: TRIGGER_TASK_NAME,
@@ -2880,7 +3146,7 @@ export class EmbeddedWorkflowService extends Service {
           baseInterval: intervalMs,
           kind: WORKFLOW_TASK_KIND,
           workflowId,
-          scheduleNodeId: node.id,
+          scheduleNodeId,
           idempotencyKey,
           trigger: triggerWithSchedule,
         },
@@ -2906,7 +3172,7 @@ export class EmbeddedWorkflowService extends Service {
     }
   }
 
-  private async saveExecution(
+  private async savePendingExecution(
     execution: WorkflowExecution,
     idempotencyKey?: string
   ): Promise<void> {
@@ -2925,44 +3191,255 @@ export class EmbeddedWorkflowService extends Service {
         stoppedAt: execution.stoppedAt ?? null,
         execution: cloneJson(execution),
         idempotencyKey: key,
-      })
-      .onConflictDoUpdate({
-        target: [embeddedExecutions.agentId, embeddedExecutions.id],
-        set: {
-          workflowId: execution.workflowId,
-          status: execution.status,
-          mode: execution.mode,
-          finished: execution.finished,
-          startedAt: execution.startedAt,
-          stoppedAt: execution.stoppedAt ?? null,
-          execution: cloneJson(execution),
-          idempotencyKey: key,
-        },
+        executionOwnerId: this.executionOwnerId,
+        executionLeaseExpiresAt: sql`CURRENT_TIMESTAMP + (${this.executionLeaseDurationMs} * INTERVAL '1 millisecond')`,
       });
+  }
+
+  private async finalizeOwnedExecution(
+    execution: WorkflowExecution,
+    idempotencyKey?: string
+  ): Promise<void> {
+    const rows = await this.getDb()
+      .update(embeddedExecutions)
+      .set({
+        workflowId: execution.workflowId,
+        status: execution.status,
+        mode: execution.mode,
+        finished: execution.finished,
+        startedAt: execution.startedAt,
+        stoppedAt: execution.stoppedAt ?? null,
+        execution: cloneJson(execution),
+        idempotencyKey: idempotencyKey ?? null,
+        executionOwnerId: null,
+        executionLeaseExpiresAt: null,
+      })
+      .where(
+        and(
+          eq(embeddedExecutions.agentId, this.tenantAgentId),
+          eq(embeddedExecutions.id, execution.id),
+          eq(embeddedExecutions.executionOwnerId, this.executionOwnerId)
+        )
+      )
+      .returning({ id: embeddedExecutions.id });
+    if (rows.length === 0) {
+      throw new ElizaError('Workflow execution ownership was lost before finalization', {
+        code: 'WORKFLOW_EXECUTION_LEASE_LOST',
+        context: { workflowId: execution.workflowId, executionId: execution.id },
+      });
+    }
+  }
+
+  private async renewExecutionLease(executionId: string): Promise<void> {
+    const rows = await this.getDb()
+      .update(embeddedExecutions)
+      .set({
+        executionLeaseExpiresAt: sql`CURRENT_TIMESTAMP + (${this.executionLeaseDurationMs} * INTERVAL '1 millisecond')`,
+      })
+      .where(
+        and(
+          eq(embeddedExecutions.agentId, this.tenantAgentId),
+          eq(embeddedExecutions.id, executionId),
+          eq(embeddedExecutions.finished, false),
+          eq(embeddedExecutions.status, 'running'),
+          eq(embeddedExecutions.executionOwnerId, this.executionOwnerId)
+        )
+      )
+      .returning({ id: embeddedExecutions.id });
+    if (rows.length === 0) {
+      throw new ElizaError('Workflow execution lease is no longer owned by this runtime', {
+        code: 'WORKFLOW_EXECUTION_LEASE_LOST',
+        context: { executionId },
+      });
+    }
+  }
+
+  private startExecutionLeaseHeartbeat(
+    executionId: string,
+    externalSignals: readonly AbortSignal[]
+  ): { signal: AbortSignal; stop: () => Promise<void> } {
+    const controller = new AbortController();
+    const abortListeners = new Map<AbortSignal, () => void>();
+    for (const externalSignal of externalSignals) {
+      const onExternalAbort = (): void => controller.abort(externalSignal.reason);
+      abortListeners.set(externalSignal, onExternalAbort);
+      if (externalSignal.aborted) onExternalAbort();
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    const heartbeat = (async () => {
+      while (!controller.signal.aborted) {
+        await waitForDelay(EXECUTION_LEASE_HEARTBEAT_MS, controller.signal);
+        if (controller.signal.aborted) break;
+        try {
+          await this.renewExecutionLease(executionId);
+        } catch (error) {
+          this.runtime.reportError?.('EmbeddedWorkflowService.executionLeaseHeartbeat', error, {
+            executionId,
+          });
+          controller.abort(error);
+        }
+      }
+    })();
+    return {
+      signal: controller.signal,
+      stop: async () => {
+        for (const [externalSignal, onExternalAbort] of abortListeners) {
+          externalSignal.removeEventListener('abort', onExternalAbort);
+        }
+        if (!controller.signal.aborted) controller.abort(new Error('Execution lease stopped'));
+        await heartbeat;
+      },
+    };
+  }
+
+  private async claimIdempotentExecution(
+    workflowData: WorkflowDefinition,
+    mode: WorkflowExecuteMode,
+    triggerData: Record<string, unknown> | undefined,
+    idempotencyKey: string,
+    scheduleNodeId: string | undefined
+  ): Promise<{ execution: WorkflowExecution; claimed: boolean }> {
+    await this.ensureSchema();
+    const tenantAgentId = this.tenantAgentId;
+    const workflowId = workflowData.id ?? '';
+    const lockIdentity = JSON.stringify([tenantAgentId, workflowId, idempotencyKey]);
+
+    return this.getDb().transaction(async (tx) => {
+      // The lock serializes claimants without imposing a new unique constraint
+      // that would reject historical duplicate rows already present in stores.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockIdentity}))`);
+      const existingRows = await tx
+        .select()
+        .from(embeddedExecutions)
+        .where(
+          and(
+            eq(embeddedExecutions.agentId, tenantAgentId),
+            eq(embeddedExecutions.workflowId, workflowId),
+            eq(embeddedExecutions.idempotencyKey, idempotencyKey)
+          )
+        )
+        .orderBy(desc(embeddedExecutions.startedAt))
+        .limit(1);
+      const existing = existingRows[0];
+      if (existing) {
+        return { execution: cloneJson(existing.execution), claimed: false };
+      }
+
+      const pending = this.createPendingExecution(
+        workflowData,
+        mode,
+        triggerData,
+        idempotencyKey,
+        scheduleNodeId
+      );
+      await tx.insert(embeddedExecutions).values({
+        agentId: tenantAgentId,
+        id: pending.id,
+        workflowId: pending.workflowId,
+        status: pending.status,
+        mode: pending.mode,
+        finished: pending.finished,
+        startedAt: pending.startedAt,
+        stoppedAt: pending.stoppedAt ?? null,
+        execution: cloneJson(pending),
+        idempotencyKey,
+        executionOwnerId: this.executionOwnerId,
+        executionLeaseExpiresAt: sql`CURRENT_TIMESTAMP + (${this.executionLeaseDurationMs} * INTERVAL '1 millisecond')`,
+      });
+      return { execution: pending, claimed: true };
+    });
   }
 
   /**
    * Re-drive executions whose host disappeared while Smithers still owns a
    * durable run. The pending row supplies the stable execution id and frozen
-   * workflow definition; `force:false` then skips every persisted node and
-   * resumes at the first unfinished one without repeating side effects.
+   * workflow definition. A shared Smithers backend skips persisted nodes;
+   * host-local backends retain at-least-once semantics after lease expiry.
    */
   private startExecutionRecovery(): void {
     const signal = this.recoveryController.signal;
-    this.recoveryPromise = this.recoverUnfinishedExecutions(signal).catch((error) => {
-      if (signal.aborted) return;
-      // error-policy:J7 startup recovery is supervised in the background so a
-      // long workflow cannot block the workflows API; scan failures remain
-      // observable and their rows remain resumable.
-      this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecutions', error, {});
-      logger.warn(
-        {
-          src: 'plugin:workflow:embedded',
-          error: error instanceof Error ? error.message : String(error),
-        },
-        'unfinished workflow recovery scan failed'
+    this.recoveryPromise = (async () => {
+      while (!signal.aborted) {
+        try {
+          await this.recoverUnfinishedExecutions(signal);
+        } catch (error) {
+          if (signal.aborted) return;
+          // error-policy:J7 recovery polling is supervised in the background;
+          // scan failures remain observable and the durable rows remain eligible.
+          this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecutions', error, {});
+          logger.warn(
+            {
+              src: 'plugin:workflow:embedded',
+              error: error instanceof Error ? error.message : String(error),
+            },
+            'unfinished workflow recovery scan failed'
+          );
+        }
+        await waitForDelay(EXECUTION_RECOVERY_POLL_MS, signal);
+      }
+    })();
+  }
+
+  private recoveryEligibility() {
+    return or(
+      lte(embeddedExecutions.executionLeaseExpiresAt, sql`CURRENT_TIMESTAMP`),
+      and(
+        isNull(embeddedExecutions.executionLeaseExpiresAt),
+        sql`${embeddedExecutions.startedAt}::timestamp with time zone <= CURRENT_TIMESTAMP - (${this.executionLeaseDurationMs} * INTERVAL '1 millisecond')`
+      )
+    );
+  }
+
+  private async claimExecutionForRecovery(executionId: string) {
+    const rows = await this.getDb()
+      .update(embeddedExecutions)
+      .set({
+        executionOwnerId: this.executionOwnerId,
+        executionLeaseExpiresAt: sql`CURRENT_TIMESTAMP + (${this.executionLeaseDurationMs} * INTERVAL '1 millisecond')`,
+      })
+      .where(
+        and(
+          eq(embeddedExecutions.agentId, this.tenantAgentId),
+          eq(embeddedExecutions.id, executionId),
+          eq(embeddedExecutions.finished, false),
+          eq(embeddedExecutions.status, 'running'),
+          this.recoveryEligibility()
+        )
+      )
+      .returning();
+    return rows[0];
+  }
+
+  private async deferOwnedExecutionRecovery(executionId: string, delayMs: number): Promise<void> {
+    await this.getDb()
+      .update(embeddedExecutions)
+      .set({
+        executionOwnerId: null,
+        executionLeaseExpiresAt: sql`CURRENT_TIMESTAMP + (${delayMs} * INTERVAL '1 millisecond')`,
+      })
+      .where(
+        and(
+          eq(embeddedExecutions.agentId, this.tenantAgentId),
+          eq(embeddedExecutions.id, executionId),
+          eq(embeddedExecutions.executionOwnerId, this.executionOwnerId)
+        )
       );
-    });
+  }
+
+  private async releaseExecutionForShutdown(executionId: string): Promise<void> {
+    try {
+      await this.deferOwnedExecutionRecovery(executionId, 0);
+    } catch (cause) {
+      // error-policy:J2 a clean stop must not conceal a failed durable handoff;
+      // preserve the database cause and make stop() fail observably.
+      const error = new ElizaError('Workflow shutdown could not release its execution lease', {
+        code: 'WORKFLOW_SHUTDOWN_LEASE_RELEASE_FAILED',
+        cause,
+        context: { executionId },
+      });
+      this.shutdownCleanupErrors.push(error);
+      throw error;
+    }
   }
 
   private async recoverUnfinishedExecutions(signal: AbortSignal): Promise<void> {
@@ -2973,18 +3450,21 @@ export class EmbeddedWorkflowService extends Service {
         and(
           eq(embeddedExecutions.agentId, this.tenantAgentId),
           eq(embeddedExecutions.finished, false),
-          eq(embeddedExecutions.status, 'running')
+          eq(embeddedExecutions.status, 'running'),
+          this.recoveryEligibility()
         )
       )
       .orderBy(embeddedExecutions.startedAt);
 
     for (const row of rows) {
       signal.throwIfAborted();
-      const pending = cloneJson(row.execution);
+      const claimed = await this.claimExecutionForRecovery(row.id);
+      if (!claimed) continue;
+      const pending = cloneJson(claimed.execution);
       try {
         const workflow =
           readSmithersResumeWorkflow(pending) ??
-          (await this.getStoredWorkflow(row.workflowId)).workflow;
+          (await this.getStoredWorkflow(claimed.workflowId)).workflow;
         const triggerData = isRecord(pending.customData?.triggerData)
           ? cloneJson(pending.customData.triggerData)
           : undefined;
@@ -2992,7 +3472,7 @@ export class EmbeddedWorkflowService extends Service {
           workflow,
           pending,
           triggerData,
-          row.idempotencyKey ?? undefined,
+          claimed.idempotencyKey ?? undefined,
           true,
           false,
           signal
@@ -3000,26 +3480,31 @@ export class EmbeddedWorkflowService extends Service {
         logger.info(
           {
             src: 'plugin:workflow:embedded',
-            workflowId: row.workflowId,
-            executionId: row.id,
+            workflowId: claimed.workflowId,
+            executionId: claimed.id,
             status: recovered.status,
           },
           'recovered unfinished workflow execution'
         );
       } catch (error) {
+        if (signal.aborted) {
+          await this.releaseExecutionForShutdown(claimed.id);
+        } else {
+          await this.deferOwnedExecutionRecovery(claimed.id, EXECUTION_RECOVERY_RETRY_MS);
+        }
         if (signal.aborted) throw error;
         // error-policy:J7 a failed startup recovery remains `running` so a later
         // startup can retry it; report the failed attempt without fabricating a
         // terminal workflow result.
         this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecution', error, {
-          workflowId: row.workflowId,
-          executionId: row.id,
+          workflowId: claimed.workflowId,
+          executionId: claimed.id,
         });
         logger.warn(
           {
             src: 'plugin:workflow:embedded',
-            workflowId: row.workflowId,
-            executionId: row.id,
+            workflowId: claimed.workflowId,
+            executionId: claimed.id,
             error: error instanceof Error ? error.message : String(error),
           },
           'unfinished workflow recovery failed; execution remains resumable'
@@ -3053,8 +3538,9 @@ export class EmbeddedWorkflowService extends Service {
   private resolveStartNodes(
     workflowData: WorkflowDefinition,
     mode: WorkflowExecuteMode,
-    incoming: Map<string, IncomingConnection[]>
-  ): Set<string> {
+    incoming: Map<string, IncomingConnection[]>,
+    scheduleNodeId?: string
+  ): { startNodes: Set<string>; matchedModeTrigger: boolean } {
     const enabledNodes = workflowData.nodes.filter((node) => !node.disabled);
     const start = new Set<string>();
 
@@ -3073,8 +3559,25 @@ export class EmbeddedWorkflowService extends Service {
         }
       }
     } else if (mode === 'trigger') {
-      for (const node of enabledNodes) {
-        if (node.type === 'workflows-nodes-base.scheduleTrigger') start.add(node.name);
+      const scheduleNodes = enabledNodes.filter(
+        (node) => node.type === 'workflows-nodes-base.scheduleTrigger'
+      );
+      if (scheduleNodeId) {
+        const workflowId = workflowData.id ?? workflowData.name;
+        const matched = scheduleNodes.find(
+          (node) => resolveScheduleNodeId(workflowId, node) === scheduleNodeId
+        );
+        if (!matched) {
+          throw new ElizaError('Scheduled workflow dispatch referenced an unknown schedule node', {
+            code: 'WORKFLOW_SCHEDULE_NODE_NOT_FOUND',
+            context: { workflowId, scheduleNodeId },
+          });
+        }
+        start.add(matched.name);
+      } else {
+        // Explicit trigger-mode debug runs do not originate from a scheduled
+        // task, so they intentionally exercise every schedule branch.
+        for (const node of scheduleNodes) start.add(node.name);
       }
     } else {
       for (const node of enabledNodes) {
@@ -3082,23 +3585,77 @@ export class EmbeddedWorkflowService extends Service {
       }
     }
 
+    const matchedModeTrigger = start.size > 0;
     if (start.size === 0) {
       for (const node of enabledNodes) {
         if ((incoming.get(node.name) ?? []).length === 0) start.add(node.name);
       }
     }
 
-    return start;
+    return { startNodes: start, matchedModeTrigger };
+  }
+
+  private collectReachableNodeNames(
+    workflowData: WorkflowDefinition,
+    startNodes: Set<string>,
+    enabledNodeNames: Set<string>
+  ): Set<string> {
+    const reachable = new Set(startNodes);
+    const queue = [...startNodes];
+
+    while (queue.length > 0) {
+      const source = queue.shift();
+      if (!source) continue;
+      const mainOutputs = workflowData.connections[source]?.main ?? [];
+      for (const connections of mainOutputs) {
+        for (const connection of connections) {
+          if (
+            connection.type !== 'main' ||
+            !enabledNodeNames.has(connection.node) ||
+            reachable.has(connection.node)
+          ) {
+            continue;
+          }
+          reachable.add(connection.node);
+          queue.push(connection.node);
+        }
+      }
+    }
+
+    return reachable;
   }
 
   private resolveExecutionPlan(
     workflowData: WorkflowDefinition,
-    mode: WorkflowExecuteMode
+    mode: WorkflowExecuteMode,
+    scheduleNodeId?: string
   ): SmithersExecutionPlan {
-    const enabledNodes = workflowData.nodes.filter((node) => !node.disabled);
+    const allEnabledNodes = workflowData.nodes.filter((node) => !node.disabled);
+    const enabledNodeNames = new Set(allEnabledNodes.map((node) => node.name));
+    const allIncoming = this.buildIncomingConnections(workflowData);
+    const { startNodes, matchedModeTrigger } = this.resolveStartNodes(
+      workflowData,
+      mode,
+      allIncoming,
+      scheduleNodeId
+    );
+    // A mode-specific trigger is an execution boundary: disconnected trigger
+    // branches belong to other invocations and must not leak side effects into
+    // this run. Workflows without a matching trigger retain root-node fallback
+    // semantics for imported or programmatic graphs.
+    const reachableNodeNames = matchedModeTrigger
+      ? this.collectReachableNodeNames(workflowData, startNodes, enabledNodeNames)
+      : enabledNodeNames;
+    const enabledNodes = allEnabledNodes.filter((node) => reachableNodeNames.has(node.name));
     const nodeByName = new Map(enabledNodes.map((node) => [node.name, node]));
-    const incoming = this.buildIncomingConnections(workflowData);
-    const startNodes = this.resolveStartNodes(workflowData, mode, incoming);
+    const incoming = new Map<string, IncomingConnection[]>();
+    for (const [destination, connections] of allIncoming) {
+      if (!reachableNodeNames.has(destination)) continue;
+      incoming.set(
+        destination,
+        connections.filter((connection) => reachableNodeNames.has(connection.source))
+      );
+    }
     const orderedNodes: WorkflowNode[] = [];
     const executed = new Set<string>();
 
@@ -3145,6 +3702,11 @@ export class EmbeddedWorkflowService extends Service {
     signal: AbortSignal
   ): Promise<INodeExecutionData[][]> {
     signal.throwIfAborted();
+    // This conditional renewal is the outer-database fencing check. It runs
+    // immediately before every delegated node (including every side-effecting
+    // node), and the lease it grants outlives Smithers' maximum run deadline.
+    await this.renewExecutionLease(executionId);
+    signal.throwIfAborted();
     const nodeType = this.nodeTypes.getByNameAndVersion(node.type);
     const context: IExecuteFunctions = {
       getNode: () => node,
@@ -3163,27 +3725,17 @@ export class EmbeddedWorkflowService extends Service {
     mode: WorkflowExecuteMode,
     triggerData?: Record<string, unknown>,
     idempotencyKey?: string,
-    throwOnError = true
+    throwOnError = true,
+    scheduleNodeId?: string
   ): Promise<WorkflowExecution> {
-    const executionId = randomUUID();
-    const startedAt = new Date();
-    const pending: WorkflowExecution = {
-      id: executionId,
-      finished: false,
+    const pending = this.createPendingExecution(
+      workflowData,
       mode,
-      startedAt: startedAt.toISOString(),
-      workflowId: workflowData.id ?? '',
-      status: 'running',
-      customData: {
-        ...(triggerData ? { triggerData } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-        [SMITHERS_RESUME_STATE_KEY]: {
-          version: 1,
-          workflow: cloneJson(workflowData),
-        } satisfies SmithersResumeState,
-      },
-    };
-    await this.saveExecution(pending, idempotencyKey);
+      triggerData,
+      idempotencyKey,
+      scheduleNodeId
+    );
+    await this.savePendingExecution(pending, idempotencyKey);
 
     return this.executePendingWorkflow(
       workflowData,
@@ -3192,6 +3744,33 @@ export class EmbeddedWorkflowService extends Service {
       idempotencyKey,
       throwOnError
     );
+  }
+
+  private createPendingExecution(
+    workflowData: WorkflowDefinition,
+    mode: WorkflowExecuteMode,
+    triggerData?: Record<string, unknown>,
+    idempotencyKey?: string,
+    scheduleNodeId?: string
+  ): WorkflowExecution {
+    const pending: WorkflowExecution = {
+      id: randomUUID(),
+      finished: false,
+      mode,
+      startedAt: nowIso(),
+      workflowId: workflowData.id ?? '',
+      status: 'running',
+      customData: {
+        ...(triggerData ? { triggerData } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(scheduleNodeId ? { scheduleNodeId } : {}),
+        [SMITHERS_RESUME_STATE_KEY]: {
+          version: 1,
+          workflow: cloneJson(workflowData),
+        } satisfies SmithersResumeState,
+      },
+    };
+    return pending;
   }
 
   private async executePendingWorkflow(
@@ -3203,8 +3782,53 @@ export class EmbeddedWorkflowService extends Service {
     persistFailure = true,
     signal?: AbortSignal
   ): Promise<WorkflowExecution> {
+    if (this.shutdownReason) {
+      if (persistFailure) await this.releaseExecutionForShutdown(pending.id);
+      throw this.shutdownReason;
+    }
+    const executionPromise = this.executePendingWorkflowRun(
+      workflowData,
+      pending,
+      triggerData,
+      idempotencyKey,
+      throwOnError,
+      persistFailure,
+      signal
+    );
+    const settlement = executionPromise.then(
+      () => undefined,
+      () => undefined
+    );
+    this.activeExecutionSettlements.add(settlement);
     try {
-      const plan = this.resolveExecutionPlan(workflowData, pending.mode);
+      return await executionPromise;
+    } finally {
+      this.activeExecutionSettlements.delete(settlement);
+    }
+  }
+
+  private async executePendingWorkflowRun(
+    workflowData: WorkflowDefinition,
+    pending: WorkflowExecution,
+    triggerData: Record<string, unknown> | undefined,
+    idempotencyKey: string | undefined,
+    throwOnError: boolean,
+    persistFailure: boolean,
+    signal?: AbortSignal
+  ): Promise<WorkflowExecution> {
+    const lease = this.startExecutionLeaseHeartbeat(pending.id, [
+      this.executionController.signal,
+      ...(signal ? [signal] : []),
+    ]);
+    let completed: WorkflowExecution | undefined;
+    let runFailed = false;
+    let runError: unknown;
+    try {
+      const scheduleNodeId =
+        typeof pending.customData?.scheduleNodeId === 'string'
+          ? pending.customData.scheduleNodeId
+          : undefined;
+      const plan = this.resolveExecutionPlan(workflowData, pending.mode, scheduleNodeId);
       const execution = await runWorkflowWithSmithers({
         tenantId: this.tenantAgentId,
         workflow: workflowData,
@@ -3213,33 +3837,53 @@ export class EmbeddedWorkflowService extends Service {
         mode: pending.mode,
         triggerData,
         plan,
-        ...(signal ? { signal } : {}),
+        signal: lease.signal,
         runNode: (node, inputData, signal) => this.executeNode(node, inputData, pending.id, signal),
       });
-      await this.saveExecution(execution, idempotencyKey);
-      return cloneJson(execution);
+      completed = execution;
     } catch (error) {
-      if (!persistFailure) throw error;
-      const stoppedAt = new Date();
-      const execution: WorkflowExecution = {
+      runFailed = true;
+      runError = error;
+    } finally {
+      await lease.stop();
+    }
+
+    if (runFailed) {
+      if (this.executionController.signal.aborted) {
+        if (persistFailure) await this.releaseExecutionForShutdown(pending.id);
+        throw runError;
+      }
+      if (!persistFailure) throw runError;
+      const failedExecution: WorkflowExecution = {
         ...pending,
         finished: true,
         status: 'error',
-        stoppedAt: stoppedAt.toISOString(),
+        stoppedAt: nowIso(),
         data: {
           resultData: {
             error: {
-              message: error instanceof Error ? error.message : String(error),
-              stack: error instanceof Error ? error.stack : undefined,
+              message: runError instanceof Error ? runError.message : String(runError),
+              stack: runError instanceof Error ? runError.stack : undefined,
+              code: runError instanceof ElizaError ? runError.code : undefined,
+              context: runError instanceof ElizaError ? runError.context : undefined,
             },
           },
         },
       };
-      await this.saveExecution(execution, idempotencyKey);
+      await this.finalizeOwnedExecution(failedExecution, idempotencyKey);
       if (!throwOnError) {
-        return cloneJson(execution);
+        return cloneJson(failedExecution);
       }
-      throw error;
+      throw runError;
     }
+
+    if (!completed) {
+      throw new ElizaError('Workflow execution completed without a result', {
+        code: 'WORKFLOW_EXECUTION_RESULT_MISSING',
+        context: { workflowId: pending.workflowId, executionId: pending.id },
+      });
+    }
+    await this.finalizeOwnedExecution(completed, idempotencyKey);
+    return cloneJson(completed);
   }
 }

@@ -90,20 +90,42 @@ export function readSmithersDurableRunLink(
   ) {
     return undefined;
   }
-  const timeoutMs =
-    typeof record.timeoutMs === "number" &&
-    Number.isFinite(record.timeoutMs) &&
-    record.timeoutMs > 0
-      ? record.timeoutMs
-      : undefined;
-  const maxTurns =
-    typeof record.maxTurns === "number" &&
-    Number.isInteger(record.maxTurns) &&
-    record.maxTurns > 0
-      ? record.maxTurns
-      : undefined;
-  const model = nonEmptyString(record.model) ? record.model : undefined;
-  const recoveredApprovalPreset = approvalPreset(record.approvalPreset);
+  const hasTimeoutMs = Object.hasOwn(record, "timeoutMs");
+  const hasMaxTurns = Object.hasOwn(record, "maxTurns");
+  const hasModel = Object.hasOwn(record, "model");
+  const hasApprovalPreset = Object.hasOwn(record, "approvalPreset");
+  let timeoutMs: number | undefined;
+  if (hasTimeoutMs) {
+    if (
+      typeof record.timeoutMs !== "number" ||
+      !Number.isFinite(record.timeoutMs) ||
+      record.timeoutMs <= 0
+    ) {
+      return undefined;
+    }
+    timeoutMs = record.timeoutMs;
+  }
+  let maxTurns: number | undefined;
+  if (hasMaxTurns) {
+    if (
+      typeof record.maxTurns !== "number" ||
+      !Number.isInteger(record.maxTurns) ||
+      record.maxTurns <= 0
+    ) {
+      return undefined;
+    }
+    maxTurns = record.maxTurns;
+  }
+  let model: string | undefined;
+  if (hasModel) {
+    if (!nonEmptyString(record.model)) return undefined;
+    model = record.model;
+  }
+  let recoveredApprovalPreset: ApprovalPreset | undefined;
+  if (hasApprovalPreset) {
+    recoveredApprovalPreset = approvalPreset(record.approvalPreset);
+    if (!recoveredApprovalPreset) return undefined;
+  }
   return {
     version: 1,
     orchestratorTaskId: record.orchestratorTaskId,

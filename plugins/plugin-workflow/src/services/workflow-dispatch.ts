@@ -10,12 +10,13 @@
  * `plugins/plugin-workflow/src/index.ts`).
  *
  * The dispatch service is a thin routing layer - it looks up the embedded
- * workflow service on the runtime and delegates to its `executeWorkflow`
- * method. There is no HTTP boundary and no sidecar lifecycle.
+ * workflow service on the runtime and delegates through its durable execution
+ * boundary. There is no HTTP boundary and no sidecar lifecycle.
  */
 
 import type { IAgentRuntime } from '@elizaos/core';
 import { logger } from '@elizaos/core';
+import type { WorkflowExecution } from '../types/index';
 import {
   EMBEDDED_WORKFLOW_SERVICE_TYPE,
   type EmbeddedWorkflowService,
@@ -39,11 +40,13 @@ export interface WorkflowDispatchResult {
  * Optional, structured dispatch options. The `idempotencyKey` field is
  * the durable contract: same workflow + same key → at most one
  * execution. Passed inline through the legacy `payload` shape (key
- * `__idempotencyKey`) when the caller can't pass a second argument.
+ * `__idempotencyKey`) when the caller can't pass a second argument. A scheduled
+ * task also supplies `scheduleNodeId` so execution starts at that exact branch.
  */
 export interface WorkflowDispatchOptions {
   triggerData?: Record<string, unknown>;
   idempotencyKey?: string;
+  scheduleNodeId?: string;
 }
 
 export interface WorkflowDispatchService {
@@ -115,15 +118,16 @@ function getRuntimeServiceRegistry(runtime: IAgentRuntime): RuntimeServiceRegist
  * the explicit `options.idempotencyKey` or via the legacy
  * `payload.__idempotencyKey`), the dispatch service first looks up an
  * existing execution row for `(workflowId, idempotencyKey)`. If one exists,
- * the new run is suppressed and the prior execution id is returned with
- * `{ ok: true, dedup: true }`. Scheduled workflow dispatches use a
- * minute-bucketed key so two simultaneous schedule fires collapse to one
- * execution.
+ * the new run is suppressed and the prior execution result is returned with
+ * `dedup: true`. A prior terminal failure stays a failure; an in-flight or
+ * successful prior execution is accepted without launching another run.
+ * Scheduled workflow dispatches use a minute-bucketed key so two simultaneous
+ * schedule fires collapse to one execution.
  *
- * Concurrent dispatches that race past the lookup are still safely
- * coalesced because the embedded service persists the idempotency key on
- * the execution row, so the second-to-write completes but is detectable
- * as a duplicate on later lookups.
+ * The lookup is only a fast path. The embedded service serializes claimants
+ * in the shared database and commits the winning pending execution before
+ * any workflow node runs, so separate runtime processes cannot both perform
+ * side effects for the same key.
  */
 export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowDispatchService {
   // Track in-flight executions by `(workflowId, idempotencyKey)` so that
@@ -157,26 +161,30 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
       if (idempotencyKey) {
         const existing = await service.findExecutionByIdempotencyKey(id, idempotencyKey);
         if (existing) {
-          return existing.id
-            ? { ok: true, executionId: existing.id, dedup: true }
-            : { ok: true, dedup: true };
+          return resultFromExecution(existing, true);
         }
 
         const inflightKey = `${id}::${idempotencyKey}`;
         const pending = inflight.get(inflightKey);
         if (pending) {
           const result = await pending;
-          return result.ok ? { ...result, dedup: true } : result;
+          return { ...result, dedup: true };
         }
 
-        const promise = runDispatch(service, id, triggerData, idempotencyKey).finally(() => {
+        const promise = runDispatch(
+          service,
+          id,
+          triggerData,
+          idempotencyKey,
+          options.scheduleNodeId
+        ).finally(() => {
           inflight.delete(inflightKey);
         });
         inflight.set(inflightKey, promise);
         return promise;
       }
 
-      return runDispatch(service, id, triggerData, undefined);
+      return runDispatch(service, id, triggerData, undefined, options.scheduleNodeId);
     },
   };
 }
@@ -185,13 +193,24 @@ async function runDispatch(
   service: EmbeddedWorkflowService,
   workflowId: string,
   triggerData: Record<string, unknown>,
-  idempotencyKey: string | undefined
+  idempotencyKey: string | undefined,
+  scheduleNodeId: string | undefined
 ): Promise<WorkflowDispatchResult> {
   try {
+    if (idempotencyKey) {
+      const result = await service.executeWorkflowWithDedup(workflowId, {
+        mode: 'trigger',
+        triggerData,
+        idempotencyKey,
+        scheduleNodeId,
+      });
+      return resultFromExecution(result.execution, result.dedup);
+    }
+
     const execution = await service.executeWorkflow(workflowId, {
       mode: 'trigger',
       triggerData,
-      idempotencyKey,
+      scheduleNodeId,
     });
     return execution.id ? { ok: true, executionId: execution.id } : { ok: true };
   } catch (err) {
@@ -202,6 +221,31 @@ async function runDispatch(
     );
     return { ok: false, error: message };
   }
+}
+
+function resultFromExecution(execution: WorkflowExecution, dedup: boolean): WorkflowDispatchResult {
+  const executionId = execution.id || undefined;
+  const common = {
+    ...(executionId ? { executionId } : {}),
+    ...(dedup ? { dedup: true } : {}),
+  };
+  const acceptedPending =
+    execution.finished === false &&
+    (execution.status === 'new' ||
+      execution.status === 'running' ||
+      execution.status === 'waiting');
+  const acceptedSuccess = execution.finished === true && execution.status === 'success';
+  if (acceptedSuccess || acceptedPending) {
+    return { ok: true, ...common };
+  }
+  const persistedError = execution.data?.resultData?.error?.message?.trim();
+  return {
+    ok: false,
+    error:
+      persistedError ||
+      `Workflow execution ${executionId ?? '(unknown)'} ended with status ${execution.status}`,
+    ...common,
+  };
 }
 
 /**

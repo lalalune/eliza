@@ -213,8 +213,18 @@ describe("TASKS control pause/resume symmetry (#11216 follow-up)", () => {
     expect(resumed?.success).toBe(true);
     expect((await taskService.getTask(taskId))?.paused).toBe(false);
 
-    // Unfrozen: the same event now advances the task status.
-    await drive(acp, sessionId, "blocked", { message: "stuck" });
+    const resumedDetail = await taskService.getTask(taskId);
+    const resumedSessionId = resumedDetail?.sessions.find(
+      (session) => session.sessionId !== sessionId,
+    )?.sessionId;
+    expect(resumedSessionId).toBeTypeOf("string");
+
+    // Resume replaces the subprocess killed by pause. Events from that fresh
+    // session advance the task again; a late event from the stopped predecessor
+    // remains timeline-only and cannot revive its terminal record.
+    await drive(acp, resumedSessionId as string, "blocked", {
+      message: "stuck",
+    });
     expect((await taskService.getTask(taskId))?.status).toBe("blocked");
   });
 

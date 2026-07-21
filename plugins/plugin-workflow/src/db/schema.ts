@@ -131,10 +131,22 @@ export const embeddedExecutions = workflowSchema.table(
     execution: jsonb('execution').$type<WorkflowExecution>().notNull(),
     /**
      * Per-dispatch idempotency key. Scheduled dispatches use
-     * `${workflowId}:${minuteBucket}` so re-arms inside the same minute
-     * collapse to a single execution. Null for ad-hoc / manual runs.
+     * `${workflowId}:${scheduleNodeId}:${minuteBucket}` so retries of one
+     * schedule fire collapse without suppressing a sibling schedule branch.
+     * Null for ad-hoc / manual runs.
      */
     idempotencyKey: text('idempotency_key'),
+    /**
+     * Ownership lease for the process currently driving this execution.
+     * Recovery workers may claim only expired leases; its lifetime exceeds the
+     * Smithers deadline so host-local Smithers stores cannot cause a concurrent
+     * takeover while the original process can still dispatch nodes.
+     */
+    executionOwnerId: text('execution_owner_id'),
+    executionLeaseExpiresAt: timestamp('execution_lease_expires_at', {
+      withTimezone: true,
+      mode: 'date',
+    }),
   },
   (table) => ({
     tenantPk: primaryKey({
@@ -153,6 +165,12 @@ export const embeddedExecutions = workflowSchema.table(
     idempotencyKeyIdx: index('idx_embedded_executions_agent_idempotency_key').on(
       table.agentId,
       table.idempotencyKey
+    ),
+    recoveryLeaseIdx: index('idx_embedded_executions_agent_recovery_lease').on(
+      table.agentId,
+      table.finished,
+      table.status,
+      table.executionLeaseExpiresAt
     ),
   })
 );

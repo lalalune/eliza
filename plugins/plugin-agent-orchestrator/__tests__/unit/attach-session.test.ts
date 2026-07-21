@@ -26,6 +26,7 @@
 
 import type { IAgentRuntime } from "@elizaos/core";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { POOLED_ACCOUNT_RECOVERY_METADATA_KEY } from "../../src/services/coding-account-selection.js";
 import { OrchestratorTaskService } from "../../src/services/orchestrator-task-service.js";
 import { OrchestratorTaskStore } from "../../src/services/orchestrator-task-store.js";
 import { readSmithersDurableRunLink } from "../../src/services/smithers-task-integration.js";
@@ -251,6 +252,229 @@ describe("OrchestratorTaskService.attachSession", () => {
     expect(
       detail?.sessions.filter((s) => s.sessionId === "chat-sess-3").length,
     ).toBe(1);
+  });
+
+  it("preserves a terminal session when a later live attach reuses its id", async () => {
+    const { service, taskId } = await makeService();
+    await service.attachSession(taskId, {
+      sessionId: "chat-sess-terminal-reattach",
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "completed",
+      label: "finished",
+      durableRun: {
+        version: 1,
+        orchestratorTaskId: taskId,
+        taskId: `${taskId}:part:0`,
+        runId: "terminal-run",
+        tenantId: "agent-tenant",
+        initialPrompt: "finish exactly once",
+        state: "completed",
+        keepAliveAfterComplete: false,
+      },
+    });
+    const terminal = await service.getTask(taskId);
+    const stoppedAt = terminal?.sessions[0]?.stoppedAt;
+
+    await service.attachSession(taskId, {
+      sessionId: "chat-sess-terminal-reattach",
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "ready",
+      label: "late-reconnect",
+      durableRun: {
+        version: 1,
+        orchestratorTaskId: taskId,
+        taskId: `${taskId}:part:0`,
+        runId: "terminal-run",
+        tenantId: "agent-tenant",
+        initialPrompt: "finish exactly once",
+        state: "running",
+        keepAliveAfterComplete: false,
+      },
+    });
+
+    const after = await service.getTask(taskId);
+    expect(after?.sessions[0]?.status).toBe("completed");
+    expect(after?.sessions[0]?.stoppedAt).toBe(stoppedAt);
+    expect(after?.activeSessionCount).toBe(0);
+    expect(after?.status).toBe("open");
+    expect(
+      readSmithersDurableRunLink(after?.sessions[0]?.metadata)?.state,
+    ).toBe("completed");
+  });
+
+  it("serializes an attach refresh with a racing terminal account-clear event", async () => {
+    const acp = new FakeAcp();
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const service = new OrchestratorTaskService(runtime(acp), { store });
+    await service.start();
+    const task = await service.createTask({
+      title: "Ship widget",
+      goal: "Preserve the first terminal result",
+    });
+    const sessionId = "chat-sess-attach-race";
+    await service.attachSession(task.id, {
+      sessionId,
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "ready",
+      metadata: {
+        durableMarker: "before-race",
+        account: {
+          providerId: "openai-codex-subscription",
+          accountId: "acct-race",
+          label: "Race account",
+        },
+      },
+    });
+
+    let releaseWrite: (() => void) | undefined;
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let markWriteReached: (() => void) | undefined;
+    const writeReached = new Promise<void>((resolve) => {
+      markWriteReached = resolve;
+    });
+    const updateSession = store.updateSession.bind(store);
+    let delayed = false;
+    vi.spyOn(store, "updateSession").mockImplementation(
+      async (candidateSessionId, patch) => {
+        if (
+          !delayed &&
+          candidateSessionId === sessionId &&
+          patch.label === "stale-refresh"
+        ) {
+          delayed = true;
+          markWriteReached?.();
+          await writeReleased;
+        }
+        await updateSession(candidateSessionId, patch);
+      },
+    );
+
+    const attaching = service.attachSession(task.id, {
+      sessionId,
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "ready",
+      label: "stale-refresh",
+      metadata: { attachMarker: "refresh-applied" },
+    });
+    await writeReached;
+    acp.emit(sessionId, "account_cleared", {
+      providerId: "openai-codex-subscription",
+      accountId: "acct-race",
+      label: "Race account",
+    });
+    await flush();
+    releaseWrite?.();
+    await attaching;
+    await service.stop();
+
+    const after = await service.getTask(task.id);
+    const session = after?.sessions[0];
+    expect(session?.status).toBe("errored");
+    expect(session?.stoppedAt).toBeTypeOf("number");
+    expect(session?.accountId).toBeNull();
+    expect(session?.metadata).toMatchObject({
+      durableMarker: "before-race",
+      attachMarker: "refresh-applied",
+      [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: {
+        providerId: "openai-codex-subscription",
+        accountId: "acct-race",
+      },
+    });
+    expect(session?.metadata.account).toBeUndefined();
+  });
+
+  it("keeps a completed result while a late account clear removes attribution and retains its recovery pin", async () => {
+    const acp = new FakeAcp();
+    const { service, taskId } = await makeService(acp);
+    const sessionId = "chat-sess-terminal-account-clear";
+    await service.attachSession(taskId, {
+      sessionId,
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "completed",
+      metadata: {
+        completionProof: "sha256:proof",
+        account: {
+          providerId: "openai-codex-subscription",
+          accountId: "acct-terminal",
+          label: "Terminal account",
+        },
+      },
+    });
+    const stoppedAt = (await service.getTask(taskId))?.sessions[0]?.stoppedAt;
+
+    acp.emit(sessionId, "account_cleared", {
+      providerId: "openai-codex-subscription",
+      accountId: "acct-terminal",
+      label: "Terminal account",
+    });
+    await service.stop();
+
+    const after = await service.getTask(taskId);
+    const session = after?.sessions[0];
+    expect(session?.status).toBe("completed");
+    expect(session?.stoppedAt).toBe(stoppedAt);
+    expect(session?.accountProviderId).toBeNull();
+    expect(session?.accountId).toBeNull();
+    expect(session?.accountLabel).toBeNull();
+    expect(session?.metadata).toMatchObject({
+      completionProof: "sha256:proof",
+      [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: {
+        providerId: "openai-codex-subscription",
+        accountId: "acct-terminal",
+      },
+    });
+    expect(session?.metadata.account).toBeUndefined();
+    expect(after?.activeSessionCount).toBe(0);
+  });
+
+  it("records late ACP events without reviving a terminal session", async () => {
+    const acp = new FakeAcp();
+    const { service, taskId } = await makeService(acp);
+    const sessionId = "chat-sess-terminal-events";
+    await service.attachSession(taskId, {
+      sessionId,
+      agentType: "codex",
+      workdir: "/tmp/workdir",
+      status: "completed",
+      label: "finished",
+    });
+    const before = await service.getTask(taskId);
+    const stoppedAt = before?.sessions[0]?.stoppedAt;
+
+    for (const event of [
+      "ready",
+      "reconnected",
+      "tool_running",
+      "blocked",
+      "login_required",
+      "stopped",
+    ]) {
+      acp.emit(sessionId, event, { toolCall: { title: "late" } });
+    }
+    await service.stop();
+
+    const after = await service.getTask(taskId);
+    expect(after?.sessions[0]?.status).toBe("completed");
+    expect(after?.sessions[0]?.stoppedAt).toBe(stoppedAt);
+    expect(after?.activeSessionCount).toBe(0);
+    expect(after?.status).toBe("open");
+    expect(after?.events.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining([
+        "ready",
+        "reconnected",
+        "tool_running",
+        "blocked",
+        "login_required",
+        "stopped",
+      ]),
+    );
   });
 
   it("returns false on unknown taskId without throwing", async () => {

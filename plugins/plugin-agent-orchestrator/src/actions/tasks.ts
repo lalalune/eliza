@@ -797,9 +797,12 @@ async function runCreateLegacy(
   const fallbackWorkdir = explicitWorkdir ?? process.cwd();
   const model = pickString(params, content, "model");
   const memoryContent = pickString(params, content, "memoryContent");
-  const approvalPreset = parseApproval(
-    pickString(params, content, "approvalPreset"),
-  );
+  // Persist the effective preset, including the service default, into the
+  // durable Smithers contract. Otherwise a restart after config drift could
+  // silently resume the same graph with a different privilege boundary.
+  const approvalPreset =
+    parseApproval(pickString(params, content, "approvalPreset")) ??
+    service.defaultApprovalPreset;
   const timeoutMs = getTimeoutMs(params, content);
   const maxSmithersTurns = readPositiveInteger(
     params.maxTurns ?? content.maxTurns,
@@ -1014,6 +1017,7 @@ async function runCreateLegacy(
           workdirRouteId: route?.id,
           workdirRoute: route,
           keepAliveAfterComplete,
+          ...(smithersOwnerTaskId ? { taskId: smithersOwnerTaskId } : {}),
           ...(durableRun ? smithersDurableRunMetadata(durableRun) : {}),
         },
       });

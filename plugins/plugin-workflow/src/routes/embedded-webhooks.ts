@@ -2,7 +2,9 @@
  * Plugin-relative route handlers for trigger-node webhooks, mounted under
  * `/workflow/webhooks/:path` for every HTTP method. Inbound requests are handed
  * to the EmbeddedWorkflowService, which matches the path against active webhook
- * trigger nodes and starts the corresponding execution.
+ * trigger nodes and starts the corresponding execution. These routes remain
+ * behind the runtime's central authentication gate until a webhook-specific
+ * out-of-band signature scheme exists.
  */
 import type { IAgentRuntime, Route, RouteRequest, RouteResponse } from '@elizaos/core';
 import {
@@ -53,6 +55,8 @@ async function executeWebhook(
     );
     res.json({ success: true, data: execution });
   } catch (error) {
+    // error-policy:J1 authenticated webhook transport boundary translates
+    // typed route failures into the plugin's structured HTTP error contract.
     res.status(error instanceof WorkflowApiError ? (error.statusCode ?? 500) : 500).json({
       success: false,
       error: 'failed_to_execute_webhook',

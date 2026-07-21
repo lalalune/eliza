@@ -4,6 +4,7 @@
  * parent parses. Exercises the real Smithers execution adapter.
  */
 import { writeFile } from 'node:fs/promises';
+import { ElizaError } from '@elizaos/core';
 import {
   runWorkflowWithSmithers,
   type SmithersExecutionPlan,
@@ -229,6 +230,114 @@ async function timeoutCancellationCase(): Promise<Record<string, unknown>> {
   return { code, nodeWorkStarted, observedAbort, sideEffectHappened };
 }
 
+async function serviceStopDrainCase(): Promise<Record<string, unknown>> {
+  const nodes = [node('non-cooperative')];
+  const plan: SmithersExecutionPlan = {
+    enabledNodes: nodes,
+    startNodes: ['non-cooperative'],
+    incoming: {},
+  };
+  const cancellation = new AbortController();
+  let nodeWorkFinished = false;
+  let code: string | undefined;
+  const startedAt = Date.now();
+  try {
+    await run(
+      'wf-service-stop-drain',
+      nodes,
+      plan,
+      async () => {
+        setTimeout(
+          () =>
+            cancellation.abort(
+              new ElizaError('Embedded workflow service stopped', {
+                code: 'WORKFLOW_SERVICE_STOPPED',
+                severity: 'ephemeral',
+              })
+            ),
+          25
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        nodeWorkFinished = true;
+        return [[{ json: { finished: true } }]];
+      },
+      undefined,
+      cancellation.signal
+    );
+  } catch (error) {
+    code =
+      error && typeof error === 'object' && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : undefined;
+  }
+  return { code, nodeWorkFinished, elapsedMs: Date.now() - startedAt };
+}
+
+async function typedNodeErrorCase(): Promise<Record<string, unknown>> {
+  const nodes = [node('typed-error')];
+  const plan: SmithersExecutionPlan = {
+    enabledNodes: nodes,
+    startNodes: ['typed-error'],
+    incoming: {},
+  };
+  try {
+    await run('wf-typed-error', nodes, plan, async () => {
+      throw new ElizaError('typed node failure', {
+        code: 'WORKFLOW_NODE_TYPED_FAILURE',
+        context: { boundary: 'fixture' },
+      });
+    });
+  } catch (error) {
+    return {
+      code:
+        error && typeof error === 'object' && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : undefined,
+      context:
+        error && typeof error === 'object' && 'context' in error
+          ? (error as { context: unknown }).context
+          : undefined,
+    };
+  }
+  return {};
+}
+
+async function parallelFatalErrorCase(): Promise<Record<string, unknown>> {
+  const nodes = [node('trigger'), node('continued', { continueOnFail: true }), node('fatal')];
+  const plan: SmithersExecutionPlan = {
+    enabledNodes: nodes,
+    startNodes: ['trigger'],
+    incoming: {
+      continued: [{ source: 'trigger', sourceOutputIndex: 0, destinationInputIndex: 0 }],
+      fatal: [{ source: 'trigger', sourceOutputIndex: 0, destinationInputIndex: 0 }],
+    },
+  };
+  try {
+    await run('wf-parallel-fatal-error', nodes, plan, async (currentNode) => {
+      if (currentNode.name === 'continued') {
+        throw new ElizaError('continued branch failure', {
+          code: 'CONTINUED_BRANCH_FAILURE',
+        });
+      }
+      if (currentNode.name === 'fatal') {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        throw new ElizaError('fatal branch failure', {
+          code: 'FATAL_BRANCH_FAILURE',
+        });
+      }
+      return [[{ json: { started: true } }]];
+    });
+  } catch (error) {
+    return {
+      code:
+        error && typeof error === 'object' && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : undefined,
+    };
+  }
+  return {};
+}
+
 async function largeResultCase(): Promise<Record<string, unknown>> {
   const nodes = [node('large')];
   const plan: SmithersExecutionPlan = {
@@ -333,6 +442,9 @@ const cases: Record<string, () => Promise<Record<string, unknown>>> = {
   fail: failCase,
   timeout: timeoutCase,
   'timeout-cancellation': timeoutCancellationCase,
+  'service-stop-drain': serviceStopDrainCase,
+  'typed-node-error': typedNodeErrorCase,
+  'parallel-fatal-error': parallelFatalErrorCase,
   'large-result': largeResultCase,
   'crash-resume': crashResumeCase,
 };

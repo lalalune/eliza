@@ -1,11 +1,11 @@
 /**
  * Authenticates Cloud workflow requests, verifies agent ownership, and proxies
- * them to the assigned agent server. When no compatible runtime is assigned,
- * callers receive a typed dedicated-upgrade or retryable-unavailable response.
+ * them to the dedicated container that serves the agent's canonical chat and
+ * workflow runtime. Unavailable runtimes produce typed upgrade, wake, or retry
+ * responses without exposing Cloud credentials to the container.
  */
 import { errorToResponse } from "@/lib/api/errors";
 import { requireAuthOrApiKeyWithOrg } from "@/lib/auth";
-import { buildRedisClient } from "@/lib/cache/redis-factory";
 import { checkAgentCreditGate } from "@/lib/services/agent-billing-gate";
 import { insufficientCredits402 } from "@/lib/services/agent-billing-gate-402";
 import { elizaSandboxService } from "@/lib/services/eliza-sandbox";
@@ -21,7 +21,9 @@ const WORKFLOW_CORS_METHODS = "GET, POST, PUT, DELETE, OPTIONS";
 const WORKFLOW_PROXY_DEFAULT_TIMEOUT_MS = 120_000;
 const WORKFLOW_PROXY_GENERATION_TIMEOUT_MS = 5 * 60_000;
 const WORKFLOW_PROXY_RUN_TIMEOUT_MS = 10 * 60_000;
-const DEDICATED_LAZY_INACTIVE_STATUSES = new Set([
+const WORKFLOW_PROXY_RETRY_AFTER_SECONDS = 5;
+const WORKFLOW_PROXY_PATH_SEGMENT_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+const DEDICATED_LAZY_WAKEABLE_STATUSES = new Set([
   "stopped",
   "sleeping",
   "disconnected",
@@ -72,39 +74,71 @@ export function workflowRuntimeUnavailableResponse(
   );
 }
 
-function envString(c: AppContext | undefined, key: string): string | null {
-  const value = c?.env?.[key];
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+function workflowProxyTimeoutResponse(): Response {
+  const response = Response.json(
+    {
+      success: false,
+      code: "agent_timeout",
+      error:
+        "Agent did not start responding in time. The workflow may still be processing; retry shortly.",
+      retryable: true,
+    },
+    { status: 504 },
+  );
+  response.headers.set(
+    "Retry-After",
+    String(WORKFLOW_PROXY_RETRY_AFTER_SECONDS),
+  );
+  return response;
 }
 
-async function resolveAgentServerUrl(
-  c: AppContext,
-  agentId: string,
-): Promise<string | null> {
-  const redis = buildRedisClient(c.env);
-  if (!redis) return null;
+function isTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  );
+}
 
-  const serverName = await redis.get<string>(`agent:${agentId}:server`);
-  if (!serverName) return null;
-
-  const serverUrl = await redis.get<string>(`server:${serverName}:url`);
-  return typeof serverUrl === "string" && serverUrl.trim()
-    ? serverUrl.trim()
+function normalizeWorkflowProxySuffix(
+  suffix: string | undefined,
+): string | null {
+  if (suffix === undefined) return null;
+  const normalized = suffix.replace(/^\/+|\/+$/g, "");
+  if (!normalized) return "";
+  const segments = normalized.split("/");
+  return segments.every((segment) =>
+    WORKFLOW_PROXY_PATH_SEGMENT_PATTERN.test(segment),
+  )
+    ? segments.join("/")
     : null;
 }
 
-function buildTargetUrl(
-  serverUrl: string,
-  requestUrl: string,
-  agentId: string,
-  suffix: string,
-): URL {
-  const request = new URL(requestUrl);
-  const target = new URL(serverUrl);
-  const normalizedSuffix = suffix ? `/${suffix.replace(/^\/+/, "")}` : "";
-  target.pathname = `/agents/${encodeURIComponent(agentId)}/workflows${normalizedSuffix}`;
-  target.search = request.search;
-  return target;
+function invalidWorkflowProxyPathResponse(origin: string | null): Response {
+  return applyCorsHeaders(
+    Response.json(
+      {
+        success: false,
+        code: "invalid_workflow_path",
+        error: "Invalid agent or workflow path.",
+      },
+      { status: 400 },
+    ),
+    WORKFLOW_CORS_METHODS,
+    origin,
+  );
+}
+
+/** Maps the Cloud workflow collection shape to plugin-workflow's raw routes. */
+export function workflowContainerPath(suffix: string): string {
+  if (!suffix) return "workflows";
+  if (
+    suffix === "status" ||
+    suffix === "runtime/start" ||
+    suffix.startsWith("executions/")
+  ) {
+    return suffix;
+  }
+  return `workflows/${suffix}`;
 }
 
 /** Keeps long generation/run calls alive while bounding ordinary proxy work. */
@@ -182,7 +216,7 @@ async function wakeDedicatedLazyRuntime(params: {
   );
 }
 
-async function forwardWorkflowToAgentServer(params: {
+async function forwardWorkflowToDedicatedRuntime(params: {
   ctx: AppContext;
   request: Request;
   agentId: string;
@@ -190,11 +224,10 @@ async function forwardWorkflowToAgentServer(params: {
   user: { id: string; organization_id: string };
   executionTier: WorkflowAgentExecutionTier;
   runtimeStatus: string;
-  canWakeRuntime: boolean;
 }): Promise<Response> {
-  // Tier and durable runtime state are authoritative. Redis assignment keys can
-  // outlive a stopped process, so consulting them first can bypass both the
-  // shared-tier capability response and the paid-compute wake gate.
+  // Tier and durable runtime state are authoritative and must be checked before
+  // container lookup so shared agents cannot bypass the capability response and
+  // scale-to-zero agents cannot bypass the paid-compute wake gate.
   if (params.executionTier === "shared") {
     return workflowRuntimeUnavailableResponse(
       params.agentId,
@@ -203,82 +236,77 @@ async function forwardWorkflowToAgentServer(params: {
   }
   if (
     params.executionTier === "dedicated-lazy" &&
-    DEDICATED_LAZY_INACTIVE_STATUSES.has(params.runtimeStatus)
+    DEDICATED_LAZY_WAKEABLE_STATUSES.has(params.runtimeStatus)
   ) {
     return wakeDedicatedLazyRuntime(params);
   }
 
-  const serverUrl = await resolveAgentServerUrl(params.ctx, params.agentId);
-  if (!serverUrl) {
-    if (params.executionTier === "dedicated-lazy" && params.canWakeRuntime) {
-      return wakeDedicatedLazyRuntime(params);
-    }
-    return workflowRuntimeUnavailableResponse(
-      params.agentId,
-      params.executionTier,
-    );
-  }
-
-  const sharedSecret = envString(params.ctx, "AGENT_SERVER_SHARED_SECRET");
-  if (!sharedSecret) {
-    return Response.json(
-      {
-        success: false,
-        code: "workflow_runtime_unavailable",
-        error: "The agent workflow runtime is temporarily unavailable.",
-        capability: "workflows",
-        currentExecutionTier: params.executionTier,
-        upgradeRequired: false,
-        retryable: true,
-      },
-      { status: 503 },
-    );
-  }
-
-  const headers = new Headers(params.request.headers);
-  headers.delete("host");
-  headers.set("x-server-token", sharedSecret);
-  headers.set("x-eliza-user-id", params.user.id);
-  headers.set("x-eliza-organization-id", params.user.organization_id);
-
   const method = params.request.method.toUpperCase();
+  if (
+    method !== "GET" &&
+    method !== "POST" &&
+    method !== "PUT" &&
+    method !== "DELETE"
+  ) {
+    return Response.json(
+      { success: false, error: "Method not allowed" },
+      { status: 405 },
+    );
+  }
   const body =
-    method === "GET" || method === "HEAD"
-      ? undefined
-      : await params.request.arrayBuffer();
-  return fetch(
-    buildTargetUrl(
-      serverUrl,
-      params.request.url,
+    method === "POST" || method === "PUT"
+      ? await params.request.arrayBuffer()
+      : undefined;
+  try {
+    const requestUrl = new URL(params.request.url);
+    const response = await elizaSandboxService.proxyWorkflowRequest(
       params.agentId,
-      params.suffix,
-    ),
-    {
+      params.user.organization_id,
+      workflowContainerPath(params.suffix),
       method,
-      headers,
       body,
-      redirect: "manual",
-      signal: AbortSignal.timeout(
-        workflowProxyTimeoutMs(method, params.suffix),
-      ),
-    },
-  );
+      requestUrl.search.slice(1),
+      {
+        timeoutMs: workflowProxyTimeoutMs(method, params.suffix),
+        protocolHeaders: params.request.headers,
+      },
+    );
+    return (
+      response ??
+      workflowRuntimeUnavailableResponse(params.agentId, params.executionTier)
+    );
+  } catch (error) {
+    // error-policy:J1 the upstream workflow transport owns timeout translation;
+    // callers need an unambiguous retryable 504 instead of a generic Cloud 500.
+    if (isTimeoutError(error)) return workflowProxyTimeoutResponse();
+    throw error;
+  }
 }
 
 export async function handleWorkflowProxyRequest(
   request: Request,
-  agentId: string,
-  suffix: string,
+  agentId: string | undefined,
+  suffix: string | undefined,
   ctx: AppContext,
 ): Promise<Response> {
+  const origin = request.headers.get("origin");
   try {
     const { user } = await requireAuthOrApiKeyWithOrg(request);
+    const normalizedAgentId = agentId?.trim();
+    const normalizedSuffix = normalizeWorkflowProxySuffix(suffix);
+    if (
+      !normalizedAgentId ||
+      !WORKFLOW_PROXY_PATH_SEGMENT_PATTERN.test(normalizedAgentId) ||
+      normalizedSuffix === null
+    ) {
+      return invalidWorkflowProxyPathResponse(origin);
+    }
     // Confirm the caller's org owns this agent before proxying — otherwise any
     // authenticated user could drive workflow ops (suspend/resume/state) on
     // another org's agent just by knowing its id. Matches the suspend/resume
     // routes, which gate on getAgent(agentId, organization_id).
     const agent = await elizaSandboxService.getAgent(
-      agentId,
+      normalizedAgentId,
       user.organization_id,
     );
     if (!agent) {
@@ -288,30 +316,30 @@ export async function handleWorkflowProxyRequest(
           { status: 404 },
         ),
         WORKFLOW_CORS_METHODS,
+        origin,
       );
     }
-    const forwarded = await forwardWorkflowToAgentServer({
+    const forwarded = await forwardWorkflowToDedicatedRuntime({
       ctx,
       request,
-      agentId,
-      suffix,
+      agentId: normalizedAgentId,
+      suffix: normalizedSuffix,
       user,
       executionTier: agent.execution_tier,
       runtimeStatus: agent.status,
-      canWakeRuntime: !(
-        agent.status === "running" &&
-        agent.bridge_url &&
-        agent.health_url
-      ),
     });
-    return applyCorsHeaders(forwarded, WORKFLOW_CORS_METHODS);
+    return applyCorsHeaders(forwarded, WORKFLOW_CORS_METHODS, origin);
   } catch (error) {
     // error-policy:J1 this is the outer Cloud transport boundary; translate
     // authentication, ownership, and proxy failures into the standard response.
-    return applyCorsHeaders(errorToResponse(error), WORKFLOW_CORS_METHODS);
+    return applyCorsHeaders(
+      errorToResponse(error),
+      WORKFLOW_CORS_METHODS,
+      origin,
+    );
   }
 }
 
-export function handleWorkflowProxyOptions(): Response {
-  return handleCorsOptions(WORKFLOW_CORS_METHODS);
+export function handleWorkflowProxyOptions(origin?: string | null): Response {
+  return handleCorsOptions(WORKFLOW_CORS_METHODS, origin);
 }

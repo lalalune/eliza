@@ -89,7 +89,12 @@ interface SmithersProtocolResponse {
   requestId: string;
   ok: boolean;
   outputData?: SmithersNodeExecutionData[][];
-  error?: { message: string; stack?: string };
+  error?: {
+    message: string;
+    stack?: string;
+    code?: string;
+    context?: Record<string, unknown>;
+  };
 }
 
 interface SmithersProtocolResult {
@@ -197,8 +202,33 @@ async function resolvePluginRoot(): Promise<string> {
   return process.cwd();
 }
 
-function toErrorPayload(error: unknown): { message: string; stack?: string } {
+function toErrorPayload(error: unknown): {
+  message: string;
+  stack?: string;
+  code?: string;
+  context?: Record<string, unknown>;
+} {
+  if (error instanceof ElizaError) {
+    return {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      context: error.context,
+    };
+  }
   if (error instanceof Error) return { message: error.message, stack: error.stack };
+  if (error !== null && typeof error === 'object') {
+    const candidate = error as Record<string, unknown>;
+    return {
+      message: typeof candidate.message === 'string' ? candidate.message : String(error),
+      stack: typeof candidate.stack === 'string' ? candidate.stack : undefined,
+      code: typeof candidate.code === 'string' ? candidate.code : undefined,
+      context:
+        candidate.context !== null && typeof candidate.context === 'object'
+          ? (candidate.context as Record<string, unknown>)
+          : undefined,
+    };
+  }
   return { message: String(error) };
 }
 
@@ -259,6 +289,8 @@ function createSmithersScript(): string {
         if (!response.ok) {
           const error = new Error(response.error?.message ?? 'Node execution failed');
           if (response.error?.stack) error.stack = response.error.stack;
+          if (response.error?.code) error.code = response.error.code;
+          if (response.error?.context) error.context = response.error.context;
           entry.reject(error);
         } else {
           entry.resolve(response.outputData ?? [[]]);
@@ -571,6 +603,7 @@ export async function runWorkflowWithSmithers({
   let executionResult: WorkflowExecution | null = null;
   let runMetrics: SmithersRunMetrics | null = null;
   let protocolError: ElizaError | null = null;
+  const nodeExecutionErrors = new Map<string, unknown>();
   let stdinEnded = false;
   let externallyAborted = externalSignal?.aborted === true;
   const executionAbort = new AbortController();
@@ -579,9 +612,17 @@ export async function runWorkflowWithSmithers({
     if (!executionAbort.signal.aborted) executionAbort.abort(reason);
     try {
       proc.kill('SIGKILL');
-    } catch {
+    } catch (error) {
       // error-policy:J6 best-effort worker teardown; close/error remains the
       // authoritative observation for the subprocess lifecycle.
+      logger.warn(
+        {
+          error,
+          workflowId: workflow.id ?? '',
+          executionId,
+        },
+        '[SmithersRuntime] Failed to terminate workflow worker'
+      );
     }
   };
 
@@ -658,8 +699,12 @@ export async function runWorkflowWithSmithers({
       (async () => {
         try {
           const outputData = await runNode(node, message.inputData, executionAbort.signal);
+          nodeExecutionErrors.delete(message.nodeName);
           writeResponse({ requestId: message.requestId, ok: true, outputData });
         } catch (error) {
+          if (!executionAbort.signal.aborted) {
+            nodeExecutionErrors.set(message.nodeName, error);
+          }
           writeResponse({ requestId: message.requestId, ok: false, error: toErrorPayload(error) });
         }
       })()
@@ -706,10 +751,17 @@ export async function runWorkflowWithSmithers({
     }
     // Cooperative node work should settle promptly after cancellation, while a
     // third-party node that ignores AbortSignal must not hold the API forever.
-    await Promise.race([
-      Promise.allSettled(inflight),
-      new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-    ]);
+    const serviceStopRequiresDrain =
+      externalSignal?.reason instanceof ElizaError &&
+      externalSignal.reason.code === 'WORKFLOW_SERVICE_STOPPED';
+    if (serviceStopRequiresDrain) {
+      await Promise.allSettled(inflight);
+    } else {
+      await Promise.race([
+        Promise.allSettled(inflight),
+        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+      ]);
+    }
   }
 
   endStdin();
@@ -731,6 +783,23 @@ export async function runWorkflowWithSmithers({
   }
 
   if (exitCode !== 0) {
+    const nodeExecutionError = [...nodeExecutionErrors]
+      .filter(([nodeName]) => byName.get(nodeName)?.continueOnFail !== true)
+      .values()
+      .next();
+    if (!nodeExecutionError.done) {
+      const [nodeName, error] = nodeExecutionError.value;
+      const payload = toErrorPayload(error);
+      throw new ElizaError(`Node "${nodeName}" failed: ${payload.message}`, {
+        code: error instanceof ElizaError ? error.code : 'WORKFLOW_NODE_EXECUTION_FAILED',
+        cause: error,
+        context:
+          error instanceof ElizaError
+            ? error.context
+            : { workflowId: workflow.id ?? '', executionId, nodeName },
+        severity: error instanceof ElizaError ? error.severity : undefined,
+      });
+    }
     throw new ElizaError(
       `Smithers workflow execution failed: ${stderr.trim() || `exit ${exitCode}`}`,
       {
