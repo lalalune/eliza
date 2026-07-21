@@ -1574,6 +1574,7 @@ waifu.fun/
 /.codex-agent-worktrees/
 /.codex-pr-worktrees/
 /.codex-worktrees/
+/dist-flatpak/
 
 # chat-ux gesture e2e generated artifacts (video + screenshots)
 /packages/ui/src/components/shell/__e2e__/output-chatux/
