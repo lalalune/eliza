@@ -39,10 +39,9 @@ import {
   type CloudHandoffPhaseDetail,
 } from "../events";
 import {
-  publishNativeAgentText,
-  publishNativeToolState,
+  createNativeChatTranscriptTurnPublisher,
+  type NativeChatTranscriptTurnPublisher,
 } from "../native-transcript/chat-event-adapter";
-import { publishNativeTranscriptEvent } from "../native-transcript/transport";
 import { getWindowNavigationPath, type Tab } from "../navigation";
 import { directCloudSharedAgentIdFromBase } from "../utils/cloud-agent-base";
 import {
@@ -254,6 +253,54 @@ export function isRetryableSendError(err: unknown): boolean {
   if (kind === "network" || kind === "timeout") return true;
   const status = (err as { status?: unknown }).status;
   return status === 502 || status === 503;
+}
+
+/** Mirror a terminal chat failure with the same remediation semantics as UI. */
+function publishNativeChatSendFailure(
+  transcript: NativeChatTranscriptTurnPublisher,
+  err: unknown,
+  fallbackCode = "chat-send-failed",
+): void {
+  if (isStreamGenerationError(err)) {
+    if (err.failureKind) {
+      transcript.publishFailureKind(err.failureKind, err.message);
+      return;
+    }
+    if (err.accountConnect) {
+      transcript.publishError({
+        code: "account-connect-required",
+        retryable: false,
+        message: err.message,
+      });
+      return;
+    }
+  }
+
+  const status = (err as { status?: unknown }).status;
+  const kind = (err as { kind?: unknown }).kind;
+  const code =
+    status === 401 || status === 403
+      ? "authentication-required"
+      : status === 402
+        ? "insufficient_credits"
+        : status === 404
+          ? "not-found"
+          : status === 429
+            ? "rate_limited"
+            : status === 502 || status === 503
+              ? "provider_issue"
+              : typeof status === "number" && status >= 400 && status < 500
+                ? "invalid-request"
+                : kind === "network"
+                  ? "transport-error"
+                  : kind === "timeout"
+                    ? "transport-timeout"
+                    : fallbackCode;
+  transcript.publishError({
+    code,
+    retryable: status === 429 || isRetryableSendError(err),
+    ...(err instanceof Error && err.message ? { message: err.message } : {}),
+  });
 }
 
 /**
@@ -1488,15 +1535,12 @@ export function useChatSend(deps: UseChatSendDeps) {
           timestamp: Date.now(),
         } satisfies NonNullable<QueuedChatSend["optimisticTurn"]>);
       const { userMsgId, assistantMsgId, timestamp: now } = optimisticTurn;
-
-      if (channelType === "VOICE_DM") {
-        publishNativeTranscriptEvent({
-          type: "stt.final",
-          turnId: clientMessageId,
-          text,
-          at: now,
-        });
-      }
+      const nativeTranscript = createNativeChatTranscriptTurnPublisher({
+        enabled: channelType === "VOICE_DM",
+        turnId: clientMessageId,
+        messageId: assistantMsgId,
+      });
+      nativeTranscript.publishUserFinal(text, now);
 
       // Paint the accepted turn before conversation creation / room discovery.
       // Those calls can take seconds on a cold cloud agent; clearing the composer
@@ -1589,7 +1633,7 @@ export function useChatSend(deps: UseChatSendDeps) {
           setCompanionMessageCutoffTs(nextCutoffTs);
           convId = conversation.id;
           convRoomId = conversation.roomId;
-        } catch {
+        } catch (error) {
           // error-policy:J4 surfaced user-facing failure state.
           // First-message conversation creation failed (cold open on weak
           // signal). Remove the local accepted-turn rows and restore the draft:
@@ -1607,6 +1651,11 @@ export function useChatSend(deps: UseChatSendDeps) {
             "Couldn't start the conversation — check your connection and try again. Your message was restored.",
             "error",
             8_000,
+          );
+          publishNativeChatSendFailure(
+            nativeTranscript,
+            error,
+            "conversation-create-failed",
           );
           return;
         }
@@ -1674,14 +1723,7 @@ export function useChatSend(deps: UseChatSendDeps) {
                 : mergeStreamingText(streamedAssistantText, token);
             if (nextText === streamedAssistantText) return;
             streamedAssistantText = nextText;
-            if (channelType === "VOICE_DM") {
-              publishNativeAgentText({
-                messageId: assistantMsgId,
-                turnId: clientMessageId,
-                text: nextText,
-                final: false,
-              });
-            }
+            nativeTranscript.publishAgentText(nextText);
             if (isConversationCommitActive(convId)) {
               setChatFirstTokenReceived(true);
             }
@@ -1703,9 +1745,7 @@ export function useChatSend(deps: UseChatSendDeps) {
           // Coalesced into the streaming frame with the text + status.
           (event) => {
             scheduleToolEvent(convId, assistantMsgId, event);
-            if (channelType === "VOICE_DM") {
-              publishNativeToolState(event, clientMessageId);
-            }
+            nativeTranscript.publishToolState(event);
           },
           // Idempotency key — reused verbatim across the single auto-retry so a
           // send that landed during a blip is server-side de-duped.
@@ -1716,32 +1756,13 @@ export function useChatSend(deps: UseChatSendDeps) {
         // drop/complete/fail/interrupt — no streamed tokens may be lost.
         flushStreamingText();
 
-        if (channelType === "VOICE_DM") {
-          const finalText = data.text || streamedAssistantText;
-          if (finalText) {
-            publishNativeAgentText({
-              messageId: assistantMsgId,
-              turnId: clientMessageId,
-              text: finalText,
-              final: data.completed !== false,
-            });
-          }
-          if (data.failureKind) {
-            publishNativeTranscriptEvent({
-              type: "error",
-              code: data.failureKind,
-              retryable: true,
-            });
-          }
-          if (data.completed === false) {
-            publishNativeTranscriptEvent({
-              type: "cancel",
-              scope: "turn",
-              turnId: clientMessageId,
-              reason: "generation-incomplete",
-            });
-          }
-        }
+        nativeTranscript.publishTerminal({
+          text: data.text,
+          streamedText: streamedAssistantText,
+          completed: data.completed,
+          failureKind: data.failureKind,
+          accountConnect: data.accountConnect,
+        });
 
         if (!data.text.trim()) {
           if (data.failureKind) {
@@ -1901,14 +1922,7 @@ export function useChatSend(deps: UseChatSendDeps) {
         flushStreamingText();
         const abortError = err as Error;
         if (abortError.name === "AbortError" || controller?.signal.aborted) {
-          if (channelType === "VOICE_DM") {
-            publishNativeTranscriptEvent({
-              type: "cancel",
-              scope: "turn",
-              turnId: clientMessageId,
-              reason: "aborted",
-            });
-          }
+          nativeTranscript.publishCancel("aborted");
           dropEmptyAssistantPlaceholder(convId, assistantMsgId);
           return;
         }
@@ -1923,12 +1937,18 @@ export function useChatSend(deps: UseChatSendDeps) {
           (err.failureKind || err.accountConnect)
         ) {
           if (err.failureKind) {
+            nativeTranscript.publishFailureKind(err.failureKind, err.message);
             applyStreamingModificationForConversation(convId, {
               messageId: assistantMsgId,
               mode: "fail",
               failureKind: err.failureKind,
             });
           } else if (err.accountConnect) {
+            nativeTranscript.publishError({
+              code: "account-connect-required",
+              retryable: false,
+              message: err.message,
+            });
             applyStreamingModificationForConversation(convId, {
               messageId: assistantMsgId,
               mode: "complete",
@@ -1968,6 +1988,11 @@ export function useChatSend(deps: UseChatSendDeps) {
                 "error",
                 10_000,
               );
+              nativeTranscript.publishError({
+                code: "agent-unreachable",
+                retryable: false,
+                message: "The selected agent is no longer reachable.",
+              });
               dropEmptyAssistantPlaceholder(convId, assistantMsgId);
               return;
             }
@@ -1977,6 +2002,11 @@ export function useChatSend(deps: UseChatSendDeps) {
             // lost message.
             dropEmptyAssistantPlaceholder(convId, assistantMsgId);
             setActionNotice(buildSendFailureNotice(createErr), "error", 8_000);
+            publishNativeChatSendFailure(
+              nativeTranscript,
+              createErr,
+              "conversation-recovery-failed",
+            );
             return;
           }
 
@@ -2024,6 +2054,7 @@ export function useChatSend(deps: UseChatSendDeps) {
                     : mergeStreamingText(replayStreamedText, token);
                 if (nextText === replayStreamedText) return;
                 replayStreamedText = nextText;
+                nativeTranscript.publishAgentText(nextText);
                 if (isConversationCommitActive(conversation.id)) {
                   setChatFirstTokenReceived(true);
                 }
@@ -2043,8 +2074,10 @@ export function useChatSend(deps: UseChatSendDeps) {
                   replayAssistantId,
                   serverStatus,
                 ),
-              (event) =>
-                scheduleToolEvent(conversation.id, replayAssistantId, event),
+              (event) => {
+                scheduleToolEvent(conversation.id, replayAssistantId, event);
+                nativeTranscript.publishToolState(event);
+              },
               // Same idempotency key across the whole logical turn, including
               // the 404 recreate-and-replay recovery.
               clientMessageId,
@@ -2059,6 +2092,14 @@ export function useChatSend(deps: UseChatSendDeps) {
 
             // Commit any throttle-parked token before the terminal modification.
             flushStreamingText();
+
+            nativeTranscript.publishTerminal({
+              text: retryData.text,
+              streamedText: replayStreamedText,
+              completed: retryData.completed,
+              failureKind: retryData.failureKind,
+              accountConnect: retryData.accountConnect,
+            });
 
             if (!retryData.text.trim()) {
               applyStreamingModificationForConversation(conversation.id, {
@@ -2089,9 +2130,16 @@ export function useChatSend(deps: UseChatSendDeps) {
             flushStreamingText();
             dropEmptyAssistantPlaceholder(conversation.id, replayAssistantId);
             if (
-              (replayErr as Error).name !== "AbortError" &&
-              !controller?.signal.aborted
+              (replayErr as Error).name === "AbortError" ||
+              controller?.signal.aborted
             ) {
+              nativeTranscript.publishCancel("aborted");
+            } else {
+              publishNativeChatSendFailure(
+                nativeTranscript,
+                replayErr,
+                "conversation-replay-failed",
+              );
               setActionNotice(
                 buildSendFailureNotice(replayErr),
                 "error",
@@ -2148,12 +2196,14 @@ export function useChatSend(deps: UseChatSendDeps) {
           // through to the manual resend affordance so the turn isn't stuck
           // sending forever.
           if (controller?.signal.aborted) {
+            nativeTranscript.publishCancel("aborted");
             dropEmptyAssistantPlaceholder(convId, assistantMsgId);
             return;
           }
           // Timed out waiting — surface the manual resend path (mirror the
           // generic branch: drop the placeholder, KEEP the user's message,
           // notice + reconcile + restore-evicted).
+          publishNativeChatSendFailure(nativeTranscript, err);
           dropEmptyAssistantPlaceholder(convId, assistantMsgId);
           setActionNotice(buildSendFailureNotice(err), "error", 8_000);
           await loadConversationMessages(convId);
@@ -2178,6 +2228,7 @@ export function useChatSend(deps: UseChatSendDeps) {
           // silent dead air (the typing indicator stalls at ~30s while the SSE
           // idle timeout is 60s — without this the user just sees the dots
           // vanish and nothing replace them, reading as "my message was lost").
+          publishNativeChatSendFailure(nativeTranscript, err);
           dropEmptyAssistantPlaceholder(convId, assistantMsgId);
           const isAuth = status === 401 || status === 403;
           if (getSendValidationFailureMessage(err) !== null) {
