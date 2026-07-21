@@ -237,4 +237,46 @@ describe("useNativeComposerBridge durability", () => {
       onAcknowledgment,
     );
   });
+
+  it("rejects an attachment that the real composer cannot visibly preview", () => {
+    const acknowledgments: unknown[] = [];
+    const onAcknowledgment = (event: Event): void => {
+      acknowledgments.push((event as CustomEvent<unknown>).detail);
+    };
+    window.addEventListener(
+      NATIVE_COMPOSER_ACKNOWLEDGMENT_EVENT,
+      onAcknowledgment,
+    );
+    const bridgeOptions = options();
+    renderHook(() => useNativeComposerBridge(bridgeOptions));
+
+    act(() =>
+      dispatchNativeComposerOperation(
+        {
+          type: "attachment.add",
+          opId: "stored-attachment-op",
+          attachmentId: "stored-attachment",
+          attachment: {
+            source: "stored",
+            url: `/api/media/${"a".repeat(64)}.png`,
+          },
+        },
+        "stored-attachment-delivery",
+      ),
+    );
+
+    expect(bridgeOptions.setChatPendingImages).not.toHaveBeenCalled();
+    expect(bridgeOptions.sendChatText).not.toHaveBeenCalled();
+    expect(acknowledgments).toContainEqual({
+      deliveryId: "stored-attachment-delivery",
+      disposition: "rejected",
+      resultStatus: "rejected",
+      reason: "unsupported",
+    });
+    expect(drainNativeComposerOperations()).toEqual([]);
+    window.removeEventListener(
+      NATIVE_COMPOSER_ACKNOWLEDGMENT_EVENT,
+      onAcknowledgment,
+    );
+  });
 });

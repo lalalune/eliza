@@ -22,8 +22,11 @@
  *   - Attachments are expressed only in the vocabulary of the existing
  *     content-addressed media store — inline bytes, a `data:` URL, a remote
  *     http(s) URL to SSRF-guard, or an already-stored `/api/media/<hash>` URL.
- *     There is deliberately no file-id / handle variant, so the contract cannot
- *     express a second file store (repo commandment; see media-store.ts).
+ *     The current shipped composer only applies inline/data-URL sources because
+ *     those are the sources it can visibly preview; other valid wire shapes get
+ *     a typed `unsupported` result. There is deliberately no file-id / handle
+ *     variant, so the contract cannot express a second file store (repo
+ *     commandment; see media-store.ts).
  *
  * This module is pure type + constant declarations (runtime validation lives in
  * `decode.ts`, the state machine in `reduce.ts`) so it is safe to import from any

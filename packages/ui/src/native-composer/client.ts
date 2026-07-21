@@ -123,6 +123,10 @@ function decodeSnapshotAttachment(
   if (!optionalNonEmptyStringIsValid(raw, "name")) return null;
   if (raw.kind !== "inline" && raw.kind !== "remote" && raw.kind !== "stored")
     return null;
+  // A durable snapshot must never restore an attachment the real composer
+  // cannot render for review. The operation decoder still recognizes these
+  // media-store shapes so live callers receive a typed `unsupported` result.
+  if (raw.kind !== "inline") return null;
   if (raw.status !== "ready" && raw.status !== "pending-rehost") return null;
   const attachment: ComposerAttachment = {
     id: raw.id,
@@ -132,24 +136,11 @@ function decodeSnapshotAttachment(
     ...(isNonEmptyString(raw.mimeType) ? { mimeType: raw.mimeType } : {}),
     ...(isNonEmptyString(raw.name) ? { name: raw.name } : {}),
   };
-  const source =
-    attachment.kind === "inline"
-      ? {
-          source: "data-url" as const,
-          dataUrl: attachment.url,
-          ...(attachment.name ? { name: attachment.name } : {}),
-        }
-      : {
-          source: attachment.kind,
-          url: attachment.url,
-          ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
-          ...(attachment.name ? { name: attachment.name } : {}),
-        };
-  if (
-    attachment.kind !== "inline" &&
-    attachment.url.length > limits.maxRemoteUrlLength
-  )
-    return null;
+  const source = {
+    source: "data-url" as const,
+    dataUrl: attachment.url,
+    ...(attachment.name ? { name: attachment.name } : {}),
+  };
   const normalized = normalizeComposerAttachment(attachment.id, source, {
     maxBytes: limits.maxAttachmentBytes,
   });

@@ -120,16 +120,21 @@ describe("text + mentions + reply", () => {
 });
 
 describe("attachments", () => {
-  const stored: ComposerOperation = {
+  const inline: ComposerOperation = {
     type: "attachment.add",
     opId: "a1",
     attachmentId: "att1",
-    attachment: { source: "stored", url: `/api/media/${"a".repeat(64)}.png` },
+    attachment: {
+      source: "inline",
+      mimeType: "text/plain",
+      bytesBase64: "aGVsbG8=",
+      name: "note.txt",
+    },
   };
 
   it("adds and removes an attachment", () => {
     const { state } = run([
-      stored,
+      inline,
       { type: "attachment.remove", opId: "a2", attachmentId: "att1" },
     ]);
     expect(state.draft.attachments).toHaveLength(0);
@@ -140,7 +145,7 @@ describe("attachments", () => {
       ...ctx,
       capabilities: { attach: false, voice: true },
     };
-    const { results } = run([stored], noAttach);
+    const { results } = run([inline], noAttach);
     expect(results[0].status).toBe("rejected");
     if (results[0].status === "rejected")
       expect(results[0].reason).toBe("permission-denied");
@@ -153,14 +158,15 @@ describe("attachments", () => {
     };
     const { results } = run(
       [
-        stored,
+        inline,
         {
           type: "attachment.add",
           opId: "a2",
           attachmentId: "att2",
           attachment: {
-            source: "stored",
-            url: `/api/media/${"b".repeat(64)}.png`,
+            source: "inline",
+            mimeType: "text/plain",
+            bytesBase64: "d29ybGQ=",
           },
         },
       ],
@@ -169,6 +175,35 @@ describe("attachments", () => {
     expect(results[1].status).toBe("rejected");
     if (results[1].status === "rejected")
       expect(results[1].reason).toBe("oversized");
+  });
+
+  it("rejects remote and stored sources until they have an honest preview", () => {
+    const { state, results } = run([
+      {
+        type: "attachment.add",
+        opId: "remote",
+        attachmentId: "remote-attachment",
+        attachment: {
+          source: "remote",
+          url: "https://example.com/image.png",
+        },
+      },
+      {
+        type: "attachment.add",
+        opId: "stored",
+        attachmentId: "stored-attachment",
+        attachment: {
+          source: "stored",
+          url: `/api/media/${"a".repeat(64)}.png`,
+        },
+      },
+    ]);
+
+    expect(results).toEqual([
+      expect.objectContaining({ status: "rejected", reason: "unsupported" }),
+      expect.objectContaining({ status: "rejected", reason: "unsupported" }),
+    ]);
+    expect(state.draft.attachments).toEqual([]);
   });
 
   it("rejects a malformed attachment source with invalid-input", () => {

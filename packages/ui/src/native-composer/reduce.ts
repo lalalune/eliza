@@ -19,8 +19,9 @@
  *   - Permission/limits: an op needing an absent capability (`attach`/`voice`) is
  *     `rejected: "permission-denied"`; over-cap text/attachments/bytes are
  *     `rejected: "oversized"`; a malformed attachment source is
- *     `rejected: "invalid-input"`. A rejection is NOT recorded as processed, so a
- *     corrected retry re-evaluates.
+ *     `rejected: "invalid-input"`. Remote/stored sources remain valid wire
+ *     vocabulary but are rejected until the shipped composer can preview them.
+ *     A rejection is NOT recorded as processed, so a corrected retry re-evaluates.
  *
  * Callers pass only decoded operations (see `decode.ts`); this function trusts
  * the shapes and never re-validates them.
@@ -238,6 +239,10 @@ export function applyComposerOperation(
           "oversized",
           "attachment id exceeds max length",
         );
+      // The real composer preview owns inline bytes today. Accepting a remote or
+      // stored URL would make the attachment sendable but invisible, so keep the
+      // broader media-store wire vocabulary forward-compatible while rejecting
+      // these sources at the operation boundary until that preview ships.
       if (
         (op.attachment.source === "remote" ||
           op.attachment.source === "stored") &&
@@ -248,6 +253,16 @@ export function applyComposerOperation(
           op.opId,
           "oversized",
           "attachment URL exceeds max length",
+        );
+      if (
+        op.attachment.source === "remote" ||
+        op.attachment.source === "stored"
+      )
+        return rejected(
+          state,
+          op.opId,
+          "unsupported",
+          "external attachment previews are not available",
         );
       if (!capabilities.attach)
         return rejected(

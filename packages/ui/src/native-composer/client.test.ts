@@ -114,6 +114,19 @@ describe("createComposerBridgeClient — reload durability", () => {
         ],
       }),
     ).toEqual({ ok: false, message: "snapshot deferred send is invalid" });
+
+    const storedAttachment = {
+      id: "stored",
+      url: `/api/media/${"a".repeat(64)}.png`,
+      kind: "stored",
+      status: "ready",
+    };
+    expect(
+      decodeComposerBridgeSnapshot({
+        ...valid,
+        draft: { ...valid.draft, attachments: [storedAttachment] },
+      }),
+    ).toEqual({ ok: false, message: "snapshot draft is invalid" });
   });
 
   it("accepts empty reply previews and mention labels like the live decoder", () => {
