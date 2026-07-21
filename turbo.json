@@ -20,6 +20,7 @@
     "SEARCHBENCH_CORPUS",
     "SEARCHBENCH_LATENCY_REPEATS"
   ],
+  "globalPassThroughEnv": ["ELIZA_CHANGED_VITEST_RESULTS"],
   "tasks": {
     "build": {
       "dependsOn": ["@elizaos/core#build", "^build"],

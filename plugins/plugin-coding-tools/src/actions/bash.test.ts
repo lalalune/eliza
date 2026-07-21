@@ -921,6 +921,44 @@ describeIfPosix("shellAction", () => {
     }
   });
 
+  it("runs a structured command when path text resembles a history request", async () => {
+    const { runtime, shellHistoryService } = await makeRuntime({
+      withShellHistoryService: true,
+    });
+    const result = await shellAction.handler?.(
+      runtime,
+      makeMessage(
+        undefined,
+        "Inspect the branch from /private/tmp/eliza-coverage-clean/worktree/.tmp-shell-requested.",
+      ),
+      undefined,
+      { command: "printf 'structured-command-ran'" },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.text).toContain("structured-command-ran");
+    expect(shellHistoryService?.clearCommandHistory).not.toHaveBeenCalled();
+  });
+
+  it("infers a history subaction when no structured command is present", async () => {
+    const { runtime, shellHistoryService } = await makeRuntime({
+      shellHistoryCommands: ["git status"],
+    });
+    const result = await shellAction.handler?.(
+      runtime,
+      makeMessage(undefined, "Show the shell command history."),
+      undefined,
+      { limit: 1 },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.text).toContain("git status");
+    expect(shellHistoryService?.getCommandHistory).toHaveBeenCalledWith(
+      expect.any(String),
+      1,
+    );
+  });
+
   it("falls back to the session cwd when an explicit cwd is missing", async () => {
     const tmpRoot = path.resolve(process.cwd(), `.tmp-shell-cwd-${Date.now()}`);
     await fs.mkdir(tmpRoot, { recursive: true });
