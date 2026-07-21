@@ -153,6 +153,8 @@ async function sendNativeDraft(
     options.setChatPendingImages([]);
     options.setChatReplyTarget(null);
   } catch (error) {
+    // error-policy:J1 The chat-send action boundary translates transport and
+    // materialization failures into the typed native send result.
     client.completeSend(operation.opId, {
       ok: false,
       reason: "unsupported",

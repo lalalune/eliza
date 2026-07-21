@@ -5,6 +5,7 @@
  */
 
 import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
+import { logger } from "@elizaos/logger";
 import {
   invokeDesktopBridgeRequest,
   isElectrobunRuntime,
@@ -83,7 +84,10 @@ export async function installNativeComposerPlatformBridge(): Promise<void> {
     void publishEvent((event as CustomEvent<unknown>).detail).catch((error) => {
       // error-policy:J5 this auxiliary mirror rejection is observed here; the
       // renderer-owned composer remains the authoritative user-visible state.
-      console.error("[NativeComposer] Could not publish renderer event", error);
+      logger.error(
+        { error },
+        "[NativeComposer] Could not publish renderer event",
+      );
     });
   };
   window.addEventListener(NATIVE_COMPOSER_RENDERER_EVENT, onRendererEvent);
