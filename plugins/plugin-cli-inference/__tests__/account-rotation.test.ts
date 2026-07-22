@@ -5,8 +5,14 @@
  * provider failover without launching a real model process.
  */
 
-import { CODING_AGENT_SELECTOR_BRIDGE_SYMBOL, logger } from "@elizaos/core";
+import {
+  CODING_AGENT_SELECTOR_BRIDGE_SYMBOL,
+  type GenerateTextParams,
+  type IAgentRuntime,
+  logger,
+} from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildModels, ClaudeSdkSession, CodexSdkSession } from "../index";
 import {
   buildAmbientSubprocessEnv,
   buildRotatedSubprocessEnv,
@@ -68,9 +74,32 @@ function codexAccount(id: string): RotationAccountSelection {
   };
 }
 
+type TextModelHandler = (runtime: IAgentRuntime, params: GenerateTextParams) => Promise<string>;
+
+function claudeSdkRuntime(): IAgentRuntime {
+  return {
+    agentId: "00000000-0000-0000-0000-000000000001",
+    getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "claude-sdk" : undefined),
+  } as IAgentRuntime;
+}
+
+function codexSdkRuntime(): IAgentRuntime {
+  return {
+    agentId: "00000000-0000-0000-0000-000000000001",
+    getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "codex-sdk" : undefined),
+  } as IAgentRuntime;
+}
+
+function requiredModelHandler(models: Record<string, TextModelHandler>, modelType: string) {
+  const handler = models[modelType];
+  if (!handler) throw new Error(`missing test model handler ${modelType}`);
+  return handler;
+}
+
 const enabledGetter = () => undefined;
 
 afterEach(() => {
+  delete process.env.ELIZA_PLANNER_NATIVE_TOOLS;
   uninstallBridge();
   resetRotationStateForTests();
   vi.restoreAllMocks();
@@ -454,6 +483,25 @@ describe("withAccountRotation", () => {
     }
   });
 
+  it("does not create implicit affinity when a direct caller omits the session key", async () => {
+    const bridge = installFakeBridge([account("request-a"), account("request-b")]);
+    const scope = {};
+
+    await expect(withAccountRotation(async () => "first", ctx({ scope }) as never)).resolves.toBe(
+      "first"
+    );
+    await expect(withAccountRotation(async () => "second", ctx({ scope }) as never)).resolves.toBe(
+      "second"
+    );
+
+    const firstOptions = bridge.select.mock.calls[0]?.[1];
+    const secondOptions = bridge.select.mock.calls[1]?.[1];
+    expect(firstOptions?.sessionKey).toMatch(/^cli-inference:claude-sdk:request:/);
+    expect(secondOptions?.sessionKey).toMatch(/^cli-inference:claude-sdk:request:/);
+    expect(firstOptions?.sessionKey).not.toBe(secondOptions?.sessionKey);
+    expect(secondOptions?.accountIds).toBeUndefined();
+  });
+
   it("fails closed if the bridge violates an exact-account refresh pin", async () => {
     installFakeBridge([account("b"), account("c")]);
     const scope = {};
@@ -520,6 +568,170 @@ describe("withAccountRotation", () => {
     releaseFirst?.();
     await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
     expect(bridge.select.mock.calls[1][1]?.accountIds).toEqual(["b"]);
+  });
+
+  it("lets unrelated chat conversations select and execute independently", async () => {
+    const bridge = installFakeBridge([account("chat-a"), account("chat-b")]);
+    const runtime = claudeSdkRuntime();
+    const handler = requiredModelHandler(
+      buildModels({ ELIZA_CHAT_VIA_CLI: "claude-sdk" }) as Record<string, TextModelHandler>,
+      "TEXT_LARGE"
+    );
+    const entered: string[] = [];
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(ClaudeSdkSession.prototype, "send").mockImplementation(async (body: string) => {
+      entered.push(body);
+      await gate;
+      return body.includes("conversation-a") ? "answer-a" : "answer-b";
+    });
+    vi.spyOn(ClaudeSdkSession.prototype, "dispose").mockResolvedValue();
+
+    const callA = handler(runtime, {
+      prompt: "conversation-a",
+      providerOptions: { eliza: { conversationId: "room-a" } },
+    });
+    const callB = handler(runtime, {
+      prompt: "conversation-b",
+      providerOptions: { eliza: { conversationId: "room-b" } },
+    });
+
+    let concurrencyFailure: unknown;
+    try {
+      await vi.waitFor(() => expect(entered).toHaveLength(2));
+    } catch (error) {
+      concurrencyFailure = error;
+    } finally {
+      release?.();
+    }
+    const settled = await Promise.allSettled([callA, callB]);
+    if (concurrencyFailure) throw concurrencyFailure;
+
+    expect(settled).toEqual([
+      { status: "fulfilled", value: "answer-a" },
+      { status: "fulfilled", value: "answer-b" },
+    ]);
+    const firstSessionKey = bridge.select.mock.calls[0]?.[1]?.sessionKey;
+    const secondSessionKey = bridge.select.mock.calls[1]?.[1]?.sessionKey;
+    expect(firstSessionKey).toMatch(/^cli-inference:claude-sdk:conversation:[a-f0-9]{64}$/);
+    expect(secondSessionKey).toMatch(/^cli-inference:claude-sdk:conversation:[a-f0-9]{64}$/);
+    expect(firstSessionKey).not.toBe(secondSessionKey);
+    expect(bridge.select.mock.calls[0]?.[1]?.accountIds).toBeUndefined();
+    expect(bridge.select.mock.calls[1]?.[1]?.accountIds).toBeUndefined();
+  });
+
+  it("does not serialize unrelated Codex chats behind the model request shape", async () => {
+    const bridge = installFakeBridge([codexAccount("chat-a"), codexAccount("chat-b")]);
+    const runtime = codexSdkRuntime();
+    const handler = requiredModelHandler(
+      buildModels({ ELIZA_CHAT_VIA_CLI: "codex-sdk" }) as Record<string, TextModelHandler>,
+      "TEXT_LARGE"
+    );
+    const entered: string[] = [];
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(CodexSdkSession.prototype, "generate").mockImplementation(async (body: string) => {
+      entered.push(body);
+      await gate;
+      return body.includes("conversation-a") ? "answer-a" : "answer-b";
+    });
+
+    const callA = handler(runtime, {
+      prompt: "conversation-a",
+      providerOptions: { eliza: { conversationId: "room-a" } },
+    });
+    const callB = handler(runtime, {
+      prompt: "conversation-b",
+      providerOptions: { eliza: { conversationId: "room-b" } },
+    });
+
+    let concurrencyFailure: unknown;
+    try {
+      await vi.waitFor(() => expect(entered).toHaveLength(2));
+    } catch (error) {
+      concurrencyFailure = error;
+    } finally {
+      release?.();
+    }
+    const settled = await Promise.allSettled([callA, callB]);
+    if (concurrencyFailure) throw concurrencyFailure;
+
+    expect(settled).toEqual([
+      { status: "fulfilled", value: "answer-a" },
+      { status: "fulfilled", value: "answer-b" },
+    ]);
+    const firstSessionKey = bridge.select.mock.calls[0]?.[1]?.sessionKey;
+    const secondSessionKey = bridge.select.mock.calls[1]?.[1]?.sessionKey;
+    expect(firstSessionKey).toMatch(/^cli-inference:codex-sdk:conversation:[a-f0-9]{64}$/);
+    expect(secondSessionKey).toMatch(/^cli-inference:codex-sdk:conversation:[a-f0-9]{64}$/);
+    expect(firstSessionKey).not.toBe(secondSessionKey);
+    expect(bridge.select.mock.calls[0]?.[1]?.accountIds).toBeUndefined();
+    expect(bridge.select.mock.calls[1]?.[1]?.accountIds).toBeUndefined();
+  });
+
+  it("pins every SDK mode for one conversation to the same account", async () => {
+    process.env.ELIZA_PLANNER_NATIVE_TOOLS = "0";
+    const bridge = installFakeBridge([account("chat-a"), account("chat-a")]);
+    const runtime = claudeSdkRuntime();
+    const models = buildModels({ ELIZA_CHAT_VIA_CLI: "claude-sdk" }) as Record<
+      string,
+      TextModelHandler
+    >;
+    const textHandler = requiredModelHandler(models, "TEXT_LARGE");
+    const plannerHandler = requiredModelHandler(models, "ACTION_PLANNER");
+    vi.spyOn(ClaudeSdkSession.prototype, "send")
+      .mockResolvedValueOnce("text-answer")
+      .mockResolvedValueOnce('{"action":"NONE","params":{}}');
+    vi.spyOn(ClaudeSdkSession.prototype, "dispose").mockResolvedValue();
+    const providerOptions = { eliza: { conversationId: "room-stable" } };
+
+    await expect(
+      textHandler(runtime, {
+        system: "text completion system",
+        prompt: "first turn",
+        providerOptions,
+      })
+    ).resolves.toBe("text-answer");
+    await expect(
+      plannerHandler(runtime, {
+        system: "entirely different planner system",
+        prompt: "choose an action",
+        providerOptions,
+      })
+    ).resolves.toContain('"action":"NONE"');
+
+    expect(bridge.select).toHaveBeenCalledTimes(2);
+    const firstOptions = bridge.select.mock.calls[0]?.[1];
+    const secondOptions = bridge.select.mock.calls[1]?.[1];
+    expect(firstOptions?.sessionKey).toBe(secondOptions?.sessionKey);
+    expect(secondOptions?.accountIds).toEqual(["chat-a"]);
+  });
+
+  it("uses a unique pool session for every model call without core affinity", async () => {
+    const bridge = installFakeBridge([account("anonymous-a"), account("anonymous-b")]);
+    const runtime = claudeSdkRuntime();
+    const handler = requiredModelHandler(
+      buildModels({ ELIZA_CHAT_VIA_CLI: "claude-sdk" }) as Record<string, TextModelHandler>,
+      "TEXT_LARGE"
+    );
+    vi.spyOn(ClaudeSdkSession.prototype, "send")
+      .mockResolvedValueOnce("anonymous-a")
+      .mockResolvedValueOnce("anonymous-b");
+    vi.spyOn(ClaudeSdkSession.prototype, "dispose").mockResolvedValue();
+
+    await expect(handler(runtime, { system: "same", prompt: "same" })).resolves.toBe("anonymous-a");
+    await expect(handler(runtime, { system: "same", prompt: "same" })).resolves.toBe("anonymous-b");
+
+    const firstOptions = bridge.select.mock.calls[0]?.[1];
+    const secondOptions = bridge.select.mock.calls[1]?.[1];
+    expect(firstOptions?.sessionKey).toMatch(/^cli-inference:claude-sdk:request:/);
+    expect(secondOptions?.sessionKey).toMatch(/^cli-inference:claude-sdk:request:/);
+    expect(firstOptions?.sessionKey).not.toBe(secondOptions?.sessionKey);
+    expect(secondOptions?.accountIds).toBeUndefined();
   });
 
   it("rotates on OpenAI's classic quota envelope (the pre-fix silent tier-failover)", async () => {

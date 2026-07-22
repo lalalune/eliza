@@ -904,9 +904,11 @@ function priorCleanResidualsSnapshot(
   const raw = metadata[COMPLETION_RESIDUALS_METADATA_KEY];
   if (!isRecord(raw)) return undefined;
   if (raw.status !== "clean") return undefined;
-  if (!Array.isArray(raw.residuals)) return undefined;
+  if (!Array.isArray(raw.residuals) || raw.residuals.length !== 0) {
+    return undefined;
+  }
   if (typeof raw.checkedAt !== "number") return undefined;
-  return raw as unknown as CompletionResidualsResult;
+  return { status: "clean", residuals: [], checkedAt: raw.checkedAt };
 }
 
 function _readGroundTruthVerdict(

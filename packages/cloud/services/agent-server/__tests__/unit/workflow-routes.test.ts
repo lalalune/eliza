@@ -16,6 +16,18 @@ type WorkflowInput = {
   connections: Record<string, unknown>;
 };
 
+type MissingCredential = {
+  credType: string;
+  authUrl?: string;
+};
+
+const MISSING_CREDENTIALS: MissingCredential[] = [
+  {
+    credType: "discordApi",
+    authUrl: "eliza://settings/connectors/discord",
+  },
+];
+
 function workflow(id?: string): WorkflowInput {
   return {
     ...(id ? { id } : {}),
@@ -29,7 +41,8 @@ function createWorkflowService(
   initialOwnership: Record<string, string[]> = {},
   options: {
     persistDeployOwnership?: boolean;
-    omitDeployId?: boolean;
+    emptyDeployId?: boolean;
+    missingDeployCredentials?: MissingCredential[];
     executionWorkflowIds?: Record<string, string>;
     inactiveWorkflowIds?: string[];
     generatedDraft?: WorkflowInput & { _meta?: Record<string, unknown> };
@@ -72,6 +85,15 @@ function createWorkflowService(
       userId: string,
       deployOptions?: { activate?: boolean },
     ) => {
+      if (options.missingDeployCredentials?.length) {
+        return {
+          id: "",
+          name: definition.name,
+          active: false,
+          nodeCount: definition.nodes.length,
+          missingCredentials: options.missingDeployCredentials,
+        };
+      }
       const id = definition.id ?? `created-${++createdCount}`;
       const previousActive = definition.id
         ? (activeById.get(id) ?? false)
@@ -85,8 +107,14 @@ function createWorkflowService(
       definitionById.set(id, { ...definition, id });
       const active = deployOptions?.activate ?? previousActive;
       activeById.set(id, active);
-      if (options.omitDeployId) {
-        return { name: definition.name, active };
+      if (options.emptyDeployId) {
+        return {
+          id: "",
+          name: definition.name,
+          active,
+          nodeCount: definition.nodes.length,
+          missingCredentials: [],
+        };
       }
       return { id, name: definition.name, active };
     },
@@ -472,6 +500,36 @@ describe("workflow route ownership", () => {
 });
 
 describe("workflow activation contracts", () => {
+  test("preserves a credential-gated create deployment as a successful DTO", async () => {
+    const { app, service } = createHarness(
+      createWorkflowService(
+        {},
+        { missingDeployCredentials: MISSING_CREDENTIALS },
+      ),
+    );
+
+    const response = await requestWorkflow(app, "", {
+      method: "POST",
+      userId: "caller",
+      body: { workflow: workflow() },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      id: "",
+      name: "New workflow",
+      active: false,
+      nodeCount: 0,
+      missingCredentials: MISSING_CREDENTIALS,
+      warning: "missing credentials",
+    });
+    expect(service.deployWorkflow).toHaveBeenCalledTimes(1);
+    expect(service.listWorkflows).not.toHaveBeenCalled();
+    expect(service.getWorkflow).not.toHaveBeenCalled();
+    expect(service.activateWorkflow).not.toHaveBeenCalled();
+    expect(service.deactivateWorkflow).not.toHaveBeenCalled();
+  });
+
   test("saves a new workflow inactive unless activation is explicitly requested", async () => {
     const { app, service } = createHarness();
 
@@ -609,9 +667,45 @@ describe("workflow activation contracts", () => {
     expect(service.activateWorkflow).not.toHaveBeenCalled();
   });
 
-  test("fails observably when deployment returns no verifiable workflow id", async () => {
+  test("preserves a credential-gated generate deployment as a successful DTO", async () => {
     const { app, service } = createHarness(
-      createWorkflowService({}, { omitDeployId: true }),
+      createWorkflowService(
+        {},
+        {
+          missingDeployCredentials: MISSING_CREDENTIALS,
+          generatedDraft: {
+            ...workflow(),
+            name: "Generated credential workflow",
+            nodes: [{ id: "send" }],
+          },
+        },
+      ),
+    );
+
+    const response = await requestWorkflow(app, "/generate", {
+      method: "POST",
+      userId: "caller",
+      body: { prompt: "Send a Discord recap" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      id: "",
+      name: "Generated credential workflow",
+      active: false,
+      nodeCount: 1,
+      missingCredentials: MISSING_CREDENTIALS,
+      warning: "missing credentials",
+    });
+    expect(service.generateWorkflowDraft).toHaveBeenCalledTimes(1);
+    expect(service.deployWorkflow).toHaveBeenCalledTimes(1);
+    expect(service.listWorkflows).not.toHaveBeenCalled();
+    expect(service.getWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("fails observably when an empty deployment id has no missing credentials", async () => {
+    const { app, service } = createHarness(
+      createWorkflowService({}, { emptyDeployId: true }),
     );
 
     const response = await requestWorkflow(app, "", {
@@ -686,6 +780,39 @@ describe("workflow clarification contracts", () => {
       activate: undefined,
     });
     expect(service.deactivateWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("preserves a credential-gated clarification deployment as a successful DTO", async () => {
+    const { app, service } = createHarness(
+      createWorkflowService(
+        {},
+        { missingDeployCredentials: MISSING_CREDENTIALS },
+      ),
+    );
+    const response = await requestWorkflow(app, "/resolve-clarification", {
+      method: "POST",
+      userId: "caller",
+      body: {
+        draft: structuredClone(clarificationDraft),
+        resolutions: [
+          { paramPath: "nodes[0].parameters.value", value: "approved" },
+        ],
+        name: "Resolved credential workflow",
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      id: "",
+      name: "Resolved credential workflow",
+      active: false,
+      nodeCount: 1,
+      missingCredentials: MISSING_CREDENTIALS,
+      warning: "missing credentials",
+    });
+    expect(service.deployWorkflow).toHaveBeenCalledTimes(1);
+    expect(service.listWorkflows).not.toHaveBeenCalled();
+    expect(service.getWorkflow).not.toHaveBeenCalled();
   });
 
   test("returns remaining clarifications and the scoped connector catalog without deploying", async () => {

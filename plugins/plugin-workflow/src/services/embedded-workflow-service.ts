@@ -30,7 +30,7 @@ import {
   type UUID,
 } from '@elizaos/core';
 import { detectHostCapabilities } from '@elizaos/shared';
-import { and, desc, eq, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import {
   embeddedCredentials,
@@ -204,6 +204,12 @@ interface SmithersResumeState {
   workflow: WorkflowDefinition;
 }
 
+interface ExecutionCursor {
+  version: 1;
+  startedAt: string;
+  id: string;
+}
+
 interface IncomingConnection {
   source: string;
   sourceOutputIndex: number;
@@ -303,6 +309,37 @@ function waitForDelay(ms: number, signal: AbortSignal): Promise<void> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function encodeExecutionCursor(cursor: ExecutionCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeExecutionCursor(value: string): ExecutionCursor {
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (
+      !isRecord(decoded) ||
+      decoded.version !== 1 ||
+      typeof decoded.startedAt !== 'string' ||
+      !Number.isFinite(Date.parse(decoded.startedAt)) ||
+      typeof decoded.id !== 'string' ||
+      decoded.id.length === 0
+    ) {
+      throw new Error('cursor payload is invalid');
+    }
+    return { version: 1, startedAt: decoded.startedAt, id: decoded.id };
+  } catch (error) {
+    // error-policy:J3 the cursor is untrusted input; malformed tokens produce
+    // one explicit invalid request rather than silently restarting page one.
+    throw new WorkflowApiError('Invalid workflow execution cursor', 400, error);
+  }
+}
+
+function normalizeTagName(name: string): string {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) throw new WorkflowApiError('Workflow tag name is required', 400);
+  return normalized;
 }
 
 function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
@@ -2669,19 +2706,48 @@ export class EmbeddedWorkflowService extends Service {
     cursor?: string;
   }): Promise<{ data: WorkflowExecution[]; nextCursor?: string }> {
     await this.ensureSchema();
-    const rows = await this.getDb()
+    const limit = params?.limit;
+    if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
+      throw new WorkflowApiError('Workflow execution limit must be a positive integer', 400);
+    }
+    const cursor = params?.cursor ? decodeExecutionCursor(params.cursor) : undefined;
+    const query = this.getDb()
       .select()
       .from(embeddedExecutions)
       .where(
         and(
           eq(embeddedExecutions.agentId, this.tenantAgentId),
           params?.workflowId ? eq(embeddedExecutions.workflowId, params.workflowId) : undefined,
-          params?.status ? eq(embeddedExecutions.status, params.status) : undefined
+          params?.status ? eq(embeddedExecutions.status, params.status) : undefined,
+          cursor
+            ? or(
+                lt(embeddedExecutions.startedAt, cursor.startedAt),
+                and(
+                  eq(embeddedExecutions.startedAt, cursor.startedAt),
+                  lt(embeddedExecutions.id, cursor.id)
+                )
+              )
+            : undefined
         )
       )
-      .orderBy(desc(embeddedExecutions.startedAt));
-    const data = rows.map((row) => cloneJson(row.execution));
-    return { data: typeof params?.limit === 'number' ? data.slice(0, params.limit) : data };
+      .orderBy(desc(embeddedExecutions.startedAt), desc(embeddedExecutions.id));
+    const rows = limit === undefined ? await query : await query.limit(limit + 1);
+    const hasMore = limit !== undefined && rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const data = pageRows.map((row) => cloneJson(row.execution));
+    const last = pageRows.at(-1);
+    return {
+      data,
+      ...(hasMore && last
+        ? {
+            nextCursor: encodeExecutionCursor({
+              version: 1,
+              startedAt: last.startedAt,
+              id: last.id,
+            }),
+          }
+        : {}),
+    };
   }
 
   async getExecution(id: string): Promise<WorkflowExecution> {
@@ -2718,27 +2784,49 @@ export class EmbeddedWorkflowService extends Service {
   async createTag(name: string): Promise<WorkflowTag> {
     await this.ensureSchema();
     const db = this.getDb();
+    const normalizedName = normalizeTagName(name);
+    const timestamp = nowIso();
+    const tag = {
+      id: randomUUID(),
+      name: normalizedName,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const inserted = await db
+      .insert(embeddedTags)
+      .values({ agentId: this.tenantAgentId, ...tag })
+      .onConflictDoNothing({ target: [embeddedTags.agentId, embeddedTags.name] })
+      .returning();
+    if (inserted[0]) return tagFromRow(inserted[0]);
+
     const existingRows = await db
       .select()
       .from(embeddedTags)
-      .where(and(eq(embeddedTags.agentId, this.tenantAgentId), eq(embeddedTags.name, name)))
+      .where(
+        and(eq(embeddedTags.agentId, this.tenantAgentId), eq(embeddedTags.name, normalizedName))
+      )
       .limit(1);
     const existing = existingRows[0];
-    if (existing) return tagFromRow(existing);
-    const timestamp = nowIso();
-    const tag = { id: randomUUID(), name, createdAt: timestamp, updatedAt: timestamp };
-    await db.insert(embeddedTags).values({ agentId: this.tenantAgentId, ...tag });
-    return cloneJson(tag);
+    if (!existing) {
+      throw new ElizaError('Workflow tag conflict did not resolve to a durable row', {
+        code: 'WORKFLOW_TAG_CONFLICT_UNRESOLVED',
+        context: { agentId: this.tenantAgentId, name: normalizedName },
+      });
+    }
+    return tagFromRow(existing);
   }
 
   async getOrCreateTag(name: string): Promise<WorkflowTag> {
     await this.ensureSchema();
+    const normalizedName = normalizeTagName(name);
     const rows = await this.getDb()
       .select()
       .from(embeddedTags)
       .where(eq(embeddedTags.agentId, this.tenantAgentId));
-    const existing = rows.find((tag) => tag.name.toLowerCase() === name.toLowerCase());
-    return existing ? tagFromRow(existing) : this.createTag(name);
+    // Legacy rows may retain display-case names. New writes use the normalized
+    // value covered by the unique index, so concurrent callers share one row.
+    const existing = rows.find((tag) => tag.name.toLowerCase() === normalizedName);
+    return existing ? tagFromRow(existing) : this.createTag(normalizedName);
   }
 
   async executeWorkflow(id: string, options: ExecuteOptions = {}): Promise<WorkflowExecution> {

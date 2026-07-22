@@ -5,7 +5,7 @@
  * or pooled authentication to a backend-specific subprocess environment.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { GenerateTextParams, IAgentRuntime, Plugin, ToolDefinition } from "@elizaos/core";
 import {
   HANDLE_RESPONSE_TOOL_NAME,
@@ -174,27 +174,31 @@ function resolveSdkModel(runtime: IAgentRuntime, modelType: string): string {
   return fallback;
 }
 
-function shortHash(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 16);
-}
-
 /**
- * Stable account-affinity key for an isolated SDK request shape.
- * "route" builds the native `route_action` MCP-tool session (the planner);
- * "envelope" builds the native `handle_response` session (Stage-1 routing);
- * "text" builds a plain text-generation session (reply/large tiers).
+ * Account affinity follows core's real conversation/turn identity rather than
+ * the model request shape. Stage 1 supplies its room id and the planner supplies
+ * its trajectory id through providerOptions; hashing keeps those identifiers out
+ * of account-pool diagnostics. Calls without either identity are deliberately
+ * unique so unrelated work cannot collapse onto one process-wide mutex.
  */
-function claudeSessionKey(
-  model: string,
-  systemPrompt: string,
-  mode: SdkSessionMode,
-  envelopeFields?: EnvelopeFieldSchemas
+function accountAffinityKey(
+  runtime: IAgentRuntime,
+  backend: CliBackend,
+  params: GenerateTextParams
 ): string {
-  // Envelope sessions also freeze their tool schema at query() start, so the
-  // composed field set is part of the identity (direct vs group channel
-  // shapes compose different sets; registry plugins add more).
-  const fieldsPart = envelopeFields ? shortHash(Object.keys(envelopeFields).sort().join(",")) : "";
-  return `${model}\u001f${mode}\u001f${shortHash(systemPrompt)}\u001f${fieldsPart}`;
+  const elizaOptions = params.providerOptions?.eliza;
+  if (typeof elizaOptions === "object" && elizaOptions !== null && !Array.isArray(elizaOptions)) {
+    const conversationId = Reflect.get(elizaOptions, "conversationId");
+    if (typeof conversationId === "string" && conversationId.trim().length > 0) {
+      const digest = createHash("sha256")
+        .update(String(runtime.agentId))
+        .update("\u0000")
+        .update(conversationId.trim())
+        .digest("hex");
+      return `cli-inference:${backend}:conversation:${digest}`;
+    }
+  }
+  return `cli-inference:${backend}:request:${randomUUID()}`;
 }
 
 /**
@@ -275,10 +279,6 @@ function resolveCodexModel(runtime: IAgentRuntime, modelType: string): string {
   const small = getSetting(runtime, "ELIZA_CLI_CODEX_PLANNER_MODEL");
   const isSmallTier = modelType === ModelType.ACTION_PLANNER || modelType === ModelType.TEXT_SMALL;
   return ((isSmallTier ? small : large) || large || "gpt-5.5").trim();
-}
-
-function codexSessionKey(model: string, router: boolean): string {
-  return `${model}\u001f${router ? "route" : "text"}`;
 }
 
 /**
@@ -381,7 +381,7 @@ async function generateViaCli(
     const fields = envelopeFieldSchemas(handleResponseTool);
     const { system, body } = flattenPrompt(generateParams);
     const envelopeBody = buildEnvelopeBody(system, body);
-    const key = claudeSessionKey(model, STAGE1_ENVELOPE_SYSTEM_PROMPT, "envelope", fields);
+    const sessionKey = accountAffinityKey(runtime, backend, params);
     return withAccountRotation(
       (env) =>
         runIsolatedSdkSession(
@@ -392,7 +392,7 @@ async function generateViaCli(
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
-        sessionKey: `cli-inference:${key}`,
+        sessionKey,
         scope: runtime,
       }
     );
@@ -406,10 +406,10 @@ async function generateViaCli(
     // the body with a directive that cancels any stale "call a tool" instruction,
     // so it synthesizes the final reply from already-executed tool results instead
     // of narrating intent ("I'll fetch it…"). Both are needed (proven live: 4/4 vs
-    // 2/4). The key below is account affinity only; the SDK query is not reused.
+    // 2/4). Account affinity is conversation-scoped; the SDK query is not reused.
     const framedSystem = frameTextSystemPrompt(system);
     const framedBody = appendTextDirective(body);
-    const key = claudeSessionKey(model, framedSystem, "text");
+    const sessionKey = accountAffinityKey(runtime, backend, params);
     // Pool-first auth selects and refreshes a healthy pooled Claude account when
     // one exists (ambient ~/.claude is the fallback). On a subscription limit,
     // retry a fresh query on the next healthy account before provider failover.
@@ -423,7 +423,7 @@ async function generateViaCli(
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
-        sessionKey: `cli-inference:${key}`,
+        sessionKey,
         scope: runtime,
       }
     );
@@ -434,7 +434,7 @@ async function generateViaCli(
     const model = resolveCodexModel(runtime, modelType);
     const { system, body } = flattenPrompt(generateParams);
     const framedBody = appendTextDirective(`${frameTextSystemPrompt(system)}\n\n${body}`);
-    const key = codexSessionKey(model, false);
+    const sessionKey = accountAffinityKey(runtime, backend, params);
     return withAccountRotation(
       (env) =>
         createCodexSdkSession(runtime, model, false, env).generate(
@@ -444,7 +444,7 @@ async function generateViaCli(
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
-        sessionKey: `cli-inference:${key}`,
+        sessionKey,
         scope: runtime,
       }
     );
@@ -481,7 +481,7 @@ async function planViaCli(runtime: IAgentRuntime, params: GenerateTextParams): P
   if (backend === "claude-sdk") {
     const model = resolveSdkModel(runtime, ModelType.ACTION_PLANNER);
     const routerBody = buildRouterBody(params);
-    const key = claudeSessionKey(model, ROUTER_SYSTEM_PROMPT, "route");
+    const sessionKey = accountAffinityKey(runtime, backend, params);
     return withAccountRotation(
       (env) =>
         runIsolatedSdkSession(
@@ -492,7 +492,7 @@ async function planViaCli(runtime: IAgentRuntime, params: GenerateTextParams): P
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
-        sessionKey: `cli-inference:${key}`,
+        sessionKey,
         scope: runtime,
       }
     );
@@ -505,13 +505,13 @@ async function planViaCli(runtime: IAgentRuntime, params: GenerateTextParams): P
     const model = resolveCodexModel(runtime, ModelType.ACTION_PLANNER);
     const clean = buildCleanRoutingParams(params);
     const routeBody = `${clean.system ?? ""}\n\n${clean.prompt ?? ""}`;
-    const key = codexSessionKey(model, true);
+    const sessionKey = accountAffinityKey(runtime, backend, params);
     return withAccountRotation(
       (env) => createCodexSdkSession(runtime, model, true, env).route(routeBody),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
-        sessionKey: `cli-inference:${key}`,
+        sessionKey,
         scope: runtime,
       }
     );

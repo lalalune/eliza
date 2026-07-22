@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import type { IAgentRuntime } from '@elizaos/core';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import * as dbSchema from '../../src/db/schema';
 import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
@@ -37,6 +37,7 @@ async function persistentRuntime(
   const client = new PGlite({ dataDir: join(dir, 'pglite') });
   const db = drizzle(client, { schema: dbSchema });
   return {
+    db,
     runtime: runtime({ WORKFLOW_SEED_DEFAULTS: false, ...settings }, services, db),
     async close() {
       await client.close();
@@ -255,6 +256,86 @@ describe('EmbeddedWorkflowService', () => {
     await service.stop();
     await embedded.stop();
     await harness.close();
+  }, 60_000);
+
+  test('paginates executions with a stable cursor when timestamps tie', async () => {
+    const harness = await persistentRuntime();
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    try {
+      const workflow = await service.createWorkflow(manualDefinition('execution-pages'));
+      const executions = [];
+      for (let index = 0; index < 3; index += 1) {
+        executions.push(await service.executeWorkflow(workflow.id));
+      }
+
+      const tiedStartedAt = '2026-07-21T20:00:00.000Z';
+      await harness.db
+        .update(dbSchema.embeddedExecutions)
+        .set({ startedAt: tiedStartedAt })
+        .where(
+          and(
+            eq(dbSchema.embeddedExecutions.agentId, harness.runtime.agentId),
+            eq(dbSchema.embeddedExecutions.workflowId, workflow.id)
+          )
+        );
+      const expectedIds = executions
+        .map((execution) => execution.id)
+        .sort()
+        .reverse();
+
+      const first = await service.listExecutions({ workflowId: workflow.id, limit: 2 });
+      expect(first.data.map((execution) => execution.id)).toEqual(expectedIds.slice(0, 2));
+      expect(first.nextCursor).toEqual(expect.any(String));
+
+      const second = await service.listExecutions({
+        workflowId: workflow.id,
+        limit: 2,
+        cursor: first.nextCursor,
+      });
+      expect(second.data.map((execution) => execution.id)).toEqual(expectedIds.slice(2));
+      expect(second.nextCursor).toBeUndefined();
+      await expect(
+        service.listExecutions({ workflowId: workflow.id, limit: 2, cursor: 'not-a-cursor' })
+      ).rejects.toMatchObject({ statusCode: 400 });
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('keeps concurrent owner deployments when they race to create one tag', async () => {
+    const harness = await persistentRuntime({ WORKFLOW_BACKEND: 'embedded' });
+    const embedded = await EmbeddedWorkflowService.start(harness.runtime);
+    const workflowRuntime = runtime(
+      { WORKFLOW_BACKEND: 'embedded' },
+      { embedded_workflow_service: embedded },
+      harness.db
+    );
+    workflowRuntime.getServiceLoadPromise = async (serviceType) => {
+      if (serviceType === EmbeddedWorkflowService.serviceType) return embedded;
+      throw new Error(`Unexpected service load request: ${String(serviceType)}`);
+    };
+    const service = await WorkflowService.start(workflowRuntime);
+    try {
+      const ownerId = 'concurrent-workflow-owner';
+      const definitions = Array.from({ length: 2 }, (_, index) => ({
+        ...manualDefinition(`concurrent-deploy-${index}`),
+        id: undefined,
+      }));
+      const deployed = await Promise.all(
+        definitions.map((definition) => service.deployWorkflow(definition, ownerId))
+      );
+
+      expect(new Set(deployed.map((workflow) => workflow.id)).size).toBe(definitions.length);
+      expect((await embedded.listTags()).data).toHaveLength(1);
+      expect((await service.listWorkflows(ownerId)).map((workflow) => workflow.id).sort()).toEqual(
+        deployed.map((workflow) => workflow.id).sort()
+      );
+    } finally {
+      await service.stop();
+      await embedded.stop();
+      await harness.close();
+    }
   }, 60_000);
 
   test('stop waits for admitted reads and rejects them before they can create recovery work', async () => {

@@ -51,7 +51,7 @@ export function withTrustedCloudPrincipalMetadata(
   metadata: Record<string, unknown> | undefined,
   principal: UUID | null,
 ): Record<string, unknown> | undefined {
-  const next = { ...(metadata ?? {}) };
+  const next = metadata ? { ...metadata } : {};
   delete next[CLOUD_PRINCIPAL_METADATA_KEY];
   if (principal) {
     next[CLOUD_PRINCIPAL_METADATA_KEY] = {

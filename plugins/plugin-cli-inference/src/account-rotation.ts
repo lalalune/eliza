@@ -7,6 +7,7 @@
  * selected backend's canonical auth variables.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   type CodingAccountStrategy,
   type CodingAgentSelectorBridge,
@@ -25,6 +26,7 @@ interface RotationState {
 
 let scopedRotationState = new WeakMap<object, Map<string, RotationState>>();
 let scopedRotationChains = new WeakMap<object, Map<string, Promise<void>>>();
+const MAX_ROTATION_STATE_ENTRIES = 10_000;
 
 /** A selected account plus the env the first-party subprocess needs to auth as it. */
 export interface RotationAccountSelection {
@@ -213,6 +215,8 @@ export interface RotationContext {
   strategy?: CodingAccountStrategy;
 }
 
+type KeyedRotationContext = RotationContext & { sessionKey: string };
+
 function reportRotationBookkeepingFailure(
   ctx: RotationContext,
   operation: "record-usage" | "mark-rate-limited",
@@ -246,8 +250,17 @@ function reportRotationBookkeepingFailure(
   }
 }
 
-function rotationStateKey(ctx: RotationContext): string {
-  return `${ctx.backend}\u001f${ctx.sessionKey ?? "__default"}`;
+function rotationStateKey(ctx: KeyedRotationContext): string {
+  return `${ctx.backend}\u001f${ctx.sessionKey}`;
+}
+
+/** Missing affinity must isolate this call, never create a runtime-global lane. */
+function withRequestSessionKey(ctx: RotationContext): KeyedRotationContext {
+  const sessionKey = ctx.sessionKey?.trim();
+  return {
+    ...ctx,
+    sessionKey: sessionKey || `cli-inference:${ctx.backend}:request:${randomUUID()}`,
+  };
 }
 
 function stateStore(ctx: RotationContext): Map<string, RotationState> {
@@ -259,6 +272,21 @@ function stateStore(ctx: RotationContext): Map<string, RotationState> {
   return store;
 }
 
+/** Conversation pins are bounded; eviction safely falls back to pool selection. */
+function storeRotationState(
+  store: Map<string, RotationState>,
+  key: string,
+  state: RotationState
+): void {
+  store.delete(key);
+  store.set(key, state);
+  while (store.size > MAX_ROTATION_STATE_ENTRIES) {
+    const oldest = store.keys().next().value;
+    if (oldest === undefined) return;
+    store.delete(oldest);
+  }
+}
+
 function chainStore(ctx: RotationContext): Map<string, Promise<void>> {
   let store = scopedRotationChains.get(ctx.scope);
   if (!store) {
@@ -268,7 +296,7 @@ function chainStore(ctx: RotationContext): Map<string, Promise<void>> {
   return store;
 }
 
-function enqueueRotation<T>(ctx: RotationContext, runLocked: () => Promise<T>): Promise<T> {
+function enqueueRotation<T>(ctx: KeyedRotationContext, runLocked: () => Promise<T>): Promise<T> {
   const key = rotationStateKey(ctx);
   const store = chainStore(ctx);
   const previous = store.get(key) ?? Promise.resolve();
@@ -334,9 +362,10 @@ export async function withAccountRotation(
     return attempt(ambientEnv);
   }
 
-  return enqueueRotation(ctx, async () => {
-    const stateKey = rotationStateKey(ctx);
-    const states = stateStore(ctx);
+  const keyedContext = withRequestSessionKey(ctx);
+  return enqueueRotation(keyedContext, async () => {
+    const stateKey = rotationStateKey(keyedContext);
+    const states = stateStore(keyedContext);
     let state = states.get(stateKey) ?? null;
     let subprocessEnv: RotationSubprocessEnv | undefined;
     if (state && state.bridge !== bridge) {
@@ -350,7 +379,7 @@ export async function withAccountRotation(
     if (state) {
       const selectedAccountId = state.selection.accountId;
       const refreshed = await bridge.select(agentType, {
-        ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
+        sessionKey: keyedContext.sessionKey,
         ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
         accountIds: [selectedAccountId],
       });
@@ -362,7 +391,7 @@ export async function withAccountRotation(
         }
         subprocessEnv = buildRotatedSubprocessEnv(agentType, refreshed.envPatch);
         state = rotationState(bridge, refreshed);
-        states.set(stateKey, state);
+        storeRotationState(states, stateKey, state);
       } else {
         states.delete(stateKey);
         state = null;
@@ -379,7 +408,7 @@ export async function withAccountRotation(
       let selection: RotationAccountSelection | null = null;
       try {
         selection = await bridge.select(agentType, {
-          ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
+          sessionKey: keyedContext.sessionKey,
           ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
         });
       } catch {
@@ -398,7 +427,7 @@ export async function withAccountRotation(
       if (selection) {
         subprocessEnv = buildRotatedSubprocessEnv(agentType, selection.envPatch);
         state = rotationState(bridge, selection);
-        states.set(stateKey, state);
+        storeRotationState(states, stateKey, state);
         logger.info(
           {
             src: "cli-inference:rotation",
@@ -460,7 +489,7 @@ export async function withAccountRotation(
         let selection: RotationAccountSelection | null = null;
         try {
           selection = await bridge.select(agentType, {
-            ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
+            sessionKey: keyedContext.sessionKey,
             ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
             // Copy: `tried` keeps growing across rotations; the bridge must see
             // the exclusions as of THIS call, not a live reference.
@@ -505,7 +534,7 @@ export async function withAccountRotation(
         tried.push(selection.accountId);
         subprocessEnv = buildRotatedSubprocessEnv(agentType, selection.envPatch);
         state = rotationState(bridge, selection);
-        states.set(stateKey, state);
+        storeRotationState(states, stateKey, state);
         logger.warn(
           {
             src: "cli-inference:rotation",

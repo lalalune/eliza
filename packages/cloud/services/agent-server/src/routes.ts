@@ -67,6 +67,20 @@ type WorkflowDefinitionPayload = {
   _meta?: Record<string, unknown>;
 };
 
+type WorkflowMissingCredential = {
+  credType: string;
+  authUrl?: string;
+};
+
+type CredentialGatedDeploymentResponse = {
+  id: "";
+  name: string;
+  active: false;
+  nodeCount: number;
+  missingCredentials: WorkflowMissingCredential[];
+  warning: "missing credentials";
+};
+
 type WorkflowServiceLike = {
   listWorkflows: (userId: string) => Promise<unknown[]>;
   getWorkflow: (workflowId: string, userId: string) => Promise<unknown>;
@@ -184,6 +198,53 @@ function workflowRecordId(workflow: unknown): string | null {
   if (!isRecord(workflow) || typeof workflow.id !== "string") return null;
   const id = workflow.id.trim();
   return id || null;
+}
+
+function credentialGatedDeploymentResponse(
+  deployed: unknown,
+): CredentialGatedDeploymentResponse | null {
+  if (
+    !isRecord(deployed) ||
+    typeof deployed.id !== "string" ||
+    deployed.id.trim() ||
+    typeof deployed.name !== "string" ||
+    deployed.active !== false ||
+    typeof deployed.nodeCount !== "number" ||
+    !Number.isInteger(deployed.nodeCount) ||
+    deployed.nodeCount < 0 ||
+    !Array.isArray(deployed.missingCredentials) ||
+    deployed.missingCredentials.length === 0
+  ) {
+    return null;
+  }
+
+  const missingCredentials: WorkflowMissingCredential[] = [];
+  for (const credential of deployed.missingCredentials) {
+    if (
+      !isRecord(credential) ||
+      typeof credential.credType !== "string" ||
+      !credential.credType.trim() ||
+      (credential.authUrl !== undefined &&
+        typeof credential.authUrl !== "string")
+    ) {
+      return null;
+    }
+    missingCredentials.push({
+      credType: credential.credType,
+      ...(typeof credential.authUrl === "string"
+        ? { authUrl: credential.authUrl }
+        : {}),
+    });
+  }
+
+  return {
+    id: "",
+    name: deployed.name,
+    active: false,
+    nodeCount: deployed.nodeCount,
+    missingCredentials,
+    warning: "missing credentials",
+  };
 }
 
 function workflowRouteError(
@@ -337,6 +398,9 @@ async function finalizeWorkflowDeployment(params: {
   requestedWorkflowId: string | null;
   active: boolean;
 }): Promise<unknown> {
+  const credentialGated = credentialGatedDeploymentResponse(params.deployed);
+  if (credentialGated) return credentialGated;
+
   const deployedId = workflowRecordId(params.deployed);
   if (!deployedId) {
     throw workflowRouteError(

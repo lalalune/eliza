@@ -24,11 +24,6 @@ import type {
 
 type RoomMetadataRecord = Record<string, JsonValue>;
 
-interface StoredConversationMetadata extends ConversationMetadata {
-  conversationId: string;
-  cloudOwnerEntityId?: string;
-}
-
 const VALID_SCOPES = new Set<ConversationScope>([
   "general",
   "automation-coordinator",
@@ -142,11 +137,14 @@ export function buildConversationRoomMetadata(
   };
 
   if (sanitized || cloudOwnerEntityId) {
-    next.webConversation = {
+    const storedConversation: RoomMetadataRecord = {
       conversationId: conversation.id,
-      ...(sanitized ?? {}),
-      ...(cloudOwnerEntityId ? { cloudOwnerEntityId } : {}),
-    } satisfies StoredConversationMetadata;
+    };
+    if (sanitized) Object.assign(storedConversation, sanitized);
+    if (cloudOwnerEntityId) {
+      storedConversation.cloudOwnerEntityId = cloudOwnerEntityId;
+    }
+    next.webConversation = storedConversation;
   } else {
     delete next.webConversation;
   }

@@ -84,9 +84,12 @@ reset primitive; per-call ownership is therefore the security boundary. Three mo
   that tool remain text completions, so evaluator and failure-reply paths do not
   receive a routing envelope accidentally.
 
-Account affinity is keyed by runtime plus `(model, mode, sha256(systemPrompt))`,
-but SDK query state is never cached. Calls sharing an affinity key serialize so
-selection and rate-limit rotation cannot race. The `result` envelope is inspected so an
+Account affinity is keyed by backend plus a hash of the runtime agent id and
+core's `providerOptions.eliza.conversationId` (the chat room or planner trajectory),
+but SDK query state is never cached. All SDK modes for the same supplied identity
+share one pin and serialize so selection and rate-limit rotation cannot race;
+calls without an identity receive a unique per-request key and never converge on
+a global lock. The `result` envelope is inspected so an
 `error_max_turns`/empty turn falls back to `result.result` instead of throwing a
 spurious "empty completion". Stored affinity contains account identity only;
 materialized OAuth tokens and `CODEX_HOME` environments live only for the call.
@@ -195,7 +198,7 @@ bun run --cwd plugins/plugin-cli-inference build
 - **Isolated cwd per call.** Created with `mkdtemp` under `tmpdir()`, validated by `resolveSafeCwd`, removed in a `finally`. Keeps the CLI out of real projects (suppresses Claude Code repo-context identity).
 - **`/dev/null` stdin is REQUIRED** — without it the CLI waits ~3s for stdin.
 - **sandbox.ts is a copy.** Keep in sync with `packages/plugin-remote-manifest/src/sub-agent-claude-code/sandbox.ts` if `SENSITIVE_ENV_RE` / `SAFE_ENV_KEYS` change upstream.
-- **Multi-account pool auth + rotation (SDK backends only).** The `claude-sdk` / `codex-sdk` chat brain consults the shared `CODING_AGENT_SELECTOR_BRIDGE_SYMBOL` bridge accessor from `@elizaos/core` (in `src/account-rotation.ts`) POOL-FIRST. Selection state is scoped to the live `AgentRuntime`, serialized per affinity key, and pinned to the serving account. Every isolated call re-resolves that exact account so an expiring Claude token or rotated `CODEX_HOME` generation is refreshed before spawn. On a subscription-limit throw it marks the serving account, selects the next healthy account, and retries a fresh SDK query before provider failover — see issue #11180. Empty pools fall back to a backend-specific ambient environment; neither ambient nor pooled SDK children inherit unrelated host secrets. Only rate-limit-class errors rotate; non-limit errors rethrow straight to failover. Default ON when a pool is present; opt out with `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION=0`. The COLD `claude --print` / `codex exec` CLIs still own one on-disk cred set (pool auth is SDK-only; the bare-CLI shim is issue #11180 Gap B).
+- **Multi-account pool auth + rotation (SDK backends only).** The `claude-sdk` / `codex-sdk` chat brain consults the shared `CODING_AGENT_SELECTOR_BRIDGE_SYMBOL` bridge accessor from `@elizaos/core` (in `src/account-rotation.ts`) POOL-FIRST. Selection state is scoped to the live `AgentRuntime`, serialized per hashed conversation/turn affinity key, and pinned to the serving account; requests lacking that core identity get unique keys rather than a global fallback lane. Every isolated call re-resolves that exact account so an expiring Claude token or rotated `CODEX_HOME` generation is refreshed before spawn. On a subscription-limit throw it marks the serving account, selects the next healthy account, and retries a fresh SDK query before provider failover — see issue #11180. Empty pools fall back to a backend-specific ambient environment; neither ambient nor pooled SDK children inherit unrelated host secrets. Only rate-limit-class errors rotate; non-limit errors rethrow straight to failover. Default ON when a pool is present; opt out with `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION=0`. The COLD `claude --print` / `codex exec` CLIs still own one on-disk cred set (pool auth is SDK-only; the bare-CLI shim is issue #11180 Gap B).
 - See the root `AGENTS.md` for repo-wide architecture rules, logger conventions, and ESM requirements.
 
 <!-- BEGIN: evidence-and-e2e-mandate (managed; canonical standard = repo-root AGENTS.md) -->
