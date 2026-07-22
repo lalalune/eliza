@@ -301,6 +301,39 @@ describe("changed Vitest coverage grouping", () => {
     );
   });
 
+  test("routes repository integration suites through the shared PGlite config", () => {
+    const root = fixture();
+    writeFixtureFile(
+      root,
+      "packages/test/vitest/integration.config.ts",
+      "export default {};",
+    );
+    const integrationTests = [
+      "plugins/plugin-calendar/test/calendar-action.integration.test.ts",
+      "plugins/plugin-example/src/service.integration.test.ts",
+      "packages/agent/test/runtime.integration.test.ts",
+      "packages/app-core/test/api.integration.test.ts",
+      "apps/example/test/route.integration.test.ts",
+    ];
+    for (const testPath of integrationTests) writeFixtureFile(root, testPath);
+
+    for (const testPath of integrationTests) {
+      expect(path.relative(root, findNearestVitestConfig(root, testPath))).toBe(
+        "packages/test/vitest/integration.config.ts",
+      );
+    }
+
+    const groups = groupChangedVitestTests(root, integrationTests);
+    expect(groups).toHaveLength(integrationTests.length);
+    expect(groups.every((group) => group.packageDir === root)).toBe(true);
+    expect(groups.every((group) => group.tests.length === 1)).toBe(true);
+    expect(
+      groups.every((group) =>
+        buildChangedVitestArgs(group).includes("--pool=threads"),
+      ),
+    ).toBe(true);
+  });
+
   test("runs a nested config from the owning package directory", () => {
     // Mirrors packages/test/harness/vitest.config.ts: the config sits below
     // the package root and its include patterns resolve against the package
@@ -494,6 +527,8 @@ describe("changed Vitest coverage grouping", () => {
       root,
       "coverage/vitest/root/vitest-results.json",
       JSON.stringify({
+        reason: "passed",
+        unhandledErrorCount: 0,
         testResults: [
           {
             name: testPath,
@@ -552,6 +587,8 @@ describe("changed Vitest coverage grouping", () => {
       root,
       "coverage/vitest/root/vitest-results.json",
       JSON.stringify({
+        reason: "passed",
+        unhandledErrorCount: 0,
         testResults: [
           {
             name: skippedTest,
@@ -570,6 +607,8 @@ describe("changed Vitest coverage grouping", () => {
     writeFileSync(
       resultsPath,
       JSON.stringify({
+        reason: "passed",
+        unhandledErrorCount: 0,
         testResults: [
           {
             name: skippedTest,
@@ -605,6 +644,8 @@ describe("changed Vitest coverage grouping", () => {
     writeFileSync(
       resultsPath,
       JSON.stringify({
+        reason: "passed",
+        unhandledErrorCount: 0,
         testResults: [
           {
             name: unexpectedTest,
@@ -616,6 +657,45 @@ describe("changed Vitest coverage grouping", () => {
     expect(() =>
       validateChangedTestResults(root, [expectedTest], resultsPath),
     ).toThrow("executed an unexpected changed-coverage file");
+  });
+
+  test("rejects failed runs and unhandled errors even when assertions passed", () => {
+    const root = fixture();
+    const expectedTest = path.join(root, "root.test.ts");
+    const resultsPath = writeFixtureFile(
+      root,
+      "coverage/vitest/root/vitest-results.json",
+      JSON.stringify({
+        reason: "passed",
+        unhandledErrorCount: 1,
+        testResults: [
+          {
+            name: expectedTest,
+            assertionResults: [{ status: "passed" }],
+          },
+        ],
+      }),
+    );
+
+    expect(() =>
+      validateChangedTestResults(root, [expectedTest], resultsPath),
+    ).toThrow("JSON results are malformed");
+    writeFileSync(
+      resultsPath,
+      JSON.stringify({
+        reason: "failed",
+        unhandledErrorCount: 0,
+        testResults: [
+          {
+            name: expectedTest,
+            assertionResults: [{ status: "passed" }],
+          },
+        ],
+      }),
+    );
+    expect(() =>
+      validateChangedTestResults(root, [expectedTest], resultsPath),
+    ).toThrow("JSON results are malformed");
   });
 
   test("union-merges per-group LCOV reports so any-group coverage counts once per file", () => {

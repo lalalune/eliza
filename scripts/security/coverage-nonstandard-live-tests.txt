@@ -1,0 +1,14 @@
+# Credentialed or host-dependent tests whose historical names predate the
+# canonical *.live.test.* / *.real.test.* suffixes. The changed-file coverage
+# lane is keyless; these suites run only in their dedicated live lanes.
+packages/agent/test/crash-restart-supervisor.test.ts
+packages/app-core/test/dev-stack/dev-stack-probe.test.ts
+packages/cloud/shared/src/lib/services/__tests__/payout-fork.integration.test.ts
+plugins/plugin-agent-orchestrator/src/__tests__/orchestrator-grilling-live-gemma.test.ts
+plugins/plugin-calendar/test/calendar.live-llm.test.ts
+plugins/plugin-goals/test/goals.live-llm.test.ts
+plugins/plugin-inbox/test/inbox.live-llm.test.ts
+plugins/plugin-native-macosalarm/__tests__/integration.macos.test.ts
+plugins/plugin-personal-assistant/test/multilingual-action-routing.integration.test.ts
+plugins/plugin-video/src/services/binaries.integration.test.ts
+plugins/plugin-wallet/src/chains/evm/tests/json-integration.test.ts

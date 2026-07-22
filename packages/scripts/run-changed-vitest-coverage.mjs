@@ -100,6 +100,16 @@ function isTestSuffix(testFile, marker) {
   );
 }
 
+function isRepositoryIntegrationTest(testFile) {
+  if (!isTestSuffix(testFile, ".integration.test")) return false;
+  return (
+    /^plugins\/[^/]+\/(?:src|test)\//.test(testFile) ||
+    /^apps\/[^/]+\/test\//.test(testFile) ||
+    testFile.startsWith("packages/agent/test/") ||
+    testFile.startsWith("packages/app-core/test/")
+  );
+}
+
 function requireConfig(repoRoot, configPath, testFile) {
   const absoluteConfig = path.join(repoRoot, configPath);
   if (!existsSync(absoluteConfig)) {
@@ -136,13 +146,17 @@ function findExplicitVitestConfig(repoRoot, relativeTest, absoluteTest) {
     const usesPackageIntegrationConfig =
       packageRelative.startsWith("src/") ||
       PERSONAL_ASSISTANT_SRC_INTEGRATION_FILES.has(packageRelative);
-    return requireConfig(
-      repoRoot,
-      usesPackageIntegrationConfig
-        ? PERSONAL_ASSISTANT_SRC_INTEGRATION_CONFIG
-        : REPO_INTEGRATION_CONFIG,
-      relativeTest,
-    );
+    if (usesPackageIntegrationConfig) {
+      return requireConfig(
+        repoRoot,
+        PERSONAL_ASSISTANT_SRC_INTEGRATION_CONFIG,
+        relativeTest,
+      );
+    }
+  }
+
+  if (isRepositoryIntegrationTest(normalizedTest)) {
+    return requireConfig(repoRoot, REPO_INTEGRATION_CONFIG, relativeTest);
   }
 
   if (isHarnessTest(absoluteTest)) return undefined;
@@ -348,6 +362,8 @@ export function validateChangedTestResults(
   if (
     !parsed ||
     typeof parsed !== "object" ||
+    parsed.reason !== "passed" ||
+    parsed.unhandledErrorCount !== 0 ||
     !Array.isArray(parsed.testResults)
   ) {
     throw new TypeError(`Vitest JSON results are malformed: ${resultsPath}`);
