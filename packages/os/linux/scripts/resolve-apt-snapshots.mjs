@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Resolves the APT snapshot set used by unattended elizaOS Live builds.
- * Debian main and any archive configured as `latest` follow the authoritative
- * Tails trace metadata, while compatibility-sensitive frozen archives retain
- * their checked-in serial. Every required Release file is checked before the
- * expensive Docker and live-build stages begin.
+ * Archives configured as `latest` follow the authoritative Tails trace
+ * metadata, while frozen archives retain their checked-in serial. Every
+ * required Release file is checked before the expensive Docker and live-build
+ * stages begin.
  */
 
 import { readFile } from "node:fs/promises";
@@ -20,17 +20,14 @@ const SERIAL_PATTERN = /^\d{10}$/;
 const ORIGIN_CONTRACTS = [
   {
     name: "debian",
-    followTrace: true,
     releasePaths: ["dists/trixie/Release", "dists/trixie-backports/Release"],
   },
   {
     name: "debian-security",
-    followTrace: false,
     releasePaths: ["dists/trixie-security/Release"],
   },
   {
     name: "torproject",
-    followTrace: false,
     releasePaths: ["dists/trixie/Release"],
   },
 ];
@@ -115,7 +112,7 @@ export async function resolveAptSnapshots({
   for (const contract of ORIGIN_CONTRACTS) {
     const configured = await configuredSerial(configDir, contract.name);
     const serial =
-      contract.followTrace || configured === "latest"
+      configured === "latest"
         ? await latestSerial(fetchImpl, normalizedBaseUrl, contract.name)
         : configured;
 

@@ -91,19 +91,20 @@ describe("Build elizaOS Linux ISO workflow", () => {
     );
   });
 
-  test("uses the active Buildx cache instead of a dead live-build cache path", () => {
-    const names = buildJob.steps?.map((candidate) => candidate.name) ?? [];
+  test("does not configure an unavailable GitHub Actions Buildx cache", () => {
     const build = step("Build ISO (amd64)");
 
-    expect(names).not.toContain("Restore live-build cache");
     expect(
       buildJob.steps?.some((candidate) =>
         candidate.uses?.startsWith("actions/cache@"),
       ),
     ).toBe(false);
-    expect(workflowSource).not.toContain(
-      ["$", "{{ env.LINUX_DIR }}/cache"].join(""),
-    );
-    expect(build.env?.ELIZAOS_DOCKER_BUILDX_GHA_CACHE).toBe(1);
+    expect(
+      buildJob.steps?.some((candidate) =>
+        candidate.uses?.startsWith("docker/setup-buildx-action@"),
+      ),
+    ).toBe(false);
+    expect(build.env?.ELIZAOS_DOCKER_BUILDX_GHA_CACHE).toBeUndefined();
+    expect(build.env?.ELIZAOS_DOCKER_BUILDX_CACHE_SCOPE).toBeUndefined();
   });
 });

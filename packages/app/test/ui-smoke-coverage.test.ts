@@ -35,6 +35,8 @@ import { parse } from "yaml";
  *   4. The directory-driven catch-all job stays wired into scenario-pr.yml, so
  *      every non-denied spec actually runs (named slices ∪ auto-discovered =
  *      all non-denied specs).
+ *   5. Specs ignored by the catch-all's Chromium project are either run in a
+ *      named dedicated project or recorded in the deny-list.
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -44,6 +46,14 @@ const REPO_ROOT = path.resolve(HERE, "../../..");
 const KEYLESS_WORKFLOW = path.join(
   REPO_ROOT,
   ".github/workflows/scenario-pr.yml",
+);
+const PLAYWRIGHT_CONFIG = path.join(
+  REPO_ROOT,
+  "packages/app/playwright.ui-smoke.config.ts",
+);
+const DEVICE_MATRIX = path.join(
+  REPO_ROOT,
+  "packages/app/test/ui-smoke/device-matrix.ts",
 );
 
 const VALID_CATEGORIES = [
@@ -62,6 +72,7 @@ interface DenyEntry {
 interface WorkflowStep {
   name?: string;
   run?: string;
+  env?: Record<string, string>;
   with?: Record<string, string>;
 }
 
@@ -69,7 +80,13 @@ interface WorkflowJob {
   strategy?: {
     "fail-fast"?: boolean;
     matrix?: {
-      include?: Array<{ lane: string; specs: string; grep: string }>;
+      include?: Array<{
+        lane: string;
+        specs: string;
+        grep: string;
+        project: string;
+        test_auth: string;
+      }>;
       shard?: Array<{ id: string; value: string }>;
     };
   };
@@ -144,6 +161,47 @@ function namedInWorkflow(): Set<string> {
       (match) => match[1] ?? "",
     ),
   );
+}
+
+function chromiumIgnoredSpecs(): string[] {
+  const source = readFileSync(PLAYWRIGHT_CONFIG, "utf8");
+  const ignoreBlock = source.match(
+    /name:\s*"chromium",[\s\S]*?testIgnore:\s*\[([\s\S]*?)\],\s*use:/,
+  )?.[1];
+  if (!ignoreBlock) {
+    throw new Error("chromium project must declare its testIgnore inventory");
+  }
+
+  const constantNames = [
+    ...ignoreBlock.matchAll(/\b([A-Z][A-Z0-9_]+_SPEC)\b/g),
+  ].map((match) => match[1] ?? "");
+  const specs = specFileNames();
+  return constantNames.flatMap((constantName) => {
+    const declaration = source.match(
+      new RegExp(
+        `const\\s+${constantName}\\s*=\\s*\\/((?:\\\\/|[^/])+)\\/[a-z]*;`,
+      ),
+    );
+    if (!declaration?.[1]) {
+      throw new Error(`Unable to resolve ${constantName} testIgnore pattern`);
+    }
+    const pattern = new RegExp(declaration[1]);
+    return specs.filter((spec) => pattern.test(spec));
+  });
+}
+
+function specsMatchedByConstant(sourcePath: string, name: string): string[] {
+  const source = readFileSync(sourcePath, "utf8");
+  const declaration = source.match(
+    new RegExp(
+      `(?:const|export\\s+const)\\s+${name}\\s*=\\s*/((?:\\\\/|[^/])+)/[a-z]*;`,
+    ),
+  );
+  if (!declaration?.[1]) {
+    throw new Error(`Unable to resolve ${name} testMatch pattern`);
+  }
+  const pattern = new RegExp(declaration[1]);
+  return specFileNames().filter((spec) => pattern.test(spec));
 }
 
 describe("ui-smoke spec coverage gate", () => {
@@ -233,6 +291,37 @@ describe("ui-smoke spec coverage gate", () => {
     ).toBe(true);
   });
 
+  it("never counts a Chromium-ignored spec as auto-discovered coverage", () => {
+    const denied = new Set(denyList().map((entry) => entry.spec));
+    const named = namedInWorkflow();
+    const silentlyIgnored = chromiumIgnoredSpecs().filter(
+      (spec) => !denied.has(spec) && !named.has(spec),
+    );
+    expect(
+      silentlyIgnored,
+      `The auto-discovered job selects --project=chromium, so every Chromium-ignored ` +
+        `spec must run in a named dedicated project or be deny-listed: ${silentlyIgnored.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("dedicated and live-only specs cannot leak through named project inventories", () => {
+    const denied = new Set(denyList().map((entry) => entry.spec));
+    const projectOwned = [
+      ...specsMatchedByConstant(
+        DEVICE_MATRIX,
+        "ASSERTION_GRADE_DASHBOARD_SPECS",
+      ),
+      ...specsMatchedByConstant(PLAYWRIGHT_CONFIG, "WEBKIT_SMOKE_SPECS"),
+    ];
+    const leaked = [...new Set(projectOwned)].filter((spec) =>
+      denied.has(spec),
+    );
+    expect(
+      leaked,
+      `A deny-listed spec is selected implicitly by a named PR project: ${leaked.join(", ")}`,
+    ).toEqual([]);
+  });
+
   it("splits the all-pages lane without dropping any owned browser suite", () => {
     const job = workflowJobs()["app-browser-all-pages"];
     expect(job).toBeDefined();
@@ -242,26 +331,43 @@ describe("ui-smoke spec coverage gate", () => {
         lane: "desktop-routes",
         specs: "test/ui-smoke/all-pages-clicksafe.spec.ts",
         grep: "route renders without console failures: desktop|visible safe app tiles|shared ViewHeader",
+        project: "chromium",
+        test_auth: "false",
       },
       {
         lane: "mobile-routes",
         specs: "test/ui-smoke/all-pages-clicksafe.spec.ts",
         grep: "route renders without console failures: mobile",
+        project: "chromium",
+        test_auth: "false",
       },
       {
         lane: "builtin-desktop",
         specs: "test/ui-smoke/builtin-views-visual.spec.ts",
         grep: "builtin views visual coverage.* desktop$",
+        project: "chromium",
+        test_auth: "false",
       },
       {
         lane: "builtin-mobile",
         specs: "test/ui-smoke/builtin-views-visual.spec.ts",
         grep: "builtin views visual coverage.* mobile$",
+        project: "chromium",
+        test_auth: "false",
       },
       {
         lane: "documents",
         specs: "test/ui-smoke/documents-view.spec.ts",
         grep: ".",
+        project: "chromium",
+        test_auth: "false",
+      },
+      {
+        lane: "cloud-console",
+        specs: "test/ui-smoke/cloud-console-routes.spec.ts",
+        grep: ".",
+        project: "audit-cloud",
+        test_auth: "true",
       },
     ]);
 
@@ -270,8 +376,12 @@ describe("ui-smoke spec coverage gate", () => {
       "Actual app all-pages render + click-safety browser coverage",
     );
     expect(runStep.run).toContain(githubExpression("matrix.specs"));
+    expect(runStep.run).toContain(githubExpression("matrix.project"));
     expect(runStep.run).toContain(
       `--grep "${githubExpression("matrix.grep")}"`,
+    );
+    expect(runStep.env?.VITE_PLAYWRIGHT_TEST_AUTH).toBe(
+      githubExpression("matrix.test_auth"),
     );
     const artifactStep = workflowStep(
       job ?? {},
@@ -282,7 +392,7 @@ describe("ui-smoke spec coverage gate", () => {
     );
   });
 
-  it("runs the auto-discovered browser inventory across four complete shards", () => {
+  it("runs the auto-discovered browser inventory across four file-safe shards", () => {
     const job = workflowJobs()["app-browser-auto-discovered"];
     expect(job).toBeDefined();
     expect(job?.strategy?.["fail-fast"]).toBe(false);
@@ -302,8 +412,8 @@ describe("ui-smoke spec coverage gate", () => {
     );
     expect(runStep.run).toContain('read -r -a specs <<< "$spec_output"');
     expect(runStep.run).not.toMatch(/read[^\n]*<<<[^\n]*\$\(node/);
-    expect(runStep.run).toContain('"${specs[@]}"');
-    expect(runStep.run).toContain("--fully-parallel");
+    expect(runStep.run).toContain('"$' + '{specs[@]}"');
+    expect(runStep.run).not.toContain("--fully-parallel");
     expect(runStep.run).toContain(
       `--shard="${githubExpression("matrix.shard.value")}"`,
     );

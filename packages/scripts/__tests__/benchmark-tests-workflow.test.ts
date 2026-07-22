@@ -31,9 +31,20 @@ describe("Benchmark Bridge Tests workflow", () => {
     );
   });
 
+  test("runs the benchmark CI-classification contract without model credentials", () => {
+    expect(workflow).toContain("lane: benchmark-ci-coverage");
+    expect(workflow).toContain("runtime: python");
+    expect(workflow).toContain(
+      "PYTHONPATH=packages python -m pytest packages/benchmarks/tests/test_ci_coverage.py -q",
+    );
+    expect(workflow).toContain("if: matrix.runtime == 'python'");
+    expect(workflow).toContain("pytest==8.4.1");
+  });
+
   test("runs for develop and every source or setup dependency it consumes", () => {
     const requiredPaths = [
       "packages/lifeops-bench/**",
+      "packages/benchmarks/**",
       "packages/agent/**",
       "packages/core/**",
       "packages/shared/**",
@@ -46,6 +57,7 @@ describe("Benchmark Bridge Tests workflow", () => {
       "package.json",
       "bun.lock",
       ".github/workflows/benchmark-tests.yml",
+      ".github/workflows/benchmark-orchestrator-scheduled.yml",
     ];
 
     expect(parsedWorkflow.on?.push?.branches).toEqual(["main", "develop"]);

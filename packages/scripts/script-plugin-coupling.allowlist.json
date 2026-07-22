@@ -271,6 +271,11 @@
     "reason": "LifeOps live-lane runner enumerates the connector plugins that require real OAuth credentials"
   },
   {
+    "file": "scripts/mobile/android-native-plugin-ci-inventory.ts",
+    "tokens": ["plugins/plugin-native-network-policy"],
+    "reason": "the Android device lane audits every native androidTest source set against the Capacitor-synced Gradle graph; this exact plugin is the reviewed exclusion because it intentionally is not wired into that graph"
+  },
+  {
     "file": "scripts/training-harvest/build-manifest.mjs",
     "tokens": [
       "@elizaos/plugin-cli-inference",

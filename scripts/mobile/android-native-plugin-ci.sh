@@ -18,16 +18,24 @@ chmod +x "$GRADLEW"
 adb emu sms send 15558675309 "probe Eliza-9967-SMS-roundtrip ci" || true
 adb shell settings put secure location_mode 3 || true
 
-"$GRADLEW" -p "$ANDROID_DIR" --no-daemon \
-  :app:connectedDebugAndroidTest \
-  :elizaos-capacitor-system:connectedDebugAndroidTest \
-  :elizaos-capacitor-wifi:connectedDebugAndroidTest \
-  :elizaos-capacitor-phone:connectedDebugAndroidTest \
-  :elizaos-capacitor-camera:connectedDebugAndroidTest \
-  :elizaos-capacitor-contacts:connectedDebugAndroidTest \
-  :elizaos-capacitor-messages:connectedDebugAndroidTest \
-  :elizaos-capacitor-mobile-signals:connectedDebugAndroidTest \
-  :elizaos-capacitor-location:connectedDebugAndroidTest
+# Capacitor regenerates the module graph during build:android. Derive tasks from
+# that synced graph so every wired module with src/androidTest gates this run;
+# the inventory also rejects an empty graph instead of reporting a false pass.
+INVENTORY_OUTPUT="$(bun "$REPO_ROOT/scripts/mobile/android-native-plugin-ci-inventory.ts" \
+  --android-dir "$ANDROID_DIR")"
+ANDROID_TEST_TASKS=()
+while IFS= read -r task; do
+  if [[ -n "$task" ]]; then
+    ANDROID_TEST_TASKS+=("$task")
+  fi
+done <<<"$INVENTORY_OUTPUT"
+if [[ ${#ANDROID_TEST_TASKS[@]} -eq 0 ]]; then
+  echo "No wired Android instrumentation tasks were discovered" >&2
+  exit 1
+fi
+printf 'Running wired Android instrumentation task: %s\n' "${ANDROID_TEST_TASKS[@]}"
+
+"$GRADLEW" -p "$ANDROID_DIR" --no-daemon "${ANDROID_TEST_TASKS[@]}"
 
 # PACKAGE_USAGE_STATS is special access and does not survive the preceding
 # reinstall, so this second run proves a positive usage read under an explicit

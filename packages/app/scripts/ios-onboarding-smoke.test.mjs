@@ -4,23 +4,23 @@
  * production transport-result validator remains in the exercised path.
  */
 
+import { afterEach, beforeEach, expect, it, mock, spyOn } from "bun:test";
 import fs from "node:fs";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-const harness = vi.hoisted(() => ({
-  assertInstalledIosAppRendererFresh: vi.fn(),
-  assertLiveReply: vi.fn(),
-  captureIosSimulatorScreenshot: vi.fn(
+const harness = {
+  assertInstalledIosAppRendererFresh: mock(),
+  assertLiveReply: mock(),
+  captureIosSimulatorScreenshot: mock(
     ({ filename }) => `/evidence/${filename}`,
   ),
-  clearIosSmokeDefaults: vi.fn(),
-  execFileSync: vi.fn(),
-  spawnSync: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
-  startDeviceE2eHostAgent: vi.fn(),
-  startIosSimulatorVideo: vi.fn(),
-}));
+  clearIosSmokeDefaults: mock(),
+  execFileSync: mock(),
+  spawnSync: mock(() => ({ status: 0, stdout: "", stderr: "" })),
+  startDeviceE2eHostAgent: mock(),
+  startIosSimulatorVideo: mock(),
+};
 
-vi.mock("node:child_process", () => ({
+mock.module("node:child_process", () => ({
   default: {
     execFileSync: harness.execFileSync,
     spawnSync: harness.spawnSync,
@@ -28,22 +28,22 @@ vi.mock("node:child_process", () => ({
   execFileSync: harness.execFileSync,
   spawnSync: harness.spawnSync,
 }));
-vi.mock("../test/liveness-contract.mjs", () => ({
+mock.module("../test/liveness-contract.mjs", () => ({
   assertLiveReply: harness.assertLiveReply,
 }));
-vi.mock("./lib/host-agent.mjs", () => ({
+mock.module("./lib/host-agent.mjs", () => ({
   DEFAULT_HOST_AGENT_PORT: 31338,
   startDeviceE2eHostAgent: harness.startDeviceE2eHostAgent,
 }));
-vi.mock("./lib/ios-renderer-stamp.mjs", () => ({
-  assertCandidateIosAppRendererFresh: vi.fn(),
+mock.module("./lib/ios-renderer-stamp.mjs", () => ({
+  assertCandidateIosAppRendererFresh: mock(),
   assertInstalledIosAppRendererFresh:
     harness.assertInstalledIosAppRendererFresh,
 }));
-vi.mock("./lib/ios-sim-defaults-hygiene.mjs", () => ({
+mock.module("./lib/ios-sim-defaults-hygiene.mjs", () => ({
   clearIosSmokeDefaults: harness.clearIosSmokeDefaults,
 }));
-vi.mock("./lib/ios-simulator-capture.mjs", () => ({
+mock.module("./lib/ios-simulator-capture.mjs", () => ({
   captureIosSimulatorScreenshot: harness.captureIosSimulatorScreenshot,
   startIosSimulatorVideo: harness.startIosSimulatorVideo,
 }));
@@ -101,8 +101,25 @@ function preferenceResult(args) {
   return null;
 }
 
+async function waitForAssertion(assertion, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw lastError ?? new Error("Timed out waiting for assertion");
+}
+
 beforeEach(() => {
-  vi.clearAllMocks();
+  for (const fn of Object.values(harness)) {
+    fn.mockClear();
+  }
   process.argv = [
     "node",
     "ios-onboarding-smoke.mjs",
@@ -135,10 +152,8 @@ beforeEach(() => {
     if (result !== null) return result;
     return "";
   });
-  mkdirSpy = vi.spyOn(fs, "mkdirSync").mockImplementation(() => undefined);
-  writeFileSpy = vi
-    .spyOn(fs, "writeFileSync")
-    .mockImplementation(() => undefined);
+  mkdirSpy = spyOn(fs, "mkdirSync").mockImplementation(() => undefined);
+  writeFileSpy = spyOn(fs, "writeFileSync").mockImplementation(() => undefined);
 });
 
 afterEach(() => {
@@ -156,26 +171,23 @@ afterEach(() => {
   } else {
     process.env.IOS_ONBOARDING_SMOKE_DELAY_MS = originalDelay;
   }
-  vi.restoreAllMocks();
+  mock.restore();
 });
 
 it("accepts completed transport evidence and writes the reviewed result artifact", async () => {
-  const log = vi.spyOn(console, "log").mockImplementation(() => {});
-  const error = vi.spyOn(console, "error").mockImplementation(() => {});
-  const exit = vi.spyOn(process, "exit").mockImplementation((code) => {
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  const exit = spyOn(process, "exit").mockImplementation((code) => {
     throw new Error(`unexpected process.exit(${code})`);
   });
 
   await import("./ios-onboarding-smoke.mjs");
 
-  await vi.waitFor(
-    () => {
-      expect(
-        log.mock.calls.flat().some((value) => String(value).includes("PASS")),
-      ).toBe(true);
-    },
-    { timeout: 5_000 },
-  );
+  await waitForAssertion(() => {
+    expect(
+      log.mock.calls.flat().some((value) => String(value).includes("PASS")),
+    ).toBe(true);
+  });
   expect(exit).not.toHaveBeenCalled();
   expect(error).not.toHaveBeenCalled();
   expect(harness.startDeviceE2eHostAgent).not.toHaveBeenCalled();

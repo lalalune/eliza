@@ -78,6 +78,22 @@ describe("scheduled workflow recovery contracts", () => {
     expect(workflowSource).not.toMatch(/jq -r \.id\b/);
   });
 
+  test("configured Hetzner preflight failures cannot skip the scheduled smoke", () => {
+    const workflow = parseWorkflow("hetzner-sleep-wake-smoke.yml");
+    const preflight = namedStep(
+      workflow.jobs?.["sleep-wake"],
+      "Check Hetzner API token",
+    );
+
+    expect(preflight.run).toMatch(
+      /if \[ "\$status" -ne 0 \]; then[\s\S]*?::error::Hetzner API token preflight could not reach[\s\S]*?exit 1\s+fi/,
+    );
+    expect(preflight.run).toMatch(
+      /if \[ "\$\{status_code#5\}" != "\$status_code" \]; then[\s\S]*?::error::Hetzner API token preflight returned HTTP[\s\S]*?exit 1\s+fi/,
+    );
+    expect(preflight.run).not.toContain("github.event_name");
+  });
+
   test("every Android emulator action enters one persistent Bash script", () => {
     const workflow = parseWorkflow("android-device-e2e.yml");
     const expectedCommands = [
@@ -167,5 +183,22 @@ describe("scheduled workflow recovery contracts", () => {
     expect(setup.with?.["node-version"]).toBe("24");
     expect(setupIndex).toBeGreaterThanOrEqual(0);
     expect(initIndex).toBeGreaterThan(setupIndex);
+  });
+
+  test("CodeQL resource ceilings match hosted and self-hosted runners", () => {
+    const workflow = parseWorkflow("codeql.yml");
+    const job = workflow.jobs?.analyze;
+    const init = namedStep(job, "Initialize CodeQL");
+    const runsOn = String(job?.["runs-on"]);
+
+    expect(runsOn).toContain("github.event_name == 'pull_request'");
+    expect(runsOn).toContain('["ubuntu-latest"]');
+    expect(runsOn).toContain('["self-hosted","Linux","X64","hetzner-robot"]');
+    expect(init.with?.ram).toBe(
+      `\${{ runner.environment == 'self-hosted' && 120000 || 12000 }}`,
+    );
+    expect(init.with?.threads).toBe(
+      `\${{ runner.environment == 'self-hosted' && 8 || 2 }}`,
+    );
   });
 });

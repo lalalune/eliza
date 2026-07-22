@@ -268,18 +268,33 @@ jobs:
           - lane: desktop-routes
             specs: test/ui-smoke/all-pages-clicksafe.spec.ts
             grep: "route renders without console failures: desktop|visible safe app tiles|shared ViewHeader"
+            project: chromium
+            test_auth: "false"
           - lane: mobile-routes
             specs: test/ui-smoke/all-pages-clicksafe.spec.ts
             grep: "route renders without console failures: mobile"
+            project: chromium
+            test_auth: "false"
           - lane: builtin-desktop
             specs: test/ui-smoke/builtin-views-visual.spec.ts
             grep: "builtin views visual coverage.* desktop$"
+            project: chromium
+            test_auth: "false"
           - lane: builtin-mobile
             specs: test/ui-smoke/builtin-views-visual.spec.ts
             grep: "builtin views visual coverage.* mobile$"
+            project: chromium
+            test_auth: "false"
           - lane: documents
             specs: test/ui-smoke/documents-view.spec.ts
             grep: .
+            project: chromium
+            test_auth: "false"
+          - lane: cloud-console
+            specs: test/ui-smoke/cloud-console-routes.spec.ts
+            grep: .
+            project: audit-cloud
+            test_auth: "true"
     runs-on: ${{ fromJSON(vars.HETZNER_FLEET_ONLINE == 'false' && '["ubuntu-24.04"]' || '["self-hosted","hetzner-robot"]') }}
     timeout-minutes: 35
     steps:
@@ -308,7 +323,9 @@ jobs:
         run: bunx playwright install --with-deps chromium
 
       - name: Actual app all-pages render + click-safety browser coverage
-        run: bun run --cwd packages/app test:e2e ${{ matrix.specs }} --project=chromium --grep "${{ matrix.grep }}"
+        env:
+          VITE_PLAYWRIGHT_TEST_AUTH: ${{ matrix.test_auth }}
+        run: bun run --cwd packages/app test:e2e ${{ matrix.specs }} --project="${{ matrix.project }}" --grep "${{ matrix.grep }}"
 
       - name: Upload app browser all-pages artifacts
         if: always()
@@ -353,7 +370,7 @@ jobs:
         run: bunx playwright install --with-deps chromium
 
       - name: Actual app feature interaction browser coverage
-        run: bun run --cwd packages/app test:e2e test/ui-smoke/apps-utility-interactions.spec.ts test/ui-smoke/apps-model-training-interactions.spec.ts test/ui-smoke/apps-comms-device-interactions.spec.ts test/ui-smoke/apps-diagnostics-interactions.spec.ts test/ui-smoke/apps-builtin-pages-interactions.spec.ts test/ui-smoke/settings-sections-interactions.spec.ts test/ui-smoke/settings-mobile-load.spec.ts test/ui-smoke/apps-personal-assistant-decomposed-interactions.spec.ts test/ui-smoke/apps-personal-assistant-feed-interactions.spec.ts test/ui-smoke/vault-modal-interactions.spec.ts test/ui-smoke/desktop-workspace-interactions.spec.ts test/ui-smoke/settings-audit-capture.spec.ts test/ui-smoke/settings-chat-control.spec.ts test/ui-smoke/routing-matrix-dispatch.spec.ts test/ui-smoke/chat-overlay-controls-interactions.spec.ts test/ui-smoke/task-widget-in-chat.spec.ts test/ui-smoke/chat-attachment.spec.ts test/ui-smoke/chat-3d-model.spec.ts test/ui-smoke/chat-large-paste.spec.ts test/ui-smoke/chat-clear-swipe.spec.ts test/ui-smoke/files-view.spec.ts test/ui-smoke/files-view-crud.spec.ts test/ui-smoke/conversation-management.spec.ts test/ui-smoke/chat-cloud-routed.spec.ts test/ui-smoke/slash-commands.spec.ts test/ui-smoke/model-download-deferral.spec.ts test/ui-smoke/home-widget-priority.spec.ts test/ui-smoke/settings-background.spec.ts --project=chromium
+        run: bun run --cwd packages/app test:e2e test/ui-smoke/apps-utility-interactions.spec.ts test/ui-smoke/apps-model-training-interactions.spec.ts test/ui-smoke/apps-comms-device-interactions.spec.ts test/ui-smoke/apps-diagnostics-interactions.spec.ts test/ui-smoke/apps-builtin-pages-interactions.spec.ts test/ui-smoke/settings-sections-interactions.spec.ts test/ui-smoke/settings-mobile-load.spec.ts test/ui-smoke/apps-personal-assistant-decomposed-interactions.spec.ts test/ui-smoke/apps-personal-assistant-feed-interactions.spec.ts test/ui-smoke/desktop-workspace-interactions.spec.ts test/ui-smoke/settings-chat-control.spec.ts test/ui-smoke/routing-matrix-dispatch.spec.ts test/ui-smoke/chat-overlay-controls-interactions.spec.ts test/ui-smoke/task-widget-in-chat.spec.ts test/ui-smoke/chat-attachment.spec.ts test/ui-smoke/chat-3d-model.spec.ts test/ui-smoke/chat-large-paste.spec.ts test/ui-smoke/chat-clear-swipe.spec.ts test/ui-smoke/files-view.spec.ts test/ui-smoke/files-view-crud.spec.ts test/ui-smoke/conversation-management.spec.ts test/ui-smoke/chat-cloud-routed.spec.ts test/ui-smoke/slash-commands.spec.ts test/ui-smoke/model-download-deferral.spec.ts test/ui-smoke/home-widget-priority.spec.ts test/ui-smoke/settings-background.spec.ts --project=chromium
 
       - name: Upload app browser feature interaction artifacts
         if: always()
@@ -443,7 +460,7 @@ jobs:
         run: bunx playwright install --with-deps chromium
 
       - name: Actual app ratcheted keyless browser coverage
-        run: bun run --cwd packages/app test:e2e test/ui-smoke/ai-qa-capture.spec.ts test/ui-smoke/android-system-apps.spec.ts test/ui-smoke/apps-session.spec.ts test/ui-smoke/apps-session-direct-a.spec.ts test/ui-smoke/apps-session-direct-b.spec.ts test/ui-smoke/auth-startup.spec.ts test/ui-smoke/automations.spec.ts test/ui-smoke/browser-workspace.spec.ts test/ui-smoke/character-editor.spec.ts test/ui-smoke/wallet-inventory.spec.ts test/ui-smoke/workflow-editor.spec.ts test/ui-smoke/computer-use.spec.ts test/ui-smoke/connectors.spec.ts test/ui-smoke/first-run-startup.spec.ts test/ui-smoke/model-download-deferral.spec.ts test/ui-smoke/history-navigation.spec.ts test/ui-smoke/orchestrator-gui-workbench.spec.ts test/ui-smoke/backups-no-destructive-reset.spec.ts test/ui-smoke/tutorial-chat.spec.ts test/ui-smoke/warming-shell-startup.spec.ts test/ui-smoke/runtime-configurability.spec.ts test/ui-smoke/perf-load-kpi.spec.ts test/ui-smoke/perf-interaction-kpi.spec.ts test/ui-smoke/perf-reduced-motion.spec.ts test/ui-smoke/screenshare-gui-interactions.spec.ts test/ui-smoke/task-coordinator-gui-interactions.spec.ts test/ui-smoke/titlebar-navigation.spec.ts test/ui-smoke/ui-smoke.spec.ts --project=chromium
+        run: bun run --cwd packages/app test:e2e test/ui-smoke/ai-qa-capture.spec.ts test/ui-smoke/android-system-apps.spec.ts test/ui-smoke/apps-session.spec.ts test/ui-smoke/apps-session-direct-a.spec.ts test/ui-smoke/apps-session-direct-b.spec.ts test/ui-smoke/auth-startup.spec.ts test/ui-smoke/automations.spec.ts test/ui-smoke/browser-workspace.spec.ts test/ui-smoke/wallet-inventory.spec.ts test/ui-smoke/workflow-editor.spec.ts test/ui-smoke/computer-use.spec.ts test/ui-smoke/connectors.spec.ts test/ui-smoke/first-run-startup.spec.ts test/ui-smoke/model-download-deferral.spec.ts test/ui-smoke/history-navigation.spec.ts test/ui-smoke/orchestrator-gui-workbench.spec.ts test/ui-smoke/backups-no-destructive-reset.spec.ts test/ui-smoke/tutorial-chat.spec.ts test/ui-smoke/warming-shell-startup.spec.ts test/ui-smoke/runtime-configurability.spec.ts test/ui-smoke/perf-load-kpi.spec.ts test/ui-smoke/perf-interaction-kpi.spec.ts test/ui-smoke/perf-reduced-motion.spec.ts test/ui-smoke/screenshare-gui-interactions.spec.ts test/ui-smoke/task-coordinator-gui-interactions.spec.ts test/ui-smoke/titlebar-navigation.spec.ts test/ui-smoke/ui-smoke.spec.ts --project=chromium
 
       - name: Upload app browser ratcheted artifacts
         if: always()
@@ -517,7 +534,9 @@ jobs:
             exit 0
           fi
           echo "Auto-discovered ui-smoke specs: ${specs[*]}"
-          bun run --cwd packages/app test:e2e "${specs[@]}" --project=chromium --fully-parallel --shard="${{ matrix.shard.value }}"
+          # Shard at file granularity because audit specs accumulate findings and
+          # write one report from afterAll; splitting a file corrupts that evidence.
+          bun run --cwd packages/app test:e2e "${specs[@]}" --project=chromium --shard="${{ matrix.shard.value }}"
 
       - name: Upload app browser auto-discovered artifacts
         if: always()
@@ -568,8 +587,8 @@ jobs:
       - name: Install Playwright browsers
         run: bunx playwright install --with-deps chromium
 
-      # The assertion-grade dashboard specs (browser-workspace, character-editor,
-      # wallet-inventory, workflow-editor) across mobile-portrait/-landscape,
+      # The assertion-grade dashboard specs (browser-workspace, wallet-inventory,
+      # workflow-editor) across mobile-portrait/-landscape,
       # iPad portrait (all hasTouch), and 1440×900 desktop.
       - name: Dashboard device-matrix browser coverage (portrait/landscape/iPad/desktop)
         run: bun run --cwd packages/app test:e2e --project=dashboard-mobile-portrait --project=dashboard-mobile-landscape --project=dashboard-ipad-portrait --project=dashboard-desktop-landscape

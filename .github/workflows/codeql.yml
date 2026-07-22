@@ -82,13 +82,13 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           config-file: ./.github/codeql/codeql-config.yml
-          # WHY: the paths-ignore config shrinks the JS/TS database ~36x (~107MB), so
-          # the memory pressure behind exit-137 is resolved at the source. threads can
-          # return toward the machine's 12-core capacity for fast analysis (holding the
-          # robot briefly instead of ~1h); ram stays a generous ceiling (~120GB of the
-          # 244GB box) purely as a safety net against an unmeasured pathological query.
-          ram: 120000
-          threads: 8
+          # WHY: the paths-ignore config keeps the JS/TS database tractable, while
+          # each runner still needs a resource ceiling below its physical capacity.
+          # Pull requests run on 16 GB GitHub-hosted machines; trusted events run on
+          # the 244 GB robot. A 120 GB request makes hosted query startup fail before
+          # analysis, so keep the hosted lane conservative and preserve robot speed.
+          ram: ${{ runner.environment == 'self-hosted' && 120000 || 12000 }}
+          threads: ${{ runner.environment == 'self-hosted' && 8 || 2 }}
 
       - if: matrix.build-mode == 'manual'
         shell: bash

@@ -27,9 +27,64 @@
       "reason": "Drives real chat through a local llama.cpp model planner and requires a running llama-server (LLAMACPP_URL, usually with an eliza-1 GGUF loaded); the keyless PR lane cannot provide that model daemon or GPU/CPU budget, so it is a manual/live local-model report spec rather than a secret-free PR gate."
     },
     {
+      "spec": "proactive-suggestions-live.spec.ts",
+      "category": "live-only",
+      "reason": "Exercises the real proactive event bus, LLM judge, cooldown, dismissal, and acceptance pipeline; it requires ELIZA_UI_SMOKE_LIVE_STACK=1 plus a live local/provider model, while the keyless stub has none of those runtime services."
+    },
+    {
+      "spec": "scheduled-reminder-fire.spec.ts",
+      "category": "live-only",
+      "reason": "Exercises a real ScheduledTask from creation through the personal-assistant scheduler and notification dispatch; it requires ELIZA_UI_SMOKE_LIVE_STACK=1 with the personal-assistant plugin loaded, which the keyless browser stack does not provide."
+    },
+    {
+      "spec": "view-create-edit-live-e2e.spec.ts",
+      "category": "live-only",
+      "reason": "Creates, edits, hot-reloads, and records trajectories for a real generated plugin view; it requires ELIZA_UI_SMOKE_LIVE_STACK=1, ELIZA_UI_SMOKE_VIEW_CREATE_EDIT=1, a live model, and an externalized trajectory directory."
+    },
+    {
+      "spec": "character-editor.spec.ts",
+      "category": "live-only",
+      "reason": "Its only suite persists character edits through the real character backend and explicitly requires ELIZA_UI_SMOKE_LIVE_STACK=1; the keyless stub cannot prove reload persistence."
+    },
+    {
+      "spec": "vault-modal-interactions.spec.ts",
+      "category": "live-only",
+      "reason": "Its only suite adds, reveals, persists, and deletes a secret through the real on-disk vault and explicitly requires ELIZA_UI_SMOKE_LIVE_STACK=1; the keyless stub cannot prove that boundary."
+    },
+    {
+      "spec": "full-walkthrough.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Runs in the named app-walkthrough-mock job via `bun run --cwd packages/app test:e2e:walkthrough`; it records the complete desktop and mobile walkthrough with retained evidence, so the auto-discovered shards must not run the same long evidence suite a second time."
+    },
+    {
       "spec": "all-views-aesthetic-audit.spec.ts",
       "category": "dedicated-tool",
       "reason": "Runs via `bun run --cwd packages/app audit:app` (--project=audit-app); it walks every app view at desktop and mobile, captures artifacts, and writes manual-review stubs, so it is a deliberate visual-audit tool rather than default smoke (also testIgnore'd in the chromium project of playwright.ui-smoke.config.ts)."
+    },
+    {
+      "spec": "cloud-surfaces-aesthetic-audit.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Runs via `bun run --cwd packages/app audit:cloud` (--project=audit-cloud); it walks every registered cloud route at desktop and mobile, writes shared report/manual-review artifacts from afterAll, and requires a renderer built with test auth, so the chromium PR project deliberately testIgnore's it."
+    },
+    {
+      "spec": "applications-dropdown-contrast.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Runs via `VITE_PLAYWRIGHT_TEST_AUTH=true bun run --cwd packages/app test:e2e --project=audit-app-dropdown`; it captures focused light/dark Applications dropdown contrast evidence with the dedicated test-auth project, so the chromium PR project deliberately testIgnore's it."
+    },
+    {
+      "spec": "views-deep-audit-capture.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Opt-in UX evidence sweep enabled by ELIZA_VIEWS_DEEP_AUDIT=1; it captures wallet, browser, launcher, and settings state matrices across viewports, so it is a deliberate audit tool rather than a default keyless smoke."
+    },
+    {
+      "spec": "views-plugin-audit-capture.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Opt-in plugin-view evidence sweep enabled by ELIZA_PLUGIN_VIEWS_AUDIT=1; it captures and classifies every registered plugin view across viewports, so it is a deliberate audit tool rather than a default keyless smoke."
+    },
+    {
+      "spec": "settings-audit-capture.spec.ts",
+      "category": "dedicated-tool",
+      "reason": "Opt-in visual evidence sweep enabled by ELIZA_SETTINGS_AUDIT=1; it captures every settings section at desktop and mobile into reports/settings-audit without a pass/fail verdict, so it is an on-demand manual-review tool rather than CI coverage."
     },
     {
       "spec": "all-views-interaction.spec.ts",

@@ -267,12 +267,12 @@ jobs:
   # (issue #9967 "wire into CI" + issue #9943 "on-device never gates a PR"). Until
   # this lane, the native-plugin Kotlin ran on no test, on no device in CI — the
   # only coverage was a mocked Capacitor bridge in desktop Chromium. This builds
-  # every native plugin's androidTest, boots a KVM emulator, and runs the real
-  # on-device reads (RoleManager / AudioManager / WifiManager / TelecomManager /
-  # CameraManager / ContactsProvider / content://sms / UsageStatsManager /
-  # FusedLocationProvider) via `connectedDebugAndroidTest` — gradle fails the job
-  # on any test failure. Label-gated (`ci:device`) or dispatch, like the smokes
-  # above, because booting an emulator is heavy.
+  # every wired module with an androidTest source set, boots a KVM emulator, and
+  # runs those suites via `connectedDebugAndroidTest`. The task inventory is
+  # derived from the Capacitor-synced Gradle graph, so a newly wired native
+  # plugin cannot silently miss this gate. Gradle fails the job on any test
+  # failure. Label-gated (`ci:device`) or dispatch, like the smokes above,
+  # because booting an emulator is heavy.
   native-plugin-androidtest:
     if: >-
       github.event_name == 'workflow_dispatch' ||

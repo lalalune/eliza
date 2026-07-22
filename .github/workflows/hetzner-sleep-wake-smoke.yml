@@ -10,9 +10,9 @@ name: Hetzner Sleep-Wake Smoke
 #
 # Secret gating mirrors hetzner-e2e.yml: missing HCLOUD_TOKEN_CI / SSH secrets
 # skip cleanly (exit 0 + loud warning and step summary) so forks and inactive
-# environments stay quiet. A configured credential that Hetzner rejects is red
-# for every event: otherwise the real-infra nightly can look healthy while it
-# never exercised anything.
+# environments stay quiet. Once the secrets are configured, every preflight or
+# lifecycle failure is red: otherwise the real-infra nightly can look healthy
+# while it never exercised anything.
 #
 # Required secrets (GitHub environment: ci-hetzner-e2e):
 #   HCLOUD_TOKEN_CI        - Hetzner Cloud API token (CI-scoped project)
@@ -120,9 +120,9 @@ jobs:
           set -e
           if [ "$status" -ne 0 ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Hetzner API token preflight could not reach api.hetzner.cloud; skipping sleep-wake smoke."
+            echo "::error::Hetzner API token preflight could not reach api.hetzner.cloud; failing configured sleep-wake smoke."
             {
-              echo "### Hetzner sleep-wake smoke skipped"
+              echo "### Hetzner sleep-wake smoke failed before provisioning"
               echo ""
               echo "Hetzner API token preflight could not reach \`api.hetzner.cloud\` before provisioning capacity."
               echo ""
@@ -130,10 +130,7 @@ jobs:
               echo "$response"
               echo "\`\`\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              exit 1
-            fi
-            exit 0
+            exit 1
           fi
 
           status_code="$(printf '%s' "$response" | bun -e 'const chunks=[]; for await (const chunk of Bun.stdin.stream()) chunks.push(Buffer.from(chunk)); const data = JSON.parse(Buffer.concat(chunks).toString() || "{}"); console.log(data.status ?? "");')"
@@ -157,9 +154,9 @@ jobs:
 
           if [ "${status_code#5}" != "$status_code" ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Hetzner API token preflight returned HTTP $status_code; skipping sleep-wake smoke before provisioning."
+            echo "::error::Hetzner API token preflight returned HTTP $status_code; failing configured sleep-wake smoke before provisioning."
             {
-              echo "### Hetzner sleep-wake smoke skipped"
+              echo "### Hetzner sleep-wake smoke failed before provisioning"
               echo ""
               echo "Hetzner API token preflight returned HTTP \`$status_code\` before provisioning capacity."
               echo ""
@@ -167,10 +164,7 @@ jobs:
               echo "$response"
               echo "\`\`\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              exit 1
-            fi
-            exit 0
+            exit 1
           fi
 
           echo "::error::Unexpected Hetzner API token preflight response: $response"

@@ -47,16 +47,12 @@ function deterministicFetch(responses) {
 function availableResponses(baseUrl) {
   return new Map([
     [
-      `${baseUrl}/debian/project/trace/debian`,
-      new Response("Archive serial: 2026072104\n"),
-    ],
-    [
       `${baseUrl}/debian-security/project/trace/debian-security`,
       new Response("Archive serial: 2026072104\n"),
     ],
-    [`${baseUrl}/debian/2026072104/dists/trixie/Release`, new Response(null)],
+    [`${baseUrl}/debian/2026070701/dists/trixie/Release`, new Response(null)],
     [
-      `${baseUrl}/debian/2026072104/dists/trixie-backports/Release`,
+      `${baseUrl}/debian/2026070701/dists/trixie-backports/Release`,
       new Response(null),
     ],
     [
@@ -70,7 +66,7 @@ function availableResponses(baseUrl) {
   ]);
 }
 
-test("refreshes Debian, resolves latest security, and retains the Tor pin", async () => {
+test("resolves latest archives while retaining frozen serials", async () => {
   const baseUrl = "https://snapshots.test";
   const configDir = await snapshotConfig({
     debian: "2026070701",
@@ -88,10 +84,14 @@ test("refreshes Debian, resolves latest security, and retains the Tor pin", asyn
   });
 
   assert.deepEqual(snapshots, {
-    debian: "2026072104",
+    debian: "2026070701",
     "debian-security": "2026072104",
     torproject: "2026050704",
   });
+  assert.equal(
+    requests.some(({ url }) => url.includes("/debian/project/trace/debian")),
+    false,
+  );
   assert.equal(
     requests.some(({ url }) =>
       url.includes("/torproject/project/trace/torproject"),
@@ -110,7 +110,7 @@ test("fails before returning a snapshot map when a Release file was pruned", asy
   });
   const responses = availableResponses(baseUrl);
   responses.set(
-    `${baseUrl}/debian/2026072104/dists/trixie-backports/Release`,
+    `${baseUrl}/debian/2026070701/dists/trixie-backports/Release`,
     new Response(null, { status: 404 }),
   );
   const { fetchImpl } = deterministicFetch(responses);
@@ -130,7 +130,7 @@ test("rejects malformed authoritative trace metadata", async () => {
   });
   const responses = availableResponses(baseUrl);
   responses.set(
-    `${baseUrl}/debian/project/trace/debian`,
+    `${baseUrl}/debian-security/project/trace/debian-security`,
     new Response("Archive serial: ../../latest\n"),
   );
   const { fetchImpl } = deterministicFetch(responses);

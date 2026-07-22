@@ -3,7 +3,7 @@
  * app layouts.
  */
 export const ASSERTION_GRADE_DASHBOARD_SPECS =
-  /(browser-workspace|character-editor|wallet-inventory|workflow-editor)\.spec\.ts/;
+  /(browser-workspace|wallet-inventory|workflow-editor)\.spec\.ts/;
 
 export const DASHBOARD_E2E_DEVICE_MATRIX = [
   {

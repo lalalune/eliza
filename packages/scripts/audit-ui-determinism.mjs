@@ -146,17 +146,8 @@ function isFunctionLike(node) {
   );
 }
 
-/** Is `fn` an argument to a deferred caller, a JSX on* handler, or async? */
+/** Is `fn` directly owned by a deferred caller or JSX on* handler? */
 function isDeferredCallback(fn) {
-  if (
-    (ts.isArrowFunction(fn) ||
-      ts.isFunctionExpression(fn) ||
-      ts.isFunctionDeclaration(fn) ||
-      ts.isMethodDeclaration(fn)) &&
-    fn.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)
-  ) {
-    return true;
-  }
   const parent = fn.parent;
   if (!parent) return false;
   // arg to a deferred caller: useEffect(() => {...})
@@ -183,6 +174,186 @@ function isDeferredCallback(fn) {
   return false;
 }
 
+function isAsyncFunction(fn) {
+  return fn.modifiers?.some(
+    (modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword,
+  );
+}
+
+function deferredCallerName(call) {
+  const callee = call.expression;
+  if (ts.isIdentifier(callee)) return callee.text;
+  if (ts.isPropertyAccessExpression(callee)) return callee.name.text;
+  return null;
+}
+
+function isDeferredReference(node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (
+    ts.isJsxExpression(parent) &&
+    parent.parent &&
+    ts.isJsxAttribute(parent.parent)
+  ) {
+    return /^on[A-Z]/.test(parent.parent.name?.getText?.() ?? "");
+  }
+  return (
+    ts.isCallExpression(parent) &&
+    parent.arguments.includes(node) &&
+    DEFERRED_CALLERS.has(deferredCallerName(parent))
+  );
+}
+
+function contextAtExecutionSite(node, resolving) {
+  let current = node.parent;
+  while (current) {
+    if (isFunctionLike(current)) {
+      if (isDeferredCallback(current)) return "deferred";
+      const referencedContext = asyncReferenceContext(current, resolving);
+      if (referencedContext) return referencedContext;
+      const name = functionName(current);
+      if (isComponentOrHookName(name) || (containsJsx(current) && !name)) {
+        return "render-time";
+      }
+    }
+    current = current.parent;
+  }
+  return "module";
+}
+
+function identifierForFunction(fn) {
+  if (ts.isFunctionDeclaration(fn) && fn.name) return fn.name.text;
+  const parent = fn.parent;
+  if (
+    parent &&
+    ts.isVariableDeclaration(parent) &&
+    ts.isIdentifier(parent.name)
+  ) {
+    return parent.name.text;
+  }
+  return null;
+}
+
+function enclosingReferenceScope(fn) {
+  let current = fn.parent;
+  while (current && !ts.isSourceFile(current)) {
+    if (isFunctionLike(current)) return current;
+    current = current.parent;
+  }
+  return fn.getSourceFile();
+}
+
+function chooseExecutionContext(contexts) {
+  if (contexts.includes("render-time")) return "render-time";
+  if (contexts.includes("module")) return "module";
+  if (contexts.includes("deferred")) return "deferred";
+  return null;
+}
+
+function identifierReferenceContext(fn, name, resolving) {
+  const contexts = [];
+  const visit = (node) => {
+    if (node === fn) return;
+    if (ts.isIdentifier(node) && node.text === name) {
+      const parent = node.parent;
+      if (isDeferredReference(node)) {
+        contexts.push("deferred");
+      } else if (
+        parent &&
+        ts.isCallExpression(parent) &&
+        parent.expression === node
+      ) {
+        contexts.push(contextAtExecutionSite(parent, resolving));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(enclosingReferenceScope(fn));
+  return chooseExecutionContext(contexts);
+}
+
+function classNameForMethod(fn) {
+  const owner = fn.parent;
+  if (
+    (ts.isClassDeclaration(owner) || ts.isClassExpression(owner)) &&
+    owner.name
+  ) {
+    return owner.name.text;
+  }
+  return null;
+}
+
+function newExpressionName(node) {
+  if (!ts.isNewExpression(node) || !ts.isIdentifier(node.expression)) {
+    return null;
+  }
+  return node.expression.text;
+}
+
+function methodReferenceContext(fn, resolving) {
+  if (!ts.isIdentifier(fn.name)) return null;
+  const className = classNameForMethod(fn);
+  if (!className) return null;
+
+  const source = fn.getSourceFile();
+  const instanceNames = new Set();
+  const collectInstances = (node) => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      newExpressionName(node.initializer) === className
+    ) {
+      instanceNames.add(node.name.text);
+    }
+    ts.forEachChild(node, collectInstances);
+  };
+  collectInstances(source);
+
+  const contexts = [];
+  const visit = (node) => {
+    if (node === fn) return;
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      node.name.text === fn.name.text
+    ) {
+      const receiver = node.expression;
+      const receiverMatches =
+        newExpressionName(receiver) === className ||
+        (ts.isIdentifier(receiver) &&
+          (receiver.text === className || instanceNames.has(receiver.text)));
+      if (receiverMatches) {
+        if (isDeferredReference(node)) {
+          contexts.push("deferred");
+        } else if (
+          node.parent &&
+          ts.isCallExpression(node.parent) &&
+          node.parent.expression === node
+        ) {
+          contexts.push(contextAtExecutionSite(node.parent, resolving));
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return chooseExecutionContext(contexts);
+}
+
+function asyncReferenceContext(fn, resolving = new Set()) {
+  if (!isAsyncFunction(fn)) return null;
+  // An async body runs synchronously until its first await, so the modifier
+  // cannot decide render safety; the actual invocation sites own that answer.
+  if (resolving.has(fn)) return null;
+  const nextResolving = new Set(resolving);
+  nextResolving.add(fn);
+  if (ts.isMethodDeclaration(fn)) {
+    return methodReferenceContext(fn, nextResolving);
+  }
+  const name = identifierForFunction(fn);
+  return name ? identifierReferenceContext(fn, name, nextResolving) : null;
+}
+
 /**
  * Classify a forbidden call node by execution context.
  * @returns {"render-time"|"deferred"|"module"}
@@ -193,6 +364,8 @@ function classify(node) {
   while (cur) {
     if (isFunctionLike(cur)) {
       if (isDeferredCallback(cur)) return "deferred";
+      const referencedContext = asyncReferenceContext(cur);
+      if (referencedContext) return referencedContext;
       const name = functionName(cur);
       if (isComponentOrHookName(name) || (containsJsx(cur) && !name)) {
         outerComponentOrHook = cur;
@@ -385,9 +558,33 @@ function runSelfTest() {
       "Date.now()",
     ],
     [
+      "async function called by a deferred async handler",
+      "function Foo(){ async function load(){ return Date.now(); } async function handleClick(){ await load(); } return <button onClick={handleClick}/>; }",
+      "deferred",
+      "Date.now()",
+    ],
+    [
       "async method deferred",
       "class Handler { async run(){ return Date.now(); } } function Foo(){ return <button onClick={()=>new Handler().run()}/>; }",
       "deferred",
+      "Date.now()",
+    ],
+    [
+      "async function declaration invoked during render",
+      "function Foo(){ async function read(){ return Date.now(); } const pending = read(); return <div>{String(pending)}</div>; }",
+      "render-time",
+      "Date.now()",
+    ],
+    [
+      "async method invoked during render",
+      "class Reader { async read(){ return Date.now(); } } function Foo(){ const pending = new Reader().read(); return <div>{String(pending)}</div>; }",
+      "render-time",
+      "Date.now()",
+    ],
+    [
+      "async IIFE invoked during render",
+      "function Foo(){ const pending = (async()=>Date.now())(); return <div>{String(pending)}</div>; }",
+      "render-time",
       "Date.now()",
     ],
   ];

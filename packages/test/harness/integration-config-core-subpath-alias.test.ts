@@ -15,6 +15,7 @@
  * file on disk.
  */
 import { existsSync, statSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import integrationConfig from "../vitest/integration.config.ts";
 
@@ -61,6 +62,12 @@ function resolveThroughAliases(
   return entry ? importee.replace(entry.find, entry.replacement) : undefined;
 }
 
+function resolvesToSourceFile(target: string): boolean {
+  return [target, `${target}.ts`, path.join(target, "index.ts")].some(
+    (candidate) => existsSync(candidate) && statSync(candidate).isFile(),
+  );
+}
+
 describe("integration.config.ts @elizaos/core alias (#11047)", () => {
   const coreSpecifiers = [
     "@elizaos/core",
@@ -98,8 +105,8 @@ describe("integration.config.ts @elizaos/core alias (#11047)", () => {
     expect(resolved, "@elizaos/core/roles must resolve").toBeDefined();
     const target = resolved as string;
     expect(
-      existsSync(target) && statSync(target).isFile(),
-      `@elizaos/core/roles resolved to "${target}", which is not a file (ENOTDIR, #11047)`,
+      resolvesToSourceFile(target),
+      `@elizaos/core/roles resolved to "${target}", which has no source file candidate (ENOTDIR, #11047)`,
     ).toBe(true);
   });
 });

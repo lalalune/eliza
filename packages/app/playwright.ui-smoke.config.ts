@@ -70,10 +70,10 @@ const webkitLaneEnabled = process.env.PLAYWRIGHT_WEBKIT === "1";
 // The all-views aesthetic audit (#8796) walks ~50 views × 2 viewports; it is a
 // dedicated tool run via `audit:app`, not part of the default e2e smoke.
 const AUDIT_APP_SPEC = /all-views-aesthetic-audit\.spec\.ts/;
-// The cloud-surface aesthetic audit (#10725/#11342) walks every registered
-// cloud route (packages/ui/src/cloud/register-all.ts) at desktop + mobile; a
-// dedicated tool run via `audit:cloud`, not part of the default e2e smoke.
-const AUDIT_CLOUD_SPEC = /cloud-surfaces-aesthetic-audit\.spec\.ts/;
+// The cloud audit project owns both the visual route walk and the focused
+// authenticated route assertions because both require the test-auth renderer.
+const AUDIT_CLOUD_SPEC =
+  /(cloud-surfaces-aesthetic-audit|cloud-console-routes)\.spec\.ts/;
 // Focused light/dark contrast proof for the Applications dropdown/select
 // popovers (#14232): renders the two touched surfaces in BOTH themes with the
 // SelectContent popover open. Run via `--project=audit-app-dropdown`; kept out
@@ -86,7 +86,7 @@ const AUDIT_APP_DROPDOWN_SPEC = /applications-dropdown-contrast\.spec\.ts/;
 // accepts them), so the shipped Capacitor iOS WebView / desktop WKWebView
 // engine must run in CI, not only Chromium wearing a Safari viewport.
 const WEBKIT_SMOKE_SPECS =
-  /(browser-workspace|character-editor|wallet-inventory|workflow-editor|ui-smoke|input-modality)\.spec\.ts/;
+  /(browser-workspace|wallet-inventory|workflow-editor|ui-smoke|input-modality)\.spec\.ts/;
 const recording = !!process.env.E2E_RECORD;
 const videoMode =
   process.env.ELIZA_UI_SMOKE_DISABLE_VIDEO === "1"

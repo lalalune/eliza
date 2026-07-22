@@ -9,12 +9,34 @@ vi.mock("@elizaos/core", () => ({
   writeWorkspaceFolderConfig: vi.fn(),
 }));
 
-vi.mock("./mac-window-effects", () => ({
+const macWindowEffectsMock = vi.hoisted(() => ({
   enableVibrancy: vi.fn(() => false),
   ensureShadow: vi.fn(() => false),
+  isAppActive: vi.fn(() => false),
   setNativeDragRegion: vi.fn(),
   setTrafficLightsPosition: vi.fn(),
 }));
+
+vi.mock("./mac-window-effects", () => macWindowEffectsMock);
+
+const desktopManagers = new Set<DesktopManager>();
+
+function createDesktopManager(): DesktopManager {
+  const manager = new DesktopManager();
+  desktopManagers.add(manager);
+  return manager;
+}
+
+beforeEach(() => {
+  macWindowEffectsMock.isAppActive.mockReset().mockReturnValue(false);
+});
+
+afterEach(async () => {
+  for (const manager of desktopManagers) {
+    await manager.dispose();
+  }
+  desktopManagers.clear();
+});
 
 const electrobunMock = vi.hoisted(() => {
   type Handler = (event?: unknown) => void;
@@ -303,7 +325,7 @@ class FakeBrowserWindow {
 }
 
 function createManagerWithWindow() {
-  const manager = new DesktopManager();
+  const manager = createDesktopManager();
   const window = new FakeBrowserWindow();
   manager.setMainWindow(window as never);
   return { manager, window };
@@ -377,7 +399,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("returns safe fallback states when no main window is present", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
 
     await expect(manager.getWindowBounds()).resolves.toEqual({
       x: 0,
@@ -463,7 +485,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("restores a missing main window before showing it", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const restored = new FakeBrowserWindow();
     const restore = vi.fn(() => {
       manager.setMainWindow(restored as never);
@@ -481,7 +503,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("tears down old window event handlers when replacing the main window", () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const first = new FakeBrowserWindow();
     const second = new FakeBrowserWindow();
 
@@ -498,7 +520,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("routes tray quit through the app quit callback", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const requestQuit = vi.fn(async () => {});
     manager.setRequestQuitCallback(requestQuit);
 
@@ -516,7 +538,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("reports global shortcut registration rejection without tracking the shortcut", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     electrobunMock.GlobalShortcut.register.mockReturnValueOnce(false);
 
     await expect(
@@ -536,7 +558,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("tracks successfully registered global shortcuts for replacement and unregister", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     electrobunMock.GlobalShortcut.register
       .mockReturnValueOnce(true)
       .mockReturnValueOnce(true);
@@ -564,7 +586,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("presses a registered shortcut through the test seam", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const sendToWebview = vi.fn();
     manager.setSendToWebview(sendToWebview);
     electrobunMock.GlobalShortcut.register.mockReturnValueOnce(true);
@@ -587,7 +609,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("surfaces registered shortcuts in shell diagnostics", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     electrobunMock.GlobalShortcut.register.mockReturnValueOnce(true);
 
     await manager.registerShortcut({
@@ -606,7 +628,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("opens tray popover as an app renderer with preload, rpc, partition, and API injection", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const rpc = { request: {}, send: {}, setTransport: vi.fn() };
     const injectApiBase = vi.fn();
     const wireRpc = vi.fn();
@@ -688,7 +710,7 @@ describe("DesktopManager main window controls", () => {
   });
 
   it("awaits tray teardown during dispose", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     await manager.createTray({
       icon: "/tmp/appIcon.png",
       menu: [{ id: "quit", label: "Quit" }],
@@ -717,7 +739,7 @@ describe("DesktopManager notifications", () => {
   });
 
   it("covers callback and native context-menu boundaries used beside notifications", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     const sent = vi.fn();
     const openSettings = vi.fn();
     const openSurface = vi.fn(async () => ({
@@ -802,7 +824,7 @@ describe("DesktopManager notifications", () => {
   });
 
   it("observes native notification delivery at the canonical DesktopManager boundary", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     // Exercise the real Utils boundary used by packaged Electrobun, never a
     // browser Notification substitute or a monkey-patched diagnostics recorder.
 
@@ -866,7 +888,7 @@ describe("DesktopManager notifications", () => {
   });
 
   it("documents closeNotification as an Electrobun no-op", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
 
     await expect(
       manager.closeNotification({ id: "notification_1" }),
@@ -875,7 +897,7 @@ describe("DesktopManager notifications", () => {
   });
 
   it("uses native clipboard and safe shell boundaries", async () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
 
     await manager.writeToClipboard({ text: "hello" });
     expect(electrobunMock.Utils.clipboardWriteText).toHaveBeenCalledWith(
@@ -976,7 +998,7 @@ describe("DesktopManager dockless (tray-first) Dock tracking (#12184)", () => {
     );
 
   it("hides the Dock icon at rest — only the pill exists", () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     manager.setTrayFirstMode(true);
     // Pill main window is attached: NOT a full window → Dock stays hidden.
     manager.setMainWindowFullWindow(false);
@@ -984,7 +1006,7 @@ describe("DesktopManager dockless (tray-first) Dock tracking (#12184)", () => {
   });
 
   it("reveals the Dock icon when a managed window opens, hides it when the last closes", () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     manager.setTrayFirstMode(true);
     manager.setMainWindowFullWindow(false);
 
@@ -996,14 +1018,14 @@ describe("DesktopManager dockless (tray-first) Dock tracking (#12184)", () => {
   });
 
   it("reveals the Dock icon when the main window itself is a full dashboard", () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     manager.setTrayFirstMode(true);
     manager.setMainWindowFullWindow(true);
     expect(dockCalls().at(-1)).toBe(true);
   });
 
   it("does not touch the Dock icon when dockless mode is off", () => {
-    const manager = new DesktopManager();
+    const manager = createDesktopManager();
     manager.setMainWindowFullWindow(true);
     manager.setManagedWindowsPresent(true);
     expect(electrobunMock.Utils.setDockIconVisible).not.toHaveBeenCalled();
