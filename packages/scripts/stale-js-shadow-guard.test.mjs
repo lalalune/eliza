@@ -1,9 +1,15 @@
 /** Exercises the stale JavaScript guard against isolated, real Git repositories on disk. */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { findStaleJsShadows, run } from "./stale-js-shadow-guard.mjs";
 
@@ -39,8 +45,14 @@ test("ignores JavaScript shadows inside dependency directories", (t) => {
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
   mkdirSync(join(root, "node_modules/example/src"), { recursive: true });
-  writeFileSync(join(root, "node_modules/example/src/index.ts"), "export {};\n");
-  writeFileSync(join(root, "node_modules/example/src/index.js"), "dependency output\n");
+  writeFileSync(
+    join(root, "node_modules/example/src/index.ts"),
+    "export {};\n",
+  );
+  writeFileSync(
+    join(root, "node_modules/example/src/index.js"),
+    "dependency output\n",
+  );
 
   assert.deepEqual(findStaleJsShadows(root), []);
 });
@@ -51,8 +63,14 @@ test("preserves generated keyword data required by source-mode startup", (t) => 
 
   const generatedDir = join(root, "packages/shared/src/i18n/generated");
   mkdirSync(generatedDir, { recursive: true });
-  writeFileSync(join(generatedDir, "validation-keyword-data.ts"), "export {};\n");
-  writeFileSync(join(generatedDir, "validation-keyword-data.js"), "export {};\n");
+  writeFileSync(
+    join(generatedDir, "validation-keyword-data.ts"),
+    "export {};\n",
+  );
+  writeFileSync(
+    join(generatedDir, "validation-keyword-data.js"),
+    "export {};\n",
+  );
 
   assert.deepEqual(findStaleJsShadows(root), []);
 });
@@ -78,4 +96,17 @@ test("allows source archives that do not contain Git metadata", (t) => {
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
   assert.equal(run({ root }), 0);
+});
+
+test("runs before the app web bundle can resolve source modules", () => {
+  const appPackage = JSON.parse(
+    readFileSync(new URL("../app/package.json", import.meta.url), "utf8"),
+  );
+  const command = appPackage.scripts["build:web"];
+  const guardIndex = command.indexOf("stale-js-shadow-guard.mjs");
+  const bundleIndex = command.indexOf("vite.js build");
+
+  assert.notEqual(guardIndex, -1);
+  assert.notEqual(bundleIndex, -1);
+  assert.ok(guardIndex < bundleIndex);
 });
