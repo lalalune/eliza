@@ -271,6 +271,14 @@ describe("Discord durable turn / outbox state machine", () => {
 		expect(
 			harness.memoriesById.has(makeInboundMemory(messageId).id as string),
 		).toBe(true);
+		const inboundMemory = makeInboundMemory(messageId);
+		expect(
+			harness.memoriesById.get(discordTurnId({ agentId: AGENT_ID }, messageId)),
+		).toMatchObject({
+			entityId: inboundMemory.entityId,
+			roomId: inboundMemory.roomId,
+			worldId: roomIdFor(CHANNEL_ID),
+		});
 		expect(await turnState(harness, messageId)).not.toBe("REPLIED");
 
 		// Redelivery after "restart" resumes and delivers the reply.
