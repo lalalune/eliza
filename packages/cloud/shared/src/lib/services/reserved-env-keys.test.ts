@@ -18,6 +18,42 @@ describe("reserved-env-keys", () => {
     expect(findReservedEnvKeys(["FOO", "BAR"])).toEqual([]);
   });
 
+  test("rejects caller control of the fleet agent-server credential", () => {
+    expect(findReservedEnvKeys(["agent_server_shared_secret", "APP_SECRET"])).toEqual([
+      "agent_server_shared_secret",
+    ]);
+    expect(
+      stripReservedEnvKeys({
+        AGENT_SERVER_SHARED_SECRET: "caller-known",
+        APP_SECRET: "keep-me",
+      }),
+    ).toEqual({ APP_SECRET: "keep-me" });
+  });
+
+  test("rejects caller control of the managed execution tier", () => {
+    expect(findReservedEnvKeys(["eliza_cloud_execution_tier", "APP_SECRET"])).toEqual([
+      "eliza_cloud_execution_tier",
+    ]);
+    expect(
+      stripReservedEnvKeys({
+        ELIZA_CLOUD_EXECUTION_TIER: "dedicated-always",
+        APP_SECRET: "keep-me",
+      }),
+    ).toEqual({ APP_SECRET: "keep-me" });
+  });
+
+  test("rejects caller control of the managed agent credential generation", () => {
+    expect(findReservedEnvKeys(["eliza_api_token_generation", "APP_SECRET"])).toEqual([
+      "eliza_api_token_generation",
+    ]);
+    expect(
+      stripReservedEnvKeys({
+        ELIZA_API_TOKEN_GENERATION: "forged-generation",
+        APP_SECRET: "keep-me",
+      }),
+    ).toEqual({ APP_SECRET: "keep-me" });
+  });
+
   test("Steward keyless config is platform-owned but OpenAI shim keys remain mode-specific", () => {
     expect(
       findReservedEnvKeys([

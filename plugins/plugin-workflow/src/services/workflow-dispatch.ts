@@ -84,12 +84,29 @@ interface RuntimeServiceRegistry {
   set(serviceType: string, services: WorkflowDispatchServiceEntry[]): void;
 }
 
-function resolveEmbeddedService(runtime: IAgentRuntime): EmbeddedWorkflowService | null {
+function isEmbeddedWorkflowService(value: unknown): value is EmbeddedWorkflowService {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, 'executeWorkflow') === 'function' &&
+    typeof Reflect.get(value, 'executeWorkflowWithDedup') === 'function' &&
+    typeof Reflect.get(value, 'findExecutionByIdempotencyKey') === 'function'
+  );
+}
+
+async function resolveEmbeddedService(
+  runtime: IAgentRuntime
+): Promise<EmbeddedWorkflowService | null> {
   const service = runtime.getService<EmbeddedWorkflowService>(EMBEDDED_WORKFLOW_SERVICE_TYPE);
-  if (service && typeof service.executeWorkflow === 'function') {
-    return service;
-  }
-  return null;
+  if (isEmbeddedWorkflowService(service)) return service;
+
+  const getServiceLoadPromise: unknown = Reflect.get(runtime, 'getServiceLoadPromise');
+  if (typeof getServiceLoadPromise !== 'function') return null;
+
+  const loaded: unknown = await Reflect.apply(getServiceLoadPromise, runtime, [
+    EMBEDDED_WORKFLOW_SERVICE_TYPE,
+  ]);
+  return isEmbeddedWorkflowService(loaded) ? loaded : null;
 }
 
 function getRuntimeServiceRegistry(runtime: IAgentRuntime): RuntimeServiceRegistry | null {
@@ -121,8 +138,8 @@ function getRuntimeServiceRegistry(runtime: IAgentRuntime): RuntimeServiceRegist
  * the new run is suppressed and the prior execution result is returned with
  * `dedup: true`. A prior terminal failure stays a failure; an in-flight or
  * successful prior execution is accepted without launching another run.
- * Scheduled workflow dispatches use a minute-bucketed key so two simultaneous
- * schedule fires collapse to one execution.
+ * Scheduled workflow dispatches use an occurrence-specific key so retries
+ * collapse without suppressing later sub-minute occurrences.
  *
  * The lookup is only a fast path. The embedded service serializes claimants
  * in the shared database and commits the winning pending execution before
@@ -146,7 +163,18 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
       if (!id) {
         return { ok: false, error: 'workflow id required' };
       }
-      const service = resolveEmbeddedService(runtime);
+      let service: EmbeddedWorkflowService | null;
+      try {
+        service = await resolveEmbeddedService(runtime);
+      } catch (error) {
+        // error-policy:J1 scheduled-trigger dispatch translates startup failure
+        // into the explicit failure result consumed by the scheduler boundary.
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          error: `embedded workflow service failed to start: ${message}`,
+        };
+      }
       if (!service) {
         return { ok: false, error: 'embedded workflow service not registered' };
       }

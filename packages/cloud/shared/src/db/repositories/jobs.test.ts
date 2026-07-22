@@ -74,4 +74,36 @@ describe("prepareJobInsertData", () => {
       buildContext: expect.any(String),
     });
   });
+
+  test("preserves the lazy-tier transition marker inline when job data is offloaded", async () => {
+    const objects = new Map<string, string>();
+    setRuntimeR2Bucket(memoryBucket(objects));
+    process.env.SQL_HEAVY_PAYLOAD_STORAGE = "r2";
+    process.env.SQL_HEAVY_PAYLOAD_MIN_BYTES = "1";
+    process.env.SQL_HEAVY_PAYLOAD_INLINE_PREVIEW_BYTES = "0";
+
+    const prepared = await prepareJobInsertData({
+      id: "44444444-4444-4444-8444-444444444444",
+      type: "agent_restart",
+      organization_id: "22222222-2222-4222-8222-222222222222",
+      user_id: "33333333-3333-4333-8333-333333333333",
+      data: {
+        agentId: "55555555-5555-4555-8555-555555555555",
+        organizationId: "22222222-2222-4222-8222-222222222222",
+        userId: "33333333-3333-4333-8333-333333333333",
+        executionTierTransition: "dedicated-lazy-to-dedicated-always",
+        diagnosticContext: "x".repeat(1024),
+      },
+    });
+
+    expect(prepared.data_storage).toBe("r2");
+    expect(prepared.data).toMatchObject({
+      agentId: "55555555-5555-4555-8555-555555555555",
+      executionTierTransition: "dedicated-lazy-to-dedicated-always",
+    });
+    expect(JSON.parse([...objects.values()][0] ?? "{}")).toMatchObject({
+      executionTierTransition: "dedicated-lazy-to-dedicated-always",
+      diagnosticContext: expect.any(String),
+    });
+  });
 });

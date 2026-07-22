@@ -15,7 +15,7 @@ export interface MockRuntimeOptions {
 /**
  * Create a useModel mock that handles both structured (responseSchema) and text (formatting) calls.
  *
- * - Structured calls (TEXT_SMALL with `responseSchema`) → return schemaResult
+ * - Structured calls (TEXT_LARGE with `responseSchema`) → return schemaResult
  * - Text calls (TEXT_SMALL for formatActionResponse) → return the data section from the prompt
  *   so tests can verify that the right data was passed to the LLM
  */

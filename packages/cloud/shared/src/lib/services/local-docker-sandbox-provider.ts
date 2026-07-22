@@ -265,6 +265,7 @@ export class LocalDockerSandboxProvider implements SandboxProvider {
       AGENT_NAME: agentName,
       AGENT_ID: agentId,
       ELIZA_CLOUD_PROVISIONED: "1",
+      ...(config.executionTier ? { ELIZA_CLOUD_EXECUTION_TIER: config.executionTier } : {}),
       ELIZA_PORT: agentPort,
       PORT: agentPort,
       BRIDGE_PORT: agentBridgePort,

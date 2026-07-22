@@ -1,36 +1,13 @@
 /**
- * POST /api/v1/eliza/agents/[agentId]/upgrade-tier
+ * Changes a hosted agent's execution tier behind the owner-authenticated Cloud
+ * boundary. Shared agents migrate to a separate always-on record and hand off
+ * their conversation only after provisioning. Scale-to-zero dedicated agents
+ * become always-on in place after explicit continuous-billing confirmation.
  *
- * First-class shared→dedicated tier upgrade (#15355). The shared agent keeps
- * serving the user throughout: this route only mints and provisions the
- * SEPARATE dedicated migration target; the client-side handoff machinery
- * (readiness poll → idempotent transcript import → repoint, see
- * `packages/ui/src/cloud/handoff/`) performs the actual switch once the
- * container is running, and only a confirmed switch deletes the shared bridge.
- *
- * Distinct from `agent_upgrade`/`[agentId]/downgrade`, which are IMAGE
- * blue/green swap/rollback for an existing container — this route changes the
- * agent's execution tier by minting a new dedicated record.
- *
- * Contract:
- *  - 404 unknown agent OR another org's agent (org-scoped read; no oracle).
- *  - 409 when the agent is not shared-tier (nothing to upgrade).
- *  - 402 canonical insufficient-credits body when the org cannot fund
- *    {@link AGENT_PRICING.UPGRADE_MIN_HOSTING_DAYS} days of dedicated hosting —
- *    a dedicated agent burns credits continuously, so the gate demands runway,
- *    not the bare create minimum.
- *  - 202 `created:true` + jobId/polling on a fresh mint. Identity is copied
- *    SERVER-side (agent_name / character_id / agent_config / environment_vars):
- *    the compat create route never reads the source row, and clients must not
- *    reconstruct identity from DTOs (onboarding-created shared agents keep
- *    name/bio only in agent_config).
- *  - 2xx `alreadyInProgress:true` reattach when this shared agent already has a
- *    live migration target (the `__agentUpgradedFrom` marker): the single-flight
- *    service (per-source database lock spanning target creation through the
- *    provision enqueue, #15943) makes retries and concurrent tabs resume the
- *    SAME upgrade, with target and job committed atomically — so a reattach
- *    never prepares credentials or environment state; it only reads (or
- *    re-arms, for stopped/sleeping/dead-job targets) durable state.
+ * Both paths enforce dedicated-hosting credit runway and durable single-flight
+ * jobs. The in-place path commits its tier CAS with a marked restart/wake job;
+ * the shared path commits its migration target with a provision job. Retries
+ * reattach to those exact records, and another organization's id remains a 404.
  */
 
 import { Hono } from "hono";
@@ -40,6 +17,11 @@ import { AGENT_PRICING } from "@/lib/constants/agent-pricing";
 import { getMaxNonTerminalAgentsForOrg } from "@/lib/constants/agent-sandbox-quota";
 import { checkAgentTierUpgradeCreditGate } from "@/lib/services/agent-billing-gate";
 import { insufficientCredits402 } from "@/lib/services/agent-billing-gate-402";
+import {
+  type DedicatedLazyTierTransition,
+  findDedicatedLazyTierTransition,
+  promoteDedicatedLazyAgentToAlwaysOn,
+} from "@/lib/services/agent-lazy-tier-transition";
 import {
   createTierUpgradeTargetWithProvision,
   findLiveTierUpgradeTarget,
@@ -93,6 +75,183 @@ function asEnvRecord(value: unknown): Record<string, string> {
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+}
+
+function continuousBillingConfirmationRequired(): Response {
+  return json(
+    {
+      success: false,
+      code: "continuous_billing_confirmation_required",
+      error: "Confirm continuous billing to upgrade this agent to always-on.",
+    },
+    400,
+  );
+}
+
+async function requireContinuousBillingConfirmation(
+  request: Request,
+): Promise<Response | null> {
+  const raw = await request.text();
+  if (!raw.trim()) return continuousBillingConfirmationRequired();
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    // error-policy:J3 untrusted request JSON becomes an explicit invalid result.
+    return json(
+      { success: false, code: "invalid_request", error: "Invalid JSON body" },
+      400,
+    );
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return continuousBillingConfirmationRequired();
+  }
+  const record = body as Record<string, unknown>;
+  if (record.confirmContinuousBilling !== true) {
+    return continuousBillingConfirmationRequired();
+  }
+  if (Object.keys(record).some((key) => key !== "confirmContinuousBilling")) {
+    return json(
+      {
+        success: false,
+        code: "invalid_request",
+        error: "Unrecognized request field",
+      },
+      400,
+    );
+  }
+  return null;
+}
+
+function respondToInPlaceTransition(
+  transition: DedicatedLazyTierTransition,
+): Response {
+  const alreadyInProgress =
+    !transition.created &&
+    (transition.job.status === "pending" ||
+      transition.job.status === "in_progress");
+  return json(
+    {
+      success: true,
+      created: transition.created,
+      reattached: !transition.created,
+      alreadyInProgress,
+      completed: transition.job.status === "completed",
+      transition: "in_place",
+      data: {
+        id: transition.agent.id,
+        agentId: transition.agent.id,
+        previousExecutionTier: "dedicated-lazy",
+        executionTier: transition.agent.execution_tier,
+        action: transition.action,
+        status: transition.job.status,
+        jobId: transition.job.id,
+        estimatedCompletionAt: transition.job.estimated_completion_at,
+      },
+      polling: pollingBody(transition.job.id),
+    },
+    202,
+  );
+}
+
+async function promoteDedicatedLazyAgent(
+  request: Request,
+  agent: AgentRow,
+  user: AuthedUser,
+  env: AppEnv["Bindings"],
+  options: { priorConfirmationRecorded?: boolean } = {},
+): Promise<Response> {
+  if (!options.priorConfirmationRecorded) {
+    const confirmationError =
+      await requireContinuousBillingConfirmation(request);
+    if (confirmationError) return confirmationError;
+  }
+
+  const creditCheck = await checkAgentTierUpgradeCreditGate(
+    user.organization_id,
+  );
+  if (!creditCheck.allowed) {
+    return json(
+      insufficientCredits402(
+        creditCheck,
+        "[agent-upgrade-tier] Always-on transition blocked: insufficient hosting runway",
+        { agentId: agent.id, orgId: user.organization_id },
+        { requiredBalance: AGENT_PRICING.UPGRADE_MINIMUM_BALANCE },
+      ),
+      402,
+    );
+  }
+
+  const workerHealth = await checkProvisioningWorkerHealth();
+  if (!workerHealth.ok) {
+    logger.warn(
+      "[agent-upgrade-tier] Always-on transition blocked: provisioning worker unavailable",
+      {
+        agentId: agent.id,
+        orgId: user.organization_id,
+        code: workerHealth.code,
+      },
+    );
+    return json(
+      provisioningWorkerFailureBody(workerHealth),
+      workerHealth.status,
+    );
+  }
+
+  const result = await promoteDedicatedLazyAgentToAlwaysOn({
+    agentId: agent.id,
+    organizationId: user.organization_id,
+    userId: user.id,
+  });
+  if (result.kind === "not_found") {
+    return json({ success: false, error: "Agent not found" }, 404);
+  }
+  if (result.kind === "not_promotable") {
+    if (options.priorConfirmationRecorded) {
+      return json(
+        {
+          success: false,
+          code: "agent_transition_not_ready",
+          error: `Agent cannot retry its always-on transition while its status is ${result.status}.`,
+        },
+        409,
+      );
+    }
+    if (result.executionTier !== "dedicated-lazy") {
+      return json(
+        {
+          success: false,
+          code: "not_shared_tier",
+          error:
+            "Only shared-tier agents can be upgraded to dedicated. This agent already runs on its own container.",
+        },
+        409,
+      );
+    }
+    return json(
+      {
+        success: false,
+        code: "agent_transition_not_ready",
+        error: `Agent cannot transition to always-on while its status is ${result.status}.`,
+      },
+      409,
+    );
+  }
+
+  if (result.created) {
+    void provisioningJobService.triggerImmediate(env).catch(() => {
+      // error-policy:J5 the durable job is observable and the provisioning cron retries it.
+    });
+  }
+  logger.info("[agent-upgrade-tier] In-place always-on transition accepted", {
+    agentId: result.agent.id,
+    orgId: user.organization_id,
+    action: result.action,
+    jobId: result.job.id,
+    created: result.created,
+    balance: creditCheck.balance,
+  });
+  return respondToInPlaceTransition(result);
 }
 
 /**
@@ -206,6 +365,34 @@ async function __hono_POST(
     );
     if (!shared) {
       return json({ success: false, error: "Agent not found" }, 404);
+    }
+
+    if (
+      shared.execution_tier === "dedicated-always" ||
+      shared.execution_tier === "dedicated-lazy"
+    ) {
+      const existingTransition = await findDedicatedLazyTierTransition({
+        agentId,
+        organizationId: user.organization_id,
+      });
+      if (existingTransition) {
+        if (existingTransition.job.status === "failed") {
+          // The server-owned marker proves the owner already confirmed
+          // continuous billing. A transport retry after terminal failure may
+          // therefore be bodyless, but it must re-prove current credit runway
+          // and worker health before a fresh relaunch job is committed.
+          return await promoteDedicatedLazyAgent(request, shared, user, env, {
+            priorConfirmationRecorded: true,
+          });
+        }
+        if (shared.execution_tier === "dedicated-always") {
+          return respondToInPlaceTransition(existingTransition);
+        }
+      }
+    }
+
+    if (shared.execution_tier === "dedicated-lazy") {
+      return await promoteDedicatedLazyAgent(request, shared, user, env);
     }
 
     if (shared.execution_tier !== "shared") {

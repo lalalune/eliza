@@ -30,6 +30,40 @@ describe("managed Eliza environment", () => {
     expect(result.environmentVars.PUBLIC_BASE_URL).toBe("https://cloud-agent-1.elizacloud.ai");
   });
 
+  test("marks newly minted container credentials as safe for provisioning retries", async () => {
+    const { MANAGED_AGENT_API_TOKEN_GENERATION, prepareManagedElizaBaseEnvironment } = await import(
+      "./managed-eliza-config"
+    );
+
+    const result = await prepareManagedElizaBaseEnvironment({
+      organizationId: "org-1",
+      userId: "user-1",
+      agentSandboxId: "cloud-agent-1",
+    });
+
+    expect(result.environmentVars.ELIZA_API_TOKEN).toMatch(/^agent_[a-f0-9]{32}$/);
+    expect(result.environmentVars.ELIZA_API_TOKEN_GENERATION).toBe(
+      MANAGED_AGENT_API_TOKEN_GENERATION,
+    );
+  });
+
+  test("does not bless an existing unmarked credential during a shared env merge", async () => {
+    const { prepareManagedElizaBaseEnvironment } = await import("./managed-eliza-config");
+
+    const result = await prepareManagedElizaBaseEnvironment({
+      organizationId: "org-1",
+      userId: "user-1",
+      agentSandboxId: "cloud-agent-1",
+      existingEnv: {
+        ELIZA_API_TOKEN: "agent_legacy_exposed_token",
+        ELIZA_API_TOKEN_GENERATION: "caller-forged",
+      },
+    });
+
+    expect(result.environmentVars.ELIZA_API_TOKEN).toBe("agent_legacy_exposed_token");
+    expect(result.environmentVars.ELIZA_API_TOKEN_GENERATION).toBeUndefined();
+  });
+
   test("replaces local and tunnel public base urls before provisioning", async () => {
     process.env.ELIZA_CLOUD_AGENT_BASE_DOMAIN = "elizacloud.ai";
     const { prepareManagedElizaBaseEnvironment } = await import("./managed-eliza-config");

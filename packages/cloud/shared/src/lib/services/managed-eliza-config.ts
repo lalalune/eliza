@@ -23,6 +23,32 @@ const DEV_ELIZA_APP_ORIGINS = [
  */
 export const RESERVED_MANAGED_ELIZA_ENV_KEYS = RESERVED_PLATFORM_ENV_KEYS;
 
+/**
+ * Marks credentials minted after raw container tokens stopped being returned
+ * by pairing. Provision retries may reuse a persisted container only when this
+ * marker accompanies its token; unmarked containers are retired and recreated.
+ */
+export const MANAGED_AGENT_API_TOKEN_GENERATION = "scoped-principal-v1";
+
+export function hasCurrentManagedAgentApiToken(
+  environmentVars: Record<string, string> | null | undefined,
+): boolean {
+  return (
+    Boolean(environmentVars?.ELIZA_API_TOKEN?.trim()) &&
+    environmentVars?.ELIZA_API_TOKEN_GENERATION === MANAGED_AGENT_API_TOKEN_GENERATION
+  );
+}
+
+export function rotateManagedAgentApiToken(
+  environmentVars: Record<string, string> | null | undefined,
+): Record<string, string> {
+  return {
+    ...(environmentVars ?? {}),
+    ELIZA_API_TOKEN: `agent_${crypto.randomUUID().replace(/-/g, "")}`,
+    ELIZA_API_TOKEN_GENERATION: MANAGED_AGENT_API_TOKEN_GENERATION,
+  };
+}
+
 export interface ManagedElizaEnvironmentResult {
   apiToken: string;
   changed: boolean;
@@ -240,15 +266,28 @@ export async function prepareManagedElizaBaseEnvironment(
     userId: params.userId,
     agentSandboxId: params.agentSandboxId,
   });
-  const apiToken =
-    existingEnv.ELIZA_API_TOKEN?.trim() || `agent_${crypto.randomUUID().replace(/-/g, "")}`;
+  const existingApiToken = existingEnv.ELIZA_API_TOKEN?.trim();
+  const hasCurrentApiToken = hasCurrentManagedAgentApiToken(existingEnv);
+  // An unknown marker is never allowed to bless an existing credential. The
+  // lifecycle provisioner rotates unmarked tokens after it has retired any
+  // persisted container; this shared merge must preserve that distinction.
+  delete existingEnv.ELIZA_API_TOKEN_GENERATION;
+  const managedApiToken = existingApiToken
+    ? {
+        ELIZA_API_TOKEN: existingApiToken,
+        ...(hasCurrentApiToken
+          ? { ELIZA_API_TOKEN_GENERATION: MANAGED_AGENT_API_TOKEN_GENERATION }
+          : {}),
+      }
+    : rotateManagedAgentApiToken(existingEnv);
+  const apiToken = managedApiToken.ELIZA_API_TOKEN;
 
   return {
     apiToken,
     agentApiKey,
     environmentVars: {
       ...existingEnv,
-      ELIZA_API_TOKEN: apiToken,
+      ...managedApiToken,
       ELIZA_ALLOW_WS_QUERY_TOKEN: "1",
       ELIZA_ALLOWED_ORIGINS: mergeManagedAllowedOrigins(existingEnv.ELIZA_ALLOWED_ORIGINS),
       // Public web UI on by default — users access it via the agent

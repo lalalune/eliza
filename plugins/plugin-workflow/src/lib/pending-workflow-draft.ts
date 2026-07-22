@@ -17,6 +17,8 @@ export interface PendingWorkflowDraftScope {
   cacheKey: string;
 }
 
+const pendingWorkflowDraftScopeTails = new Map<string, Promise<void>>();
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -122,4 +124,51 @@ export async function clearPendingWorkflowDraft(
   scope: PendingWorkflowDraftScope
 ): Promise<void> {
   await runtime.deleteCache(scope.cacheKey);
+}
+
+/**
+ * Claims a pending draft by atomically deleting its cache key before deployment.
+ * A false delete means another turn already consumed the draft and must win.
+ */
+export async function claimPendingWorkflowDraft(
+  runtime: IAgentRuntime,
+  scope: PendingWorkflowDraftScope
+): Promise<void> {
+  const claimed = await runtime.deleteCache(scope.cacheKey);
+  if (!claimed) {
+    throw new ElizaError('Pending workflow draft was already claimed by another chat turn', {
+      code: 'WORKFLOW_PENDING_DRAFT_ALREADY_CLAIMED',
+      context: { cacheKey: scope.cacheKey },
+      severity: 'ephemeral',
+    });
+  }
+}
+
+/**
+ * Serializes draft reads, claims, cancellation, and compensation for one
+ * conversation. The cache delete remains the authoritative atomic claim; this
+ * queue also prevents a later local turn from reading between claim and restore.
+ */
+export async function withPendingWorkflowDraftScopeLock<T>(
+  runtime: IAgentRuntime,
+  scope: PendingWorkflowDraftScope,
+  operation: () => Promise<T>
+): Promise<T> {
+  const lockKey = `${runtime.agentId}:${scope.cacheKey}`;
+  const predecessor = pendingWorkflowDraftScopeTails.get(lockKey) ?? Promise.resolve();
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const tail = predecessor.then(() => gate);
+  pendingWorkflowDraftScopeTails.set(lockKey, tail);
+  await predecessor;
+  try {
+    return await operation();
+  } finally {
+    releaseGate();
+    if (pendingWorkflowDraftScopeTails.get(lockKey) === tail) {
+      pendingWorkflowDraftScopeTails.delete(lockKey);
+    }
+  }
 }

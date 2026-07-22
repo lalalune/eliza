@@ -808,6 +808,42 @@ describe("useChatSend action handoff", () => {
     window.removeEventListener(NAVIGATE_VIEW_EVENT, onNavigate);
   });
 
+  it("opens Automations after a successful workflow lifecycle action without an id", async () => {
+    mocks.client.sendConversationMessageStream.mockResolvedValue({
+      text: "Found 3 workflows.",
+      completed: true,
+      actionResults: [
+        {
+          actionName: "WORKFLOW",
+          success: true,
+          values: { count: 3 },
+        },
+      ],
+    });
+    const navigations: CustomEvent[] = [];
+    const onNavigate = (event: Event) => navigations.push(event as CustomEvent);
+    window.addEventListener(NAVIGATE_VIEW_EVENT, onNavigate);
+    const deps = makeDeps({
+      activeConversationId: "conv-1",
+      conversations: [conversation("conv-1", "room-1")],
+    });
+    const { result } = renderHook(() => useChatSend(deps));
+
+    await act(async () => {
+      await result.current.sendChatText("show my workflows", {
+        conversationId: "conv-1",
+      });
+    });
+
+    expect(navigations).toHaveLength(1);
+    expect(navigations[0]?.detail).toEqual({
+      viewId: "automations",
+      viewPath: "/automations",
+    });
+    expect(deps.setActionNotice).not.toHaveBeenCalled();
+    window.removeEventListener(NAVIGATE_VIEW_EVENT, onNavigate);
+  });
+
   it("keeps VIEWS navigation authoritative when a turn also returns a workflow id", async () => {
     mocks.client.sendConversationMessageStream.mockResolvedValue({
       text: "Opening Calendar.",

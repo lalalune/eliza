@@ -10777,6 +10777,7 @@ export class DefaultMessageService implements IMessageService {
 					runPostTurnEvaluators(runtime, message, state, {
 						didRespond: didRespondGate,
 						responses: responseMessages,
+						...(actionResults ? { actionResults } : {}),
 					}),
 				);
 				await runPostDeliverySideEffect(runtime, "ALWAYS_AFTER", () =>
@@ -10790,6 +10791,7 @@ export class DefaultMessageService implements IMessageService {
 			await runPostTurnEvaluators(runtime, message, state, {
 				didRespond: didRespondGate,
 				responses: responseMessages,
+				...(actionResults ? { actionResults } : {}),
 			});
 			await runtime.runActionsByMode("ALWAYS_AFTER", message, state, {
 				didRespond: didRespondGate,

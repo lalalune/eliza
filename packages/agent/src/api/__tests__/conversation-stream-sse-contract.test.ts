@@ -71,22 +71,34 @@ vi.mock("../server-helpers.ts", async () => {
   );
   return {
     ...actual,
-    buildUserMessages: vi.fn(({ prompt, userId, agentId, roomId }) => ({
-      userMessage: {
-        id: stringToUuid("stream-contract-user-msg"),
-        entityId: userId,
-        agentId,
-        roomId,
-        content: { text: prompt, source: "api", channelType: ChannelType.DM },
-      },
-      messageToStore: {
-        id: stringToUuid("stream-contract-user-msg-store"),
-        entityId: userId,
-        agentId,
-        roomId,
-        content: { text: prompt, source: "api", channelType: ChannelType.DM },
-      },
-    })),
+    buildUserMessages: vi.fn(
+      ({ prompt, userId, agentId, roomId, metadata }) => ({
+        userMessage: {
+          id: stringToUuid("stream-contract-user-msg"),
+          entityId: userId,
+          agentId,
+          roomId,
+          content: {
+            text: prompt,
+            source: "api",
+            channelType: ChannelType.DM,
+            ...(metadata ? { metadata } : {}),
+          },
+        },
+        messageToStore: {
+          id: stringToUuid("stream-contract-user-msg-store"),
+          entityId: userId,
+          agentId,
+          roomId,
+          content: {
+            text: prompt,
+            source: "api",
+            channelType: ChannelType.DM,
+            ...(metadata ? { metadata } : {}),
+          },
+        },
+      }),
+    ),
     resolveWalletModeGuidanceReply: () => null,
     resolveAppUserName: () => "tester",
   };
@@ -101,6 +113,8 @@ import { handleConversationRoutes } from "../conversation-routes.ts";
 
 const AGENT_ID = stringToUuid("stream-contract-agent") as UUID;
 const USER_ID = stringToUuid("stream-contract-user") as UUID;
+const ORIGINAL_CLOUD_PROVISIONED = process.env.ELIZA_CLOUD_PROVISIONED;
+const ORIGINAL_API_TOKEN = process.env.ELIZA_API_TOKEN;
 const ROOM_ID = stringToUuid("stream-contract-room") as UUID;
 const TOKENS = ["Ordered ", "token ", "frame ", "stream."];
 const FINAL_TEXT = TOKENS.join("");
@@ -342,6 +356,12 @@ function createState(
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  let room = {
+    id: ROOM_ID,
+    name: conv.title,
+    channelId: `web-conv-${conv.id}`,
+    metadata: {},
+  };
   const useModel = createStreamingUseModelFixture();
   const runtime = {
     agentId: AGENT_ID,
@@ -359,12 +379,16 @@ function createState(
     ensureConnection: vi.fn(async () => undefined),
     updateWorld: vi.fn(async () => undefined),
     getWorld: vi.fn(async () => null),
-    getRoom: vi.fn(async () => null),
+    getRoom: vi.fn(async (roomId: UUID) => (roomId === ROOM_ID ? room : null)),
     getService: vi.fn(() => null),
     getServicesByType: vi.fn(() => []),
     getSetting: vi.fn(() => null),
     drainChatPreHandlers: vi.fn(async () => null),
-    adapter: {},
+    adapter: {
+      updateRoom: vi.fn(async (nextRoom: typeof room) => {
+        room = nextRoom;
+      }),
+    },
   } as unknown as AgentRuntime;
 
   return {
@@ -416,6 +440,73 @@ describe("conversation stream SSE contract (#10712)", () => {
   afterEach(() => {
     vi.clearAllMocks();
     requestStreamProtocol = undefined;
+    if (ORIGINAL_CLOUD_PROVISIONED === undefined) {
+      delete process.env.ELIZA_CLOUD_PROVISIONED;
+    } else {
+      process.env.ELIZA_CLOUD_PROVISIONED = ORIGINAL_CLOUD_PROVISIONED;
+    }
+    if (ORIGINAL_API_TOKEN === undefined) {
+      delete process.env.ELIZA_API_TOKEN;
+    } else {
+      process.env.ELIZA_API_TOKEN = ORIGINAL_API_TOKEN;
+    }
+  });
+
+  it("binds a managed chat turn to the edge-attested Cloud principal", async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    process.env.ELIZA_API_TOKEN = "per-agent-token";
+    const cloudPrincipal = stringToUuid("cloud-chat-user");
+    let handledMessage: { entityId?: unknown; content?: unknown } | null = null;
+    const messageService = {
+      async handleMessage(
+        _runtime: AgentRuntime,
+        message: { entityId?: unknown; content?: unknown },
+      ) {
+        handledMessage = message;
+        return {
+          didRespond: true,
+          responseContent: { text: "Cloud workflow chat ready." },
+          responseMessages: [],
+        };
+      },
+      shouldRespond: () => ({
+        shouldRespond: true,
+        skipEvaluation: true,
+        reason: "cloud-principal-test",
+      }),
+      deleteMessage: async () => undefined,
+      clearChannel: async () => undefined,
+    } as NonNullable<AgentRuntime["messageService"]>;
+    const { ctx } = createCtx(messageService);
+    ctx.req.headers["x-eliza-user-id"] = cloudPrincipal;
+    ctx.req.headers["x-eliza-principal-token"] = "per-agent-token";
+    const conversation = ctx.state.conversations.get("conv-1");
+    if (!conversation) throw new Error("stream contract conversation missing");
+    conversation.cloudOwnerEntityId = cloudPrincipal;
+
+    await handleConversationRoutes(ctx);
+
+    expect(handledMessage).toMatchObject({
+      entityId: cloudPrincipal,
+      content: {
+        metadata: {
+          elizaCloudPrincipal: { id: cloudPrincipal, attested: true },
+        },
+      },
+    });
+  });
+
+  it("rejects a managed chat turn without an edge-attested principal", async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    process.env.ELIZA_API_TOKEN = "per-agent-token";
+    const { ctx, record, useModel } = createCtx();
+
+    await handleConversationRoutes(ctx);
+
+    expect(record.writes.join("")).toContain(
+      "error 401: Cloud user principal is required",
+    );
+    expect(useModel).not.toHaveBeenCalled();
   });
 
   it("emits thinking→streaming status, ordered cumulative token frames, then a terminal done frame with thought", async () => {

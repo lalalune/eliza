@@ -147,7 +147,7 @@ Workflow generation/repair model calls also read optional primitive settings or 
 | `WORKFLOW_LLM_MODEL` / `WORKFLOW_MODEL` / `WORKFLOW_TEST_MODEL` | `gpt-oss-120b` in Cerebras mode | Per-workflow model hint attached to generation/repair calls and `providerOptions.workflow`. |
 | `WORKFLOW_LLM_RUNTIME_PROVIDER` / `WORKFLOW_MODEL_RUNTIME_PROVIDER` | `openai` when provider is `cerebras` | Override the registered runtime provider name used as the third `runtime.useModel()` argument. |
 
-Cerebras mode is inferred from `ELIZA_PROVIDER=cerebras`, an `OPENAI_BASE_URL` on `cerebras.ai`, or a standalone `CEREBRAS_API_KEY` with no OpenAI key/base URL. The OpenAI plugin then reads `CEREBRAS_MODEL` / `CEREBRAS_API_KEY` / `CEREBRAS_BASE_URL`.
+Cerebras mode is inferred from `ELIZA_PROVIDER=cerebras`, an `OPENAI_BASE_URL` on `cerebras.ai`, or a standalone `CEREBRAS_API_KEY` with no OpenAI key/base URL. The OpenAI plugin then reads `CEREBRAS_MODEL` / `CEREBRAS_API_KEY` / `CEREBRAS_BASE_URL`. When `ELIZA_CHAT_VIA_CLI` selects `codex`, `codex-sdk`, `claude`, or `claude-sdk`, that subscription route remains authoritative over ambient Cerebras credentials; set a workflow-specific provider key above to override it intentionally. Workflow model helpers use `TEXT_LARGE` for those CLI backends because it is the tier they always register, including repair and response-formatting helpers that normally request `TEXT_SMALL`; non-CLI deployments retain the cheaper small tier.
 
 ## How to extend
 

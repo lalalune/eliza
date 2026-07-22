@@ -90,7 +90,16 @@ describe('Set/Edit Fields deploy and Smithers execution', () => {
     });
     expect(stored.nodes[1]?.parameters.fields).toBeUndefined();
 
-    const execution = await service.runWorkflow(deployed.id, undefined, OWNER_ID);
+    const execution = await service.runWorkflow(
+      deployed.id,
+      {
+        triggerData: {
+          eventKind: 'MESSAGE_RECEIVED',
+          eventPayload: { text: 'hello from the event bridge' },
+        },
+      },
+      OWNER_ID
+    );
     const output = execution.data?.resultData?.runData?.['Set Result']?.[0]?.data?.main?.[0]?.[0]
       ?.json as Record<string, unknown> | undefined;
 
@@ -100,6 +109,8 @@ describe('Set/Edit Fields deploy and Smithers execution', () => {
       empty: '',
       enabled: false,
       count: 0,
+      eventKind: 'MESSAGE_RECEIVED',
+      eventPayload: { text: 'hello from the event bridge' },
     });
   });
 

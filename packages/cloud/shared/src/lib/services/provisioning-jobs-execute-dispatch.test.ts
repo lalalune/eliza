@@ -19,7 +19,11 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { jobsRepository } from "../../db/repositories/jobs";
 import type { Job } from "../../db/schemas/jobs";
 import { elizaSandboxService } from "./eliza-sandbox";
-import { JOB_TYPES, type ProvisioningJobType } from "./provisioning-job-types";
+import {
+  DEDICATED_LAZY_TO_ALWAYS_TRANSITION,
+  JOB_TYPES,
+  type ProvisioningJobType,
+} from "./provisioning-job-types";
 import { provisioningJobService } from "./provisioning-jobs";
 
 const ORG = "22222222-2222-4222-8222-222222222222";
@@ -349,6 +353,67 @@ describe("executeJob dispatch — failure path per job type retries (increments 
 });
 
 describe("executeJob dispatch — type-specific disposition rules", () => {
+  test("a marked transition restart carries an atomic lazy-tier failure writeback", async () => {
+    const ctx = harness(
+      makeJob(JOB_TYPES.AGENT_RESTART, {
+        executionTierTransition: DEDICATED_LAZY_TO_ALWAYS_TRANSITION,
+      }),
+    );
+    stub("executeRestart", {
+      success: false,
+      containerStopped: false,
+      containerStarted: false,
+      error: "permanent relaunch failure",
+    });
+    try {
+      const res = await run(JOB_TYPES.AGENT_RESTART);
+      expect(res.failed).toBe(1);
+      expect(typeof ctx.incrementSpy.mock.calls[0]?.[3]).toBe("function");
+    } finally {
+      ctx.claimSpy.mockRestore();
+      ctx.recoverSpy.mockRestore();
+      ctx.updateStatusSpy.mockRestore();
+      ctx.updateSpy.mockRestore();
+      ctx.incrementSpy.mockRestore();
+      ctx.retryLaterSpy.mockRestore();
+    }
+  });
+
+  test("a marked transition wake relaunches when status drift made wake a no-op", async () => {
+    const ctx = harness(
+      makeJob(JOB_TYPES.AGENT_WAKE, {
+        executionTierTransition: DEDICATED_LAZY_TO_ALWAYS_TRANSITION,
+      }),
+    );
+    const wakeSpy = stub("executeWake", {
+      success: true,
+      reprovisioned: false,
+    });
+    const restartSpy = stub("executeRestart", {
+      success: true,
+      containerStopped: true,
+      containerStarted: true,
+      bridgeUrl: "http://10.0.0.5:8080",
+      healthUrl: "http://10.0.0.5:8081",
+    });
+    try {
+      const res = await run(JOB_TYPES.AGENT_WAKE);
+      expect(res.succeeded).toBe(1);
+      expect(wakeSpy).toHaveBeenCalledTimes(1);
+      expect(restartSpy).toHaveBeenCalledTimes(1);
+      expect(completedCall(ctx)?.[2]?.result).toMatchObject({
+        reprovisioned: true,
+      });
+    } finally {
+      ctx.claimSpy.mockRestore();
+      ctx.recoverSpy.mockRestore();
+      ctx.updateStatusSpy.mockRestore();
+      ctx.updateSpy.mockRestore();
+      ctx.incrementSpy.mockRestore();
+      ctx.retryLaterSpy.mockRestore();
+    }
+  });
+
   test("agent_provision retryable transport → requeued without burning an attempt", async () => {
     const ctx = harness(makeJob(JOB_TYPES.AGENT_PROVISION));
     stub("provision", {

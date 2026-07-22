@@ -26,6 +26,7 @@ import {
   ChannelType,
   type Content,
   createMessageMemory,
+  ElizaError,
   logger,
   MESSAGE_SOURCE_AGENT_GREETING,
   MESSAGE_SOURCE_CLIENT_CHAT,
@@ -83,9 +84,15 @@ import {
 } from "./chat-routes.ts";
 import { resolveClientChatAdminEntityId } from "./client-chat-admin.ts";
 import {
+  isCloudPrincipalRequired,
+  resolveTrustedCloudPrincipal,
+  withTrustedCloudPrincipalMetadata,
+} from "./cloud-principal.ts";
+import {
   buildConversationRoomMetadata,
   sanitizeConversationMetadata,
 } from "./conversation-metadata.ts";
+import { restoreConversationFromDbById } from "./conversation-restore.ts";
 import { resolveHttpAccessContext } from "./http-access-context.ts";
 import { evictOldestConversation } from "./memory-bounds.ts";
 import { generateMessageCorpus, seedMessageCorpus } from "./message-corpus.ts";
@@ -555,7 +562,15 @@ function ensureAdminEntityId(state: ConversationRouteState): UUID {
 function resolveConversationCaller(
   req: http.IncomingMessage,
   state: ConversationRouteState,
+  cloudPrincipal: UUID | null = resolveTrustedCloudPrincipal(req),
 ): { entityId: UUID; role: WaifuChatWorldRole; userName: string } {
+  if (cloudPrincipal) {
+    return {
+      entityId: cloudPrincipal,
+      role: "OWNER",
+      userName: `Cloud user ${cloudPrincipal}`,
+    };
+  }
   const access = resolveWaifuChatAccess(req);
   if (!access) {
     return {
@@ -604,16 +619,79 @@ function canWaifuAccessConversation(
   return getWaifuChatOwnerWallet(conv) === access.walletAddress.toLowerCase();
 }
 
-function rejectWaifuConversationAccessIfNeeded(
+function canConversationCallerAccess(
   req: http.IncomingMessage,
+  cloudPrincipal: UUID | null,
+  conv: ConversationMeta,
+): boolean {
+  if (
+    isCloudPrincipalRequired() &&
+    (!cloudPrincipal || conv.cloudOwnerEntityId !== cloudPrincipal)
+  ) {
+    return false;
+  }
+  return canWaifuAccessConversation(resolveWaifuChatAccess(req), conv);
+}
+
+function rejectConversationAccessIfNeeded(
+  req: http.IncomingMessage,
+  cloudPrincipal: UUID | null,
   conv: ConversationMeta,
   error: ConversationRouteContext["error"],
   res: http.ServerResponse,
 ): boolean {
-  const access = resolveWaifuChatAccess(req);
-  if (canWaifuAccessConversation(access, conv)) return false;
+  if (canConversationCallerAccess(req, cloudPrincipal, conv)) return false;
   error(res, "Conversation not found", 404);
   return true;
+}
+
+function publicConversationMeta(
+  conversation: ConversationMeta,
+): Omit<ConversationMeta, "cloudOwnerEntityId"> {
+  const { cloudOwnerEntityId: _serverOwnedCloudOwner, ...publicConversation } =
+    conversation;
+  return publicConversation;
+}
+
+function broadcastConversationUpdate(
+  state: ConversationRouteState,
+  conversation: ConversationMeta,
+): void {
+  // The server's socket boundary resolves the internal conversation id back to
+  // its attested owner before delivery; the DTO itself never carries that owner.
+  state.broadcastWs?.({
+    type: "conversation-updated",
+    conversation: publicConversationMeta(conversation),
+  });
+}
+
+function evictOldestConversationForCaller(
+  conversations: Map<string, ConversationMeta>,
+  cap: number,
+  cloudPrincipal: UUID | null,
+): string | null {
+  if (!cloudPrincipal) {
+    return evictOldestConversation(conversations, cap);
+  }
+
+  const owned = Array.from(conversations.entries()).filter(
+    ([, conversation]) => conversation.cloudOwnerEntityId === cloudPrincipal,
+  );
+  if (owned.length <= cap) return null;
+
+  let oldest: [string, ConversationMeta] | null = null;
+  for (const candidate of owned) {
+    if (
+      !oldest ||
+      new Date(candidate[1].updatedAt).getTime() <
+        new Date(oldest[1].updatedAt).getTime()
+    ) {
+      oldest = candidate;
+    }
+  }
+  if (!oldest) return null;
+  conversations.delete(oldest[0]);
+  return oldest[0];
 }
 
 function rejectWaifuNonAdminMutationIfNeeded(
@@ -710,6 +788,25 @@ function markConversationDeleted(
   }
 }
 
+function unmarkConversationDeleted(
+  state: ConversationRouteState,
+  conversationId: string,
+): void {
+  if (!state.deletedConversationIds.delete(conversationId)) return;
+  try {
+    persistDeletedConversationIdsToState(state.deletedConversationIds);
+  } catch (err) {
+    state.deletedConversationIds.add(conversationId);
+    // error-policy:J2 Retain the tombstone in memory when durable removal fails.
+    throw new ElizaError("Failed to persist restored conversation tombstones", {
+      code: "CONVERSATION_TOMBSTONE_RESTORE_FAILED",
+      context: { conversationId },
+      cause: err,
+      severity: "fatal",
+    });
+  }
+}
+
 async function deleteConversationRoomData(
   runtime: AgentRuntime,
   roomId: UUID,
@@ -728,10 +825,21 @@ async function deleteConversationRoomData(
     return;
   }
 
-  const dbDeleteRoom = runtimeWithDelete.adapter.db.deleteRoom;
+  const db = runtimeWithDelete.adapter?.db;
+  const dbDeleteRoom = db?.deleteRoom;
   if (typeof dbDeleteRoom === "function") {
-    await dbDeleteRoom.call(runtimeWithDelete.adapter.db, roomId);
+    await dbDeleteRoom.call(db, roomId);
+    return;
   }
+
+  throw new ElizaError(
+    "Conversation room deletion is not supported by this runtime",
+    {
+      code: "CONVERSATION_ROOM_DELETE_UNSUPPORTED",
+      context: { roomId },
+      severity: "fatal",
+    },
+  );
 }
 
 async function deleteConversationMemories(
@@ -812,6 +920,9 @@ async function ensureConversationRoom(
   const ownerId = ensureAdminEntityId(state);
   const worldId = stringToUuid(`${agentName}-web-chat-world`);
   const messageServerId = stringToUuid(`${agentName}-web-server`) as UUID;
+  const roomMetadata = buildConversationRoomMetadata(conv, ownerId, {
+    waifuRole: caller.role,
+  });
   await runtime.ensureConnection({
     entityId: caller.entityId,
     roomId: conv.roomId,
@@ -821,7 +932,7 @@ async function ensureConversationRoom(
     channelId: `web-conv-${conv.id}`,
     type: ChannelType.DM,
     messageServerId,
-    metadata: { ownership: { ownerId }, waifuRole: caller.role },
+    metadata: roomMetadata,
   });
   await ensureWorldOwnershipAndRoles(
     runtime,
@@ -830,6 +941,7 @@ async function ensureConversationRoom(
     caller.entityId,
     caller.role,
   );
+  await syncConversationRoomState(state, conv);
 }
 
 async function syncConversationRoomState(
@@ -839,7 +951,16 @@ async function syncConversationRoomState(
   if (!state.runtime) return;
   const runtime = state.runtime;
   const room = await runtime.getRoom(conv.roomId);
-  if (!room) return;
+  if (!room) {
+    if (conv.cloudOwnerEntityId) {
+      throw new ElizaError("Managed conversation room was not created", {
+        code: "CLOUD_CONVERSATION_ROOM_MISSING",
+        context: { conversationId: conv.id, roomId: conv.roomId },
+        severity: "fatal",
+      });
+    }
+    return;
+  }
 
   const ownerId = ensureAdminEntityId(state);
   const nextMetadata = buildConversationRoomMetadata(
@@ -859,6 +980,16 @@ async function syncConversationRoomState(
     updateRoom?: (nextRoom: typeof room) => Promise<void>;
   };
   if (typeof adapter.updateRoom !== "function") {
+    if (conv.cloudOwnerEntityId) {
+      throw new ElizaError(
+        "Managed conversation ownership cannot be persisted",
+        {
+          code: "CLOUD_CONVERSATION_ROOM_UPDATE_UNSUPPORTED",
+          context: { conversationId: conv.id, roomId: conv.roomId },
+          severity: "fatal",
+        },
+      );
+    }
     return;
   }
 
@@ -1057,7 +1188,23 @@ async function getConversationWithRestore(
   const existing = state.conversations.get(convId);
   if (existing) return existing;
   await waitForConversationRestore(state);
-  return state.conversations.get(convId);
+  const restored = state.conversations.get(convId);
+  if (restored || !state.runtime || !isCloudPrincipalRequired()) {
+    return restored;
+  }
+  const restoredFromDb = await restoreConversationFromDbById(
+    state.runtime,
+    state,
+    convId,
+  );
+  if (restoredFromDb?.cloudOwnerEntityId) {
+    evictOldestConversationForCaller(
+      state.conversations,
+      500,
+      restoredFromDb.cloudOwnerEntityId,
+    );
+  }
+  return restoredFromDb;
 }
 
 /** Default recent-window size for GET /messages (the newest N turns). */
@@ -1554,18 +1701,23 @@ export async function handleConversationRoutes(
     if (!pathname.startsWith("/api/conversations")) return false;
   }
 
+  const cloudPrincipal = resolveTrustedCloudPrincipal(req);
+  if (isCloudPrincipalRequired() && !cloudPrincipal) {
+    error(res, "Cloud user principal is required", 401);
+    return true;
+  }
+
   // ── GET /api/conversations ──────────────────────────────────────────
   if (method === "GET" && pathname === "/api/conversations") {
     await waitForConversationRestore(state);
-    const waifuAccess = resolveWaifuChatAccess(req);
     const convos = Array.from(state.conversations.values())
       .filter((c) => !state.deletedConversationIds.has(c.id))
-      .filter((c) => canWaifuAccessConversation(waifuAccess, c))
+      .filter((c) => canConversationCallerAccess(req, cloudPrincipal, c))
       .sort(
         (a, b) =>
           new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
       );
-    json(res, { conversations: convos });
+    json(res, { conversations: convos.map(publicConversationMeta) });
     return true;
   }
 
@@ -1606,11 +1758,10 @@ export async function handleConversationRoutes(
       return true;
     }
     const runtime = state.runtime;
-    const waifuAccess = resolveWaifuChatAccess(req);
     const conversationsByRoomId = new Map<UUID, ConversationMeta>();
     for (const conv of state.conversations.values()) {
       if (state.deletedConversationIds.has(conv.id)) continue;
-      if (!canWaifuAccessConversation(waifuAccess, conv)) continue;
+      if (!canConversationCallerAccess(req, cloudPrincipal, conv)) continue;
       conversationsByRoomId.set(conv.roomId, conv);
     }
     // Scope the keyword search to the rooms the requester can actually see, in
@@ -1707,7 +1858,7 @@ export async function handleConversationRoutes(
     pathname === "/api/conversations/dev/seed-messages"
   ) {
     // 404 (not 403) in production so the route's existence isn't advertised.
-    if (process.env.NODE_ENV === "production") {
+    if (process.env.NODE_ENV === "production" || isCloudPrincipalRequired()) {
       error(res, "Not found", 404);
       return true;
     }
@@ -1756,7 +1907,7 @@ export async function handleConversationRoutes(
         updatedAt: new Date(conv.lastMessageAt).toISOString(),
       });
     }
-    evictOldestConversation(state.conversations, 500);
+    evictOldestConversationForCaller(state.conversations, 500, cloudPrincipal);
     logger.info(
       {
         conversations: summary.conversations.length,
@@ -1804,6 +1955,7 @@ export async function handleConversationRoutes(
       id,
       title: body.title?.trim() || "New Chat",
       roomId,
+      ...(cloudPrincipal ? { cloudOwnerEntityId: cloudPrincipal } : {}),
       ...(metadata ? { metadata } : {}),
       createdAt: now,
       updatedAt: now,
@@ -1819,16 +1971,15 @@ export async function handleConversationRoutes(
       | undefined;
 
     // Soft cap: evict the oldest conversation when the map exceeds 500
-    evictOldestConversation(state.conversations, 500);
+    evictOldestConversationForCaller(state.conversations, 500, cloudPrincipal);
 
     if (state.runtime) {
       try {
         await ensureConversationRoom(
           state,
           conv,
-          resolveConversationCaller(req, state),
+          resolveConversationCaller(req, state, cloudPrincipal),
         );
-        await syncConversationRoomState(state, conv);
         if (body.includeGreeting === true) {
           const storedGreeting = await ensureConversationGreetingStored(
             state,
@@ -1853,7 +2004,10 @@ export async function handleConversationRoutes(
         return true;
       }
     }
-    json(res, { conversation: conv, ...(greeting ? { greeting } : {}) });
+    json(res, {
+      conversation: publicConversationMeta(conv),
+      ...(greeting ? { greeting } : {}),
+    });
     return true;
   }
 
@@ -1868,7 +2022,9 @@ export async function handleConversationRoutes(
       error(res, "Conversation not found", 404);
       return true;
     }
-    if (rejectWaifuConversationAccessIfNeeded(req, conv, error, res)) {
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
     if (!state.runtime) {
@@ -2194,6 +2350,15 @@ export async function handleConversationRoutes(
     /^\/api\/conversations\/[^/]+\/import$/.test(pathname)
   ) {
     const convId = decodeURIComponent(pathname.split("/")[3]);
+    await waitForConversationRestore(state);
+    let conv = await getConversationWithRestore(state, convId);
+    if (
+      conv &&
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
+      return true;
+    }
+
     const rawImport = await readJsonBody<Record<string, unknown>>(req, res);
     if (rawImport === null) return true;
     const rawMessages = rawImport.messages;
@@ -2240,26 +2405,56 @@ export async function handleConversationRoutes(
       error(res, "Agent is not running", 503);
       return true;
     }
-    await waitForConversationRestore(state);
 
-    let conv = state.conversations.get(convId);
+    if (!conv && isCloudPrincipalRequired()) {
+      conv = await restoreConversationFromDbById(runtime, state, convId);
+      if (
+        conv &&
+        rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+      ) {
+        return true;
+      }
+    }
+
     if (!conv) {
       const now = new Date().toISOString();
+      const roomId = stringToUuid(`web-conv-${convId}`);
+      // A tombstone can hide a room whose earlier best-effort deletion failed.
+      // Never overlay that persisted data with a new caller-owned map entry.
+      if (isCloudPrincipalRequired() && (await runtime.getRoom(roomId))) {
+        error(res, "Conversation not found", 404);
+        return true;
+      }
       conv = {
         id: convId,
         title:
           typeof rawImport.title === "string" && rawImport.title.trim()
             ? rawImport.title.trim()
             : "New Chat",
-        roomId: stringToUuid(`web-conv-${convId}`),
+        roomId,
+        ...(cloudPrincipal ? { cloudOwnerEntityId: cloudPrincipal } : {}),
         createdAt: now,
         updatedAt: now,
       };
+      try {
+        unmarkConversationDeleted(state, convId);
+      } catch (err) {
+        error(
+          res,
+          `Failed to restore conversation: ${getErrorMessage(err)}`,
+          500,
+        );
+        return true;
+      }
       state.conversations.set(convId, conv);
-      evictOldestConversation(state.conversations, 500);
+      evictOldestConversationForCaller(
+        state.conversations,
+        500,
+        cloudPrincipal,
+      );
     }
 
-    const caller = resolveConversationCaller(req, state);
+    const caller = resolveConversationCaller(req, state, cloudPrincipal);
     try {
       await ensureConversationRoom(state, conv, caller);
     } catch (err) {
@@ -2324,7 +2519,7 @@ export async function handleConversationRoutes(
       }
     }
     conv.updatedAt = new Date().toISOString();
-    state.broadcastWs?.({ type: "conversation-updated", conversation: conv });
+    broadcastConversationUpdate(state, conv);
     json(res, {
       conversationId: convId,
       inserted,
@@ -2342,6 +2537,11 @@ export async function handleConversationRoutes(
     const conv = await getConversationWithRestore(state, convId);
     if (!conv) {
       error(res, "Conversation not found", 404);
+      return true;
+    }
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
     if (rejectWaifuNonAdminMutationIfNeeded(req, error, res)) return true;
@@ -2376,10 +2576,7 @@ export async function handleConversationRoutes(
         },
       );
       conv.updatedAt = new Date().toISOString();
-      state.broadcastWs?.({
-        type: "conversation-updated",
-        conversation: conv,
-      });
+      broadcastConversationUpdate(state, conv);
       json(res, { ok: true, deletedCount: result.deletedCount });
     } catch (err) {
       const status =
@@ -2409,7 +2606,9 @@ export async function handleConversationRoutes(
     }
     // Non-admin waifu callers may only mutate their own conversation; the
     // access-scoped 404 keeps a foreign conv id from leaking existence.
-    if (rejectWaifuConversationAccessIfNeeded(req, conv, error, res)) {
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
     if (rejectWaifuNonAdminMutationIfNeeded(req, error, res)) return true;
@@ -2423,10 +2622,7 @@ export async function handleConversationRoutes(
     try {
       const result = await deleteConversationMessage(runtime, conv, messageId);
       conv.updatedAt = new Date().toISOString();
-      state.broadcastWs?.({
-        type: "conversation-updated",
-        conversation: conv,
-      });
+      broadcastConversationUpdate(state, conv);
       json(res, { ok: true, deletedCount: result.deletedCount });
     } catch (err) {
       const status =
@@ -2449,7 +2645,9 @@ export async function handleConversationRoutes(
       error(res, "Conversation not found", 404);
       return true;
     }
-    if (rejectWaifuConversationAccessIfNeeded(req, conv, error, res)) {
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
 
@@ -2573,7 +2771,7 @@ export async function handleConversationRoutes(
       return failStream("Agent is not running");
     }
 
-    const caller = resolveConversationCaller(req, state);
+    const caller = resolveConversationCaller(req, state, cloudPrincipal);
     const userId = caller.entityId;
     const turnStartedAt = Date.now();
 
@@ -2593,7 +2791,7 @@ export async function handleConversationRoutes(
       roomId: conv.roomId,
       channelType,
       messageSource: source,
-      metadata: chatMetadata,
+      metadata: withTrustedCloudPrincipalMetadata(chatMetadata, cloudPrincipal),
     });
 
     try {
@@ -2951,7 +3149,9 @@ export async function handleConversationRoutes(
       error(res, "Conversation not found", 404);
       return true;
     }
-    if (rejectWaifuConversationAccessIfNeeded(req, conv, error, res)) {
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
     const chatPayload = await readChatRequestPayload(req, res, {
@@ -3011,7 +3211,7 @@ export async function handleConversationRoutes(
       error(res, "Agent is not running", 503);
       return true;
     }
-    const caller = resolveConversationCaller(req, state);
+    const caller = resolveConversationCaller(req, state, cloudPrincipal);
     const userId = caller.entityId;
     const turnStartedAt = Date.now();
 
@@ -3034,7 +3234,7 @@ export async function handleConversationRoutes(
       roomId: conv.roomId,
       channelType,
       messageSource: source,
-      metadata: restMetadata,
+      metadata: withTrustedCloudPrincipalMetadata(restMetadata, cloudPrincipal),
     });
 
     try {
@@ -3182,7 +3382,9 @@ export async function handleConversationRoutes(
       error(res, "Conversation not found", 404);
       return true;
     }
-    if (rejectWaifuConversationAccessIfNeeded(req, conv, error, res)) {
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
 
@@ -3198,7 +3400,7 @@ export async function handleConversationRoutes(
       await ensureConversationRoom(
         state,
         conv,
-        resolveConversationCaller(req, state),
+        resolveConversationCaller(req, state, cloudPrincipal),
       );
     } catch (err) {
       error(
@@ -3237,6 +3439,11 @@ export async function handleConversationRoutes(
     const conv = await getConversationWithRestore(state, convId);
     if (!conv) {
       error(res, "Conversation not found", 404);
+      return true;
+    }
+    if (
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
       return true;
     }
     if (rejectWaifuNonAdminMutationIfNeeded(req, error, res)) return true;
@@ -3327,7 +3534,7 @@ export async function handleConversationRoutes(
       conv.updatedAt = new Date().toISOString();
       await syncConversationRoomState(state, conv);
     }
-    json(res, { conversation: conv });
+    json(res, { conversation: publicConversationMeta(conv) });
     return true;
   }
 
@@ -3358,6 +3565,7 @@ export async function handleConversationRoutes(
     for (const conv of Array.from(state.conversations.values())) {
       if (keepId && conv.id === keepId) continue;
       if (state.deletedConversationIds.has(conv.id)) continue;
+      if (!canConversationCallerAccess(req, cloudPrincipal, conv)) continue;
       const memories = await runtime.getMemories({
         roomId: conv.roomId,
         tableName: "messages",
@@ -3392,6 +3600,20 @@ export async function handleConversationRoutes(
     if (rejectWaifuNonAdminMutationIfNeeded(req, error, res)) return true;
     const convId = decodeURIComponent(pathname.split("/")[3]);
     const conv = await getConversationWithRestore(state, convId);
+    if (!conv && isCloudPrincipalRequired()) {
+      error(res, "Conversation not found", 404);
+      return true;
+    }
+    if (
+      conv &&
+      rejectConversationAccessIfNeeded(req, cloudPrincipal, conv, error, res)
+    ) {
+      return true;
+    }
+    if (conv?.roomId && !state.runtime && isCloudPrincipalRequired()) {
+      error(res, "Agent is not running", 503);
+      return true;
+    }
     if (conv?.roomId && state.runtime) {
       try {
         const memories = await state.runtime.getMemories({
@@ -3408,17 +3630,14 @@ export async function handleConversationRoutes(
         if (memoryIds.length > 0) {
           await deleteConversationMemories(state.runtime, memoryIds);
         }
-      } catch (err) {
-        logger.debug(
-          `[conversations] Failed to delete messages for ${convId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      try {
         await deleteConversationRoomData(state.runtime, conv.roomId);
       } catch (err) {
-        logger.debug(
-          `[conversations] Failed to delete room data for ${convId}: ${err instanceof Error ? err.message : String(err)}`,
+        error(
+          res,
+          `Failed to delete conversation: ${getErrorMessage(err)}`,
+          500,
         );
+        return true;
       }
     }
     state.conversations.delete(convId);

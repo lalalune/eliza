@@ -5,11 +5,16 @@
  * a non-empty-string guard, validates the waifu-chat owner wallet as a 0x
  * address, and drops everything else — so a client cannot smuggle an unknown
  * scope or a non-string id into the conversation system. The remaining helpers
- * fold sanitized metadata into a room's `webConversation` record, read it back
- * out (optionally pinned to a conversation id), and classify a scope as
- * automation- or page-scoped.
+ * fold sanitized metadata and the server-attested Cloud owner into a room's
+ * `webConversation` record, read them back out (optionally pinned to a
+ * conversation id), and classify a scope as automation- or page-scoped.
  */
-import type { JsonValue, Room } from "@elizaos/core";
+import {
+  type JsonValue,
+  type Room,
+  type UUID,
+  validateUuid,
+} from "@elizaos/core";
 import { asNonEmptyString, asRecord } from "@elizaos/shared";
 import type {
   ConversationMeta,
@@ -21,6 +26,7 @@ type RoomMetadataRecord = Record<string, JsonValue>;
 
 interface StoredConversationMetadata extends ConversationMetadata {
   conversationId: string;
+  cloudOwnerEntityId?: string;
 }
 
 const VALID_SCOPES = new Set<ConversationScope>([
@@ -120,21 +126,26 @@ export function sanitizeConversationMetadata(
 }
 
 export function buildConversationRoomMetadata(
-  conversation: Pick<ConversationMeta, "id" | "metadata">,
+  conversation: Pick<
+    ConversationMeta,
+    "id" | "metadata" | "cloudOwnerEntityId"
+  >,
   ownerId: string,
   existingMetadata?: unknown,
 ): RoomMetadataRecord {
   const base = (asRecord(existingMetadata) ?? {}) as RoomMetadataRecord;
   const sanitized = sanitizeConversationMetadata(conversation.metadata);
+  const cloudOwnerEntityId = validateUuid(conversation.cloudOwnerEntityId);
   const next: RoomMetadataRecord = {
     ...base,
     ownership: { ownerId },
   };
 
-  if (sanitized) {
+  if (sanitized || cloudOwnerEntityId) {
     next.webConversation = {
       conversationId: conversation.id,
-      ...sanitized,
+      ...(sanitized ?? {}),
+      ...(cloudOwnerEntityId ? { cloudOwnerEntityId } : {}),
     } satisfies StoredConversationMetadata;
   } else {
     delete next.webConversation;
@@ -164,6 +175,27 @@ export function extractConversationMetadataFromRoom(
     return undefined;
   }
   return sanitizeConversationMetadata(stored);
+}
+
+/**
+ * Restores the server-owned Cloud principal without passing it through the
+ * caller-writable conversation metadata schema.
+ */
+export function extractConversationCloudOwnerEntityIdFromRoom(
+  room: Pick<Room, "metadata"> | null | undefined,
+  expectedConversationId?: string,
+): UUID | undefined {
+  const roomMetadata = asRecord(room?.metadata);
+  const stored = asRecord(roomMetadata?.webConversation);
+  if (!stored) return undefined;
+  const storedConversationId = normalizeOptionalString(stored.conversationId);
+  if (
+    expectedConversationId &&
+    storedConversationId !== expectedConversationId
+  ) {
+    return undefined;
+  }
+  return validateUuid(stored.cloudOwnerEntityId) ?? undefined;
 }
 
 export function isAutomationConversationMetadata(

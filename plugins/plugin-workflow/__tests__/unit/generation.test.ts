@@ -1,5 +1,6 @@
 /** Unit tests for the RAG generation helpers (keyword extraction, intent, field/parameter correction) with a mocked model. */
 import { describe, expect, mock, test } from 'bun:test';
+import { ModelType } from '@elizaos/core';
 import type {
   NodeDefinition,
   OutputRefValidation,
@@ -77,6 +78,84 @@ describe('extractKeywords', () => {
     const result = await extractKeywords(runtime, 'Create a manual workflow with a Set node');
 
     expect(result).toEqual(['manual trigger', 'set node', 'json']);
+  });
+
+  test('uses the large model tier registered by subscription CLI backends', async () => {
+    for (const backend of ['codex', 'codex-sdk', 'claude', 'claude-sdk']) {
+      const useModel = mock(() => Promise.resolve({ keywords: ['manual trigger'] }));
+      const runtime = createModelRuntime({
+        settings: { ELIZA_CHAT_VIA_CLI: backend },
+        useModel,
+      });
+
+      await extractKeywords(runtime, `Create a manual workflow through ${backend}`);
+
+      expect(useModel.mock.calls[0]?.[0]).toBe(ModelType.TEXT_LARGE);
+    }
+  });
+
+  test('keeps non-CLI structured extraction on the small model tier', async () => {
+    const useModel = mock(() => Promise.resolve({ keywords: ['manual trigger'] }));
+    const runtime = createModelRuntime({ useModel });
+
+    await extractKeywords(runtime, 'Create a manual workflow');
+
+    expect(useModel.mock.calls[0]?.[0]).toBe(ModelType.TEXT_SMALL);
+  });
+
+  test('keeps subscription CLI routing authoritative over ambient Cerebras credentials', async () => {
+    for (const backend of ['codex', 'codex-sdk', 'claude', 'claude-sdk']) {
+      const useModel = mock(() => Promise.resolve({ keywords: ['manual trigger'] }));
+      const runtime = createModelRuntime({
+        settings: {
+          ELIZA_CHAT_VIA_CLI: backend,
+          CEREBRAS_API_KEY: 'ambient-cerebras-key',
+        },
+        useModel,
+      });
+
+      await extractKeywords(runtime, `Create a workflow through ${backend}`);
+
+      const call = useModel.mock.calls[0];
+      expect(call?.[0]).toBe(ModelType.TEXT_LARGE);
+      const params = call?.[1] as
+        | { model?: string; providerOptions?: { workflow?: unknown } }
+        | undefined;
+      expect(params?.model).toBeUndefined();
+      expect(params?.providerOptions?.workflow).toBeUndefined();
+    }
+  });
+
+  test('still honors an explicit workflow provider override in subscription mode', async () => {
+    const useModel = mock(() => Promise.resolve({ keywords: ['gmail'] }));
+    const runtime = createModelRuntime({
+      settings: {
+        ELIZA_CHAT_VIA_CLI: 'codex-sdk',
+        CEREBRAS_API_KEY: 'ambient-cerebras-key',
+        WORKFLOW_MODEL_PROVIDER: 'cerebras',
+      },
+      useModel,
+    });
+
+    await extractKeywords(runtime, 'Summarize Gmail');
+
+    assertCerebrasWorkflowCall(useModel.mock.calls[0], 'extractKeywords');
+  });
+
+  test('fails fast on invalid structured subscription output', async () => {
+    const useModel = mock(() => Promise.resolve('not valid JSON'));
+    const runtime = createModelRuntime({
+      settings: {
+        ELIZA_CHAT_VIA_CLI: 'claude-sdk',
+        CEREBRAS_API_KEY: 'ambient-cerebras-key',
+      },
+      useModel,
+    });
+
+    await expect(extractKeywords(runtime, 'Create a workflow')).rejects.toThrow(
+      'Keyword extraction failed: Structured workflow model returned invalid JSON'
+    );
+    expect(useModel.mock.calls[0]?.[0]).toBe(ModelType.TEXT_LARGE);
   });
 
   test('trims and filters empty keywords', async () => {
@@ -602,6 +681,58 @@ describe('workflow generation model routing', () => {
 
     assertCerebrasWorkflowCall(useModel.mock.calls[0], 'correctFieldReferences');
     assertCerebrasWorkflowCall(useModel.mock.calls[1], 'correctParameterNames');
+  });
+
+  test('keeps text repair and formatting helpers on the subscription-backed large tier', async () => {
+    const useModel = mock((_modelType, params: { prompt?: string }) => {
+      if (params.prompt?.includes('Fix the workflows field reference')) {
+        return Promise.resolve('={{ $json.Subject }}');
+      }
+      if (params.prompt?.includes('Type: SUCCESS')) {
+        return Promise.resolve('Workflow saved.');
+      }
+      return Promise.resolve(
+        JSON.stringify({ responses: { values: [{ content: 'subscription' }] } })
+      );
+    });
+    const runtime = createModelRuntime({
+      settings: { ELIZA_CHAT_VIA_CLI: 'codex-sdk' },
+      useModel,
+    });
+
+    await correctFieldReferences(runtime, workflow, [
+      {
+        nodeName: 'Set',
+        expression: '={{ $json.subject }}',
+        field: 'subject',
+        sourceNodeName: 'Gmail',
+        sourceNodeType: 'workflows-nodes-base.gmail',
+        resource: 'message',
+        operation: 'getAll',
+        availableFields: ['Subject'],
+      },
+    ]);
+    await correctParameterNames(runtime, workflow, [
+      {
+        nodeName: 'Set',
+        nodeType: 'workflows-nodes-base.set',
+        currentParams: { prompt: 'subscription' },
+        unknownKeys: ['prompt'],
+        propertyDefs: [{ name: 'responses', type: 'fixedCollection' }],
+      },
+    ]);
+    await formatActionResponse(runtime, 'SUCCESS', { workflowId: 'wf-subscription' });
+
+    expect(useModel.mock.calls).toHaveLength(3);
+    for (const call of useModel.mock.calls) {
+      expect(call[0]).toBe(ModelType.TEXT_LARGE);
+      const params = call[1] as {
+        model?: string;
+        providerOptions?: { workflow?: unknown };
+      };
+      expect(params.model).toBeUndefined();
+      expect(params.providerOptions?.workflow).toBeUndefined();
+    }
   });
 });
 

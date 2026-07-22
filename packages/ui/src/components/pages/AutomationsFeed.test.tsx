@@ -23,11 +23,13 @@ import type {
 import { ApiError } from "../../api/client-types-core";
 import { getCached, invalidate, setCached } from "../../hooks/resource-cache";
 import { AutomationsFeed, automationListCacheKey } from "./AutomationsFeed";
+import { dispatchWorkflowActionHandoff } from "./workflow-action-handoff";
 
 const DEFAULT_AGENT_BASE =
   "https://api.elizacloud.ai/api/v1/eliza/agents/de42b5ff-72d3-4a1a-8a16-19aee293bfea";
 const SECOND_AGENT_BASE =
   "https://api.elizacloud.ai/api/v1/eliza/agents/9b0deccb-a884-4149-b91d-328004ac108d";
+const DEDICATED_AGENT_BASE = "https://agent-lazy-1.elizacloud.ai";
 
 const clientMock = vi.hoisted(() => ({
   baseUrl:
@@ -49,9 +51,32 @@ vi.mock("../../utils/openExternalUrl", () => ({
 }));
 
 vi.mock("./WorkflowEditor", () => ({
-  WorkflowEditor: ({ initial }: { initial?: WorkflowDefinition | null }) => (
-    <div data-testid="workflow-editor-stub">
+  WorkflowEditor: ({
+    initial,
+    cloudAgentId,
+    onEnableAlwaysOn,
+    onCancel,
+  }: {
+    initial?: WorkflowDefinition | null;
+    cloudAgentId?: string | null;
+    onEnableAlwaysOn?: (agentId: string) => void;
+    onCancel?: () => void;
+  }) => (
+    <div
+      data-testid="workflow-editor-stub"
+      data-cloud-agent-id={cloudAgentId ?? ""}
+    >
       {initial?.name ?? "New workflow"}
+      {cloudAgentId && onEnableAlwaysOn && (
+        <button type="button" onClick={() => onEnableAlwaysOn(cloudAgentId)}>
+          Enable always-on
+        </button>
+      )}
+      {onCancel && (
+        <button type="button" onClick={onCancel}>
+          Close workflow editor
+        </button>
+      )}
     </div>
   ),
 }));
@@ -161,6 +186,7 @@ afterEach(() => {
   cleanup();
   invalidate(automationListCacheKey(DEFAULT_AGENT_BASE));
   invalidate(automationListCacheKey(SECOND_AGENT_BASE));
+  invalidate(automationListCacheKey(DEDICATED_AGENT_BASE));
   vi.clearAllMocks();
 });
 
@@ -214,6 +240,149 @@ describe("AutomationsFeed", () => {
 
     await screen.findByText("Nightly review");
     expect(screen.queryByRole("button", { name: "New" })).toBeNull();
+  });
+
+  it("closes an open workflow editor after a successful list handoff", async () => {
+    window.location.hash = "#automations/workflow-1";
+    render(<AutomationsFeed />);
+
+    expect(await screen.findByTestId("workflow-editor-stub")).toBeTruthy();
+
+    act(() => {
+      dispatchWorkflowActionHandoff(
+        [
+          {
+            actionName: "WORKFLOW",
+            success: true,
+            values: { count: 3 },
+          },
+        ],
+        { dispatchNavigate: vi.fn() },
+      );
+    });
+
+    expect(screen.queryByTestId("workflow-editor-stub")).toBeNull();
+    expect(await screen.findByTestId("automations-layout")).toBeTruthy();
+    expect(window.location.hash).toBe("#automations");
+    await waitFor(() => {
+      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("refreshes the feed behind an id-bearing chat workflow handoff", async () => {
+    const refreshed = responseFixture();
+    refreshed.automations = [
+      ...refreshed.automations,
+      automationItem({
+        id: "automation-chat-created",
+        workflowId: "workflow-chat-created",
+        title: "Chat-created workflow",
+        enabled: false,
+        status: "paused",
+        lastExecution: undefined,
+      }),
+    ];
+    clientMock.listAutomations
+      .mockResolvedValueOnce(responseFixture())
+      .mockResolvedValue(refreshed);
+    clientMock.getWorkflowDefinition.mockResolvedValue(
+      workflowDefinition({
+        id: "workflow-chat-created",
+        name: "Chat-created workflow",
+        active: false,
+      }),
+    );
+    render(<AutomationsFeed />);
+    await screen.findByText("Nightly review");
+
+    act(() => {
+      dispatchWorkflowActionHandoff(
+        [
+          {
+            actionName: "WORKFLOW",
+            success: true,
+            values: { workflowId: "workflow-chat-created" },
+          },
+        ],
+        { dispatchNavigate: vi.fn() },
+      );
+    });
+
+    expect(
+      (await screen.findByTestId("workflow-editor-stub")).textContent,
+    ).toContain("Chat-created workflow");
+    await waitFor(() => {
+      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      getCached<AutomationListResponse>(
+        automationListCacheKey(DEFAULT_AGENT_BASE),
+      )?.data.automations.some(
+        (automation) => automation.workflowId === "workflow-chat-created",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close workflow editor" }),
+    );
+    expect(await screen.findByText("Chat-created workflow")).toBeTruthy();
+  });
+
+  it("preserves the dedicated upgrade path when a workflow deep-link is gated", async () => {
+    window.location.hash = "#automations/workflow-1";
+    clientMock.getWorkflowDefinition.mockRejectedValue(
+      new ApiError({
+        kind: "http",
+        path: "/api/workflow/workflows/workflow-1",
+        status: 409,
+        code: "workflow_requires_dedicated",
+        message:
+          "Workflows require a dedicated agent runtime. Upgrade this agent before managing workflows.",
+      }),
+    );
+
+    render(<AutomationsFeed />);
+
+    expect(await screen.findByText("Dedicated agent required")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Upgrade to Dedicated" }),
+    );
+    expect(openExternalUrlMock).toHaveBeenCalledWith(
+      "https://elizacloud.ai/dashboard/agents/de42b5ff-72d3-4a1a-8a16-19aee293bfea",
+    );
+  });
+
+  it("passes a dedicated subdomain agent id to the workflow subscription control", async () => {
+    window.location.hash = "#automations/workflow-1";
+    clientMock.baseUrl = DEDICATED_AGENT_BASE;
+
+    render(<AutomationsFeed />);
+
+    const editor = await screen.findByTestId("workflow-editor-stub");
+    expect(editor.getAttribute("data-cloud-agent-id")).toBe("agent-lazy-1");
+    fireEvent.click(screen.getByRole("button", { name: "Enable always-on" }));
+    expect(openExternalUrlMock).toHaveBeenCalledWith(
+      "https://elizacloud.ai/dashboard/agents/agent-lazy-1",
+    );
+  });
+
+  it("retries a transient workflow deep-link load without leaving the editor", async () => {
+    window.location.hash = "#automations/workflow-1";
+    clientMock.getWorkflowDefinition
+      .mockRejectedValueOnce(
+        new Error("Workflow store temporarily unavailable"),
+      )
+      .mockResolvedValueOnce(workflowDefinition());
+
+    render(<AutomationsFeed />);
+
+    expect(await screen.findByText("Workflow couldn't be loaded")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByTestId("workflow-editor-stub")).toBeTruthy();
+    expect(clientMock.getWorkflowDefinition).toHaveBeenCalledTimes(2);
   });
 
   it("never paints one Cloud agent's cached workflows after switching agents", async () => {

@@ -1,14 +1,12 @@
 /**
- * Cross-component event bus for "show me this workflow" deep-links.
+ * Cross-component event bus for Automations selection handoffs.
  *
- * Dispatched from chat surfaces (e.g. when the agent replies about a
- * workflow it just created or modified) and consumed by AutomationsFeed,
- * which scrolls the matching row into view and opens its editor.
- *
- * Restored from the deleted AutomationsView.tsx — keep this file thin.
+ * Chat surfaces can select a workflow or clear the current editor back to the
+ * list. AutomationsFeed consumes both commands without requiring a remount.
  */
 
 export const VISUALIZE_WORKFLOW_EVENT = "eliza:automations:visualize-workflow";
+export const SHOW_AUTOMATIONS_LIST_EVENT = "eliza:automations:show-list";
 
 export interface VisualizeWorkflowEventDetail {
   workflowId: string;
@@ -21,4 +19,9 @@ export function dispatchVisualizeWorkflow(workflowId: string): void {
       detail: { workflowId },
     }),
   );
+}
+
+export function dispatchShowAutomationsList(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(SHOW_AUTOMATIONS_LIST_EVENT));
 }

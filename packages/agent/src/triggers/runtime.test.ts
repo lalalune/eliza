@@ -278,8 +278,56 @@ describe("executeTriggerTask", () => {
     const nextRunAtMs = persisted?.nextRunAtMs;
     expect(persistedMetadata?.scheduleNodeId).toBe("schedule-node-a");
     expect(persistedMetadata?.idempotencyKey).toBe(
-      `wf-1:schedule-node-a:${Math.floor((nextRunAtMs ?? 0) / 60_000)}`,
+      `wf-1:schedule-node-a:${nextRunAtMs}`,
     );
+  });
+
+  it("uses a distinct idempotency key for each sub-minute scheduled occurrence", async () => {
+    vi.useFakeTimers();
+    try {
+      const minuteStart = new Date("2026-07-21T12:00:00.000Z").getTime();
+      vi.setSystemTime(minuteStart);
+      const firstOccurrence = minuteStart + 5_000;
+      const task = makeTriggerTask(
+        { triggerType: "interval", intervalMs: 5_000 },
+        { scheduleNodeId: "schedule-node-a" },
+      );
+      const metadata = task.metadata as Record<string, unknown>;
+      metadata.updateInterval = 5_000;
+      metadata.baseInterval = 5_000;
+      metadata.idempotencyKey = `wf-1:schedule-node-a:${firstOccurrence}`;
+      const trigger = metadata.trigger as Record<string, unknown>;
+      trigger.intervalMs = 5_000;
+      trigger.nextRunAtMs = firstOccurrence;
+
+      vi.setSystemTime(firstOccurrence);
+      await executeTriggerTask(handle.runtime, task, { source: "scheduler" });
+
+      const firstPatch = handle.updatedTasks[0]?.patch.metadata as
+        | Record<string, unknown>
+        | undefined;
+      const rearmedTask = { ...task, metadata: firstPatch } as Task;
+      const nextTrigger = readTriggerConfig(rearmedTask);
+      const secondOccurrence = nextTrigger?.nextRunAtMs;
+      const secondKey = firstPatch?.idempotencyKey;
+      expect(secondOccurrence).toBe(firstOccurrence + 5_000);
+      expect(secondKey).toBe(`wf-1:schedule-node-a:${secondOccurrence}`);
+      expect(secondKey).not.toBe(metadata.idempotencyKey);
+
+      vi.setSystemTime(secondOccurrence ?? firstOccurrence + 5_000);
+      await executeTriggerTask(handle.runtime, rearmedTask, {
+        source: "scheduler",
+      });
+
+      expect(
+        handle.dispatchCalls.map((call) => call.options?.idempotencyKey),
+      ).toEqual([
+        `wf-1:schedule-node-a:${firstOccurrence}`,
+        `wf-1:schedule-node-a:${secondOccurrence}`,
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("records an accepted duplicate delivery as skipped without a second completion notice", async () => {

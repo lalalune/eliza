@@ -2,13 +2,11 @@
  * ElizaAgentActions — start/stop/deactivate/reactivate/snapshot/upgrade/delete
  * controls on the agent detail page.
  *
- * **Upgrade to Dedicated** (shared-tier agents only, #15355) drives the whole
- * shared→dedicated tier upgrade from this page: a confirm dialog spells out the
- * continuous hosting burn and the server-enforced credit runway, then
- * `POST /upgrade-tier` mints + provisions the dedicated migration target
- * (identity copied server-side) and the handoff module moves the conversation
- * and — only on a confirmed switch — removes the shared bridge before this
- * page navigates to the new agent.
+ * Tier changes share `POST /upgrade-tier` but have intentionally distinct UI
+ * contracts. Shared agents mint a dedicated migration target and hand off the
+ * conversation. Scale-to-zero dedicated agents become always-on in place only
+ * after explicit continuous-billing confirmation, then restart or wake through
+ * the normal durable-job poller so their identity and chat URL never change.
  *
  * **Deactivate** is the user-facing name for the `sleep` lifecycle action
  * (`POST /sleep`): a deep cold suspend that saves a durable encrypted backup,
@@ -83,6 +81,7 @@ export function ElizaAgentActions({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showDeactivateConfirm, setShowDeactivateConfirm] = useState(false);
   const [showUpgradeConfirm, setShowUpgradeConfirm] = useState(false);
+  const [showAlwaysOnConfirm, setShowAlwaysOnConfirm] = useState(false);
   // Set for the whole shared→dedicated upgrade span (provision + transcript
   // move); the id is the dedicated migration target this page navigates to on
   // a confirmed switch.
@@ -114,6 +113,15 @@ export function ElizaAgentActions({
         toast.success(
           t("cloud.containers.agentActions.reactivated", {
             defaultValue: "Agent reactivated",
+          }),
+        );
+        return;
+      }
+      if (action === "enable-always-on") {
+        toast.success(
+          t("cloud.containers.agentActions.alwaysOnEnabled", {
+            defaultValue:
+              "Always-on enabled — scheduled workflows can now run continuously",
           }),
         );
         return;
@@ -161,6 +169,11 @@ export function ElizaAgentActions({
   // Tier upgrade is a shared-agent-only promotion (#15355); a dedicated agent
   // already runs on its own container.
   const canUpgrade = isRunning && !isDedicated && !upgradeTargetId;
+  const canEnableAlwaysOn =
+    executionTier === "dedicated-lazy" &&
+    ["running", "stopped", "sleeping", "disconnected"].includes(
+      effectiveStatus,
+    );
   const upgradeJob = upgradePoller.getStatus(agentId);
   const isStopped = ["stopped", "error", "pending", "disconnected"].includes(
     effectiveStatus,
@@ -420,6 +433,83 @@ export function ElizaAgentActions({
     }
   }
 
+  /**
+   * Promote a scale-to-zero dedicated agent in place. The explicit body is the
+   * server's billing-consent boundary; successful responses must describe the
+   * same agent and the always-on tier before this page attaches to the job.
+   */
+  async function doEnableAlwaysOn() {
+    setLoading("enable-always-on");
+    try {
+      const { status: httpStatus, data } = await apiWithStatus<{
+        transition?: string;
+        completed?: boolean;
+        data?: {
+          agentId?: string;
+          executionTier?: AgentExecutionTier;
+          jobId?: string;
+          status?: string;
+        };
+        error?: string;
+      }>(`/api/v1/eliza/agents/${agentId}/upgrade-tier`, {
+        method: "POST",
+        json: { confirmContinuousBilling: true },
+      });
+
+      if (httpStatus === 402) {
+        toast.error(
+          data?.error ??
+            t("cloud.containers.agentActions.alwaysOnInsufficientCredits", {
+              defaultValue:
+                "Not enough credits to enable always-on hosting. Add funds and try again.",
+            }),
+        );
+        return;
+      }
+      if (httpStatus < 200 || httpStatus >= 300) {
+        throw new Error(data?.error ?? `HTTP ${httpStatus}`);
+      }
+      if (
+        data?.transition !== "in_place" ||
+        data.data?.agentId !== agentId ||
+        data.data.executionTier !== "dedicated-always"
+      ) {
+        throw new Error("Always-on transition returned an invalid agent state");
+      }
+
+      if (data.completed || data.data.status === "completed") {
+        toast.success(
+          t("cloud.containers.agentActions.alwaysOnAlreadyEnabled", {
+            defaultValue: "Always-on hosting is already enabled",
+          }),
+        );
+        window.location.reload();
+        return;
+      }
+
+      const jobId = data.data.jobId;
+      if (!jobId) {
+        throw new Error("Always-on transition did not return a job id");
+      }
+      jobActionById.current.set(jobId, "enable-always-on");
+      poller.track(agentId, jobId);
+      toast.success(
+        t("cloud.containers.agentActions.alwaysOnQueued", {
+          defaultValue:
+            "Always-on transition queued — this agent will restart or wake in place",
+        }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(
+        `${t("cloud.containers.agentActions.alwaysOnFailed", { defaultValue: "Could not enable always-on" })}: ${msg}`,
+      );
+    } finally {
+      setLoading(null);
+      setShowAlwaysOnConfirm(false);
+    }
+  }
+
   return (
     <BrandCard className="relative" cornerSize="md">
       <div className="relative z-10 space-y-4">
@@ -487,6 +577,29 @@ export function ElizaAgentActions({
                 )}
                 {t("cloud.containers.agentActions.upgrade", {
                   defaultValue: "Upgrade to Dedicated",
+                })}
+              </BrandButton>
+            )}
+
+            {canEnableAlwaysOn && (
+              <BrandButton
+                variant="primary"
+                size="sm"
+                onClick={() => setShowAlwaysOnConfirm(true)}
+                disabled={!!loading || isBusy}
+                data-testid="agent-enable-always-on-button"
+                title={t("cloud.containers.agentActions.alwaysOnHint", {
+                  defaultValue:
+                    "Keep this agent running continuously so scheduled workflows can fire on time.",
+                })}
+              >
+                {loading === "enable-always-on" ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Sun className="h-4 w-4" />
+                )}
+                {t("cloud.containers.agentActions.enableAlwaysOn", {
+                  defaultValue: "Enable Always-On",
                 })}
               </BrandButton>
             )}
@@ -676,28 +789,36 @@ export function ElizaAgentActions({
               style={{ fontFamily: "var(--font-roboto-mono)" }}
             >
               <Loader2 className="h-4 w-4 animate-spin" />
-              {trackedAction === "delete"
-                ? t("cloud.containers.agentActions.deleteHint", {
+              {trackedAction === "enable-always-on"
+                ? t("cloud.containers.agentActions.alwaysOnProgressHint", {
                     defaultValue:
-                      "Agent delete is running. This page will return to Instances when the job finishes.",
+                      "Enabling always-on — restarting or waking this agent in place. Scheduled workflows become available when the job completes.",
                   })
-                : trackedAction === "sleep"
-                  ? t("cloud.containers.agentActions.deactivateProgressHint", {
+                : trackedAction === "delete"
+                  ? t("cloud.containers.agentActions.deleteHint", {
                       defaultValue:
-                        "Deactivating — saving an encrypted backup and releasing compute. This page will refresh when the job finishes.",
+                        "Agent delete is running. This page will return to Instances when the job finishes.",
                     })
-                  : trackedAction === "wake"
+                  : trackedAction === "sleep"
                     ? t(
-                        "cloud.containers.agentActions.reactivateProgressHint",
+                        "cloud.containers.agentActions.deactivateProgressHint",
                         {
                           defaultValue:
-                            "Reactivating — restoring your agent from its backup. This can take a few minutes; the page will refresh when it finishes.",
+                            "Deactivating — saving an encrypted backup and releasing compute. This page will refresh when the job finishes.",
                         },
                       )
-                    : t("cloud.containers.agentActions.provisioningHint", {
-                        defaultValue:
-                          "Agent job is running. This page will refresh when the job finishes.",
-                      })}
+                    : trackedAction === "wake"
+                      ? t(
+                          "cloud.containers.agentActions.reactivateProgressHint",
+                          {
+                            defaultValue:
+                              "Reactivating — restoring your agent from its backup. This can take a few minutes; the page will refresh when it finishes.",
+                          },
+                        )
+                      : t("cloud.containers.agentActions.provisioningHint", {
+                          defaultValue:
+                            "Agent job is running. This page will refresh when the job finishes.",
+                        })}
             </p>
             {trackedJob && (
               <p
@@ -713,6 +834,67 @@ export function ElizaAgentActions({
           </div>
         )}
       </div>
+
+      <AlertDialog
+        open={showAlwaysOnConfirm}
+        onOpenChange={setShowAlwaysOnConfirm}
+      >
+        <AlertDialogContent className="bg-card border-border">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-txt-strong">
+              {t("cloud.containers.agentActions.alwaysOnTitle", {
+                defaultValue: "Enable continuous always-on hosting?",
+              })}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-muted">
+              <span className="block">
+                {t("cloud.containers.agentActions.alwaysOnBody1", {
+                  defaultValue:
+                    "This agent stays running instead of scaling to zero, so scheduled workflows can fire without a chat request waking it first. Hosting consumes credits continuously — {{daily}}/day ({{rate}}).",
+                  daily: formatUSD(AGENT_PRICING.DAILY_RUNNING_COST),
+                  rate: formatHourlyRate(AGENT_PRICING.RUNNING_HOURLY_RATE),
+                })}
+              </span>
+              <span className="block mt-2">
+                {t("cloud.containers.agentActions.alwaysOnBody2", {
+                  defaultValue:
+                    "Your agent, chat history, and Web UI address stay the same. A running agent restarts in place; a stopped or deactivated agent wakes in place.",
+                })}
+              </span>
+              <span className="block mt-2">
+                {t("cloud.containers.agentActions.alwaysOnBody3", {
+                  defaultValue:
+                    "A balance of at least {{minimum}} ({{days}} days of hosting) is required. You can deactivate or delete the agent later to stop continuous hourly billing.",
+                  minimum: formatUSD(AGENT_PRICING.UPGRADE_MINIMUM_BALANCE),
+                  days: String(AGENT_PRICING.UPGRADE_MIN_HOSTING_DAYS),
+                })}
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-border bg-transparent text-txt hover:bg-surface">
+              {t("cloud.containers.agentActions.cancel", {
+                defaultValue: "Cancel",
+              })}
+            </AlertDialogCancel>
+            <Button
+              type="button"
+              disabled={!!loading || isBusy}
+              onClick={() => void doEnableAlwaysOn()}
+              data-testid="agent-enable-always-on-confirm"
+            >
+              {loading === "enable-always-on" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Sun className="h-4 w-4" />
+              )}
+              {t("cloud.containers.agentActions.alwaysOnConfirm", {
+                defaultValue: "Confirm continuous billing",
+              })}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Upgrade confirm — the billing consequence (continuous hosting burn +
           the server-enforced runway minimum) is shown BEFORE anything changes.

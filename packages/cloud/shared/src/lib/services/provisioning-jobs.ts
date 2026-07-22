@@ -46,7 +46,11 @@ import { readContainerProvisionJobData } from "./container-jobs-data";
 import { dispatchContainerStopJob } from "./container-stop-job-service";
 import { elizaProvisionAdvisoryLockSql } from "./eliza-provision-lock";
 import { elizaSandboxService, SNAPSHOT_ENDPOINT_UNSUPPORTED } from "./eliza-sandbox";
-import { JOB_TYPES, type ProvisioningJobType } from "./provisioning-job-types";
+import {
+  DEDICATED_LAZY_TO_ALWAYS_TRANSITION,
+  JOB_TYPES,
+  type ProvisioningJobType,
+} from "./provisioning-job-types";
 import {
   isWaifuWebhookTargetUrl,
   resolveWaifuWebhookTarget,
@@ -96,6 +100,8 @@ export interface AgentWakeJobData {
   agentId: string;
   organizationId: string;
   userId: string;
+  /** Server-owned marker for an in-place execution-tier transition. */
+  executionTierTransition?: typeof DEDICATED_LAZY_TO_ALWAYS_TRANSITION;
   /**
    * Explicit user-selected restore point (an older validated backup) — the
    * escape hatch when the latest backup fails the wake integrity gate. Never
@@ -113,6 +119,8 @@ export interface AgentRestartJobData {
   agentId: string;
   organizationId: string;
   userId: string;
+  /** Server-owned marker for an in-place execution-tier transition. */
+  executionTierTransition?: typeof DEDICATED_LAZY_TO_ALWAYS_TRANSITION;
 }
 
 export interface AgentUpgradeJobData {
@@ -464,13 +472,16 @@ function isAgentWakeJobData(value: unknown): value is AgentWakeJobData {
   ) {
     return false;
   }
-  const { restoreBackupId, forceFreshBoot } = value as {
+  const { restoreBackupId, forceFreshBoot, executionTierTransition } = value as {
     restoreBackupId?: unknown;
     forceFreshBoot?: unknown;
+    executionTierTransition?: unknown;
   };
   return (
     (restoreBackupId === undefined || typeof restoreBackupId === "string") &&
-    (forceFreshBoot === undefined || typeof forceFreshBoot === "boolean")
+    (forceFreshBoot === undefined || typeof forceFreshBoot === "boolean") &&
+    (executionTierTransition === undefined ||
+      executionTierTransition === DEDICATED_LAZY_TO_ALWAYS_TRANSITION)
   );
 }
 
@@ -482,12 +493,18 @@ function readAgentWakeJobData(job: Job): AgentWakeJobData {
 }
 
 function isAgentRestartJobData(value: unknown): value is AgentRestartJobData {
+  const executionTierTransition =
+    typeof value === "object" && value !== null
+      ? (value as { executionTierTransition?: unknown }).executionTierTransition
+      : undefined;
   return (
     typeof value === "object" &&
     value !== null &&
     typeof (value as { agentId?: unknown }).agentId === "string" &&
     typeof (value as { organizationId?: unknown }).organizationId === "string" &&
-    typeof (value as { userId?: unknown }).userId === "string"
+    typeof (value as { userId?: unknown }).userId === "string" &&
+    (executionTierTransition === undefined ||
+      executionTierTransition === DEDICATED_LAZY_TO_ALWAYS_TRANSITION)
   );
 }
 
@@ -1424,6 +1441,66 @@ export class ProvisioningJobService {
   }
 
   /**
+   * Couple a lazy→always tier transition to the lifecycle work that makes the
+   * new runtime contract effective. The caller owns the surrounding
+   * transaction and tier CAS; this method keeps the job in that same commit.
+   *
+   * Reuse is limited to jobs that already carry the transition marker. A
+   * generic restart/wake may finish provisioning between releasing the agent
+   * lock and its terminal job-status write; reusing it could therefore commit
+   * the tier CAS after the old launch completed. A distinct marked job ensures
+   * one launch necessarily observes the committed always-on tier.
+   */
+  async enqueueAgentTierTransitionOnceInTx(
+    tx: DbTransaction,
+    params: {
+      agentId: string;
+      organizationId: string;
+      userId: string;
+      action: "restart" | "wake";
+    },
+  ): Promise<{ job: Job; created: boolean }> {
+    const executionTierTransition = DEDICATED_LAZY_TO_ALWAYS_TRANSITION;
+    const common = {
+      agentId: params.agentId,
+      organizationId: params.organizationId,
+      userId: params.userId,
+      executionTierTransition,
+    };
+    const result =
+      params.action === "restart"
+        ? await this.enqueueLifecycleJobInTx<AgentRestartJobData>(tx, {
+            jobType: JOB_TYPES.AGENT_RESTART,
+            jobData: common,
+            toRecord: agentRestartJobDataToRecord,
+            agentId: params.agentId,
+            organizationId: params.organizationId,
+            userId: params.userId,
+            maxAttempts: 3,
+            estimatedDurationMs: 90_000,
+            logName: "agent_restart",
+            idempotencyPredicates: [
+              sql`${jobs.data} ->> 'executionTierTransition' = ${executionTierTransition}`,
+            ],
+          })
+        : await this.enqueueLifecycleJobInTx<AgentWakeJobData>(tx, {
+            jobType: JOB_TYPES.AGENT_WAKE,
+            jobData: common,
+            toRecord: agentWakeJobDataToRecord,
+            agentId: params.agentId,
+            organizationId: params.organizationId,
+            userId: params.userId,
+            maxAttempts: 3,
+            estimatedDurationMs: 90_000,
+            logName: "agent_wake",
+            idempotencyPredicates: [
+              sql`${jobs.data} ->> 'executionTierTransition' = ${executionTierTransition}`,
+            ],
+          });
+    return result;
+  }
+
+  /**
    * Fleet-upgrade: enqueue a blue/green swap of `agentId` onto `toDigest`.
    * Called by the reconciler when a registry probe sees the configured tag
    * has moved. The handler provisions a new container on the least-loaded
@@ -1866,6 +1943,9 @@ export class ProvisioningJobService {
       const recovered = await jobsRepository.recoverInProgressJobsStartedBefore({
         type: jobType,
         startedBefore,
+        onFailedInTx: async (tx, failedJob, errorMessage) => {
+          await this.applyPermanentFailureWriteback(tx, failedJob, errorMessage);
+        },
       });
       totalRecovered += recovered;
     }
@@ -1980,10 +2060,22 @@ export class ProvisioningJobService {
   }
 
   /**
+   * Apply the dependent-row writeback while a repository recovery path still
+   * owns the transaction that changes the job to `failed`.
+   */
+  private async applyPermanentFailureWriteback(
+    tx: DbTransaction,
+    failedJob: Job,
+    errorMessage: string,
+  ): Promise<void> {
+    const writeback = this.buildPermanentFailureWriteback(failedJob, errorMessage);
+    if (writeback) await writeback(tx, failedJob);
+  }
+
+  /**
    * Builds the in-transaction dependent-row writeback for a job that has just
-   * exhausted its retries. Returned callback runs INSIDE incrementAttempt's
-   * transaction (atomic with the job-status `failed` flip). Returns undefined
-   * for job types that have no dependent status row to flip.
+   * exhausted its retries. The returned callback keeps the job failure and its
+   * dependent resource state atomic; unrelated job types need no callback.
    */
   private buildPermanentFailureWriteback(
     job: Job,
@@ -2080,6 +2172,42 @@ export class ProvisioningJobService {
           logger.warn(
             "[provisioning-jobs] Recorded rollback-safe upgrade failure without marking sandbox terminal",
             { jobId: job.id, agentId, failedTargetDigest: toDigest },
+          );
+        };
+      }
+      // A lazy→always transition is effective only after its marked relaunch
+      // succeeds. If that job exhausts retries, restore the lazy tier in the
+      // same transaction as the terminal job write: billing, API reads, and
+      // the dashboard then all expose the retryable state instead of claiming
+      // an old lazy runtime is continuously hosted. The marker is server-owned,
+      // so ordinary restart/wake failures retain their existing disposition.
+      case JOB_TYPES.AGENT_RESTART:
+      case JOB_TYPES.AGENT_WAKE: {
+        const transitionData =
+          job.type === JOB_TYPES.AGENT_RESTART
+            ? readAgentRestartJobData(job)
+            : readAgentWakeJobData(job);
+        if (transitionData.executionTierTransition !== DEDICATED_LAZY_TO_ALWAYS_TRANSITION) {
+          return undefined;
+        }
+        return async (tx) => {
+          await tx
+            .update(agentSandboxes)
+            .set({ execution_tier: "dedicated-lazy", updated_at: new Date() })
+            .where(
+              and(
+                eq(agentSandboxes.id, transitionData.agentId),
+                eq(agentSandboxes.organization_id, transitionData.organizationId),
+                eq(agentSandboxes.execution_tier, "dedicated-always"),
+              ),
+            );
+          logger.warn(
+            "[provisioning-jobs] Restored lazy tier after permanent always-on transition failure",
+            {
+              jobId: job.id,
+              agentId: transitionData.agentId,
+              organizationId: transitionData.organizationId,
+            },
           );
         };
       }
@@ -2501,10 +2629,33 @@ export class ProvisioningJobService {
       agentId: data.agentId,
     });
 
-    const result = await elizaSandboxService.executeWake(data.agentId, data.organizationId, {
+    let result = await elizaSandboxService.executeWake(data.agentId, data.organizationId, {
       restoreBackupId: data.restoreBackupId,
       forceFreshBoot: data.forceFreshBoot,
     });
+
+    // A sleeping/stopped agent can become running after the transition was
+    // committed but before this marked wake executes (for example, an older
+    // wake already in flight). executeWake intentionally no-ops on running,
+    // which is correct for ordinary wake requests but cannot prove the live
+    // container was launched with the always-on tier. Force one relaunch when
+    // this transition job did not itself provision the runtime.
+    if (
+      data.executionTierTransition === DEDICATED_LAZY_TO_ALWAYS_TRANSITION &&
+      result.success &&
+      !result.reprovisioned
+    ) {
+      logger.info(
+        "[provisioning-jobs] Tier-transition wake found a running runtime; forcing relaunch",
+        { jobId: job.id, agentId: data.agentId },
+      );
+      const restart = await elizaSandboxService.executeRestart(data.agentId, data.organizationId);
+      result = {
+        success: restart.success,
+        reprovisioned: restart.containerStarted,
+        error: restart.error,
+      };
+    }
 
     if (await this.completeIfAgentGone(job, result, data.agentId)) return;
 
@@ -3374,6 +3525,9 @@ export class ProvisioningJobService {
         staleThresholdMs: COLD_BOOT_JOB_TYPES.has(jobType)
           ? COLD_BOOT_STALE_JOB_THRESHOLD_MS
           : DEFAULT_STALE_JOB_THRESHOLD_MS,
+        onFailedInTx: async (tx, failedJob, errorMessage) => {
+          await this.applyPermanentFailureWriteback(tx, failedJob, errorMessage);
+        },
       });
       totalRecovered += recovered;
     }

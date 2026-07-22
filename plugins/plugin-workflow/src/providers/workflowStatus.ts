@@ -8,11 +8,10 @@ import {
   logger,
   type Memory,
   type Provider,
-  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import { WORKFLOW_SERVICE_TYPE, type WorkflowService } from '../services/index';
-import { getLocalOwnerEntityId } from '../utils/context';
+import { getLocalOwnerEntityId, resolveWorkflowOwnerEntityId } from '../utils/context';
 
 export const workflowStatusProvider: Provider = {
   name: 'workflow_status',
@@ -38,7 +37,7 @@ export const workflowStatusProvider: Provider = {
         };
       }
 
-      ownerEntityId = (await resolveCanonicalOwnerIdForMessage(runtime, _message)) ?? ownerEntityId;
+      ownerEntityId = await resolveWorkflowOwnerEntityId(runtime, _message);
 
       const workflows = await service.listWorkflows(ownerEntityId);
 

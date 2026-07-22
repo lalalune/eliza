@@ -90,6 +90,9 @@ export const JOB_TYPES = {
 
 export type ProvisioningJobType = (typeof JOB_TYPES)[keyof typeof JOB_TYPES];
 
+/** Durable server-owned job marker for the in-place lazy→always transition. */
+export const DEDICATED_LAZY_TO_ALWAYS_TRANSITION = "dedicated-lazy-to-dedicated-always" as const;
+
 // ── Lanes (which daemon claims which jobs) ──────────────────────────────────
 // The one `jobs` table + ProvisioningJobService codepath is shared, but the
 // rows split into two INDEPENDENT lanes that can be claimed by SEPARATE daemons:

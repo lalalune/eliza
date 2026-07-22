@@ -116,7 +116,14 @@ function createWorkflowService(
   const runWorkflow = mock(
     async (
       workflowId: string,
-      _options: { mode?: "manual"; throwOnError?: boolean } | undefined,
+      _options:
+        | {
+            mode?: "manual";
+            triggerData?: Record<string, unknown>;
+            idempotencyKey?: string;
+            throwOnError?: boolean;
+          }
+        | undefined,
       _userId: string,
     ) => {
       const id = `execution-${++executionCount}`;
@@ -242,10 +249,14 @@ async function requestWorkflow(
     method?: "GET" | "POST" | "PUT" | "DELETE";
     userId?: string;
     body?: unknown;
+    headers?: Record<string, string>;
   } = {},
 ): Promise<Response> {
   const headers = new Headers({ "x-server-token": SHARED_SECRET });
   if (options.userId) headers.set("x-eliza-user-id", options.userId);
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    headers.set(name, value);
+  }
   if (options.body !== undefined)
     headers.set("content-type", "application/json");
   return app.handle(
@@ -812,6 +823,62 @@ describe("workflow clarification contracts", () => {
 });
 
 describe("workflow run and history ownership", () => {
+  test("forwards trigger data and retry identity without trusting the body for ownership", async () => {
+    const { app, service } = createHarness(
+      createWorkflowService({ caller: ["owned-workflow"] }),
+    );
+    const response = await requestWorkflow(app, "/owned-workflow/run", {
+      method: "POST",
+      userId: "caller",
+      headers: { "idempotency-key": "cloud-run-request-1" },
+      body: {
+        userId: "spoofed-user",
+        triggerData: { source: "subscription-retry" },
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(service.runWorkflow).toHaveBeenCalledWith(
+      "owned-workflow",
+      {
+        mode: "manual",
+        triggerData: { source: "subscription-retry" },
+        idempotencyKey: "cloud-run-request-1",
+        throwOnError: false,
+      },
+      "caller",
+    );
+  });
+
+  test("rejects conflicting retry keys and malformed trigger data", async () => {
+    const { app, service } = createHarness(
+      createWorkflowService({ caller: ["owned-workflow"] }),
+    );
+    const conflicting = await requestWorkflow(app, "/owned-workflow/run", {
+      method: "POST",
+      userId: "caller",
+      headers: {
+        "idempotency-key": "request-a",
+        "x-idempotency-key": "request-b",
+      },
+    });
+    const malformed = await requestWorkflow(app, "/owned-workflow/run", {
+      method: "POST",
+      userId: "caller",
+      body: { triggerData: "not-an-object" },
+    });
+
+    expect(conflicting.status).toBe(400);
+    expect(await conflicting.json()).toMatchObject({
+      code: "workflow_idempotency_key_conflict",
+    });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toMatchObject({
+      code: "workflow_trigger_data_invalid",
+    });
+    expect(service.runWorkflow).not.toHaveBeenCalled();
+  });
+
   test("allows an owner to run and inspect executions and revisions", async () => {
     const { app, service } = createHarness(
       createWorkflowService(

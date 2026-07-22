@@ -84,7 +84,14 @@ type WorkflowServiceLike = {
   deleteWorkflow: (workflowId: string, userId: string) => Promise<void>;
   runWorkflow: (
     workflowId: string,
-    options: { mode?: "manual"; throwOnError?: boolean } | undefined,
+    options:
+      | {
+          mode?: "manual";
+          triggerData?: Record<string, unknown>;
+          idempotencyKey?: string;
+          throwOnError?: boolean;
+        }
+      | undefined,
     userId: string,
   ) => Promise<unknown>;
   listExecutions: (
@@ -154,6 +161,23 @@ function requireWorkflowPrincipal(
     code: "workflow_principal_required",
     error: "Workflow user principal is required",
   };
+}
+
+function readWorkflowIdempotencyKey(
+  headers: HeaderMap,
+  set: { status?: number | string },
+): string | WorkflowErrorResponse | undefined {
+  const standard = headers["idempotency-key"]?.trim();
+  const legacy = headers["x-idempotency-key"]?.trim();
+  if (standard && legacy && standard !== legacy) {
+    set.status = 400;
+    return {
+      success: false,
+      code: "workflow_idempotency_key_conflict",
+      error: "Conflicting workflow idempotency keys",
+    };
+  }
+  return standard || legacy || undefined;
 }
 
 function workflowRecordId(workflow: unknown): string | null {
@@ -1064,12 +1088,26 @@ export function createRoutes(manager: AgentManager, sharedSecret: string) {
 
     .post(
       "/agents/:id/workflows/:workflowId/run",
-      async ({ params, headers, set }) => {
+      async ({ params, body, headers, set }) => {
         const headerMap = headers as HeaderMap;
         const denial = requireInternalAuth(headerMap, set, sharedSecret);
         if (denial) return denial;
         const userId = requireWorkflowPrincipal(headerMap, set);
         if (typeof userId !== "string") return userId;
+        const idempotencyKey = readWorkflowIdempotencyKey(headerMap, set);
+        if (idempotencyKey && typeof idempotencyKey !== "string") {
+          return idempotencyKey;
+        }
+        const rawBody: Record<string, unknown> = isRecord(body) ? body : {};
+        const triggerData = rawBody.triggerData;
+        if (triggerData !== undefined && !isRecord(triggerData)) {
+          set.status = 400;
+          return {
+            success: false,
+            code: "workflow_trigger_data_invalid",
+            error: "triggerData must be an object",
+          };
+        }
 
         return await withWorkflowService(
           manager,
@@ -1081,6 +1119,8 @@ export function createRoutes(manager: AgentManager, sharedSecret: string) {
               params.workflowId,
               {
                 mode: "manual",
+                ...(triggerData ? { triggerData } : {}),
+                ...(idempotencyKey ? { idempotencyKey } : {}),
                 throwOnError: false,
               },
               userId,

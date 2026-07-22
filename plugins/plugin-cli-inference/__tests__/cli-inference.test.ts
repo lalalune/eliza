@@ -473,7 +473,7 @@ describe("models map gating (large-tier only)", () => {
     }
   });
 
-  it("routes warm Claude SDK handlers through the current default Opus model", async () => {
+  it("routes isolated Claude SDK handlers through the current default Opus model", async () => {
     let captured: { model?: string; body?: string } = {};
     vi.spyOn(ClaudeSdkSession.prototype, "send").mockImplementation(function (
       this: ClaudeSdkSession,
@@ -505,6 +505,92 @@ describe("models map gating (large-tier only)", () => {
 
     expect(captured.model).toBe("claude-opus-4-8");
     expect(captured.body).toContain("hello");
+  });
+
+  it("isolates Claude SDK query and runtime config across sequential model calls", async () => {
+    const captured: Array<{
+      instance: ClaudeSdkSession;
+      executable?: string;
+      effort?: string;
+    }> = [];
+    vi.spyOn(ClaudeSdkSession.prototype, "send").mockImplementation(function (
+      this: ClaudeSdkSession
+    ) {
+      const internal = this as unknown as {
+        claudeExecutablePath?: string;
+        effort?: string;
+      };
+      captured.push({
+        instance: this,
+        executable: internal.claudeExecutablePath,
+        effort: internal.effort,
+      });
+      return Promise.resolve("isolated");
+    });
+    const models = buildModels({ ELIZA_CHAT_VIA_CLI: "claude-sdk" }) as Record<
+      string,
+      (
+        runtime: { getSetting: (key: string) => string | undefined },
+        params: unknown
+      ) => Promise<string>
+    >;
+    const runtime = (executable: string, effort: string) => ({
+      getSetting: (key: string) =>
+        key === "ELIZA_CHAT_VIA_CLI"
+          ? "claude-sdk"
+          : key === "ELIZA_CLI_CLAUDE_BIN"
+            ? executable
+            : key === "ELIZA_CLI_CLAUDE_EFFORT"
+              ? effort
+              : undefined,
+    });
+
+    await models.TEXT_LARGE(runtime("/usr/local/bin/claude-a", "low"), { prompt: "one" });
+    await models.TEXT_LARGE(runtime("/usr/local/bin/claude-b", "xhigh"), { prompt: "two" });
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.instance).not.toBe(captured[1]?.instance);
+    expect(captured.map(({ executable, effort }) => ({ executable, effort }))).toEqual([
+      { executable: "/usr/local/bin/claude-a", effort: "low" },
+      { executable: "/usr/local/bin/claude-b", effort: "xhigh" },
+    ]);
+  });
+
+  it("runtime disposal cannot interrupt another runtime's active Claude query", async () => {
+    const sessions: ClaudeSdkSession[] = [];
+    const releases = new Map<string, (value: string) => void>();
+    vi.spyOn(ClaudeSdkSession.prototype, "send").mockImplementation(function (
+      this: ClaudeSdkSession,
+      body: string
+    ) {
+      sessions.push(this);
+      return new Promise<string>((resolve) => {
+        releases.set(body.includes("runtime-a") ? "a" : "b", resolve);
+      });
+    });
+    const dispose = vi.spyOn(ClaudeSdkSession.prototype, "dispose").mockResolvedValue();
+    const models = buildModels({ ELIZA_CHAT_VIA_CLI: "claude-sdk" }) as Record<
+      string,
+      (runtime: IAgentRuntime, params: { prompt: string }) => Promise<string>
+    >;
+    const runtime = (): IAgentRuntime =>
+      ({
+        getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "claude-sdk" : undefined),
+      }) as IAgentRuntime;
+    const runtimeA = runtime();
+    const runtimeB = runtime();
+
+    const callA = models.TEXT_LARGE(runtimeA, { prompt: "runtime-a" });
+    const callB = models.TEXT_LARGE(runtimeB, { prompt: "runtime-b" });
+    await vi.waitFor(() => expect(sessions).toHaveLength(2));
+
+    await cliInferencePlugin.dispose?.(runtimeA);
+    expect(dispose.mock.instances).toEqual([sessions[0]]);
+
+    releases.get("a")?.("a");
+    releases.get("b")?.("b");
+    await expect(Promise.all([callA, callB])).resolves.toEqual(["a", "b"]);
+    expect(dispose.mock.instances.filter((instance) => instance === sessions[1])).toHaveLength(1);
   });
 
   it("registers and routes ACTION_PLANNER only in text-planner mode", async () => {
@@ -570,15 +656,17 @@ describe("models map gating (large-tier only)", () => {
     }
   });
 
-  it("routes warm Codex SDK handlers through the default Codex model", async () => {
-    let captured: { model?: string; body?: string } = {};
+  it("routes isolated Codex SDK handlers through the default Codex model", async () => {
+    let captured: { model?: string; body?: string; outputSchema?: unknown } = {};
     vi.spyOn(CodexSdkSession.prototype, "generate").mockImplementation(function (
       this: CodexSdkSession,
-      body: string
+      body: string,
+      outputSchema?: unknown
     ) {
       captured = {
         model: (this as unknown as { model?: string }).model,
         body,
+        outputSchema,
       };
       return Promise.resolve("from codex sdk");
     });
@@ -593,10 +681,68 @@ describe("models map gating (large-tier only)", () => {
       getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "codex-sdk" : undefined),
     };
 
-    await expect(models.TEXT_LARGE(runtime, { prompt: "hello" })).resolves.toBe("from codex sdk");
+    const responseSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["answer"],
+      properties: { answer: { type: "string" } },
+    };
+    await expect(models.TEXT_LARGE(runtime, { prompt: "hello", responseSchema })).resolves.toBe(
+      "from codex sdk"
+    );
 
     expect(captured.model).toBe("gpt-5.5");
     expect(captured.body).toContain("hello");
+    expect(captured.outputSchema).toBe(responseSchema);
+  });
+
+  it("does not reuse Codex adapter credentials or config across runtimes", async () => {
+    const captured: Array<{
+      instance: CodexSdkSession;
+      executable?: string;
+      effort?: string;
+    }> = [];
+    vi.spyOn(CodexSdkSession.prototype, "generate").mockImplementation(function (
+      this: CodexSdkSession
+    ) {
+      const internal = this as unknown as {
+        codexBinPath?: string;
+        reasoningEffort?: string;
+      };
+      captured.push({
+        instance: this,
+        executable: internal.codexBinPath,
+        effort: internal.reasoningEffort,
+      });
+      return Promise.resolve("isolated");
+    });
+    const models = buildModels({ ELIZA_CHAT_VIA_CLI: "codex-sdk" }) as Record<
+      string,
+      (
+        runtime: { getSetting: (key: string) => string | undefined },
+        params: unknown
+      ) => Promise<string>
+    >;
+    const runtime = (executable: string, effort: string) => ({
+      getSetting: (key: string) =>
+        key === "ELIZA_CHAT_VIA_CLI"
+          ? "codex-sdk"
+          : key === "ELIZA_CLI_CODEX_BIN"
+            ? executable
+            : key === "ELIZA_CLI_CODEX_REASONING_EFFORT"
+              ? effort
+              : undefined,
+    });
+
+    await models.TEXT_LARGE(runtime("/usr/local/bin/codex-a", "low"), { prompt: "one" });
+    await models.TEXT_LARGE(runtime("/usr/local/bin/codex-b", "xhigh"), { prompt: "two" });
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.instance).not.toBe(captured[1]?.instance);
+    expect(captured.map(({ executable, effort }) => ({ executable, effort }))).toEqual([
+      { executable: "/usr/local/bin/codex-a", effort: "low" },
+      { executable: "/usr/local/bin/codex-b", effort: "xhigh" },
+    ]);
   });
 
   it("keeps init inert when disabled and rejects colliding Claude routes", async () => {

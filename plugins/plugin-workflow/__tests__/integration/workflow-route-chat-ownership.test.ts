@@ -32,6 +32,13 @@ const FOREIGN_ENTITY_ID = stringToUuid('workflow-foreign-owner');
 const CHAT_ROOM_ID = stringToUuid('workflow-route-chat-owner-room');
 const servers: http.Server[] = [];
 const harnesses: EmbeddedHarness[] = [];
+const initialCloudProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
+const initialAgentApiToken = process.env.ELIZA_API_TOKEN;
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -44,6 +51,8 @@ afterEach(async () => {
     )
   );
   await Promise.all(harnesses.splice(0).map((harness) => harness.close()));
+  restoreEnv('ELIZA_CLOUD_PROVISIONED', initialCloudProvisioned);
+  restoreEnv('ELIZA_API_TOKEN', initialAgentApiToken);
 });
 
 function manualWorkflow(name: string): WorkflowDefinition {
@@ -225,6 +234,130 @@ async function workflowScheduleTasks(
 }
 
 describe('local workflow route/chat ownership and lifecycle', () => {
+  test('Cloud routes require an attested principal and isolate users within one organization', async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = '1';
+    process.env.ELIZA_API_TOKEN = 'per-agent-principal-proof';
+    const { baseUrl } = await makeHarness();
+    const ownerA = stringToUuid('cloud-workflow-owner-a');
+    const ownerB = stringToUuid('cloud-workflow-owner-b');
+    const trustedHeaders = (owner: string) => ({
+      'x-eliza-user-id': owner,
+      'x-eliza-principal-token': 'per-agent-principal-proof',
+    });
+
+    for (const headers of [
+      undefined,
+      { 'x-eliza-user-id': ownerA },
+      {
+        'x-eliza-user-id': ownerA,
+        'x-eliza-principal-token': 'caller-controlled-secret',
+      },
+    ]) {
+      const denied = await requestJson(baseUrl, '/api/automations', {
+        ...(headers ? { headers } : {}),
+      });
+      expect(denied.status).toBe(401);
+      expect(denied.body).toMatchObject({
+        code: 'workflow_principal_required',
+      });
+    }
+
+    const createdA = await requestJson(baseUrl, '/api/workflow/workflows', {
+      method: 'POST',
+      body: manualWorkflow('Owner A workflow'),
+      headers: trustedHeaders(ownerA),
+    });
+    const createdB = await requestJson(baseUrl, '/api/workflow/workflows', {
+      method: 'POST',
+      body: manualWorkflow('Owner B workflow'),
+      headers: trustedHeaders(ownerB),
+    });
+    expect(createdA.status).toBe(200);
+    expect(createdB.status).toBe(200);
+
+    const listFor = async (owner: string) =>
+      await requestJson(baseUrl, '/api/workflow/workflows', {
+        headers: trustedHeaders(owner),
+      });
+    const listA = await listFor(ownerA);
+    const listB = await listFor(ownerB);
+    expect(listA.body.workflows).toEqual([
+      expect.objectContaining({ id: createdA.body.id, name: 'Owner A workflow' }),
+    ]);
+    expect(listB.body.workflows).toEqual([
+      expect.objectContaining({ id: createdB.body.id, name: 'Owner B workflow' }),
+    ]);
+
+    const runPath = `/api/workflow/workflows/${String(createdA.body.id)}/run`;
+    const firstRun = await requestJson(baseUrl, runPath, {
+      method: 'POST',
+      body: { triggerData: { source: 'cloud-retry' } },
+      headers: {
+        ...trustedHeaders(ownerA),
+        'idempotency-key': 'cloud-run-request-1',
+      },
+    });
+    const retriedRun = await requestJson(baseUrl, runPath, {
+      method: 'POST',
+      body: { triggerData: { source: 'cloud-retry' } },
+      headers: {
+        ...trustedHeaders(ownerA),
+        'idempotency-key': 'cloud-run-request-1',
+      },
+    });
+    const distinctRun = await requestJson(baseUrl, runPath, {
+      method: 'POST',
+      body: { triggerData: { source: 'cloud-retry' } },
+      headers: {
+        ...trustedHeaders(ownerA),
+        'idempotency-key': 'cloud-run-request-2',
+      },
+    });
+    expect(firstRun.status).toBe(200);
+    expect(retriedRun.status).toBe(200);
+    expect(distinctRun.status).toBe(200);
+    expect((retriedRun.body.execution as WorkflowExecution).id).toBe(
+      (firstRun.body.execution as WorkflowExecution).id
+    );
+    expect((distinctRun.body.execution as WorkflowExecution).id).not.toBe(
+      (firstRun.body.execution as WorkflowExecution).id
+    );
+  });
+
+  test('free-text clarification resolves once and deploys instead of looping', async () => {
+    const { workflowService, baseUrl } = await makeHarness();
+    const draft = {
+      ...manualWorkflow('Free-text clarification'),
+      _meta: {
+        requiresClarification: [
+          {
+            kind: 'free_text',
+            question: 'What context should the workflow remember?',
+            paramPath: '',
+          },
+        ],
+      },
+    };
+
+    const resolved = await requestJson(baseUrl, '/api/workflow/workflows/resolve-clarification', {
+      method: 'POST',
+      body: {
+        draft,
+        resolutions: [{ paramPath: '   ', value: 'Remember the release context.' }],
+      },
+    });
+
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.status).not.toBe('needs_clarification');
+    expect(resolved.body).toMatchObject({ name: 'Free-text clarification' });
+    const deployed = await workflowService.getWorkflow(String(resolved.body.id), OWNER_ENTITY_ID);
+    expect(deployed).toMatchObject({
+      id: resolved.body.id,
+      name: 'Free-text clarification',
+      active: false,
+    });
+  });
+
   test('the untagged seeded default has real backing routes for the canonical local owner', async () => {
     const { harness, baseUrl } = await makeHarness({ seedDefaults: true });
 

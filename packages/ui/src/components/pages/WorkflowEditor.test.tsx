@@ -19,6 +19,7 @@ import type {
   WorkflowDefinition,
   WorkflowExecution,
 } from "../../api/client-types-chat";
+import { ApiError } from "../../api/client-types-core";
 import { WorkflowEditor } from "./WorkflowEditor";
 
 vi.mock("../../api", () => ({
@@ -305,6 +306,98 @@ describe("WorkflowEditor", () => {
     expect(
       await screen.findByRole("button", { name: /run now/i }),
     ).toBeTruthy();
+  });
+
+  it("revalidates the parent feed after activate and run mutations", async () => {
+    const activated = { ...workflowFixture(), active: true };
+    clientMock.activateWorkflowDefinition.mockResolvedValue(activated);
+    const onChanged = vi.fn();
+
+    render(
+      <WorkflowEditor initial={workflowFixture()} onChanged={onChanged} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /activate/i }));
+    await waitFor(() => {
+      expect(clientMock.activateWorkflowDefinition).toHaveBeenCalledWith(
+        "workflow-1",
+      );
+    });
+    expect(onChanged).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /run now/i }));
+    await waitFor(() => {
+      expect(clientMock.runWorkflowDefinition).toHaveBeenCalledWith(
+        "workflow-1",
+      );
+    });
+    expect(onChanged).toHaveBeenCalledTimes(2);
+  });
+
+  it("turns the scheduled-workflow tier rejection into an always-on management action", async () => {
+    clientMock.activateWorkflowDefinition.mockRejectedValue(
+      new ApiError({
+        kind: "http",
+        path: "/api/workflow/workflows/workflow-1/activate",
+        status: 409,
+        code: "workflow_requires_always_on",
+        message:
+          "Scheduled workflows require an always-on agent runtime. Confirm continuous billing before activating this workflow.",
+      }),
+    );
+    const onEnableAlwaysOn = vi.fn();
+
+    render(
+      <WorkflowEditor
+        initial={workflowFixture()}
+        cloudAgentId="agent-lazy-1"
+        onEnableAlwaysOn={onEnableAlwaysOn}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /activate/i }));
+
+    const alert = await screen.findByTestId("workflow-always-on-required");
+    expect(alert.textContent).toContain("Always-on agent required");
+    expect(alert.textContent).toContain("continuous hourly credit usage");
+    fireEvent.click(screen.getByRole("button", { name: /enable always-on/i }));
+    expect(onEnableAlwaysOn).toHaveBeenCalledWith("agent-lazy-1");
+  });
+
+  it("requires a run-status refresh after an ambiguous timeout", async () => {
+    clientMock.runWorkflowDefinition.mockRejectedValueOnce(
+      new ApiError({
+        kind: "timeout",
+        path: "/api/workflow/workflows/workflow-1/run",
+        message: "Request timed out",
+      }),
+    );
+
+    render(<WorkflowEditor initial={workflowFixture()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /run now/i }));
+
+    expect(
+      await screen.findByText(
+        /may still be processing; refresh workflow runs/i,
+      ),
+    ).toBeTruthy();
+    const blockedRunButton = screen.getByRole("button", {
+      name: /refresh runs first/i,
+    }) as HTMLButtonElement;
+    expect(blockedRunButton.disabled).toBe(true);
+    fireEvent.click(blockedRunButton);
+    expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /refresh workflow runs/i }),
+    );
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("button", { name: /run now/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
   });
 
   it("restores a selected saved workflow version from history", async () => {

@@ -62,6 +62,12 @@ import { parseClampedInteger } from "@elizaos/shared/utils/number-parsing";
 import { type WebSocket, WebSocketServer } from "ws";
 import { installPlugin as installPluginDirect } from "../services/plugin-installer.ts";
 import { handleStandaloneCloudPairRoute } from "./cloud-pair-route.ts";
+import {
+  canCloudPrincipalReceiveRealtimePayload,
+  cloudPrincipalOwnsConversation,
+  isCloudPrincipalRequired,
+  resolveTrustedCloudPrincipal,
+} from "./cloud-principal.ts";
 import { handlePluginDirectoryRoutes } from "./plugin-directory-routes.ts";
 
 // `@elizaos/plugin-browser` and `@elizaos/plugin-x402` load lazily: X402 only
@@ -4211,10 +4217,21 @@ export async function startApiServer(opts?: {
     `[eliza-api] Server timeouts: requestTimeout=${requestTimeoutMs}ms, headersTimeout=${headersTimeoutMs}ms, keepAliveTimeout=${keepAliveTimeoutMs}ms`,
   );
 
+  const canSendWebSocketPayload = (
+    client: WebSocket,
+    payload: unknown,
+  ): boolean =>
+    !isCloudPrincipalRequired() ||
+    canCloudPrincipalReceiveRealtimePayload(
+      wsCloudPrincipals.get(client),
+      state.conversations.values(),
+      payload,
+    );
+
   const broadcastWs = (payload: unknown): void => {
     const message = JSON.stringify(payload);
     for (const client of wsClients) {
-      if (client.readyState === 1) {
+      if (client.readyState === 1 && canSendWebSocketPayload(client, payload)) {
         try {
           client.send(message);
         } catch (err) {
@@ -4665,6 +4682,10 @@ export async function startApiServer(opts?: {
   });
   const wsClients = new Set<WebSocket>();
   const wsClientIds = new WeakMap<WebSocket, string>();
+  const wsCloudPrincipals = new WeakMap<
+    WebSocket,
+    NonNullable<ReturnType<typeof resolveTrustedCloudPrincipal>>
+  >();
   /**
    * Per-connection active conversation. Each browser window/client owns its own
    * active conversation, so two windows no longer fight over a single global.
@@ -4789,6 +4810,10 @@ export async function startApiServer(opts?: {
 
   // Handle WebSocket connections
   wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
+    const cloudPrincipal = resolveTrustedCloudPrincipal(request);
+    if (cloudPrincipal) {
+      wsCloudPrincipals.set(ws, cloudPrincipal);
+    }
     let wsClientId: string | null = null;
     let wsUrl: URL;
     try {
@@ -4857,6 +4882,7 @@ export async function startApiServer(opts?: {
           DEFAULT_REPLAY_LIMIT,
         );
         for (const event of replay) {
+          if (!canSendWebSocketPayload(ws, event)) continue;
           ws.send(JSON.stringify(event));
         }
       } catch (err) {
@@ -4954,13 +4980,27 @@ export async function startApiServer(opts?: {
           const conversationId =
             typeof msg.conversationId === "string" ? msg.conversationId : null;
           if (conversationId) {
+            if (
+              isCloudPrincipalRequired() &&
+              !cloudPrincipalOwnsConversation(
+                wsCloudPrincipals.get(ws),
+                state.conversations.get(conversationId),
+              )
+            ) {
+              logger.warn(
+                "[eliza-api] Cloud WebSocket rejected an inaccessible active conversation",
+              );
+              return;
+            }
             wsActiveConversations.set(ws, conversationId);
           } else {
             wsActiveConversations.delete(ws);
           }
           // Keep the global as a sensible "any/most-recent active conversation"
           // default for non-client-targeted routing (autonomy, swarm synthesis).
-          state.activeConversationId = conversationId;
+          if (!isCloudPrincipalRequired()) {
+            state.activeConversationId = conversationId;
+          }
         } else if (
           msg.type === "pty-subscribe" &&
           typeof msg.sessionId === "string"
@@ -5197,18 +5237,7 @@ export async function startApiServer(opts?: {
 
   // Generic broadcast — sends an arbitrary JSON payload to all WS clients.
   state.broadcastWs = (data: object) => {
-    const message = JSON.stringify(data);
-    for (const client of wsClients) {
-      if (client.readyState === 1) {
-        try {
-          client.send(message);
-        } catch (err) {
-          logger.error(
-            `[eliza-api] WebSocket broadcast error: ${err instanceof Error ? err.message : err}`,
-          );
-        }
-      }
-    }
+    broadcastWs(data);
   };
 
   // Give the views module a process-level broadcaster so the view-scoped action
@@ -5230,6 +5259,7 @@ export async function startApiServer(opts?: {
     for (const client of wsClients) {
       if (client.readyState !== 1) continue;
       if (wsClientIds.get(client) !== clientId) continue;
+      if (!canSendWebSocketPayload(client, data)) continue;
       try {
         client.send(message);
         delivered += 1;
@@ -5249,6 +5279,16 @@ export async function startApiServer(opts?: {
     for (const client of wsClients) {
       if (client.readyState !== 1) continue;
       if (wsActiveConversations.get(client) !== conversationId) continue;
+      if (
+        isCloudPrincipalRequired() &&
+        !cloudPrincipalOwnsConversation(
+          wsCloudPrincipals.get(client),
+          state.conversations.get(conversationId),
+        )
+      ) {
+        continue;
+      }
+      if (!canSendWebSocketPayload(client, data)) continue;
       try {
         client.send(message);
         delivered += 1;

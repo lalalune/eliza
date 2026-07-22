@@ -31,8 +31,14 @@
  */
 
 import { agentSandboxesRepository } from "@/db/repositories/agent-sandboxes";
+import { usersRepository } from "@/db/repositories/users";
 import { requireAuthOrApiKeyWithOrg } from "@/lib/auth";
+import {
+  dedicatedAgentSessionIssuerFromEnvironment,
+  verifyDedicatedAgentSession,
+} from "@/lib/auth/dedicated-agent-session";
 import { AGENT_PRICING } from "@/lib/constants/agent-pricing";
+import { CORS_ALLOW_HEADERS } from "@/lib/cors-constants";
 import { runWithCloudBindingsAsync } from "@/lib/runtime/cloud-bindings";
 import { checkAgentCreditGate } from "@/lib/services/agent-billing-gate";
 import { provisioningJobService } from "@/lib/services/provisioning-jobs";
@@ -106,8 +112,9 @@ function resolveOriginHost(env: Bindings): string {
 /**
  * Forward the request to the agent-router origin (the CP), preserving
  * path / method / body. When `injectBearer` is provided, the inbound auth is
- * REPLACED with the agent's own `ELIZA_API_TOKEN` (so the container accepts it);
- * otherwise headers pass through unchanged and the container's own auth applies.
+ * replaced with the agent's own `ELIZA_API_TOKEN` and the caller-supplied user
+ * header is replaced with the principal resolved from that Cloud credential.
+ * Otherwise headers pass through unchanged and the container's own auth applies.
  */
 async function proxyToOrigin(
   request: Request,
@@ -115,16 +122,29 @@ async function proxyToOrigin(
   url: URL,
   injectBearer?: string,
   injectQueryToken = false,
+  injectPrincipal?: string,
+  injectPrincipalToken?: string,
 ): Promise<Response> {
   const targetUrl = new URL(request.url);
   targetUrl.hostname = resolveOriginHost(env);
   const headers = new Headers(request.headers);
   headers.delete("host");
+  // Identity headers are never allowed to traverse the public edge verbatim,
+  // including on anonymous/pass-through asset requests.
+  headers.delete("x-eliza-user-id");
+  headers.delete("x-eliza-principal-token");
+  headers.delete("x-server-token");
   headers.set("x-forwarded-host", url.host);
   headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
   if (injectBearer) {
     headers.set("authorization", `Bearer ${injectBearer}`);
     headers.delete("x-api-key");
+    if (injectPrincipal?.trim()) {
+      headers.set("x-eliza-user-id", injectPrincipal.trim());
+    }
+    if (injectPrincipalToken?.trim()) {
+      headers.set("x-eliza-principal-token", injectPrincipalToken.trim());
+    }
     // The realtime WebSocket carries the token as `?token=` (browsers can't set
     // headers on `new WebSocket()`); the container reads it via
     // ELIZA_ALLOW_WS_QUERY_TOKEN. Rewrite that query param to the agent token
@@ -262,12 +282,24 @@ async function resumeAndRespond(
         jobId = job.id;
         alreadyInProgress = !created;
       } catch (error) {
+        // error-policy:J1 the proxy boundary exposes scheduling failure as a
+        // retryable error instead of claiming that a resume was requested.
         logger.warn("[dedicated-proxy] auto-resume enqueue failed", {
           agentId,
           orgId,
           status: sandbox.status,
           error: error instanceof Error ? error.message : String(error),
         });
+        const response = Response.json(
+          {
+            success: false,
+            code: "agent_resume_enqueue_failed",
+            error: "Agent resume could not be scheduled. Retry shortly.",
+          },
+          { status: 503 },
+        );
+        response.headers.set("Retry-After", String(RETRY_AFTER_SECONDS));
+        return response;
       }
     } else {
       logger.warn("[dedicated-proxy] auto-resume blocked: worker unavailable", {
@@ -316,6 +348,18 @@ function extractQueryToken(request: Request, url: URL): string | null {
   return url.searchParams.get("token")?.trim() || null;
 }
 
+function extractPresentedToken(
+  request: Request,
+  queryToken: string | null,
+): string | null {
+  if (queryToken) return queryToken;
+  const authorization = request.headers.get("authorization")?.trim();
+  if (authorization?.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice(7).trim() || null;
+  }
+  return request.headers.get("x-api-key")?.trim() || null;
+}
+
 /**
  * CORS headers for a browser-visible proxy response. The CP (nginx → agent-router)
  * forwards verbatim and injects nothing, so its CORS-less 404/503 — and our own
@@ -331,7 +375,7 @@ function corsHeadersFor(request: Request): Record<string, string> {
     vary: "origin",
     "access-control-allow-credentials": "true",
     "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": "authorization,content-type,x-api-key",
+    "access-control-allow-headers": CORS_ALLOW_HEADERS,
   };
 }
 
@@ -405,12 +449,56 @@ async function proxyDedicatedAgent(
       : request;
     let orgId: string;
     let userId: string;
-    try {
-      const { user } = await requireAuthOrApiKeyWithOrg(authRequest);
-      orgId = user.organization_id;
-      userId = user.id;
-    } catch {
-      return proxyToOrigin(request, env, url);
+    const pairedSessionToken = extractPresentedToken(request, queryToken);
+    const pairedSession = pairedSessionToken
+      ? await verifyDedicatedAgentSession(pairedSessionToken, agentId, {
+          issuer: dedicatedAgentSessionIssuerFromEnvironment(env),
+        })
+      : ({ valid: false } as const);
+    if (pairedSession.valid) {
+      const pairedUser = await usersRepository.findWithOrganization(
+        pairedSession.claims.userId,
+      );
+      if (!pairedUser) {
+        return Response.json(
+          {
+            success: false,
+            code: "paired_session_membership_inactive",
+            error: "The paired Cloud membership is no longer active.",
+          },
+          { status: 401 },
+        );
+      }
+      const pairedOrganization = pairedUser.organization;
+      if (
+        !pairedUser.is_active ||
+        pairedUser.deleted_at ||
+        pairedUser.organization_id !== pairedSession.claims.organizationId ||
+        !pairedOrganization ||
+        pairedOrganization.id !== pairedSession.claims.organizationId ||
+        !pairedOrganization.is_active
+      ) {
+        return Response.json(
+          {
+            success: false,
+            code: "paired_session_membership_inactive",
+            error: "The paired Cloud membership is no longer active.",
+          },
+          { status: 401 },
+        );
+      }
+      orgId = pairedSession.claims.organizationId;
+      userId = pairedSession.claims.userId;
+    } else {
+      try {
+        const { user } = await requireAuthOrApiKeyWithOrg(authRequest);
+        orgId = user.organization_id;
+        userId = user.id;
+      } catch {
+        // error-policy:J4 invalid Cloud auth deliberately degrades to the
+        // container-owned auth boundary without forwarding any trust headers.
+        return proxyToOrigin(request, env, url);
+      }
     }
 
     // 2. Ownership — the caller's org MUST own this dedicated agent. Not
@@ -461,15 +549,31 @@ async function proxyDedicatedAgent(
     //    upgrade the token rode in `?token=`, so rewrite that too.
     const envVars = (sandbox.environment_vars ?? {}) as Record<string, string>;
     const agentToken = envVars.ELIZA_API_TOKEN?.trim();
-    // No managed token (older / not-yet-provisioned agent) → pass through.
+    if (!agentToken) {
+      logger.error("[dedicated-proxy] agent credential is unavailable", {
+        agentId,
+      });
+      return Response.json(
+        {
+          success: false,
+          code: "agent_principal_transport_unavailable",
+          error: "Agent identity transport is not configured.",
+        },
+        { status: 503 },
+      );
+    }
     return proxyToOrigin(
       request,
       env,
       url,
-      agentToken || undefined,
+      agentToken,
       queryToken !== null,
+      userId,
+      agentToken,
     );
   } catch (error) {
+    // error-policy:J1 this public subdomain proxy boundary fails closed by
+    // stripping edge trust and delegating the request to container auth.
     // Fail-closed: any unexpected error → pass through WITHOUT injecting, so
     // the container's own auth still gates access.
     logger.error(

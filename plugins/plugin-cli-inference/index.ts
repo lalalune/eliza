@@ -1,3 +1,10 @@
+/**
+ * Sanctioned CLI/SDK model handlers for subscription-backed chat and planning.
+ * The plugin is inert until ELIZA_CHAT_VIA_CLI selects a backend, registers only
+ * configured text/planner tiers, isolates every SDK request, and confines ambient
+ * or pooled authentication to a backend-specific subprocess environment.
+ */
+
 import { createHash } from "node:crypto";
 import type { GenerateTextParams, IAgentRuntime, Plugin, ToolDefinition } from "@elizaos/core";
 import {
@@ -30,45 +37,6 @@ import {
 import { CodexCli } from "./src/codex-cli-exec";
 import { CodexSdkSession } from "./src/codex-sdk-session";
 import { flattenPrompt } from "./src/prompt-flatten";
-
-/**
- * @elizaos/plugin-cli-inference — the TOS-clean SAFE/CLOUD inference route.
- *
- * Serves chat/planner inference through sanctioned local routes:
- *   - `claude --print`  (reads ~/.claude/.credentials.json itself), or
- *   - a warm Claude Agent SDK session (reads the Claude subscription creds itself), or
- *   - `codex exec`      (reads ~/.codex/auth.json itself).
- *
- * eliza never sees/forwards/logs the subscription token — the child env is
- * filtered (allowlist + secret blocklist) and the CLI loads its own creds. This
- * is the develop-shippable peer to the two never-commit, TOS-gray bypass paths
- * (the claude-code-stealth fetch interceptor in
- * `packages/agent/src/auth/credentials.ts` and plugin-codex-cli `postResponses`)
- * which replay the consumer-subscription token in-process.
- *
- * The whole models map is INERT unless `ELIZA_CHAT_VIA_CLI` is `claude`,
- * `claude-sdk`, or `codex`. We register TEXT_LARGE / TEXT_MEGA /
- * RESPONSE_HANDLER only:
- *
- *   - RESPONSE_HANDLER is the whole point — it generates the user-facing reply,
- *     which is exactly what "chat on the sub" means. That is one CLI spawn per
- *     turn that actually answers (~3-4s).
- *   - TEXT_LARGE / TEXT_MEGA cover other large free-text generations (e.g. the
- *     post-turn evaluator) — also occasional, also tolerant of plain text.
- *   - ACTION_PLANNER is registered ONLY in text-planner mode
- *     (`ELIZA_PLANNER_NATIVE_TOOLS=0`), where the planner emits an XML
- *     `<response><actions>` block the free-text CLI CAN produce. With native
- *     tools on (the default), the planner needs GBNF / native-tool /
- *     responseSchema enforcement the CLI cannot honor, so it stays on the
- *     grammar/tool-honoring provider (cerebras / zai / anthropic). Gating on
- *     `NATIVE_TOOLS=0` lets the SAFE route run STANDALONE (chat + planner +
- *     coding all on the subscription CLI) without ever hijacking a hybrid setup.
- *
- * High-frequency should-respond/triage (TEXT_SMALL/NANO/MEDIUM) is never
- * registered, so per-turn CLI spawn cost stays bounded to the user-facing reply
- * via RESPONSE_HANDLER, the planner (text mode only), and possibly the post-turn
- * evaluator — not the cheap triage calls.
- */
 
 /** Large-tier free-text model types this plugin registers (when enabled). */
 const LARGE_TIER_MODEL_TYPES: readonly string[] = [
@@ -157,10 +125,9 @@ function envelopeFieldSchemas(tool: ToolDefinition): EnvelopeFieldSchemas {
 }
 
 // "claude"      → cold `claude --print` per call (TOS-clean, but ~5-15s/call).
-// "claude-sdk"  → WARM Claude Agent SDK session (TOS-clean + sanctioned + fast
-//                 ~2s/turn after warm-up); the recommended Claude route.
+// "claude-sdk"  → isolated Claude Agent SDK query (TOS-clean + sanctioned).
 // "codex"       → cold `codex exec` per call (TOS-clean ChatGPT OAuth).
-// "codex-sdk"   → WARM Codex SDK thread (TOS-clean ChatGPT OAuth + fast); the
+// "codex-sdk"   → isolated Codex SDK threads (TOS-clean ChatGPT OAuth); the
 //                 codex peer of claude-sdk. ROUTE mode uses native outputSchema.
 type CliBackend = "claude" | "claude-sdk" | "codex" | "codex-sdk";
 
@@ -183,26 +150,11 @@ export function resolveCliBackend(source: { ELIZA_CHAT_VIA_CLI?: string }): CliB
   return undefined;
 }
 
-// Persistent warm Agent SDK sessions. The SDK freezes `systemPrompt` + tool
-// config at query() start (no mid-session reset — proven live, research
-// wf_3199bde6), so we key by (model, mode, systemPrompt-hash): each distinct
-// system prompt and each mode (text vs native router) gets its own warm process.
-// Keying by model ALONE would share one frozen-system opus session across
-// RESPONSE_HANDLER/TEXT_LARGE/TEXT_MEGA, bleeding context between tiers/rooms and
-// intermittently returning empty turns. Lives for the plugin's lifetime; torn
-// down in dispose().
-const sdkSessions = new Map<string, ClaudeSdkSession>();
-
-/**
- * Upper bound on concurrently-cached warm sessions. Each session is a live
- * Claude Code process, so the cache must not grow without bound as distinct
- * system prompts appear. In practice only a handful of keys are hot (a few
- * tiers × the stable system-prompt prefix), but a long-lived agent whose system
- * prompt drifts could otherwise accumulate processes. When the cap is exceeded
- * the least-recently-used session is disposed (LRU: Map preserves insertion
- * order; a cache hit re-inserts to mark it most-recently-used).
- */
-const MAX_SDK_SESSIONS = 8;
+// Claude's streaming-input query is a continuing conversation with no supported
+// history reset. Track only currently-running one-call sessions for lifecycle
+// teardown; never cache one across Eliza model calls or hidden SDK context could
+// cross rooms, users, and system prompts.
+const activeClaudeSdkSessions = new WeakMap<IAgentRuntime, Set<ClaudeSdkSession>>();
 
 /** The Claude model for a given tier (planner/small can differ from large). */
 function resolveSdkModel(runtime: IAgentRuntime, modelType: string): string {
@@ -227,7 +179,7 @@ function shortHash(value: string): string {
 }
 
 /**
- * Lazily create + cache a warm SDK session for a (model, mode, systemPrompt).
+ * Stable account-affinity key for an isolated SDK request shape.
  * "route" builds the native `route_action` MCP-tool session (the planner);
  * "envelope" builds the native `handle_response` session (Stage-1 routing);
  * "text" builds a plain text-generation session (reply/large tiers).
@@ -262,19 +214,10 @@ export function resolveSdkEffort(runtime: IAgentRuntime, mode: SdkSessionMode): 
 }
 
 /**
- * Evict + dispose a warm Claude SDK session by its cache key so the NEXT
- * `getSdkSession` for that key spins up a fresh process — which re-reads the
- * (rotated) `CLAUDE_CODE_OAUTH_TOKEN` / `~/.claude` credential. Used by account
- * rotation after a subscription limit. Best-effort: dispose is fire-and-forget.
+ * Construct one isolated Claude SDK session. The SDK has no history-reset API,
+ * so the session must be disposed after exactly one Eliza model call.
  */
-function evictSdkSession(key: string): void {
-  const existing = sdkSessions.get(key);
-  if (!existing) return;
-  sdkSessions.delete(key);
-  void existing.dispose();
-}
-
-function getSdkSession(
+function createSdkSession(
   runtime: IAgentRuntime,
   model: string,
   systemPrompt: string,
@@ -282,55 +225,49 @@ function getSdkSession(
   subprocessEnv?: RotationSubprocessEnv,
   envelopeFields?: EnvelopeFieldSchemas
 ): ClaudeSdkSession {
-  const key = claudeSessionKey(model, systemPrompt, mode, envelopeFields);
-  const existing = sdkSessions.get(key);
-  if (existing) {
-    // Mark most-recently-used: delete + re-insert moves it to the Map's tail.
-    sdkSessions.delete(key);
-    sdkSessions.set(key, existing);
-    return existing;
-  }
-  const session = new ClaudeSdkSession({
+  return new ClaudeSdkSession({
     model,
     systemPrompt,
     mode,
     envelopeFields,
     claudeExecutablePath: getSetting(runtime, "ELIZA_CLI_CLAUDE_BIN"),
-    restartAfterTurns: parseTimeout(getSetting(runtime, "ELIZA_CLI_SDK_RESTART_AFTER_TURNS")),
     turnTimeoutMs:
       parseTurnTimeout(getSetting(runtime, "ELIZA_CLI_SDK_TURN_TIMEOUT_MS")) ??
       parseTurnTimeout(getSetting(runtime, "ELIZA_CLI_TIMEOUT_MS")),
     effort: resolveSdkEffort(runtime, mode),
     subprocessEnv,
   });
-  sdkSessions.set(key, session);
-  // Evict least-recently-used past the cap (each session is a live process).
-  // dispose() is best-effort fire-and-forget — the new session is already
-  // cached and returned synchronously.
-  while (sdkSessions.size > MAX_SDK_SESSIONS) {
-    const lruKey = sdkSessions.keys().next().value as string | undefined;
-    if (lruKey === undefined) break;
-    const lru = sdkSessions.get(lruKey);
-    sdkSessions.delete(lruKey);
-    void lru?.dispose();
+}
+
+async function runIsolatedSdkSession(
+  runtime: IAgentRuntime,
+  session: ClaudeSdkSession,
+  body: string
+): Promise<string> {
+  let active = activeClaudeSdkSessions.get(runtime);
+  if (!active) {
+    active = new Set<ClaudeSdkSession>();
+    activeClaudeSdkSessions.set(runtime, active);
   }
-  return session;
+  active.add(session);
+  try {
+    return await session.send(body);
+  } finally {
+    active.delete(session);
+    if (active.size === 0) activeClaudeSdkSessions.delete(runtime);
+    await session.dispose();
+  }
 }
 
-/** Tear down all warm SDK sessions (plugin dispose). */
-export async function disposeSdkSessions(): Promise<void> {
-  const all = [...sdkSessions.values()];
-  sdkSessions.clear();
+/** Tear down this runtime's isolated Claude calls during plugin shutdown. */
+export async function disposeSdkSessions(runtime: IAgentRuntime): Promise<void> {
+  const active = activeClaudeSdkSessions.get(runtime);
+  if (!active) return;
+  const all = [...active];
+  active.clear();
+  activeClaudeSdkSessions.delete(runtime);
   await Promise.all(all.map((s) => s.dispose()));
-  const codex = [...codexSdkSessions.values()];
-  codexSdkSessions.clear();
-  for (const s of codex) s.dispose();
 }
-
-// Warm Codex SDK threads, keyed by (model, mode). codex-sdk has no thread-level
-// system prompt (it's folded into the body), so ONE warm thread per (model, mode)
-// serves every system prompt — simpler than the claude cache.
-const codexSdkSessions = new Map<string, CodexSdkSession>();
 
 /** The codex model for a given tier (planner/small can differ from large). */
 function resolveCodexModel(runtime: IAgentRuntime, modelType: string): string {
@@ -345,38 +282,23 @@ function codexSessionKey(model: string, router: boolean): string {
 }
 
 /**
- * Evict + dispose a warm Codex SDK thread by its cache key so the next
- * `getCodexSdkSession` re-starts it — re-reading the (rotated) per-account
- * `CODEX_HOME`. Used by account rotation after a subscription limit.
+ * Construct a stateless Codex adapter for one Eliza model call. Even the adapter
+ * is request-owned so runtime-specific binary, effort, and account settings can
+ * never be inherited from another AgentRuntime.
  */
-function evictCodexSdkSession(key: string): void {
-  const existing = codexSdkSessions.get(key);
-  if (!existing) return;
-  codexSdkSessions.delete(key);
-  existing.dispose();
-}
-
-/** Lazily create + cache a warm Codex SDK thread for a (model, mode). */
-function getCodexSdkSession(
+function createCodexSdkSession(
   runtime: IAgentRuntime,
   model: string,
   router: boolean,
   subprocessEnv?: RotationSubprocessEnv
 ): CodexSdkSession {
-  const key = codexSessionKey(model, router);
-  let session = codexSdkSessions.get(key);
-  if (!session) {
-    session = new CodexSdkSession({
-      model,
-      router,
-      reasoningEffort: getSetting(runtime, "ELIZA_CLI_CODEX_REASONING_EFFORT"),
-      codexBinPath: getSetting(runtime, "ELIZA_CLI_CODEX_BIN"),
-      restartAfterTurns: parseTimeout(getSetting(runtime, "ELIZA_CLI_SDK_RESTART_AFTER_TURNS")),
-      subprocessEnv,
-    });
-    codexSdkSessions.set(key, session);
-  }
-  return session;
+  return new CodexSdkSession({
+    model,
+    router,
+    reasoningEffort: getSetting(runtime, "ELIZA_CLI_CODEX_REASONING_EFFORT"),
+    codexBinPath: getSetting(runtime, "ELIZA_CLI_CODEX_BIN"),
+    subprocessEnv,
+  });
 }
 
 function parseTimeout(value: string | undefined): number | undefined {
@@ -396,7 +318,7 @@ export function parseTurnTimeout(value: string | undefined): number | undefined 
   return n;
 }
 
-// One binary setting covers both warm and cold backends so container images can
+// One binary setting covers both SDK and cold backends so container images can
 // pin executables outside the launcher allowlist. Blank settings retain the
 // allowlisted PATH lookup used by unmanaged installations.
 function resolveBinaryPin(runtime: IAgentRuntime, key: string): string | undefined {
@@ -462,60 +384,68 @@ async function generateViaCli(
     const key = claudeSessionKey(model, STAGE1_ENVELOPE_SYSTEM_PROMPT, "envelope", fields);
     return withAccountRotation(
       (env) =>
-        getSdkSession(runtime, model, STAGE1_ENVELOPE_SYSTEM_PROMPT, "envelope", env, fields).send(
+        runIsolatedSdkSession(
+          runtime,
+          createSdkSession(runtime, model, STAGE1_ENVELOPE_SYSTEM_PROMPT, "envelope", env, fields),
           envelopeBody
         ),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
         sessionKey: `cli-inference:${key}`,
-        onRotate: () => evictSdkSession(key),
+        scope: runtime,
       }
     );
   }
   if (backend === "claude-sdk") {
-    // Warm, persistent Agent SDK session. The SDK freezes `systemPrompt` at start,
-    // so we flatten system+messages here and hand the session a STABLE system
-    // (so all turns of a tier share one warm process) plus a self-contained body.
+    // The Agent SDK freezes `systemPrompt` at query start, so we flatten
+    // system+messages and hand the isolated query a self-contained request.
     const model = resolveSdkModel(runtime, modelType);
     const { system, body } = flattenPrompt(generateParams);
     // Reframe the agentic SDK model as a pure completion engine (system) AND close
     // the body with a directive that cancels any stale "call a tool" instruction,
     // so it synthesizes the final reply from already-executed tool results instead
     // of narrating intent ("I'll fetch it…"). Both are needed (proven live: 4/4 vs
-    // 2/4). Keying by the framed system keeps one warm process per tier.
+    // 2/4). The key below is account affinity only; the SDK query is not reused.
     const framedSystem = frameTextSystemPrompt(system);
     const framedBody = appendTextDirective(body);
     const key = claudeSessionKey(model, framedSystem, "text");
-    // Pool-first auth: the FIRST warm session already auths as a healthy pooled
-    // Claude account when one exists (ambient ~/.claude is the fallback). On a
-    // subscription limit, rotate to the next healthy pooled account (evicting
-    // the warm session so it re-auths as the new account), then retry; fall
-    // through to provider failover only when the pool is exhausted.
+    // Pool-first auth selects and refreshes a healthy pooled Claude account when
+    // one exists (ambient ~/.claude is the fallback). On a subscription limit,
+    // retry a fresh query on the next healthy account before provider failover.
     return withAccountRotation(
-      (env) => getSdkSession(runtime, model, framedSystem, "text", env).send(framedBody),
+      (env) =>
+        runIsolatedSdkSession(
+          runtime,
+          createSdkSession(runtime, model, framedSystem, "text", env),
+          framedBody
+        ),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
         sessionKey: `cli-inference:${key}`,
-        onRotate: () => evictSdkSession(key),
+        scope: runtime,
       }
     );
   }
   if (backend === "codex-sdk") {
-    // Warm Codex SDK thread. codex-sdk folds the system into the body, so frame
-    // the body the same way (the SDK model is agentic too) and run TEXT mode.
+    // Codex SDK folds the system into the body, so frame the body the same way
+    // (the SDK model is agentic too) and run TEXT mode on an isolated thread.
     const model = resolveCodexModel(runtime, modelType);
     const { system, body } = flattenPrompt(generateParams);
     const framedBody = appendTextDirective(`${frameTextSystemPrompt(system)}\n\n${body}`);
     const key = codexSessionKey(model, false);
     return withAccountRotation(
-      (env) => getCodexSdkSession(runtime, model, false, env).generate(framedBody),
+      (env) =>
+        createCodexSdkSession(runtime, model, false, env).generate(
+          framedBody,
+          params.responseSchema
+        ),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
         sessionKey: `cli-inference:${key}`,
-        onRotate: () => evictCodexSdkSession(key),
+        scope: runtime,
       }
     );
   }
@@ -529,12 +459,12 @@ async function generateViaCli(
  * Two implementations, picked by backend:
  *
  *  - **claude-sdk (native router):** the model is given ONE in-process MCP tool
- *    (`route_action`) and emits a real `tool_use` the warm session captures as
+ *    (`route_action`) and emits a real `tool_use` the isolated query captures as
  *    `{action, params}`. This matches the stealth/native path's full
  *    functionality (live-info → WEB_FETCH, sub-agents) with no free-text JSON
  *    parsing and no required-tool retry loop. The per-turn action menu +
  *    transcript + persona ride in the BODY (system stays the constant
- *    `ROUTER_SYSTEM_PROMPT` so one warm process serves every planner turn).
+ *    `ROUTER_SYSTEM_PROMPT`; each planner turn gets a fresh query).
  *
  *  - **claude / codex CLI:** the free-text CLI cannot honor native tools, so we
  *    rebuild the call into the proven CLEAN text-routing form (pick ONE action,
@@ -553,12 +483,17 @@ async function planViaCli(runtime: IAgentRuntime, params: GenerateTextParams): P
     const routerBody = buildRouterBody(params);
     const key = claudeSessionKey(model, ROUTER_SYSTEM_PROMPT, "route");
     return withAccountRotation(
-      (env) => getSdkSession(runtime, model, ROUTER_SYSTEM_PROMPT, "route", env).send(routerBody),
+      (env) =>
+        runIsolatedSdkSession(
+          runtime,
+          createSdkSession(runtime, model, ROUTER_SYSTEM_PROMPT, "route", env),
+          routerBody
+        ),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
         sessionKey: `cli-inference:${key}`,
-        onRotate: () => evictSdkSession(key),
+        scope: runtime,
       }
     );
   }
@@ -572,12 +507,12 @@ async function planViaCli(runtime: IAgentRuntime, params: GenerateTextParams): P
     const routeBody = `${clean.system ?? ""}\n\n${clean.prompt ?? ""}`;
     const key = codexSessionKey(model, true);
     return withAccountRotation(
-      (env) => getCodexSdkSession(runtime, model, true, env).route(routeBody),
+      (env) => createCodexSdkSession(runtime, model, true, env).route(routeBody),
       {
         backend,
         getValue: (k) => getSetting(runtime, k),
         sessionKey: `cli-inference:${key}`,
-        onRotate: () => evictCodexSdkSession(key),
+        scope: runtime,
       }
     );
   }
@@ -625,7 +560,7 @@ export function buildModelMetadata(
   const backend = resolveCliBackend(source);
   if (!backend) return undefined;
   const isCodex = backend === "codex" || backend === "codex-sdk";
-  const isWarm = backend === "claude-sdk" || backend === "codex-sdk";
+  const isSdk = backend === "claude-sdk" || backend === "codex-sdk";
   const largeSetting = isCodex ? "ELIZA_CLI_CODEX_MODEL" : "ELIZA_CLI_CLAUDE_MODEL";
   const plannerSetting = isCodex
     ? "ELIZA_CLI_CODEX_PLANNER_MODEL"
@@ -653,7 +588,7 @@ export function buildModelMetadata(
   }
   if (textPlannerEnabled()) {
     for (const modelType of PLANNER_MODEL_TYPES) {
-      metadata[modelType] = declaration(isWarm ? [plannerSetting, largeSetting] : [largeSetting]);
+      metadata[modelType] = declaration(isSdk ? [plannerSetting, largeSetting] : [largeSetting]);
     }
   }
   return metadata;
@@ -662,7 +597,7 @@ export function buildModelMetadata(
 export const cliInferencePlugin: Plugin = {
   name: "cli-inference",
   description:
-    "TOS-clean SAFE/CLOUD inference: serves large-tier model handlers through sanctioned claude, claude-sdk, or codex routes; each route reads its own creds. Inert unless ELIZA_CHAT_VIA_CLI=claude|claude-sdk|codex.",
+    "TOS-clean SAFE/CLOUD inference: serves large-tier model handlers through sanctioned claude, claude-sdk, codex, or codex-sdk routes; each route reads its own creds. Inert unless ELIZA_CHAT_VIA_CLI selects one of those backends.",
   modelMetadata: buildModelMetadata(),
   // High priority so that, when ELIZA_CHAT_VIA_CLI is set, this plugin
   // deterministically wins the tiers it registers (TEXT_LARGE / TEXT_MEGA /
@@ -674,7 +609,6 @@ export const cliInferencePlugin: Plugin = {
     ELIZA_CLI_CLAUDE_MODEL: readEnv("ELIZA_CLI_CLAUDE_MODEL") ?? null,
     ELIZA_CLI_CLAUDE_PLANNER_MODEL: readEnv("ELIZA_CLI_CLAUDE_PLANNER_MODEL") ?? null,
     ELIZA_CLI_CLAUDE_BIN: readEnv("ELIZA_CLI_CLAUDE_BIN") ?? null,
-    ELIZA_CLI_SDK_RESTART_AFTER_TURNS: readEnv("ELIZA_CLI_SDK_RESTART_AFTER_TURNS") ?? null,
     ELIZA_CLI_SDK_TURN_TIMEOUT_MS: readEnv("ELIZA_CLI_SDK_TURN_TIMEOUT_MS") ?? null,
     ELIZA_CLI_CODEX_MODEL: readEnv("ELIZA_CLI_CODEX_MODEL") ?? null,
     ELIZA_CLI_CODEX_BIN: readEnv("ELIZA_CLI_CODEX_BIN") ?? null,
@@ -701,8 +635,8 @@ export const cliInferencePlugin: Plugin = {
     }
     logger.info(
       backend === "claude-sdk"
-        ? "[cli-inference] enabled via ELIZA_CHAT_VIA_CLI=claude-sdk — WARM Agent SDK sessions (TOS-clean, sanctioned, fast)"
-        : `[cli-inference] enabled via ELIZA_CHAT_VIA_CLI=${backend} — large-tier handlers spawn the ${backend} CLI`
+        ? "[cli-inference] enabled via ELIZA_CHAT_VIA_CLI=claude-sdk — isolated Agent SDK queries (TOS-clean, sanctioned)"
+        : `[cli-inference] enabled via ELIZA_CHAT_VIA_CLI=${backend} — large-tier handlers use the ${backend} route`
     );
     if (textPlannerEnabled()) {
       logger.info(
@@ -715,8 +649,8 @@ export const cliInferencePlugin: Plugin = {
       );
     }
   },
-  async dispose(): Promise<void> {
-    await disposeSdkSessions();
+  async dispose(runtime: IAgentRuntime): Promise<void> {
+    await disposeSdkSessions(runtime);
   },
   models: buildModels(),
 };

@@ -42,6 +42,17 @@ const MISSING = "dddddddd-9999-4999-8999-999999999999";
 const ORG_FULL = "33333333-3333-4333-8333-333333333333";
 const USER_FULL = "bbbbbbbb-2222-4222-8222-222222222222";
 const SHARED_FULL = "cccccccc-ffff-4fff-8fff-ffffffffffff";
+const LAZY_CONFIRM = "eeeeeeee-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const LAZY_CREDIT = "eeeeeeee-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const LAZY_RUNNING = "eeeeeeee-cccc-4ccc-8ccc-cccccccccccc";
+const LAZY_SLEEPING = "eeeeeeee-dddd-4ddd-8ddd-dddddddddddd";
+const LAZY_PENDING = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const LAZY_CONCURRENT = "eeeeeeee-ffff-4fff-8fff-ffffffffffff";
+const LAZY_WORKER_DOWN = "ffffffff-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const LAZY_FAILED_RETRY = "ffffffff-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const LAZY_FAILED_GATES = "ffffffff-cccc-4ccc-8ccc-cccccccccccc";
+const LAZY_FAILED_PENDING = "ffffffff-dddd-4ddd-8ddd-dddddddddddd";
+const LAZY_FAILED_PROVISIONING = "ffffffff-eeee-4eee-8eee-eeeeeeeeeeee";
 
 // Caller identity is switchable so the cross-org denial path is exercised for
 // real (org A's user probing org B's agent).
@@ -209,12 +220,60 @@ afterAll(async () => {
   mock.module("@/lib/auth", () => realAuthSnapshot);
 });
 
-function upgrade(agentId: string) {
-  return app.request(
-    `/api/v1/eliza/agents/${agentId}/upgrade-tier`,
-    { method: "POST" },
-    ENV,
-  );
+function upgrade(agentId: string, body?: unknown) {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  return app.request(`/api/v1/eliza/agents/${agentId}/upgrade-tier`, init, ENV);
+}
+
+async function insertLazyAgent(
+  id: string,
+  status: "running" | "sleeping" | "pending" | "provisioning",
+) {
+  const { dbWrite } = await import("@/db/client");
+  const { agentSandboxes } = await import("@/db/schemas/agent-sandboxes");
+  await dbWrite.insert(agentSandboxes).values({
+    id,
+    organization_id: ORG_A,
+    user_id: USER_A,
+    agent_name: `Lazy ${status}`,
+    execution_tier: "dedicated-lazy",
+    status,
+    database_status: "none",
+  });
+}
+
+async function markTransitionFailedAndRestoreLazy(
+  agentId: string,
+  jobId: string,
+): Promise<void> {
+  const { dbWrite } = await import("@/db/client");
+  const { agentSandboxes } = await import("@/db/schemas/agent-sandboxes");
+  const { jobs } = await import("@/db/schemas/jobs");
+  await dbWrite.transaction(async (tx) => {
+    await tx
+      .update(jobs)
+      .set({
+        status: "failed",
+        attempts: 3,
+        completed_at: new Date(),
+        error: "simulated terminal relaunch failure",
+      })
+      .where(eq(jobs.id, jobId));
+    await tx
+      .update(agentSandboxes)
+      .set({ execution_tier: "dedicated-lazy", updated_at: new Date() })
+      .where(eq(agentSandboxes.id, agentId));
+  });
+}
+
+async function jobsForAgent(agentId: string) {
+  const { dbWrite } = await import("@/db/client");
+  const { jobs } = await import("@/db/schemas/jobs");
+  return dbWrite.select().from(jobs).where(eq(jobs.agent_id, agentId));
 }
 
 describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
@@ -246,6 +305,409 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
     expect(body.code).toBe("not_shared_tier");
   });
 
+  test("a lazy agent requires explicit continuous-billing confirmation before any mutation", async () => {
+    expect(pgliteReady).toBe(true);
+    await insertLazyAgent(LAZY_CONFIRM, "running");
+
+    for (const body of [undefined, { confirmContinuousBilling: false }]) {
+      const res = await upgrade(LAZY_CONFIRM, body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({
+        success: false,
+        code: "continuous_billing_confirmation_required",
+      });
+    }
+
+    const { dbWrite } = await import("@/db/client");
+    const { agentSandboxes } = await import("@/db/schemas/agent-sandboxes");
+    const { jobs } = await import("@/db/schemas/jobs");
+    const [agent] = await dbWrite
+      .select()
+      .from(agentSandboxes)
+      .where(eq(agentSandboxes.id, LAZY_CONFIRM));
+    expect(agent?.execution_tier).toBe("dedicated-lazy");
+    expect(
+      await dbWrite.select().from(jobs).where(eq(jobs.agent_id, LAZY_CONFIRM)),
+    ).toHaveLength(0);
+  });
+
+  test("a confirmed lazy promotion still requires the dedicated hosting runway", async () => {
+    expect(pgliteReady).toBe(true);
+    await insertLazyAgent(LAZY_CREDIT, "running");
+    await setOrgBalance(ORG_A, "0.50");
+    try {
+      const res = await upgrade(LAZY_CREDIT, {
+        confirmContinuousBilling: true,
+      });
+      expect(res.status).toBe(402);
+      expect(await res.json()).toMatchObject({
+        success: false,
+        code: "insufficient_credits",
+        requiredBalance: 0.72,
+      });
+      const { agentSandboxesRepository } = await import(
+        "@/db/repositories/agent-sandboxes"
+      );
+      expect(
+        (await agentSandboxesRepository.findByIdAndOrg(LAZY_CREDIT, ORG_A))
+          ?.execution_tier,
+      ).toBe("dedicated-lazy");
+    } finally {
+      await setOrgBalance(ORG_A, "10");
+    }
+  });
+
+  test("worker health is checked before a lazy tier or job mutation", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_WORKER_DOWN, "running");
+    const previous = process.env.REQUIRE_PROVISIONING_WORKER;
+    process.env.REQUIRE_PROVISIONING_WORKER = "true";
+    try {
+      const { buildRedisClient } = await import("@/lib/cache/redis-factory");
+      const { PROVISIONING_WORKER_HEARTBEAT_KEY } = await import(
+        "@/lib/services/provisioning-worker-health"
+      );
+      const redis = buildRedisClient();
+      if (!redis) throw new Error("mock Redis unavailable");
+      await redis.del(PROVISIONING_WORKER_HEARTBEAT_KEY);
+
+      const res = await upgrade(LAZY_WORKER_DOWN, {
+        confirmContinuousBilling: true,
+      });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toMatchObject({
+        success: false,
+        code: "PROVISIONING_WORKER_UNHEALTHY",
+      });
+      const { agentSandboxesRepository } = await import(
+        "@/db/repositories/agent-sandboxes"
+      );
+      expect(
+        (await agentSandboxesRepository.findByIdAndOrg(LAZY_WORKER_DOWN, ORG_A))
+          ?.execution_tier,
+      ).toBe("dedicated-lazy");
+      const { dbWrite } = await import("@/db/client");
+      const { jobs } = await import("@/db/schemas/jobs");
+      expect(
+        await dbWrite
+          .select()
+          .from(jobs)
+          .where(eq(jobs.agent_id, LAZY_WORKER_DOWN)),
+      ).toHaveLength(0);
+    } finally {
+      if (previous === undefined)
+        delete process.env.REQUIRE_PROVISIONING_WORKER;
+      else process.env.REQUIRE_PROVISIONING_WORKER = previous;
+    }
+  });
+
+  test("a running lazy agent transitions in place with one restart job and retry reattachment", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_RUNNING, "running");
+
+    const res = await upgrade(LAZY_RUNNING, {
+      confirmContinuousBilling: true,
+    });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as {
+      created: boolean;
+      transition: string;
+      data: {
+        id: string;
+        agentId: string;
+        previousExecutionTier: string;
+        executionTier: string;
+        action: string;
+        jobId: string;
+      };
+      polling: { endpoint: string };
+    };
+    expect(body.created).toBe(true);
+    expect(body.transition).toBe("in_place");
+    expect(body.data).toMatchObject({
+      id: LAZY_RUNNING,
+      agentId: LAZY_RUNNING,
+      previousExecutionTier: "dedicated-lazy",
+      executionTier: "dedicated-always",
+      action: "restart",
+    });
+    expect(body.polling.endpoint).toBe(`/api/v1/jobs/${body.data.jobId}`);
+
+    const { dbWrite } = await import("@/db/client");
+    const { agentSandboxes } = await import("@/db/schemas/agent-sandboxes");
+    const { jobs } = await import("@/db/schemas/jobs");
+    const [stored] = await dbWrite
+      .select()
+      .from(agentSandboxes)
+      .where(eq(agentSandboxes.id, LAZY_RUNNING));
+    expect(stored?.execution_tier).toBe("dedicated-always");
+    const jobRows = await dbWrite
+      .select()
+      .from(jobs)
+      .where(eq(jobs.agent_id, LAZY_RUNNING));
+    expect(jobRows).toHaveLength(1);
+    expect(jobRows[0]?.type).toBe("agent_restart");
+    expect(jobRows[0]?.data.executionTierTransition).toBe(
+      "dedicated-lazy-to-dedicated-always",
+    );
+
+    // Confirmation is recorded by the first transition. A transport retry can
+    // be bodyless and still reattach to the exact durable job.
+    const retry = await upgrade(LAZY_RUNNING);
+    expect(retry.status).toBe(202);
+    expect(await retry.json()).toMatchObject({
+      created: false,
+      reattached: true,
+      alreadyInProgress: true,
+      completed: false,
+      transition: "in_place",
+      data: { agentId: LAZY_RUNNING, jobId: body.data.jobId },
+    });
+
+    await dbWrite
+      .update(jobs)
+      .set({ status: "completed", completed_at: new Date() })
+      .where(eq(jobs.id, body.data.jobId));
+    const completedRetry = await upgrade(LAZY_RUNNING);
+    expect(completedRetry.status).toBe(202);
+    expect(await completedRetry.json()).toMatchObject({
+      created: false,
+      reattached: true,
+      alreadyInProgress: false,
+      completed: true,
+      data: {
+        agentId: LAZY_RUNNING,
+        jobId: body.data.jobId,
+        status: "completed",
+      },
+    });
+  });
+
+  test("a reloaded failed transition is visibly lazy and bodyless retry creates one new active marked job", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_FAILED_RETRY, "running");
+    const firstResponse = await upgrade(LAZY_FAILED_RETRY, {
+      confirmContinuousBilling: true,
+    });
+    expect(firstResponse.status).toBe(202);
+    const first = (await firstResponse.json()) as {
+      data: { jobId: string };
+    };
+    await markTransitionFailedAndRestoreLazy(
+      LAZY_FAILED_RETRY,
+      first.data.jobId,
+    );
+
+    const { agentSandboxesRepository } = await import(
+      "@/db/repositories/agent-sandboxes"
+    );
+    expect(
+      (await agentSandboxesRepository.findByIdAndOrg(LAZY_FAILED_RETRY, ORG_A))
+        ?.execution_tier,
+    ).toBe("dedicated-lazy");
+
+    // The durable server marker proves the prior confirmation after reload,
+    // so a transport retry needs no body but must mint a distinct relaunch.
+    const retryResponse = await upgrade(LAZY_FAILED_RETRY);
+    expect(retryResponse.status).toBe(202);
+    const retry = (await retryResponse.json()) as {
+      created: boolean;
+      completed: boolean;
+      data: { agentId: string; jobId: string; status: string };
+    };
+    expect(retry).toMatchObject({
+      created: true,
+      completed: false,
+      data: {
+        agentId: LAZY_FAILED_RETRY,
+        status: "pending",
+      },
+    });
+    expect(retry.data.jobId).not.toBe(first.data.jobId);
+    const rows = await jobsForAgent(LAZY_FAILED_RETRY);
+    expect(rows).toHaveLength(2);
+    expect(
+      rows.filter(
+        (job) =>
+          job.data.executionTierTransition ===
+            "dedicated-lazy-to-dedicated-always" &&
+          (job.status === "pending" || job.status === "in_progress"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      (await agentSandboxesRepository.findByIdAndOrg(LAZY_FAILED_RETRY, ORG_A))
+        ?.execution_tier,
+    ).toBe("dedicated-always");
+  });
+
+  test("failed-transition rearm leaves tier and jobs untouched when credit or worker gates fail", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_FAILED_GATES, "running");
+    const firstResponse = await upgrade(LAZY_FAILED_GATES, {
+      confirmContinuousBilling: true,
+    });
+    expect(firstResponse.status).toBe(202);
+    const first = (await firstResponse.json()) as {
+      data: { jobId: string };
+    };
+    await markTransitionFailedAndRestoreLazy(
+      LAZY_FAILED_GATES,
+      first.data.jobId,
+    );
+
+    await setOrgBalance(ORG_A, "0.50");
+    const creditDenied = await upgrade(LAZY_FAILED_GATES);
+    expect(creditDenied.status).toBe(402);
+    expect(await creditDenied.json()).toMatchObject({
+      code: "insufficient_credits",
+    });
+    expect(await jobsForAgent(LAZY_FAILED_GATES)).toHaveLength(1);
+
+    await setOrgBalance(ORG_A, "10");
+    const previous = process.env.REQUIRE_PROVISIONING_WORKER;
+    process.env.REQUIRE_PROVISIONING_WORKER = "true";
+    try {
+      const { buildRedisClient } = await import("@/lib/cache/redis-factory");
+      const { PROVISIONING_WORKER_HEARTBEAT_KEY } = await import(
+        "@/lib/services/provisioning-worker-health"
+      );
+      const redis = buildRedisClient();
+      if (!redis) throw new Error("mock Redis unavailable");
+      await redis.del(PROVISIONING_WORKER_HEARTBEAT_KEY);
+
+      const workerDenied = await upgrade(LAZY_FAILED_GATES);
+      expect(workerDenied.status).toBe(503);
+      expect(await workerDenied.json()).toMatchObject({
+        code: "PROVISIONING_WORKER_UNHEALTHY",
+      });
+      expect(await jobsForAgent(LAZY_FAILED_GATES)).toHaveLength(1);
+      const { agentSandboxesRepository } = await import(
+        "@/db/repositories/agent-sandboxes"
+      );
+      expect(
+        (
+          await agentSandboxesRepository.findByIdAndOrg(
+            LAZY_FAILED_GATES,
+            ORG_A,
+          )
+        )?.execution_tier,
+      ).toBe("dedicated-lazy");
+    } finally {
+      if (previous === undefined)
+        delete process.env.REQUIRE_PROVISIONING_WORKER;
+      else process.env.REQUIRE_PROVISIONING_WORKER = previous;
+    }
+  });
+
+  test("failed-transition retries remain typed-409 while lifecycle state is unstable", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    const { dbWrite } = await import("@/db/client");
+    const { jobs } = await import("@/db/schemas/jobs");
+    for (const [agentId, status] of [
+      [LAZY_FAILED_PENDING, "pending"],
+      [LAZY_FAILED_PROVISIONING, "provisioning"],
+    ] as const) {
+      await insertLazyAgent(agentId, status);
+      await dbWrite.insert(jobs).values({
+        type: "agent_restart",
+        status: "failed",
+        data: {
+          agentId,
+          organizationId: ORG_A,
+          userId: USER_A,
+          executionTierTransition: "dedicated-lazy-to-dedicated-always",
+        },
+        organization_id: ORG_A,
+        user_id: USER_A,
+        agent_id: agentId,
+        attempts: 3,
+        max_attempts: 3,
+      });
+
+      const response = await upgrade(agentId);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        success: false,
+        code: "agent_transition_not_ready",
+      });
+      expect(await jobsForAgent(agentId)).toHaveLength(1);
+    }
+  });
+
+  test("a sleeping lazy agent transitions in place with a wake job", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_SLEEPING, "sleeping");
+    const res = await upgrade(LAZY_SLEEPING, {
+      confirmContinuousBilling: true,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({
+      created: true,
+      transition: "in_place",
+      data: {
+        agentId: LAZY_SLEEPING,
+        executionTier: "dedicated-always",
+        action: "wake",
+      },
+    });
+  });
+
+  test("an ineligible lazy lifecycle state is a typed 409 with no tier mutation", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_PENDING, "pending");
+    const res = await upgrade(LAZY_PENDING, {
+      confirmContinuousBilling: true,
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      success: false,
+      code: "agent_transition_not_ready",
+    });
+    const { agentSandboxesRepository } = await import(
+      "@/db/repositories/agent-sandboxes"
+    );
+    expect(
+      (await agentSandboxesRepository.findByIdAndOrg(LAZY_PENDING, ORG_A))
+        ?.execution_tier,
+    ).toBe("dedicated-lazy");
+  });
+
+  test("concurrent confirmed lazy promotions converge on one in-place job", async () => {
+    expect(pgliteReady).toBe(true);
+    await setOrgBalance(ORG_A, "10");
+    await insertLazyAgent(LAZY_CONCURRENT, "running");
+    try {
+      const responses = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          upgrade(LAZY_CONCURRENT, { confirmContinuousBilling: true }),
+        ),
+      );
+      expect(responses.every((response) => response.status === 202)).toBe(true);
+      const bodies = (await Promise.all(
+        responses.map((response) => response.json()),
+      )) as Array<{
+        created: boolean;
+        data: { agentId: string; jobId: string };
+      }>;
+      expect(new Set(bodies.map((body) => body.data.agentId))).toEqual(
+        new Set([LAZY_CONCURRENT]),
+      );
+      expect(new Set(bodies.map((body) => body.data.jobId)).size).toBe(1);
+      expect(bodies.filter((body) => body.created)).toHaveLength(1);
+    } finally {
+      // The pre-existing shared-upgrade gate regression below begins at the
+      // fixture's original below-runway balance.
+      await setOrgBalance(ORG_A, "0.50");
+    }
+  });
+
   test("a non-running shared agent is refused with a typed 409", async () => {
     expect(pgliteReady).toBe(true);
 
@@ -257,6 +719,14 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
 
   test("a balance above the create minimum but below the hosting runway is a canonical 402", async () => {
     expect(pgliteReady).toBe(true);
+    const { agentSandboxesRepository } = await import(
+      "@/db/repositories/agent-sandboxes"
+    );
+    const beforeAgentIds = (
+      await agentSandboxesRepository.listByOrganization(ORG_A)
+    )
+      .map((agent) => agent.id)
+      .sort();
 
     const res = await upgrade(SHARED_A);
     expect(res.status).toBe(402);
@@ -276,13 +746,8 @@ describe("POST /api/v1/eliza/agents/:agentId/upgrade-tier", () => {
     expect(body.error).toContain("3 days of hosting");
 
     // Nothing was minted on the denied path.
-    const { agentSandboxesRepository } = await import(
-      "@/db/repositories/agent-sandboxes"
-    );
     const agents = await agentSandboxesRepository.listByOrganization(ORG_A);
-    expect(agents.map((a) => a.id).sort()).toEqual(
-      [SHARED_A, SHARED_A_STOPPED, DEDICATED_A].sort(),
-    );
+    expect(agents.map((a) => a.id).sort()).toEqual(beforeAgentIds);
   });
 
   test("stopped and sleeping targets cannot restart below the hosting runway", async () => {

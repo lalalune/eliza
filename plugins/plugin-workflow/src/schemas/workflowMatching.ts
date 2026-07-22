@@ -1,10 +1,10 @@
 /** JSON schema for the workflow-matching LLM call: matched workflow id, confidence, and scored candidates. */
 export const workflowMatchingSchema = {
   type: 'object',
+  additionalProperties: false,
   properties: {
     matchedWorkflowId: {
-      type: 'string',
-      nullable: true,
+      type: ['string', 'null'],
     },
     confidence: {
       type: 'string',
@@ -14,6 +14,7 @@ export const workflowMatchingSchema = {
       type: 'array',
       items: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           id: { type: 'string' },
           name: { type: 'string' },

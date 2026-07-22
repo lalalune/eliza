@@ -11,6 +11,7 @@ import * as dbSchema from '../../src/db/schema';
 import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
 import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
 import { WorkflowService } from '../../src/services/workflow-service';
+import type { WorkflowDefinition } from '../../src/types/index';
 
 function runtime(
   settings: Record<string, unknown> = {},
@@ -70,7 +71,10 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
     failCacheWrite: false,
     cacheWriteReturnsFalse: false,
     failPriorDeletionCheck: false,
+    failTaskCreateAt: null as number | null,
+    failTaskDeleteAt: null as number | null,
   };
+  const taskOps = { creates: 0, deletes: 0 };
   const runtimeDb = new Proxy(db, {
     get(target, prop, receiver) {
       if (prop !== 'select') return Reflect.get(target, prop, receiver);
@@ -104,11 +108,23 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
         reports.push({ scope, error, context });
       },
       createTask: async (task: Record<string, unknown>) => {
+        taskOps.creates += 1;
+        if (control.failTaskCreateAt === taskOps.creates) {
+          control.failTaskCreateAt = null;
+          throw new Error('injected task create failure');
+        }
         taskSeq += 1;
-        tasks.push({ id: `task-${taskSeq}`, ...task });
+        const stored = { id: `task-${taskSeq}`, ...task };
+        tasks.push(stored);
+        return stored.id;
       },
       getTasks: async () => tasks,
       deleteTask: async (id: string) => {
+        taskOps.deletes += 1;
+        if (control.failTaskDeleteAt === taskOps.deletes) {
+          control.failTaskDeleteAt = null;
+          throw new Error('injected task delete failure');
+        }
         const index = tasks.findIndex((task) => task.id === id);
         if (index >= 0) tasks.splice(index, 1);
       },
@@ -136,6 +152,7 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
     tasks,
     cache,
     control,
+    taskOps,
     reports,
     setSetting(key: string, value: unknown) {
       settingsMap[key] = value;
@@ -158,6 +175,43 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
 
 const DEFAULT_WORKFLOW_ID = 'system-device-health-check';
 const SEED_MARKER_KEY = 'eliza:workflow:seeded-defaults:v1';
+
+function scheduledDefinition(id: string, intervalsInSeconds: number[]): WorkflowDefinition {
+  const nodes = intervalsInSeconds.map((seconds, index) => ({
+    id: `schedule-${index + 1}`,
+    name: `Schedule ${index + 1}`,
+    type: 'workflows-nodes-base.scheduleTrigger',
+    typeVersion: 1.2,
+    position: [0, index * 100] as [number, number],
+    parameters: {
+      rule: { interval: [{ field: 'seconds', secondsInterval: seconds }] },
+    },
+  }));
+  return {
+    id,
+    name: `Scheduled ${id}`,
+    nodes,
+    connections: {},
+  };
+}
+
+function manualDefinition(id: string): WorkflowDefinition {
+  return {
+    id,
+    name: `Manual ${id}`,
+    nodes: [
+      {
+        id: 'manual',
+        name: 'Manual Trigger',
+        type: 'workflows-nodes-base.manualTrigger',
+        typeVersion: 1,
+        position: [0, 0],
+        parameters: {},
+      },
+    ],
+    connections: {},
+  };
+}
 
 describe('EmbeddedWorkflowService', () => {
   test('rejects workflows with unregistered nodes before activation', async () => {
@@ -424,6 +478,384 @@ describe('EmbeddedWorkflowService', () => {
     }
   }, 90_000);
 
+  test('preserves an unchanged schedule task identity, deadline, and idempotency across restart', async () => {
+    const harness = await seedingHarness();
+    const first = await harness.start();
+    const snapshot = structuredClone(harness.tasks);
+    const operationsBeforeRestart = { ...harness.taskOps };
+    await first.stop();
+
+    const second = await harness.start();
+    try {
+      expect(harness.tasks).toEqual(snapshot);
+      expect(harness.taskOps).toEqual(operationsBeforeRestart);
+      expect(harness.tasks).toHaveLength(1);
+      const metadata = harness.tasks[0]?.metadata as
+        | { idempotencyKey?: string; trigger?: { nextRunAtMs?: number } }
+        | undefined;
+      expect(harness.tasks[0]?.id).toBe(snapshot[0]?.id);
+      expect(metadata?.idempotencyKey).toBe(
+        (snapshot[0]?.metadata as { idempotencyKey?: string } | undefined)?.idempotencyKey
+      );
+      expect(metadata?.trigger?.nextRunAtMs).toBe(
+        (snapshot[0]?.metadata as { trigger?: { nextRunAtMs?: number } } | undefined)?.trigger
+          ?.nextRunAtMs
+      );
+    } finally {
+      await second.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('keeps manual workflows available on scale-to-zero Cloud agents but rejects schedule activation', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-lazy',
+    });
+    const service = await harness.start();
+    try {
+      const scheduled = await service.createWorkflow(scheduledDefinition('lazy-schedule', [30]));
+      expect(scheduled.active).toBe(false);
+      await expect(service.activateWorkflow(scheduled.id)).rejects.toMatchObject({
+        statusCode: 409,
+        response: {
+          success: false,
+          code: 'workflow_requires_always_on',
+          capability: 'scheduled_workflows',
+          currentExecutionTier: 'dedicated-lazy',
+          requiredExecutionTier: 'dedicated-always',
+          upgradeRequired: true,
+        },
+      });
+      expect((await service.getWorkflow(scheduled.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+
+      const manual = await service.createWorkflow(manualDefinition('lazy-manual'));
+      const activated = await service.activateWorkflow(manual.id);
+      expect(activated.active).toBe(true);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('rejects an active update that adds a schedule on a scale-to-zero Cloud agent', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-lazy',
+    });
+    const service = await harness.start();
+    try {
+      const manual = await service.createWorkflow(manualDefinition('lazy-active-update'));
+      await service.activateWorkflow(manual.id);
+
+      await expect(
+        service.updateWorkflow(manual.id, scheduledDefinition(manual.id, [45]))
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        response: { code: 'workflow_requires_always_on' },
+      });
+      const unchanged = await service.getWorkflow(manual.id);
+      expect(unchanged.active).toBe(true);
+      expect(unchanged.nodes.map((node) => node.type)).toEqual([
+        'workflows-nodes-base.manualTrigger',
+      ]);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('rejects restoring an active scheduled revision after an agent moves to scale-to-zero', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
+    });
+    const service = await harness.start();
+    try {
+      const scheduled = await service.createWorkflow(scheduledDefinition('lazy-restore', [30]));
+      await service.activateWorkflow(scheduled.id);
+      await service.updateWorkflow(scheduled.id, scheduledDefinition(scheduled.id, [45]));
+      const activeRevision = (await service.listWorkflowRevisions(scheduled.id)).data.find(
+        (revision) => revision.active && revision.operation === 'update'
+      );
+      if (!activeRevision) throw new Error('Expected an active scheduled revision');
+      await service.deactivateWorkflow(scheduled.id);
+      harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-lazy');
+
+      await expect(
+        service.restoreWorkflowRevision(scheduled.id, activeRevision.versionId)
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        response: { code: 'workflow_requires_always_on' },
+      });
+      expect((await service.getWorkflow(scheduled.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('does not seed a scheduled default on a scale-to-zero Cloud agent', async () => {
+    const harness = await seedingHarness({
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-lazy',
+    });
+    const service = await harness.start();
+    try {
+      expect((await service.listWorkflows()).data).toHaveLength(0);
+      expect(harness.tasks).toHaveLength(0);
+      expect(harness.cache.get(SEED_MARKER_KEY)).toBeUndefined();
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('deactivates legacy schedules on lazy startup while preserving active manual workflows', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
+    });
+    const first = await harness.start();
+    const scheduled = await first.createWorkflow(scheduledDefinition('legacy-lazy-schedule', [30]));
+    const manual = await first.createWorkflow(manualDefinition('legacy-lazy-manual'));
+    await first.activateWorkflow(scheduled.id);
+    await first.activateWorkflow(manual.id);
+    expect(harness.tasks).toHaveLength(1);
+    await first.stop();
+    harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-lazy');
+
+    const second = await harness.start();
+    try {
+      expect((await second.getWorkflow(scheduled.id)).active).toBe(false);
+      expect((await second.getWorkflow(manual.id)).active).toBe(true);
+      expect(harness.tasks).toHaveLength(0);
+      expect(harness.reports).toContainEqual(
+        expect.objectContaining({
+          scope: 'EmbeddedWorkflowService.rehydrateSchedules',
+          context: {
+            workflowId: scheduled.id,
+            currentExecutionTier: 'dedicated-lazy',
+          },
+        })
+      );
+    } finally {
+      await second.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('serializes activation and deactivation across schedule reconciliation', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(
+      scheduledDefinition('activate-deactivate-race', [30])
+    );
+    const internal = service as unknown as {
+      armSchedules: (workflowId: string) => Promise<void>;
+    };
+    const armSchedules = internal.armSchedules.bind(service);
+    let enterArm: (() => void) | undefined;
+    let releaseArm: (() => void) | undefined;
+    const armEntered = new Promise<void>((resolve) => {
+      enterArm = resolve;
+    });
+    const armReleased = new Promise<void>((resolve) => {
+      releaseArm = resolve;
+    });
+    internal.armSchedules = async (workflowId) => {
+      enterArm?.();
+      await armReleased;
+      await armSchedules(workflowId);
+    };
+
+    try {
+      const activation = service.activateWorkflow(workflow.id);
+      await armEntered;
+      let deactivationSettled = false;
+      const deactivation = service.deactivateWorkflow(workflow.id).finally(() => {
+        deactivationSettled = true;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(deactivationSettled).toBe(false);
+      releaseArm?.();
+
+      const [activated, deactivated] = await Promise.all([activation, deactivation]);
+      expect(activated.active).toBe(true);
+      expect(deactivated.active).toBe(false);
+      expect((await service.getWorkflow(workflow.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      releaseArm?.();
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('serializes an active update before deletion so no schedule task survives the row', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(scheduledDefinition('update-delete-race', [30]));
+    await service.activateWorkflow(workflow.id);
+    const internal = service as unknown as {
+      reconcileSchedules: (
+        workflowId: string,
+        definition: WorkflowDefinition | null
+      ) => Promise<void>;
+    };
+    const reconcileSchedules = internal.reconcileSchedules.bind(service);
+    let enterUpdateReconcile: (() => void) | undefined;
+    let releaseUpdateReconcile: (() => void) | undefined;
+    const updateReconcileEntered = new Promise<void>((resolve) => {
+      enterUpdateReconcile = resolve;
+    });
+    const updateReconcileReleased = new Promise<void>((resolve) => {
+      releaseUpdateReconcile = resolve;
+    });
+    internal.reconcileSchedules = async (workflowId, definition) => {
+      const interval = definition?.nodes[0]?.parameters.rule as
+        | { interval?: Array<{ secondsInterval?: number }> }
+        | undefined;
+      if (interval?.interval?.[0]?.secondsInterval === 45) {
+        enterUpdateReconcile?.();
+        await updateReconcileReleased;
+      }
+      await reconcileSchedules(workflowId, definition);
+    };
+
+    try {
+      const update = service.updateWorkflow(workflow.id, scheduledDefinition(workflow.id, [45]));
+      await updateReconcileEntered;
+      let deletionSettled = false;
+      const deletion = service.deleteWorkflow(workflow.id).finally(() => {
+        deletionSettled = true;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(deletionSettled).toBe(false);
+      releaseUpdateReconcile?.();
+
+      await Promise.all([update, deletion]);
+      await expect(service.getWorkflow(workflow.id)).rejects.toMatchObject({ statusCode: 404 });
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      releaseUpdateReconcile?.();
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('rolls back activation when its schedule task cannot be created', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(scheduledDefinition('activate-rollback', [30]));
+    harness.control.failTaskCreateAt = harness.taskOps.creates + 1;
+
+    try {
+      await expect(service.activateWorkflow(workflow.id)).rejects.toMatchObject({
+        code: 'WORKFLOW_LIFECYCLE_RECONCILE_FAILED',
+        context: { workflowId: workflow.id, operation: 'activate' },
+      });
+      expect((await service.getWorkflow(workflow.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('restores the prior definition and task snapshot after a partial schedule update', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(scheduledDefinition('update-rollback', [30]));
+    await service.activateWorkflow(workflow.id);
+    const previousWorkflow = await service.getWorkflow(workflow.id);
+    const previousTasks = structuredClone(harness.tasks);
+    // The changed first interval and added sibling both require creates. Fail
+    // the second so reconciliation has already deleted/replaced part of the set.
+    harness.control.failTaskCreateAt = harness.taskOps.creates + 2;
+
+    try {
+      await expect(
+        service.updateWorkflow(workflow.id, scheduledDefinition(workflow.id, [45, 60]))
+      ).rejects.toMatchObject({
+        code: 'WORKFLOW_LIFECYCLE_RECONCILE_FAILED',
+        context: { workflowId: workflow.id, operation: 'update' },
+      });
+      expect(await service.getWorkflow(workflow.id)).toMatchObject({
+        name: previousWorkflow.name,
+        active: true,
+        versionId: previousWorkflow.versionId,
+        nodes: previousWorkflow.nodes,
+      });
+      expect(harness.tasks).toEqual(previousTasks);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('restores active state and all tasks after a partial deactivation delete', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(
+      scheduledDefinition('deactivate-rollback', [30, 60])
+    );
+    await service.activateWorkflow(workflow.id);
+    const previous = await service.getWorkflow(workflow.id);
+    const previousTasks = structuredClone(harness.tasks);
+    harness.control.failTaskDeleteAt = harness.taskOps.deletes + 2;
+
+    try {
+      await expect(service.deactivateWorkflow(workflow.id)).rejects.toMatchObject({
+        code: 'WORKFLOW_LIFECYCLE_RECONCILE_FAILED',
+        context: { workflowId: workflow.id, operation: 'deactivate' },
+      });
+      expect(await service.getWorkflow(workflow.id)).toMatchObject({
+        active: true,
+        versionId: previous.versionId,
+      });
+      expect(harness.tasks).toEqual(previousTasks);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('restores a deleted workflow row and tasks when schedule cleanup fails', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    const workflow = await service.createWorkflow(scheduledDefinition('delete-rollback', [30, 60]));
+    await service.activateWorkflow(workflow.id);
+    const previous = await service.getWorkflow(workflow.id);
+    const previousTasks = structuredClone(harness.tasks);
+    harness.control.failTaskDeleteAt = harness.taskOps.deletes + 2;
+
+    try {
+      await expect(service.deleteWorkflow(workflow.id)).rejects.toMatchObject({
+        code: 'WORKFLOW_LIFECYCLE_RECONCILE_FAILED',
+        context: { workflowId: workflow.id, operation: 'delete' },
+      });
+      expect(await service.getWorkflow(workflow.id)).toMatchObject({
+        active: true,
+        versionId: previous.versionId,
+      });
+      expect(harness.tasks).toEqual(previousTasks);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
   test('respects a user deletion — no zombie re-seed after restart', async () => {
     const harness = await seedingHarness();
     const first = await harness.start();
@@ -682,7 +1114,12 @@ describe('EmbeddedWorkflowService', () => {
       const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-child-'));
       const client = new PGlite({ dataDir: join(dir, 'pglite') });
       const db = drizzle(client, { schema: dbSchema });
-      const runtime = { agentId: 'agent-test', db, getSetting: () => null, getService: () => null };
+      const runtime = {
+        agentId: 'agent-test',
+        db,
+        getSetting: (key) => key === 'WORKFLOW_SEED_DEFAULTS' ? false : null,
+        getService: () => null,
+      };
       const service = await EmbeddedWorkflowService.start(runtime);
       try {
         __setWorkflowHttpTransportForTests(runtime, {
@@ -902,7 +1339,9 @@ describe('EmbeddedWorkflowService', () => {
     const dataDir = join(dir, 'pglite');
     const firstClient = new PGlite({ dataDir });
     const firstDb = drizzle(firstClient, { schema: dbSchema });
-    const first = await EmbeddedWorkflowService.start(runtime({}, {}, firstDb));
+    const first = await EmbeddedWorkflowService.start(
+      runtime({ WORKFLOW_SEED_DEFAULTS: false }, {}, firstDb)
+    );
     const created = await first.createWorkflow({
       name: 'Persistent workflow',
       nodes: [
@@ -922,7 +1361,9 @@ describe('EmbeddedWorkflowService', () => {
 
     const secondClient = new PGlite({ dataDir });
     const secondDb = drizzle(secondClient, { schema: dbSchema });
-    const second = await EmbeddedWorkflowService.start(runtime({}, {}, secondDb));
+    const second = await EmbeddedWorkflowService.start(
+      runtime({ WORKFLOW_SEED_DEFAULTS: false }, {}, secondDb)
+    );
     const loaded = await second.getWorkflow(created.id);
 
     expect(loaded.name).toBe('Persistent workflow');
@@ -1008,7 +1449,13 @@ describe('EmbeddedWorkflowService', () => {
       const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-code-'));
       const client = new PGlite({ dataDir: join(dir, 'pglite') });
       const db = drizzle(client, { schema: dbSchema });
-      const runtime = { agentId: 'agent-test', character: { settings: {} }, db, getSetting: () => null, getService: () => null };
+      const runtime = {
+        agentId: 'agent-test',
+        character: { settings: {} },
+        db,
+        getSetting: (key) => key === 'WORKFLOW_SEED_DEFAULTS' ? false : null,
+        getService: () => null,
+      };
       const service = await EmbeddedWorkflowService.start(runtime);
       try {
         const created = await service.createWorkflow({
@@ -1126,7 +1573,13 @@ describe('EmbeddedWorkflowService', () => {
       const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-smithers-'));
       const client = new PGlite({ dataDir: join(dir, 'pglite') });
       const db = drizzle(client, { schema: dbSchema });
-      const runtime = { agentId: 'agent-test', character: { settings: {} }, db, getSetting: () => null, getService: () => null };
+      const runtime = {
+        agentId: 'agent-test',
+        character: { settings: {} },
+        db,
+        getSetting: (key) => key === 'WORKFLOW_SEED_DEFAULTS' ? false : null,
+        getService: () => null,
+      };
       const service = await EmbeddedWorkflowService.start(runtime);
       let smithersDbPath = null;
       try {
@@ -1234,7 +1687,13 @@ describe('EmbeddedWorkflowService', () => {
       const dir = await mkdtemp(join(tmpdir(), 'embedded-workflows-webhook-'));
       const client = new PGlite({ dataDir: join(dir, 'pglite') });
       const db = drizzle(client, { schema: dbSchema });
-      const runtime = { agentId: 'agent-test', character: { settings: {} }, db, getSetting: () => null, getService: () => null };
+      const runtime = {
+        agentId: 'agent-test',
+        character: { settings: {} },
+        db,
+        getSetting: (key) => key === 'WORKFLOW_SEED_DEFAULTS' ? false : null,
+        getService: () => null,
+      };
       const service = await EmbeddedWorkflowService.start(runtime);
       try {
         const created = await service.createWorkflow({

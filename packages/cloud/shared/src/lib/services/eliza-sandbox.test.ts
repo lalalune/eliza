@@ -173,7 +173,10 @@ function customSandbox(): AgentSandbox {
     last_heartbeat_at: null,
     error_message: null,
     error_count: 0,
-    environment_vars: { ELIZA_API_TOKEN: "agent-token" },
+    environment_vars: {
+      ELIZA_API_TOKEN: "agent-token",
+      ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+    },
     node_id: "node-1",
     container_name: "agent-e06bb509",
     bridge_port: 18923,
@@ -995,7 +998,10 @@ describe("ElizaSandboxService provision — node attribution guard (C1b)", () =>
       bridge_port: null,
       web_ui_port: null,
       headscale_ip: null,
-      environment_vars: {},
+      environment_vars: {
+        ELIZA_API_TOKEN: "agent-current",
+        ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+      },
     };
   }
 
@@ -2635,6 +2641,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(
       undefined,
     );
+    const rotateSpy = spyOn(agentSandboxesRepository, "rotateProvisioningCredential");
     const create = mock(async () => providerHandle());
     const provider: SandboxProvider = {
       create,
@@ -2650,9 +2657,11 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
       // Reusing the live container is the whole point — a second create would
       // double-provision and orphan a container.
       expect(create).not.toHaveBeenCalled();
+      expect(rotateSpy).not.toHaveBeenCalled();
     } finally {
       findSpy.mockRestore();
       lockSpy.mockRestore();
+      rotateSpy.mockRestore();
     }
   });
 
@@ -2672,6 +2681,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(
       undefined,
     );
+    const rotateSpy = spyOn(agentSandboxesRepository, "rotateProvisioningCredential");
     const create = mock(async () => providerHandle());
     const provider: SandboxProvider = {
       create,
@@ -2684,11 +2694,102 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
       expect(res.error).toBe("Agent is already being provisioned");
       expect(res.sandboxRecord).toBe(provisioningRow);
       expect(create).not.toHaveBeenCalled();
+      expect(rotateSpy).not.toHaveBeenCalled();
     } finally {
       findSpy.mockRestore();
       lockSpy.mockRestore();
+      rotateSpy.mockRestore();
     }
   });
+
+  for (const legacyStatus of ["stopped", "sleeping", "disconnected", "error", "pending"] as const) {
+    test(`legacy ${legacyStatus} credential is rotated and durably marked before create`, async () => {
+      const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+      const originalRow: AgentSandbox = {
+        ...provisioningReadyRow(),
+        status: legacyStatus,
+        sandbox_id: null,
+        node_id: null,
+        container_name: null,
+        bridge_port: null,
+        web_ui_port: null,
+        headscale_ip: null,
+        environment_vars: { ELIZA_API_TOKEN: "agent_legacy_exposed" },
+      };
+      let storedRow: AgentSandbox = { ...originalRow, status: "provisioning" };
+      const findSpy = spyOn(agentSandboxesRepository, "findByIdAndOrg").mockResolvedValue(
+        originalRow,
+      );
+      const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(
+        storedRow,
+      );
+      const findByIdSpy = spyOn(agentSandboxesRepository, "findById").mockImplementation(
+        async () => storedRow,
+      );
+      const rotateSpy = spyOn(
+        agentSandboxesRepository,
+        "rotateProvisioningCredential",
+      ).mockImplementation(async (params) => {
+        storedRow = {
+          ...storedRow,
+          environment_vars: params.environmentVars,
+          updated_at: new Date(storedRow.updated_at.getTime() + 1),
+        };
+        return storedRow;
+      });
+      const updateSpy = spyOn(agentSandboxesRepository, "update").mockImplementation(
+        async (_id, data) => {
+          storedRow = { ...storedRow, ...data } as AgentSandbox;
+          return storedRow;
+        },
+      );
+      const apiKeySpy = spyOn(apiKeysService, "createForAgent").mockResolvedValue({
+        id: "22222222-2222-4222-8222-222222222222",
+        plainKey: "eliza_test_agent_key",
+        prefix: "eliza_test",
+      });
+      const create = mock(async () => {
+        throw new Error("synthetic create failure");
+      });
+      const provider: SandboxProvider = {
+        create,
+        stop: mock(async () => {}),
+        checkHealth: mock(async () => true),
+      };
+
+      try {
+        const result = await new ElizaSandboxService(provider).provision(AGENT, ORG);
+
+        expect(result.success).toBe(false);
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(rotateSpy).toHaveBeenCalledTimes(1);
+        const rotation = rotateSpy.mock.calls[0]?.[0];
+        expect(rotation?.clearContainerHandle).toBe(false);
+        expect(rotation?.environmentVars.ELIZA_API_TOKEN).toMatch(/^agent_[a-f0-9]{32}$/);
+        expect(rotation?.environmentVars.ELIZA_API_TOKEN).not.toBe("agent_legacy_exposed");
+        expect(rotation?.environmentVars.ELIZA_API_TOKEN_GENERATION).toBe("scoped-principal-v1");
+        const createConfig = create.mock.calls[0]?.[0];
+        expect(createConfig?.environmentVars?.ELIZA_API_TOKEN).toBe(
+          rotation?.environmentVars.ELIZA_API_TOKEN,
+        );
+        expect(createConfig?.environmentVars?.ELIZA_API_TOKEN_GENERATION).toBe(
+          "scoped-principal-v1",
+        );
+        // A provider failure never restores the credential that pairing exposed.
+        expect((storedRow.environment_vars as Record<string, string>).ELIZA_API_TOKEN).toBe(
+          rotation?.environmentVars.ELIZA_API_TOKEN,
+        );
+        expect(JSON.stringify(storedRow.environment_vars)).not.toContain("agent_legacy_exposed");
+      } finally {
+        findSpy.mockRestore();
+        lockSpy.mockRestore();
+        findByIdSpy.mockRestore();
+        rotateSpy.mockRestore();
+        updateSpy.mockRestore();
+        apiKeySpy.mockRestore();
+      }
+    });
+  }
 
   test("(3) UNIQUE (port TOCTOU) on attempt 1 → ghost stop + retry → attempt 2 succeeds", async () => {
     const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
@@ -2868,6 +2969,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
       expect(res.success).toBe(true);
       expect(create.mock.calls[0]?.[0]).toMatchObject({
         dockerImage: customImage,
+        executionTier: "custom",
       });
     } finally {
       findSpy.mockRestore();
@@ -3930,7 +4032,130 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     }
   });
 
-  test("(10) retry after transport_unresolved adopts the persisted container instead of re-creating it", async () => {
+  test("(10) unmarked provisioning retry retires the legacy container and recreates with a rotated credential", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const row: AgentSandbox = {
+      ...provisioningReadyRow(),
+      status: "provisioning",
+      sandbox_id: "sandbox-legacy-1",
+      bridge_url: "https://legacy-runtime.example",
+      health_url: "https://legacy-runtime.example/api/health",
+      node_id: "node-legacy",
+      container_name: "agent-legacy-1",
+      bridge_port: 3333,
+      web_ui_port: 4444,
+      headscale_ip: "100.64.0.41",
+      environment_vars: { ELIZA_API_TOKEN: "agent_legacy_exposed" },
+    };
+    let rotatedRow: AgentSandbox | undefined;
+    const findSpy = spyOn(agentSandboxesRepository, "findByIdAndOrg").mockResolvedValue(row);
+    const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(row);
+    const findByIdSpy = spyOn(agentSandboxesRepository, "findById").mockImplementation(
+      async () => rotatedRow ?? row,
+    );
+    const rotateSpy = spyOn(
+      agentSandboxesRepository,
+      "rotateProvisioningCredential",
+    ).mockImplementation(async (params) => {
+      rotatedRow = {
+        ...row,
+        sandbox_id: null,
+        bridge_url: null,
+        health_url: null,
+        node_id: null,
+        container_name: null,
+        bridge_port: null,
+        web_ui_port: null,
+        headscale_ip: null,
+        environment_vars: params.environmentVars,
+        updated_at: new Date(row.updated_at.getTime() + 1),
+      };
+      return rotatedRow;
+    });
+    const updateSpy = spyOn(agentSandboxesRepository, "update").mockImplementation(
+      async (_id, data) => {
+        rotatedRow = { ...(rotatedRow ?? row), ...data } as AgentSandbox;
+        return rotatedRow;
+      },
+    );
+    const apiKeySpy = spyOn(apiKeysService, "createForAgent").mockResolvedValue({
+      id: "22222222-2222-4222-8222-222222222222",
+      plainKey: "eliza_test_agent_key",
+      prefix: "eliza_test",
+    });
+    const stop = mock(async () => {});
+    const create = mock(async (_config: Parameters<SandboxProvider["create"]>[0]) => {
+      throw new Error("synthetic create failure after safe retirement");
+    });
+    const provider: SandboxProvider = {
+      create,
+      stop,
+      checkHealth: mock(async () => true),
+    };
+
+    try {
+      const result = await new ElizaSandboxService(provider).provision(AGENT, ORG);
+
+      expect(result.success).toBe(false);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledWith("sandbox-legacy-1");
+      expect(rotateSpy).toHaveBeenCalledTimes(1);
+      expect(rotateSpy.mock.calls[0]?.[0].clearContainerHandle).toBe(true);
+      expect(create).toHaveBeenCalledTimes(1);
+      const createEnv = create.mock.calls[0]?.[0].environmentVars;
+      expect(createEnv?.ELIZA_API_TOKEN).toMatch(/^agent_[a-f0-9]{32}$/);
+      expect(createEnv?.ELIZA_API_TOKEN).not.toBe("agent_legacy_exposed");
+      expect(createEnv?.ELIZA_API_TOKEN_GENERATION).toBe("scoped-principal-v1");
+    } finally {
+      findSpy.mockRestore();
+      lockSpy.mockRestore();
+      findByIdSpy.mockRestore();
+      rotateSpy.mockRestore();
+      updateSpy.mockRestore();
+      apiKeySpy.mockRestore();
+    }
+  });
+
+  test("(10a) unmarked provisioning retry fails closed when the legacy container cannot be retired", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const row: AgentSandbox = {
+      ...provisioningReadyRow(),
+      status: "provisioning",
+      sandbox_id: "sandbox-legacy-1",
+      bridge_url: "https://legacy-runtime.example",
+      health_url: "https://legacy-runtime.example/api/health",
+      environment_vars: { ELIZA_API_TOKEN: "agent_legacy_exposed" },
+    };
+    const findSpy = spyOn(agentSandboxesRepository, "findByIdAndOrg").mockResolvedValue(row);
+    const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(row);
+    const rotateSpy = spyOn(agentSandboxesRepository, "rotateProvisioningCredential");
+    const create = mock(async () => providerHandle());
+    const stop = mock(async () => {
+      throw new Error("SSH unavailable");
+    });
+    const provider: SandboxProvider = {
+      create,
+      stop,
+      checkHealth: mock(async () => true),
+    };
+
+    try {
+      const result = await new ElizaSandboxService(provider).provision(AGENT, ORG);
+
+      expect(result.success).toBe(false);
+      expect(result.retryable).toBe(true);
+      expect(result.error).toContain("teardown failed");
+      expect(stop).toHaveBeenCalledWith("sandbox-legacy-1");
+      expect(rotateSpy).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      lockSpy.mockRestore();
+      rotateSpy.mockRestore();
+    }
+  });
+
+  test("(10b) marked retry after transport_unresolved adopts the persisted container without rotating", async () => {
     const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
     const row: AgentSandbox = {
       ...provisioningReadyRow(),
@@ -3947,6 +4172,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     const finalRow: AgentSandbox = { ...row, status: "running" };
     const findSpy = spyOn(agentSandboxesRepository, "findByIdAndOrg").mockResolvedValue(row);
     const lockSpy = spyOn(agentSandboxesRepository, "trySetProvisioning").mockResolvedValue(row);
+    const rotateSpy = spyOn(agentSandboxesRepository, "rotateProvisioningCredential");
     const backupSpy = spyOn(agentSandboxesRepository, "getLatestBackup").mockResolvedValue(
       undefined,
     );
@@ -3985,6 +4211,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
       expect(res.success).toBe(true);
       expect(create).not.toHaveBeenCalled();
       expect(stop).not.toHaveBeenCalled();
+      expect(rotateSpy).not.toHaveBeenCalled();
       expect(healthInputs).toEqual([{ sandboxId: "sandbox-blue-1" }]);
       const runningWrite = updateSpy.mock.calls.find(
         ([, data]) => (data as { status?: string }).status === "running",
@@ -3997,6 +4224,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     } finally {
       findSpy.mockRestore();
       lockSpy.mockRestore();
+      rotateSpy.mockRestore();
       backupSpy.mockRestore();
       updateSpy.mockRestore();
       apiKeySpy.mockRestore();
@@ -4005,7 +4233,7 @@ describe("ElizaSandboxService.provision dedup + port-collision retry (LARP H2)",
     }
   });
 
-  test("(10b) retry adoption refuses persisted docker container without node_id", async () => {
+  test("(10c) marked retry adoption refuses persisted docker container without node_id", async () => {
     const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
     const row: AgentSandbox = {
       ...provisioningReadyRow(),
@@ -4401,11 +4629,23 @@ describe("ElizaSandboxService.executeUpgrade blue/green rollback + CAS guard (LA
       expect(res.error).toContain("rolled back to old container");
       expect(create).toHaveBeenCalledTimes(1);
       expect(checkHealth).toHaveBeenCalledTimes(1);
+      const blueConfig = create.mock.calls[0]?.[0] as
+        | { environmentVars?: Record<string, string>; executionTier?: string }
+        | undefined;
+      expect(blueConfig?.executionTier).toBe("custom");
+      expect(blueConfig?.environmentVars?.ELIZA_API_TOKEN).toMatch(/^agent_[a-f0-9]{32}$/);
+      expect(blueConfig?.environmentVars?.ELIZA_API_TOKEN).not.toBe("agent-token");
       // The unhealthy blue is torn down...
       expect(stop).toHaveBeenCalledTimes(1);
       expect(stop).toHaveBeenCalledWith("sandbox-new-1");
       // ...and the live row is never swapped.
       expect(transactionCalled).toBe(false);
+      // No authoritative write occurred, so rollback keeps the old serving
+      // credential paired with the old routing row.
+      expect(agent.environment_vars).toEqual({
+        ELIZA_API_TOKEN: "agent-token",
+        ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+      });
       expect(res.oldNodeId).toBe("node-old");
       expect(res.oldContainerName).toBe("agent-old-1");
     } finally {
@@ -4516,6 +4756,14 @@ describe("ElizaSandboxService.executeUpgrade blue/green rollback + CAS guard (LA
       create: async () => blueHandle(TO_DIGEST),
       checkHealth: async () => true,
     });
+    const healthRequests: Array<{ url: string; headers: Record<string, string> }> = [];
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      healthRequests.push({
+        url: fetchUrl(input),
+        headers: fetchHeaders(init?.headers),
+      });
+      return runtimeHealthResponse();
+    }) as unknown as typeof fetch;
     const svc = new ElizaSandboxService(provider);
     // Pin the lifecycle lock + the FOR-UPDATE read to a no-op / unchanged row so
     // the CAS guard passes and control reaches the UPDATE.
@@ -4569,6 +4817,40 @@ describe("ElizaSandboxService.executeUpgrade blue/green rollback + CAS guard (LA
       expect(params).toContain(TO_DIGEST); // image_digest := toDigest
       expect(params).toContain(FROM_DIGEST); // previous_image_digest := fromDigest
       expect(params).toContain(DOCKER_IMAGE); // previous_docker_image (agent.docker_image is null → dockerImage)
+      const blueConfig = create.mock.calls[0]?.[0] as
+        | { environmentVars?: Record<string, string> }
+        | undefined;
+      const rotatedToken = blueConfig?.environmentVars?.ELIZA_API_TOKEN;
+      expect(rotatedToken).toMatch(/^agent_[a-f0-9]{32}$/);
+      expect(rotatedToken).not.toBe("agent-token");
+      expect(healthRequests).toEqual([
+        {
+          url: "https://new-bridge.example/api/health",
+          headers: expect.objectContaining({
+            Authorization: `Bearer ${rotatedToken}`,
+            "X-Api-Key": rotatedToken,
+            "X-Eliza-Token": rotatedToken,
+          }),
+        },
+      ]);
+      const persistedEnvironment = params
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => {
+          try {
+            return JSON.parse(value) as Record<string, string>;
+          } catch {
+            return null;
+          }
+        })
+        .find((value) => value?.ELIZA_API_TOKEN === rotatedToken);
+      expect(persistedEnvironment).toEqual({
+        ELIZA_API_TOKEN: rotatedToken,
+        ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+      });
+      expect(agent.environment_vars).toEqual({
+        ELIZA_API_TOKEN: "agent-token",
+        ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+      });
       // Success clears the upgrade-exhaustion marker: a row frozen for a prior
       // target re-arms the moment a swap onto a new target lands (#15358).
       const updateSql = new PgDialect().sqlToQuery(executedSql as SQL).sql.toLowerCase();
@@ -4881,6 +5163,25 @@ describe("ElizaSandboxService.executeUpgrade blue/green rollback + CAS guard (LA
     expect(executedSql).toBeUndefined();
     expect(stop).toHaveBeenCalledWith("sandbox-new-1");
   });
+
+  test("(e4) concurrent environment edit keeps the old token/routing and abandons blue", async () => {
+    const editedRow: AgentSandbox = {
+      ...liveAgentRow(),
+      environment_vars: {
+        ELIZA_API_TOKEN: "agent-token",
+        USER_SETTING: "changed-during-blue-boot",
+      },
+    };
+    const { res, executedSql, stop } = await runSwapWithRow(liveAgentRow(), editedRow);
+    expect(res.success).toBe(false);
+    expect(res.error).toContain("Agent changed during upgrade");
+    expect(executedSql).toBeUndefined();
+    expect(stop).toHaveBeenCalledWith("sandbox-new-1");
+    expect(editedRow.environment_vars).toEqual({
+      ELIZA_API_TOKEN: "agent-token",
+      USER_SETTING: "changed-during-blue-boot",
+    });
+  });
 });
 
 // #9964 — executeDowngrade() symmetric blue/green rollback onto the persisted
@@ -5067,6 +5368,7 @@ describe("ElizaSandboxService.executeDowngrade rollback onto previous_image_dige
       expect(params).toContain(PREV_DIGEST); // image_digest := previous
       expect(create.mock.calls[0]?.[0]).toMatchObject({
         dockerImage: `ghcr.io/elizaos/eliza-agent@${PREV_DIGEST}`,
+        executionTier: "custom",
       });
       expect(create).toHaveBeenCalledTimes(1);
       expect(checkHealth).toHaveBeenCalledTimes(1);

@@ -54,7 +54,7 @@ import { WORKFLOW_MATCHING_SYSTEM_PROMPT } from './workflow-prompts/workflowMatc
 
 type StructuredModelRunner = {
   useModel<T>(
-    modelType: typeof ModelType.TEXT_SMALL,
+    modelType: WorkflowTextModelType,
     params: GenerateTextParams & { responseSchema: unknown },
     provider?: string
   ): Promise<T>;
@@ -144,10 +144,24 @@ function inferCerebrasMode(runtime: IAgentRuntime): boolean {
   return !!cerebrasKey && !readStringSetting(runtime, 'OPENAI_API_KEY') && !openAiBaseUrl;
 }
 
+function usesSubscriptionCliBackend(runtime: IAgentRuntime): boolean {
+  const backend = readStringSetting(runtime, 'ELIZA_CHAT_VIA_CLI')?.toLowerCase();
+  return (
+    backend === 'codex' ||
+    backend === 'codex-sdk' ||
+    backend === 'claude' ||
+    backend === 'claude-sdk'
+  );
+}
+
 function resolveWorkflowModelRouting(runtime: IAgentRuntime): WorkflowModelRouting | null {
   const explicitProvider = readFirstStringSetting(runtime, WORKFLOW_MODEL_PROVIDER_KEYS);
+  // A workflow-specific override is intentional, but ambient provider keys often coexist
+  // with subscription auth. In that case the CLI gate owns model selection so workflow
+  // generation cannot silently bypass the user's configured subscription.
   const requestedProvider =
-    explicitProvider ?? (inferCerebrasMode(runtime) ? 'cerebras' : undefined);
+    explicitProvider ??
+    (!usesSubscriptionCliBackend(runtime) && inferCerebrasMode(runtime) ? 'cerebras' : undefined);
   const normalizedProvider = requestedProvider?.toLowerCase();
   const model =
     readFirstStringSetting(runtime, WORKFLOW_MODEL_KEYS) ??
@@ -219,7 +233,7 @@ async function useStructuredModel<T>(
     callSite
   );
   const result = await structuredRuntime.useModel<unknown>(
-    ModelType.TEXT_SMALL,
+    usesSubscriptionCliBackend(runtime) ? ModelType.TEXT_LARGE : ModelType.TEXT_SMALL,
     routed.params as GenerateTextParams & { responseSchema: unknown },
     routed.provider
   );
@@ -244,7 +258,11 @@ async function useWorkflowTextModel(
   callSite: string
 ): Promise<string> {
   const routed = withWorkflowModelRouting(runtime, params, callSite);
-  return (await runtime.useModel(modelType, routed.params, routed.provider)) as string;
+  const routedModelType =
+    modelType === ModelType.TEXT_SMALL && usesSubscriptionCliBackend(runtime)
+      ? ModelType.TEXT_LARGE
+      : modelType;
+  return (await runtime.useModel(routedModelType, routed.params, routed.provider)) as string;
 }
 
 /**

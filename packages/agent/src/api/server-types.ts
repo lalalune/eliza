@@ -61,6 +61,12 @@ export interface ConversationMeta {
   id: string;
   title: string;
   roomId: UUID;
+  /**
+   * Server-attested owner for managed Cloud conversations. This is kept
+   * outside caller-writable `metadata` so a client cannot reassign a chat by
+   * creating or patching a conversation with another user's principal.
+   */
+  cloudOwnerEntityId?: UUID;
   metadata?: ConversationMetadata;
   createdAt: string;
   updatedAt: string;

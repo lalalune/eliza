@@ -167,6 +167,103 @@ describe("viewContextEvaluator.shouldRun — contextual gate", () => {
 			),
 		).toBe(false);
 	});
+
+	it("does not override a successful WORKFLOW action handoff", async () => {
+		expect(
+			await viewContextEvaluator.shouldRun(
+				ctx("build a daily digest workflow", {
+					state: {
+						values: {},
+						data: {
+							actionResults: [
+								{
+									success: true,
+									data: { actionName: "WORKFLOW" },
+									values: { workflowId: "workflow-1" },
+								},
+							],
+						},
+						text: "",
+					},
+				}),
+			),
+		).toBe(false);
+	});
+
+	it("uses canonical action results from evaluator options before state", async () => {
+		expect(
+			await viewContextEvaluator.shouldRun(
+				ctx("build a daily digest workflow", {
+					options: {
+						didRespond: true,
+						actionResults: [
+							{
+								success: true,
+								data: { actionName: "WORKFLOW" },
+								values: { workflowId: "workflow-1" },
+							},
+						],
+					},
+					state: {
+						values: {},
+						data: {},
+						text: "",
+					},
+				}),
+			),
+		).toBe(false);
+	});
+
+	it("does not fall back to stale state when canonical options are present", async () => {
+		expect(
+			await viewContextEvaluator.shouldRun(
+				ctx("fix the workflow build failure", {
+					options: {
+						didRespond: true,
+						actionResults: [
+							{
+								success: false,
+								data: { actionName: "WORKFLOW" },
+							},
+						],
+					},
+					state: {
+						values: {},
+						data: {
+							actionResults: [
+								{
+									success: true,
+									data: { actionName: "WORKFLOW" },
+								},
+							],
+						},
+						text: "",
+					},
+				}),
+			),
+		).toBe(true);
+	});
+
+	it("still evaluates contextual routing after a failed WORKFLOW action", async () => {
+		expect(
+			await viewContextEvaluator.shouldRun(
+				ctx("fix the workflow build failure", {
+					state: {
+						values: {},
+						data: {
+							actionResults: [
+								{
+									success: false,
+									data: { actionName: "WORKFLOW" },
+								},
+							],
+						},
+						text: "",
+					},
+				}),
+			),
+		).toBe(true);
+	});
 });
 
 describe("viewContextEvaluator.prompt — GEPA-optimizable instruction", () => {

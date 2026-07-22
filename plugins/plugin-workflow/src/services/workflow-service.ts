@@ -997,12 +997,13 @@ export class WorkflowService extends Service {
         try {
           await client.deleteWorkflow(deployedWorkflow.id);
         } catch (cleanupError) {
-          // error-policy:J6 compensation is best-effort; the ownership failure
-          // below remains the primary error while the orphan cleanup is logged.
-          logger.error(
-            { src: 'plugin:workflow:service:main', cleanupError },
-            `Failed to remove unowned workflow ${deployedWorkflow.id}`
-          );
+          // error-policy:J2 ownership and compensation failures together mean
+          // the caller cannot assume the unowned definition was removed.
+          throw new ElizaError('Workflow ownership persistence and cleanup both failed', {
+            code: 'WORKFLOW_OWNERSHIP_COMPENSATION_FAILED',
+            cause: new AggregateError([error, cleanupError]),
+            context: { workflowId: deployedWorkflow.id, userId },
+          });
         }
         throw new ElizaError('Workflow ownership could not be persisted', {
           code: 'WORKFLOW_OWNERSHIP_PERSIST_FAILED',
@@ -1037,14 +1038,20 @@ export class WorkflowService extends Service {
           try {
             await client.deleteWorkflow(deployedWorkflow.id);
           } catch (cleanupError) {
-            // error-policy:J6 compensation is best-effort; the lifecycle
-            // failure remains primary while orphan cleanup is observable here.
-            logger.error(
-              { src: 'plugin:workflow:service:main', cleanupError },
-              `Failed to remove workflow ${deployedWorkflow.id} after lifecycle failure`
-            );
+            // error-policy:J2 both failures must cross the boundary because an
+            // orphan definition is materially different from a clean rejection.
+            throw new ElizaError('Workflow lifecycle change and cleanup both failed', {
+              code: 'WORKFLOW_ACTIVATION_COMPENSATION_FAILED',
+              cause: new AggregateError([error, cleanupError]),
+              context: { workflowId: deployedWorkflow.id, userId, desiredActive },
+            });
           }
         }
+        // Capability errors are already boundary-safe and carry the structured
+        // subscription contract consumed by HTTP and chat. Preserve that code
+        // and actionable message after compensation instead of flattening it
+        // into the generic lifecycle wrapper below.
+        if (error instanceof WorkflowApiError) throw error;
         throw new ElizaError(
           desiredActive ? 'Workflow activation failed' : 'Workflow deactivation failed',
           {
@@ -1187,27 +1194,25 @@ export class WorkflowService extends Service {
     userId?: string
   ): Promise<WorkflowExecution> {
     const mode = options?.mode ?? 'manual';
+    const idempotencyKey = options?.idempotencyKey?.trim() || undefined;
     const execute = async () => {
       if (userId) await this.assertWorkflowOwned(workflowId, userId);
       return this.getClient().executeWorkflow(workflowId, {
         mode,
         triggerData: options?.triggerData,
-        idempotencyKey: options?.idempotencyKey,
+        idempotencyKey,
         throwOnError: options?.throwOnError,
       });
     };
-    if (mode !== 'manual') return execute();
+    if (mode !== 'manual' || !idempotencyKey) return execute();
 
-    // Manual runs are synchronous at the HTTP/action boundary. Coalesce only
-    // exact semantic duplicates so transport retries cannot repeat side effects
-    // while callers with distinct payloads or execution behavior remain independent.
+    // Only an explicit caller-owned key establishes retry identity. Identical
+    // user requests without one remain independent workflow invocations.
     const ownerId = userId?.trim() || getLocalOwnerEntityId(this.runtime);
     const inFlightKey = stableStringify({
       ownerId,
       workflowId,
-      triggerData: options?.triggerData,
-      idempotencyKey: options?.idempotencyKey,
-      throwOnError: options?.throwOnError ?? true,
+      idempotencyKey,
     });
     const existing = this.manualRunsInFlight.get(inFlightKey);
     if (existing) return existing;

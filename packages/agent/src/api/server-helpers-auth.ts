@@ -21,6 +21,7 @@ import {
   stripOptionalHostPort,
 } from "@elizaos/shared";
 import { isRegisteredTokenRoleAuthorized } from "./boundary-role-resolver.ts";
+import { resolveTrustedCloudPrincipal } from "./cloud-principal.ts";
 import { sweepExpiredEntries } from "./memory-bounds.ts";
 
 // ---------------------------------------------------------------------------
@@ -671,7 +672,11 @@ export function isWebSocketAuthorized(
 
   const handshakeToken = extractWebSocketHandshakeToken(request, url);
   if (!handshakeToken) return false;
-  return tokenMatches(expected, handshakeToken);
+  if (!tokenMatches(expected, handshakeToken)) return false;
+  return (
+    !isCloudProvisionedContainer() ||
+    Boolean(resolveTrustedCloudPrincipal(request))
+  );
 }
 
 export interface WebSocketUpgradeRejection {
@@ -717,6 +722,10 @@ export function resolveWebSocketUpgradeRejection(
   // Cloud containers must authenticate at the handshake level because there is
   // no trusted upstream proxy handling auth for the WebSocket path.
   if (!handshakeToken && isCloudProvisionedContainer()) {
+    return { status: 401, reason: "Unauthorized" };
+  }
+
+  if (isCloudProvisionedContainer() && !resolveTrustedCloudPrincipal(req)) {
     return { status: 401, reason: "Unauthorized" };
   }
 

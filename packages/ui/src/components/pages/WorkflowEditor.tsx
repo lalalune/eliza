@@ -27,6 +27,7 @@ import {
   PlayCircle,
   Power,
   RefreshCw,
+  Rocket,
   RotateCcw,
   Save,
   Wand2,
@@ -39,6 +40,7 @@ import type {
   WorkflowExecution,
   WorkflowRevision,
 } from "../../api/client-types-chat";
+import { isApiError } from "../../api/client-types-core";
 import { dispatchChatPrefill } from "../../events";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import {
@@ -62,13 +64,19 @@ import { WorkflowGraphViewer } from "./WorkflowGraphViewer";
 
 export interface WorkflowEditorProps {
   initial?: WorkflowDefinition | null;
+  cloudAgentId?: string | null;
+  onEnableAlwaysOn?: (agentId: string) => void;
   onSaved?: (workflow: WorkflowDefinition) => void;
+  onChanged?: () => void;
   onCancel?: () => void;
 }
 
 export function WorkflowEditor({
   initial = null,
+  cloudAgentId = null,
+  onEnableAlwaysOn,
   onSaved,
+  onChanged,
   onCancel,
 }: WorkflowEditorProps) {
   const [text, setText] = useState(() => workflowToJsonText(initial));
@@ -91,7 +99,11 @@ export function WorkflowEditor({
   );
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [runStatusUnknown, setRunStatusUnknown] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [alwaysOnRequirement, setAlwaysOnRequirement] = useState<string | null>(
+    null,
+  );
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [executions, setExecutions] = useState<WorkflowExecution[]>([]);
   const [executionsLoading, setExecutionsLoading] = useState(false);
@@ -126,7 +138,9 @@ export function WorkflowEditor({
       settings: {},
     });
     setSaveError(null);
+    setAlwaysOnRequirement(null);
     setExecutionError(null);
+    setRunStatusUnknown(false);
     setExecutions([]);
     setSelectedExecutionId(null);
     setDiagnosticsCopying(false);
@@ -149,26 +163,41 @@ export function WorkflowEditor({
   const activeWorkflow = lastValidWorkflow ?? initial;
   const workflowIsActive = activeWorkflow?.active === true;
 
-  const refreshExecutions = useCallback(async () => {
-    if (!persistedWorkflowId) {
-      setExecutions([]);
-      setSelectedExecutionId(null);
-      return;
+  const captureAlwaysOnRequirement = useCallback((error: unknown): boolean => {
+    if (isApiError(error) && error.code === "workflow_requires_always_on") {
+      setAlwaysOnRequirement(error.message);
+      return true;
     }
-    setExecutionsLoading(true);
-    setExecutionError(null);
-    try {
-      const next = await client.getWorkflowExecutions(persistedWorkflowId, 20);
-      setExecutions(next);
-      setSelectedExecutionId((current) => current ?? next[0]?.id ?? null);
-    } catch (e) {
-      setExecutionError(
-        e instanceof Error ? e.message : "Failed to load workflow runs.",
-      );
-    } finally {
-      setExecutionsLoading(false);
-    }
-  }, [persistedWorkflowId]);
+    return false;
+  }, []);
+
+  const refreshExecutions = useCallback(
+    async (confirmUnknownRun = false) => {
+      if (!persistedWorkflowId) {
+        setExecutions([]);
+        setSelectedExecutionId(null);
+        return;
+      }
+      setExecutionsLoading(true);
+      setExecutionError(null);
+      try {
+        const next = await client.getWorkflowExecutions(
+          persistedWorkflowId,
+          20,
+        );
+        setExecutions(next);
+        setSelectedExecutionId((current) => current ?? next[0]?.id ?? null);
+        if (confirmUnknownRun) setRunStatusUnknown(false);
+      } catch (e) {
+        setExecutionError(
+          e instanceof Error ? e.message : "Failed to load workflow runs.",
+        );
+      } finally {
+        setExecutionsLoading(false);
+      }
+    },
+    [persistedWorkflowId],
+  );
 
   useEffect(() => {
     void refreshExecutions();
@@ -237,6 +266,7 @@ export function WorkflowEditor({
       return;
     }
     setSaveError(null);
+    setAlwaysOnRequirement(null);
     setSaving(true);
     try {
       const req = toWriteRequest(parseState);
@@ -251,7 +281,11 @@ export function WorkflowEditor({
       void refreshExecutions();
       void loadRevisionsForWorkflow(saved.id, saved.versionId ?? null);
     } catch (e) {
-      setSaveError(e instanceof Error ? e.message : "Failed to save workflow.");
+      if (!captureAlwaysOnRequirement(e)) {
+        setSaveError(
+          e instanceof Error ? e.message : "Failed to save workflow.",
+        );
+      }
     } finally {
       setSaving(false);
     }
@@ -261,6 +295,7 @@ export function WorkflowEditor({
     onSaved,
     refreshExecutions,
     loadRevisionsForWorkflow,
+    captureAlwaysOnRequirement,
   ]);
 
   const handleToggleActive = useCallback(async () => {
@@ -270,6 +305,7 @@ export function WorkflowEditor({
     }
     setSaving(true);
     setSaveError(null);
+    setAlwaysOnRequirement(null);
     try {
       const updated = workflowIsActive
         ? await client.deactivateWorkflowDefinition(persistedWorkflowId)
@@ -277,19 +313,34 @@ export function WorkflowEditor({
       setCurrentVersionId(updated.versionId ?? null);
       setLastValidWorkflow(updated);
       setText(workflowToJsonText(updated));
+      onChanged?.();
       void refreshRevisions();
     } catch (e) {
-      setSaveError(
-        e instanceof Error ? e.message : "Failed to update workflow state.",
-      );
+      if (!captureAlwaysOnRequirement(e)) {
+        setSaveError(
+          e instanceof Error ? e.message : "Failed to update workflow state.",
+        );
+      }
     } finally {
       setSaving(false);
     }
-  }, [persistedWorkflowId, workflowIsActive, refreshRevisions]);
+  }, [
+    persistedWorkflowId,
+    workflowIsActive,
+    onChanged,
+    refreshRevisions,
+    captureAlwaysOnRequirement,
+  ]);
 
   const handleRunNow = useCallback(async () => {
     if (!persistedWorkflowId) {
       setSaveError("Save the workflow before running it.");
+      return;
+    }
+    if (runStatusUnknown) {
+      setExecutionError(
+        "Refresh workflow runs before trying again; the previous run may still be processing.",
+      );
       return;
     }
     setRunning(true);
@@ -304,20 +355,30 @@ export function WorkflowEditor({
       setSelectedExecutionId(execution.id);
       setDiagnosticsCopied(false);
       setEvaluationSamplesCopied(false);
+      setRunStatusUnknown(false);
+      onChanged?.();
     } catch (e) {
+      const ambiguousCompletion =
+        isApiError(e) && (e.code === "agent_timeout" || e.kind === "timeout");
+      setRunStatusUnknown(ambiguousCompletion);
       setExecutionError(
-        e instanceof Error ? e.message : "Failed to run workflow.",
+        ambiguousCompletion
+          ? "The run did not confirm completion before the timeout. It may still be processing; refresh workflow runs before trying again."
+          : e instanceof Error
+            ? e.message
+            : "Failed to run workflow.",
       );
     } finally {
       setRunning(false);
     }
-  }, [persistedWorkflowId]);
+  }, [persistedWorkflowId, runStatusUnknown, onChanged]);
 
   const handleRestoreRevision = useCallback(
     async (versionId: string) => {
       if (!persistedWorkflowId) return;
       setSaving(true);
       setSaveError(null);
+      setAlwaysOnRequirement(null);
       setRevisionsError(null);
       try {
         const restored = await client.restoreWorkflowRevision(
@@ -331,16 +392,24 @@ export function WorkflowEditor({
         void refreshExecutions();
         void refreshRevisions();
       } catch (e) {
-        setRevisionsError(
-          e instanceof Error
-            ? e.message
-            : "Failed to restore workflow version.",
-        );
+        if (!captureAlwaysOnRequirement(e)) {
+          setRevisionsError(
+            e instanceof Error
+              ? e.message
+              : "Failed to restore workflow version.",
+          );
+        }
       } finally {
         setSaving(false);
       }
     },
-    [persistedWorkflowId, onSaved, refreshExecutions, refreshRevisions],
+    [
+      persistedWorkflowId,
+      onSaved,
+      refreshExecutions,
+      refreshRevisions,
+      captureAlwaysOnRequirement,
+    ],
   );
 
   const handleCopyDiagnostics = useCallback(async () => {
@@ -489,8 +558,10 @@ export function WorkflowEditor({
     role: "button",
     label: "Run workflow now",
     group: "workflow-toolbar",
-    description: "Run the saved workflow once and show the execution.",
-    status: running ? "busy" : undefined,
+    description: runStatusUnknown
+      ? "Refresh recent runs before starting another execution."
+      : "Run the saved workflow once and show the execution.",
+    status: running ? "busy" : runStatusUnknown ? "inactive" : undefined,
     onActivate: () => void handleRunNow(),
   });
 
@@ -501,7 +572,7 @@ export function WorkflowEditor({
     group: "workflow-executions",
     description: "Reload recent workflow executions.",
     status: executionsLoading ? "busy" : undefined,
-    onActivate: () => void refreshExecutions(),
+    onActivate: () => void refreshExecutions(true),
   });
 
   const copyDiagnosticsButton = useAgentElement<HTMLButtonElement>({
@@ -574,13 +645,13 @@ export function WorkflowEditor({
         <Button
           ref={editInChatButton.ref}
           {...editInChatButton.agentProps}
+          aria-label="Edit in chat"
           variant="outline"
           size="sm"
           onClick={handleEditInChat}
         >
           <ClipboardList className="mr-1.5 h-3.5 w-3.5" aria-hidden />
-          <span className="hidden sm:inline">Edit in chat</span>
-          <span className="sm:hidden">Chat</span>
+          <span>Edit in chat</span>
         </Button>
         <Button
           ref={formatButton.ref}
@@ -632,14 +703,14 @@ export function WorkflowEditor({
             variant="outline"
             size="sm"
             onClick={() => void handleRunNow()}
-            disabled={running || saving}
+            disabled={running || saving || runStatusUnknown}
           >
             {running ? (
               <Spinner className="mr-1.5 h-3.5 w-3.5" />
             ) : (
               <PlayCircle className="mr-1.5 h-3.5 w-3.5" aria-hidden />
             )}
-            Run now
+            {runStatusUnknown ? "Refresh runs first" : "Run now"}
           </Button>
         )}
         {onCancel && (
@@ -658,6 +729,34 @@ export function WorkflowEditor({
       {(saveError || lineErrorBanner) && (
         <div className="rounded-sm border border-danger/20 bg-danger/10 p-2.5 text-xs text-danger">
           {saveError ?? lineErrorBanner}
+        </div>
+      )}
+
+      {alwaysOnRequirement && (
+        <div
+          role="alert"
+          data-testid="workflow-always-on-required"
+          className="flex flex-col gap-3 rounded-sm border border-warning/25 bg-warning/10 p-3 text-sm text-accent-muted dark:text-warning sm:flex-row sm:items-center"
+        >
+          <AlertTriangle className="h-5 w-5 shrink-0" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">Always-on agent required</p>
+            <p className="mt-1 text-xs opacity-90">{alwaysOnRequirement}</p>
+            <p className="mt-1 text-xs opacity-90">
+              Enabling always-on changes this agent from scale-to-zero to
+              continuous hosting and starts continuous hourly credit usage.
+            </p>
+          </div>
+          {cloudAgentId && onEnableAlwaysOn && (
+            <Button
+              size="sm"
+              className="min-h-11 shrink-0 sm:min-h-8"
+              onClick={() => onEnableAlwaysOn(cloudAgentId)}
+            >
+              <Rocket className="h-4 w-4" aria-hidden />
+              Enable always-on
+            </Button>
+          )}
         </div>
       )}
 
@@ -740,7 +839,7 @@ export function WorkflowEditor({
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7"
-                onClick={() => void refreshExecutions()}
+                onClick={() => void refreshExecutions(true)}
                 disabled={!persistedWorkflowId || executionsLoading}
                 aria-label="Refresh workflow runs"
               >

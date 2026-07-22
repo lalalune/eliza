@@ -267,9 +267,9 @@ function buildPrompt(params: {
 			(text): text is string => typeof text === "string" && text.length > 0,
 		)
 		.join("\n");
-	const actionResults = isRecord(state.data)
-		? state.data.actionResults
-		: undefined;
+	const actionResults =
+		options.actionResults ??
+		(isRecord(state.data) ? state.data.actionResults : undefined);
 	const providerContext = state.text.trim() || "(none)";
 	const sharedParts = {
 		latestMessage,

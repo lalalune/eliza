@@ -12,7 +12,9 @@ import {
   test,
 } from "bun:test";
 import * as agentSandboxesActual from "@/db/repositories/agent-sandboxes";
+import * as usersActual from "@/db/repositories/users";
 import * as authActual from "@/lib/auth";
+import * as dedicatedSessionActual from "@/lib/auth/dedicated-agent-session";
 import * as cloudBindingsActual from "@/lib/runtime/cloud-bindings";
 import * as billingGateActual from "@/lib/services/agent-billing-gate";
 import * as provisioningJobsActual from "@/lib/services/provisioning-jobs";
@@ -27,6 +29,14 @@ let creditGateResult: { allowed: boolean; balance: number; error?: string } = {
   balance: 100,
 };
 let enqueueCalls = 0;
+let enqueueError: Error | null = null;
+let pairedUserResult: Record<string, unknown> | undefined;
+let pairedSessionResult:
+  | { valid: true; claims: dedicatedSessionActual.DedicatedAgentSessionClaims }
+  | { valid: false; code: "invalid_token" | "not_configured" } = {
+  valid: false,
+  code: "invalid_token",
+};
 
 mock.module("@/lib/runtime/cloud-bindings", () => ({
   ...cloudBindingsActual,
@@ -39,11 +49,22 @@ mock.module("@/lib/auth", () => ({
     return authResult;
   },
 }));
+mock.module("@/lib/auth/dedicated-agent-session", () => ({
+  ...dedicatedSessionActual,
+  verifyDedicatedAgentSession: async () => pairedSessionResult,
+}));
 mock.module("@/db/repositories/agent-sandboxes", () => ({
   ...agentSandboxesActual,
   agentSandboxesRepository: {
     ...agentSandboxesActual.agentSandboxesRepository,
     findByIdAndOrg: async () => sandboxResult,
+  },
+}));
+mock.module("@/db/repositories/users", () => ({
+  ...usersActual,
+  usersRepository: {
+    ...usersActual.usersRepository,
+    findWithOrganization: async () => pairedUserResult,
   },
 }));
 mock.module("@/lib/services/provisioning-jobs", () => ({
@@ -52,6 +73,7 @@ mock.module("@/lib/services/provisioning-jobs", () => ({
     ...provisioningJobsActual.provisioningJobService,
     enqueueAgentProvisionOnce: async () => {
       enqueueCalls++;
+      if (enqueueError) throw enqueueError;
       return {
         job: { id: "job-1" },
         created: true,
@@ -92,7 +114,12 @@ afterAll(() => {
   globalThis.fetch = originalFetch;
   mock.module("@/lib/runtime/cloud-bindings", () => cloudBindingsActual);
   mock.module("@/lib/auth", () => authActual);
+  mock.module(
+    "@/lib/auth/dedicated-agent-session",
+    () => dedicatedSessionActual,
+  );
   mock.module("@/db/repositories/agent-sandboxes", () => agentSandboxesActual);
+  mock.module("@/db/repositories/users", () => usersActual);
   mock.module("@/lib/services/agent-billing-gate", () => billingGateActual);
   mock.module("@/lib/services/provisioning-jobs", () => provisioningJobsActual);
   mock.module(
@@ -139,6 +166,9 @@ beforeEach(() => {
   sandboxResult = null;
   creditGateResult = { allowed: true, balance: 100 };
   enqueueCalls = 0;
+  enqueueError = null;
+  pairedSessionResult = { valid: false, code: "invalid_token" };
+  pairedUserResult = undefined;
 });
 
 describe("dedicated-agent-proxy — unified auth", () => {
@@ -159,6 +189,10 @@ describe("dedicated-agent-proxy — unified auth", () => {
       "Bearer agent-secret-token",
     );
     expect(captured?.headers.get("x-api-key")).toBeNull();
+    expect(captured?.headers.get("x-eliza-user-id")).toBe("u1");
+    expect(captured?.headers.get("x-eliza-principal-token")).toBe(
+      "agent-secret-token",
+    );
     expect(new URL(captured?.url ?? "").hostname).toBe("cp.example.test");
     // withCors backfills the browser Origin even though the mocked upstream
     // ("ok") carried none, so the proxied response is never CORS-opaque (#15347).
@@ -167,11 +201,166 @@ describe("dedicated-agent-proxy — unified auth", () => {
     );
   });
 
-  test("NO cloud token → pass through unchanged (never injects the agent token)", async () => {
+  test("two users in one org retain distinct principals and caller spoofing is overwritten", async () => {
+    sandboxResult = runningDedicated;
+    for (const userId of ["user-a", "user-b"]) {
+      authResult = { user: { id: userId, organization_id: "org1" } };
+      const headers = new Headers({
+        authorization: `Bearer cloud-token-${userId}`,
+        "x-eliza-user-id": "spoofed-user",
+        "x-server-token": "spoofed-server-secret",
+      });
+      const request = new Request(
+        `https://${AGENT}.elizacloud.ai/api/workflow/workflows`,
+        { headers },
+      );
+      const response = await handleDedicatedAgentProxy(
+        request,
+        ENV,
+        urlOf(request),
+        AGENT,
+      );
+
+      expect(response.status).toBe(200);
+      expect(captured?.headers.get("x-eliza-user-id")).toBe(userId);
+      expect(captured?.headers.get("x-eliza-principal-token")).toBe(
+        "agent-secret-token",
+      );
+    }
+  });
+
+  test("a paired scoped session authenticates without exposing the container token", async () => {
+    pairedSessionResult = {
+      valid: true,
+      claims: {
+        userId: "paired-user",
+        organizationId: "org1",
+        agentId: AGENT,
+      },
+    };
+    pairedUserResult = {
+      id: "paired-user",
+      organization_id: "org1",
+      is_active: true,
+      deleted_at: null,
+      organization: { id: "org1", is_active: true },
+    };
+    sandboxResult = runningDedicated;
+    const request = makeRequest("paired-session-token");
+
+    const response = await handleDedicatedAgentProxy(
+      request,
+      ENV,
+      urlOf(request),
+      AGENT,
+    );
+
+    expect(response.status).toBe(200);
+    expect(captured?.headers.get("authorization")).toBe(
+      "Bearer agent-secret-token",
+    );
+    expect(captured?.headers.get("x-eliza-user-id")).toBe("paired-user");
+  });
+
+  test("fails closed when the per-agent principal transport is not configured", async () => {
+    authResult = { user: { id: "u1", organization_id: "org1" } };
+    sandboxResult = { ...runningDedicated, environment_vars: {} };
+    const request = makeRequest("cloud-token");
+
+    const response = await handleDedicatedAgentProxy(
+      request,
+      ENV,
+      urlOf(request),
+      AGENT,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      code: "agent_principal_transport_unavailable",
+    });
+    expect(captured).toBeNull();
+  });
+
+  test("revokes a paired session as soon as its Cloud membership becomes inactive", async () => {
+    pairedSessionResult = {
+      valid: true,
+      claims: {
+        userId: "paired-user",
+        organizationId: "org1",
+        agentId: AGENT,
+      },
+    };
+    pairedUserResult = {
+      id: "paired-user",
+      organization_id: "org1",
+      is_active: false,
+      deleted_at: null,
+      organization: { id: "org1", is_active: true },
+    };
+    sandboxResult = runningDedicated;
+    const request = makeRequest("paired-session-token");
+
+    const response = await handleDedicatedAgentProxy(
+      request,
+      ENV,
+      urlOf(request),
+      AGENT,
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({
+      code: "paired_session_membership_inactive",
+    });
+    expect(captured).toBeNull();
+  });
+
+  test("revokes a paired session when its Cloud organization is inactive", async () => {
+    pairedSessionResult = {
+      valid: true,
+      claims: {
+        userId: "paired-user",
+        organizationId: "org1",
+        agentId: AGENT,
+      },
+    };
+    pairedUserResult = {
+      id: "paired-user",
+      organization_id: "org1",
+      is_active: true,
+      deleted_at: null,
+      organization: { id: "org1", is_active: false },
+    };
+    sandboxResult = runningDedicated;
+    const request = makeRequest("paired-session-token");
+
+    const response = await handleDedicatedAgentProxy(
+      request,
+      ENV,
+      urlOf(request),
+      AGENT,
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({
+      code: "paired_session_membership_inactive",
+    });
+    expect(captured).toBeNull();
+  });
+
+  test("NO cloud token → strips trust headers and never injects the agent token", async () => {
     authResult = "throw";
-    const r = makeRequest();
+    const r = new Request(`https://${AGENT}.elizacloud.ai/api/status`, {
+      headers: {
+        "x-eliza-user-id": "spoofed-user",
+        "x-eliza-principal-token": "spoofed-proof",
+        "x-server-token": "spoofed-fleet-secret",
+      },
+    });
     await handleDedicatedAgentProxy(r, ENV, urlOf(r), AGENT);
     expect(captured?.headers.get("authorization")).toBeNull();
+    expect(captured?.headers.get("x-eliza-user-id")).toBeNull();
+    expect(captured?.headers.get("x-eliza-principal-token")).toBeNull();
+    expect(captured?.headers.get("x-server-token")).toBeNull();
   });
 
   test("authenticated NON-OWNER (findByIdAndOrg → null) → pass through, agent token NEVER injected", async () => {
@@ -219,6 +408,27 @@ describe("dedicated-agent-proxy — unified auth", () => {
     const res = await handleDedicatedAgentProxy(r, ENV, urlOf(r), AGENT);
     expect(res.status).toBe(202);
     expect(enqueueCalls).toBe(1); // paying org is not blocked
+  });
+
+  test("resume enqueue failure is a retryable 503, never a fabricated starting state", async () => {
+    authResult = { user: { id: "u1", organization_id: "org1" } };
+    sandboxResult = { ...runningDedicated, status: "stopped" };
+    enqueueError = new Error("database unavailable");
+
+    const response = await handleDedicatedAgentProxy(
+      makeRequest("cloud-token"),
+      ENV,
+      urlOf(makeRequest("cloud-token")),
+      AGENT,
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBeTruthy();
+    expect(await response.json()).toMatchObject({
+      success: false,
+      code: "agent_resume_enqueue_failed",
+    });
+    expect(captured).toBeNull();
   });
 
   test("owner of a SUSPENDED / zero-balance agent → 402 and NO re-provision (free-compute suspension bypass closed, #11583)", async () => {
@@ -302,6 +512,12 @@ describe("dedicated-agent-proxy — CORS + unroutable short-circuit (#15347)", (
     expect(res.status).toBe(204);
     expect(res.headers.get("access-control-allow-origin")).toBe(ORIGIN);
     expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+    expect(res.headers.get("access-control-allow-headers")).toContain(
+      "Idempotency-Key",
+    );
+    expect(res.headers.get("access-control-allow-headers")).toContain(
+      "X-ElizaOS-Client-Id",
+    );
     expect(captured).toBeNull(); // preflight is answered at the edge
   });
 

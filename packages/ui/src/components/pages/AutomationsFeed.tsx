@@ -45,6 +45,10 @@ import {
   type FeedFilter,
   passesFilter,
 } from "../../utils/automation-feed-filter";
+import {
+  dedicatedCloudAgentIdFromBase,
+  directCloudSharedAgentIdFromBase,
+} from "../../utils/cloud-agent-base";
 import { formatSchedule } from "../../utils/cron-format";
 import { mergeUnifiedTasks } from "../../utils/merge-unified-tasks";
 import { openExternalUrl } from "../../utils/openExternalUrl";
@@ -59,6 +63,7 @@ import { ScheduledTaskEditor } from "./ScheduledTaskEditor";
 import { TaskEditor } from "./TaskEditor";
 import { WorkflowEditor } from "./WorkflowEditor";
 import {
+  SHOW_AUTOMATIONS_LIST_EVENT,
   VISUALIZE_WORKFLOW_EVENT,
   type VisualizeWorkflowEventDetail,
 } from "./workflow-graph-events";
@@ -123,16 +128,10 @@ type WorkflowRouteIssue =
   | { kind: "requires-dedicated"; message: string; agentId: string };
 
 function cloudAgentIdFromApiBase(baseUrl: string): string | null {
-  try {
-    const match = /^\/api\/v1\/eliza\/agents\/([^/]+)(?:\/bridge)?\/?$/.exec(
-      new URL(baseUrl).pathname,
-    );
-    return match?.[1] ? decodeURIComponent(match[1]) : null;
-  } catch {
-    // error-policy:J3 a malformed or non-cloud API base is an explicit invalid
-    // signal; it must not produce a guessed agent-management destination.
-    return null;
-  }
+  return (
+    directCloudSharedAgentIdFromBase(baseUrl) ??
+    dedicatedCloudAgentIdFromBase(baseUrl)
+  );
 }
 
 interface FeedRow {
@@ -553,20 +552,35 @@ export function AutomationsFeed({
       window.removeEventListener("eliza:automations:setFilter", handler);
   }, []);
 
-  // Behavior #3: chat agent says "show me this workflow" → scroll + open.
+  // Behavior #3: chat workflow results select an editor or return to the list.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const handler = (event: Event) => {
+    const workflowHandler = (event: Event) => {
       const detail = (event as CustomEvent<VisualizeWorkflowEventDetail>)
         .detail;
       if (!detail?.workflowId) return;
-      setLink({ kind: "workflow", id: detail.workflowId });
+      setEditor({ kind: "workflow", workflowId: detail.workflowId });
+      // Every id-bearing workflow result may have changed the collection or its
+      // execution summary. Refresh behind the editor so closing a chat-created,
+      // activated, deactivated, or newly-run workflow never reveals stale rows.
+      void refresh();
       const row = rowRefs.current.get(detail.workflowId);
       row?.scrollIntoView({ behavior: "smooth", block: "center" });
     };
-    window.addEventListener(VISUALIZE_WORKFLOW_EVENT, handler);
-    return () => window.removeEventListener(VISUALIZE_WORKFLOW_EVENT, handler);
-  }, [setLink]);
+    const listHandler = () => {
+      setEditor({ kind: "none" });
+      // Chat lifecycle actions can mutate the backing workflow collection
+      // while this feed remains mounted. Revalidate so returning to the list
+      // never presents a deleted workflow or omits a newly-created one.
+      void refresh();
+    };
+    window.addEventListener(VISUALIZE_WORKFLOW_EVENT, workflowHandler);
+    window.addEventListener(SHOW_AUTOMATIONS_LIST_EVENT, listHandler);
+    return () => {
+      window.removeEventListener(VISUALIZE_WORKFLOW_EVENT, workflowHandler);
+      window.removeEventListener(SHOW_AUTOMATIONS_LIST_EVENT, listHandler);
+    };
+  }, [refresh, setEditor]);
 
   const allRows = useMemo(
     () => automations.map((item) => automationToRow(item, t)),
@@ -707,6 +721,7 @@ export function AutomationsFeed({
         key={`${cacheKey}:${editor.workflowId ?? NEW_AUTOMATION_LINK_ID}`}
         requestCacheKey={cacheKey}
         workflowId={editor.workflowId}
+        cloudAgentId={cloudAgentIdFromApiBase(apiBaseUrl)}
         onSaved={() => {
           if (
             activeCacheKeyRef.current === cacheKey &&
@@ -716,6 +731,7 @@ export function AutomationsFeed({
           }
         }}
         onCancel={() => setEditor({ kind: "none" })}
+        onUpgrade={openDedicatedUpgrade}
       />
     );
   }
@@ -1345,13 +1361,17 @@ function AutomationEmptyIllustration() {
 function WorkflowEditorLoader({
   requestCacheKey,
   workflowId,
+  cloudAgentId,
   onSaved,
   onCancel,
+  onUpgrade,
 }: {
   requestCacheKey: string;
   workflowId: string | null;
+  cloudAgentId: string | null;
   onSaved: () => void;
   onCancel: () => void;
+  onUpgrade: (agentId: string) => void;
 }) {
   const { t } = useTranslation();
   // A null workflowId means "create new" — resolve to a null definition
@@ -1362,14 +1382,33 @@ function WorkflowEditorLoader({
   );
 
   if (fetchState.status === "error") {
-    return (
-      <div className="p-6">
-        <div className="rounded-sm border border-danger/20 bg-danger/10 p-3 text-sm text-danger">
-          {fetchState.error.message ||
+    const requiresDedicated =
+      isApiError(fetchState.error) &&
+      fetchState.error.code === "workflow_requires_dedicated";
+    const issue: WorkflowServiceIssue = requiresDedicated
+      ? {
+          kind: "unavailable",
+          title: "Dedicated agent required",
+          message: fetchState.error.message,
+          ...(cloudAgentId ? { upgradeAgentId: cloudAgentId } : {}),
+        }
+      : {
+          kind: "error",
+          title: "Workflow couldn't be loaded",
+          message:
+            fetchState.error.message ||
             t("automationsfeed.workflowLoadError", {
               defaultValue: "Failed to load workflow.",
-            })}
-        </div>
+            }),
+        };
+    return (
+      <div className="p-6">
+        <WorkflowServiceIssuePanel
+          issue={issue}
+          onRetry={fetchState.refetch}
+          onUpgrade={onUpgrade}
+          full
+        />
         <Button variant="ghost" size="sm" className="mt-3" onClick={onCancel}>
           {t("automationsfeed.back", { defaultValue: "Back" })}
         </Button>
@@ -1387,7 +1426,10 @@ function WorkflowEditorLoader({
     <div className="device-layout mx-auto flex h-full w-full max-w-7xl flex-col gap-4 px-4 pt-[var(--view-pad-top)] pb-[var(--view-pad-bottom)] lg:px-6">
       <WorkflowEditor
         initial={fetchState.data}
+        cloudAgentId={cloudAgentId}
+        onEnableAlwaysOn={onUpgrade}
         onSaved={onSaved}
+        onChanged={onSaved}
         onCancel={onCancel}
       />
     </div>

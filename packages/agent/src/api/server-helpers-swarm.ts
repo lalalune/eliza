@@ -26,6 +26,7 @@ import {
 import { sanitizeCompletionRelay } from "@elizaos/plugin-agent-orchestrator";
 import { generateChatResponse as generateChatResponseFromChatRoutes } from "./chat-routes.ts";
 import { resolveClientChatAdminEntityId } from "./client-chat-admin.ts";
+import { isCloudPrincipalRequired } from "./cloud-principal.ts";
 import { beginDelivery } from "./delivery-dedupe.ts";
 import type {
   CoordinationLLMResponse,
@@ -97,6 +98,11 @@ export async function routeAutonomyTextToUser(
 ): Promise<void> {
   const runtime = state.runtime;
   if (!runtime) return;
+
+  // A process-global autonomy callback carries no attested end-user principal.
+  // Selecting the most recent conversation in a multi-user Cloud container
+  // would persist one user's event into another user's transcript.
+  if (isCloudPrincipalRequired()) return;
 
   const normalizedText = responseText.trim();
   if (!normalizedText) return;

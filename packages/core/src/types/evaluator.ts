@@ -13,6 +13,7 @@ import type { State } from "./state";
 export interface EvaluatorRunOptions {
 	didRespond?: boolean;
 	responses?: Memory[];
+	actionResults?: ActionResult[];
 	callback?: HandlerCallback;
 	phase?: string;
 }

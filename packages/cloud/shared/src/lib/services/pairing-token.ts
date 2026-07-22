@@ -1,4 +1,8 @@
-// Coordinates cloud service pairing token behavior behind route handlers.
+/**
+ * Issues and atomically consumes origin-bound dedicated-agent pairing tokens.
+ * Callers may inspect a token before consumption so account and organization
+ * eligibility can be checked without burning the one-time capability.
+ */
 import { agentPairingTokensRepository } from "../../db/repositories/agent-pairing-tokens";
 import { getAlternateDomainOrigins } from "./pairing-token-domains";
 
@@ -49,6 +53,41 @@ function createPairingToken(): string {
   return base64UrlEncode(bytes);
 }
 
+function normalizeOrigin(expectedOrigin?: string | null): string | null {
+  if (!expectedOrigin) return null;
+  try {
+    return new URL(expectedOrigin).origin;
+  } catch {
+    // error-policy:J3 an untrusted Origin that cannot be parsed is explicitly
+    // invalid and never falls back to an unscoped token lookup.
+    return null;
+  }
+}
+
+function pairingTokenFromRow(row: {
+  user_id: string;
+  organization_id: string;
+  agent_id: string;
+  instance_url: string;
+  expected_origin: string;
+  expires_at: Date;
+  created_at: Date;
+}): PairingToken {
+  return {
+    userId: row.user_id,
+    orgId: row.organization_id,
+    agentId: row.agent_id,
+    instanceUrl: row.instance_url,
+    expectedOrigin: row.expected_origin,
+    expiresAt: row.expires_at.getTime(),
+    createdAt: row.created_at.getTime(),
+  };
+}
+
+function allowedOrigins(origin: string): string[] {
+  return [origin, ...getAlternateDomainOrigins(origin)];
+}
+
 class PairingTokenService {
   async generateToken(
     userId: string,
@@ -73,17 +112,30 @@ class PairingTokenService {
     return token;
   }
 
-  async validateToken(token: string, expectedOrigin?: string | null): Promise<PairingToken | null> {
-    if (!expectedOrigin) {
-      return null;
-    }
+  /**
+   * Resolve a valid token without setting `used_at`. The route uses this phase
+   * only to load the immutable user/org/agent scope needed for eligibility
+   * checks; `validateToken` remains the atomic one-time consumption boundary.
+   */
+  async inspectToken(token: string, expectedOrigin?: string | null): Promise<PairingToken | null> {
+    const normalizedOrigin = normalizeOrigin(expectedOrigin);
+    if (!normalizedOrigin) return null;
 
-    let normalizedOrigin: string;
-    try {
-      normalizedOrigin = new URL(expectedOrigin).origin;
-    } catch {
+    const row = await agentPairingTokensRepository.findByTokenHash(await hashToken(token));
+    if (
+      !row ||
+      row.used_at ||
+      row.expires_at.getTime() <= Date.now() ||
+      !allowedOrigins(normalizedOrigin).includes(row.expected_origin)
+    ) {
       return null;
     }
+    return pairingTokenFromRow(row);
+  }
+
+  async validateToken(token: string, expectedOrigin?: string | null): Promise<PairingToken | null> {
+    const normalizedOrigin = normalizeOrigin(expectedOrigin);
+    if (!normalizedOrigin) return null;
 
     // Try the exact origin first
     let row = await agentPairingTokensRepository.consumeValidToken(
@@ -109,15 +161,7 @@ class PairingTokenService {
       return null;
     }
 
-    return {
-      userId: row.user_id,
-      orgId: row.organization_id,
-      agentId: row.agent_id,
-      instanceUrl: row.instance_url,
-      expectedOrigin: row.expected_origin,
-      expiresAt: row.expires_at.getTime(),
-      createdAt: row.created_at.getTime(),
-    };
+    return pairingTokenFromRow(row);
   }
 }
 

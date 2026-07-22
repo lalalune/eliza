@@ -1,64 +1,10 @@
 /**
- * Chat-brain multi-account rotation for the SAFE/CLI inference route (issue
- * #11180 Gap A).
- *
- * The problem: without this module `plugin-cli-inference` authenticates the warm
- * claude-sdk / codex-sdk session from the machine's single ambient credential
- * (`~/.claude` / `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.codex` / `CODEX_HOME`). Two
- * consequences: (a) an app-connected subscription stored in the account pool is
- * never used for chat — on a machine with no ambient CLI login the route fails
- * outright even though a healthy pooled account exists; (b) when the active
- * account hits its hourly/monthly subscription limit, the SDK ends the turn by
- * streaming the limit envelope, the session handlers throw (per the
- * throw-to-failover contract), and `useModel` skips straight to the next
- * provider TIER (cloud / API key) — it never asks the pool for the next healthy
- * *account* of the SAME provider first. A user with two Claude Max accounts
- * still stalls the brain when account #1 limits, exactly like a solo account.
- *
- * The fix (this module): consume the coding-agent selector bridge
- * (`CODING_AGENT_SELECTOR_BRIDGE_SYMBOL`, single-sourced in `@elizaos/core`) —
- * the SAME bridge coding sub-agents rotate through, which maps backend →
- * provider, pool-selects the next healthy account, and MATERIALIZES the exact
- * env the subprocess needs: `CLAUDE_CODE_OAUTH_TOKEN` for claude, a per-account
- * `CODEX_HOME` for codex) at TWO points:
- *
- *  1. **Pool-first initial auth.** BEFORE the session's first attempt, select a
- *     healthy pooled account and hand its subprocess-only env to the warm
- *     session. Without this, an app-connected subscription sits stored-but-
- *     unused while the SDK auths from the machine's ambient credential — and on
- *     a machine with NO ambient login the route fails outright even though a
- *     pooled account is present. Ambient stays the FALLBACK: an empty pool
- *     (select → null) or a failed selection preserves the pre-pool behavior
- *     (attempt with no env).
- *  2. **Rotation on a subscription-limit-classed throw.** We mark the limited
- *     account, select the next healthy one, build its subprocess-only env,
- *     dispose the warm session so it re-auths as the new account on its next
- *     start, and retry the turn transparently. Only when the pool returns null
- *     (all accounts limited / no pool / single account) do we rethrow so the
- *     caller's existing provider-failover chain runs. Rotation (account A →
- *     account B, same provider) therefore composes with — and runs BEFORE —
- *     failover (claude → cloud → api).
- *
- * Design notes:
- *  - **Bridge over `globalThis`, not an app-core import.** The pool + credential
- *    store live in `@elizaos/app-core`; this plugin depends only on
- *    `@elizaos/core`. Like `plugin-agent-orchestrator/coding-account-selection.ts`
- *    we read the narrow contract off a `Symbol.for(...)` key. When no pool is
- *    configured the bridge is absent and this module is a pass-through no-op
- *    (single-account behavior is byte-for-byte unchanged).
- *  - **TOS invariant preserved.** The subscription token materialized by the
- *    bridge only ever lands in the first-party SDK subprocess env (`query
- *    options.env` / `new Codex({ env })`), never the runtime's shared
- *    `process.env`, never logs, never a third-party API. `CODEX_HOME` is a
- *    directory path, not a secret.
- *  - **Rotation is opt-out-able**, gated like the rest of the plugin's env
- *    conventions: `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION` (default ON when a pool
- *    is present; set `0`/`false`/`off` to disable and go straight to failover).
- *  - **Only rate-limit-class errors rotate.** A non-limit failure (timeout parsed
- *    as retryable is still a limit-shaped signal; a 400/empty-completion/auth
- *    error is NOT) rethrows immediately so we never burn the pool on a bug.
- *
- * @module plugin-cli-inference/account-rotation
+ * Runtime-scoped subscription-account selection for isolated CLI SDK calls.
+ * The core bridge supplies first-party Claude/Codex auth without an app-core
+ * dependency; this module pins and refreshes the serving account, serializes
+ * rotation, and retries rate-limit failures before provider failover (#11180).
+ * Ambient and pooled children receive only process-launch essentials plus the
+ * selected backend's canonical auth variables.
  */
 
 import {
@@ -67,16 +13,18 @@ import {
   getCodingAgentSelectorBridge,
   logger,
 } from "@elizaos/core";
+import { filterEnv } from "./sandbox";
 
 export type RotationAgentType = "claude" | "codex";
 export type RotationSubprocessEnv = Record<string, string | undefined>;
 
 interface RotationState {
-  selection: RotationAccountSelection;
-  subprocessEnv: RotationSubprocessEnv;
+  bridge: CodingAgentSelectorBridge;
+  selection: Omit<RotationAccountSelection, "envPatch">;
 }
 
-const rotationStateBySession = new Map<string, RotationState>();
+let scopedRotationState = new WeakMap<object, Map<string, RotationState>>();
+let scopedRotationChains = new WeakMap<object, Map<string, Promise<void>>>();
 
 /** A selected account plus the env the first-party subprocess needs to auth as it. */
 export interface RotationAccountSelection {
@@ -98,7 +46,7 @@ export function getCodingAccountBridge(): CodingAgentSelectorBridge | null {
 }
 
 /**
- * The backends whose warm SDK sessions authenticate per pooled account. The
+ * The SDK backends whose credential-bound state authenticates per pooled account. The
  * cold `claude --print` / `codex exec` CLIs read the machine's single on-disk
  * login and are out of scope for in-runtime rotation (they'd need the CLI shim,
  * issue #11180 Gap B), so ONLY the SDK backends map to a rotation agent type.
@@ -165,16 +113,54 @@ export function rotationEnabled(getValue: (key: string) => string | undefined): 
 }
 
 /**
- * Ambient auth vars that would compete with a rotated account's env patch.
- * Both SDKs replace the subprocess environment when `env` is provided, so the
- * merge spreads `process.env` (PATH/HOME survive) but drops these first;
- * otherwise an operator's own ambient key/home could outrank the selected pool
- * account.
+ * The only auth vars each first-party SDK subprocess may receive. The child
+ * starts from the same narrow process-launch allowlist as the cold CLI path;
+ * host secrets for unrelated providers never cross this boundary.
  */
-const COMPETING_AUTH_VARS: Readonly<Record<RotationAgentType, readonly string[]>> = {
+const BACKEND_AUTH_VARS: Readonly<Record<RotationAgentType, readonly string[]>> = {
   claude: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
   codex: ["CODEX_HOME", "OPENAI_API_KEY"],
 };
+
+function safeBaseSubprocessEnv(): RotationSubprocessEnv {
+  return typeof process === "undefined" ? {} : filterEnv(process.env);
+}
+
+function validateBackendAuthPatch(
+  agentType: RotationAgentType,
+  envPatch: Record<string, string>
+): void {
+  const allowed = new Set(BACKEND_AUTH_VARS[agentType]);
+  const entries = Object.entries(envPatch);
+  if (entries.length === 0) {
+    throw new Error(`[cli-inference:rotation] selected ${agentType} account has no auth env`);
+  }
+  for (const [key, value] of entries) {
+    if (!allowed.has(key)) {
+      throw new Error(
+        `[cli-inference:rotation] refusing unexpected ${agentType} auth env key ${JSON.stringify(key)}`
+      );
+    }
+    if (!value.trim()) {
+      throw new Error(`[cli-inference:rotation] selected ${agentType} account has an empty ${key}`);
+    }
+  }
+}
+
+/**
+ * Build the least-privilege environment for the machine's ambient SDK login.
+ * Only process-launch essentials plus this backend's canonical auth variables
+ * cross the subprocess boundary; credentials for other providers do not.
+ */
+export function buildAmbientSubprocessEnv(agentType: RotationAgentType): RotationSubprocessEnv {
+  const env = safeBaseSubprocessEnv();
+  if (typeof process === "undefined") return env;
+  for (const key of BACKEND_AUTH_VARS[agentType]) {
+    const value = process.env[key];
+    if (value?.trim()) env[key] = value;
+  }
+  return env;
+}
 
 /**
  * Build the SDK subprocess env for a rotated account. Pure: it never mutates
@@ -185,16 +171,31 @@ export function buildRotatedSubprocessEnv(
   agentType: RotationAgentType,
   envPatch: Record<string, string>
 ): RotationSubprocessEnv {
-  const env: RotationSubprocessEnv = typeof process === "undefined" ? {} : { ...process.env };
-  for (const key of COMPETING_AUTH_VARS[agentType]) {
-    delete env[key];
-  }
+  validateBackendAuthPatch(agentType, envPatch);
+  const env = safeBaseSubprocessEnv();
   return { ...env, ...envPatch };
 }
 
 /** A description safe to log about a selection (label + provider, NEVER the token). */
 function safeAccountLabel(sel: RotationAccountSelection): string {
   return `${sel.providerId}/${sel.label}`;
+}
+
+/** Persist account affinity without retaining the materialized auth secret. */
+function rotationState(
+  bridge: CodingAgentSelectorBridge,
+  selection: RotationAccountSelection
+): RotationState {
+  return {
+    bridge,
+    selection: {
+      providerId: selection.providerId,
+      accountId: selection.accountId,
+      label: selection.label,
+      source: selection.source,
+      strategy: selection.strategy,
+    },
+  };
 }
 
 export interface RotationContext {
@@ -204,25 +205,92 @@ export interface RotationContext {
   getValue: (key: string) => string | undefined;
   /** Stable key so pool session-affinity ties a conversation to one account. */
   sessionKey?: string;
-  /**
-   * Called whenever the selected account changes — after the pool-first initial
-   * selection and after each successful rotation, BEFORE the (re)try — so the
-   * caller can tear down any warm SDK session bound to the previous credential;
-   * the fresh session then re-auths as the newly-selected account on its next
-   * start. A no-op when no warm session exists yet (the common initial case).
-   */
-  onRotate: () => void | Promise<void>;
+  /** Runtime-owned identity boundary and optional diagnostic reporter. */
+  scope: object & {
+    reportError?: (scope: string, error: unknown, context?: Record<string, unknown>) => void;
+  };
   /** Selection strategy override (else the pool's default). */
   strategy?: CodingAccountStrategy;
+}
+
+function reportRotationBookkeepingFailure(
+  ctx: RotationContext,
+  operation: "record-usage" | "mark-rate-limited",
+  error: unknown
+): void {
+  logger.warn(
+    {
+      src: "cli-inference:rotation",
+      backend: ctx.backend,
+      operation,
+    },
+    `[cli-inference] subscription account ${operation} bookkeeping failed`
+  );
+  try {
+    ctx.scope.reportError?.("cli-inference.account-rotation", error, {
+      backend: ctx.backend,
+      operation,
+    });
+  } catch {
+    // error-policy:J7 diagnostics-must-not-kill-the-loop — custom runtime-like
+    // scopes may violate reportError's no-throw contract; warn without recursing.
+    logger.warn(
+      {
+        src: "cli-inference:rotation",
+        backend: ctx.backend,
+        operation,
+        reason: "report-error-failed",
+      },
+      "[cli-inference] runtime rejected an account-bookkeeping diagnostic"
+    );
+  }
 }
 
 function rotationStateKey(ctx: RotationContext): string {
   return `${ctx.backend}\u001f${ctx.sessionKey ?? "__default"}`;
 }
 
+function stateStore(ctx: RotationContext): Map<string, RotationState> {
+  let store = scopedRotationState.get(ctx.scope);
+  if (!store) {
+    store = new Map<string, RotationState>();
+    scopedRotationState.set(ctx.scope, store);
+  }
+  return store;
+}
+
+function chainStore(ctx: RotationContext): Map<string, Promise<void>> {
+  let store = scopedRotationChains.get(ctx.scope);
+  if (!store) {
+    store = new Map<string, Promise<void>>();
+    scopedRotationChains.set(ctx.scope, store);
+  }
+  return store;
+}
+
+function enqueueRotation<T>(ctx: RotationContext, runLocked: () => Promise<T>): Promise<T> {
+  const key = rotationStateKey(ctx);
+  const store = chainStore(ctx);
+  const previous = store.get(key) ?? Promise.resolve();
+  const run = previous.then(runLocked, runLocked);
+  // error-policy:J5 the tail is only the per-runtime rotation mutex. The real
+  // result and rejection are returned through `run`; this settled tail prevents
+  // an unhandled rejection while allowing the next request to acquire the lock.
+  const tail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  store.set(key, tail);
+  void tail.finally(() => {
+    if (store.get(key) === tail) store.delete(key);
+  });
+  return run;
+}
+
 /** Test seam: keeps per-test rotation state independent. */
 export function resetRotationStateForTests(): void {
-  rotationStateBySession.clear();
+  scopedRotationState = new WeakMap<object, Map<string, RotationState>>();
+  scopedRotationChains = new WeakMap<object, Map<string, Promise<void>>>();
 }
 
 /**
@@ -233,7 +301,7 @@ export function resetRotationStateForTests(): void {
  *  1. Pool-FIRST initial auth: when no account is selected for this session yet,
  *     select a healthy pooled account BEFORE the first attempt so a stored
  *     app-connected subscription serves the very first turn. Empty pool / failed
- *     selection → ambient fallback (attempt with no env, pre-pool behavior).
+ *     selection → ambient fallback through a backend-specific safe env.
  *  2. Try `attempt(env)`. On success, return it (and best-effort record usage on
  *     the currently-selected account).
  *  3. If it throws and the error is NOT a subscription-limit (or rotation is
@@ -241,9 +309,9 @@ export function resetRotationStateForTests(): void {
  *     the caller's existing provider-failover chain handles it.
  *  4. On a limit error: mark the current account rate-limited, select the next
  *     healthy account from the pool (excluding every account already tried),
- *     build its subprocess-only env, dispose the warm session (`onRotate`), and retry.
- *     Repeat until an attempt succeeds or the pool is exhausted; when the pool
- *     returns null, rethrow the LAST limit error so failover runs.
+ *     build its subprocess-only env, and retry in a fresh SDK process. Repeat
+ *     until an attempt succeeds or the pool is exhausted; when the pool returns
+ *     null, rethrow the LAST limit error so failover runs.
  *
  * A single structured `warn` is emitted per rotation (no credential/envelope
  * leakage). At most `maxRotations` swaps are attempted to bound the loop even if
@@ -256,176 +324,205 @@ export async function withAccountRotation(
 ): Promise<string> {
   const agentType = rotationAgentTypeForBackend(ctx.backend);
   const bridge = agentType ? getCodingAccountBridge() : null;
-  // No rotation possible/desired → single, un-wrapped attempt (behavior
-  // identical to pre-rotation: any throw goes straight to the caller's failover).
-  if (!bridge || !agentType || !rotationEnabled(ctx.getValue)) {
+  // Cold backends already apply their own child-env filter and do not use this
+  // SDK-specific account path.
+  if (!agentType) {
     return attempt();
   }
-
-  const stateKey = rotationStateKey(ctx);
-  let state = rotationStateBySession.get(stateKey) ?? null;
-
-  // Pool-first initial auth: nothing selected for this session yet, so ask the
-  // pool BEFORE the first attempt instead of silently starting on the machine's
-  // ambient credential. An app user who connected their subscription expects it
-  // used immediately — and a machine with NO ambient login would otherwise fail
-  // despite a healthy pooled account. Ambient stays the fallback: select → null
-  // (empty pool) or a selection error changes nothing.
-  if (!state) {
-    let selection: RotationAccountSelection | null = null;
-    try {
-      selection = await bridge.select(agentType, {
-        ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
-        ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
-      });
-    } catch (selectErr) {
-      // error-policy:J4 explicit degrade — the account POOL is optional; if its
-      // select() fails we fall back to the ambient credential (documented degrade),
-      // the CLI still runs. Not a swallowed inference failure.
-      logger.warn(
-        {
-          src: "cli-inference:rotation",
-          backend: ctx.backend,
-          reason: "initial-select-failed",
-        },
-        `[cli-inference] initial pool selection failed (${String(selectErr)}) — falling back to the ambient credential`
-      );
-    }
-    if (selection) {
-      state = {
-        selection,
-        subprocessEnv: buildRotatedSubprocessEnv(agentType, selection.envPatch),
-      };
-      rotationStateBySession.set(stateKey, state);
-      // Evict any warm session that started on the ambient credential before
-      // the pool was installed, so the next start auths as the selected
-      // account. A no-op when no session exists yet (the common first turn).
-      try {
-        await ctx.onRotate();
-      } catch {
-        // error-policy:J6 best-effort teardown — the fresh start re-inits anyway.
-      }
-      logger.info(
-        {
-          src: "cli-inference:rotation",
-          backend: ctx.backend,
-          account: safeAccountLabel(selection),
-          strategy: selection.strategy,
-        },
-        `[cli-inference] pooled ${agentType} account selected for warm-session auth`
-      );
-    }
+  const ambientEnv = buildAmbientSubprocessEnv(agentType);
+  if (!bridge || !rotationEnabled(ctx.getValue)) {
+    return attempt(ambientEnv);
   }
 
-  const tried: string[] = state ? [state.selection.accountId] : [];
-  let lastError: unknown;
+  return enqueueRotation(ctx, async () => {
+    const stateKey = rotationStateKey(ctx);
+    const states = stateStore(ctx);
+    let state = states.get(stateKey) ?? null;
+    let subprocessEnv: RotationSubprocessEnv | undefined;
+    if (state && state.bridge !== bridge) {
+      states.delete(stateKey);
+      state = null;
+    }
 
-  for (let rotations = 0; rotations <= maxRotations; rotations += 1) {
-    try {
-      const result = await attempt(state?.subprocessEnv);
-      // Record a successful call against the account we rotated INTO so
-      // quota-aware selection reflects real usage (best-effort; never throws).
-      if (state) {
-        void bridge
-          // error-policy:J7 usage accounting is telemetry — a recordUsage failure
-          // must not fail the successful inference result being returned.
-          .recordUsage(state.selection.providerId, state.selection.accountId, { ok: true })
-          .catch(() => undefined);
-      }
-      return result;
-    } catch (err) {
-      lastError = err;
-      if (!isSubscriptionLimitError(err)) {
-        // Not a limit — a genuine failure. Do NOT rotate (would burn a healthy
-        // account); rethrow so the caller's provider-failover chain runs.
-        throw err;
-      }
-      // The active account just limited. Mark it (with its reset window) so
-      // quota-aware selection routes around it, then pick the next healthy one.
-      // Only for an account WE selected (the ambient credential is untracked).
-      if (state) {
-        void bridge
-          // error-policy:J7 marking the limit is best-effort bookkeeping; failure
-          // to persist it must not stop the rotation-to-next-account below.
-          .markRateLimited(
-            state.selection.providerId,
-            state.selection.accountId,
-            Date.now() + ROTATION_RATE_LIMIT_COOLOFF_MS,
-            "cli-inference subscription limit"
-          )
-          .catch(() => undefined);
-        rotationStateBySession.delete(stateKey);
+    // A fresh SDK query/process must not reuse an old materialized access token.
+    // Re-resolve the exact selected account on every call; `accountIds` preserves
+    // affinity while allowing the bridge to refresh tokens or CODEX_HOME safely.
+    if (state) {
+      const selectedAccountId = state.selection.accountId;
+      const refreshed = await bridge.select(agentType, {
+        ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
+        ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
+        accountIds: [selectedAccountId],
+      });
+      if (refreshed) {
+        if (refreshed.accountId !== selectedAccountId) {
+          throw new Error(
+            `[cli-inference:rotation] pinned ${agentType} account changed from ${selectedAccountId} to ${refreshed.accountId}`
+          );
+        }
+        subprocessEnv = buildRotatedSubprocessEnv(agentType, refreshed.envPatch);
+        state = rotationState(bridge, refreshed);
+        states.set(stateKey, state);
+      } else {
+        states.delete(stateKey);
         state = null;
       }
+    }
 
+    // Pool-first initial auth: nothing selected for this session yet, so ask the
+    // pool BEFORE the first attempt instead of silently starting on the machine's
+    // ambient credential. An app user who connected their subscription expects it
+    // used immediately — and a machine with NO ambient login would otherwise fail
+    // despite a healthy pooled account. Ambient stays the fallback: select → null
+    // (empty pool) or a selection error changes nothing.
+    if (!state) {
       let selection: RotationAccountSelection | null = null;
       try {
         selection = await bridge.select(agentType, {
           ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
           ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
-          // Copy: `tried` keeps growing across rotations; the bridge must see
-          // the exclusions as of THIS call, not a live reference.
-          exclude: [...tried],
         });
-      } catch (selectErr) {
-        // error-policy:J2 context-adding — pool selection itself failed; treat as
-        // pool-exhausted and rethrow the ORIGINAL limit error so the caller's
-        // provider-failover chain runs (does not fabricate a success).
-        logger.warn(
-          {
-            src: "cli-inference:rotation",
-            backend: ctx.backend,
-            reason: "select-failed",
-          },
-          `[cli-inference] account rotation select failed (${String(selectErr)}) — falling through to provider failover`
-        );
-        throw err;
-      }
-
-      if (!selection) {
-        // Pool exhausted: every healthy account tried, or none configured.
-        // Rethrow the limit error so the caller's failover chain (cloud / API)
-        // runs — rotation composes with, and yields to, failover.
-        logger.warn(
-          {
-            src: "cli-inference:rotation",
-            backend: ctx.backend,
-            tried: tried.length,
-            reason: "pool-exhausted",
-          },
-          `[cli-inference] all pooled ${agentType} accounts rate-limited (${tried.length} tried) — failing over to next provider tier`
-        );
-        throw err;
-      }
-
-      tried.push(selection.accountId);
-      state = {
-        selection,
-        subprocessEnv: buildRotatedSubprocessEnv(agentType, selection.envPatch),
-      };
-      rotationStateBySession.set(stateKey, state);
-      // Tear down the warm session so it re-auths as the newly-selected account.
-      try {
-        await ctx.onRotate();
       } catch {
-        // error-policy:J6 best-effort teardown — the fresh start re-inits anyway.
+        // error-policy:J4 explicit degrade — the account POOL is optional; if its
+        // select() fails we fall back to the ambient credential (documented degrade),
+        // the CLI still runs. Not a swallowed inference failure.
+        logger.warn(
+          {
+            src: "cli-inference:rotation",
+            backend: ctx.backend,
+            reason: "initial-select-failed",
+          },
+          "[cli-inference] initial pool selection failed — falling back to the ambient credential"
+        );
       }
-      logger.warn(
-        {
-          src: "cli-inference:rotation",
-          backend: ctx.backend,
-          account: safeAccountLabel(selection),
-          strategy: selection.strategy,
-          attempt: rotations + 1,
-        },
-        `[cli-inference] rotated to next ${agentType} account after subscription limit`
-      );
-      // loop retries the turn on the new account
+      if (selection) {
+        subprocessEnv = buildRotatedSubprocessEnv(agentType, selection.envPatch);
+        state = rotationState(bridge, selection);
+        states.set(stateKey, state);
+        logger.info(
+          {
+            src: "cli-inference:rotation",
+            backend: ctx.backend,
+            account: safeAccountLabel(selection),
+            strategy: selection.strategy,
+          },
+          `[cli-inference] pooled ${agentType} account selected for SDK auth`
+        );
+      }
     }
-  }
 
-  // Exhausted maxRotations without success — fail over with the last error.
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`[cli-inference] account rotation exhausted: ${String(lastError)}`);
+    const tried: string[] = state ? [state.selection.accountId] : [];
+    let lastError: unknown;
+
+    for (let rotations = 0; rotations <= maxRotations; rotations += 1) {
+      try {
+        const result = await attempt(subprocessEnv ?? ambientEnv);
+        // Record a successful call against the account we rotated INTO so
+        // quota-aware selection reflects real usage (best-effort; never throws).
+        if (state) {
+          void bridge
+            // error-policy:J7 usage accounting is telemetry — a recordUsage failure
+            // must not fail the successful inference result, but remains observable.
+            .recordUsage(state.selection.providerId, state.selection.accountId, { ok: true })
+            .catch((error) => reportRotationBookkeepingFailure(ctx, "record-usage", error));
+        }
+        return result;
+      } catch (err) {
+        lastError = err;
+        if (!isSubscriptionLimitError(err)) {
+          // Not a limit — a genuine failure. Do NOT rotate (would burn a healthy
+          // account); rethrow so the caller's provider-failover chain runs.
+          throw err;
+        }
+        // The active account just limited. Mark it (with its reset window) so
+        // quota-aware selection routes around it, then pick the next healthy one.
+        // Only for an account WE selected (the ambient credential is untracked).
+        if (state) {
+          void bridge
+            // error-policy:J7 marking the limit is best-effort bookkeeping; failure
+            // to persist it must not stop rotation, but remains observable.
+            .markRateLimited(
+              state.selection.providerId,
+              state.selection.accountId,
+              Date.now() + ROTATION_RATE_LIMIT_COOLOFF_MS,
+              "cli-inference subscription limit"
+            )
+            .catch((error) => reportRotationBookkeepingFailure(ctx, "mark-rate-limited", error));
+          states.delete(stateKey);
+          state = null;
+          subprocessEnv = undefined;
+        }
+
+        // `maxRotations` counts account swaps after the initial attempt. Do not
+        // select and retain a credential that this call will never try.
+        if (rotations >= maxRotations) throw err;
+
+        let selection: RotationAccountSelection | null = null;
+        try {
+          selection = await bridge.select(agentType, {
+            ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
+            ...(ctx.strategy ? { strategy: ctx.strategy } : {}),
+            // Copy: `tried` keeps growing across rotations; the bridge must see
+            // the exclusions as of THIS call, not a live reference.
+            exclude: [...tried],
+          });
+        } catch {
+          // error-policy:J4 explicit degrade — an unavailable optional account
+          // pool yields to provider failover by rethrowing the original limit.
+          logger.warn(
+            {
+              src: "cli-inference:rotation",
+              backend: ctx.backend,
+              reason: "select-failed",
+            },
+            "[cli-inference] account rotation select failed — falling through to provider failover"
+          );
+          throw err;
+        }
+
+        if (!selection) {
+          // Pool exhausted: every healthy account tried, or none configured.
+          // Rethrow the limit error so the caller's failover chain (cloud / API)
+          // runs — rotation composes with, and yields to, failover.
+          logger.warn(
+            {
+              src: "cli-inference:rotation",
+              backend: ctx.backend,
+              tried: tried.length,
+              reason: "pool-exhausted",
+            },
+            `[cli-inference] all pooled ${agentType} accounts rate-limited (${tried.length} tried) — failing over to next provider tier`
+          );
+          throw err;
+        }
+
+        if (tried.includes(selection.accountId)) {
+          throw new Error(
+            `[cli-inference:rotation] ${agentType} account selector returned an excluded account`
+          );
+        }
+
+        tried.push(selection.accountId);
+        subprocessEnv = buildRotatedSubprocessEnv(agentType, selection.envPatch);
+        state = rotationState(bridge, selection);
+        states.set(stateKey, state);
+        logger.warn(
+          {
+            src: "cli-inference:rotation",
+            backend: ctx.backend,
+            account: safeAccountLabel(selection),
+            strategy: selection.strategy,
+            attempt: rotations + 1,
+          },
+          `[cli-inference] rotated to next ${agentType} account after subscription limit`
+        );
+        // loop retries the turn on the new account
+      }
+    }
+
+    // Exhausted maxRotations without success — fail over with the last error.
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`[cli-inference] account rotation exhausted: ${String(lastError)}`);
+  });
 }

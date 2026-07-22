@@ -267,6 +267,7 @@ async function forwardWorkflowToDedicatedRuntime(params: {
       body,
       requestUrl.search.slice(1),
       {
+        principalId: params.user.id,
         timeoutMs: workflowProxyTimeoutMs(method, params.suffix),
         protocolHeaders: params.request.headers,
       },

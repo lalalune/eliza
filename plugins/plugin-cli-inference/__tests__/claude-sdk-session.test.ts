@@ -1,14 +1,12 @@
+/**
+ * Exercises the Claude Agent SDK transport through its injectable SDK seams.
+ * Turn scripts cover streamed text, native routing tools, timeouts, and direct
+ * transport reuse without launching the real Claude process.
+ */
+
 import { describe, expect, it, vi } from "vitest";
 import { ClaudeSdkSession, type SdkModule } from "../src/claude-sdk-session";
 import { ProviderApiError } from "../src/provider-errors";
-
-/**
- * Unit tests for the warm Agent SDK session, driven by a FAKE SdkModule via the
- * constructor's injectable `sdkModule` / `zodModule` seam (no real SDK, no real
- * `claude` process). Each "turn script" describes what the fake SDK does for one
- * turn: optionally invoke the in-process route tool handler (to set a decision),
- * optionally stream assistant text, then emit a terminal `result` with a subtype.
- */
 
 interface TurnScript {
   /** Never yield a message, used to test the per-turn timeout budget. */
@@ -32,7 +30,7 @@ type ToolHandler = (args: {
   params?: unknown;
 }) => Promise<{ content: Array<{ type: string; text: string }> }>;
 
-/** Build a fake SdkModule that replays `scripts` turn-by-turn over one warm query. */
+/** Build a fake SDK module that replays `scripts` turn-by-turn over one query. */
 function makeFakeSdk(
   scripts: TurnScript[],
   fakeOpts: { interrupt?: () => Promise<void> } = {}
@@ -45,7 +43,7 @@ function makeFakeSdk(
   const startedOptions: Array<Record<string, unknown>> = [];
   // Script progression is GLOBAL across query restarts: a self-heal/restart
   // creates a fresh query() but should continue consuming the next scripted
-  // turn (mirroring a real warm session that gets fresh turns after a restart).
+  // turn (mirroring a reused transport that gets fresh turns after a restart).
   let turn = 0;
   const sdk: SdkModule = {
     tool: (_name, _desc, _schema, handler) => ({ handler }) as unknown,
@@ -268,7 +266,7 @@ describe("ClaudeSdkSession — TEXT mode", () => {
     await session.dispose();
   });
 
-  it("restarts the warm session after restartAfterTurns to bound context", async () => {
+  it("restarts a reused transport after restartAfterTurns to bound context", async () => {
     const { session, starts } = makeSession(
       [
         { text: "one", subtype: "success" },

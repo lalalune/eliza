@@ -39,11 +39,19 @@ function fakeExecution(id: string, overrides: Partial<WorkflowExecution> = {}): 
   };
 }
 
-function makeRuntime(service: unknown = null) {
+function makeRuntime(service: unknown = null, loadPromise?: Promise<unknown>) {
   const services = new Map<string, unknown>();
   return {
     services,
     getService: mock((type: string) => (type === EMBEDDED_WORKFLOW_SERVICE_TYPE ? service : null)),
+    ...(loadPromise
+      ? {
+          getServiceLoadPromise: mock((type: string) => {
+            expect(type).toBe(EMBEDDED_WORKFLOW_SERVICE_TYPE);
+            return loadPromise;
+          }),
+        }
+      : {}),
   };
 }
 
@@ -104,6 +112,28 @@ describe('workflow dispatch service', () => {
       ok: false,
       error: 'embedded workflow service not registered',
     });
+  });
+
+  it('waits for the embedded workflow service to finish starting before dispatching', async () => {
+    let markReady!: (service: unknown) => void;
+    const ready = new Promise<unknown>((resolve) => {
+      markReady = resolve;
+    });
+    const embedded = makeEmbeddedService();
+    const runtime = makeRuntime(null, ready);
+    const dispatch = createWorkflowDispatchService(runtime as never);
+
+    const pending = dispatch.execute('wf-1');
+    await Promise.resolve();
+    expect(embedded.executeWorkflow).not.toHaveBeenCalled();
+
+    markReady(embedded);
+    await expect(pending).resolves.toEqual({
+      ok: true,
+      executionId: 'wf-1:fresh',
+    });
+    expect(runtime.getServiceLoadPromise).toHaveBeenCalledTimes(1);
+    expect(embedded.executeWorkflow).toHaveBeenCalledTimes(1);
   });
 
   it('delegates to executeWorkflow with stripped payload idempotency keys', async () => {

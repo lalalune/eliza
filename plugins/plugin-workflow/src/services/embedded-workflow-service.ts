@@ -15,6 +15,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, totalmem, uptime } from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import {
   ElizaError,
   fetchWithSsrfGuard,
@@ -23,6 +24,7 @@ import {
   logger,
   Service,
   stringToUuid,
+  type Task,
   TRIGGER_SCHEMA_VERSION,
   type TriggerConfig,
   type UUID,
@@ -80,6 +82,11 @@ const WORKFLOW_TASK_TAG = 'workflow';
  */
 const LEGACY_WORKFLOW_RUN_TASK_NAME = 'workflow.run';
 const LEGACY_WORKFLOW_WEBHOOK_TASK_NAME = 'workflow.webhook';
+
+const CLOUD_EXECUTION_TIER_SETTING = 'ELIZA_CLOUD_EXECUTION_TIER';
+const CLOUD_PROVISIONED_SETTING = 'ELIZA_CLOUD_PROVISIONED';
+const DEDICATED_LAZY_EXECUTION_TIER = 'dedicated-lazy';
+const SCHEDULE_TRIGGER_NODE_TYPE = 'workflows-nodes-base.scheduleTrigger';
 
 // Workflow node output is persisted and can also enter later model context, so
 // one public endpoint must not be able to consume the agent process's memory.
@@ -172,7 +179,7 @@ interface ExecuteOptions {
   /**
    * Optional idempotency key. The service atomically claims the key with a
    * durable pending row before execution, then returns that row to duplicate
-   * callers (e.g. minute-bucketed schedule fires).
+   * callers (e.g. repeated delivery of one scheduled occurrence).
    */
   idempotencyKey?: string;
   /** Stable identity of the schedule node whose task fired. Omitted only for
@@ -469,22 +476,33 @@ function buildDeviceHealthCheckWorkflow(): WorkflowDefinition {
 
 function shouldSeedDefaultWorkflows(runtime: IAgentRuntime): boolean {
   const raw = runtime.getSetting?.('WORKFLOW_SEED_DEFAULTS');
-  return raw !== false && raw !== 'false';
+  return raw !== false && raw !== 'false' && !isScaleToZeroCloudRuntime(runtime);
+}
+
+function isScaleToZeroCloudRuntime(runtime: IAgentRuntime): boolean {
+  const cloudProvisioned = runtime.getSetting?.(CLOUD_PROVISIONED_SETTING);
+  const executionTier = runtime.getSetting?.(CLOUD_EXECUTION_TIER_SETTING);
+  return (
+    (cloudProvisioned === true || cloudProvisioned === '1' || cloudProvisioned === 'true') &&
+    executionTier === DEDICATED_LAZY_EXECUTION_TIER
+  );
+}
+
+function hasEnabledScheduleTrigger(workflow: WorkflowDefinition): boolean {
+  return workflow.nodes.some((node) => !node.disabled && node.type === SCHEDULE_TRIGGER_NODE_TYPE);
 }
 
 /**
- * Build the per-dispatch idempotency key used to dedup back-to-back
- * scheduled fires for the same workflow node within the same minute. The
- * node identity keeps sibling schedules independent even when both are due
- * in one bucket.
+ * Build the per-dispatch idempotency key for one exact scheduled occurrence.
+ * The node identity keeps sibling schedules independent, while the timestamp
+ * lets sub-minute schedules fire repeatedly without being mistaken for retries.
  */
 export function buildScheduleIdempotencyKey(
   workflowId: string,
   scheduleNodeId: string,
   nextRunAtMs: number
 ): string {
-  const minuteBucket = Math.floor(nextRunAtMs / 60_000);
-  return `${workflowId}:${encodeURIComponent(scheduleNodeId)}:${minuteBucket}`;
+  return `${workflowId}:${encodeURIComponent(scheduleNodeId)}:${nextRunAtMs}`;
 }
 
 function resolveScheduleNodeId(workflowId: string, node: WorkflowNode): string {
@@ -596,26 +614,71 @@ function readPath(source: unknown, path: string): unknown {
   return current;
 }
 
+interface ResolvedWorkflowExpression {
+  matched: boolean;
+  value?: unknown;
+}
+
+function resolveWorkflowExpression(
+  expression: string,
+  item: INodeExecutionData
+): ResolvedWorkflowExpression {
+  const normalized = expression.trim();
+  for (const prefix of ['$json', '$input.item.json']) {
+    if (normalized === prefix) return { matched: true, value: item.json };
+    if (normalized.startsWith(`${prefix}.`)) {
+      return { matched: true, value: readPath(item.json, normalized.slice(prefix.length + 1)) };
+    }
+    if (normalized.startsWith(`${prefix}[`)) {
+      return { matched: true, value: readPath(item.json, normalized.slice(prefix.length)) };
+    }
+  }
+  return { matched: false };
+}
+
+function stringifyWorkflowInterpolation(value: unknown): string {
+  if (value === null || typeof value === 'undefined') return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
+
 function resolveParameterValue(value: unknown, item: INodeExecutionData): unknown {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
-  const expression =
-    trimmed.startsWith('={{') && trimmed.endsWith('}}')
-      ? trimmed.slice(3, -2).trim()
-      : trimmed.startsWith('{{') && trimmed.endsWith('}}')
-        ? trimmed.slice(2, -2).trim()
-        : trimmed.startsWith('=')
-          ? trimmed.slice(1).trim()
-          : trimmed;
-  const jsonPath = expression.match(/^\$json(?:\.|\[['"]?)(.+?)(?:['"]?\])?$/);
-  if (jsonPath?.[1]) {
-    return readPath(item.json, jsonPath[1]);
+  const expressionSource = trimmed.startsWith('=') ? trimmed.slice(1).trim() : trimmed;
+  const exactTemplate = expressionSource.match(/^\{\{\s*([^{}]+?)\s*\}\}$/s);
+  if (exactTemplate?.[1]) {
+    const resolved = resolveWorkflowExpression(exactTemplate[1], item);
+    if (resolved.matched) return resolved.value;
   }
-  const itemJsonPath = expression.match(/^\$input\.item\.json(?:\.|\[['"]?)(.+?)(?:['"]?\])?$/);
-  if (itemJsonPath?.[1]) {
-    return readPath(item.json, itemJsonPath[1]);
+  if (trimmed.startsWith('=')) {
+    const resolved = resolveWorkflowExpression(expressionSource, item);
+    if (resolved.matched) return resolved.value;
   }
-  return value;
+
+  let matched = false;
+  const interpolated = expressionSource.replace(
+    /\{\{\s*([^{}]+?)\s*\}\}/g,
+    (template, expression: string) => {
+      const resolved = resolveWorkflowExpression(expression, item);
+      if (!resolved.matched) return template;
+      matched = true;
+      return stringifyWorkflowInterpolation(resolved.value);
+    }
+  );
+  return matched ? interpolated : value;
+}
+
+function resolveParameterTree(value: unknown, item: INodeExecutionData): unknown {
+  if (typeof value === 'string') return resolveParameterValue(value, item);
+  if (Array.isArray(value)) return value.map((entry) => resolveParameterTree(entry, item));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, resolveParameterTree(entry, item)])
+  );
 }
 
 function isEmptyValue(value: unknown): boolean {
@@ -804,6 +867,24 @@ async function parseResponseBody(response: Response): Promise<unknown> {
   return text;
 }
 
+function createTriggerNodeOutput(
+  inputItems: INodeExecutionData[],
+  trigger: 'schedule' | 'manual'
+): INodeExecutionData[][] {
+  const firedAt = new Date().toISOString();
+  const sourceItems = inputItems.length > 0 ? inputItems : [{ json: {} }];
+  return [
+    sourceItems.map((item) => ({
+      ...item,
+      json: {
+        ...item.json,
+        firedAt,
+        trigger,
+      },
+    })),
+  ];
+}
+
 function createScheduleTriggerNode(): INodeType {
   return {
     description: {
@@ -819,16 +900,7 @@ function createScheduleTriggerNode(): INodeType {
       capabilities: { requiresLongRunning: true },
     },
     async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-      return [
-        [
-          {
-            json: {
-              firedAt: new Date().toISOString(),
-              trigger: 'schedule',
-            },
-          },
-        ],
-      ];
+      return createTriggerNodeOutput(this.getInputData(), 'schedule');
     },
     async trigger() {
       return {};
@@ -904,8 +976,11 @@ function createSetNode(): INodeType {
           ? (assignmentContainer.assignments as Array<{ name?: unknown; value?: unknown }>)
           : [];
         for (const assignment of assignments) {
-          const name = readString(assignment.name, '');
-          if (name) base[name] = assignment.value;
+          const name = readString(
+            resolveParameterValue(assignment.name, sourceItems[itemIndex]),
+            ''
+          );
+          if (name) base[name] = resolveParameterTree(assignment.value, sourceItems[itemIndex]);
         }
 
         const values = isRecord(nodeParameters.values) ? nodeParameters.values : {};
@@ -913,14 +988,15 @@ function createSetNode(): INodeType {
           if (!Array.isArray(group)) continue;
           for (const entry of group) {
             if (!isRecord(entry)) continue;
-            const name = readString(entry.name, '');
-            if (name) base[name] = entry.value;
+            const name = readString(resolveParameterValue(entry.name, sourceItems[itemIndex]), '');
+            if (name) base[name] = resolveParameterTree(entry.value, sourceItems[itemIndex]);
           }
         }
 
         const fields = isRecord(nodeParameters.fields) ? nodeParameters.fields : {};
-        if (isRecord(fields)) {
-          Object.assign(base, fields);
+        const resolvedFields = resolveParameterTree(fields, sourceItems[itemIndex]);
+        if (isRecord(resolvedFields)) {
+          Object.assign(base, resolvedFields);
         }
 
         output.push({
@@ -1023,21 +1099,26 @@ function createHttpRequestNode(): INodeType {
       const nodeParameters = this.getNode().parameters as Record<string, unknown>;
 
       for (let itemIndex = 0; itemIndex < sourceItems.length; itemIndex++) {
-        const url = readString(nodeParameters.url, '');
+        const item = sourceItems[itemIndex];
+        const url = readString(resolveParameterValue(nodeParameters.url, item), '');
         if (!url) {
           throw new Error(
             `HTTP Request node requires a url parameter; got ${JSON.stringify(nodeParameters)}`
           );
         }
 
-        const method = readString(nodeParameters.method, 'GET').toUpperCase().trim();
+        const method = readString(resolveParameterValue(nodeParameters.method, item), 'GET')
+          .toUpperCase()
+          .trim();
 
-        const headerContainer = isRecord(nodeParameters.headerParameters)
-          ? nodeParameters.headerParameters
-          : {};
+        const resolvedHeaderParameters = resolveParameterTree(
+          nodeParameters.headerParameters,
+          item
+        );
+        const headerContainer = isRecord(resolvedHeaderParameters) ? resolvedHeaderParameters : {};
         const headerParameters = headerContainer.parameters ?? [];
         const headers = {
-          ...normalizeHeaderEntries(nodeParameters.headers),
+          ...normalizeHeaderEntries(resolveParameterTree(nodeParameters.headers, item)),
           ...normalizeHeaderEntries(headerParameters),
         };
 
@@ -1046,17 +1127,19 @@ function createHttpRequestNode(): INodeType {
           headers,
           signal: this.getAbortSignal?.(),
         };
-        const bodyContainer = isRecord(nodeParameters.bodyParameters)
-          ? nodeParameters.bodyParameters
-          : {};
+        const resolvedBodyParameters = resolveParameterTree(nodeParameters.bodyParameters, item);
+        const bodyContainer = isRecord(resolvedBodyParameters) ? resolvedBodyParameters : {};
         const bodyParameters = bodyContainer.parameters ?? [];
         const bodyObject = collectParametersList(bodyParameters);
-        const jsonBody = nodeParameters.jsonBody;
-        const rawBody = nodeParameters.body;
+        const jsonBody = resolveParameterTree(nodeParameters.jsonBody, item);
+        const rawBody = resolveParameterValue(nodeParameters.body, item);
 
         if (!['GET', 'HEAD'].includes(method)) {
           if (typeof rawBody === 'string' && rawBody.length > 0) {
             requestOptions.body = rawBody;
+          } else if (rawBody !== null && typeof rawBody !== 'undefined' && rawBody !== '') {
+            requestOptions.body = JSON.stringify(rawBody);
+            headers['content-type'] = headers['content-type'] ?? 'application/json';
           } else if (isRecord(jsonBody) || Object.keys(bodyObject).length > 0) {
             requestOptions.body = JSON.stringify(isRecord(jsonBody) ? jsonBody : bodyObject);
             headers['content-type'] = headers['content-type'] ?? 'application/json';
@@ -1072,6 +1155,29 @@ function createHttpRequestNode(): INodeType {
         });
         try {
           const body = await parseResponseBody(guarded.response);
+          if (!guarded.response.ok) {
+            const safeUrl = new URL(url);
+            safeUrl.username = '';
+            safeUrl.password = '';
+            safeUrl.search = '';
+            safeUrl.hash = '';
+            const serializedBody =
+              typeof body === 'string' ? body : body === null ? '' : JSON.stringify(body);
+            const responseBodyPreview = serializedBody.slice(0, 2_048);
+            throw new ElizaError(
+              `HTTP Request ${method} ${safeUrl.toString()} failed with status ${guarded.response.status}`,
+              {
+                code: 'WORKFLOW_HTTP_STATUS_ERROR',
+                context: {
+                  method,
+                  url: safeUrl.toString(),
+                  statusCode: guarded.response.status,
+                  statusText: guarded.response.statusText,
+                  ...(responseBodyPreview ? { responseBodyPreview } : {}),
+                },
+              }
+            );
+          }
           output.push({
             json: {
               statusCode: guarded.response.status,
@@ -1103,8 +1209,8 @@ function createManualTriggerNode(): INodeType {
       outputs: ['main'] as never,
       properties: [],
     },
-    async execute(): Promise<INodeExecutionData[][]> {
-      return [[{ json: { firedAt: new Date().toISOString(), trigger: 'manual' } }]];
+    async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+      return createTriggerNodeOutput(this.getInputData(), 'manual');
     },
     async trigger() {
       return {};
@@ -1630,9 +1736,23 @@ function createRespondToEventNode(): INodeType {
         ? `\n\nEvent: ${event.kind ?? 'unknown'}\nPayload: ${JSON.stringify(event.payload ?? {})}`
         : '';
       const instructionText = `[${displayName}]\n${instructions}${eventText}`;
+      if (!executionId) {
+        runtime.logger.warn(
+          { src: 'plugin:workflow:respondToEvent', nodeName: node.name },
+          '[respondToEvent] No workflow execution id available — skipping injection'
+        );
+        return failure('execution_id_unavailable');
+      }
+      // Smithers may replay a node after a crash that occurred between the side
+      // effect and its durable step commit. A deterministic primary key turns
+      // that replay into the same memory write instead of a duplicate message.
+      const memoryId = stringToUuid(
+        `workflow:${executionId}:node:${node.id ?? node.name}:respond-to-event`
+      );
 
       await runtime.createMemory(
         {
+          id: memoryId,
           entityId: runtime.agentId,
           roomId,
           content: {
@@ -1792,6 +1912,7 @@ export class EmbeddedWorkflowService extends Service {
   private readonly activeExecutionSettlements = new Set<Promise<void>>();
   private readonly shutdownCleanupErrors: unknown[] = [];
   private readonly executionOwnerId = randomUUID();
+  private readonly workflowLifecycleTails = new Map<string, Promise<void>>();
   // A takeover cannot become eligible while a delegated node may still be in
   // flight: Smithers kills the run at its workflow deadline, and this outer
   // lease extends one teardown grace beyond that maximum.
@@ -1898,6 +2019,33 @@ export class EmbeddedWorkflowService extends Service {
       return await operationPromise;
     } finally {
       this.activeAdmissionSettlements.delete(settlement);
+    }
+  }
+
+  /**
+   * Definition rows and scheduler tasks form one lifecycle boundary. Serializing
+   * mutations for a workflow prevents a later operation from observing the
+   * intermediate DB-first state while its predecessor is still reconciling tasks.
+   */
+  private async withWorkflowLifecycleLock<T>(
+    workflowId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const predecessor = this.workflowLifecycleTails.get(workflowId) ?? Promise.resolve();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => gate);
+    this.workflowLifecycleTails.set(workflowId, tail);
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+      if (this.workflowLifecycleTails.get(workflowId) === tail) {
+        this.workflowLifecycleTails.delete(workflowId);
+      }
     }
   }
 
@@ -2174,13 +2322,22 @@ export class EmbeddedWorkflowService extends Service {
     id: string,
     workflow: WorkflowDefinition
   ): Promise<WorkflowDefinitionResponse> {
+    return this.withWorkflowLifecycleLock(id, () => this.updateWorkflowUnlocked(id, workflow));
+  }
+
+  private async updateWorkflowUnlocked(
+    id: string,
+    workflow: WorkflowDefinition
+  ): Promise<WorkflowDefinitionResponse> {
     this.assertRegisteredNodes(workflow);
     const existing = await this.getStoredWorkflow(id);
     const db = this.getDb();
-    await this.captureWorkflowRevision(id, existing, 'update');
     const updatedAt = nowIso();
     const versionId = randomUUID();
     const stored = normalizeWorkflowPayload(workflow, id, existing.workflow.active ?? false);
+    this.assertHostSupports(stored);
+    if (stored.active) this.assertScheduleActivationAllowed(stored);
+    await this.captureWorkflowRevision(id, existing, 'update');
     await db
       .update(embeddedWorkflows)
       .set({
@@ -2191,7 +2348,14 @@ export class EmbeddedWorkflowService extends Service {
         versionId,
       })
       .where(and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.id, id)));
-    if (stored.active) await this.armSchedules(id);
+    try {
+      if (stored.active) await this.armSchedules(id);
+      else await this.clearSchedules(id);
+    } catch (error) {
+      // error-policy:J2 restore the workflow row after the scheduler has restored
+      // its own snapshot, then surface one lifecycle failure with operation context.
+      return this.rollbackWorkflowRowAfterScheduleFailure(id, existing, 'update', error);
+    }
     return responseFromWorkflow(stored, existing.createdAt, updatedAt, versionId);
   }
 
@@ -2233,22 +2397,38 @@ export class EmbeddedWorkflowService extends Service {
   }
 
   async deleteWorkflow(id: string): Promise<void> {
+    return this.withWorkflowLifecycleLock(id, () => this.deleteWorkflowUnlocked(id));
+  }
+
+  private async deleteWorkflowUnlocked(id: string): Promise<void> {
     await this.ensureSchema();
-    await this.clearSchedules(id);
     const existing = await this.getStoredWorkflow(id);
     const db = this.getDb();
     await this.captureWorkflowRevision(id, existing, 'delete');
     await db
       .delete(embeddedWorkflows)
       .where(and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.id, id)));
-    if (!existing) {
-      throw new WorkflowApiError(`Workflow not found: ${id}`, 404);
+    try {
+      await this.clearSchedules(id);
+    } catch (error) {
+      // error-policy:J2 a failed task deletion restores the deleted definition
+      // after the scheduler has compensated its own partial mutation.
+      return this.rollbackWorkflowRowAfterScheduleFailure(id, existing, 'delete', error);
     }
   }
 
   async activateWorkflow(id: string): Promise<WorkflowDefinitionResponse> {
+    return this.withWorkflowLifecycleLock(id, () => this.activateWorkflowUnlocked(id));
+  }
+
+  private async activateWorkflowUnlocked(id: string): Promise<WorkflowDefinitionResponse> {
     const entry = await this.getStoredWorkflow(id);
+    const previous: StoredWorkflowRow = {
+      ...entry,
+      workflow: cloneJson(entry.workflow),
+    };
     this.assertHostSupports(entry.workflow);
+    this.assertScheduleActivationAllowed(entry.workflow);
     const db = this.getDb();
     await this.captureWorkflowRevision(id, entry, 'activate');
     entry.workflow.active = true;
@@ -2263,18 +2443,31 @@ export class EmbeddedWorkflowService extends Service {
         versionId: entry.versionId,
       })
       .where(and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.id, id)));
-    await this.armSchedules(id);
+    try {
+      await this.armSchedules(id);
+    } catch (error) {
+      // error-policy:J2 keep the prior inactive row aligned with the scheduler's
+      // restored task snapshot when activation cannot arm every task.
+      return this.rollbackWorkflowRowAfterScheduleFailure(id, previous, 'activate', error);
+    }
     return responseFromWorkflow(entry.workflow, entry.createdAt, entry.updatedAt, entry.versionId);
   }
 
   async deactivateWorkflow(id: string): Promise<WorkflowDefinitionResponse> {
+    return this.withWorkflowLifecycleLock(id, () => this.deactivateWorkflowUnlocked(id));
+  }
+
+  private async deactivateWorkflowUnlocked(id: string): Promise<WorkflowDefinitionResponse> {
     const entry = await this.getStoredWorkflow(id);
+    const previous: StoredWorkflowRow = {
+      ...entry,
+      workflow: cloneJson(entry.workflow),
+    };
     const db = this.getDb();
     await this.captureWorkflowRevision(id, entry, 'deactivate');
     entry.workflow.active = false;
     entry.updatedAt = nowIso();
     entry.versionId = randomUUID();
-    await this.clearSchedules(id);
     await db
       .update(embeddedWorkflows)
       .set({
@@ -2284,10 +2477,21 @@ export class EmbeddedWorkflowService extends Service {
         versionId: entry.versionId,
       })
       .where(and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.id, id)));
+    try {
+      await this.clearSchedules(id);
+    } catch (error) {
+      // error-policy:J2 restore the prior active definition after scheduler
+      // compensation so a failed deactivation never strands mismatched state.
+      return this.rollbackWorkflowRowAfterScheduleFailure(id, previous, 'deactivate', error);
+    }
     return responseFromWorkflow(entry.workflow, entry.createdAt, entry.updatedAt, entry.versionId);
   }
 
   async updateWorkflowTags(id: string, tagIds: string[]): Promise<WorkflowTag[]> {
+    return this.withWorkflowLifecycleLock(id, () => this.updateWorkflowTagsUnlocked(id, tagIds));
+  }
+
+  private async updateWorkflowTagsUnlocked(id: string, tagIds: string[]): Promise<WorkflowTag[]> {
     const entry = await this.getStoredWorkflow(id);
     const db = this.getDb();
     const tags: WorkflowTag[] = [];
@@ -2353,6 +2557,15 @@ export class EmbeddedWorkflowService extends Service {
     workflowId: string,
     versionId: string
   ): Promise<WorkflowDefinitionResponse> {
+    return this.withWorkflowLifecycleLock(workflowId, () =>
+      this.restoreWorkflowRevisionUnlocked(workflowId, versionId)
+    );
+  }
+
+  private async restoreWorkflowRevisionUnlocked(
+    workflowId: string,
+    versionId: string
+  ): Promise<WorkflowDefinitionResponse> {
     await this.ensureSchema();
     const db = this.getDb();
     const revisionRows = await db
@@ -2373,8 +2586,14 @@ export class EmbeddedWorkflowService extends Service {
 
     const current = await this.getStoredWorkflow(workflowId);
     const restored = normalizeWorkflowPayload(revision.workflow, workflowId, revision.active);
+    // Tags carry the live ownership boundary. The first revision is captured
+    // before a newly deployed workflow receives its owner tag, so replaying
+    // revision content must never replace current authorization metadata.
+    if (current.workflow.tags === undefined) delete restored.tags;
+    else restored.tags = cloneJson(current.workflow.tags);
     this.assertRegisteredNodes(restored);
     this.assertHostSupports(restored);
+    if (restored.active) this.assertScheduleActivationAllowed(restored);
     await this.captureWorkflowRevision(workflowId, current, 'restore');
 
     const updatedAt = nowIso();
@@ -2391,10 +2610,13 @@ export class EmbeddedWorkflowService extends Service {
       .where(
         and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.id, workflowId))
       );
-    if (restored.active) {
-      await this.armSchedules(workflowId);
-    } else {
-      await this.clearSchedules(workflowId);
+    try {
+      if (restored.active) await this.armSchedules(workflowId);
+      else await this.clearSchedules(workflowId);
+    } catch (error) {
+      // error-policy:J2 revision restore is one lifecycle operation across the
+      // workflow row and task store; compensate both before surfacing failure.
+      return this.rollbackWorkflowRowAfterScheduleFailure(workflowId, current, 'restore', error);
     }
     return responseFromWorkflow(restored, current.createdAt, updatedAt, nextVersionId);
   }
@@ -2579,8 +2801,8 @@ export class EmbeddedWorkflowService extends Service {
   /**
    * Look up the most recent execution row tagged with this idempotency
    * key for the given workflow. Returns null when none exists. The
-   * dispatch layer uses this to dedup back-to-back schedule fires that
-   * share a minute bucket — see WorkflowDispatchService.execute.
+   * dispatch layer uses this to dedup repeated delivery of one scheduled
+   * occurrence — see WorkflowDispatchService.execute.
    */
   async findExecutionByIdempotencyKey(
     workflowId: string,
@@ -2715,6 +2937,56 @@ export class EmbeddedWorkflowService extends Service {
     };
   }
 
+  private async restoreStoredWorkflowRow(id: string, entry: StoredWorkflowRow): Promise<void> {
+    const workflow = cloneJson(entry.workflow);
+    await this.getDb()
+      .insert(embeddedWorkflows)
+      .values({
+        agentId: this.tenantAgentId,
+        id,
+        name: workflow.name,
+        active: workflow.active === true,
+        workflow,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+        versionId: entry.versionId,
+      })
+      .onConflictDoUpdate({
+        target: [embeddedWorkflows.agentId, embeddedWorkflows.id],
+        set: {
+          name: workflow.name,
+          active: workflow.active === true,
+          workflow,
+          updatedAt: entry.updatedAt,
+          versionId: entry.versionId,
+        },
+      });
+  }
+
+  private async rollbackWorkflowRowAfterScheduleFailure(
+    id: string,
+    entry: StoredWorkflowRow,
+    operation: string,
+    error: unknown
+  ): Promise<never> {
+    try {
+      await this.restoreStoredWorkflowRow(id, entry);
+    } catch (rollbackError) {
+      // error-policy:J2 both failures are needed to diagnose cross-store drift;
+      // neither a failed schedule mutation nor a failed DB rollback is optional.
+      throw new ElizaError('Workflow row and schedule rollback both failed', {
+        code: 'WORKFLOW_LIFECYCLE_ROLLBACK_FAILED',
+        cause: new AggregateError([error, rollbackError]),
+        context: { workflowId: id, operation },
+      });
+    }
+    throw new ElizaError(`Workflow ${operation} failed and was rolled back`, {
+      code: 'WORKFLOW_LIFECYCLE_RECONCILE_FAILED',
+      cause: error,
+      context: { workflowId: id, operation },
+    });
+  }
+
   private assertRegisteredNodes(workflow: WorkflowDefinition): void {
     const missing = workflow.nodes
       .filter((node) => !node.disabled && !this.nodeTypes.has(node.type))
@@ -2775,6 +3047,35 @@ export class EmbeddedWorkflowService extends Service {
     }
   }
 
+  /**
+   * A scale-to-zero container has no clock while it sleeps, so accepting an
+   * active schedule would promise wall-clock delivery the runtime cannot make.
+   * Drafting and manual execution remain available; only the lifecycle change
+   * that would arm an enabled schedule requires continuous hosting.
+   */
+  private assertScheduleActivationAllowed(workflow: WorkflowDefinition): void {
+    if (!isScaleToZeroCloudRuntime(this.runtime) || !hasEnabledScheduleTrigger(workflow)) return;
+    throw new WorkflowApiError(
+      'Scheduled workflows require an always-on agent runtime. Confirm continuous billing before activating this workflow.',
+      409,
+      {
+        success: false,
+        code: 'workflow_requires_always_on',
+        error:
+          'Scheduled workflows require an always-on agent runtime. Confirm continuous billing before activating this workflow.',
+        capability: 'scheduled_workflows',
+        currentExecutionTier: DEDICATED_LAZY_EXECUTION_TIER,
+        requiredExecutionTier: 'dedicated-always',
+        upgradeRequired: true,
+        upgrade: {
+          automatic: false,
+          available: true,
+          requiresContinuousBillingConfirmation: true,
+        },
+      }
+    );
+  }
+
   /** Re-create core Tasks for every active workflow on service start.
    *  Tasks themselves persist across restart; this is a reconcile step that
    *  ensures workflows whose schedule changed (or whose tasks were never
@@ -2793,6 +3094,30 @@ export class EmbeddedWorkflowService extends Service {
         and(eq(embeddedWorkflows.agentId, this.tenantAgentId), eq(embeddedWorkflows.active, true))
       );
     for (const row of rows) {
+      if (isScaleToZeroCloudRuntime(this.runtime) && hasEnabledScheduleTrigger(row.workflow)) {
+        await this.deactivateWorkflow(row.id);
+        const policyError = new ElizaError(
+          'Scheduled workflow was deactivated because this Cloud agent scales to zero',
+          {
+            code: 'WORKFLOW_SCHEDULE_REQUIRES_ALWAYS_ON',
+            context: {
+              workflowId: row.id,
+              currentExecutionTier: DEDICATED_LAZY_EXECUTION_TIER,
+              requiredExecutionTier: 'dedicated-always',
+            },
+            severity: 'ephemeral',
+          }
+        );
+        logger.warn(
+          { src: 'plugin:workflow:embedded', workflowId: row.id },
+          'Deactivated scheduled workflow on a scale-to-zero Cloud runtime'
+        );
+        this.runtime.reportError('EmbeddedWorkflowService.rehydrateSchedules', policyError, {
+          workflowId: row.id,
+          currentExecutionTier: DEDICATED_LAZY_EXECUTION_TIER,
+        });
+        continue;
+      }
       await this.armSchedules(row.id);
     }
   }
@@ -3088,9 +3413,10 @@ export class EmbeddedWorkflowService extends Service {
   private buildScheduleTrigger(
     workflowId: string,
     workflowName: string,
+    scheduleNodeId: string,
     intervalMs: number
   ): TriggerConfig {
-    const triggerId = stringToUuid(`${workflowId}:schedule:${randomUUID()}`);
+    const triggerId = stringToUuid(`${workflowId}:schedule:${scheduleNodeId}`);
     return {
       version: TRIGGER_SCHEMA_VERSION,
       triggerId,
@@ -3108,68 +3434,218 @@ export class EmbeddedWorkflowService extends Service {
     };
   }
 
-  /** Create one recurring `TRIGGER_DISPATCH` Task per scheduleTrigger
-   *  node on the workflow. Idempotent: existing tasks for this workflow
-   *  are removed first so the task set always reflects the current
-   *  workflow definition. Each task carries an idempotency key derived
-   *  from `(workflowId, scheduleNodeId, nextRunAt-minute-bucket)` so that
-   *  retries deduplicate without suppressing a sibling schedule. */
-  private async armSchedules(workflowId: string): Promise<void> {
-    await this.clearSchedules(workflowId);
-    if (typeof this.runtime.createTask !== 'function') return;
-    const entry = await this.getStoredWorkflow(workflowId);
-    const scheduleNodes = entry.workflow.nodes.filter(
-      (node) => !node.disabled && node.type === 'workflows-nodes-base.scheduleTrigger'
-    );
-    if (scheduleNodes.length === 0) return;
-
-    const nowMs = Date.now();
-    for (const node of scheduleNodes) {
-      const intervalMs = resolveScheduleIntervalMs(node.parameters);
-      const trigger = this.buildScheduleTrigger(workflowId, entry.workflow.name, intervalMs);
-      const nextRunAtMs = nowMs + intervalMs;
-      const scheduleNodeId = resolveScheduleNodeId(workflowId, node);
-      const triggerWithSchedule: TriggerConfig = {
-        ...trigger,
-        nextRunAtMs,
-      };
-      const idempotencyKey = buildScheduleIdempotencyKey(workflowId, scheduleNodeId, nextRunAtMs);
-      await this.runtime.createTask({
-        agentId: this.runtime.agentId,
-        name: TRIGGER_TASK_NAME,
-        description: trigger.displayName,
-        tags: [...TRIGGER_TASK_TAGS, WORKFLOW_TASK_TAG],
-        metadata: {
-          blocking: true,
-          updatedAt: nowMs,
-          updateInterval: intervalMs,
-          baseInterval: intervalMs,
-          kind: WORKFLOW_TASK_KIND,
-          workflowId,
-          scheduleNodeId,
-          idempotencyKey,
-          trigger: triggerWithSchedule,
-        },
-      });
-    }
+  private scheduleTaskWorkflowId(task: Task): string | undefined {
+    return isRecord(task.metadata) && typeof task.metadata.workflowId === 'string'
+      ? task.metadata.workflowId
+      : undefined;
   }
 
-  /** Remove every core Task tagged for this workflow. */
-  private async clearSchedules(workflowId: string): Promise<void> {
-    if (typeof this.runtime.getTasks !== 'function') return;
+  private scheduleTaskNodeId(task: Task): string | undefined {
+    return isRecord(task.metadata) && typeof task.metadata.scheduleNodeId === 'string'
+      ? task.metadata.scheduleNodeId
+      : undefined;
+  }
+
+  private async listWorkflowScheduleTasks(workflowId: string): Promise<Task[]> {
+    if (typeof this.runtime.getTasks !== 'function') return [];
     const tasks = await this.runtime.getTasks({
       tags: [WORKFLOW_TASK_TAG],
       agentIds: [this.runtime.agentId],
     });
-    if (!tasks.length) return;
-    for (const task of tasks) {
+    return tasks
+      .filter((task) => this.scheduleTaskWorkflowId(task) === workflowId)
+      .map((task) => structuredClone(task));
+  }
+
+  private buildScheduleTasks(
+    workflowId: string,
+    workflow: WorkflowDefinition,
+    existingTasks: Task[]
+  ): Task[] {
+    const nowMs = Date.now();
+    const claimedExisting = new Set<Task>();
+    return workflow.nodes
+      .filter((node) => !node.disabled && node.type === 'workflows-nodes-base.scheduleTrigger')
+      .map((node) => {
+        const intervalMs = resolveScheduleIntervalMs(node.parameters);
+        const scheduleNodeId = resolveScheduleNodeId(workflowId, node);
+        const existing = existingTasks.find(
+          (task) => !claimedExisting.has(task) && this.scheduleTaskNodeId(task) === scheduleNodeId
+        );
+        if (existing) claimedExisting.add(existing);
+        const existingMetadata = isRecord(existing?.metadata) ? existing.metadata : undefined;
+        const existingTrigger = isRecord(existingMetadata?.trigger)
+          ? existingMetadata.trigger
+          : undefined;
+        const existingInterval =
+          typeof existingMetadata?.baseInterval === 'number'
+            ? existingMetadata.baseInterval
+            : existingMetadata?.updateInterval;
+        const preservesCadence = existing !== undefined && existingInterval === intervalMs;
+        const preservedNextRunAtMs =
+          preservesCadence && typeof existingTrigger?.nextRunAtMs === 'number'
+            ? existingTrigger.nextRunAtMs
+            : undefined;
+        const nextRunAtMs = preservedNextRunAtMs ?? nowMs + intervalMs;
+        const trigger = this.buildScheduleTrigger(
+          workflowId,
+          workflow.name,
+          scheduleNodeId,
+          intervalMs
+        );
+        const triggerId =
+          preservesCadence && typeof existingTrigger?.triggerId === 'string'
+            ? (existingTrigger.triggerId as UUID)
+            : trigger.triggerId;
+        const idempotencyKey = buildScheduleIdempotencyKey(workflowId, scheduleNodeId, nextRunAtMs);
+        return {
+          id:
+            existing?.id ??
+            stringToUuid(`${workflowId}:schedule-task:${encodeURIComponent(scheduleNodeId)}`),
+          agentId: this.runtime.agentId,
+          name: TRIGGER_TASK_NAME,
+          description: trigger.displayName,
+          tags: [...TRIGGER_TASK_TAGS, WORKFLOW_TASK_TAG],
+          metadata: {
+            ...(preservesCadence && existingMetadata ? structuredClone(existingMetadata) : {}),
+            blocking: true,
+            updatedAt:
+              preservesCadence && typeof existingMetadata?.updatedAt === 'number'
+                ? existingMetadata.updatedAt
+                : nowMs,
+            updateInterval: intervalMs,
+            baseInterval: intervalMs,
+            kind: WORKFLOW_TASK_KIND,
+            workflowId,
+            scheduleNodeId,
+            idempotencyKey,
+            trigger: {
+              ...trigger,
+              triggerId,
+              nextRunAtMs,
+            },
+          },
+        } satisfies Task;
+      });
+  }
+
+  private comparableScheduleTask(
+    task: Task
+  ): Pick<Task, 'id' | 'agentId' | 'name' | 'description' | 'tags' | 'metadata'> {
+    return {
+      id: task.id,
+      agentId: task.agentId,
+      name: task.name,
+      description: task.description,
+      tags: task.tags,
+      metadata: task.metadata,
+    };
+  }
+
+  private async restoreScheduleTaskSnapshot(workflowId: string, snapshot: Task[]): Promise<void> {
+    const current = await this.listWorkflowScheduleTasks(workflowId);
+    if (current.length > 0 && typeof this.runtime.deleteTask !== 'function') {
+      throw new Error('Workflow scheduler cannot delete tasks while restoring a snapshot');
+    }
+    for (const task of current) {
+      if (!task.id) throw new Error('Workflow scheduler returned a task without an id');
+      await this.runtime.deleteTask(task.id);
+    }
+    if (snapshot.length > 0 && typeof this.runtime.createTask !== 'function') {
+      throw new Error('Workflow scheduler cannot recreate tasks while restoring a snapshot');
+    }
+    for (const task of snapshot) await this.runtime.createTask(structuredClone(task));
+  }
+
+  /** Reconcile one recurring task per schedule node without moving an unchanged
+   *  task's durable deadline. Mutations are compensating: any partial failure
+   *  restores the exact pre-operation task snapshot before surfacing an error. */
+  private async reconcileSchedules(
+    workflowId: string,
+    workflow: WorkflowDefinition | null
+  ): Promise<void> {
+    const snapshot = await this.listWorkflowScheduleTasks(workflowId);
+    const desired = workflow ? this.buildScheduleTasks(workflowId, workflow, snapshot) : [];
+    if (desired.length > 0 && typeof this.runtime.createTask !== 'function') {
+      throw new ElizaError('Workflow scheduler is unavailable for an active scheduled workflow', {
+        code: 'WORKFLOW_SCHEDULER_UNAVAILABLE',
+        context: { workflowId },
+      });
+    }
+
+    const retained = new Set<Task>();
+    const toCreate: Task[] = [];
+    for (const desiredTask of desired) {
+      const existing = snapshot.find(
+        (task) =>
+          !retained.has(task) &&
+          this.scheduleTaskNodeId(task) === this.scheduleTaskNodeId(desiredTask)
+      );
       if (
-        task.id &&
-        (task.metadata as Record<string, unknown> | undefined)?.workflowId === workflowId
+        existing &&
+        isDeepStrictEqual(
+          this.comparableScheduleTask(existing),
+          this.comparableScheduleTask(desiredTask)
+        )
       ) {
-        await this.runtime.deleteTask(task.id as UUID);
+        retained.add(existing);
+      } else {
+        if (existing) retained.add(existing);
+        toCreate.push(desiredTask);
       }
     }
+    const toDelete = snapshot.filter(
+      (task) =>
+        !retained.has(task) ||
+        toCreate.some(
+          (desiredTask) => this.scheduleTaskNodeId(desiredTask) === this.scheduleTaskNodeId(task)
+        )
+    );
+    if (toDelete.length === 0 && toCreate.length === 0) return;
+    if (toDelete.length > 0 && typeof this.runtime.deleteTask !== 'function') {
+      throw new ElizaError('Workflow scheduler cannot remove obsolete schedule tasks', {
+        code: 'WORKFLOW_SCHEDULER_UNAVAILABLE',
+        context: { workflowId },
+      });
+    }
+
+    try {
+      for (const task of toDelete) {
+        if (!task.id) throw new Error('Workflow scheduler returned a task without an id');
+        await this.runtime.deleteTask(task.id);
+      }
+      for (const task of toCreate) await this.runtime.createTask(task);
+    } catch (error) {
+      // error-policy:J2 schedule reconciliation is a cross-store boundary; add
+      // workflow context only after restoring the pre-operation task snapshot.
+      try {
+        await this.restoreScheduleTaskSnapshot(workflowId, snapshot);
+      } catch (rollbackError) {
+        // error-policy:J2 surface both the original scheduler failure and the
+        // failed compensation so operators never mistake partial state for safe rollback.
+        throw new ElizaError('Workflow schedule reconciliation and rollback both failed', {
+          code: 'WORKFLOW_SCHEDULE_ROLLBACK_FAILED',
+          cause: new AggregateError([error, rollbackError]),
+          context: { workflowId },
+        });
+      }
+      throw new ElizaError('Workflow schedule reconciliation failed and was rolled back', {
+        code: 'WORKFLOW_SCHEDULE_RECONCILE_FAILED',
+        cause: error,
+        context: { workflowId },
+      });
+    }
+  }
+
+  private async armSchedules(workflowId: string): Promise<void> {
+    const entry = await this.getStoredWorkflow(workflowId);
+    await this.reconcileSchedules(workflowId, entry.workflow);
+  }
+
+  /** Remove every core Task tagged for this workflow with rollback on a
+   *  partially failed delete sequence. */
+  private async clearSchedules(workflowId: string): Promise<void> {
+    await this.reconcileSchedules(workflowId, null);
   }
 
   private async savePendingExecution(

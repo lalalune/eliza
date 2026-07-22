@@ -245,6 +245,8 @@ export interface Bindings {
   // ---- App config ----
   NEXT_PUBLIC_APP_URL?: string;
   NEXT_PUBLIC_API_URL?: string;
+  /** Canonical Cloud identity origin used to bind scoped browser sessions. */
+  ELIZA_CLOUD_URL?: string;
   /** Public VAPID key exposed by the static manifest route and used to gate web-push enablement. */
   ELIZA_WEB_PUSH_VAPID_PUBLIC_KEY?: string;
   /** Private VAPID key used only by the cloud sender; deploy as a Worker secret. */

@@ -951,7 +951,7 @@ const MAX_INFLIGHT_UPGRADES = 3;
  * e.g. the operator pinned a non-ghcr image like `eliza-agent:prod-good`, or
  * the registry is unreachable. The reconciler simply waits for the next tick.
  */
-async function processFleetUpgradeCycle(): Promise<FleetUpgradeSummary> {
+export async function processFleetUpgradeCycle(): Promise<FleetUpgradeSummary> {
   const {
     containersEnv,
     resolveImageDigest,

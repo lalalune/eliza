@@ -7,7 +7,6 @@ import {
   type IAgentRuntime,
   type Memory,
   type Provider,
-  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import {
@@ -15,7 +14,7 @@ import {
   readPendingWorkflowDraft,
 } from '../lib/pending-workflow-draft';
 import { coerceClarifications } from '../lib/workflow-clarification';
-import { getLocalOwnerEntityId } from '../utils/context';
+import { resolveWorkflowOwnerEntityId } from '../utils/context';
 
 const MAX_DRAFT_NODES = 12;
 
@@ -35,9 +34,7 @@ export const pendingDraftProvider: Provider = {
 
   get: async (runtime: IAgentRuntime, message: Memory, _state: State) => {
     try {
-      const ownerEntityId =
-        (await resolveCanonicalOwnerIdForMessage(runtime, message)) ??
-        getLocalOwnerEntityId(runtime);
+      const ownerEntityId = await resolveWorkflowOwnerEntityId(runtime, message);
       const scope = getPendingWorkflowDraftScope(message, ownerEntityId);
       const draft = await readPendingWorkflowDraft(runtime, scope);
 

@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 import { InMemoryDatabaseAdapter } from "../database/inMemoryAdapter";
 import { AgentRuntime } from "../runtime";
 import {
+	type ActionResult,
 	type Character,
 	type Evaluator,
 	type Memory,
@@ -60,6 +61,70 @@ function schema() {
 }
 
 describe("EvaluatorService", () => {
+	it("threads canonical action results through evaluator options", async () => {
+		const runtime = makeRuntime();
+		const canonicalActionResults: ActionResult[] = [
+			{
+				success: true,
+				data: { actionName: "WORKFLOW" },
+				values: { workflowId: "workflow-1" },
+			},
+		];
+		const seen: ActionResult[][] = [];
+
+		runtime.registerEvaluator({
+			name: "canonical_action_results",
+			description: "observes the completed action",
+			schema: schema(),
+			shouldRun: async ({ options }) => {
+				seen.push(options.actionResults ?? []);
+				return true;
+			},
+			prepare: async ({ options }) => {
+				seen.push(options.actionResults ?? []);
+				return undefined;
+			},
+			prompt: ({ options }) => {
+				seen.push(options.actionResults ?? []);
+				return "Check the completed action.";
+			},
+			parse: (output) => output as never,
+			processors: [
+				{
+					process: async ({ options }) => {
+						seen.push(options.actionResults ?? []);
+						return { success: true };
+					},
+				},
+			],
+		});
+
+		runtime.useModel = vi.fn(async (_modelType, params) => {
+			const prompt = String(params.messages?.[0]?.content ?? "");
+			expect(prompt).toContain('"actionName": "WORKFLOW"');
+			expect(prompt).not.toContain('"actionName": "STALE"');
+			return { canonical_action_results: { ok: true } };
+		}) as AgentRuntime["useModel"];
+
+		const result = await new EvaluatorService(runtime).run(
+			makeMessage(),
+			{
+				values: {},
+				data: {
+					actionResults: [{ success: true, data: { actionName: "STALE" } }],
+				},
+				text: "",
+			},
+			{ actionResults: canonicalActionResults },
+		);
+
+		expect(result.processedEvaluators).toEqual(["canonical_action_results"]);
+		expect(seen).toHaveLength(4);
+		for (const received of seen) {
+			expect(received).toBe(canonicalActionResults);
+		}
+	});
+
 	it("merges active evaluator sections into one structured model call", async () => {
 		const runtime = makeRuntime();
 		const processed: string[] = [];

@@ -85,7 +85,7 @@
     "pluginParameters": {
       "ELIZA_CHAT_VIA_CLI": {
         "type": "string",
-        "description": "Enable the SAFE/CLOUD inference route. Set to 'claude', 'claude-sdk', or 'codex' for large-tier inference. Unset = plugin inert.",
+        "description": "Enable the SAFE/CLOUD inference route. Set to 'claude', 'claude-sdk', 'codex', or 'codex-sdk' for large-tier inference. Unset = plugin inert.",
         "required": false,
         "sensitive": false
       },
@@ -106,13 +106,6 @@
         "type": "string",
         "description": "Path to the Claude Code executable used by the Claude Agent SDK backend.",
         "required": false,
-        "sensitive": false
-      },
-      "ELIZA_CLI_SDK_RESTART_AFTER_TURNS": {
-        "type": "number",
-        "description": "Restart each warm Claude SDK session after this many turns. Defaults to 20.",
-        "required": false,
-        "default": 20,
         "sensitive": false
       },
       "ELIZA_CLI_SDK_TURN_TIMEOUT_MS": {

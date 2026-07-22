@@ -127,7 +127,7 @@ describe('EmbeddedWorkflowService trigger task scheduling', () => {
       });
       expect(typeof task.metadata?.trigger?.nextRunAtMs).toBe('number');
       expect(task.metadata?.idempotencyKey).toBe(
-        `${created.id}:sched:${Math.floor(Number(task.metadata?.trigger?.nextRunAtMs) / 60_000)}`
+        `${created.id}:sched:${String(task.metadata?.trigger?.nextRunAtMs)}`
       );
       expect(task.tags).toContain('queue');
       expect(task.tags).toContain('repeat');

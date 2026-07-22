@@ -22,7 +22,14 @@ function hasPayloadUpdates(updates: Partial<Job> | Partial<NewJob>): boolean {
 
 function stringField(
   data: Record<string, unknown>,
-  field: "agentId" | "agentName" | "appId" | "characterId" | "organizationId" | "userId",
+  field:
+    | "agentId"
+    | "agentName"
+    | "appId"
+    | "characterId"
+    | "executionTierTransition"
+    | "organizationId"
+    | "userId",
 ): string | null {
   const value = data[field];
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -42,6 +49,7 @@ function inlineJobData(data: Record<string, unknown>): Record<string, unknown> {
     "agentName",
     "appId",
     "characterId",
+    "executionTierTransition",
     "organizationId",
     "userId",
   ] as const) {
@@ -393,6 +401,7 @@ export class JobsRepository {
     organizationId?: string;
     staleThresholdMs: number;
     maxAttempts?: number;
+    onFailedInTx?: (tx: DbTransaction, job: Job, errorMessage: string) => Promise<void>;
   }): Promise<number> {
     const staleThreshold = new Date(Date.now() - filters.staleThresholdMs);
     const conditions = [
@@ -423,15 +432,23 @@ export class JobsRepository {
         ? `Job timed out ${newAttempts} times - max attempts reached`
         : `Job timed out - recovered for retry (attempt ${newAttempts}/${maxAttempts})`;
 
-      await dbWrite
-        .update(jobs)
-        .set({
-          status: isFailed ? "failed" : "pending",
-          ...(await prepareJobPayload({ error: timeoutError }, job)),
-          attempts: newAttempts,
-          updated_at: new Date(),
-        })
-        .where(eq(jobs.id, job.id));
+      const payload = await prepareJobPayload({ error: timeoutError }, job);
+      await dbWrite.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(jobs)
+          .set({
+            status: isFailed ? "failed" : "pending",
+            ...payload,
+            attempts: newAttempts,
+            updated_at: new Date(),
+          })
+          .where(eq(jobs.id, job.id))
+          .returning();
+
+        if (isFailed && updated && filters.onFailedInTx) {
+          await filters.onFailedInTx(tx, await hydrateJob(updated), timeoutError);
+        }
+      });
 
       if (!isFailed) {
         recoveredCount++;
@@ -454,6 +471,7 @@ export class JobsRepository {
     organizationId?: string;
     startedBefore: Date;
     maxAttempts?: number;
+    onFailedInTx?: (tx: DbTransaction, job: Job, errorMessage: string) => Promise<void>;
   }): Promise<number> {
     const conditions = [
       eq(jobs.type, filters.type),
@@ -481,15 +499,23 @@ export class JobsRepository {
         ? `Job interrupted by worker restart ${newAttempts} times - max attempts reached`
         : `Job interrupted by worker restart - recovered for retry (attempt ${newAttempts}/${maxAttempts})`;
 
-      await dbWrite
-        .update(jobs)
-        .set({
-          status: isFailed ? "failed" : "pending",
-          ...(await prepareJobPayload({ error }, job)),
-          attempts: newAttempts,
-          updated_at: new Date(),
-        })
-        .where(eq(jobs.id, job.id));
+      const payload = await prepareJobPayload({ error }, job);
+      await dbWrite.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(jobs)
+          .set({
+            status: isFailed ? "failed" : "pending",
+            ...payload,
+            attempts: newAttempts,
+            updated_at: new Date(),
+          })
+          .where(eq(jobs.id, job.id))
+          .returning();
+
+        if (isFailed && updated && filters.onFailedInTx) {
+          await filters.onFailedInTx(tx, await hydrateJob(updated), error);
+        }
+      });
 
       if (!isFailed) {
         recoveredCount++;

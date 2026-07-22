@@ -6,6 +6,7 @@
 
 import type http from 'node:http';
 import type { Plugin, Route } from '@elizaos/core';
+import { getForwardedWorkflowPrincipal, isCloudWorkflowPrincipalRequired } from './routes/_helpers';
 import { handleAutomationsRoutes } from './routes/automations';
 import { handleWorkbenchTodosRoutes } from './routes/workbench-todos';
 import { handleWorkflowRoutes, type WorkflowRouteContext } from './routes/workflow-routes';
@@ -29,6 +30,23 @@ function jsonResponder(httpRes: http.ServerResponse) {
   };
 }
 
+function rejectMissingCloudPrincipal(
+  httpRes: http.ServerResponse,
+  principalId: string | undefined
+): boolean {
+  if (principalId || !isCloudWorkflowPrincipalRequired()) return false;
+  jsonResponder(httpRes)(
+    httpRes,
+    {
+      success: false,
+      code: 'workflow_principal_required',
+      error: 'Workflow user principal is required',
+    },
+    401
+  );
+  return true;
+}
+
 function makeWorkflowHandler() {
   return async (req: unknown, res: unknown, runtime: unknown): Promise<void> => {
     const httpReq = req as http.IncomingMessage;
@@ -36,6 +54,8 @@ function makeWorkflowHandler() {
     const url = new URL(httpReq.url ?? '/', 'http://localhost');
     const method = (httpReq.method ?? 'GET').toUpperCase();
     const state = buildState(runtime);
+    const principalId = getForwardedWorkflowPrincipal(httpReq);
+    if (rejectMissingCloudPrincipal(httpRes, principalId)) return;
 
     await handleWorkflowRoutes({
       req: httpReq,
@@ -43,6 +63,7 @@ function makeWorkflowHandler() {
       method,
       pathname: url.pathname,
       runtime: state.current,
+      ...(principalId ? { principalId } : {}),
       json: jsonResponder(httpRes),
     });
   };
@@ -55,6 +76,8 @@ function makeAutomationsHandler() {
     const url = new URL(httpReq.url ?? '/', 'http://localhost');
     const method = (httpReq.method ?? 'GET').toUpperCase();
     const state = buildState(runtime);
+    const principalId = getForwardedWorkflowPrincipal(httpReq);
+    if (rejectMissingCloudPrincipal(httpRes, principalId)) return;
 
     await handleAutomationsRoutes({
       req: httpReq,
@@ -62,6 +85,7 @@ function makeAutomationsHandler() {
       method,
       pathname: url.pathname,
       runtime: state.current,
+      ...(principalId ? { principalId } : {}),
       json: jsonResponder(httpRes),
     });
   };

@@ -128,6 +128,7 @@ export interface PairingTokenResponse {
 export interface AuthPairResponse {
   message: string;
   apiKey: string | null;
+  expiresAt: string;
   agentName: string;
 }
 

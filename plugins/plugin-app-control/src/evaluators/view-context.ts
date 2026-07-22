@@ -2,7 +2,11 @@
  * Evaluator that maps user context to registered views and dispatches navigation.
  */
 
-import type { Evaluator, EvaluatorProcessor } from "@elizaos/core";
+import type {
+	Evaluator,
+	EvaluatorProcessor,
+	EvaluatorRunContext,
+} from "@elizaos/core";
 import {
 	logger,
 	ModelType,
@@ -16,7 +20,25 @@ import {
 import { markViewSwitch } from "../runtime/view-switch-signal.js";
 
 const VIEWS_ACTION_NAME = "VIEWS";
+const WORKFLOW_ACTION_NAME = "WORKFLOW";
 const NONE = "none";
+
+function hasSuccessfulWorkflowActionResult(
+	context: Pick<EvaluatorRunContext, "options" | "state">,
+): boolean {
+	const actionResults =
+		context.options.actionResults ?? context.state?.data?.actionResults;
+	return Boolean(
+		actionResults?.some((result) => {
+			const actionName = result.data?.actionName;
+			return (
+				result.success === true &&
+				typeof actionName === "string" &&
+				actionName.trim().toUpperCase() === WORKFLOW_ACTION_NAME
+			);
+		}),
+	);
+}
 
 // The user-facing domain surfaces a situation can map to. Kept as a fixed enum
 // so the model output is constrained; the processor still confirms the id is an
@@ -167,8 +189,12 @@ export const viewContextEvaluator: Evaluator<ViewContextOutput> = {
 		},
 		required: ["viewId"],
 	},
-	async shouldRun({ runtime, message, options }) {
+	async shouldRun({ runtime, message, state, options }) {
 		if (options?.didRespond === false) return false;
+		// A completed workflow action is stronger evidence than contextual inference.
+		// The chat client hands successful WORKFLOW results to Automations, so a
+		// later model judgment must not race that deterministic navigation.
+		if (hasSuccessfulWorkflowActionResult({ options, state })) return false;
 		// Must be a view-capable app surface (VIEWS registered).
 		const hasViews = (runtime.actions ?? []).some(
 			(action) => action.name?.toUpperCase() === VIEWS_ACTION_NAME,

@@ -8,9 +8,21 @@
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 const repoRoot = new URL("../../../", import.meta.url);
+const apiDirectory = new URL("packages/cloud/api/", repoRoot);
+
+const pairingSigningPair = generateKeyPairSync("ec", {
+  namedCurve: "P-256",
+});
+const pairingPrivateKey = Buffer.from(
+  pairingSigningPair.privateKey.export({ type: "pkcs8", format: "pem" }),
+).toString("base64");
+const pairingPublicKey = Buffer.from(
+  pairingSigningPair.publicKey.export({ type: "spki", format: "pem" }),
+).toString("base64");
 
 function read(path: string): string {
   return readFileSync(new URL(path, repoRoot), "utf8");
@@ -50,6 +62,7 @@ const preflight = publishStep.run.slice(
 function runPreflight(env: Record<string, string>) {
   return spawnSync("bash", ["-c", preflight], {
     encoding: "utf8",
+    cwd: apiDirectory,
     env: {
       ...process.env,
       DEPLOY_ENVIRONMENT: "staging",
@@ -61,6 +74,8 @@ function runPreflight(env: Record<string, string>) {
       PRODUCTION_REALTIME_WS_ENABLED: "false",
       PRODUCTION_REALTIME_CARTESIA_VOICE_ID: "",
       PRODUCTION_REALTIME_ELIZA_ENDPOINT: "",
+      JWT_SIGNING_PRIVATE_KEY: pairingPrivateKey,
+      JWT_SIGNING_PUBLIC_KEY: pairingPublicKey,
       ...env,
     },
   });
@@ -85,6 +100,19 @@ describe("Cloud CF realtime voice deploy contract", () => {
     expect(publishStep.run).toContain(
       "DEEPGRAM_API_KEY|CARTESIA_API_KEY|VOICE_REALTIME_ELIZA_AUTHORIZATION",
     );
+  });
+
+  test("recognizes mixed-case truthy opt-ins on portable Bash", () => {
+    for (const truthy of ["tRuE", "yEs", "On"]) {
+      const result = runPreflight({
+        DEEPGRAM_API_KEY: "",
+        VOICE_REALTIME_WS_ENABLED: truthy,
+      });
+      expect(result.status, `${truthy}: ${result.stdout}${result.stderr}`).toBe(
+        1,
+      );
+      expect(result.stdout).toContain("DEEPGRAM_API_KEY");
+    }
   });
 
   test("does not require realtime secrets when staging opt-in is absent", () => {
@@ -127,6 +155,7 @@ describe("Cloud CF realtime voice deploy contract", () => {
       ],
       {
         encoding: "utf8",
+        cwd: apiDirectory,
         env: {
           ...process.env,
           DEPLOY_ENVIRONMENT: "staging",
@@ -135,11 +164,15 @@ describe("Cloud CF realtime voice deploy contract", () => {
           VOICE_REALTIME_WS_ENABLED: "true",
           VOICE_REALTIME_ELIZA_AUTHORIZATION: "",
           STAGING_ELIZACLOUD_API_KEY: "stage-cloud-key",
+          JWT_SIGNING_PRIVATE_KEY: pairingPrivateKey,
+          JWT_SIGNING_PUBLIC_KEY: pairingPublicKey,
         },
       },
     );
     expect(configured.status).toBe(0);
-    expect(configured.stdout).toBe("<Bearer stage-cloud-key>");
+    expect(configured.stdout).toContain("<Bearer stage-cloud-key>");
+    expect(configured.stdout).not.toContain(pairingPrivateKey);
+    expect(configured.stdout).not.toContain(pairingPublicKey);
 
     const empty = runPreflight({
       VOICE_REALTIME_ELIZA_AUTHORIZATION: "",

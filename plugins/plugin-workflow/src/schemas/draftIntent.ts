@@ -3,6 +3,7 @@
  */
 export const draftIntentSchema = {
   type: 'object',
+  additionalProperties: false,
   properties: {
     intent: {
       type: 'string',

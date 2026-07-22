@@ -3,7 +3,9 @@
  * and bounded query parsing. Local HTTP requests run under the same canonical
  * owner entity as client chat so both surfaces see one ownership scope.
  */
+import { timingSafeEqual } from 'node:crypto';
 import type { IAgentRuntime } from '@elizaos/core';
+import { readAliasedEnv } from '@elizaos/shared';
 import type { WorkflowService } from '../services/workflow-service';
 import { WORKFLOW_SERVICE_TYPE } from '../services/workflow-service';
 import { getLocalOwnerEntityId } from '../utils/context';
@@ -30,6 +32,38 @@ export function getService(runtime: IAgentRuntime): WorkflowService {
  */
 export function getRouteOwnerEntityId(runtime: IAgentRuntime): string {
   return getLocalOwnerEntityId(runtime);
+}
+
+/**
+ * Cloud-provisioned containers are multi-user surfaces, so silently falling
+ * back to the local owner would merge every paired Cloud user into one tenant.
+ */
+export function isCloudWorkflowPrincipalRequired(): boolean {
+  return readAliasedEnv('ELIZA_CLOUD_PROVISIONED') === '1';
+}
+
+/**
+ * Read the end-user principal installed by the authenticated Cloud gateway.
+ * Managed browsers receive a scoped Cloud session, never the per-agent API
+ * token. A separate proof header carrying that per-agent credential attests
+ * that Cloud replaced the caller-controlled principal without distributing a
+ * fleet-wide daemon secret to every tenant container.
+ */
+export function getForwardedWorkflowPrincipal(req: {
+  headers: Record<string, string | string[] | undefined>;
+}): string | undefined {
+  const expectedToken = readAliasedEnv('ELIZA_API_TOKEN')?.trim();
+  const suppliedToken = req.headers['x-eliza-principal-token'];
+  if (!expectedToken || typeof suppliedToken !== 'string') return undefined;
+  const expected = Buffer.from(expectedToken);
+  const supplied = Buffer.from(suppliedToken.trim());
+  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) {
+    return undefined;
+  }
+  const value = req.headers['x-eliza-user-id'];
+  if (typeof value !== 'string') return undefined;
+  const principalId = value.trim();
+  return principalId || undefined;
 }
 
 /**

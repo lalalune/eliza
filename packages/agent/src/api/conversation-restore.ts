@@ -14,8 +14,17 @@
  * from optimistic client state. Callers run this as a background boot task and
  * decide how to surface failures at that boundary.
  */
-import { type AgentRuntime, stringToUuid, type UUID } from "@elizaos/core";
-import { extractConversationMetadataFromRoom } from "./conversation-metadata.ts";
+import {
+  type AgentRuntime,
+  ElizaError,
+  type Room,
+  stringToUuid,
+  type UUID,
+} from "@elizaos/core";
+import {
+  extractConversationCloudOwnerEntityIdFromRoom,
+  extractConversationMetadataFromRoom,
+} from "./conversation-metadata.ts";
 import type { ConversationMeta } from "./server-types.ts";
 
 /** The in-memory conversation registry the restore writes into. */
@@ -35,6 +44,74 @@ export function webChatWorldId(agentName: string): UUID {
 
 /** The `channelId` prefix that marks a room as a web-chat conversation. */
 export const WEB_CONVERSATION_CHANNEL_PREFIX = "web-conv-";
+
+async function conversationMetaFromRoom(
+  rt: AgentRuntime,
+  room: Room,
+  convId: string,
+): Promise<ConversationMeta> {
+  const msgs = await rt.getMemories({
+    roomId: room.id as UUID,
+    tableName: "messages",
+    limit: 1,
+  });
+  const updatedAt =
+    msgs.length > 0 && msgs[0].createdAt
+      ? new Date(msgs[0].createdAt).toISOString()
+      : new Date().toISOString();
+
+  const conversationMetadata = extractConversationMetadataFromRoom(
+    room,
+    convId,
+  );
+  const cloudOwnerEntityId = extractConversationCloudOwnerEntityIdFromRoom(
+    room,
+    convId,
+  );
+
+  return {
+    id: convId,
+    title: room.name || "Chat",
+    roomId: room.id as UUID,
+    ...(cloudOwnerEntityId ? { cloudOwnerEntityId } : {}),
+    ...(conversationMetadata ? { metadata: conversationMetadata } : {}),
+    createdAt: updatedAt,
+    updatedAt,
+  };
+}
+
+/**
+ * Rehydrate one deterministic web-chat room after a soft-cap eviction or a
+ * delayed bulk restore. Import-by-id must consult this store truth before it
+ * can claim an apparently absent conversation.
+ */
+export async function restoreConversationFromDbById(
+  rt: AgentRuntime,
+  target: ConversationRestoreTarget,
+  convId: string,
+): Promise<ConversationMeta | undefined> {
+  const existing = target.conversations.get(convId);
+  if (existing) return existing;
+  if (target.deletedConversationIds.has(convId)) return undefined;
+
+  const roomId = stringToUuid(`web-conv-${convId}`) as UUID;
+  const room = await rt.getRoom(roomId);
+  if (!room) return undefined;
+  if (room.channelId !== `${WEB_CONVERSATION_CHANNEL_PREFIX}${convId}`) {
+    throw new ElizaError(
+      "Deterministic conversation room has an unexpected channel id",
+      {
+        code: "CONVERSATION_ROOM_BINDING_INVALID",
+        context: { conversationId: convId, roomId, channelId: room.channelId },
+        severity: "fatal",
+      },
+    );
+  }
+
+  const conversation = await conversationMetaFromRoom(rt, room, convId);
+  target.conversations.set(convId, conversation);
+  return conversation;
+}
 
 /**
  * Scan the agent's web-chat world and rebuild any not-yet-loaded, not-deleted
@@ -59,29 +136,7 @@ export async function restoreConversationsFromDb(
     if (!convId || conversations.has(convId)) continue;
     if (deletedConversationIds.has(convId)) continue;
 
-    const msgs = await rt.getMemories({
-      roomId: room.id as UUID,
-      tableName: "messages",
-      limit: 1,
-    });
-    const updatedAt =
-      msgs.length > 0 && msgs[0].createdAt
-        ? new Date(msgs[0].createdAt).toISOString()
-        : new Date().toISOString();
-
-    const conversationMetadata = await extractConversationMetadataFromRoom(
-      room,
-      convId,
-    );
-
-    conversations.set(convId, {
-      id: convId,
-      title: room.name || "Chat",
-      roomId: room.id as UUID,
-      ...(conversationMetadata ? { metadata: conversationMetadata } : {}),
-      createdAt: updatedAt,
-      updatedAt,
-    });
+    conversations.set(convId, await conversationMetaFromRoom(rt, room, convId));
     restored++;
   }
 

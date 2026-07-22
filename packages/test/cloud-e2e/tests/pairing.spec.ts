@@ -1,5 +1,5 @@
 /** Covers the pairing cloud E2E flow using Playwright against the real local stack with mock-backed external services. */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, webcrypto } from "node:crypto";
 import {
   createCloudAgent,
   pollSandboxStatus,
@@ -17,14 +17,14 @@ import { expect, test } from "../src/helpers/test-fixtures";
  *     redirectUrl carries `?token=` only when ELIZA_API_TOKEN is present
  *     (supportsUiTokenPairing) — pairing-token/route.ts:65-94,252-273.
  *   • POST /api/auth/pair validates the token against the request Origin, is
- *     single-use (consumeValidToken flips used_at), and returns { apiKey } from
- *     environment_vars.ELIZA_API_TOKEN — auth/pair/route.ts:26-71,
+ *     single-use (consumeValidToken flips used_at), and returns a scoped ES256
+ *     session in the stable { apiKey } field — auth/pair/route.ts,
  *     pairing-token.ts:75-120, agent-pairing-tokens.ts consumeValidToken:25-47.
  *   • Token format must match ^[A-Za-z0-9_-]{43}$ — auth/pair/route.ts:22.
  *   • Tokens expire after 60s (TOKEN_EXPIRY_MS) and bind to one expected_origin.
  *
  * The memory provider leaves environment_vars empty and sets no web_ui_port, so
- * this test stamps ELIZA_API_TOKEN (to get a real apiKey + token redirect)
+ * this test stamps ELIZA_API_TOKEN (to enable principal transport + token redirect)
  * directly on the row after it reaches running. The web-UI origin equals the
  * control-plane mock origin (health_url host).
  */
@@ -46,7 +46,7 @@ async function pair(
   origin: string | null,
 ): Promise<{
   status: number;
-  body: { apiKey?: string | null; error?: string };
+  body: { apiKey?: string | null; expiresAt?: string; error?: string };
 }> {
   const res = await fetch(`${apiUrl}/api/auth/pair`, {
     method: "POST",
@@ -58,9 +58,40 @@ async function pair(
   });
   const body = (await res.json().catch(() => ({}))) as {
     apiKey?: string | null;
+    expiresAt?: string;
     error?: string;
   };
   return { status: res.status, body };
+}
+
+async function verifyPairedSession(
+  apiUrl: string,
+  token: string,
+): Promise<Record<string, unknown>> {
+  const parts = token.split(".");
+  expect(parts).toHaveLength(3);
+  const jwksResponse = await fetch(`${apiUrl}/.well-known/jwks.json`);
+  expect(jwksResponse.status).toBe(200);
+  const jwks = (await jwksResponse.json()) as { keys?: JsonWebKey[] };
+  const jwk = jwks.keys?.[0];
+  expect(jwk).toBeTruthy();
+  const publicKey = await webcrypto.subtle.importKey(
+    "jwk",
+    jwk as JsonWebKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["verify"],
+  );
+  const signatureValid = await webcrypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    publicKey,
+    Buffer.from(parts[2] as string, "base64url"),
+    Buffer.from(`${parts[0]}.${parts[1]}`),
+  );
+  expect(signatureValid).toBe(true);
+  return JSON.parse(
+    Buffer.from(parts[1] as string, "base64url").toString("utf8"),
+  ) as Record<string, unknown>;
 }
 
 test.describe("pairing token exchange", () => {
@@ -90,8 +121,8 @@ test.describe("pairing token exchange", () => {
       onTick: processJobs,
     });
 
-    // Stamp the agent token so /api/auth/pair returns a real apiKey and the
-    // pairing-token redirect carries `?token=`.
+    // Stamp the agent token so the managed principal transport is available and
+    // the pairing-token redirect carries `?token=`.
     const { agentSandboxesRepository } = await import(
       "@elizaos/cloud-shared/db/repositories/agent-sandboxes"
     );
@@ -123,13 +154,29 @@ test.describe("pairing token exchange", () => {
       `${webUiOrigin}/pair?token=${token}`,
     );
 
-    // Exchange with the correct origin -> 200 with the agent api key.
+    // Exchange with the correct origin -> 200 with a signed, user-scoped
+    // browser session. The raw container token must never cross this boundary.
     const ok = await pair(stack.urls.api, token as string, webUiOrigin);
     expect(
       ok.status,
       `pair should succeed, got ${ok.status}: ${JSON.stringify(ok.body)}`,
     ).toBe(200);
-    expect(ok.body.apiKey).toBe(AGENT_API_TOKEN);
+    expect(ok.body.apiKey).toBeTruthy();
+    expect(ok.body.apiKey).not.toBe(AGENT_API_TOKEN);
+    expect(ok.body.expiresAt).toBeTruthy();
+    const claims = await verifyPairedSession(
+      stack.urls.api,
+      ok.body.apiKey as string,
+    );
+    expect(claims).toMatchObject({
+      userId: seededUser.userId,
+      organizationId: seededUser.organizationId,
+      agentId: sandboxId,
+      sessionVersion: 1,
+      sub: seededUser.userId,
+      aud: "dedicated-agent-session",
+    });
+    expect(Number(claims.exp) * 1000).toBe(Date.parse(ok.body.expiresAt as string));
 
     // Replaying the same token is rejected (single-use; used_at already set).
     const replay = await pair(stack.urls.api, token as string, webUiOrigin);
@@ -196,7 +243,18 @@ test.describe("pairing token exchange", () => {
     // And the (still-unused) token remains valid from the correct origin.
     const right = await pair(stack.urls.api, token as string, webUiOrigin);
     expect(right.status).toBe(200);
-    expect(right.body.apiKey).toBe(AGENT_API_TOKEN);
+    expect(right.body.apiKey).toBeTruthy();
+    expect(right.body.apiKey).not.toBe(AGENT_API_TOKEN);
+    const claims = await verifyPairedSession(
+      stack.urls.api,
+      right.body.apiKey as string,
+    );
+    expect(claims).toMatchObject({
+      userId: seededUser.userId,
+      organizationId: seededUser.organizationId,
+      agentId: sandboxId,
+      sessionVersion: 1,
+    });
   });
 
   test("rejects an expired pairing token", async ({ stack, seededUser }) => {

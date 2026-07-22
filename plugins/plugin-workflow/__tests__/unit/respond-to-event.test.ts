@@ -4,13 +4,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
-import type { IAgentRuntime, UUID } from '@elizaos/core';
+import { type IAgentRuntime, stringToUuid, type Task, type UUID } from '@elizaos/core';
 import { drizzle } from 'drizzle-orm/pglite';
 import defaultNodes from '../../src/data/defaultNodes.json';
 import * as dbSchema from '../../src/db/schema';
 import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
 
 interface CapturedMemory {
+  id: UUID;
   entityId: string;
   roomId: UUID;
   content: {
@@ -43,7 +44,15 @@ interface RuntimeMockOptions {
 
 type RespondToEventRuntime = Pick<
   IAgentRuntime,
-  'agentId' | 'db' | 'getSetting' | 'getService' | 'createMemory' | 'logger'
+  | 'agentId'
+  | 'db'
+  | 'getSetting'
+  | 'getService'
+  | 'createMemory'
+  | 'createTask'
+  | 'getTasks'
+  | 'deleteTask'
+  | 'logger'
 >;
 
 function buildRuntime(options: RuntimeMockOptions = {}): {
@@ -52,6 +61,7 @@ function buildRuntime(options: RuntimeMockOptions = {}): {
   warnings: Array<{ context: unknown; message: string }>;
 } {
   const capturedMemories: CapturedMemory[] = [];
+  const tasks: Task[] = [];
   const warnings: Array<{ context: unknown; message: string }> = [];
   const services: Record<string, unknown> = {};
   if (options.autonomy) {
@@ -66,6 +76,14 @@ function buildRuntime(options: RuntimeMockOptions = {}): {
     createMemory: mock(async (memory: CapturedMemory, _table: string) => {
       capturedMemories.push(memory);
       return memory;
+    }),
+    createTask: mock(async (task: Task) => {
+      tasks.push(structuredClone(task));
+    }),
+    getTasks: mock(async () => tasks.map((task) => structuredClone(task))),
+    deleteTask: mock(async (id: UUID) => {
+      const index = tasks.findIndex((task) => task.id === id);
+      if (index >= 0) tasks.splice(index, 1);
     }),
     logger: {
       warn: (context: unknown, message: string) => {
@@ -189,6 +207,9 @@ describe('workflows-nodes-base.respondToEvent', () => {
       expect(execution.status).toBe('success');
       expect(harness.capturedMemories).toHaveLength(1);
       const memory = harness.capturedMemories[0];
+      expect(memory.id).toBe(
+        stringToUuid(`workflow:${execution.id}:node:respond:respond-to-event`)
+      );
       expect(memory.roomId).toBe(ROOM_ID);
       expect(memory.entityId).toBe('agent-respond-to-event');
       expect(memory.content.text).toBe('[Greet User]\nReply to the user warmly');

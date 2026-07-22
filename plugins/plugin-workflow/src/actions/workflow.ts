@@ -30,20 +30,22 @@
 import {
   type Action,
   type ActionResult,
+  ElizaError,
   type HandlerCallback,
   type HandlerOptions,
   type IAgentRuntime,
   logger,
   type Memory,
-  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import { invalidateAutomationExecutionCache } from '../lib/automations-builder';
 import {
+  claimPendingWorkflowDraft,
   clearPendingWorkflowDraft,
   getPendingWorkflowDraftScope,
   persistPendingWorkflowDraft,
   readPendingWorkflowDraft,
+  withPendingWorkflowDraftScopeLock,
 } from '../lib/pending-workflow-draft';
 import {
   applyResolutions,
@@ -59,7 +61,7 @@ import type {
   WorkflowDraft,
   WorkflowExecution,
 } from '../types/index';
-import { getLocalOwnerEntityId } from '../utils/context';
+import { resolveWorkflowOwnerEntityId } from '../utils/context';
 import {
   buildWorkflowExecutionDiagnostics,
   getWorkflowExecutionError,
@@ -141,7 +143,7 @@ function readClarificationResolutions(
     if (!isRecord(item) || typeof item.paramPath !== 'string' || typeof item.value !== 'string') {
       return undefined;
     }
-    resolutions.push({ paramPath: item.paramPath, value: item.value });
+    resolutions.push({ paramPath: item.paramPath.trim(), value: item.value });
   }
   return resolutions;
 }
@@ -335,171 +337,164 @@ async function handleCreate(
   }
   try {
     const scope = getPendingWorkflowDraftScope(message, ownerEntityId);
-    const pendingDraft = await readPendingWorkflowDraft(runtime, scope);
-    const cachedContinuation =
-      !explicitDraft && pendingDraft && (params.resolutions !== undefined || !seedPrompt)
-        ? pendingDraft
-        : null;
-    const continuedWorkflow = explicitDraft ?? cachedContinuation?.workflow;
-    if (!seedPrompt && !continuedWorkflow) {
-      return {
-        success: false,
-        text: 'seedPrompt or a pending draft is required to create a workflow.',
-      };
-    }
-    if (params.resolutions !== undefined && !continuedWorkflow) {
-      return {
-        success: false,
-        text: 'No pending workflow draft exists in this conversation for those resolutions.',
-      };
-    }
+    return await withPendingWorkflowDraftScopeLock(runtime, scope, async () => {
+      const pendingDraft = await readPendingWorkflowDraft(runtime, scope);
+      const cachedContinuation =
+        !explicitDraft && pendingDraft && (params.resolutions !== undefined || !seedPrompt)
+          ? pendingDraft
+          : null;
+      const continuedWorkflow = explicitDraft ?? cachedContinuation?.workflow;
+      if (params.resolutions !== undefined && !continuedWorkflow) {
+        return {
+          success: false,
+          text: 'No pending workflow draft exists in this conversation for those resolutions.',
+        };
+      }
+      if (!seedPrompt && !continuedWorkflow) {
+        return {
+          success: false,
+          text: 'seedPrompt or a pending draft is required to create a workflow.',
+        };
+      }
 
-    // Clarification application mutates the workflow. A detached copy keeps a
-    // rejected answer from corrupting the last valid cache entry.
-    const draft = continuedWorkflow
-      ? structuredClone(continuedWorkflow)
-      : await service.generateWorkflowDraft(seedPrompt as string, {
+      // Clarification application mutates the workflow. A detached copy keeps a
+      // rejected answer from corrupting the last valid cache entry.
+      const draft = continuedWorkflow
+        ? structuredClone(continuedWorkflow)
+        : await service.generateWorkflowDraft(seedPrompt as string, {
+            userId: ownerEntityId,
+          });
+      if (continuedWorkflow && params.resolutions !== undefined) {
+        const resolutions = readClarificationResolutions(params.resolutions);
+        if (!resolutions) {
+          return {
+            success: false,
+            text: 'Clarification resolutions must be an array of { paramPath, value } entries.',
+          };
+        }
+        const mutableDraft: Record<string, unknown> = { ...draft };
+        const resolutionResult = applyResolutions(mutableDraft, resolutions);
+        if (!resolutionResult.ok) {
+          return {
+            success: false,
+            text: resolutionResult.error,
+            data: { status: 'invalid_clarification', paramPath: resolutionResult.paramPath },
+          };
+        }
+        const resolvedPaths = new Set(
+          resolutions.map((resolution) => resolution.paramPath).filter((path) => path.length > 0)
+        );
+        const freeFormCount = resolutions.filter(
+          (resolution) => resolution.paramPath.length === 0
+        ).length;
+        pruneResolvedClarifications(mutableDraft, resolvedPaths, freeFormCount);
+        Object.assign(draft, mutableDraft);
+      }
+      if (name) {
+        draft.name = name;
+      }
+      const clarifications = coerceClarifications(draft._meta?.requiresClarification);
+      if (clarifications.length > 0) {
+        const storedDraft: WorkflowDraft = {
+          workflow: draft,
+          prompt:
+            cachedContinuation?.prompt ??
+            seedPrompt ??
+            pendingDraft?.prompt ??
+            `Continue workflow "${draft.name}"`,
           userId: ownerEntityId,
+          createdAt: Date.now(),
+          originMessageId:
+            cachedContinuation?.originMessageId ??
+            pendingDraft?.originMessageId ??
+            (typeof message.id === 'string' ? message.id : undefined),
+        };
+        await persistPendingWorkflowDraft(runtime, scope, storedDraft);
+        const text = `I need ${clarifications.length} clarification${clarifications.length === 1 ? '' : 's'} before I can create this workflow: ${clarifications
+          .map((clarification, index) => `${index + 1}. ${clarification.question}`)
+          .join(' ')}`;
+        const data = { status: 'needs_clarification', draft, clarifications } as const;
+        if (callback) {
+          await callback({
+            text,
+            action: WORKFLOW_ACTION,
+            metadata: {
+              status: data.status,
+              clarificationCount: clarifications.length,
+              clarificationQuestions: clarifications.map((clarification) => clarification.question),
+            },
+          });
+        }
+        return {
+          success: false,
+          text,
+          values: { status: data.status, clarificationCount: clarifications.length },
+          data,
+        };
+      }
+      const claimedDraft = cachedContinuation;
+      if (claimedDraft) {
+        await claimPendingWorkflowDraft(runtime, scope);
+      }
+      let deployed: WorkflowCreationResult;
+      try {
+        deployed = await service.deployWorkflow(draft, ownerEntityId, {
+          activate: readBoolean(params.active),
         });
-    if (continuedWorkflow && params.resolutions !== undefined) {
-      const resolutions = readClarificationResolutions(params.resolutions);
-      if (!resolutions) {
-        return {
-          success: false,
-          text: 'Clarification resolutions must be an array of { paramPath, value } entries.',
-        };
+      } catch (deployError) {
+        // error-policy:J2 restore the claimed conversation state before the
+        // action boundary translates the deployment failure for a later retry.
+        if (claimedDraft) {
+          try {
+            await persistPendingWorkflowDraft(runtime, scope, claimedDraft);
+          } catch (restoreError) {
+            // error-policy:J2 preserve both failures when cache compensation also fails.
+            throw new ElizaError('Workflow deployment and pending draft restore both failed', {
+              code: 'WORKFLOW_PENDING_DRAFT_RESTORE_FAILED',
+              cause: new AggregateError([deployError, restoreError]),
+              context: { ownerEntityId, roomId: scope.roomId },
+            });
+          }
+        }
+        throw deployError;
       }
-      const mutableDraft: Record<string, unknown> = { ...draft };
-      const resolutionResult = applyResolutions(mutableDraft, resolutions);
-      if (!resolutionResult.ok) {
-        return {
-          success: false,
-          text: resolutionResult.error,
-          data: { status: 'invalid_clarification', paramPath: resolutionResult.paramPath },
-        };
+      if (deployed.id) {
+        invalidateAutomationExecutionCache(service, ownerEntityId, deployed.id);
       }
-      const resolvedPaths = new Set(
-        resolutions.map((resolution) => resolution.paramPath).filter((path) => path.length > 0)
-      );
-      const freeFormCount = resolutions.filter(
-        (resolution) => resolution.paramPath.length === 0
-      ).length;
-      pruneResolvedClarifications(mutableDraft, resolvedPaths, freeFormCount);
-      Object.assign(draft, mutableDraft);
-    }
-    if (name) {
-      draft.name = name;
-    }
-    const clarifications = coerceClarifications(draft._meta?.requiresClarification);
-    if (clarifications.length > 0) {
-      const storedDraft: WorkflowDraft = {
-        workflow: draft,
-        prompt:
-          cachedContinuation?.prompt ??
-          seedPrompt ??
-          pendingDraft?.prompt ??
-          `Continue workflow "${draft.name}"`,
-        userId: ownerEntityId,
-        createdAt: Date.now(),
-        originMessageId:
-          cachedContinuation?.originMessageId ??
-          pendingDraft?.originMessageId ??
-          (typeof message.id === 'string' ? message.id : undefined),
-      };
-      await persistPendingWorkflowDraft(runtime, scope, storedDraft);
-      const text = `I need ${clarifications.length} clarification${clarifications.length === 1 ? '' : 's'} before I can create this workflow: ${clarifications
-        .map((clarification, index) => `${index + 1}. ${clarification.question}`)
-        .join(' ')}`;
-      const data = { status: 'needs_clarification', draft, clarifications } as const;
+      if (!deployed.id) {
+        if (claimedDraft) {
+          await persistPendingWorkflowDraft(runtime, scope, claimedDraft);
+        }
+        const missing = deployed.missingCredentials.map((c) => c.credType).join(', ');
+        const text = missing
+          ? `Workflow generated but missing credentials: ${missing}.`
+          : 'Workflow generation produced no deployable result.';
+        return { success: false, text, data: { missingCredentials: deployed.missingCredentials } };
+      }
+      const text = deployed.active
+        ? `Created and activated workflow "${deployed.name}".`
+        : `Created draft workflow "${deployed.name}".`;
       if (callback) {
         await callback({
           text,
           action: WORKFLOW_ACTION,
           metadata: {
-            status: data.status,
-            clarificationCount: clarifications.length,
-            clarificationQuestions: clarifications.map((clarification) => clarification.question),
+            workflowId: deployed.id,
+            workflowName: deployed.name,
           },
         });
       }
       return {
-        success: false,
+        success: true,
         text,
-        values: { status: data.status, clarificationCount: clarifications.length },
-        data,
-      };
-    }
-    const deployed = await service.deployWorkflow(draft, ownerEntityId, {
-      activate: readBoolean(params.active),
-    });
-    if (deployed.id) {
-      invalidateAutomationExecutionCache(service, ownerEntityId, deployed.id);
-    }
-    if (!deployed.id) {
-      const missing = deployed.missingCredentials.map((c) => c.credType).join(', ');
-      const text = missing
-        ? `Workflow generated but missing credentials: ${missing}.`
-        : 'Workflow generation produced no deployable result.';
-      return { success: false, text, data: { missingCredentials: deployed.missingCredentials } };
-    }
-    let pendingDraftWarning: { code: string; message: string } | undefined;
-    if (pendingDraft) {
-      try {
-        await clearPendingWorkflowDraft(runtime, scope);
-      } catch (err) {
-        // error-policy:J6 post-commit cache cleanup cannot roll back a deployed workflow.
-        const detail = err instanceof Error ? err.message : String(err);
-        const code =
-          isRecord(err) && typeof err.code === 'string'
-            ? err.code
-            : 'WORKFLOW_PENDING_DRAFT_CLEAR_FAILED';
-        pendingDraftWarning = {
-          code,
-          message:
-            'The workflow was created, but its pending chat draft could not be cleared. Do not retry creation.',
-        };
-        logger.warn(
-          { src: 'plugin:workflow:action:create', workflowId: deployed.id, detail },
-          pendingDraftWarning.message
-        );
-        runtime.reportError('WorkflowAction.pendingDraftClearAfterDeploy', err, {
-          workflowId: deployed.id,
-          ownerEntityId,
-          roomId: scope.roomId,
-        });
-      }
-    }
-    const deployedText = deployed.active
-      ? `Created and activated workflow "${deployed.name}".`
-      : `Created draft workflow "${deployed.name}".`;
-    const text = pendingDraftWarning
-      ? `${deployedText} ${pendingDraftWarning.message}`
-      : deployedText;
-    if (callback) {
-      await callback({
-        text,
-        action: WORKFLOW_ACTION,
-        metadata: {
+        values: {
           workflowId: deployed.id,
           workflowName: deployed.name,
-          ...(pendingDraftWarning ? { warningCode: pendingDraftWarning.code } : {}),
+          active: deployed.active,
         },
-      });
-    }
-    return {
-      success: true,
-      text,
-      values: {
-        workflowId: deployed.id,
-        workflowName: deployed.name,
-        active: deployed.active,
-        ...(pendingDraftWarning ? { warning: true } : {}),
-      },
-      data: {
-        workflow: summarizeWorkflow(deployed),
-        ...(pendingDraftWarning ? { warning: pendingDraftWarning } : {}),
-      },
-    };
+        data: { workflow: summarizeWorkflow(deployed) },
+      };
+    });
   } catch (err) {
     // error-policy:J1 action-boundary translation returns cache failures as a failed tool result.
     const message = err instanceof Error ? err.message : String(err);
@@ -516,29 +511,41 @@ async function handleCancelPendingDraft(
 ): Promise<ActionResult> {
   try {
     const scope = getPendingWorkflowDraftScope(message, ownerEntityId);
-    const pendingDraft = await readPendingWorkflowDraft(runtime, scope);
-    if (!pendingDraft) {
-      const text = 'No pending workflow draft exists in this conversation.';
-      if (callback) {
-        await callback({ text, action: WORKFLOW_ACTION, metadata: { status: 'no_pending_draft' } });
+    return await withPendingWorkflowDraftScopeLock(runtime, scope, async () => {
+      const pendingDraft = await readPendingWorkflowDraft(runtime, scope);
+      if (!pendingDraft) {
+        const text = 'No pending workflow draft exists in this conversation.';
+        if (callback) {
+          await callback({
+            text,
+            action: WORKFLOW_ACTION,
+            metadata: { status: 'no_pending_draft' },
+          });
+        }
+        return {
+          success: true,
+          text,
+          values: { status: 'no_pending_draft' },
+          data: { status: 'no_pending_draft' },
+        };
       }
-      return { success: true, text, data: { status: 'no_pending_draft' } };
-    }
 
-    await clearPendingWorkflowDraft(runtime, scope);
-    const text = `Canceled pending workflow "${pendingDraft.workflow.name}".`;
-    if (callback) {
-      await callback({
+      await clearPendingWorkflowDraft(runtime, scope);
+      const text = `Canceled pending workflow "${pendingDraft.workflow.name}".`;
+      if (callback) {
+        await callback({
+          text,
+          action: WORKFLOW_ACTION,
+          metadata: { status: 'canceled', workflowName: pendingDraft.workflow.name },
+        });
+      }
+      return {
+        success: true,
         text,
-        action: WORKFLOW_ACTION,
-        metadata: { status: 'canceled', workflowName: pendingDraft.workflow.name },
-      });
-    }
-    return {
-      success: true,
-      text,
-      data: { status: 'canceled', workflowName: pendingDraft.workflow.name },
-    };
+        values: { status: 'canceled', workflowName: pendingDraft.workflow.name },
+        data: { status: 'canceled', workflowName: pendingDraft.workflow.name },
+      };
+    });
   } catch (err) {
     // error-policy:J1 action-boundary translation returns cache failures as a failed tool result.
     const message = err instanceof Error ? err.message : String(err);
@@ -573,8 +580,12 @@ async function handleModify(
       values: { workflowId, workflowName: existing.name },
       data: { workflow: existing, awaitingUserInput: true },
     };
-  } catch {
-    return { success: false, text: `Workflow not found: ${workflowId}` };
+  } catch (err) {
+    // error-policy:J1 the action boundary must preserve operational failures;
+    // only the service's typed 404 message is allowed to read as not-found.
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ src: 'plugin:workflow:action:modify' }, message);
+    return { success: false, text: message };
   }
 }
 
@@ -599,8 +610,12 @@ async function handleToggleActive(
   let existing: WorkflowDefinitionResponse;
   try {
     existing = await service.getWorkflow(workflowId, ownerEntityId);
-  } catch {
-    return { success: false, text: `Workflow not found: ${workflowId}` };
+  } catch (err) {
+    // error-policy:J1 preserve the service failure so a storage outage is not
+    // fabricated into a missing-workflow response.
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ src: 'plugin:workflow:action:toggle_active' }, message);
+    return { success: false, text: message };
   }
   try {
     if (explicitActive) {
@@ -613,7 +628,6 @@ async function handleToggleActive(
     logger.warn({ src: 'plugin:workflow:action:toggle_active' }, msg);
     return { success: false, text: msg };
   }
-  const refreshed = await service.getWorkflow(workflowId, ownerEntityId);
   const text = explicitActive
     ? `Activated workflow "${existing.name}".`
     : `Deactivated workflow "${existing.name}".`;
@@ -628,7 +642,7 @@ async function handleToggleActive(
     success: true,
     text,
     values: { workflowId, active: explicitActive },
-    data: { workflow: summarizeWorkflow(refreshed) },
+    data: { workflow: summarizeWorkflow({ ...existing, active: explicitActive }) },
   };
 }
 
@@ -645,8 +659,12 @@ async function handleDeleteWorkflow(
   let existing: WorkflowDefinitionResponse;
   try {
     existing = await service.getWorkflow(workflowId, ownerEntityId);
-  } catch {
-    return { success: false, text: `Workflow not found: ${workflowId}` };
+  } catch (err) {
+    // error-policy:J1 preserve the service failure so deletion is never
+    // presented as a harmless missing-row case during an outage.
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ src: 'plugin:workflow:action:delete' }, message);
+    return { success: false, text: message };
   }
   try {
     await service.deleteWorkflow(workflowId, ownerEntityId);
@@ -1075,18 +1093,29 @@ export const workflowAction: Action = {
       schema: { type: 'string' as const },
     },
     {
-      name: 'draft',
-      description:
-        'Optional explicit workflow draft for compatibility. Normal chat continuation reloads the pending draft from the current conversation.',
-      required: false,
-      schema: { type: 'object' as const },
-    },
-    {
       name: 'resolutions',
       description:
-        'Clarification answers for a pending create draft, as { paramPath, value } entries.',
+        'Clarification answers for the pending create draft. The server reloads the draft from the current conversation.',
       required: false,
-      schema: { type: 'array' as const },
+      schema: {
+        type: 'array' as const,
+        items: {
+          type: 'object' as const,
+          properties: {
+            paramPath: {
+              type: 'string' as const,
+              description:
+                'Exact clarification parameter path, or an empty string for a free-form answer.',
+            },
+            value: {
+              type: 'string' as const,
+              description: 'User-provided clarification answer.',
+            },
+          },
+          required: ['paramPath', 'value'],
+          additionalProperties: false,
+        },
+      },
     },
     {
       name: 'name',
@@ -1136,8 +1165,7 @@ export const workflowAction: Action = {
     if (!service) {
       return { success: false, text: 'Workflow service is not registered.' };
     }
-    const ownerEntityId =
-      (await resolveCanonicalOwnerIdForMessage(runtime, message)) ?? getLocalOwnerEntityId(runtime);
+    const ownerEntityId = await resolveWorkflowOwnerEntityId(runtime, message);
     switch (op) {
       case 'list':
         return handleListWorkflows(service, params, ownerEntityId, callback);

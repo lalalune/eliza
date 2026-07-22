@@ -35,9 +35,10 @@ const proxyWorkflowRequest = mock<
     organizationId: string,
     workflowPath: string,
     method: "GET" | "POST" | "PUT" | "DELETE",
-    body?: BodyInit | null,
-    query?: string,
-    options?: {
+    body: BodyInit | null | undefined,
+    query: string | undefined,
+    options: {
+      principalId: string;
       timeoutMs?: number;
       protocolHeaders?: HeadersInit;
     },
@@ -616,6 +617,9 @@ describe("legacy Cloud SDK workflow routes", () => {
     });
     expect(call?.[5]).toBe("");
     expect(call?.[6]?.timeoutMs).toBe(10 * 60_000);
+    expect(call?.[6]).toMatchObject({
+      principalId: "user-1",
+    });
   });
 
   test("returns the canonical retryable timeout contract for a legacy run", async () => {
@@ -738,9 +742,39 @@ describe("workflow dedicated-container routing", () => {
       resolutions: [],
     });
     expect(call?.[6]?.timeoutMs).toBe(5 * 60_000);
+    expect(call?.[6]).toMatchObject({
+      principalId: "user-1",
+    });
     expect(new Headers(call?.[6]?.protocolHeaders).get("x-eliza-user-id")).toBe(
       "spoofed-user",
     );
+  });
+
+  test("keeps same-organization users in distinct workflow principal scopes", async () => {
+    getAgent.mockImplementation(async () => ({
+      id: "agent-1",
+      execution_tier: "dedicated-always" as const,
+      status: "running",
+    }));
+    proxyWorkflowRequest.mockImplementation(async () =>
+      Response.json({ workflows: [] }),
+    );
+
+    for (const userId of ["user-a", "user-b"]) {
+      requireAuth.mockImplementationOnce(async () => ({
+        user: { id: userId, organization_id: "org-1" },
+      }));
+      const response = await handleWorkflowProxyRequest(
+        workflowRequest({ "x-eliza-user-id": "spoofed-user" }),
+        "agent-1",
+        "",
+        context(),
+      );
+      expect(response.status).toBe(200);
+      expect(proxyWorkflowRequest.mock.calls.at(-1)?.[6]).toMatchObject({
+        principalId: userId,
+      });
+    }
   });
 
   test("forwards the evaluation-samples suffix and query without a body", async () => {

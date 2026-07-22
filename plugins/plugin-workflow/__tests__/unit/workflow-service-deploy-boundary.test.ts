@@ -109,7 +109,7 @@ async function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('WorkflowService deployment boundary', () => {
-  test('coalesces omitted and explicit default throw behavior for the same manual run', async () => {
+  test('keeps identical manual runs independent without an explicit idempotency key', async () => {
     let releaseFirstRun: (() => void) | undefined;
     let invocation = 0;
     const executeWorkflow = mock(async (workflowId: string) => {
@@ -136,17 +136,17 @@ describe('WorkflowService deployment boundary', () => {
     const duplicate = service.runWorkflow('workflow-owned', { throwOnError: true }, USER_ID);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
     releaseFirstRun?.();
     const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
-    expect(duplicateResult.id).toBe(firstResult.id);
+    expect(duplicateResult.id).not.toBe(firstResult.id);
 
     const next = await service.runWorkflow('workflow-owned', undefined, USER_ID);
-    expect(next.id).toBe('execution-2');
-    expect(executeWorkflow).toHaveBeenCalledTimes(2);
+    expect(next.id).toBe('execution-3');
+    expect(executeWorkflow).toHaveBeenCalledTimes(3);
   });
 
-  test('keeps concurrent manual runs with distinct semantic inputs independent', async () => {
+  test('coalesces concurrent manual retries only when their explicit idempotency key matches', async () => {
     let releaseFirstRun: (() => void) | undefined;
     let invocation = 0;
     const executeWorkflow = mock(async (workflowId: string) => {
@@ -182,20 +182,27 @@ describe('WorkflowService deployment boundary', () => {
     ];
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(executeWorkflow).toHaveBeenCalledTimes(4);
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
     releaseFirstRun?.();
     const results = await Promise.all(runs);
-    expect(new Set(results.map((result) => result.id)).size).toBe(4);
+    expect(results[1]?.id).toBe(results[0]?.id);
+    expect(results[3]?.id).toBe(results[0]?.id);
+    expect(results[2]?.id).not.toBe(results[0]?.id);
   });
 
-  test('coalesces trigger data whose object keys have equivalent meaning', async () => {
+  test('treats a whitespace-only idempotency key as absent', async () => {
     let releaseFirstRun: (() => void) | undefined;
+    let invocation = 0;
     const executeWorkflow = mock(async (workflowId: string) => {
-      await new Promise<void>((resolve) => {
-        releaseFirstRun = resolve;
-      });
+      invocation += 1;
+      const executionId = `execution-${invocation}`;
+      if (invocation === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstRun = resolve;
+        });
+      }
       return {
-        id: 'execution-1',
+        id: executionId,
         workflowId,
         mode: 'manual' as const,
         status: 'success' as const,
@@ -208,20 +215,20 @@ describe('WorkflowService deployment boundary', () => {
 
     const first = service.runWorkflow(
       'workflow-owned',
-      { triggerData: { source: 'chat', payload: { first: 1, second: 2 } } },
+      { idempotencyKey: '   ', triggerData: { source: 'chat' } },
       USER_ID
     );
     const equivalent = service.runWorkflow(
       'workflow-owned',
-      { triggerData: { payload: { second: 2, first: 1 }, source: 'chat' } },
+      { idempotencyKey: '   ', triggerData: { source: 'chat' } },
       USER_ID
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    expect(executeWorkflow).toHaveBeenCalledTimes(2);
     releaseFirstRun?.();
     const [firstResult, equivalentResult] = await Promise.all([first, equivalent]);
-    expect(equivalentResult.id).toBe(firstResult.id);
+    expect(equivalentResult.id).not.toBe(firstResult.id);
   });
 
   test('does not coalesce concurrent manual runs across owner scopes', async () => {
@@ -247,8 +254,12 @@ describe('WorkflowService deployment boundary', () => {
     });
     const { service } = await harness({ executeWorkflow });
 
-    const localOwnerRun = service.runWorkflow('workflow-owned');
-    const explicitOwnerRun = service.runWorkflow('workflow-owned', undefined, USER_ID);
+    const localOwnerRun = service.runWorkflow('workflow-owned', { idempotencyKey: 'request-1' });
+    const explicitOwnerRun = service.runWorkflow(
+      'workflow-owned',
+      { idempotencyKey: 'request-1' },
+      USER_ID
+    );
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(executeWorkflow).toHaveBeenCalledTimes(2);
@@ -271,10 +282,11 @@ describe('WorkflowService deployment boundary', () => {
       });
     const { service } = await harness({ executeWorkflow });
 
-    await expect(service.runWorkflow('workflow-owned', undefined, USER_ID)).rejects.toThrow(
+    const options = { idempotencyKey: 'request-retry' };
+    await expect(service.runWorkflow('workflow-owned', options, USER_ID)).rejects.toThrow(
       'Smithers unavailable'
     );
-    const retried = await service.runWorkflow('workflow-owned', undefined, USER_ID);
+    const retried = await service.runWorkflow('workflow-owned', options, USER_ID);
 
     expect(retried.id).toBe('execution-retry');
     expect(executeWorkflow).toHaveBeenCalledTimes(2);
@@ -404,6 +416,28 @@ describe('WorkflowService deployment boundary', () => {
     expect(client.activateWorkflow).not.toHaveBeenCalled();
   });
 
+  test('surfaces both ownership and orphan-cleanup failures', async () => {
+    const ownershipError = new Error('tag store unavailable');
+    const cleanupError = new Error('workflow store unavailable');
+    const { service } = await harness({
+      updateWorkflowTags: mock(async () => {
+        throw ownershipError;
+      }),
+      deleteWorkflow: mock(async () => {
+        throw cleanupError;
+      }),
+    });
+
+    const failure = await service.deployWorkflow(workflow(), USER_ID).catch((error) => error);
+
+    expect(failure).toMatchObject({
+      name: 'ElizaError',
+      code: 'WORKFLOW_OWNERSHIP_COMPENSATION_FAILED',
+    });
+    expect(failure.cause).toBeInstanceOf(AggregateError);
+    expect((failure.cause as AggregateError).errors).toEqual([ownershipError, cleanupError]);
+  });
+
   test('removes a new tagged workflow when activation fails', async () => {
     const activateWorkflow = mock(async () => {
       throw new Error('scheduler unavailable');
@@ -419,6 +453,55 @@ describe('WorkflowService deployment boundary', () => {
 
     expect(client.updateWorkflowTags).toHaveBeenCalledTimes(1);
     expect(client.deleteWorkflow).toHaveBeenCalledWith('workflow-created');
+  });
+
+  test('preserves a typed subscription capability error after activation compensation', async () => {
+    const capability = {
+      success: false,
+      code: 'workflow_requires_always_on',
+      error: 'Scheduled workflows require an always-on agent runtime.',
+    };
+    const activateWorkflow = mock(async () => {
+      throw new WorkflowApiError(capability.error, 409, capability);
+    });
+    const { service, client } = await harness({ activateWorkflow });
+
+    await expect(
+      service.deployWorkflow(workflow(), USER_ID, { activate: true })
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      response: capability,
+    });
+
+    expect(client.deleteWorkflow).toHaveBeenCalledWith('workflow-created');
+  });
+
+  test('surfaces both a typed activation rejection and failed orphan cleanup', async () => {
+    const capabilityError = new WorkflowApiError(
+      'Scheduled workflows require an always-on agent runtime.',
+      409,
+      { code: 'workflow_requires_always_on', error: 'Always-on is required.' }
+    );
+    const cleanupError = new Error('workflow store unavailable');
+    const { service } = await harness({
+      activateWorkflow: mock(async () => {
+        throw capabilityError;
+      }),
+      deleteWorkflow: mock(async () => {
+        throw cleanupError;
+      }),
+    });
+
+    const failure = await service
+      .deployWorkflow(workflow(), USER_ID, { activate: true })
+      .catch((error) => error);
+
+    expect(failure).toMatchObject({
+      name: 'ElizaError',
+      code: 'WORKFLOW_ACTIVATION_COMPENSATION_FAILED',
+    });
+    expect(failure.cause).toBeInstanceOf(AggregateError);
+    expect((failure.cause as AggregateError).errors).toEqual([capabilityError, cleanupError]);
   });
 
   test('keeps a new workflow inactive unless activation is explicit', async () => {

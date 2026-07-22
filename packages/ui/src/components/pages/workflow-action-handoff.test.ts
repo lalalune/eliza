@@ -82,4 +82,62 @@ describe("workflow action handoff", () => {
     expect(events).toHaveLength(1);
     expect(events[0].detail).toEqual({ workflowId: "workflow-1" });
   });
+
+  it("opens the Automations feed for a successful workflow lifecycle result without an id", () => {
+    const dispatchNavigate = vi.fn();
+    const dispatchShowList = vi.fn();
+    const dispatchVisualize = vi.fn();
+
+    const dispatched = dispatchWorkflowActionHandoff(
+      [
+        {
+          actionName: "WORKFLOW",
+          success: true,
+          values: { count: 3 },
+        },
+      ],
+      { dispatchNavigate, dispatchShowList, dispatchVisualize },
+    );
+
+    expect(dispatched).toBe(true);
+    expect(dispatchNavigate).toHaveBeenCalledWith({
+      viewId: "automations",
+      viewPath: "/automations",
+    });
+    expect(dispatchShowList).toHaveBeenCalledTimes(1);
+    expect(dispatchVisualize).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate for a failed workflow result", () => {
+    const dispatchNavigate = vi.fn();
+
+    expect(
+      dispatchWorkflowActionHandoff(
+        [{ actionName: "WORKFLOW", success: false }],
+        { dispatchNavigate },
+      ),
+    ).toBe(false);
+    expect(dispatchNavigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "canceled",
+    "no_pending_draft",
+  ])("keeps chat open for a %s clarification-draft result", (status) => {
+    const dispatchNavigate = vi.fn();
+
+    expect(
+      dispatchWorkflowActionHandoff(
+        [
+          {
+            actionName: "WORKFLOW",
+            success: true,
+            values: { status },
+          },
+        ],
+        { dispatchNavigate },
+      ),
+    ).toBe(false);
+    expect(dispatchNavigate).not.toHaveBeenCalled();
+  });
 });

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const CASE_TIMEOUT_MS = 45_000;
 const fixturePath = fileURLToPath(new URL('../fixtures/smithers-runtime-case.ts', import.meta.url));
 const pluginRoot = fileURLToPath(new URL('../..', import.meta.url));
+const repoRoot = fileURLToPath(new URL('../../../..', import.meta.url));
 
 interface CaseRunResult {
   stdout: string;
@@ -34,11 +35,11 @@ function buildChildEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function runCase(caseName: string): Promise<CaseRunResult> {
+async function runCase(caseName: string, cwd = pluginRoot): Promise<CaseRunResult> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smithers-runtime-case-'));
   const resultPath = join(tempDir, `${caseName}.json`);
   const proc = spawn(process.env.BUN_BIN || 'bun', ['run', fixturePath, caseName], {
-    cwd: pluginRoot,
+    cwd,
     env: { ...buildChildEnv(), SMITHERS_RUNTIME_CASE_OUTPUT: resultPath },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -94,6 +95,21 @@ async function runCase(caseName: string): Promise<CaseRunResult> {
 }
 
 describe('runWorkflowWithSmithers (in-process Smithers engine)', () => {
+  it('resolves the physical worker module independently of the caller cwd', async () => {
+    const unrelatedCwd = await mkdtemp(join(tmpdir(), 'smithers-runtime-cwd-'));
+    try {
+      const [fromRepoRoot, fromUnrelatedCwd] = await Promise.all([
+        runCase('retry', repoRoot),
+        runCase('retry', unrelatedCwd),
+      ]);
+
+      expect(fromRepoRoot.result).toMatchObject({ status: 'success', attempts: 2 });
+      expect(fromUnrelatedCwd.result).toMatchObject({ status: 'success', attempts: 2 });
+    } finally {
+      await rm(unrelatedCwd, { force: true, recursive: true });
+    }
+  }, 60_000);
+
   it('runs independent nodes as a parallel level and routes data through the DAG', async () => {
     const { result } = await runCase('fanout');
 

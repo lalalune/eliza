@@ -199,8 +199,8 @@ interface WorkflowDispatchServiceLike {
 
 /**
  * Read the idempotency key the task metadata carries for this trigger
- * fire. armSchedules / rehydrateSchedules write a minute-bucketed key
- * onto the metadata so dispatch can short-circuit duplicate fires.
+ * fire. armSchedules / rehydrateSchedules write an occurrence-specific key
+ * onto the metadata so dispatch can short-circuit duplicate deliveries.
  */
 function readTaskIdempotencyKey(task: Task): string | undefined {
   const meta = task.metadata as Record<string, unknown> | undefined;
@@ -220,8 +220,7 @@ function buildWorkflowTaskIdempotencyKey(
   scheduleIdentity: string,
   nextRunAtMs: number,
 ): string {
-  const minuteBucket = Math.floor(nextRunAtMs / 60_000);
-  return `${workflowId}:${encodeURIComponent(scheduleIdentity)}:${minuteBucket}`;
+  return `${workflowId}:${encodeURIComponent(scheduleIdentity)}:${nextRunAtMs}`;
 }
 
 /**
@@ -592,11 +591,36 @@ export async function executeTriggerTask(
       updatedTrigger.runCount >= updatedTrigger.maxRuns);
 
   const existingMetadata = taskMetadata(task);
-  const nextMetadata = buildTriggerMetadata({
-    existingMetadata,
-    trigger: updatedTrigger,
-    nowMs: finishedAt,
-  });
+  const embeddedScheduleInterval =
+    updatedTrigger.kind === "workflow" &&
+    updatedTrigger.triggerType === "interval" &&
+    typeof existingMetadata.scheduleNodeId === "string" &&
+    typeof existingMetadata.baseInterval === "number" &&
+    Number.isFinite(existingMetadata.baseInterval) &&
+    existingMetadata.baseInterval > 0 &&
+    existingMetadata.baseInterval === updatedTrigger.intervalMs
+      ? existingMetadata.baseInterval
+      : undefined;
+  // Smithers schedule nodes persist their validated cadence as baseInterval.
+  // Preserve it here because generic chat-created triggers deliberately clamp
+  // intervals to one minute, while workflow nodes support seconds-level rules.
+  const nextMetadata =
+    embeddedScheduleInterval === undefined
+      ? buildTriggerMetadata({
+          existingMetadata,
+          trigger: updatedTrigger,
+          nowMs: finishedAt,
+        })
+      : {
+          ...existingMetadata,
+          blocking: true,
+          updatedAt: finishedAt,
+          updateInterval: embeddedScheduleInterval,
+          trigger: {
+            ...updatedTrigger,
+            nextRunAtMs: finishedAt + embeddedScheduleInterval,
+          },
+        };
 
   let metadataToPersist: TriggerTaskMetadata;
   if (!nextMetadata) {
@@ -620,9 +644,9 @@ export async function executeTriggerTask(
     };
   }
 
-  // Refresh the idempotency key for the next fire so a re-run within the
-  // same minute window collapses at dispatch. The schedule-arming layer
-  // (`armSchedules`) seeds the initial key with the same formula.
+  // Refresh the key for the next scheduled occurrence. A retry of the same
+  // persisted occurrence reuses its key, while sub-minute schedules receive a
+  // distinct key for every intended fire.
   if (
     metadataToPersist.trigger?.kind === "workflow" &&
     metadataToPersist.trigger.workflowId &&

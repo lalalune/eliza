@@ -520,6 +520,43 @@ describe("handleSwarmSynthesis", () => {
 });
 
 describe("routeAutonomyTextToUser", () => {
+  it("fails closed instead of selecting a process-global Cloud conversation", async () => {
+    const previousCloudProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    const createMemory = vi.fn();
+    const broadcastWs = vi.fn();
+    const state = {
+      runtime: {
+        agentId: "00000000-0000-0000-0000-000000000001",
+        createMemory,
+      },
+      conversations: new Map([
+        [
+          "foreign-latest",
+          {
+            id: "foreign-latest",
+            roomId: "00000000-0000-0000-0000-000000000002",
+            updatedAt: "2026-05-07T00:00:00.000Z",
+          },
+        ],
+      ]),
+      broadcastWs,
+    } as never;
+
+    try {
+      await routeAutonomyTextToUser(state, "private reminder", "reminder");
+    } finally {
+      if (previousCloudProvisioned === undefined) {
+        delete process.env.ELIZA_CLOUD_PROVISIONED;
+      } else {
+        process.env.ELIZA_CLOUD_PROVISIONED = previousCloudProvisioned;
+      }
+    }
+
+    expect(createMemory).not.toHaveBeenCalled();
+    expect(broadcastWs).not.toHaveBeenCalled();
+  });
+
   it("does not persist swarm synthesis before the connector stores the platform reply", async () => {
     const createMemory = vi.fn();
     const broadcastWs = vi.fn();

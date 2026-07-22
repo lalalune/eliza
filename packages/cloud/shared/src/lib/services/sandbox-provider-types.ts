@@ -60,6 +60,12 @@ export interface SandboxCreateConfig {
   organizationId: string;
   environmentVars: Record<string, string>;
   /**
+   * Cloud-owned runtime contract for managed agent containers. Providers inject
+   * this after caller environment values so tenant configuration cannot claim a
+   * different billing/lifecycle tier inside the agent process.
+   */
+  executionTier?: "shared" | "dedicated-lazy" | "dedicated-always" | "custom";
+  /**
    * Full character config for this agent (the `agent_sandboxes.agent_config`
    * row). When present, the provider injects it as ELIZA_AGENT_CHARACTER_JSON
    * so the container boots AS this character instead of the bundled default

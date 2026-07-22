@@ -7,7 +7,7 @@
 import type http from 'node:http';
 import type { AgentRuntime } from '@elizaos/core';
 import { buildAutomationListResponse } from '../lib/automations-builder';
-import { getRouteOwnerEntityId } from './_helpers';
+import { getRouteOwnerEntityId, isCloudWorkflowPrincipalRequired } from './_helpers';
 
 type JsonResponder = (res: http.ServerResponse, body: unknown, status?: number) => void;
 
@@ -35,6 +35,14 @@ export async function handleAutomationsRoutes(ctx: AutomationsRouteContext): Pro
   }
   if (!ctx.runtime) {
     sendJson(ctx, 503, { error: 'Agent runtime is not available' });
+    return true;
+  }
+  if (!ctx.principalId?.trim() && isCloudWorkflowPrincipalRequired()) {
+    sendJson(ctx, 401, {
+      success: false,
+      code: 'workflow_principal_required',
+      error: 'Workflow user principal is required',
+    });
     return true;
   }
   try {

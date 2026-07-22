@@ -14,8 +14,8 @@ import { isCloudProvisionedContainer, resolveApiToken } from "@elizaos/shared";
 import { getOrReadCachedFile } from "./memory-bounds.ts";
 import { findOwnPackageRoot } from "./server-helpers.ts";
 
-// One-time warning when an operator opts into embedding the API token in served
-// HTML outside a cloud-provisioned container (see ELIZA_FORCE_INJECT_TOKEN below).
+// One-time warning when a self-hosting operator opts into embedding the API
+// token in served HTML (see ELIZA_FORCE_INJECT_TOKEN below).
 let warnedForceInjectToken = false;
 
 // ---------------------------------------------------------------------------
@@ -189,28 +189,52 @@ export function injectApiBaseIntoHtml(
  * Decide whether to embed the API token into the served dashboard HTML, and
  * return the token to inject (or `null`).
  *
- * The token is the full-capability API token, and the dashboard HTML is served
- * pre-auth, so embedding it is a capability grant. It is injected when:
- * - the agent runs inside a cloud-provisioned container (already behind cloud
- *   auth, with a controlled host/origin set), or
- * - the operator explicitly opts in with `ELIZA_FORCE_INJECT_TOKEN` — for
- *   self-hosters who front the dashboard with their own auth gate. This MUST NOT
- *   be enabled on a directly exposed agent port; we warn once when it is set
- *   outside a cloud container so the risk is observable.
+ * The token is a full-capability credential and dashboard HTML is served
+ * pre-auth, so managed Cloud containers never embed it. Self-hosters may opt in
+ * with `ELIZA_FORCE_INJECT_TOKEN` only when their own authenticated reverse
+ * proxy protects the page; a one-time warning makes that capability grant
+ * observable.
  */
 export function resolveInjectedDashboardToken(): string | null {
   const cloudProvisioned = isCloudProvisionedContainer();
   const forceInjectToken = isTruthyEnvValue(
     process.env.ELIZA_FORCE_INJECT_TOKEN,
   );
-  if (forceInjectToken && !cloudProvisioned && !warnedForceInjectToken) {
+  if (cloudProvisioned || !forceInjectToken) return null;
+  if (!warnedForceInjectToken) {
     warnedForceInjectToken = true;
     logger.warn(
       "[static-file-server] ELIZA_FORCE_INJECT_TOKEN is set — embedding the API token in served dashboard HTML. Ensure the dashboard is fronted by your own auth gate; do not enable this on a directly exposed agent port.",
     );
   }
-  if (!cloudProvisioned && !forceInjectToken) return null;
   return resolveApiToken(process.env);
+}
+
+/** Build the exact SPA index body returned by {@link serveStaticUi}. */
+function renderStaticUiIndexHtml(html: Buffer): Buffer {
+  const dashboardToken = resolveInjectedDashboardToken();
+  // Expose the VAPID PUBLIC key (safe for the browser) so the installed PWA can
+  // subscribe to Web Push. The PRIVATE key stays a cloud secret. Absent env ⇒
+  // the client renders the "push not configured" state.
+  const webPushVapidPublicKey =
+    process.env.ELIZA_WEB_PUSH_VAPID_PUBLIC_KEY?.trim() || null;
+  const injectOpts =
+    dashboardToken || webPushVapidPublicKey
+      ? {
+          ...(dashboardToken ? { apiToken: dashboardToken } : {}),
+          ...(webPushVapidPublicKey ? { webPushVapidPublicKey } : {}),
+        }
+      : undefined;
+  return injectApiBaseIntoHtml(
+    html,
+    process.env.ELIZA_EXTERNAL_BASE_URL,
+    injectOpts,
+  );
+}
+
+interface StaticUiSource {
+  root: string;
+  indexHtml: Buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +245,9 @@ export function serveStaticUi(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   pathname: string,
+  source?: StaticUiSource,
 ): boolean {
-  const root = resolveUiDir();
+  const root = source?.root ?? resolveUiDir();
   if (!root) return false;
 
   // Keep API and WebSocket namespaces exclusively owned by server handlers.
@@ -301,33 +326,15 @@ export function serveStaticUi(
   const reqExt = path.extname(decodedPath).toLowerCase();
   if (reqExt && reqExt !== ".html") return false;
 
-  if (!uiIndexHtml) return false;
+  const indexHtml = source?.indexHtml ?? uiIndexHtml;
+  if (!indexHtml) return false;
 
   // When served behind a reverse proxy that rewrites the app under a path prefix,
   // inject the API base so the UI client sends requests to the correct path prefix.
-  // For cloud-provisioned containers, also inject the API token so the browser
-  // client can authenticate without requiring a pairing flow. Self-hosted
-  // operators who front the UI with their own auth gate (e.g. a reverse-proxy
-  // cookie wall) can opt into the same token injection with
-  // ELIZA_FORCE_INJECT_TOKEN (see resolveInjectedDashboardToken).
-  const cloudToken = resolveInjectedDashboardToken();
-  // Expose the VAPID PUBLIC key (safe for the browser) so the installed PWA can
-  // subscribe to Web Push. The PRIVATE key stays a cloud secret. Absent env ⇒
-  // the client renders the "push not configured" state.
-  const webPushVapidPublicKey =
-    process.env.ELIZA_WEB_PUSH_VAPID_PUBLIC_KEY?.trim() || null;
-  const injectOpts =
-    cloudToken || webPushVapidPublicKey
-      ? {
-          ...(cloudToken ? { apiToken: cloudToken } : {}),
-          ...(webPushVapidPublicKey ? { webPushVapidPublicKey } : {}),
-        }
-      : undefined;
-  const html = injectApiBaseIntoHtml(
-    uiIndexHtml,
-    process.env.ELIZA_EXTERNAL_BASE_URL,
-    injectOpts,
-  );
+  // Managed Cloud pages rely on pairing/scoped sessions and never receive the
+  // raw agent token. Only the explicit self-hosted opt-in in
+  // resolveInjectedDashboardToken can add it here.
+  const html = renderStaticUiIndexHtml(indexHtml);
 
   sendStaticResponse(
     req,

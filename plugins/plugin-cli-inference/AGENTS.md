@@ -1,6 +1,6 @@
 # @elizaos/plugin-cli-inference
 
-TOS-clean SAFE/CLOUD inference route for elizaOS. Serves chat/planner inference by **spawning the sanctioned local CLI** (`claude --print` or `codex exec`) as eliza model handlers. The CLI reads its own subscription credentials from disk — eliza never sees, forwards, or logs the token.
+TOS-clean SAFE/CLOUD inference route for elizaOS. Serves chat/planner inference through sanctioned Claude/Codex CLI and SDK subprocesses. Ambient logins stay on disk; pooled auth is materialized by the account bridge into a least-privilege subprocess environment and is never written to the parent environment, persisted by this plugin, or logged.
 
 ## Purpose / role
 
@@ -9,7 +9,7 @@ This is the develop-shippable peer to the two TOS-gray, never-commit bypass path
 - the in-process claude-code-stealth fetch interceptor at `packages/agent/src/auth/credentials.ts`, and
 - `plugin-codex-cli`'s in-process `postResponses` HTTP path,
 
-both of which replay the consumer-subscription token in-process. Here the handlers SHELL OUT to the official CLI, which loads `~/.claude/.credentials.json` / `~/.codex/auth.json` itself. The token is never injected into the child env (`filterEnv` allowlist + `SENSITIVE_ENV_RE` blocklist) or into logs (stderr is redacted before logging).
+both of which replay the consumer-subscription token into a third-party HTTP client. Here the handlers use first-party CLI/SDK subprocesses. Ambient auth is loaded from `~/.claude` / `~/.codex`; pooled auth is restricted to the selected backend's canonical key (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CODEX_HOME`, or `OPENAI_API_KEY`). Every SDK child receives only the process-launch allowlist plus that backend's auth, and stderr is redacted before logging.
 
 Node-only (`"platforms": ["node"]`) — exported from `index.node.ts` only.
 
@@ -19,7 +19,8 @@ Single env gate: **`ELIZA_CHAT_VIA_CLI=claude`**, **`claude-sdk`**, **`codex`**,
 
 - Unset → the plugin is never added to the resolved set (`auto-enable.ts shouldEnable` is false), and even if force-loaded its models map is empty. INERT; no existing code path changes.
 - `claude` / `codex` → the large-tier handlers **cold-spawn** that CLI per call (`claude --print` / `codex exec`).
-- `claude-sdk` → the handlers run a **warm Claude Agent SDK session** (one persistent process per `(model, systemPrompt, mode)`), not a per-call spawn. This is the fast + TOS-clean path: ~1-2s warm vs the CLI's 25-68s cold-spawn-per-call, and it does **native tool-calling** for the planner. See "Warm Agent SDK backend" below.
+- `claude-sdk` → each handler runs an **isolated Claude Agent SDK query** with native planner tool-calling. The SDK has no history-reset API, so a query is never reused across Eliza model calls; this prevents hidden context from crossing rooms, users, or runtimes.
+- `codex-sdk` → each handler constructs a request-owned SDK adapter and fresh Codex thread; response schemas use native structured output without retaining thread history.
 
 ## Plugin surface
 
@@ -27,7 +28,7 @@ No actions, providers, evaluators, or routes. Model handlers only, and **only th
 
 | Model type | Backend |
 |---|---|
-| `TEXT_LARGE` | `claude --print` or `codex exec` |
+| `TEXT_LARGE` | Configured Claude/Codex CLI or isolated SDK backend |
 | `TEXT_MEGA` | "" |
 | `RESPONSE_HANDLER` | "" |
 | `ACTION_PLANNER` | "" — **only when `ELIZA_PLANNER_NATIVE_TOOLS=0`** (text-planner mode) |
@@ -49,22 +50,24 @@ Note: the per-turn `claude` subprocess makes the text-planner path slower than a
 direct-API provider (~tens of seconds for a planner turn) — use the `claude-sdk`
 backend below to keep the clean path fast.
 
-## Warm Agent SDK backend (`ELIZA_CHAT_VIA_CLI=claude-sdk`)
+## Isolated Claude Agent SDK backend (`ELIZA_CHAT_VIA_CLI=claude-sdk`)
 
 The fast, TOS-clean way to run the whole brain on a Claude Max subscription.
 Effective 2026-06-15 Anthropic grants subscriptions a monthly **Agent SDK
 credit**, so driving the brain through `@anthropic-ai/claude-agent-sdk` (which
-reads `~/.claude` / `CLAUDE_CODE_OAUTH_TOKEN` itself — eliza never sees the
-token) is **officially sanctioned**, strictly cleaner than the stealth
+reads `~/.claude` or the account bridge's subprocess-scoped
+`CLAUDE_CODE_OAUTH_TOKEN`) is **officially sanctioned**, strictly cleaner than the stealth
 token-replay. The SDK is loaded via a variable dynamic import (`src/claude-sdk-session.ts`)
 so the plugin stays inert and never imports it unless this backend is set.
 
-A `ClaudeSdkSession` keeps ONE warm streaming-input `query()` process alive, so
-the cold-start is paid once, not per call. Two modes:
+The plugin constructs one `ClaudeSdkSession` per Eliza model call and disposes
+its streaming-input `query()` after that call. Eliza already supplies the full
+transcript, while the SDK query retains hidden conversation state and offers no
+reset primitive; per-call ownership is therefore the security boundary. Three modes:
 
 - **TEXT mode** (`generate`) — `RESPONSE_HANDLER` / `TEXT_LARGE` / `TEXT_MEGA`.
   `allowedTools: []` + `settingSources: []` strip Claude Code's own tools and
-  project context → a warm chat-completion engine. The model is reframed as a
+  project context → a pure chat-completion query. The model is reframed as a
   pure completion engine (`frameTextSystemPrompt` system prefix + a closing
   `appendTextDirective`) so it synthesizes the final reply from already-executed
   tool results rather than narrating agentic intent ("I'll fetch it…").
@@ -76,14 +79,17 @@ the cold-start is paid once, not per call. Two modes:
   functionality (WEB_FETCH, sub-agents) with no free-text JSON parsing and no
   required-tool retry loop. The returned bare `{action, params}` is consumed by
   the loop's existing text-mode parser — no core change.
+- **ENVELOPE mode** (`envelope`) — the Stage-1 `RESPONSE_HANDLER` captures the
+  framework's composed `handle_response` tool fields natively. Calls without
+  that tool remain text completions, so evaluator and failure-reply paths do not
+  receive a routing envelope accidentally.
 
-Sessions are keyed by `(model, mode, sha256(systemPrompt))` because the SDK
-freezes `systemPrompt` + `mcpServers` at `query()` start (no mid-session reset);
-`setModel()` switches tiers live on one process. Calls are serialized; the
-session self-heals on error and restarts after `restartAfterTurns` (default 20)
-to bound context growth. The `result` envelope is inspected so an
+Account affinity is keyed by runtime plus `(model, mode, sha256(systemPrompt))`,
+but SDK query state is never cached. Calls sharing an affinity key serialize so
+selection and rate-limit rotation cannot race. The `result` envelope is inspected so an
 `error_max_turns`/empty turn falls back to `result.result` instead of throwing a
-spurious "empty completion".
+spurious "empty completion". Stored affinity contains account identity only;
+materialized OAuth tokens and `CODEX_HOME` environments live only for the call.
 
 Per-tier models: `ELIZA_CLI_CLAUDE_PLANNER_MODEL` (small/planner, e.g. sonnet) +
 `ELIZA_CLI_CLAUDE_MODEL` (large, e.g. opus); `ELIZA_CLI_CLAUDE_BIN` points the
@@ -93,31 +99,36 @@ SDK at the Claude Code executable.
 returns a session-limit error); plan a fallback (a key/Cloud tier, or stealth on
 a self-host) for production continuity.
 
-## Warm Codex SDK backend (`ELIZA_CHAT_VIA_CLI=codex-sdk`)
+## Isolated Codex SDK backend (`ELIZA_CHAT_VIA_CLI=codex-sdk`)
 
 The codex peer of `claude-sdk` (`src/codex-sdk-session.ts`). Runs the brain on a
 ChatGPT/Codex subscription via `@openai/codex-sdk` (loaded by variable dynamic
-import; reads `~/.codex/auth.json` itself). A `CodexSdkSession` keeps ONE warm
-`Thread` (`codex.startThread()` once, `thread.run()` per turn) instead of the
-`codex exec` cold-spawn-per-call. Two modes:
+import; reads `~/.codex/auth.json` itself). A `CodexSdkSession` and its `Thread`
+are both constructed fresh for every Eliza model call. Eliza
+already sends the complete transcript, so retaining SDK thread context would
+leak hidden history across rooms, users, and system prompts. Two modes:
 
-- **TEXT** (`generate`): `thread.run(body)` with `sandboxMode:"read-only"`,
-  `approvalPolicy:"never"`, `networkAccessEnabled:false` → a warm completion
-  engine; returns the turn's `finalResponse`.
+- **TEXT** (`generate`): when a caller supplies `responseSchema`, normalize its
+  nested objects to the Responses API's strict contract and call
+  `thread.run(body, { outputSchema })` (plain `thread.run(body)` otherwise), with `sandboxMode:"read-only"`,
+  `approvalPolicy:"never"`, `networkAccessEnabled:false`; returns the turn's
+  `finalResponse`. Open maps and unconstrained values pass through a closed JSON
+  string envelope and are restored before downstream validation, so dynamic keys
+  are not silently erased.
 - **ROUTE** (`route`): codex NATIVE structured output (`outputSchema`) constrains
   the turn to `{action, params}` (params as a JSON string for OpenAI strict mode),
-  reliable at scale. REQUIRES `ELIZA_CLI_CODEX_BIN` pointing at the system codex —
-  the SDK bundles an old codex (0.80.0) that rejects current models/structured output.
+  reliable at scale. `ELIZA_CLI_CODEX_BIN` optionally overrides the SDK's
+  version-matched binary for deployments that manage Codex separately.
 
-codex-sdk has no thread-level system prompt, so the system is folded into the
-body and ONE warm thread per `(model, mode)` serves every system prompt. Per-tier
-models: `ELIZA_CLI_CODEX_PLANNER_MODEL` + `ELIZA_CLI_CODEX_MODEL`;
-`ELIZA_CLI_CODEX_REASONING_EFFORT` sets `modelReasoningEffort`.
-
-**Status:** LIVE-VERIFIED in the bot on a ChatGPT/Codex sub — btc \$59,527, eth
-\$1,566, weather, identity, knows-user, 8×8=64; live-info routes to WEB_FETCH and
-synthesizes the real fetched value (after the canonical-contentToText fix). Needs
-`ELIZA_CLI_CODEX_BIN`=system codex. 12 fake-SDK unit tests.
+codex-sdk has no thread-level system prompt, so the system and complete
+transcript are folded into the body of each isolated call. Per-tier models:
+`ELIZA_CLI_CODEX_PLANNER_MODEL` + `ELIZA_CLI_CODEX_MODEL`;
+`ELIZA_CLI_CODEX_REASONING_EFFORT` sets `modelReasoningEffort`. The session
+always pins a transport-supported value (default `high`) so an ambient Codex
+CLI setting such as `ultra` cannot become the unsupported Responses API value
+`max`; explicit `max` / `ultra` aliases are normalized to `xhigh`. Fake-SDK tests
+cover request isolation, strict-schema normalization/restoration, routing,
+effort, and failure paths.
 
 ## Layout
 
@@ -126,7 +137,7 @@ plugins/plugin-cli-inference/
   index.ts                  Plugin entry — gates + registers large-tier handlers; init double-activation guard
   index.node.ts             Node re-export
   index.browser.ts          Browser stub (node-only plugin; empty models)
-  auto-enable.ts            shouldEnable = ELIZA_CHAT_VIA_CLI is claude|claude-sdk|codex
+  auto-enable.ts            shouldEnable = ELIZA_CHAT_VIA_CLI is claude|claude-sdk|codex|codex-sdk
   src/
     claude-cli.ts           ClaudeCli — spawns `claude --print`; __setSpawnForTests seam
     codex-cli-exec.ts       CodexCli — spawns `codex exec --json`; JSONL last-assistant parse
@@ -148,19 +159,20 @@ plugins/plugin-cli-inference/
 
 | Var | Required | Default | Description |
 |---|---|---|---|
-| `ELIZA_CHAT_VIA_CLI` | — | (unset = inert) | `claude`, `claude-sdk`, or `codex` — the single enable gate |
+| `ELIZA_CHAT_VIA_CLI` | — | (unset = inert) | `claude`, `claude-sdk`, `codex`, or `codex-sdk` — the single enable gate |
 | `ELIZA_CLI_CLAUDE_MODEL` | No | `claude-opus-4-8` | claude large-tier model (`--model` / SDK large tier) |
 | `ELIZA_CLI_CLAUDE_PLANNER_MODEL` | No | (falls back to large) | `claude-sdk` small/planner tier model (e.g. sonnet) |
 | `ELIZA_CLI_CLAUDE_BIN` | No | (SDK default / allowlist lookup) | path to the claude executable: drives the `claude-sdk` session AND pins the cold `claude` spawn (deploys outside the SOC2 launcher allowlist) |
-| `ELIZA_CLI_SDK_RESTART_AFTER_TURNS` | No | `20` | `claude-sdk`: restart a warm session after N turns (bounds context) |
 | `ELIZA_CLI_CLAUDE_EFFORT` | No | (SDK default: high) | `claude-sdk`: reasoning effort forwarded to the SDK `effort` option (`low`/`medium`/`high`/`xhigh`/`max`); an unsupported level for the model is silently downgraded by the SDK |
 | `ELIZA_CLI_CLAUDE_PLANNER_EFFORT` | No | (falls back to `ELIZA_CLI_CLAUDE_EFFORT`) | `claude-sdk`: effort for the ROUTE-mode planner tier, so routing depth tunes independently of reply depth |
 | `ELIZA_CLI_CLAUDE_ALL_TIERS` | No | (unset = large tiers only) | `claude-sdk`: also serve the high-frequency triage tiers (TEXT_SMALL/NANO/MEDIUM) on this route so the ENTIRE text brain runs on the one subscription (no cerebras/gemma fallthrough). Higher subscription usage; triage defaults to the cheaper large-tier model, not the planner tier |
 | `ELIZA_CLI_CLAUDE_SMALL_MODEL` | No | (falls back to `ELIZA_CLI_CLAUDE_MODEL`) | `claude-sdk` ALL-TIERS: model for the triage tiers (should-respond gate, callback rewrite) — set a cheaper model (e.g. sonnet/haiku) so high-frequency triage doesn't run on opus |
 | `ELIZA_CLI_CODEX_MODEL` | No | `gpt-5.5` | codex large-tier model (`codex exec -m` / SDK large tier) |
 | `ELIZA_CLI_CODEX_PLANNER_MODEL` | No | (falls back to large) | `codex-sdk` small/planner tier model |
-| `ELIZA_CLI_CODEX_REASONING_EFFORT` | No | (sdk default) | `codex-sdk`: `modelReasoningEffort` (minimal..xhigh) |
-| `ELIZA_CLI_CODEX_BIN` | No | (sdk bundled / allowlist lookup) | path to the system codex binary: REQUIRED for `codex-sdk` (bundled 0.80.0 rejects current models); also pins the cold `codex` spawn |
+| `ELIZA_CLI_CODEX_REASONING_EFFORT` | No | `high` | `codex-sdk`: `modelReasoningEffort` (`minimal`, `low`, `medium`, `high`, `xhigh`; `max`/`ultra` normalize to `xhigh`) |
+| `ELIZA_CLI_CODEX_BIN` | No | (SDK-pinned binary / allowlist lookup) | optional system codex override for `codex-sdk`; also pins the cold `codex` spawn |
+| `ELIZA_CLI_SDK_TURN_TIMEOUT_MS` | No | `90000` | Claude SDK query/read timeout; explicit `0` opts into an unbounded turn |
+| `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION` | No | enabled | set to `0`/`false`/`no`/`off` to disable pooled SDK account rotation |
 | `ELIZA_CLI_TIMEOUT_MS` | No | `120000` | per-call spawn timeout (SIGTERM on expiry; CLI backends) |
 
 ## Errors
@@ -183,7 +195,7 @@ bun run --cwd plugins/plugin-cli-inference build
 - **Isolated cwd per call.** Created with `mkdtemp` under `tmpdir()`, validated by `resolveSafeCwd`, removed in a `finally`. Keeps the CLI out of real projects (suppresses Claude Code repo-context identity).
 - **`/dev/null` stdin is REQUIRED** — without it the CLI waits ~3s for stdin.
 - **sandbox.ts is a copy.** Keep in sync with `packages/plugin-remote-manifest/src/sub-agent-claude-code/sandbox.ts` if `SENSITIVE_ENV_RE` / `SAFE_ENV_KEYS` change upstream.
-- **Multi-account pool auth + rotation (SDK backends only).** The `claude-sdk` / `codex-sdk` chat brain consults the shared `CODING_AGENT_SELECTOR_BRIDGE_SYMBOL` bridge accessor from `@elizaos/core` (in `src/account-rotation.ts`) POOL-FIRST: the FIRST warm-session auth selects a healthy pooled account and materializes its subprocess-only SDK env (`CLAUDE_CODE_OAUTH_TOKEN` / per-account `CODEX_HOME`), so an app-connected subscription is used immediately — the ambient `~/.claude` / `CLAUDE_CODE_OAUTH_TOKEN` credential is only the fallback when the pool is empty or selection fails. On a subscription-limit throw it then rotates to the next healthy pooled account before falling to provider failover — see issue #11180. Rotation evicts the warm session so it re-auths as the new account and retries transparently without mutating the parent `process.env`. Only rate-limit-class errors rotate; non-limit errors rethrow straight to failover. Default ON when a pool is present; opt out with `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION=0`. The COLD `claude --print` / `codex exec` CLIs still own one on-disk cred set (pool auth is SDK-only; the bare-CLI shim is issue #11180 Gap B).
+- **Multi-account pool auth + rotation (SDK backends only).** The `claude-sdk` / `codex-sdk` chat brain consults the shared `CODING_AGENT_SELECTOR_BRIDGE_SYMBOL` bridge accessor from `@elizaos/core` (in `src/account-rotation.ts`) POOL-FIRST. Selection state is scoped to the live `AgentRuntime`, serialized per affinity key, and pinned to the serving account. Every isolated call re-resolves that exact account so an expiring Claude token or rotated `CODEX_HOME` generation is refreshed before spawn. On a subscription-limit throw it marks the serving account, selects the next healthy account, and retries a fresh SDK query before provider failover — see issue #11180. Empty pools fall back to a backend-specific ambient environment; neither ambient nor pooled SDK children inherit unrelated host secrets. Only rate-limit-class errors rotate; non-limit errors rethrow straight to failover. Default ON when a pool is present; opt out with `ELIZA_CLI_INFERENCE_ACCOUNT_ROTATION=0`. The COLD `claude --print` / `codex exec` CLIs still own one on-disk cred set (pool auth is SDK-only; the bare-CLI shim is issue #11180 Gap B).
 - See the root `AGENTS.md` for repo-wide architecture rules, logger conventions, and ESM requirements.
 
 <!-- BEGIN: evidence-and-e2e-mandate (managed; canonical standard = repo-root AGENTS.md) -->

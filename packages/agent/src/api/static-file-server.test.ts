@@ -3,15 +3,17 @@
  *
  * The dashboard `index.html` is served pre-auth, so embedding the
  * full-capability API token into it is a capability grant. These tests pin the
- * gate: the token is injected only for cloud-provisioned containers or when an
- * operator explicitly opts in with `ELIZA_FORCE_INJECT_TOKEN`, and the opt-in
- * uses the canonical truthy parser (not a strict `=== "1"`).
+ * gate: managed Cloud HTML never receives the token, including when a stale
+ * force-injection flag is present. Only a self-hosting operator's explicit
+ * `ELIZA_FORCE_INJECT_TOKEN` opt-in may embed it.
  */
 
+import type http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   injectApiBaseIntoHtml,
   resolveInjectedDashboardToken,
+  serveStaticUi,
 } from "./static-file-server.ts";
 
 const TOKEN_ENV = "ELIZA_API_TOKEN";
@@ -60,6 +62,48 @@ describe("resolveInjectedDashboardToken", () => {
     process.env[TOKEN_ENV] = TOKEN;
     process.env[FORCE_ENV] = "0";
     expect(resolveInjectedDashboardToken()).toBeNull();
+  });
+
+  it("returns null for a managed Cloud container even when force injection is set", () => {
+    process.env[TOKEN_ENV] = TOKEN;
+    process.env[CLOUD_ENV] = "1";
+    process.env[FORCE_ENV] = "1";
+    expect(resolveInjectedDashboardToken()).toBeNull();
+  });
+
+  it("serves managed SPA HTML without the raw token or bootstrap marker", () => {
+    process.env[TOKEN_ENV] = TOKEN;
+    process.env[CLOUD_ENV] = "1";
+    process.env[FORCE_ENV] = "1";
+
+    let status = 0;
+    let body = "";
+    const response = {
+      writeHead(code: number) {
+        status = code;
+        return response;
+      },
+      end(chunk?: Buffer | string) {
+        body = chunk?.toString() ?? "";
+        return response;
+      },
+    };
+    const handled = serveStaticUi(
+      { method: "GET" } as http.IncomingMessage,
+      response as unknown as http.ServerResponse,
+      "/",
+      {
+        root: "/nonexistent-managed-ui-root",
+        indexHtml: Buffer.from(
+          "<!doctype html><html><head></head><body>managed dashboard</body></html>",
+        ),
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(status).toBe(200);
+    expect(body).not.toContain(TOKEN);
+    expect(body).not.toContain("__ELIZA_API_TOKEN__");
   });
 });
 

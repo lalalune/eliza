@@ -28,7 +28,7 @@ import type {
   WorkflowDefinitionResponse,
 } from '../types/index';
 import { WorkflowApiError } from '../types/index';
-import { getRouteOwnerEntityId } from './_helpers';
+import { getRouteOwnerEntityId, isCloudWorkflowPrincipalRequired } from './_helpers';
 
 export type WorkflowMode = 'local' | 'disabled';
 export type WorkflowRuntimeStatus = 'ready' | 'error';
@@ -79,6 +79,9 @@ function resolveOwnerEntityId(ctx: WorkflowRouteContext): string {
   if (ctx.principalId?.trim()) {
     return ctx.principalId.trim();
   }
+  if (isCloudWorkflowPrincipalRequired()) {
+    throw new WorkflowApiError('Workflow user principal is required', 401);
+  }
   if (!ctx.runtime) {
     throw new WorkflowApiError('Workflow route principal is unavailable', 503);
   }
@@ -102,11 +105,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function typedWorkflowErrorBody(error: WorkflowApiError): Record<string, unknown> | null {
+  if (!isRecord(error.response)) return null;
+  if (typeof error.response.code !== 'string' || typeof error.response.error !== 'string') {
+    return null;
+  }
+  return error.response;
+}
+
 function asClarificationResolution(value: unknown): WorkflowClarificationResolution | null {
   if (!isRecord(value) || typeof value.paramPath !== 'string' || typeof value.value !== 'string') {
     return null;
   }
-  return { paramPath: value.paramPath, value: value.value };
+  return { paramPath: value.paramPath.trim(), value: value.value };
 }
 
 function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
@@ -122,7 +133,8 @@ function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
 async function readJsonBody(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  maxBytes = 1_048_576
+  maxBytes = 1_048_576,
+  required = true
 ): Promise<Record<string, unknown> | null> {
   const attachedBody = (req as http.IncomingMessage & { body?: unknown }).body;
   if (attachedBody !== undefined) {
@@ -150,6 +162,7 @@ async function readJsonBody(
   }
 
   if (chunks.length === 0) {
+    if (!required) return {};
     res.statusCode = 400;
     res.setHeader('content-type', 'application/json; charset=utf-8');
     res.end(JSON.stringify({ error: 'JSON body is required' }));
@@ -170,6 +183,22 @@ async function readJsonBody(
     res.end(JSON.stringify({ error: 'invalid JSON body' }));
     return null;
   }
+}
+
+function readRequestHeader(req: http.IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function readWorkflowIdempotencyKey(req: http.IncomingMessage): string | undefined {
+  const standard = readRequestHeader(req, 'idempotency-key');
+  const legacy = readRequestHeader(req, 'x-idempotency-key');
+  if (standard && legacy && standard !== legacy) {
+    throw new WorkflowApiError('Conflicting workflow idempotency keys', 400);
+  }
+  return standard ?? legacy;
 }
 
 function asWorkflow(value: unknown): WorkflowDefinition | null {
@@ -398,12 +427,10 @@ async function handleResolveClarification(
   }
 
   const resolvedPaths = new Set(
-    body.resolutions
-      .map((resolution) => (isRecord(resolution) ? resolution.paramPath : undefined))
-      .filter((path): path is string => typeof path === 'string' && path.length > 0)
+    validResolutions.map((resolution) => resolution.paramPath).filter((path) => path.length > 0)
   );
-  const freeFormCount = body.resolutions.filter(
-    (resolution) => !isRecord(resolution) || typeof resolution.paramPath !== 'string'
+  const freeFormCount = validResolutions.filter(
+    (resolution) => resolution.paramPath.length === 0
   ).length;
   pruneResolvedClarifications(draftRecord, resolvedPaths, freeFormCount);
 
@@ -497,11 +524,20 @@ async function handleRunWorkflow(
   service: WorkflowService,
   id: string
 ): Promise<void> {
+  const body = await readJsonBody(ctx.req, ctx.res, 1_048_576, false);
+  if (!body) return;
+  if (body.triggerData !== undefined && !isRecord(body.triggerData)) {
+    sendJson(ctx, 400, { error: 'triggerData must be an object' });
+    return;
+  }
   const ownerEntityId = resolveOwnerEntityId(ctx);
+  const idempotencyKey = readWorkflowIdempotencyKey(ctx.req);
   const execution = await service.runWorkflow(
     id,
     {
       mode: 'manual',
+      ...(body.triggerData ? { triggerData: body.triggerData } : {}),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       throwOnError: false,
     },
     ownerEntityId
@@ -633,12 +669,13 @@ export async function handleWorkflowRoutes(ctx: WorkflowRouteContext): Promise<v
     // All not-found results share one body so workflow, execution, and revision
     // identifiers cannot be used as a cross-owner existence oracle.
     const status = error instanceof WorkflowApiError ? (error.statusCode ?? 500) : 500;
+    const typedBody = error instanceof WorkflowApiError ? typedWorkflowErrorBody(error) : null;
     sendJson(
       ctx,
       status,
       status === 404
         ? { error: 'Workflow resource not found', code: 'workflow_resource_not_found' }
-        : { error: error instanceof Error ? error.message : String(error) }
+        : (typedBody ?? { error: error instanceof Error ? error.message : String(error) })
     );
   }
 }

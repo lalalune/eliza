@@ -1,4 +1,4 @@
-// Exercises pairing token behavior with deterministic cloud-shared lib fixtures.
+/** Exercises pairing-token origin aliasing with deterministic URL fixtures. */
 import { describe, expect, it } from "bun:test";
 import { DOMAIN_ALIAS_GROUPS, getAlternateDomainOrigins } from "./pairing-token-domains";
 

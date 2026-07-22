@@ -5,6 +5,8 @@
  * so the rest of the fixture code stays focused on lifecycle.
  */
 
+import { generateKeyPairSync } from "node:crypto";
+
 export interface StackUrls {
   hetzner: string;
   controlPlane: string;
@@ -15,6 +17,17 @@ export interface StackUrls {
 export const PLAYWRIGHT_TEST_AUTH_SECRET =
   "playwright-local-auth-secret-32bytes";
 const CLOUD_E2E_LOCAL_ROOT_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+const CLOUD_E2E_JWT_SIGNING_KEYS = (() => {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", {
+    namedCurve: "P-256",
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  return {
+    privateKey: Buffer.from(privateKey).toString("base64"),
+    publicKey: Buffer.from(publicKey).toString("base64"),
+  };
+})();
 
 /**
  * Strip env vars that announce the current process was launched via bun
@@ -71,6 +84,11 @@ export function buildSharedEnv(
     CONTAINER_CONTROL_PLANE_TOKEN: "test-token",
     CRON_SECRET: "test-cron-secret",
     INTERNAL_SECRET: "test-internal-secret",
+    // Pairing uses the same real ES256 mint/verify path as production. One
+    // per-worker keypair is shared by the API subprocess and its JWKS route.
+    JWT_SIGNING_PRIVATE_KEY: CLOUD_E2E_JWT_SIGNING_KEYS.privateKey,
+    JWT_SIGNING_PUBLIC_KEY: CLOUD_E2E_JWT_SIGNING_KEYS.publicKey,
+    JWT_SIGNING_KEY_ID: "cloud-e2e",
     // Apps Product 2 deploy path: enable the route and give the mock apps
     // worker a prebuilt image to attach to container rows.
     APPS_DEPLOY_ENABLED: "1",

@@ -249,6 +249,47 @@ describe("AgentSandboxesRepository", () => {
     expect((after.match(/is null/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
+  test("credential rotation is version-guarded and clears a retired provisioning handle atomically", async () => {
+    capturedWhere = undefined;
+    set.mockClear();
+    const { AgentSandboxesRepository } = await import("./agent-sandboxes");
+    const expectedUpdatedAt = new Date("2026-07-21T12:00:00.000Z");
+
+    await new AgentSandboxesRepository().rotateProvisioningCredential({
+      id: "e06bb509-6c52-4c33-a9f7-66addc43e8c8",
+      expectedUpdatedAt,
+      environmentVars: {
+        ELIZA_API_TOKEN: "agent_rotated",
+        ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+      },
+      clearContainerHandle: true,
+    });
+
+    const capturedSet = set.mock.calls.at(-1)?.[0];
+    if (!capturedSet) throw new Error("rotation did not build an update payload");
+    expect(capturedSet.environment_vars).toEqual({
+      ELIZA_API_TOKEN: "agent_rotated",
+      ELIZA_API_TOKEN_GENERATION: "scoped-principal-v1",
+    });
+    for (const column of [
+      "sandbox_id",
+      "bridge_url",
+      "health_url",
+      "node_id",
+      "container_name",
+      "bridge_port",
+      "web_ui_port",
+      "headscale_ip",
+      "last_heartbeat_at",
+    ]) {
+      expect(capturedSet[column]).toBeNull();
+    }
+    if (!capturedWhere) throw new Error("rotation did not build a where clause");
+    const sql = new PgDialect().sqlToQuery(capturedWhere).sql.toLowerCase();
+    expect(sql).toContain('"status" = $');
+    expect(sql).toContain('"updated_at" = $');
+  });
+
   test("heartbeat selection excludes shared-runtime agents (no container to dial)", async () => {
     capturedWhere = undefined;
 

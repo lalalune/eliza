@@ -1,5 +1,5 @@
 /** Unit tests for the `/api/automations` combined-view builder over an in-memory task/room runtime (deterministic). */
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { ServerResponse } from 'node:http';
 import type { AgentRuntime, Room, Task, UUID } from '@elizaos/core';
 import { stringToUuid } from '@elizaos/core';
@@ -11,10 +11,12 @@ import type { AutomationListResponse } from '../../../src/lib/automations-types'
 import { handleAutomationsRoutes } from '../../../src/routes/automations';
 import { handleWorkflowRoutes } from '../../../src/routes/workflow-routes';
 import { WORKFLOW_SERVICE_TYPE } from '../../../src/services/workflow-service';
+import { WorkflowApiError } from '../../../src/types/index';
 
 const AGENT_NAME = 'Eliza';
 const WORLD_ID = stringToUuid(`${AGENT_NAME}-web-chat-world`);
 const DEFAULT_OWNER_ID = stringToUuid(`${AGENT_NAME}-admin-entity`);
+const INITIAL_CLOUD_PROVISIONED = process.env.ELIZA_CLOUD_PROVISIONED;
 
 type AutomationsRuntime = Pick<
   AgentRuntime,
@@ -34,6 +36,7 @@ interface RuntimeMockOptions {
   executionErrorsByWorkflow?: Record<string, string>;
   runExecution?: Record<string, unknown>;
   workflowsThrows?: boolean;
+  activationError?: Error;
 }
 
 function createWorkflowServiceMock(opts: RuntimeMockOptions) {
@@ -66,6 +69,12 @@ function createWorkflowServiceMock(opts: RuntimeMockOptions) {
       }
       return Promise.resolve(execution);
     }),
+    activateWorkflow: mock(async () => {
+      if (opts.activationError) throw opts.activationError;
+    }),
+    getWorkflow: mock(async (workflowId: string) =>
+      (opts.workflows ?? []).find((workflow) => workflow.id === workflowId)
+    ),
   };
 }
 
@@ -103,6 +112,11 @@ beforeEach(() => {
   __resetAutomationsCacheForTests();
 });
 
+afterEach(() => {
+  if (INITIAL_CLOUD_PROVISIONED === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+  else process.env.ELIZA_CLOUD_PROVISIONED = INITIAL_CLOUD_PROVISIONED;
+});
+
 describe('buildAutomationListResponse', () => {
   test('combines workflows, triggers, and draft conversations into a single list', async () => {
     const workflowId = 'wf-9001';
@@ -128,7 +142,7 @@ describe('buildAutomationListResponse', () => {
           triggerType: 'cron',
           enabled: true,
           wakeMode: 'inject_now',
-          createdBy: DEFAULT_OWNER_ID,
+          createdBy: 'workflow.schedule',
           cronExpression: '0 7 * * *',
           runCount: 5,
           kind: 'workflow',
@@ -382,7 +396,12 @@ describe('buildAutomationListResponse', () => {
 
     let runStatus = 0;
     await handleWorkflowRoutes({
-      req: { method: 'POST', url: `/api/workflow/workflows/${workflowId}/run` } as never,
+      req: {
+        method: 'POST',
+        url: `/api/workflow/workflows/${workflowId}/run`,
+        headers: {},
+        body: {},
+      } as never,
       res: {} as ServerResponse,
       method: 'POST',
       pathname: `/api/workflow/workflows/${workflowId}/run`,
@@ -400,6 +419,42 @@ describe('buildAutomationListResponse', () => {
     expect(runStatus).toBe(200);
     expect(workflowService.listExecutions).toHaveBeenCalledTimes(2);
     expect(after.automations[0]?.lastExecution?.startedAt).toBe('2024-05-01T06:47:00.000Z');
+  });
+
+  test('preserves the typed always-on subscription contract at the raw HTTP boundary', async () => {
+    const capabilityBody = {
+      success: false,
+      code: 'workflow_requires_always_on',
+      error: 'Scheduled workflows require an always-on agent runtime.',
+      capability: 'scheduled_workflows',
+      currentExecutionTier: 'dedicated-lazy',
+      requiredExecutionTier: 'dedicated-always',
+      upgradeRequired: true,
+    };
+    const runtime = createRuntimeMock({
+      activationError: new WorkflowApiError(capabilityBody.error, 409, capabilityBody),
+    });
+    let status = 0;
+    let body: unknown;
+
+    await handleWorkflowRoutes({
+      req: {
+        method: 'POST',
+        url: '/api/workflow/workflows/lazy-schedule/activate',
+      } as never,
+      res: {} as ServerResponse,
+      method: 'POST',
+      pathname: '/api/workflow/workflows/lazy-schedule/activate',
+      runtime,
+      principalId: DEFAULT_OWNER_ID,
+      json: (_res, responseBody, responseStatus = 200) => {
+        status = responseStatus;
+        body = responseBody;
+      },
+    });
+
+    expect(status).toBe(409);
+    expect(body).toEqual(capabilityBody);
   });
 
   test('isolates cached executions between agent workflow services', async () => {
@@ -477,6 +532,7 @@ describe('handleAutomationsRoutes', () => {
   });
 
   test('isolates rooms, drafts, tasks, triggers, and workflows for two principals on one agent', async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = '1';
     const ownerA = stringToUuid('automations-owner-a') as UUID;
     const ownerB = stringToUuid('automations-owner-b') as UUID;
     const makeDraftRoom = (ownerId: UUID, suffix: string): Room => ({
@@ -485,9 +541,10 @@ describe('handleAutomationsRoutes', () => {
       source: 'web',
       type: 'GROUP' as Room['type'],
       metadata: {
-        ownership: { ownerId },
+        ownership: { ownerId: DEFAULT_OWNER_ID },
         webConversation: {
           conversationId: `conversation-${suffix}`,
+          cloudOwnerEntityId: ownerId,
           scope: 'automation-workflow-draft',
           draftId: 'shared-draft-id',
           workflowName: `Draft ${suffix}`,
@@ -535,7 +592,7 @@ describe('handleAutomationsRoutes', () => {
           triggerType: 'cron',
           enabled: true,
           wakeMode: 'inject_now',
-          createdBy: ownerA,
+          createdBy: 'workflow.schedule',
           cronExpression: '0 9 * * *',
           runCount: 0,
           kind: 'workflow',
@@ -555,7 +612,22 @@ describe('handleAutomationsRoutes', () => {
       versionId: `version-${id}`,
     });
     const runtime = createRuntimeMock({
-      rooms: [makeDraftRoom(ownerA, 'A'), makeDraftRoom(ownerB, 'B')],
+      rooms: [
+        makeDraftRoom(ownerA, 'A'),
+        makeDraftRoom(ownerB, 'B'),
+        {
+          ...makeDraftRoom(ownerA, 'legacy'),
+          name: 'Legacy Cloud draft without attested owner',
+          metadata: {
+            ownership: { ownerId: ownerA },
+            webConversation: {
+              conversationId: 'legacy-conversation',
+              scope: 'automation-workflow-draft',
+              draftId: 'legacy-draft',
+            },
+          },
+        },
+      ],
       tasks: [makeTask(ownerA, 'A'), makeTask(ownerB, 'B')],
       triggerTasks: [
         makePromptTrigger(ownerA, 'A'),
@@ -593,15 +665,21 @@ describe('handleAutomationsRoutes', () => {
     expect(titlesA).toEqual(
       expect.arrayContaining(['Draft A', 'Task A', 'Prompt A', 'Workflow A'])
     );
-    expect(titlesA).not.toEqual(
-      expect.arrayContaining(['Draft B', 'Task B', 'Prompt B', 'Workflow B'])
-    );
+    for (const hiddenTitle of [
+      'Draft B',
+      'Task B',
+      'Prompt B',
+      'Workflow B',
+      'Legacy Cloud draft without attested owner',
+    ]) {
+      expect(titlesA).not.toContain(hiddenTitle);
+    }
     expect(titlesB).toEqual(
       expect.arrayContaining(['Draft B', 'Task B', 'Prompt B', 'Workflow B'])
     );
-    expect(titlesB).not.toEqual(
-      expect.arrayContaining(['Draft A', 'Task A', 'Prompt A', 'Workflow A'])
-    );
+    for (const hiddenTitle of ['Draft A', 'Task A', 'Prompt A', 'Workflow A']) {
+      expect(titlesB).not.toContain(hiddenTitle);
+    }
     expect(
       responseA.automations.find((item) => item.draftId === 'shared-draft-id')?.room?.roomId
     ).toBe(stringToUuid('draft-room-A'));
@@ -609,6 +687,15 @@ describe('handleAutomationsRoutes', () => {
       responseB.automations.find((item) => item.draftId === 'shared-draft-id')?.room?.roomId
     ).toBe(stringToUuid('draft-room-B'));
     expect(responseA.automations.some((item) => item.workflowId === 'wf-owner-b')).toBe(false);
+    expect(
+      responseA.automations.find((item) => item.workflowId === 'wf-owner-a')?.schedules
+    ).toEqual([]);
+    expect(
+      responseB.automations
+        .find((item) => item.workflowId === 'wf-owner-b')
+        ?.schedules.map((schedule) => schedule.id)
+    ).toEqual([stringToUuid('foreign-workflow-trigger')]);
+    expect(titlesB).not.toContain('Legacy Cloud draft without attested owner');
 
     const service = runtime.getService(WORKFLOW_SERVICE_TYPE) as ReturnType<
       typeof createWorkflowServiceMock

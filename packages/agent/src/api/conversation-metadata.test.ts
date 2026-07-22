@@ -1,10 +1,17 @@
 /**
- * Unit coverage for `sanitizeConversationMetadata` — a pure, deterministic
- * sanitizer with no runtime or I/O. Pins each allowlist/guard branch of the
- * untrusted-metadata → typed-DTO boundary.
+ * Deterministic coverage for conversation metadata sanitization and room
+ * persistence. It pins the caller-writable allowlist separately from the
+ * server-attested Cloud owner that must survive restore without entering the
+ * public metadata DTO.
  */
+import { stringToUuid } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
-import { sanitizeConversationMetadata } from "./conversation-metadata.ts";
+import {
+  buildConversationRoomMetadata,
+  extractConversationCloudOwnerEntityIdFromRoom,
+  extractConversationMetadataFromRoom,
+  sanitizeConversationMetadata,
+} from "./conversation-metadata.ts";
 
 /**
  * `sanitizeConversationMetadata` is the untrusted-input → typed-DTO boundary for
@@ -71,5 +78,88 @@ describe("sanitizeConversationMetadata", () => {
       workflowId: "wf-1",
       workflowName: "Daily report",
     });
+  });
+
+  it("keeps the server-owned Cloud principal outside caller metadata", () => {
+    expect(
+      sanitizeConversationMetadata({
+        scope: "general",
+        cloudOwnerEntityId: stringToUuid("spoofed-cloud-owner"),
+      }),
+    ).toEqual({ scope: "general" });
+  });
+});
+
+describe("managed Cloud conversation room metadata", () => {
+  it("persists and restores the server-owned principal independently of public metadata", () => {
+    const cloudOwnerEntityId = stringToUuid("cloud-owner-a");
+    const stored = buildConversationRoomMetadata(
+      {
+        id: "conversation-a",
+        cloudOwnerEntityId,
+        metadata: { scope: "automation-workflow", workflowId: "workflow-a" },
+      },
+      "agent-owner",
+      { unrelated: "preserved" },
+    );
+    const room = { metadata: stored };
+
+    expect(stored).toMatchObject({
+      unrelated: "preserved",
+      webConversation: {
+        conversationId: "conversation-a",
+        cloudOwnerEntityId,
+        scope: "automation-workflow",
+        workflowId: "workflow-a",
+      },
+    });
+    expect(
+      extractConversationCloudOwnerEntityIdFromRoom(room, "conversation-a"),
+    ).toBe(cloudOwnerEntityId);
+    expect(extractConversationMetadataFromRoom(room, "conversation-a")).toEqual(
+      { scope: "automation-workflow", workflowId: "workflow-a" },
+    );
+  });
+
+  it("fails closed when persisted metadata belongs to a different conversation id", () => {
+    const cloudOwnerEntityId = stringToUuid("cloud-owner-b");
+    const room = {
+      metadata: buildConversationRoomMetadata(
+        { id: "conversation-b", cloudOwnerEntityId },
+        "agent-owner",
+      ),
+    };
+
+    expect(
+      extractConversationCloudOwnerEntityIdFromRoom(room, "conversation-a"),
+    ).toBeUndefined();
+  });
+
+  it("fails closed when the persisted conversation binding is absent or the owner is not a UUID", () => {
+    const cloudOwnerEntityId = stringToUuid("cloud-owner-c");
+
+    expect(
+      extractConversationCloudOwnerEntityIdFromRoom(
+        {
+          metadata: {
+            webConversation: { cloudOwnerEntityId },
+          },
+        },
+        "conversation-c",
+      ),
+    ).toBeUndefined();
+    expect(
+      extractConversationCloudOwnerEntityIdFromRoom(
+        {
+          metadata: {
+            webConversation: {
+              conversationId: "conversation-c",
+              cloudOwnerEntityId: "caller-controlled-owner",
+            },
+          },
+        },
+        "conversation-c",
+      ),
+    ).toBeUndefined();
   });
 });

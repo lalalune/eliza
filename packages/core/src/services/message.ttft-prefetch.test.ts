@@ -7,14 +7,22 @@
  * `embedRecallQuery` seam and text normalization; a dropped turn (muted / LLM
  * off) issues no embed; (2) the Stage-1 sender role is resolved once per turn
  * and reused by the pre-LLM shortcut gate through the trajectory context
- * instead of a second room+world lookup. Fake runtime over real service code,
- * no live model; the turn runs the deterministic no-model reply path.
+ * instead of a second room+world lookup; (3) completed action results cross the
+ * post-turn evaluator boundary unchanged. Fake runtime over real service code;
+ * no live model.
  */
 import { describe, expect, it, vi } from "vitest";
 import { embedRecallQuery } from "../features/documents/recall-embed";
+import { ShortcutRegistry } from "../runtime/shortcut-registry";
 import { TurnControllerRegistry } from "../runtime/turn-controller";
+import type { Action } from "../types/components";
 import type { Room, World } from "../types/environment";
-import type { IAgentRuntime, Memory, UUID } from "../types/index";
+import type {
+	EvaluatorRunOptions,
+	IAgentRuntime,
+	Memory,
+	UUID,
+} from "../types/index";
 import { ModelType } from "../types/index";
 import { DefaultMessageService } from "./message";
 
@@ -244,5 +252,74 @@ describe("Stage-1 sender role resolved once per turn", () => {
 		// the same message; the injection gate short-circuits on zero risk score
 		// so it never re-resolves either.
 		expect(getWorld).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("post-turn evaluator action result context", () => {
+	it("passes the canonical shortcut action results to the evaluator service", async () => {
+		const { runtime } = makeRuntime();
+		const workflowAction: Action = {
+			name: "WORKFLOW",
+			description: "create a workflow",
+			validate: async () => true,
+			handler: async (_runtime, _message, _state, _options, callback) => {
+				await callback?.({ text: "Workflow created." });
+				return {
+					success: true,
+					text: "Workflow created.",
+					values: { workflowId: "workflow-1" },
+				};
+			},
+		};
+		const shortcutRegistry = new ShortcutRegistry();
+		shortcutRegistry.register({
+			id: "cmd:workflow",
+			kind: "explicit",
+			aliases: ["/workflow"],
+			target: { kind: "action", name: "WORKFLOW" },
+		});
+		const evaluatorRun = vi.fn(
+			async (
+				_message: Memory,
+				_state: unknown,
+				_options: EvaluatorRunOptions,
+			) => ({
+				skipped: true,
+				activeEvaluators: [],
+				processedEvaluators: [],
+				results: [],
+				errors: [],
+			}),
+		);
+		Object.assign(runtime, {
+			actions: [workflowAction],
+			shortcutRegistry,
+			getModel: vi.fn((modelType: string) =>
+				modelType === ModelType.TEXT_LARGE ? async () => undefined : null,
+			),
+			getServiceLoadPromise: vi.fn(async () => ({ run: evaluatorRun })),
+		});
+
+		const result = await new DefaultMessageService().handleMessage(
+			runtime,
+			userMessage("/workflow"),
+		);
+
+		expect(result.mode).toBe("simple");
+		expect(runtime.logger.debug).toHaveBeenCalledWith(
+			expect.objectContaining({ src: "service:message" }),
+			"Message resolved via pre-LLM shortcut gate",
+		);
+		expect(result.responseContent?.thought).toBe("Shortcut: cmd:workflow");
+		expect(result.actionResults).toEqual([
+			expect.objectContaining({
+				success: true,
+				data: { actionName: "WORKFLOW" },
+				values: { workflowId: "workflow-1" },
+			}),
+		]);
+		expect(evaluatorRun).toHaveBeenCalledTimes(1);
+		const evaluatorOptions = evaluatorRun.mock.calls[0]?.[2];
+		expect(evaluatorOptions?.actionResults).toBe(result.actionResults);
 	});
 });

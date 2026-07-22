@@ -1,55 +1,9 @@
 /**
- * Warm Claude Agent SDK inference session — the FAST, TOS-clean way to run an
- * Eliza brain on a Claude Max subscription.
- *
- * Unlike `claude --print` (ClaudeCli), which cold-spawns a fresh process on
- * EVERY model call (~5-15s startup each; the planner's ~4-8 calls/turn = 25-68s),
- * this keeps ONE long-lived Claude Code process warm via the Agent SDK's
- * streaming-input mode. The startup cost is paid once; subsequent turns are just
- * inference (~1-2s, proven). Auth is the subscription's own OAuth — the SDK reads
- * `~/.claude` or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`); eliza
- * never sees the token. Effective 2026-06-15 this is OFFICIALLY sanctioned use
- * of a Claude subscription (the monthly Agent SDK credit), so it is strictly
- * cleaner than the in-process stealth token-replay.
- *
- * THREE MODES (the SDK fixes `systemPrompt` + `mcpServers` at query() start —
- * see the live-proven research wf_3199bde6: there is NO mid-session
- * setSystemPrompt or history-reset, so a session is created per frozen system
- * prompt):
- *
- *  - TEXT mode (`generate`): pure text generation for the reply / large tiers.
- *    `allowedTools: []` strips Claude Code's own tools so the SDK is a warm
- *    chat-completion engine. `maxTurns` defaults to 1 (a one-shot answer leaves
- *    no room for the agentic "I'll fetch it…" preamble-then-act pattern that
- *    leaks when >1), and the `result` envelope is inspected so an
- *    `error_max_turns`/empty turn falls back to `result.result` instead of
- *    throwing a spurious "empty completion".
- *
- *  - ROUTE mode (`route`): the ACTION_PLANNER decision via NATIVE tool-calling.
- *    A single in-process MCP tool (`route_action`) is the ONLY allowed tool; the
- *    model emits a real `tool_use`, the SDK routes it to our handler in-process,
- *    and the handler captures `{action, params}` — Eliza executes the action,
- *    Claude Code never does. This matches the stealth/native path's full
- *    functionality (WEB_FETCH, sub-agents) with no free-text JSON parsing and no
- *    required-tool retry loop. The turn ends `subtype=error_max_turns` (normal
- *    for a tool-calling turn under `maxTurns: 1`); the captured decision — not
- *    the assistant text — is the result.
- *
- *  - ENVELOPE mode (`envelope`): the Stage-1 RESPONSE_HANDLER routing envelope
- *    via the same native-tool pattern (`handle_response`). Every other Stage-1
- *    lane structurally forces the envelope (anthropic native tool_use, cloud
- *    tool_choice:required, local GBNF); free text alone let the model answer
- *    live-info asks in prose, which core's tolerance accepted as a finished
- *    "simple reply" — no planner, no fetch. The captured envelope is returned
- *    as a JSON string core parses identically to a native tool call;
- *    off-contract prose falls back to TEXT-mode semantics.
- *
- * One instance == one (model, systemPrompt, mode). Calls are SERIALIZED (one in
- * flight per warm session); spin up multiple instances for concurrency. The
- * session is RESTARTED after `restartAfterTurns` turns to bound the accumulating
- * context window.
- *
- * @module plugin-cli-inference/claude-sdk-session
+ * Claude Agent SDK transport for text completion and native routing tool calls.
+ * Each instance owns one streaming SDK query, whose system prompt, tools, auth,
+ * and hidden conversation state are fixed at query start. The plugin creates and
+ * disposes an instance for every Eliza model call so independent calls cannot
+ * share context or credentials; serialized reuse exists only as a transport seam.
  */
 
 import { logger } from "@elizaos/core";
@@ -212,24 +166,22 @@ interface ZodModule {
 export interface ClaudeSdkSessionConfig {
   model?: string | null;
   /**
-   * Frozen system prompt for this session. The SDK resolves `systemPrompt` once
-   * at query() start, so the caller MUST key its session cache by this value
-   * (one warm process per distinct system prompt).
+   * Frozen system prompt for this query. The SDK resolves `systemPrompt` once
+   * at query() start, so callers must not reuse an instance across independent
+   * Eliza model calls.
    */
   systemPrompt?: string | null;
   /** Session shape — see {@link SdkSessionMode}. Default "text". */
   mode?: SdkSessionMode;
   /**
    * ENVELOPE mode only (required there): declared schema types of the Stage-1
-   * fields this session captures, derived from core's composed
-   * HANDLE_RESPONSE tool for the turn that opened the session. The caller
-   * keys its session cache by this set, since the SDK freezes tool schemas at
-   * query() start.
+   * fields this query captures, derived from core's composed HANDLE_RESPONSE
+   * tool. The SDK freezes tool schemas at query() start.
    */
   envelopeFields?: EnvelopeFieldSchemas;
   /** Path to the Claude Code executable the SDK drives. */
   claudeExecutablePath?: string | null;
-  /** Restart the warm session after this many turns (bounds context growth). */
+  /** Bound context growth if a lower-level caller deliberately reuses this transport. */
   restartAfterTurns?: number;
   /** Hard wall-clock budget for one SDK turn. Defaults below common 120s
    *  connector timeouts. Explicit `0` opts out to unbounded (#16553) — an
@@ -310,9 +262,9 @@ export function normalizeEffort(value: string | null | undefined): string | null
 }
 
 /**
- * A single warm Agent SDK session for one (model, systemPrompt, mode). Lazily
- * starts on first call, serializes calls, and self-heals (restarts) on error or
- * after `restartAfterTurns`.
+ * One Agent SDK transport for a fixed model, system prompt, mode, and credential
+ * set. Production owns it for a single send; serialization and bounded reuse are
+ * retained for direct transport consumers and deterministic tests.
  */
 export class ClaudeSdkSession {
   private readonly model: string;
@@ -388,7 +340,7 @@ export class ClaudeSdkSession {
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    // Serialize so only one turn is in flight per warm session (the streaming
+    // Serialize so only one turn is in flight per SDK query (the streaming
     // generator is a single conversation, and pendingDecision is shared).
     const run = this.chain.then(fn, fn);
     // error-policy:J5 the chain tail only serializes turns; the REAL result/error
@@ -402,7 +354,7 @@ export class ClaudeSdkSession {
     if (!body.trim()) {
       throw new Error("[cli-inference:sdk] empty prompt body");
     }
-    // Restart the warm session periodically to bound the accumulating window.
+    // Bound accumulated context for lower-level callers that reuse an instance.
     if (this.query && this.turns >= this.restartAfterTurns) {
       await this.dispose();
     }
@@ -579,7 +531,21 @@ export class ClaudeSdkSession {
       this.query = null;
       this.iterator = null;
       this.feed = null;
-      stale?.interrupt?.().catch(() => {});
+      if (stale?.interrupt) {
+        void stale.interrupt().catch(() => {
+          // error-policy:J6 best-effort teardown — the stale query cannot be
+          // inherited, but a failed interrupt remains visible to operators.
+          logger.warn(
+            {
+              src: "cli-inference:sdk",
+              model: this.model,
+              mode: this.mode,
+              reason: "stale-query-interrupt-failed",
+            },
+            "[cli-inference:sdk] failed to interrupt a stale Claude SDK query"
+          );
+        });
+      }
       throw new ProviderApiError("[cli-inference:sdk] session disposed during start", {
         retryable: true,
       });
@@ -590,7 +556,7 @@ export class ClaudeSdkSession {
         model: this.model,
         mode: this.mode,
       },
-      "warm Claude Agent SDK session started"
+      "Claude Agent SDK query started"
     );
   }
 
@@ -789,7 +755,7 @@ export class ClaudeSdkSession {
   }
 
   /**
-   * Tear down the warm session (on restart, error, or dispose).
+   * Tear down the SDK query (on restart, error, or dispose).
    *
    * BOUNDED (#16553): `query.interrupt()` sends a control request to the CLI
    * process and awaits its acknowledgement — a wedged spawn (version-mismatch
@@ -831,7 +797,16 @@ export class ClaudeSdkSession {
         ]);
       } catch {
         // error-policy:J6 best-effort teardown — interrupting an already-dead
-        // query on dispose; failure here does not matter (the session is discarded).
+        // query cannot retain state, but the failed teardown remains observable.
+        logger.warn(
+          {
+            src: "cli-inference:sdk",
+            model: this.model,
+            mode: this.mode,
+            reason: "query-interrupt-failed",
+          },
+          "[cli-inference:sdk] failed to interrupt a discarded Claude SDK query"
+        );
       } finally {
         if (timer) clearTimeout(timer);
       }

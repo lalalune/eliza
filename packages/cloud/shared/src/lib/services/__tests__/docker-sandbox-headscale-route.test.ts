@@ -10,6 +10,7 @@ import {
   resolveDockerSandboxImage,
   resolveSandboxRegistryEnv,
   shouldCleanupHeadscaleVpn,
+  stripFleetServerSecret,
 } from "../docker-sandbox-provider";
 
 const savedEnv = { ...process.env };
@@ -158,6 +159,18 @@ describe("resolveDockerSandboxImage", () => {
     expect(resolveDockerSandboxImage(undefined, "ghcr.io/elizaos/eliza:stable")).toBe(
       "ghcr.io/elizaos/eliza:stable",
     );
+  });
+});
+
+describe("stripFleetServerSecret", () => {
+  test("removes every stored spelling without exposing the daemon credential", () => {
+    expect(
+      stripFleetServerSecret({
+        agent_server_shared_secret: "case-variant",
+        AGENT_SERVER_SHARED_SECRET: "stored-tenant-value",
+        KEEP_ME: "yes",
+      }),
+    ).toEqual({ KEEP_ME: "yes" });
   });
 });
 

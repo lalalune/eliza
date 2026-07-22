@@ -764,6 +764,50 @@ export class AgentSandboxesRepository {
   }
 
   /**
+   * Publish a freshly-minted managed credential only for the provisioning
+   * attempt that still owns the row version returned by `trySetProvisioning`.
+   * Clearing a retired handle in the same write prevents a retry from adopting
+   * a container that was booted with the superseded credential.
+   */
+  async rotateProvisioningCredential(params: {
+    id: string;
+    expectedUpdatedAt: Date;
+    environmentVars: Record<string, string>;
+    clearContainerHandle: boolean;
+  }): Promise<AgentSandbox | undefined> {
+    await ensureAgentSandboxSchema();
+    const now = new Date();
+    const [row] = await dbWrite
+      .update(agentSandboxes)
+      .set({
+        environment_vars: params.environmentVars,
+        updated_at: now,
+        ...(params.clearContainerHandle
+          ? {
+              sandbox_id: null,
+              bridge_url: null,
+              health_url: null,
+              node_id: null,
+              container_name: null,
+              bridge_port: null,
+              web_ui_port: null,
+              headscale_ip: null,
+              last_heartbeat_at: null,
+            }
+          : {}),
+      })
+      .where(
+        and(
+          eq(agentSandboxes.id, params.id),
+          eq(agentSandboxes.status, "provisioning"),
+          eq(agentSandboxes.updated_at, params.expectedUpdatedAt),
+        ),
+      )
+      .returning();
+    return row;
+  }
+
+  /**
    * Atomically restore a still-recoverable agent to `running` after a successful
    * bridge re-probe. The recovery read -> probe -> write window spans seconds,
    * during which the row may move to `deletion_pending` (delete enqueue),

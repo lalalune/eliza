@@ -172,7 +172,7 @@ Now output ONLY the compact JSON routing object for the single next action.`;
 }
 
 /**
- * Framing prefix for the warm Agent SDK in TEXT mode (reply / large tiers).
+ * Framing prefix for the Claude Agent SDK in TEXT mode (reply / large tiers).
  *
  * The SDK drives Claude Code, which is agentic by nature: fed eliza's flattened
  * RESPONSE_HANDLER prompt — a message history with tool-calls + a stale "call a
@@ -221,26 +221,24 @@ export function appendTextDirective(body: string): string {
 }
 
 /**
- * STABLE system prompt for the NATIVE-TOOL router (warm Agent SDK, ROUTE mode).
+ * Stable system prompt for the native-tool router (Claude Agent SDK ROUTE mode).
  *
  * The model is given exactly ONE tool — `route_action({action, params})` — and
  * must call it once per turn. This is the structural replacement for the
  * free-text `{action,params}` text-planner: a real `tool_use` the SDK delivers
  * to our in-process handler, so there is no JSON-from-prose parsing and no
- * required-tool retry loop. Kept CONSTANT (per-turn variation — the action menu,
- * transcript, persona — rides in the body) because the SDK freezes `systemPrompt`
- * at session start, so a constant system keeps ONE warm process per model.
+ * required-tool retry loop. Per-turn variation — the action menu, transcript,
+ * and persona — rides in the body because the SDK freezes `systemPrompt` at
+ * query start.
  */
 /**
- * STABLE system prompt for the Stage-1 ENVELOPE session (warm Agent SDK,
- * ENVELOPE mode). The model is given exactly ONE tool — `handle_response` —
+ * Stable system prompt for the Stage-1 Claude Agent SDK ENVELOPE query. The
+ * model is given exactly ONE tool — `handle_response` —
  * and must call it once per turn with the routing envelope the per-turn
- * instructions (riding in the body) define. Kept CONSTANT for the same reason
- * as ROUTER_SYSTEM_PROMPT below: the SDK freezes `systemPrompt` at session
- * start, so a constant system keeps ONE warm process serving every Stage-1
- * turn. All the real routing rules (simple vs planning, live-info, field
- * docs) come from the framework's own Stage-1 template in the body — this
- * prompt only pins the OUTPUT CHANNEL to the tool call.
+ * instructions (riding in the body) define. The SDK freezes `systemPrompt` at
+ * query start, while all real routing rules (simple vs planning, live-info,
+ * field docs) come from the framework's own Stage-1 template in the body. This
+ * prompt only pins the output channel to the tool call.
  */
 export const STAGE1_ENVELOPE_SYSTEM_PROMPT = `You are the Stage-1 message router for an Eliza AI agent. The user message contains the full routing instructions, the agent persona, and the conversation. Follow those instructions exactly, then submit your decision by calling the handle_response tool EXACTLY ONCE with every field those instructions define — never answer in plain text, never skip the tool call.`;
 

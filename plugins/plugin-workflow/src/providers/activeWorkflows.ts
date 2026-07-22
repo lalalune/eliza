@@ -7,11 +7,10 @@ import {
   type IAgentRuntime,
   type Memory,
   type Provider,
-  resolveCanonicalOwnerIdForMessage,
   type State,
 } from '@elizaos/core';
 import { WORKFLOW_SERVICE_TYPE, type WorkflowService } from '../services/index';
-import { getLocalOwnerEntityId } from '../utils/context';
+import { getLocalOwnerEntityId, resolveWorkflowOwnerEntityId } from '../utils/context';
 
 function getWorkflowSearchQuery(message: Memory): string | null {
   const text = typeof message.content.text === 'string' ? message.content.text.trim() : '';
@@ -49,7 +48,7 @@ export const activeWorkflowsProvider: Provider = {
         };
       }
 
-      ownerEntityId = (await resolveCanonicalOwnerIdForMessage(runtime, _message)) ?? ownerEntityId;
+      ownerEntityId = await resolveWorkflowOwnerEntityId(runtime, _message);
       const searchQuery = getWorkflowSearchQuery(_message);
       const workflows = searchQuery
         ? await service.searchWorkflows(searchQuery, ownerEntityId)

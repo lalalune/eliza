@@ -14,7 +14,7 @@
 
 import type { AgentRuntime, Room, Task, UUID } from '@elizaos/core';
 import { ElizaError, stringToUuid } from '@elizaos/core';
-import { getRouteOwnerEntityId } from '../routes/_helpers';
+import { getRouteOwnerEntityId, isCloudWorkflowPrincipalRequired } from '../routes/_helpers';
 import type { WorkflowStatusResponse } from '../routes/workflow-routes';
 import { WORKFLOW_SERVICE_TYPE, type WorkflowService } from '../services/workflow-service';
 import type {
@@ -238,13 +238,16 @@ function readAutomationRoomRecord(
 
   const roomMetadata = isRecord(room.metadata) ? room.metadata : null;
   const ownership = isRecord(roomMetadata?.ownership) ? roomMetadata.ownership : null;
-  const ownerEntityId = asString(ownership?.ownerId);
-  if (!ownerEntityId) {
-    return null;
-  }
   const webConversation = isRecord(roomMetadata?.webConversation)
     ? roomMetadata.webConversation
     : null;
+  // Local room ownership grants belong to the canonical app owner. Managed
+  // Cloud multiplexes multiple end users through that same agent, so only the
+  // server-persisted attested principal can scope its conversation rows.
+  const ownerEntityId = isCloudWorkflowPrincipalRequired()
+    ? asString(webConversation?.cloudOwnerEntityId)
+    : asString(ownership?.ownerId);
+  if (!ownerEntityId) return null;
 
   return {
     title: asString(room.name) ?? 'Automation',
@@ -597,26 +600,33 @@ export async function buildAutomationListResponse(
       .filter((task): task is WorkbenchTaskView => task !== null)
   );
 
-  const triggerTaskRecords = await listTriggerTasks(runtime);
-  const triggerItems = triggerTaskRecords
-    .filter((task) => {
-      if (isHeartbeatTask(task)) return true;
-      const trigger = taskToTriggerSummary(task);
-      return trigger?.createdBy === ownerEntityId;
-    })
-    .map((task) => taskToTriggerSummary(task))
-    .filter((trigger): trigger is TriggerSummary => trigger !== null);
-  const triggerTaskIds = new Set(triggerItems.map((trigger) => trigger.taskId));
-  const taskItems = tasks
-    .filter((task) => !triggerTaskIds.has(task.id))
-    .map((task) => buildCoordinatorTaskItem(task, taskRooms.get(task.id)));
-
   const service = getWorkflowService(runtime);
   const workflowStatus = buildWorkflowStatus(service);
   const { workflows: workflowList, workflowFetchError } = await loadWorkflowList(
     service,
     ownerEntityId
   );
+  const ownedWorkflowIds = new Set(workflowList.map((workflow) => workflow.id));
+
+  const triggerTaskRecords = await listTriggerTasks(runtime);
+  const triggerItems = triggerTaskRecords.flatMap((task): TriggerSummary[] => {
+    const trigger = taskToTriggerSummary(task);
+    if (!trigger) return [];
+    if (isHeartbeatTask(task)) return [trigger];
+
+    // Workflow schedules are created by the workflow runtime, so their
+    // `createdBy` value identifies the subsystem rather than the end user.
+    // The already owner-scoped workflow list is the authority for visibility.
+    if (trigger.kind === 'workflow') {
+      return trigger.workflowId && ownedWorkflowIds.has(trigger.workflowId) ? [trigger] : [];
+    }
+
+    return trigger.createdBy === ownerEntityId ? [trigger] : [];
+  });
+  const triggerTaskIds = new Set(triggerItems.map((trigger) => trigger.taskId));
+  const taskItems = tasks
+    .filter((task) => !triggerTaskIds.has(task.id))
+    .map((task) => buildCoordinatorTaskItem(task, taskRooms.get(task.id)));
 
   const workflowItemsById = new Map<string, AutomationItem>();
   for (const workflow of workflowList) {

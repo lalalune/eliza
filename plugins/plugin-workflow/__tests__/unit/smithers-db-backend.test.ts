@@ -2,13 +2,15 @@
  * Unit tests for Smithers database backend selection in plugin-workflow.
  *
  * The selection logic lives in `resolveSmithersDbConfig` (env → payload) and
- * the inline subprocess script (payload.dbConfig → Smithers layer). These tests
+ * the package-local worker (payload.dbConfig → Smithers layer). These tests
  * exercise:
  *   1. resolveSmithersDbConfig: valid backends and required connection details
  *   2. Subprocess layer selection fails instead of silently changing storage.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { join } from 'node:path';
+import { resolveStateDir } from '@elizaos/core';
 import {
   buildSmithersWorkerEnv,
   resolveSmithersDbConfig,
@@ -92,11 +94,30 @@ describe('Smithers worker isolation', () => {
     const second = resolveSmithersDbPath('agent-two', 'shared-workflow');
 
     expect(first).not.toBe(second);
-    expect(first).toEndWith('/.eliza/smithers/agent-one/shared-workflow.sqlite');
-    expect(second).toEndWith('/.eliza/smithers/agent-two/shared-workflow.sqlite');
+    expect(first).toBe(join(resolveStateDir(), 'smithers', 'agent-one', 'shared-workflow.sqlite'));
+    expect(second).toBe(join(resolveStateDir(), 'smithers', 'agent-two', 'shared-workflow.sqlite'));
     expect(() => resolveSmithersDbPath(' ', 'shared-workflow')).toThrow(
       'require an agent tenant id'
     );
+  });
+
+  it('keeps durable paths stable when the process cwd changes', () => {
+    const originalCwd = process.cwd();
+    const originalStateDir = process.env.ELIZA_STATE_DIR;
+    const stateDir = join(originalCwd, '.smithers-state-test');
+    try {
+      process.env.ELIZA_STATE_DIR = stateDir;
+      const before = resolveSmithersDbPath('agent-one', 'shared-workflow');
+      process.chdir(join(originalCwd, '..'));
+      const after = resolveSmithersDbPath('agent-one', 'shared-workflow');
+
+      expect(after).toBe(before);
+      expect(after).toBe(join(stateDir, 'smithers', 'agent-one', 'shared-workflow.sqlite'));
+    } finally {
+      process.chdir(originalCwd);
+      if (originalStateDir === undefined) delete process.env.ELIZA_STATE_DIR;
+      else process.env.ELIZA_STATE_DIR = originalStateDir;
+    }
   });
 
   it('does not forward provider credentials or workflow payloads through the environment', () => {
@@ -128,9 +149,8 @@ describe('Smithers worker isolation', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Replicates the inline branch from createSmithersScript so we can unit-test
- * it without spawning a real subprocess. The logic is identical to what the
- * script string does:
+ * Replicates the worker branch so backend selection can be tested without
+ * spawning a real subprocess. The logic is identical to what the worker does:
  *
  *   const provider = dbConfig.provider ?? 'sqlite';
  *   sqlite → Smithers.sqlite; configured remote backends must exist or throw.

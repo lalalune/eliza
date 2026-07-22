@@ -131,8 +131,8 @@ export const embeddedExecutions = workflowSchema.table(
     execution: jsonb('execution').$type<WorkflowExecution>().notNull(),
     /**
      * Per-dispatch idempotency key. Scheduled dispatches use
-     * `${workflowId}:${scheduleNodeId}:${minuteBucket}` so retries of one
-     * schedule fire collapse without suppressing a sibling schedule branch.
+     * `${workflowId}:${scheduleNodeId}:${nextRunAtMs}` so retries of one
+     * occurrence collapse without suppressing sibling or sub-minute fires.
      * Null for ad-hoc / manual runs.
      */
     idempotencyKey: text('idempotency_key'),

@@ -1,11 +1,16 @@
 /**
  * Drives embedded HTTP Request nodes through the real core SSRF guard with a
  * deterministic DNS-pinned transport, covering blocked and allowed targets.
+ * The body runs in a child because Bun/PGlite can retain invalid Emscripten
+ * descriptors after an oversized ReadableStream is cancelled and its raw test
+ * database closes; the process boundary keeps that VM state out of later files.
  */
 import { expect, test } from 'bun:test';
+import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { stringToUuid } from '@elizaos/core';
 import { drizzle } from 'drizzle-orm/pglite';
@@ -16,7 +21,74 @@ import {
 } from '../../src/services/embedded-workflow-service';
 import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
 
+const SSRF_CHILD_ENV = 'ELIZA_WORKFLOW_HTTP_SSRF_CHILD';
+const SSRF_CHILD_TIMEOUT_MS = 90_000;
+const testPath = fileURLToPath(import.meta.url);
+const pluginRoot = fileURLToPath(new URL('../..', import.meta.url));
+
+function buildChildEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, [SSRF_CHILD_ENV]: '1' };
+  for (const key of Object.keys(env)) {
+    const normalized = key.toUpperCase();
+    if (
+      normalized === 'NODE_V8_COVERAGE' ||
+      normalized === 'BUN_TEST' ||
+      normalized.startsWith('BUN_TEST_') ||
+      normalized.startsWith('VITEST') ||
+      normalized.startsWith('NYC_') ||
+      normalized.includes('COVERAGE')
+    ) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+async function runSsrfProofInIsolatedProcess(): Promise<void> {
+  const proc = spawn(process.env.BUN_BIN || process.execPath, ['test', testPath], {
+    cwd: pluginRoot,
+    env: buildChildEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let timedOut = false;
+  proc.stdout.setEncoding('utf8');
+  proc.stderr.setEncoding('utf8');
+  proc.stdout.on('data', (chunk: string) => {
+    stdout += chunk;
+  });
+  proc.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    proc.kill('SIGKILL');
+  }, SSRF_CHILD_TIMEOUT_MS);
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    proc.once('error', reject);
+    proc.once('close', (code) => resolve(code ?? 1));
+  }).finally(() => clearTimeout(timeout));
+
+  if (timedOut) {
+    throw new Error(
+      `Isolated workflow HTTP SSRF proof timed out.\nstdout:\n${stdout}\nstderr:\n${stderr}`
+    );
+  }
+  if (exitCode !== 0) {
+    throw new Error(
+      `Isolated workflow HTTP SSRF proof failed with exit ${exitCode}.\nstdout:\n${stdout}\nstderr:\n${stderr}`
+    );
+  }
+}
+
 test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pinned public redirect', async () => {
+  if (process.env[SSRF_CHILD_ENV] !== '1') {
+    await runSsrfProofInIsolatedProcess();
+    return;
+  }
+
   const root = await mkdtemp(join(tmpdir(), 'workflow-http-ssrf-'));
   const client = new PGlite({ dataDir: join(root, 'pglite') });
   const db = drizzle(client, { schema: dbSchema });
@@ -35,6 +107,7 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
   let oversizedBodyCancelled = false;
   let declaredBodyCancelled = false;
   let lyingLengthBodyCancelled = false;
+  let dynamicRequest: { url: string; eventKind: string | null; body: string | null } | undefined;
 
   __setWorkflowHttpTransportForTests(runtime, {
     lookupFn: async (hostname) => {
@@ -110,6 +183,29 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
             'content-length': '1048576',
             'content-type': 'text/plain',
           },
+        });
+      }
+      if (url.pathname === '/not-found') {
+        return new Response(JSON.stringify({ error: 'missing' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname === '/server-error') {
+        return new Response(JSON.stringify({ error: 'unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname === '/items/42') {
+        dynamicRequest = {
+          url: url.toString(),
+          eventKind: new Headers(init.headers).get('x-event-kind'),
+          body: typeof init.body === 'string' ? init.body : null,
+        };
+        return new Response(JSON.stringify({ allowed: true, path: url.pathname }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
         });
       }
       return new Response(JSON.stringify({ allowed: true, path: url.pathname }), {
@@ -213,6 +309,99 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
       ?.data?.main?.[0]?.[0]?.json as Record<string, unknown> | undefined;
     expect(exactLimitExecution.status).toBe('success');
     expect((exactLimitItem?.body as string).length).toBe(1_048_576);
+
+    for (const [path, statusCode] of [
+      ['/not-found', 404],
+      ['/server-error', 503],
+    ] as const) {
+      const failedWorkflow = await createHttpWorkflow(`https://public.example${path}`);
+      const failedExecution = await service.executeWorkflow(failedWorkflow.id, {
+        throwOnError: false,
+      });
+      expect(failedExecution.status).toBe('error');
+      expect(failedExecution.data?.resultData?.error).toMatchObject({
+        code: 'WORKFLOW_HTTP_STATUS_ERROR',
+        context: {
+          method: 'GET',
+          url: `https://public.example${path}`,
+          statusCode,
+        },
+      });
+    }
+
+    const dynamicWorkflowId = `http-expression-${crypto.randomUUID()}`;
+    workflowIds.push(dynamicWorkflowId);
+    const dynamicWorkflow = await service.createWorkflow({
+      id: dynamicWorkflowId,
+      name: 'HTTP and Set expressions',
+      nodes: [
+        {
+          id: 'manual',
+          name: 'Manual Trigger',
+          type: 'workflows-nodes-base.manualTrigger',
+          typeVersion: 1,
+          position: [0, 0],
+          parameters: {},
+        },
+        {
+          id: 'http',
+          name: 'HTTP Request',
+          type: 'workflows-nodes-base.httpRequest',
+          typeVersion: 4.2,
+          position: [200, 0],
+          parameters: {
+            method: 'POST',
+            url: '=https://public.example/items/{{$json.itemId}}',
+            headers: { 'x-event-kind': '={{ $json.eventKind }}' },
+            jsonBody: {
+              message: '={{ $json.eventPayload.text }}',
+              eventPayload: '={{ $json.eventPayload }}',
+            },
+          },
+        },
+        {
+          id: 'set',
+          name: 'Set Result',
+          type: 'workflows-nodes-base.set',
+          typeVersion: 3.4,
+          position: [400, 0],
+          parameters: {
+            assignments: {
+              assignments: [
+                { name: 'responseAllowed', value: '={{ $json.body.allowed }}' },
+                { name: 'responsePath', value: '=path:{{$json.body.path}}' },
+              ],
+            },
+          },
+        },
+      ],
+      connections: {
+        'Manual Trigger': { main: [[{ node: 'HTTP Request', type: 'main', index: 0 }]] },
+        'HTTP Request': { main: [[{ node: 'Set Result', type: 'main', index: 0 }]] },
+      },
+    });
+    const dynamicExecution = await service.executeWorkflow(dynamicWorkflow.id, {
+      triggerData: {
+        itemId: 42,
+        eventKind: 'MESSAGE_RECEIVED',
+        eventPayload: { text: 'hello from chat' },
+      },
+    });
+    const dynamicOutput = dynamicExecution.data?.resultData?.runData?.['Set Result']?.[0]?.data
+      ?.main?.[0]?.[0]?.json as Record<string, unknown> | undefined;
+    expect(dynamicExecution.status).toBe('success');
+    expect(dynamicRequest).toEqual({
+      url: 'https://public.example/items/42',
+      eventKind: 'MESSAGE_RECEIVED',
+      body: JSON.stringify({
+        message: 'hello from chat',
+        eventPayload: { text: 'hello from chat' },
+      }),
+    });
+    expect(dynamicOutput).toMatchObject({
+      responseAllowed: true,
+      responsePath: 'path:/items/42',
+    });
   } finally {
     __setWorkflowHttpTransportForTests(runtime, undefined);
     await service.stop();

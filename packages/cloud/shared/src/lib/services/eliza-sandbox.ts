@@ -72,7 +72,12 @@ import {
   elizaProvisionAdvisoryLockSql,
 } from "./eliza-provision-lock";
 import { headscaleIntegration } from "./headscale-integration";
-import { applyManagedAgentInferenceEnvDefaults } from "./managed-eliza-config";
+import {
+  applyManagedAgentInferenceEnvDefaults,
+  hasCurrentManagedAgentApiToken,
+  MANAGED_AGENT_API_TOKEN_GENERATION,
+  rotateManagedAgentApiToken,
+} from "./managed-eliza-config";
 import { prepareManagedElizaEnvironment } from "./managed-eliza-env";
 import { JOB_TYPES } from "./provisioning-job-types";
 import { mergeRuntimeAgentSecretsFromEnv } from "./runtime-agent-secrets";
@@ -364,6 +369,8 @@ export interface BridgeRequest {
 }
 
 export interface WorkflowProxyRequestOptions {
+  /** Authenticated Cloud user; overwrites any caller-supplied principal header. */
+  principalId: string;
   /** Per-operation deadline selected by the authenticated Cloud boundary. */
   timeoutMs?: number;
   /** Untrusted inbound headers; only workflow protocol metadata is retained. */
@@ -484,6 +491,22 @@ function digestPinnedImageRef(imageRef: string, digest: string): string {
   const lastSlash = imageRef.lastIndexOf("/");
   const withoutTag = lastColon > lastSlash ? imageRef.slice(0, lastColon) : imageRef;
   return `${withoutTag}@${digest}`;
+}
+
+function environmentVarsEqual(left: unknown, right: unknown): boolean {
+  const asRecord = (value: unknown): Record<string, unknown> | null =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  const leftRecord = asRecord(left);
+  const rightRecord = asRecord(right);
+  if (!leftRecord || !rightRecord) return leftRecord === rightRecord;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every(
+    (key, index) => key === rightKeys[index] && leftRecord[key] === rightRecord[key],
+  );
 }
 
 function isDockerSandboxMetadata(value: unknown): value is DockerSandboxMetadata {
@@ -1589,6 +1612,79 @@ export class ElizaSandboxService {
     }
     rec = lock;
 
+    const lockedEnvironment = (rec.environment_vars as Record<string, string> | null) ?? {};
+    if (!hasCurrentManagedAgentApiToken(lockedEnvironment)) {
+      const hasPersistedContainerHandle = Boolean(
+        rec.sandbox_id ||
+          rec.container_name ||
+          rec.node_id ||
+          rec.bridge_url ||
+          rec.health_url ||
+          rec.bridge_port ||
+          rec.web_ui_port ||
+          rec.headscale_ip,
+      );
+      const retirementTarget = rec.sandbox_id?.trim() || rec.container_name?.trim();
+
+      // An unmarked provisioning row may point at a container that still runs
+      // with a credential previously exposed to the browser. Never adopt that
+      // handle: retire it before publishing the replacement token. A teardown
+      // failure remains retryable and cannot advance the row to `running`.
+      if (hasPersistedContainerHandle) {
+        if (!retirementTarget) {
+          return {
+            success: false,
+            retryable: true,
+            sandboxRecord: rec,
+            error: "Legacy provisioning container could not be identified for credential rotation",
+          };
+        }
+        try {
+          await (await this.getProvider()).stop(retirementTarget);
+        } catch (error) {
+          if (!this.isIgnorableSandboxStopError(error)) {
+            logger.error(
+              "[agent-sandbox] Legacy provisioning container teardown failed before credential rotation",
+              {
+                agentId: rec.id,
+                sandboxId: retirementTarget,
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+            return {
+              success: false,
+              retryable: true,
+              sandboxRecord: rec,
+              error: "Legacy provisioning container teardown failed before credential rotation",
+            };
+          }
+          logger.info(
+            "[agent-sandbox] Legacy provisioning container was already absent before credential rotation",
+            {
+              agentId: rec.id,
+              sandboxId: retirementTarget,
+            },
+          );
+        }
+      }
+
+      const rotated = await agentSandboxesRepository.rotateProvisioningCredential({
+        id: rec.id,
+        expectedUpdatedAt: rec.updated_at,
+        environmentVars: rotateManagedAgentApiToken(lockedEnvironment),
+        clearContainerHandle: hasPersistedContainerHandle,
+      });
+      if (!rotated) {
+        return {
+          success: false,
+          retryable: true,
+          sandboxRecord: await agentSandboxesRepository.findById(rec.id),
+          error: "Provisioning credential rotation lost the active row version",
+        };
+      }
+      rec = rotated;
+    }
+
     // 1. Database
     let dbUri = rec.database_uri;
     if (rec.database_status !== "ready" || !dbUri) {
@@ -1690,6 +1786,7 @@ export class ElizaSandboxService {
             agentId: rec.id,
             agentName: rec.agent_name ?? "CloudAgent",
             organizationId: rec.organization_id,
+            executionTier: rec.execution_tier,
             environmentVars: {
               ...callerEnv,
               ...dbEnv,
@@ -3986,9 +4083,9 @@ export class ElizaSandboxService {
     orgId: string,
     workflowPath: string,
     method: "GET" | "POST" | "PUT" | "DELETE",
-    body?: BodyInit | null,
-    query?: string,
-    options: WorkflowProxyRequestOptions = {},
+    body: BodyInit | null | undefined,
+    query: string | undefined,
+    options: WorkflowProxyRequestOptions,
   ): Promise<Response | null> {
     if (!ElizaSandboxService.ALLOWED_WORKFLOW_PATH_PATTERNS.some((re) => re.test(workflowPath))) {
       logger.warn("[agent-sandbox] Rejected workflow proxy: invalid path", {
@@ -4033,8 +4130,10 @@ export class ElizaSandboxService {
 
     const fullPath = `/api/workflow/${workflowPath}${sanitizedQuery ? `?${sanitizedQuery}` : ""}`;
     // Cloud credentials terminate before the tenant runtime. The container
-    // receives its own trusted token from fetchAgentApi plus only transport
-    // metadata needed for tracing, negotiation, and request idempotency.
+    // receives its own trusted token from fetchAgentApi, the boundary-resolved
+    // principal, and only transport metadata needed for tracing, negotiation,
+    // and request idempotency. The principal is assigned after the allowlist so
+    // a caller-controlled x-eliza-user-id can never survive this boundary.
     const headers = new Headers({ Accept: "application/json" });
     const inboundHeaders = new Headers(options.protocolHeaders);
     for (const [name, value] of inboundHeaders) {
@@ -4042,6 +4141,17 @@ export class ElizaSandboxService {
         headers.set(name, value);
       }
     }
+    const principalId = options.principalId.trim();
+    const environmentVars = (rec.environment_vars ?? {}) as Record<string, string>;
+    const principalToken = environmentVars.ELIZA_API_TOKEN?.trim();
+    if (!principalId || !principalToken) {
+      throw new Error("Workflow proxy requires an authenticated principal transport");
+    }
+    headers.set("x-eliza-user-id", principalId);
+    // The per-agent API token is never exposed to managed browsers. Reusing it
+    // on a separate proof header limits a compromised container to its own
+    // tenant instead of distributing the daemon's fleet-wide shared secret.
+    headers.set("x-eliza-principal-token", principalToken);
     if (method !== "GET" && method !== "DELETE" && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
@@ -5840,10 +5950,26 @@ export class ElizaSandboxService {
     const upgradeEnv = await decryptAgentEnvVars(
       (agent.environment_vars as Record<string, string>) ?? {},
     );
+    // The old token stays in the authoritative row while blue provisions and
+    // passes readiness. Only the atomic routing swap below publishes this fresh
+    // token, so every pre-cutover failure leaves the old container fully usable
+    // and every successful cutover invalidates credentials exposed by an older
+    // managed dashboard build.
+    const rotatedStoredEnvironment = rotateManagedAgentApiToken(
+      (agent.environment_vars as Record<string, string>) ?? {},
+    );
+    const rotatedApiToken = rotatedStoredEnvironment.ELIZA_API_TOKEN;
+    const rotatedUpgradeEnvironment = {
+      ...upgradeEnv,
+      ...applyManagedAgentInferenceEnvDefaults(upgradeEnv),
+      ELIZA_API_TOKEN: rotatedApiToken,
+      ELIZA_API_TOKEN_GENERATION: MANAGED_AGENT_API_TOKEN_GENERATION,
+    };
     const config = {
       agentId,
       agentName: agent.agent_name ?? "",
       organizationId: orgId,
+      executionTier: agent.execution_tier,
       // Re-apply the cloud-managed inference defaults on top of the stored env so
       // an agent provisioned BEFORE the embedding-dimension / model pins landed
       // heals on upgrade instead of freezing a stale config (e.g. 1536-d cloud
@@ -5853,10 +5979,7 @@ export class ElizaSandboxService {
       // ELIZA_AGENT_LOCAL_STATE, PGLITE_DATA_DIR, ELIZA_PLUGIN_SET, ...) — the
       // narrow helper deliberately avoids the full provision merge, which would
       // mint a new API key / strip DATABASE_URL / flip local-state on upgrade (#8434).
-      environmentVars: {
-        ...upgradeEnv,
-        ...applyManagedAgentInferenceEnvDefaults(upgradeEnv),
-      },
+      environmentVars: rotatedUpgradeEnvironment,
       dockerImage: digestPinnedImageRef(dockerImage, toDigest),
       excludeNodeId: oldNodeId,
       // Preserve the LIVE Headscale node during the overlap (#16565): the
@@ -5935,7 +6058,7 @@ export class ElizaSandboxService {
     }
 
     const runtimeHealth = await this.verifyUpgradeRuntimeHealth({
-      agent,
+      agent: { id: agent.id, environment_vars: rotatedUpgradeEnvironment },
       bridgeUrl: blueHandle.bridgeUrl,
     });
     if (!runtimeHealth.success) {
@@ -5990,6 +6113,10 @@ export class ElizaSandboxService {
           current.container_name !== oldContainerName ||
           current.sandbox_id !== oldSandboxId ||
           current.image_digest !== fromDigest ||
+          // Persisting the rotated token must not clobber an environment edit
+          // that landed while blue was booting. Abandoning blue is safe because
+          // the old row/token/routing have not changed yet.
+          !environmentVarsEqual(current.environment_vars, agent.environment_vars) ||
           // The docker_image leg of this CAS exists to catch one concurrent
           // COMPETING change: the agent being repointed at a custom image (a
           // DIFFERENT repo) while the blue provisioned — adopting the blue
@@ -6020,6 +6147,7 @@ export class ElizaSandboxService {
             image_digest = ${toDigest},
             previous_image_digest = ${fromDigest},
             previous_docker_image = ${current.docker_image || dockerImage},
+            environment_vars = ${JSON.stringify(rotatedStoredEnvironment)}::jsonb,
             error_message = NULL,
             last_heartbeat_at = NOW(),
             updated_at = NOW()
@@ -6188,6 +6316,7 @@ export class ElizaSandboxService {
       agentId,
       agentName: agent.agent_name ?? "",
       organizationId: orgId,
+      executionTier: agent.execution_tier,
       environmentVars: {
         ...rollbackEnv,
         ...applyManagedAgentInferenceEnvDefaults(rollbackEnv),

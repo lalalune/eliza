@@ -7,9 +7,11 @@ import {
   type IAgentRuntime,
   type Memory,
   resolveCanonicalOwnerId,
+  resolveCanonicalOwnerIdForMessage,
   type State,
   stringToUuid,
 } from '@elizaos/core';
+import { readAliasedEnv } from '@elizaos/shared';
 
 /**
  * Resolve the single local owner identity shared by app routes and client chat.
@@ -25,6 +27,37 @@ export function getLocalOwnerEntityId(runtime: IAgentRuntime): string {
 
   const agentName = runtime.character?.name?.trim() || 'Eliza';
   return stringToUuid(`${agentName}-admin-entity`);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Browser-originated Cloud messages carry a server-owned marker installed only
+ * after the edge principal proof succeeds. This keeps chat workflow ownership
+ * aligned with the authenticated workflow HTTP routes.
+ */
+export function getAttestedCloudWorkflowPrincipal(message: Memory): string | null {
+  if (readAliasedEnv('ELIZA_CLOUD_PROVISIONED') !== '1') return null;
+  const metadata = asRecord(message.content.metadata);
+  const attestation = asRecord(metadata?.elizaCloudPrincipal);
+  if (attestation?.attested !== true || typeof attestation.id !== 'string') return null;
+  const principalId = stringToUuid(attestation.id.trim());
+  return principalId === message.entityId ? principalId : null;
+}
+
+export async function resolveWorkflowOwnerEntityId(
+  runtime: IAgentRuntime,
+  message: Memory
+): Promise<string> {
+  return (
+    getAttestedCloudWorkflowPrincipal(message) ??
+    (await resolveCanonicalOwnerIdForMessage(runtime, message)) ??
+    getLocalOwnerEntityId(runtime)
+  );
 }
 
 export function buildConversationContext(message: Memory, state: State | undefined): string {

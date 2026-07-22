@@ -519,6 +519,11 @@ jobs:
           # unset, so they publish on every redeploy once ops adds them.
           ELIZA_VOICE_CATALOG_SIGNING_KEY_BASE64: ${{ secrets.ELIZA_VOICE_CATALOG_SIGNING_KEY_BASE64 }}
           ELIZA_VOICE_CATALOG_PUBLIC_KEY_BASE64: ${{ secrets.ELIZA_VOICE_CATALOG_PUBLIC_KEY_BASE64 }}
+          # ES256 pair used to mint and verify dedicated-agent browser
+          # sessions. Pairing fails closed before consuming its one-time code
+          # when either value is absent or the deployed pair is invalid.
+          JWT_SIGNING_PRIVATE_KEY: ${{ secrets.JWT_SIGNING_PRIVATE_KEY }}
+          JWT_SIGNING_PUBLIC_KEY: ${{ secrets.JWT_SIGNING_PUBLIC_KEY }}
           VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
           VAST_BASE_URL: ${{ secrets.VAST_BASE_URL }}
           DEPLOY_ENVIRONMENT: ${{ steps.env.outputs.deploy_environment }}
@@ -551,11 +556,29 @@ jobs:
           }
 
           is_truthy() {
-            case "${1,,}" in
-              1|true|yes|on) return 0 ;;
+            case "${1:-}" in
+              1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
               *) return 1 ;;
             esac
           }
+
+          missing_pairing_signing_secrets=()
+          for name in JWT_SIGNING_PRIVATE_KEY JWT_SIGNING_PUBLIC_KEY; do
+            if ! has_nonblank_value "${!name:-}"; then
+              missing_pairing_signing_secrets+=("$name")
+            fi
+          done
+          if [ "${#missing_pairing_signing_secrets[@]}" -gt 0 ]; then
+            echo "::error::Dedicated-agent pairing signing secrets are missing: ${missing_pairing_signing_secrets[*]}"
+            exit 1
+          fi
+          # Presence alone is not readiness: malformed or independently valid
+          # mismatched keys would publish successfully but burn pairing codes
+          # on sessions the edge cannot verify. The validator reads only env,
+          # derives the public key, and completes an ES256 sign/verify probe.
+          if ! node ../../scripts/cloud/validate-jwt-signing-keypair.mjs; then
+            exit 1
+          fi
 
           # Construct the staging fallback only when the source key is real.
           # Never publish the invalid-but-nonempty string "Bearer ".
@@ -690,6 +713,8 @@ jobs:
             DEEPGRAM_API_KEY \
             ELIZA_VOICE_CATALOG_SIGNING_KEY_BASE64 \
             ELIZA_VOICE_CATALOG_PUBLIC_KEY_BASE64 \
+            JWT_SIGNING_PRIVATE_KEY \
+            JWT_SIGNING_PUBLIC_KEY \
             VAST_API_KEY \
             VAST_BASE_URL \
             DEEPGRAM_API_KEY \

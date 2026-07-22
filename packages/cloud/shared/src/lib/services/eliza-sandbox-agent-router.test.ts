@@ -338,6 +338,7 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
             null,
             "limit=2&include=output&drop=ignored",
             {
+              principalId: "user-1",
               timeoutMs: 120_000,
               protocolHeaders: {
                 Accept: "application/vnd.eliza.workflow+json",
@@ -393,7 +394,8 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
     expect(requests[0]?.headers.get("x-request-id")).toBe("request-1");
     expect(requests[0]?.headers.get("cookie")).toBeNull();
     expect(requests[0]?.headers.get("x-eliza-organization-id")).toBeNull();
-    expect(requests[0]?.headers.get("x-eliza-user-id")).toBeNull();
+    expect(requests[0]?.headers.get("x-eliza-user-id")).toBe("user-1");
+    expect(requests[0]?.headers.get("x-eliza-principal-token")).toBe("agent-token");
     expect(requests[1]?.method).toBe("GET");
     expect(requests[2]?.method).toBe("POST");
     expect(requests[2]?.headers.get("accept")).toBe("application/json");
@@ -448,6 +450,9 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
               method,
               method === "POST" || method === "PUT" ? "{}" : null,
               "limit=5",
+              {
+                principalId: "user-1",
+              },
             );
             expect(response?.status).toBe(200);
           }
@@ -456,6 +461,11 @@ describe("ElizaSandboxService Worker agent-router fetch", () => {
             "org-1",
             "workflows/workflow-1/unknown",
             "GET",
+            undefined,
+            undefined,
+            {
+              principalId: "user-1",
+            },
           );
           expect(rejected?.status).toBe(400);
         },
