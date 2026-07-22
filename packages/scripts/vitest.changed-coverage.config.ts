@@ -32,6 +32,7 @@ function normalizeAliasEntries(alias: unknown): Alias[] {
 export function composeChangedCoverageConfig(
   packageConfig: ViteUserConfig,
   repoRoot: string,
+  selectedTests: string[],
 ): ViteUserConfig {
   const packageConditions = packageConfig.resolve?.conditions ?? [];
   return {
@@ -44,7 +45,55 @@ export function composeChangedCoverageConfig(
         ...buildHarnessSourceAliases(repoRoot),
       ],
     },
+    test: {
+      ...packageConfig.test,
+      // The runner passes exact, pre-classified unit-test paths on the CLI.
+      // Package include/exclude globs describe their full-suite lanes and can
+      // legitimately omit script or specialty tests that this lane selected.
+      // Exact includes keep those selected files runnable without widening the
+      // changed-file lane to any neighboring suite.
+      include: selectedTests,
+      exclude: [],
+      coverage: {
+        ...packageConfig.test?.coverage,
+        // Package configs often scope full-suite reports to `src/**`. The
+        // changed lane must instead report every module the exact selected
+        // tests execute, including package-owned script entrypoints.
+        include: undefined,
+      },
+    },
   };
+}
+
+function parseSelectedTests(
+  rawTests: string | undefined,
+  repoRoot: string,
+): string[] {
+  if (!rawTests) {
+    throw new Error("Changed coverage requires ELIZA_CHANGED_VITEST_TESTS");
+  }
+  const parsed: unknown = JSON.parse(rawTests);
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(
+      "ELIZA_CHANGED_VITEST_TESTS must be a non-empty JSON array",
+    );
+  }
+
+  return parsed.map((testPath) => {
+    if (typeof testPath !== "string" || testPath.length === 0) {
+      throw new Error("ELIZA_CHANGED_VITEST_TESTS entries must be file paths");
+    }
+    const absoluteTest = path.resolve(testPath);
+    const relativeTest = path.relative(repoRoot, absoluteTest);
+    if (
+      relativeTest === ".." ||
+      relativeTest.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeTest)
+    ) {
+      throw new Error(`Changed test escapes the repository: ${testPath}`);
+    }
+    return absoluteTest.split(path.sep).join("/");
+  });
 }
 
 export async function loadChangedCoverageConfig(
@@ -60,6 +109,10 @@ export async function loadChangedCoverageConfig(
   }
 
   const absoluteRoot = path.resolve(repoRoot);
+  const selectedTests = parseSelectedTests(
+    env.ELIZA_CHANGED_VITEST_TESTS,
+    absoluteRoot,
+  );
   const absoluteConfig = path.resolve(configPath);
   const relativeConfig = path.relative(absoluteRoot, absoluteConfig);
   if (
@@ -83,7 +136,11 @@ export async function loadChangedCoverageConfig(
   if (!loaded) {
     throw new Error(`Package Vitest config was not loaded: ${configPath}`);
   }
-  return composeChangedCoverageConfig(loaded.config, absoluteRoot);
+  return composeChangedCoverageConfig(
+    loaded.config,
+    absoluteRoot,
+    selectedTests,
+  );
 }
 
 export default defineConfig((configEnv) =>

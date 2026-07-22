@@ -5,6 +5,7 @@
  */
 import { Capacitor } from "@capacitor/core";
 import { runIosFullBunSmokeIfRequested } from "@elizaos/app-core";
+import { client } from "@elizaos/ui/api";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const iosBoot = vi.hoisted(() => ({
@@ -22,7 +23,9 @@ const iosBoot = vi.hoisted(() => ({
     | undefined,
   initializeAppLifecycle: vi.fn(),
   initializeNetworkListener: vi.fn(async () => undefined),
-  preferenceSet: vi.fn(async () => undefined),
+  preferenceSet: vi.fn(
+    async (_entry: { key: string; value: string }) => undefined,
+  ),
 }));
 
 iosBoot.createRoot.mockReturnValue({ render: iosBoot.render });
@@ -122,8 +125,58 @@ beforeEach(() => {
     "requestAnimationFrame",
     vi.fn(() => 1),
   );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ),
+  );
+  vi.stubGlobal(
+    "WebSocket",
+    class TestWebSocket extends EventTarget {
+      constructor(_url: string | URL) {
+        super();
+      }
+    },
+  );
+  vi.spyOn(client, "getBaseUrl").mockReturnValue("http://127.0.0.1:31338");
+  vi.spyOn(client, "repointBaseUrl").mockImplementation(() => undefined);
+  vi.spyOn(client, "getConnectionState").mockReturnValue({
+    state: "connected",
+    reconnectAttempt: 0,
+    maxReconnectAttempts: 10,
+    disconnectedAt: null,
+  });
+  window.localStorage.clear();
   window.localStorage.setItem("eliza:mobile-runtime-mode", "local");
-  document.body.innerHTML = '<div id="root"></div>';
+  window.localStorage.setItem(
+    "eliza:ios-onboarding-smoke:request",
+    JSON.stringify({ apiBase: "http://127.0.0.1:31338" }),
+  );
+  window.localStorage.setItem(
+    "elizaos:active-server",
+    JSON.stringify({
+      kind: "remote",
+      apiBase: "http://127.0.0.1:31338",
+    }),
+  );
+  document.body.innerHTML = [
+    '<div id="root"></div>',
+    '<div data-testid="home-launcher-surface" data-page="home"></div>',
+    '<textarea data-testid="chat-composer-textarea"></textarea>',
+  ].join("");
+  for (const element of document.querySelectorAll<HTMLElement>(
+    '[data-testid="home-launcher-surface"], [data-testid="chat-composer-textarea"]',
+  )) {
+    Object.defineProperty(element, "offsetParent", {
+      value: document.body,
+      configurable: true,
+    });
+  }
 });
 
 describe("renderer interactive iOS composition", () => {
@@ -183,6 +236,33 @@ describe("renderer interactive iOS composition", () => {
           value: expect.stringContaining('"phase":"handled"'),
         }),
       ),
+    );
+
+    await vi.waitFor(
+      () => {
+        const mixedContentResult = iosBoot.preferenceSet.mock.calls
+          .map(([entry]) => entry)
+          .filter(
+            (entry) => entry.key === "eliza:ios-mixed-content-smoke:result",
+          )
+          .at(-1);
+        expect(mixedContentResult).toBeDefined();
+        const result = JSON.parse(String(mixedContentResult?.value));
+        expect(result).toMatchObject({
+          ok: true,
+          phase: "complete",
+          expectedWebSocketUrl: "ws://127.0.0.1:31338/ws",
+          webSocketExpected: false,
+          webSocketConstructorCalls: [],
+          webSocketOpenCalls: [],
+          connectionState: { state: "connected" },
+          restHealth: { ok: true, status: 200 },
+        });
+      },
+      { timeout: 3_000 },
+    );
+    expect(client.repointBaseUrl).toHaveBeenCalledWith(
+      "http://127.0.0.1:31338",
     );
 
     expect(window.location.hash).toContain("aec-loop");

@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mergeLcovReports } from "../merge-lcov-reports.mjs";
 import {
+  buildChangedVitestInvocation,
   findNearestPackageDir,
   findNearestVitestConfig,
   groupChangedVitestTests,
@@ -79,6 +80,30 @@ describe("changed Vitest coverage grouping", () => {
         path.join(root, "packages/feature/src/nested/feature.test.ts"),
       ]),
     );
+  });
+
+  test("hands the exact CLI test inventory to the package config", () => {
+    const root = fixture();
+    const [group] = groupChangedVitestTests(root, [
+      "packages/feature/src/nested/feature.test.ts",
+    ]);
+    const invocation = buildChangedVitestInvocation(root, group, {
+      PATH: "/fixture/bin",
+    });
+
+    expect(invocation.command).toBe("bunx");
+    expect(invocation.args).toEqual(
+      expect.arrayContaining(["vitest", "run", ...group.tests]),
+    );
+    expect(invocation.options.cwd).toBe(group.packageDir);
+    expect(invocation.options.env).toMatchObject({
+      PATH: "/fixture/bin",
+      ELIZA_CHANGED_VITEST_CONFIG: group.configPath,
+      ELIZA_CHANGED_VITEST_REPO_ROOT: root,
+    });
+    expect(
+      JSON.parse(invocation.options.env.ELIZA_CHANGED_VITEST_TESTS),
+    ).toEqual(group.tests);
   });
 
   test("prefers vitest.harness.config.ts for *.harness.test.ts files", () => {
@@ -202,8 +227,16 @@ describe("changed Vitest coverage grouping", () => {
           alias: [packageAlias],
           conditions: ["browser"],
         },
+        test: {
+          include: ["src/**/*.test.ts"],
+          exclude: ["scripts/**/*.test.mjs"],
+          coverage: {
+            include: ["src/**/*.ts"],
+          },
+        },
       },
       repoRoot,
+      [path.join(repoRoot, "packages/app/scripts/smoke.test.mjs")],
     );
     const aliases = config.resolve?.alias;
     expect(Array.isArray(aliases)).toBe(true);
@@ -226,6 +259,11 @@ describe("changed Vitest coverage grouping", () => {
       replacement: path.join(repoRoot, "packages/shared/src/index.ts"),
     });
     expect(config.resolve?.conditions).toEqual(["browser", "eliza-source"]);
+    expect(config.test?.include).toEqual([
+      path.join(repoRoot, "packages/app/scripts/smoke.test.mjs"),
+    ]);
+    expect(config.test?.exclude).toEqual([]);
+    expect(config.test?.coverage?.include).toBeUndefined();
   });
 
   test("loads extensionless TypeScript config dependencies through Vite", async () => {
@@ -240,6 +278,9 @@ describe("changed Vitest coverage grouping", () => {
           "packages/agent/vitest.config.ts",
         ),
         ELIZA_CHANGED_VITEST_REPO_ROOT: repoRoot,
+        ELIZA_CHANGED_VITEST_TESTS: JSON.stringify([
+          path.join(repoRoot, "packages/agent/src/index.test.ts"),
+        ]),
       },
     );
 

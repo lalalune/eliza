@@ -129,6 +129,35 @@ describe("GitHub workspace provider repository boundary", () => {
     ).rejects.toThrow("Invalid GitHub repository format");
     expect(createClient).not.toHaveBeenCalled();
   });
+
+  it("uses the workspace credential for the injected repository request", async () => {
+    const request = vi.fn(async () => ({
+      data: { default_branch: "develop" },
+    }));
+    const createRequest = vi.fn(() => request);
+    const provider = createGitHubPatProvider({ createRequest });
+    const credential = {
+      id: "credential-1",
+      type: "pat" as const,
+      token: "workspace-token",
+      repo: "https://github.com/example/repo.git",
+      permissions: ["contents:read"],
+      expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+      provider: "github",
+    };
+
+    await expect(
+      provider.getDefaultBranch(
+        "https://github.com/example/repo.git",
+        credential,
+      ),
+    ).resolves.toBe("develop");
+    expect(createRequest).toHaveBeenCalledWith("workspace-token");
+    expect(request).toHaveBeenCalledWith("GET /repos/{owner}/{repo}", {
+      owner: "example",
+      repo: "repo",
+    });
+  });
 });
 
 describe("CodingWorkspaceService.createPR diff-review boundary", () => {

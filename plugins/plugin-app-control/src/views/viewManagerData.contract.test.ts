@@ -120,6 +120,22 @@ describe("fetchViewEntries contract (/api/views ViewRegistryEntry shape)", () =>
 		});
 	});
 
+	it("rejects whitespace-only required view identity fields", async () => {
+		for (const field of ["id", "label", "pluginName"] as const) {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () =>
+					jsonResponse({ views: [{ ...fullEntry, [field]: "   " }] }),
+				),
+			);
+			await expect(fetchViewEntries()).rejects.toMatchObject({
+				name: "ElizaError",
+				code: "VIEW_MANAGER_LIST_RESPONSE_INVALID",
+				context: { index: 0, field },
+			});
+		}
+	});
+
 	it("throws 'HTTP <status>' on a non-ok response", async () => {
 		vi.stubGlobal(
 			"fetch",
@@ -176,6 +192,7 @@ describe("collapseViewEntries", () => {
 		]);
 		expect(collapsed).toHaveLength(1);
 		expect(collapsed[0].label).toBe("Future Surface");
+		expect(collapsed[0].viewType).toBe("gui");
 		expect(collapsed[0].modalities).toEqual(["gui", "tui"]);
 	});
 

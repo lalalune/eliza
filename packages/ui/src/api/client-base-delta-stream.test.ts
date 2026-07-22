@@ -133,6 +133,13 @@ describe("delta-v2 chat stream client reducer", () => {
       vi.fn(),
     );
 
+    expect(request).toHaveBeenCalledWith(
+      "http://agent.example:31337/api/conversations/c/messages/stream",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer token" }),
+      }),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
     expect(parseRequestBody(request).streamProtocol).toBe("delta-v2");
   });
 

@@ -250,6 +250,67 @@ describe("hydrateInitialConversation — chat always has a chat (#1)", () => {
     expect(result).toBeNull();
   });
 
+  it("keeps the saved draft when every alternate conversation fails to load", async () => {
+    window.localStorage.setItem("eliza:chat:activeConversationId", "empty");
+    const emptyDraft = {
+      ...CONVERSATION,
+      id: "empty",
+      title: "New Chat",
+      roomId: "empty-room",
+      updatedAt: "2026-06-28T00:00:00.000Z",
+    };
+    const unavailableConversation = {
+      ...CONVERSATION,
+      id: "unavailable",
+      roomId: "unavailable-room",
+      updatedAt: "2026-06-27T00:00:00.000Z",
+    };
+    const blockOnlyConversation = {
+      ...CONVERSATION,
+      id: "block-only",
+      roomId: "block-only-room",
+      updatedAt: "2026-06-26T00:00:00.000Z",
+    };
+    const greeting = {
+      id: "greeting",
+      role: "assistant",
+      source: MESSAGE_SOURCE_AGENT_GREETING,
+      text: "Welcome back",
+      timestamp: 1,
+    };
+    const blockOnlyAssistant = {
+      id: "block-only-assistant",
+      role: "assistant",
+      text: "",
+      blocks: [{ type: "text", text: "Welcome back" }],
+      timestamp: 1,
+    };
+    const client = makeFakeClient({
+      listConversations: vi.fn(async () => ({
+        conversations: [
+          emptyDraft,
+          unavailableConversation,
+          blockOnlyConversation,
+        ],
+      })),
+      getConversationMessages: vi.fn(async (id: string) => {
+        if (id === "empty") return { messages: [greeting] };
+        if (id === "block-only") {
+          return { messages: [blockOnlyAssistant] };
+        }
+        throw new Error("conversation store unavailable");
+      }),
+    });
+    const { deps, setActiveConversationId, setConversationMessages } =
+      makeDeps(client);
+
+    const result = await hydrateInitialConversation(deps);
+
+    expect(setActiveConversationId).toHaveBeenCalledWith("empty");
+    expect(setConversationMessages).toHaveBeenCalledWith([greeting]);
+    expect(result).toBeNull();
+  });
+
   it("restores the MOST-RECENT real conversation even when the server list is not recency-sorted", async () => {
     window.localStorage.setItem("eliza:chat:activeConversationId", "empty");
     const olderReal = {

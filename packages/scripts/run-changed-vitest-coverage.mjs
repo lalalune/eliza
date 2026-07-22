@@ -171,44 +171,62 @@ export function normalizeLcovReport(repoRoot, baseDir, reportDir) {
   writeFileSync(lcovPath, normalized);
 }
 
+/**
+ * Builds the complete runner-to-config subprocess contract for one package
+ * group so the selected test inventory cannot diverge from the CLI paths.
+ */
+export function buildChangedVitestInvocation(
+  repoRoot,
+  group,
+  baseEnv = process.env,
+) {
+  return {
+    command: "bunx",
+    args: [
+      "vitest",
+      "run",
+      ...group.tests,
+      "--config",
+      CHANGED_COVERAGE_CONFIG,
+      "--coverage",
+      "--coverage.reporter=lcov",
+      // Package configs carry whole-suite global thresholds. This lane runs
+      // only changed files and applies its stricter changed-source floor in
+      // coverage-gate.awk after merging the per-package LCOV reports.
+      "--coverage.thresholds.lines=0",
+      "--coverage.thresholds.functions=0",
+      "--coverage.thresholds.statements=0",
+      "--coverage.thresholds.branches=0",
+      // Cross-package suites (the PGLite runtime harness) execute workspace
+      // sources OUTSIDE the package root via source aliases; without this
+      // flag that real execution is invisible to the changed-file gate.
+      "--coverage.allowExternal=true",
+      `--coverage.reportsDirectory=${group.reportDir}`,
+    ],
+    options: {
+      // Run from the owning package (not the config's directory): package
+      // scripts invoke nested configs from the package root, and relative
+      // `include` patterns resolve against the cwd.
+      cwd: group.packageDir,
+      env: {
+        ...baseEnv,
+        ELIZA_CHANGED_VITEST_CONFIG: group.configPath,
+        ELIZA_CHANGED_VITEST_REPO_ROOT: path.resolve(repoRoot),
+        ELIZA_CHANGED_VITEST_TESTS: JSON.stringify(group.tests),
+      },
+      stdio: "inherit",
+    },
+  };
+}
+
 export function runChangedVitestCoverage(repoRoot, testFiles) {
   const groups = groupChangedVitestTests(repoRoot, testFiles);
   for (const group of groups) {
+    const invocation = buildChangedVitestInvocation(repoRoot, group);
     const result = spawnSync(
-      "bunx",
-      [
-        "vitest",
-        "run",
-        ...group.tests,
-        "--config",
-        CHANGED_COVERAGE_CONFIG,
-        "--coverage",
-        "--coverage.reporter=lcov",
-        // Package configs carry whole-suite global thresholds. This lane runs
-        // only changed files and applies its stricter changed-source floor in
-        // coverage-gate.awk after merging the per-package LCOV reports.
-        "--coverage.thresholds.lines=0",
-        "--coverage.thresholds.functions=0",
-        "--coverage.thresholds.statements=0",
-        "--coverage.thresholds.branches=0",
-        // Cross-package suites (the PGLite runtime harness) execute workspace
-        // sources OUTSIDE the package root via source aliases; without this
-        // flag that real execution is invisible to the changed-file gate.
-        "--coverage.allowExternal=true",
-        `--coverage.reportsDirectory=${group.reportDir}`,
-      ],
-      {
-        // Run from the owning package (not the config's directory): package
-        // scripts invoke nested configs from the package root, and relative
-        // `include` patterns resolve against the cwd.
-        cwd: group.packageDir,
-        env: {
-          ...process.env,
-          ELIZA_CHANGED_VITEST_CONFIG: group.configPath,
-          ELIZA_CHANGED_VITEST_REPO_ROOT: path.resolve(repoRoot),
-        },
-        stdio: "inherit",
-      },
+      invocation.command,
+      invocation.args,
+      invocation.options,
     );
 
     if (result.error) throw result.error;

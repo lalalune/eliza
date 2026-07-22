@@ -24,6 +24,7 @@ import {
   selectCopyTargetNodeModules,
   shouldCopyPackageEntry,
   shouldCopyWorkspacePublishEntry,
+  shouldKeepPackageRelativePath,
   shouldSkipPackagedDependency,
 } from "./copy-runtime-node-modules";
 
@@ -671,5 +672,26 @@ describe("assertRequiredBundledPackagesLanded", () => {
         path.join(nodeModulesDir, "@elizaos", "plugin-sql", "package.json"),
       );
     }
+  });
+});
+
+describe("cross-platform runtime asset selection", () => {
+  it("selects ffprobe from the requested target instead of the build host", () => {
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/darwin/arm64/ffprobe",
+        "darwin",
+        "arm64",
+        "ffprobe-static",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux/x64/ffprobe",
+        "darwin",
+        "arm64",
+        "ffprobe-static",
+      ),
+    ).toBe(false);
   });
 });

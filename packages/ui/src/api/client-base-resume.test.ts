@@ -65,6 +65,13 @@ describe("ElizaClient 202 dedicated-agent resume handling", () => {
     await client.fetch("/api/status");
 
     expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(
+      "http://agent.example:2138/api/status",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer token" }),
+      }),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
   });
 
   it("throws a distinguishable agent_resuming error after the bounded retries", async () => {
