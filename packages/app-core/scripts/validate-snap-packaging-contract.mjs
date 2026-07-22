@@ -76,6 +76,9 @@ const AGGREGATE_STORE_CREDENTIALS_EXPRESSION =
   "$" + "{{ secrets.SNAP_STORE_CREDENTIALS }}";
 const MATRIX_RUNNER_EXPRESSION = "$" + "{{ matrix.runner }}";
 const MATRIX_ARCH_EXPRESSION = "$" + "{{ matrix.arch }}";
+const PR_HEAD_OR_TRIGGER_SHA_EXPRESSION =
+  "$" +
+  "{{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}";
 const SHELL_VERSION_EXPANSION = "$" + "{VERSION}";
 const SHELL_GRADE_EXPANSION = "$" + "{SNAP_GRADE}";
 
@@ -353,6 +356,7 @@ function validateSnapBuildJob(
     publish,
     allowedExtraSteps = [],
     expectedCheckoutRef,
+    expectedSourceRevision,
   },
 ) {
   if (expectedNeeds === undefined) {
@@ -461,7 +465,7 @@ function validateSnapBuildJob(
   } else {
     invariant(
       checkoutInputs.ref === expectedCheckoutRef,
-      `${label} checkout must use the requested release tag`,
+      `${label} checkout must use the expected source ref`,
     );
   }
 
@@ -606,6 +610,12 @@ function validateSnapBuildJob(
     provenanceEnv.SNAP_PATH === SNAP_OUTPUT_EXPRESSION,
     `${label} provenance must consume the built artifact output`,
   );
+  if (expectedSourceRevision !== undefined) {
+    invariant(
+      provenanceEnv.EXPECTED_SOURCE_REVISION === expectedSourceRevision,
+      `${label} provenance must receive the expected source revision`,
+    );
+  }
   const provenanceLines = activeScriptLines(
     provenance.run,
     `${label} provenance script`,
@@ -614,6 +624,17 @@ function validateSnapBuildJob(
     provenanceLines[0] === "set -euo pipefail",
     `${label} provenance must start fail closed`,
   );
+  if (expectedSourceRevision !== undefined) {
+    requireOrderedLines(
+      provenanceLines,
+      [
+        'SOURCE_REVISION="$(git rev-parse HEAD)"',
+        'test "$SOURCE_REVISION" = "$EXPECTED_SOURCE_REVISION"',
+        `printf 'source_revision=%s\\n' "$SOURCE_REVISION"`,
+      ],
+      `${label} source provenance`,
+    );
+  }
   for (const required of [
     "snap version",
     "snapcraft version",
@@ -815,6 +836,8 @@ export function validateSnapWorkflowSource(
     uploadStepName: "Upload snap artifact",
     uploadRetention: 30,
     attestationCondition: "github.event_name != 'pull_request'",
+    expectedCheckoutRef: PR_HEAD_OR_TRIGGER_SHA_EXPRESSION,
+    expectedSourceRevision: PR_HEAD_OR_TRIGGER_SHA_EXPRESSION,
     allowedExtraSteps: [
       "Free disk space on runner",
       "Normalize runner root ownership for snapd",
@@ -1204,6 +1227,25 @@ export function validateSnapManifestSource(
       pruneIndex >= 0 &&
       frozenInstallIndex < pruneIndex,
     "Snapcraft frozen install must run before the workspace is pruned",
+  );
+
+  const runtimeCopyIndex = activeLines.indexOf(
+    "node --import tsx packages/app-core/scripts/copy-runtime-node-modules.ts \\",
+  );
+  const runtimeTypesCleanupIndexes = activeLines
+    .map((line, index) =>
+      line === 'node "$RM_PATH_RECURSIVE" node_modules/@types' ? index : -1,
+    )
+    .filter((index) => index >= 0);
+  const finalBuildTypesCleanupIndex = activeLines.lastIndexOf(
+    'node "$RM_PATH_RECURSIVE" "$SNAP_BUILD_TYPES_DIR"',
+  );
+  invariant(
+    runtimeCopyIndex >= 0 &&
+      runtimeTypesCleanupIndexes.length === 1 &&
+      runtimeTypesCleanupIndexes[0] > runtimeCopyIndex &&
+      finalBuildTypesCleanupIndex > runtimeTypesCleanupIndexes[0],
+    "Snapcraft declaration inputs must remain available until the transitive runtime closure is materialized",
   );
 
   const forbiddenAcquisition = [

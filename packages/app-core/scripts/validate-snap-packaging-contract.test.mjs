@@ -85,6 +85,29 @@ describe("Snap build workflow contract", () => {
     );
   });
 
+  it("rejects a pull-request merge ref in place of the exact source head", () => {
+    const mutated = mutateYaml(workflowSource, (workflow) => {
+      jobStep(workflow, "build-snap", "Checkout").with.ref =
+        githubExpression("github.sha");
+    });
+    expect(() => validateSnapWorkflowSource(mutated)).toThrow(
+      /must use the expected source ref/,
+    );
+  });
+
+  it("rejects provenance that is not bound to the exact source head", () => {
+    const mutated = mutateYaml(workflowSource, (workflow) => {
+      delete jobStep(
+        workflow,
+        "build-snap",
+        "Record builder and base provenance",
+      ).env.EXPECTED_SOURCE_REVISION;
+    });
+    expect(() => validateSnapWorkflowSource(mutated)).toThrow(
+      /must receive the expected source revision/,
+    );
+  });
+
   it.each([
     ["job dependency", (job) => (job.needs = "optional")],
     ["job condition", (job) => (job.if = githubExpression("false"))],
@@ -447,6 +470,17 @@ describe("Snapcraft hermetic dependency contract", () => {
           '      if false; then\n        test -f bun.lock\n        LOCKFILE_SHA256="$(sha256sum bun.lock)"\n        bun install --frozen-lockfile --ignore-scripts\n        test "$(sha256sum bun.lock)" = "$LOCKFILE_SHA256"\n        test -x "$ROOT_NODE_MODULES_BIN/turbo"\n      fi',
         ),
       /must execute at top level/,
+    ],
+    [
+      "declaration inputs removed before transitive runtime materialization",
+      (source) =>
+        source
+          .replace('      node "$RM_PATH_RECURSIVE" node_modules/@types\n', "")
+          .replace(
+            "      # Install into snap\n",
+            '      node "$RM_PATH_RECURSIVE" node_modules/@types\n\n      # Install into snap\n',
+          ),
+      /declaration inputs must remain available/,
     ],
     [
       "reordered lock verification",

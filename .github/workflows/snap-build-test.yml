@@ -52,6 +52,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           # Skip submodules entirely. The snap build uses the committed lock
           # with `bun install --frozen-lockfile --ignore-scripts` and
           # `SKIP_NATIVE_PLUGINS=1`, so it never reads from any of the
@@ -152,11 +153,15 @@ jobs:
         env:
           SNAP_PATH: ${{ steps.snapcraft.outputs.snap }}
           EVIDENCE_DIR: snap-evidence/${{ matrix.arch }}
+          EXPECTED_SOURCE_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           test -f "$SNAP_PATH"
           mkdir -p "$EVIDENCE_DIR"
+          SOURCE_REVISION="$(git rev-parse HEAD)"
+          test "$SOURCE_REVISION" = "$EXPECTED_SOURCE_REVISION"
           {
+            printf 'source_revision=%s\n' "$SOURCE_REVISION"
             printf 'github_sha=%s\n' "$GITHUB_SHA"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
             printf 'runner_os=%s\n' "$RUNNER_OS"

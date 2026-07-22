@@ -1,14 +1,6 @@
 /**
- * Focused unit coverage for the pure decision helpers in
- * `copy-runtime-node-modules.ts`.
- *
- * The desktop runtime-copy script is what the electrobun tar-safe baseline fix
- * touches (adding `@smithers-orchestrator/aws` → CodeBuild/ECS/CloudWatch-Logs
- * to `PACKAGED_DEPENDENCY_SKIPS`). These tests exercise the platform-variant,
- * version-inference, dependency-walk, and candidate-selection helpers that
- * decide WHICH files/packages land in the packaged bundle. They pass explicit
- * `targetOS`/`targetArch` so the assertions are deterministic on any CI
- * runner, and use tmp fixtures for the manifest-reading helpers.
+ * Exercises runtime-copy decisions against real temporary manifests and filesystem trees.
+ * Explicit platform inputs keep native-variant assertions deterministic across CI runners.
  */
 
 import {
@@ -26,11 +18,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  assertRequiredBundledPackagesLanded,
   assertTarSafeRuntimePaths,
   copyPackageDir,
   expandWorkspacePattern,
   getRuntimeDependencies,
   getRuntimeDependencyEntries,
+  getWorkspacePackageRuntimeCopyEntries,
   inferVersionFromBunEntryPath,
   isExactVersionSpecifier,
   isPackageCompatibleWithCurrentPlatform,
@@ -40,14 +34,18 @@ import {
   patchCopiedElevenLabsTarSafePaths,
   readWorkspacePatterns,
   recursiveRemoveErrorDetail,
+  selectCopyTargetNodeModules,
   selectResolvedCandidate,
   shouldCopyPackageEntry,
+  shouldCopyWorkspacePublishEntry,
   shouldKeepPackageRelativePath,
   shouldSkipPackagedAppCoreEntry,
+  shouldSkipPackagedDependency,
   visitFiles,
 } from "./copy-runtime-node-modules";
 
 let tmpDir: string;
+const workspaceFixtureDirs: string[] = [];
 
 function writeManifest(
   name: string,
@@ -59,12 +57,30 @@ function writeManifest(
   return manifestPath;
 }
 
+function writeWorkspaceManifest(
+  name: string,
+  manifest: Record<string, unknown> = {},
+): string {
+  const dir = mkdtempSync(
+    path.join(process.cwd(), ".runtime-copy-workspace-cov-"),
+  );
+  workspaceFixtureDirs.push(dir);
+  writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name, ...manifest }, null, 2),
+  );
+  return dir;
+}
+
 beforeEach(() => {
   tmpDir = mkdtempSync(path.join(tmpdir(), "copy-runtime-cov-"));
 });
 
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
+  for (const dir of workspaceFixtureDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("matchesRuntimeVariant", () => {
@@ -833,5 +849,321 @@ describe("copyPackageDir", () => {
     );
     expect(existsSync(landedManifest)).toBe(true);
     expect(existsSync(landedEntry)).toBe(true);
+  });
+});
+
+describe("workspace publish surface", () => {
+  it("derives the runtime top-level entries from files and executable exports", () => {
+    const sourceDir = writeWorkspaceManifest("@elizaos/example-workspace", {
+      files: ["dist/**", "assets/icons", "!src/private", "*.md"],
+      main: "./server/index.js",
+      module: "./esm/index.js",
+      exports: {
+        ".": {
+          types: "./types/index.d.ts",
+          import: "./dist/index.js",
+          default: "./dist/index.js",
+          "eliza-source": "./src/index.ts",
+        },
+        "./feature": [
+          { types: "./types/feature.d.ts" },
+          { import: "./features/feature.js" },
+        ],
+      },
+    });
+
+    expect(
+      [
+        ...(getWorkspacePackageRuntimeCopyEntries(
+          "@elizaos/example-workspace",
+          sourceDir,
+        ) ?? []),
+      ].sort(),
+    ).toEqual(
+      [
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "README.md",
+        "assets",
+        "dist",
+        "esm",
+        "features",
+        "package.json",
+        "server",
+      ].sort(),
+    );
+  });
+
+  it("keeps the agent source condition because Bun may resolve it at runtime", () => {
+    const sourceDir = writeWorkspaceManifest("@elizaos/agent", {
+      files: ["dist"],
+    });
+    mkdirSync(path.join(sourceDir, "src"));
+
+    expect(
+      getWorkspacePackageRuntimeCopyEntries("@elizaos/agent", sourceDir),
+    ).toContain("src");
+  });
+
+  it("declines non-workspace or unbounded manifests", () => {
+    expect(
+      getWorkspacePackageRuntimeCopyEntries(
+        "@elizaos/outside",
+        mkdtempSync(path.join(tmpDir, "outside-")),
+      ),
+    ).toBeNull();
+
+    const missingManifest = mkdtempSync(
+      path.join(process.cwd(), ".runtime-copy-workspace-cov-"),
+    );
+    workspaceFixtureDirs.push(missingManifest);
+    expect(
+      getWorkspacePackageRuntimeCopyEntries(
+        "@elizaos/missing-manifest",
+        missingManifest,
+      ),
+    ).toBeNull();
+
+    const unbounded = writeWorkspaceManifest("@elizaos/unbounded", {
+      files: "dist",
+    });
+    expect(
+      getWorkspacePackageRuntimeCopyEntries("@elizaos/unbounded", unbounded),
+    ).toBeNull();
+  });
+
+  it("copies only the package root and allowed top-level publish entries", () => {
+    const sourceDir = writeWorkspaceManifest("@elizaos/example-workspace", {
+      files: ["dist"],
+    });
+    const allowed = new Set(["package.json", "dist"]);
+
+    expect(shouldCopyWorkspacePublishEntry(sourceDir, sourceDir, allowed)).toBe(
+      true,
+    );
+    expect(
+      shouldCopyWorkspacePublishEntry(
+        path.join(sourceDir, "dist", "index.js"),
+        sourceDir,
+        allowed,
+      ),
+    ).toBe(true);
+    expect(
+      shouldCopyWorkspacePublishEntry(
+        path.join(sourceDir, "src", "index.ts"),
+        sourceDir,
+        allowed,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("shouldSkipPackagedDependency", () => {
+  it("drops unused Smithers infrastructure clients from the packaged runtime", () => {
+    for (const dependency of [
+      "@aws-sdk/client-codebuild",
+      "@aws-sdk/client-ecs",
+      "@aws-sdk/client-cloudwatch-logs",
+    ]) {
+      expect(
+        shouldSkipPackagedDependency("@smithers-orchestrator/aws", dependency),
+      ).toBe(true);
+    }
+  });
+
+  it("keeps runtime dependencies that are not explicitly excluded", () => {
+    expect(
+      shouldSkipPackagedDependency(
+        "@smithers-orchestrator/aws",
+        "@aws-sdk/client-s3",
+      ),
+    ).toBe(false);
+    expect(shouldSkipPackagedDependency("example", "commander")).toBe(false);
+  });
+
+  it("rejects a native package for a different architecture", () => {
+    const foreignArch = process.arch === "x64" ? "arm64" : "x64";
+    expect(
+      shouldSkipPackagedDependency(
+        "example",
+        `@node-llama-cpp/${process.platform}-${foreignArch}`,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("selectCopyTargetNodeModules", () => {
+  function makeCopyLayout() {
+    const rootDestDir = mkdtempSync(path.join(tmpDir, "copy-layout-"));
+    const targetNodeModules = path.join(rootDestDir, "node_modules");
+    const requesterDestDir = path.join(
+      targetNodeModules,
+      "requester",
+      "node_modules",
+      "child",
+    );
+    mkdirSync(requesterDestDir, { recursive: true });
+    return { rootDestDir, targetNodeModules, requesterDestDir };
+  }
+
+  it("places root requests, new packages, and hoisted packages at the root", () => {
+    const { rootDestDir, targetNodeModules, requesterDestDir } =
+      makeCopyLayout();
+
+    expect(
+      selectCopyTargetNodeModules({
+        name: "example",
+        requesterDestDir: rootDestDir,
+        rootDestDir,
+        targetNodeModules,
+        topLevelVersions: new Map(),
+        resolvedVersion: "1.0.0",
+      }),
+    ).toBe(targetNodeModules);
+    expect(
+      selectCopyTargetNodeModules({
+        name: "new-package",
+        requesterDestDir,
+        rootDestDir,
+        targetNodeModules,
+        topLevelVersions: new Map(),
+        resolvedVersion: "1.0.0",
+      }),
+    ).toBe(targetNodeModules);
+    expect(
+      selectCopyTargetNodeModules({
+        name: "@elizaos/core",
+        requesterDestDir,
+        rootDestDir,
+        targetNodeModules,
+        topLevelVersions: new Map([["@elizaos/core", "2.0.0"]]),
+        resolvedVersion: "1.0.0",
+      }),
+    ).toBe(targetNodeModules);
+  });
+
+  it("reuses compatible top-level versions", () => {
+    const { rootDestDir, targetNodeModules, requesterDestDir } =
+      makeCopyLayout();
+
+    for (const [name, topLevelVersion, resolvedVersion] of [
+      ["ordinary", "1.2.3", "1.2.3"],
+      ["@walletconnect/core", "2.7.9", "2.7.1"],
+      ["@smithy/core", "3.4.2", "3.3.9"],
+    ] as const) {
+      expect(
+        selectCopyTargetNodeModules({
+          name,
+          requesterDestDir,
+          rootDestDir,
+          targetNodeModules,
+          topLevelVersions: new Map([[name, topLevelVersion]]),
+          resolvedVersion,
+        }),
+      ).toBe(targetNodeModules);
+    }
+  });
+
+  it("reuses an exact ancestor and otherwise nests an incompatible version", () => {
+    const { rootDestDir, targetNodeModules, requesterDestDir } =
+      makeCopyLayout();
+    const name = "versioned-package";
+    const ancestorNodeModules = path.join(
+      rootDestDir,
+      "node_modules",
+      "requester",
+      "node_modules",
+    );
+    const ancestorPackageDir = path.join(ancestorNodeModules, name);
+    mkdirSync(ancestorPackageDir, { recursive: true });
+    writeFileSync(
+      path.join(ancestorPackageDir, "package.json"),
+      JSON.stringify({ name, version: "2.0.0" }),
+    );
+
+    expect(
+      selectCopyTargetNodeModules({
+        name,
+        requesterDestDir,
+        rootDestDir,
+        targetNodeModules,
+        topLevelVersions: new Map([[name, "1.0.0"]]),
+        resolvedVersion: "2.0.0",
+      }),
+    ).toBe(ancestorNodeModules);
+
+    expect(
+      selectCopyTargetNodeModules({
+        name,
+        requesterDestDir,
+        rootDestDir,
+        targetNodeModules,
+        topLevelVersions: new Map([[name, "1.0.0"]]),
+        resolvedVersion: "3.0.0",
+      }),
+    ).toBe(path.join(requesterDestDir, "node_modules"));
+  });
+});
+
+describe("assertRequiredBundledPackagesLanded", () => {
+  function writeBundledPackage(
+    targetNodeModules: string,
+    name: string,
+    manifest: Record<string, unknown>,
+  ): string {
+    const packageDir = path.join(targetNodeModules, ...name.split("/"));
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name, ...manifest }),
+    );
+    return packageDir;
+  }
+
+  it("accepts present packages and executable manifest entrypoints", () => {
+    const targetNodeModules = path.join(tmpDir, "required-ok", "node_modules");
+    const packageDir = writeBundledPackage(targetNodeModules, "@elizaos/core", {
+      main: "./dist/index.js",
+      exports: {
+        ".": {
+          types: "./dist/index.d.ts",
+          import: "./dist/index.js",
+        },
+      },
+    });
+    mkdirSync(path.join(packageDir, "dist"), { recursive: true });
+    writeFileSync(path.join(packageDir, "dist", "index.js"), "export {};\n");
+    writeBundledPackage(targetNodeModules, "custom-runtime", {});
+
+    expect(() =>
+      assertRequiredBundledPackagesLanded(
+        targetNodeModules,
+        new Set(["@elizaos/core", "custom-runtime"]),
+      ),
+    ).not.toThrow();
+  });
+
+  it("reports both missing packages and missing baseline entrypoints", () => {
+    const targetNodeModules = path.join(
+      tmpDir,
+      "required-fail",
+      "node_modules",
+    );
+    writeBundledPackage(targetNodeModules, "@elizaos/core", {
+      exports: {
+        ".": {
+          types: "./dist/index.d.ts",
+          import: "./dist/index.js",
+        },
+      },
+    });
+
+    expect(() =>
+      assertRequiredBundledPackagesLanded(
+        targetNodeModules,
+        new Set(["@elizaos/core", "missing-runtime"]),
+      ),
+    ).toThrowError(/2 required runtime package check\(s\) failed/);
   });
 });
