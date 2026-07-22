@@ -105,8 +105,10 @@ import { getPermissionManager } from "./native/permissions";
 import { getRemotePluginHost } from "./native/remote-plugin-host";
 import { checkWebGpuSupport } from "./native/webgpu-browser-support";
 import {
+  configureNativeComposerHost,
   enqueueNativeComposerOperations,
   nativeComposerOperationsFromDeepLink,
+  sanitizeNativeComposerDeepLink,
 } from "./native-composer-host";
 import { getPersistedDeployment } from "./persisted-deployment";
 import { printElectrobunDevSettingsBanner } from "./print-electrobun-dev-settings-banner";
@@ -2319,8 +2321,22 @@ async function forwardDeepLinkToRenderer(url: string): Promise<void> {
   // Assistant/Siri/Shortcuts links deliberately stay renderer-owned. LifeOps
   // requests must go through the normal chat/runtime planner, which persists
   // ScheduledTask records instead of creating native macOS-only state.
+  let rendererUrl: string;
   try {
-    const operations = nativeComposerOperationsFromDeepLink(url);
+    rendererUrl = sanitizeNativeComposerDeepLink(url, BRAND.urlScheme);
+  } catch (error) {
+    // error-policy:J3 malformed or oversized custom-scheme input is rejected
+    // at the native trust boundary and is never forwarded into web code.
+    logger.warn(
+      `[NativeComposer] Rejected unsafe deep link: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return;
+  }
+  try {
+    const operations = nativeComposerOperationsFromDeepLink(
+      rendererUrl,
+      BRAND.urlScheme,
+    );
     if (operations.length > 0) {
       sendToActiveRenderer(
         "nativeComposerOperationStream",
@@ -2328,14 +2344,14 @@ async function forwardDeepLinkToRenderer(url: string): Promise<void> {
       );
     }
   } catch (error) {
-    // error-policy:J4 the renderer still receives the original deep link and
-    // renders its existing reviewable fallback; the native byte handoff is
-    // visibly unavailable and logged instead of silently dropping a file.
+    // error-policy:J4 the renderer still receives the sanitized text-only URL
+    // and renders its existing reviewable fallback; durable handoff failure is
+    // logged instead of fabricating a queued operation.
     logger.warn(
-      `[NativeComposer] Could not materialize deep-link attachment: ${error instanceof Error ? error.message : String(error)}`,
+      `[NativeComposer] Could not persist deep-link operations: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  sendToActiveRenderer("shareTargetReceived", { url });
+  sendToActiveRenderer("shareTargetReceived", { url: rendererUrl });
 }
 
 function setupDeepLinks(): void {
@@ -2498,6 +2514,7 @@ async function main(): Promise<void> {
     bundle_path: resolveStartupBundlePath(process.execPath),
   });
   await loadTheAppEnvFilesForMain();
+  configureNativeComposerHost({ userDataDir: Utils.paths.userData });
   recordStartupPhase("env_loaded", {
     pid: process.pid,
   });
