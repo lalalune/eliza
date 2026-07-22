@@ -114,6 +114,16 @@ export const GUARDED_REAL_LIVE_SUITES = [
       "vision-qa CLI backend driving a real claude/codex CLI (ELIZA_VISION_QA_CLI selects); spends operator CLI tokens",
   },
   {
+    file: "packages/feed/packages/engine/src/__tests__/integration/npc-voice-diversity.live.test.ts",
+    optIn: "RUN_LIVE_LLM_TESTS",
+    anyOf: [["GROQ_API_KEY"], ["OPENAI_API_KEY"]],
+    guardVia: [
+      "packages/feed/packages/testing/integration/helpers/live-runtime.ts",
+    ],
+    notes:
+      "manual Feed live-model suite; the root workspace live sweep excludes the Feed subtree",
+  },
+  {
     file: "plugins/plugin-agent-orchestrator/__tests__/live/native-acp-smoke.live.test.ts",
     optIn: "RUN_LIVE_NATIVE_ACP",
   },

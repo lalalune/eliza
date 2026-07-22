@@ -27,6 +27,31 @@ test("every changed Bun suite gets a fresh process for module-mock isolation", (
   expect(workflow).not.toContain("process_isolated_tests");
 });
 
+test("changed Bun coverage requires complete per-file JUnit execution", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  expect(workflow).toContain(
+    '--reporter=junit --reporter-outfile="$junit_report"',
+  );
+  expect(workflow).toContain(
+    `node packages/scripts/validate-bun-test-results.mjs "\${changed_tests[$index]}" "$junit_report"`,
+  );
+  expect(workflow).toContain('rm -f "$junit_report"');
+});
+
+test("changed nonstandard guarded tests fail instead of disappearing", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  expect(workflow).toContain(
+    "- name: Reject changed nonstandard guarded tests",
+  );
+  expect(workflow).toContain("if: steps.changed.outputs.guarded_tests != ''");
+  expect(workflow).toContain(
+    `printf '%s\\n' "\${{ steps.changed.outputs.guarded_tests }}"`,
+  );
+  expect(workflow).toContain(
+    "Rename each suite to a canonical *.live.test.*, *.real.test.*, or *.e2e.test.* path",
+  );
+});
+
 test("changed Vitest coverage tests use package-aware source configuration", () => {
   const workflow = readFileSync(workflowPath, "utf8");
   expect(workflow).toMatch(
@@ -55,6 +80,7 @@ test("changed Vitest coverage tests use package-aware source configuration", () 
   );
   expect(runner).toContain("validateChangedTestResults(");
   expect(runner).toContain("Changed test file executed no passing tests");
+  expect(runner).toContain("did not pass every discovered test");
 });
 
 test("cloud/shared coverage resolves the real plugin-sql node source before builds", async () => {

@@ -115,7 +115,7 @@ describe("real/live guarded-suite manifest (#9310 §E)", () => {
       drift.stale,
       "listed in GUARDED_REAL_LIVE_SUITES but no longer guarded on disk — remove the stale entry",
     ).toEqual([]);
-  });
+  }, 30_000);
 
   test("channel topic context has an invocable credentialed live proof", () => {
     expect(
@@ -140,6 +140,23 @@ describe("real/live guarded-suite manifest (#9310 §E)", () => {
     ).toMatchObject({
       optIn: "ELIZA_LIVE_TEST",
       requires: ["ANTHROPIC_API_KEY"],
+    });
+  });
+
+  test("Feed NPC voice generation has an explicit live-model contract", () => {
+    expect(
+      manifest.find(
+        (entry) =>
+          entry.file ===
+          "packages/feed/packages/engine/src/__tests__/integration/npc-voice-diversity.live.test.ts",
+      ),
+    ).toMatchObject({
+      optIn: "RUN_LIVE_LLM_TESTS",
+      anyOf: [["GROQ_API_KEY"], ["OPENAI_API_KEY"]],
+      guardVia: [
+        "packages/feed/packages/testing/integration/helpers/live-runtime.ts",
+      ],
+      notes: expect.stringContaining("manual Feed live-model suite"),
     });
   });
 

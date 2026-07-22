@@ -12,9 +12,10 @@
 # `BASE..HEAD` diff would count develop-side files the branch never touched as
 # "changed" whenever the branch trails develop, dragging unrelated tests into the
 # gate (issue #15845). Test files are bucketed into a Bun-native lane and a
-# Vitest lane by which runner they import; e2e/live suites and Android specs are
-# excluded by both filename and directory so a `test/e2e/` path cannot slip into
-# the fast unit lane.
+# Vitest lane by which runner they import. Nonstandard guarded tests are emitted
+# separately so the workflow fails explicitly instead of treating a path
+# allowlist as proof that another lane ran them; canonical e2e/live suites and
+# Android specs remain outside this fast unit lane.
 set -euo pipefail
 
 BASE=$1
@@ -37,13 +38,17 @@ if [ -z "$MERGE_BASE" ]; then
   exit 1
 fi
 
-# Excluded from both unit lanes: e2e/live suites (by filename *and* by a
-# `test/e2e/` directory segment) and Android specs. These run in dedicated lanes
-# and pull in heavy harnesses that the changed-file coverage gate must not.
+# Historical guarded names cannot silently disappear from the unit lanes. The
+# workflow rejects changed entries until they use a canonical suffix and have a
+# real owning lane.
+is_guarded_test() {
+  grep -Fxq "$1" "$NONSTANDARD_LIVE_TEST_MANIFEST"
+}
+
+# Excluded from both unit lanes: canonical e2e/live suites (by filename and by
+# a `test/e2e/` directory segment) and Android specs. These run in dedicated
+# lanes and pull in heavy harnesses that the changed-file coverage gate must not.
 is_excluded_test() {
-  if grep -Fxq "$1" "$NONSTANDARD_LIVE_TEST_MANIFEST"; then
-    return 0
-  fi
   case "$1" in
     *.e2e.test.*|*.live.test.*|*.real.test.*|*.real.e2e.test.*|packages/app/test/android/*.android.spec.*) return 0 ;;
     packages/test/cloud-e2e/tests/*.spec.*) return 0 ;;
@@ -95,6 +100,16 @@ changed_node_self_tests() {
       done
 }
 
+changed_guarded_tests() {
+  changed_tests | while IFS= read -r file; do
+    # Keep deleted/renamed entries visible: a stale manifest entry is still a
+    # guarded-test contract change and must fail rather than vanish behind -f.
+    if is_guarded_test "$file"; then
+      echo "$file"
+    fi
+  done
+}
+
 echo 'files<<EOF'
 changed_source
 echo 'EOF'
@@ -107,9 +122,14 @@ echo 'node_tests<<EOF'
 changed_node_self_tests
 echo 'EOF'
 
+echo 'guarded_tests<<EOF'
+changed_guarded_tests
+echo 'EOF'
+
 echo 'bun_tests<<EOF'
 changed_tests | while IFS= read -r file; do
   [ -f "$file" ] || continue
+  is_guarded_test "$file" && continue
   is_excluded_test "$file" && continue
   if grep -Eq "from ['\"]vitest['\"]|require\\(['\"]vitest['\"]\\)" "$file"; then
     continue
@@ -124,6 +144,7 @@ echo 'EOF'
 echo 'vitest_tests<<EOF'
 changed_tests | while IFS= read -r file; do
   [ -f "$file" ] || continue
+  is_guarded_test "$file" && continue
   is_excluded_test "$file" && continue
   if grep -Eq "from ['\"]@?playwright/test['\"]|require\\(['\"]@?playwright/test['\"]\\)" "$file"; then
     continue

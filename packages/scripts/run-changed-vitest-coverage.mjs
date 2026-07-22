@@ -423,6 +423,12 @@ export function validateChangedTestResults(
         `Changed test file executed no passing tests: ${displayPath}`,
       );
     }
+    const nonPassing = fileStatuses.filter((status) => status !== "passed");
+    if (nonPassing.length > 0) {
+      throw new Error(
+        `Changed test file did not pass every discovered test (${nonPassing.join(", ")}): ${displayPath}`,
+      );
+    }
   }
 }
 
