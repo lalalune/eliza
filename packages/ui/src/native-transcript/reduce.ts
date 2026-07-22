@@ -176,15 +176,18 @@ export function applyTranscriptEvent(
       ) {
         break;
       }
-      upsert(key, (previous) => ({
-        kind: "agent",
-        id: event.messageId,
-        status: event.final ? "final" : "streaming",
-        text: event.text,
-        turnId:
+      upsert(key, (previous) => {
+        const turnId =
           event.turnId ??
-          (previous && previous.kind === "agent" ? previous.turnId : undefined),
-      }));
+          (previous && previous.kind === "agent" ? previous.turnId : undefined);
+        return {
+          kind: "agent",
+          id: event.messageId,
+          status: event.final ? "final" : "streaming",
+          text: event.text,
+          ...(turnId === undefined ? {} : { turnId }),
+        };
+      });
       break;
     }
 
@@ -199,23 +202,27 @@ export function applyTranscriptEvent(
       ) {
         break;
       }
-      upsert(key, (previous) => ({
-        kind: "tool",
-        id: event.callId,
-        status:
-          event.phase === "started"
-            ? "running"
-            : event.phase === "succeeded"
-              ? "succeeded"
-              : "failed",
-        name: event.name,
-        detail:
+      upsert(key, (previous) => {
+        const detail =
           event.detail ??
-          (previous && previous.kind === "tool" ? previous.detail : undefined),
-        turnId:
+          (previous && previous.kind === "tool" ? previous.detail : undefined);
+        const turnId =
           event.turnId ??
-          (previous && previous.kind === "tool" ? previous.turnId : undefined),
-      }));
+          (previous && previous.kind === "tool" ? previous.turnId : undefined);
+        return {
+          kind: "tool",
+          id: event.callId,
+          status:
+            event.phase === "started"
+              ? "running"
+              : event.phase === "succeeded"
+                ? "succeeded"
+                : "failed",
+          name: event.name,
+          ...(detail === undefined ? {} : { detail }),
+          ...(turnId === undefined ? {} : { turnId }),
+        };
+      });
       break;
     }
 
