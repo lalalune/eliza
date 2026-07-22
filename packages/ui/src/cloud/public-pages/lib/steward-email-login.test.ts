@@ -119,7 +119,37 @@ describe("steward email sign-in adapter", () => {
     );
   });
 
-  it("rejects a successful response that does not satisfy the auth contract", async () => {
+  it("returns a validated MFA challenge", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        data: {
+          ok: true,
+          mfaRequired: true,
+          mfa: {
+            type: "totp",
+            challengeId: "challenge-1",
+            expiresAt: "2026-07-17T12:10:00.000Z",
+          },
+          user: { id: "user-1", email: "person@example.com" },
+        },
+      }),
+    );
+
+    await expect(
+      verifyStewardEmailSignInCode(
+        { baseUrl: "/steward", tenantId: "elizacloud", fetchImpl },
+        "person@example.com",
+        "123456",
+      ),
+    ).resolves.toMatchObject({
+      ok: true,
+      mfaRequired: true,
+      mfa: { type: "totp", challengeId: "challenge-1" },
+    });
+  });
+
+  it("fails closed on a partial session response", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(
       jsonResponse({
         ok: true,
@@ -135,41 +165,23 @@ describe("steward email sign-in adapter", () => {
       ),
     ).rejects.toMatchObject({
       status: 502,
-      message: "Steward email sign-in response was malformed.",
+      message: "Steward email code verification response was malformed.",
     });
   });
 
-  it("normalizes a nested MFA challenge after the response envelope is unwrapped", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      jsonResponse({
-        ok: true,
-        data: {
-          mfaRequired: true,
-          mfa: {
-            type: "totp",
-            challengeId: "mfa-1",
-            expiresAt: "2026-07-21T22:00:00.000Z",
-          },
-          user: { id: "user-1", email: "person@example.com" },
-        },
-      }),
-    );
+  it("fails closed when a successful response is not JSON", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response("upstream proxy error", { status: 200 }));
 
     await expect(
-      verifyStewardEmailSignInCode(
+      startStewardEmailLogin(
         { baseUrl: "/steward", tenantId: "elizacloud", fetchImpl },
         "person@example.com",
-        "123456",
       ),
-    ).resolves.toEqual({
-      ok: true,
-      mfaRequired: true,
-      mfa: {
-        type: "totp",
-        challengeId: "mfa-1",
-        expiresAt: "2026-07-21T22:00:00.000Z",
-      },
-      user: { id: "user-1", email: "person@example.com" },
+    ).rejects.toMatchObject({
+      status: 502,
+      message: "Steward email sign-in response was malformed.",
     });
   });
 
