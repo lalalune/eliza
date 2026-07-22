@@ -195,7 +195,7 @@ export function ElizaWalletSection({ agentId }: ElizaWalletSectionProps) {
         </div>
         <button
           type="button"
-          className="min-h-touch shrink-0 px-3 text-xs font-medium text-destructive underline-offset-4 hover:underline"
+          className="min-h-touch shrink-0 px-3 text-xs font-medium text-destructive underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => {
             setLoading(true);
             void fetchData();
