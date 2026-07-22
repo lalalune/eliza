@@ -268,6 +268,29 @@ describe("applyCanonicalFileBootToConfig", () => {
     expect(out.agents?.list?.[0].default).toBe(true);
     expect(out.agents?.list?.[0].system).toContain("SYNTHETIC SOUL");
   });
+
+  it("creates the agents config when the optional section is absent", () => {
+    const manifestPath = "/cfg/m.json";
+    const fs = fakeFs({
+      "/ws/SOUL.md": "SYNTHETIC SOUL",
+      [manifestPath]: JSON.stringify({
+        root: "/ws",
+        files: [{ label: "SOUL.md", path: "SOUL.md", required: true }],
+      }),
+    });
+
+    const out = applyCanonicalFileBootToConfig(
+      {},
+      { [CANONICAL_BOOT_MANIFEST_ENV]: manifestPath },
+      { fs, log: false },
+    );
+
+    expect(out.agents?.list?.[0]).toMatchObject({
+      id: "main",
+      default: true,
+      system: expect.stringContaining("SYNTHETIC SOUL"),
+    });
+  });
 });
 
 describe("real-disk round trip (synthetic tmpdir fixtures + canary reboot)", () => {
