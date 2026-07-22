@@ -320,8 +320,13 @@ describe("send", () => {
     expect(state.sending?.draft.text).toBe("hi");
     expect(state.draft.text).toBe("hi again");
     const resolved = resolveSend(state, "s", {
-      ok: true,
-      messageId: "m1",
+      status: "accepted",
+      receipt: {
+        conversationId: "conversation-1",
+        clientMessageId: "s",
+        userMessageId: "m1",
+      },
+      completed: true,
     });
     expect(resolved.draft.text).toBe("hi again");
   });
@@ -342,15 +347,26 @@ describe("send", () => {
 
   it("resolveSend success clears the draft; failure keeps it", () => {
     const { state } = run([seed, { type: "send", opId: "s" }]);
-    const ok = resolveSend(state, "s", { ok: true, messageId: "m1" });
+    const ok = resolveSend(state, "s", {
+      status: "accepted",
+      receipt: {
+        conversationId: "conversation-1",
+        clientMessageId: "s",
+        userMessageId: "m1",
+      },
+      completed: true,
+    });
     expect(ok.draft.text).toBe("");
     expect(ok.sending).toBeNull();
 
     const { state: state2 } = run([seed, { type: "send", opId: "s" }]);
     const fail = resolveSend(state2, "s", {
-      ok: false,
-      reason: "invalid-input",
+      status: "failed",
+      conversationId: "conversation-1",
+      clientMessageId: "s",
+      reason: "validation",
       message: "x",
+      retryable: false,
     });
     expect(fail.draft.text).toBe("hi");
     expect(fail.sending).toBeNull();
@@ -369,11 +385,22 @@ describe("cancellation", () => {
   });
 
   it("cancel scope=draft clears the body but keeps focus", () => {
-    const { state } = run([
-      { type: "focus.set", opId: "f", focused: true, keyboard: "shown" },
+    let state = initialComposerState();
+    state = {
+      ...state,
+      draft: {
+        ...state.draft,
+        focused: true,
+        keyboard: "shown",
+        revision: 1,
+      },
+    };
+    for (const operation of [
       { type: "text.set", opId: "t", text: "hi" },
       { type: "cancel", opId: "c", scope: "draft" },
-    ]);
+    ] as const) {
+      state = applyComposerOperation(state, operation, ctx).state;
+    }
     expect(state.draft.text).toBe("");
     expect(state.draft.focused).toBe(true);
     expect(state.draft.keyboard).toBe("shown");
@@ -435,18 +462,24 @@ describe("voice handoff + focus", () => {
       expect(results[0].reason).toBe("permission-denied");
   });
 
-  it("focus.set updates focus + keyboard", () => {
-    const { state } = run([
+  it("focus.set records requests without fabricating observed state", () => {
+    const { state, results } = run([
       { type: "focus.set", opId: "f1", focused: true },
       { type: "focus.set", opId: "f2", focused: false },
+    ]);
+    expect(results.map((result) => result.status)).toEqual([
+      "applied",
+      "applied",
     ]);
     expect(state.draft.focused).toBe(false);
     expect(state.draft.keyboard).toBe("hidden");
   });
 
-  it("focus.set defaults to shown while focused", () => {
-    const { state } = run([{ type: "focus.set", opId: "f", focused: true }]);
-    expect(state.draft.focused).toBe(true);
-    expect(state.draft.keyboard).toBe("shown");
+  it("does not echo the requested keyboard visibility", () => {
+    const { state } = run([
+      { type: "focus.set", opId: "f", focused: true, keyboard: "shown" },
+    ]);
+    expect(state.draft.focused).toBe(false);
+    expect(state.draft.keyboard).toBe("hidden");
   });
 });

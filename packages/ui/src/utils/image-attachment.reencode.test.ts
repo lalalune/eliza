@@ -75,6 +75,7 @@ describe("filesToImageAttachments — client-side re-encode to the server cap", 
     expect(attachment.mimeType).toBe("image/jpeg");
     expect(attachment.data).toBe(SMALL_JPEG_DATA);
     expect(attachment.name).toBe("photo.heic");
+    expect(attachment.clientAttachmentId).toMatch(/^attachment-/);
   });
 
   it("downscales an allowlisted JPEG whose base64 payload is over the server cap", async () => {

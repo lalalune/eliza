@@ -61,6 +61,7 @@ import type { TranslateFn } from "../../types";
 import {
   buildDroppedAttachmentNotice,
   CHAT_UPLOAD_ACCEPT,
+  chatAttachmentClientIdentity,
   chatUploadKind,
   intakeAttachmentFiles,
   MAX_CHAT_IMAGES,
@@ -916,8 +917,8 @@ export function ChatView({
       ) : null}
       <ChatAttachmentStrip
         variant={variant}
-        items={chatPendingImages.map((img, imgIdx) => ({
-          id: String(imgIdx),
+        items={chatPendingImages.map((img) => ({
+          id: chatAttachmentClientIdentity(img),
           alt: img.name,
           name: img.name,
           src: `data:${img.mimeType};base64,${img.data}`,
@@ -929,7 +930,12 @@ export function ChatView({
             name: item.name,
           })
         }
-        onRemove={(id) => removeImage(Number(id))}
+        onRemove={(id) => {
+          const index = chatPendingImages.findIndex(
+            (image) => chatAttachmentClientIdentity(image) === id,
+          );
+          if (index >= 0) removeImage(index);
+        }}
       />
       {voiceLatency ? (
         <div

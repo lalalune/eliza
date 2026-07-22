@@ -30,6 +30,7 @@ import {
   NATIVE_COMPOSER_SCHEMA,
   type NativeComposerSchema,
   type SendOutcome,
+  type VoiceHandoffPhase,
 } from "./contract";
 import {
   decodeComposerOperation,
@@ -78,6 +79,12 @@ export interface ComposerBridgeClient {
   completeSend(opId: string, outcome: SendOutcome): void;
   /** Toggle transport liveness; going online flushes the deferred send queue. */
   setOnline(online: boolean): void;
+  /** Reconcile the reducer with the real UI composer after manual edits. */
+  reconcileDraft(draft: Omit<ComposerDraft, "revision">): void;
+  /** Publish focus only after the real textarea/keyboard observer sees it. */
+  observeFocus(focused: boolean, keyboard: ComposerDraft["keyboard"]): void;
+  /** Publish voice phases only after the shell UI observes the transition. */
+  observeVoice(phase: VoiceHandoffPhase): void;
   getDraft(): ComposerDraft;
   getState(): ComposerBridgeState;
   /** Subscribe to events emitted toward the native shell. */
@@ -337,6 +344,55 @@ function rawOpId(raw: unknown): string {
   return "";
 }
 
+function sameReply(
+  left: ComposerDraft["reply"],
+  right: ComposerDraft["reply"],
+): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.messageId === right.messageId &&
+      left.authorId === right.authorId &&
+      left.preview === right.preview)
+  );
+}
+
+function sameDraftValues(
+  left: ComposerDraft,
+  right: Omit<ComposerDraft, "revision">,
+): boolean {
+  return (
+    left.text === right.text &&
+    left.focused === right.focused &&
+    left.keyboard === right.keyboard &&
+    sameReply(left.reply, right.reply) &&
+    left.attachments.length === right.attachments.length &&
+    left.attachments.every((attachment, index) => {
+      const other = right.attachments[index];
+      return (
+        other !== undefined &&
+        attachment.id === other.id &&
+        attachment.url === other.url &&
+        attachment.mimeType === other.mimeType &&
+        attachment.name === other.name &&
+        attachment.kind === other.kind &&
+        attachment.status === other.status
+      );
+    }) &&
+    left.mentions.length === right.mentions.length &&
+    left.mentions.every((mention, index) => {
+      const other = right.mentions[index];
+      return (
+        other !== undefined &&
+        mention.id === other.id &&
+        mention.label === other.label &&
+        mention.kind === other.kind
+      );
+    })
+  );
+}
+
 export function createComposerBridgeClient(
   options: ComposerBridgeClientOptions = {},
 ): ComposerBridgeClient {
@@ -355,25 +411,20 @@ export function createComposerBridgeClient(
     for (const listener of listeners) listener(event);
   };
 
-  // A draft-mutating result is echoed to the shell; emit the specific side
-  // events (focus/voice) so a shell that only cares about those need not diff.
-  const emitFor = (op: ComposerOperation, result: DispatchResult): void => {
+  const emitFor = (
+    previousDraft: ComposerDraft,
+    result: DispatchResult,
+  ): void => {
     if (result.status !== "applied") return;
-    emit({ type: "draft.changed", draft: result.draft });
-    if (op.type === "focus.set")
-      emit({
-        type: "focus.changed",
-        focused: result.draft.focused,
-        keyboard: result.draft.keyboard,
-      });
-    if (op.type === "voice.handoff")
-      emit({ type: "voice.state", phase: op.phase });
+    if (previousDraft.revision !== result.draft.revision)
+      emit({ type: "draft.changed", draft: result.draft });
   };
 
   const applyDecoded = (op: ComposerOperation): DispatchResult => {
+    const previousDraft = state.draft;
     const step = applyComposerOperation(state, op, ctx);
     state = step.state;
-    emitFor(op, step.result);
+    emitFor(previousDraft, step.result);
     return step.result;
   };
 
@@ -440,9 +491,11 @@ export function createComposerBridgeClient(
       // Native callbacks may be duplicated or arrive after cancellation. Only
       // the active reservation owns the result event and draft transition.
       if (state.sending?.opId !== opId) return;
+      const previousDraft = state.draft;
       state = resolveSend(state, opId, outcome);
       emit({ type: "send.result", opId, outcome });
-      emit({ type: "draft.changed", draft: state.draft });
+      if (previousDraft.revision !== state.draft.revision)
+        emit({ type: "draft.changed", draft: state.draft });
     },
     setOnline(online) {
       ctx.online = online;
@@ -453,6 +506,40 @@ export function createComposerBridgeClient(
       // watching the queue wants the draft snapshot after the flush.
       if (flushed.results.some((r) => r.status === "applied"))
         emit({ type: "draft.changed", draft: state.draft });
+    },
+    reconcileDraft(draft) {
+      if (sameDraftValues(state.draft, draft)) return;
+      state = {
+        ...state,
+        draft: {
+          ...draft,
+          attachments: [...draft.attachments],
+          mentions: [...draft.mentions],
+          revision: state.draft.revision + 1,
+        },
+      };
+      emit({ type: "draft.changed", draft: state.draft });
+    },
+    observeFocus(focused, keyboard) {
+      if (state.draft.focused === focused && state.draft.keyboard === keyboard)
+        return;
+      state = {
+        ...state,
+        draft: {
+          ...state.draft,
+          focused,
+          keyboard,
+          // Focus is observed UI state, not an edit to the sendable payload.
+          // Keeping the content revision stable lets an accepted send clear its
+          // body while preserving the newly observed focus/keyboard state.
+          revision: state.draft.revision,
+        },
+      };
+      emit({ type: "draft.changed", draft: state.draft });
+      emit({ type: "focus.changed", focused, keyboard });
+    },
+    observeVoice(phase) {
+      emit({ type: "voice.state", phase });
     },
     getDraft() {
       return state.draft;

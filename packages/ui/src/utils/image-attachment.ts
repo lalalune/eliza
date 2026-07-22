@@ -11,6 +11,12 @@ import {
   MAX_CHAT_UPLOAD_ATTACHMENTS,
 } from "@elizaos/shared";
 import type { ImageAttachment } from "../api/client-types-chat";
+import { createChatAttachmentClientId } from "./chat-attachment-identity";
+
+export {
+  chatAttachmentClientIdentity,
+  createChatAttachmentClientId,
+} from "./chat-attachment-identity";
 
 /**
  * Per-message attachment count cap. Sourced from the SAME shared constant the
@@ -355,6 +361,7 @@ async function fileToChatAttachment(file: File): Promise<ImageAttachment> {
   // error-policy:J4 thumbnail is optional enrichment (see createImageThumbnail).
   const thumbnail = await createImageThumbnail(file).catch(() => null);
   return {
+    clientAttachmentId: createChatAttachmentClientId(),
     data,
     mimeType,
     // The server requires a non-empty name under its length cap; a clipboard
@@ -505,6 +512,7 @@ export function pastedTextToAttachment(
   opts: { name?: string } = {},
 ): ImageAttachment {
   return {
+    clientAttachmentId: createChatAttachmentClientId(),
     data: utf8ToBase64(text),
     mimeType: "text/markdown",
     name: opts.name ?? PASTED_TEXT_DEFAULT_NAME,

@@ -59,16 +59,46 @@ function isWellFormedMime(mime: string): boolean {
   return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(mime);
 }
 
-/** Decoded byte length of a standard/loose base64 payload (whitespace stripped). */
-function base64ByteLength(base64: string): number | null {
+interface CanonicalBase64 {
+  payload: string;
+  byteLength: number;
+}
+
+/** Validate loose base64 and add the padding browsers require for data URLs. */
+function canonicalizeBase64(base64: string): CanonicalBase64 | null {
   const cleaned = base64.replace(/\s+/g, "");
-  if (cleaned.length === 0) return 0;
+  if (cleaned.length === 0) return { payload: "", byteLength: 0 };
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned)) return null;
-  // A base64 payload can omit padding, but a length congruent to 1 mod 4 can
-  // never encode complete bytes. Buffer.from would silently accept it.
-  if (cleaned.replace(/=+$/, "").length % 4 === 1) return null;
-  const padding = cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0;
-  return Math.floor((cleaned.length * 3) / 4) - padding;
+  const core = cleaned.replace(/=+$/, "");
+  const remainder = core.length % 4;
+  // A base64 payload can omit padding, but one sextet cannot encode a byte.
+  if (remainder === 1) return null;
+  const requiredPadding = remainder === 0 ? 0 : 4 - remainder;
+  const suppliedPadding = cleaned.length - core.length;
+  if (suppliedPadding !== 0 && suppliedPadding !== requiredPadding) return null;
+  return {
+    payload: core + "=".repeat(requiredPadding),
+    byteLength: Math.floor((core.length * 6) / 8),
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index] ?? 0;
+    const second = bytes[index + 1];
+    const third = bytes[index + 2];
+    encoded += alphabet[first >> 2];
+    encoded += alphabet[((first & 0x03) << 4) | ((second ?? 0) >> 4)];
+    encoded +=
+      second === undefined
+        ? "="
+        : alphabet[((second & 0x0f) << 2) | ((third ?? 0) >> 6)];
+    encoded += third === undefined ? "=" : alphabet[third & 0x3f];
+  }
+  return encoded;
 }
 
 /**
@@ -88,12 +118,6 @@ function isObviouslyPrivateHost(hostname: string): boolean {
   if (host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80"))
     return true;
   return false;
-}
-
-function parseDataUrlMime(dataUrl: string): string | undefined {
-  const header = dataUrl.slice("data:".length).split(",", 1)[0] ?? "";
-  const mime = header.split(";", 1)[0]?.trim();
-  return mime && mime.length > 0 ? mime : undefined;
 }
 
 function validateUploadMetadata(
@@ -120,15 +144,38 @@ function uploadByteCap(mimeType: string, requestedCap: number): number {
   return Math.min(requestedCap, endpointCap);
 }
 
-/** Upper-bound byte size of a `data:` URL payload (base64 or percent/plain). */
-function dataUrlByteLength(dataUrl: string): number | null {
+interface CanonicalDataUrl {
+  mimeType: string;
+  url: string;
+  byteLength: number;
+}
+
+/** Convert every accepted data URL form into one preview-safe base64 form. */
+function canonicalizeDataUrl(dataUrl: string): CanonicalDataUrl | null {
+  if (!dataUrl.startsWith("data:")) return null;
   const comma = dataUrl.indexOf(",");
   if (comma < 0) return null;
   const header = dataUrl.slice("data:".length, comma);
+  const headerParts = header.split(";").map((part) => part.trim());
+  const mimeType = headerParts[0]?.toLowerCase();
+  if (!mimeType) return null;
   const payload = dataUrl.slice(comma + 1);
-  if (/;base64/i.test(header)) return base64ByteLength(payload);
+  if (headerParts.slice(1).some((part) => part.toLowerCase() === "base64")) {
+    const canonical = canonicalizeBase64(payload);
+    if (!canonical) return null;
+    return {
+      mimeType,
+      url: `data:${mimeType};base64,${canonical.payload}`,
+      byteLength: canonical.byteLength,
+    };
+  }
   try {
-    return new TextEncoder().encode(decodeURIComponent(payload)).byteLength;
+    const bytes = new TextEncoder().encode(decodeURIComponent(payload));
+    return {
+      mimeType,
+      url: `data:${mimeType};base64,${bytesToBase64(bytes)}`,
+      byteLength: bytes.byteLength,
+    };
   } catch {
     // error-policy:J3 untrusted-input sanitizing — malformed percent escapes
     // are an explicit invalid data URL, never accepted for later persistence.
@@ -155,23 +202,24 @@ export function normalizeComposerAttachment(
         source.name,
       );
       if (metadataError) return metadataError;
-      const bytes = base64ByteLength(source.bytesBase64);
-      if (bytes === null)
+      const canonical = canonicalizeBase64(source.bytesBase64);
+      if (!canonical)
         return reject("invalid-input", "attachment bytes are not valid base64");
-      if (bytes === 0)
+      if (canonical.byteLength === 0)
         return reject("invalid-input", "attachment has no bytes");
       const byteCap = uploadByteCap(source.mimeType, maxBytes);
-      if (bytes > byteCap)
+      if (canonical.byteLength > byteCap)
         return reject(
           "oversized",
-          `attachment ${bytes}B exceeds cap ${byteCap}B`,
+          `attachment ${canonical.byteLength}B exceeds cap ${byteCap}B`,
         );
+      const mimeType = source.mimeType.toLowerCase();
       return {
         ok: true,
         attachment: {
           id,
-          url: `data:${source.mimeType};base64,${source.bytesBase64.replace(/\s+/g, "")}`,
-          mimeType: source.mimeType,
+          url: `data:${mimeType};base64,${canonical.payload}`,
+          mimeType,
           ...(source.name ? { name: source.name } : {}),
           kind: "inline",
           status: "ready",
@@ -179,27 +227,28 @@ export function normalizeComposerAttachment(
       };
     }
     case "data-url": {
-      const mime = parseDataUrlMime(source.dataUrl);
-      if (!mime)
+      const canonical = canonicalizeDataUrl(source.dataUrl);
+      if (!canonical)
         return reject("invalid-input", "data URL has no valid mediatype");
-      const metadataError = validateUploadMetadata(mime, source.name);
+      const metadataError = validateUploadMetadata(
+        canonical.mimeType,
+        source.name,
+      );
       if (metadataError) return metadataError;
-      const bytes = dataUrlByteLength(source.dataUrl);
-      if (bytes === null)
-        return reject("invalid-input", "data URL payload is malformed");
-      if (bytes === 0) return reject("invalid-input", "data URL has no bytes");
-      const byteCap = uploadByteCap(mime, maxBytes);
-      if (bytes > byteCap)
+      if (canonical.byteLength === 0)
+        return reject("invalid-input", "data URL has no bytes");
+      const byteCap = uploadByteCap(canonical.mimeType, maxBytes);
+      if (canonical.byteLength > byteCap)
         return reject(
           "oversized",
-          `attachment ${bytes}B exceeds cap ${byteCap}B`,
+          `attachment ${canonical.byteLength}B exceeds cap ${byteCap}B`,
         );
       return {
         ok: true,
         attachment: {
           id,
-          url: source.dataUrl,
-          mimeType: mime,
+          url: canonical.url,
+          mimeType: canonical.mimeType,
           ...(source.name ? { name: source.name } : {}),
           kind: "inline",
           status: "ready",

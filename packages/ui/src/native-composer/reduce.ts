@@ -368,13 +368,9 @@ export function applyComposerOperation(
       );
     }
     case "focus.set": {
-      const keyboard = op.keyboard ?? (op.focused ? "shown" : "hidden");
-      return commitApplied(
-        state,
-        op.opId,
-        limits,
-        bumpDraft(state.draft, { focused: op.focused, keyboard }),
-      );
+      // Focus is an imperative request. The DOM focus/viewport observer updates
+      // the draft only after the real textarea and keyboard state change.
+      return commitApplied(state, op.opId, limits, state.draft);
     }
     case "voice.handoff": {
       if (!capabilities.voice)
@@ -508,7 +504,7 @@ export function resolveSend(
   outcome: SendOutcome,
 ): ComposerBridgeState {
   if (!state.sending || state.sending.opId !== opId) return state;
-  if (!outcome.ok) return { ...state, sending: null };
+  if (outcome.status !== "accepted") return { ...state, sending: null };
   // Typing may continue while transport is in flight. Only clear the draft if
   // it is still the exact revision that this send captured.
   if (state.draft.revision !== state.sending.draft.revision) {
@@ -517,7 +513,12 @@ export function resolveSend(
   return {
     ...state,
     sending: null,
-    draft: { ...emptyComposerDraft(), revision: state.draft.revision + 1 },
+    draft: {
+      ...emptyComposerDraft(),
+      focused: state.draft.focused,
+      keyboard: state.draft.keyboard,
+      revision: state.draft.revision + 1,
+    },
   };
 }
 

@@ -30,13 +30,28 @@ describe("normalizeComposerAttachment — happy paths", () => {
     }
   });
 
-  it("data-url source passes through with parsed mime", () => {
+  it("canonicalizes base64 data URLs for the existing image preview", () => {
     const r = normalizeComposerAttachment("att1", {
       source: "data-url",
-      dataUrl: "data:image/jpeg;base64,/9j/AAAA",
+      dataUrl: "data:IMAGE/JPEG;base64,/9j/AAA",
     });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.attachment.mimeType).toBe("image/jpeg");
+    if (r.ok) {
+      expect(r.attachment.mimeType).toBe("image/jpeg");
+      expect(r.attachment.url).toBe("data:image/jpeg;base64,/9j/AAA=");
+    }
+  });
+
+  it("converts percent/plain data URLs to visible base64 attachments", () => {
+    const r = normalizeComposerAttachment("att1", {
+      source: "data-url",
+      dataUrl: "data:text/plain;charset=UTF-8,hello%20%E2%9C%93",
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.attachment.mimeType).toBe("text/plain");
+      expect(r.attachment.url).toBe("data:text/plain;base64,aGVsbG8g4pyT");
+    }
   });
 
   it("remote http(s) URL is kept for server-side SSRF ingest", () => {
@@ -130,6 +145,12 @@ describe("normalizeComposerAttachment — rejections", () => {
       normalizeComposerAttachment("a", {
         source: "data-url",
         dataUrl: "data:text/plain,%ZZ",
+      }),
+    ).toEqual(expect.objectContaining({ ok: false, reason: "invalid-input" }));
+    expect(
+      normalizeComposerAttachment("a", {
+        source: "data-url",
+        dataUrl: "data:text/plain;base64,AA=",
       }),
     ).toEqual(expect.objectContaining({ ok: false, reason: "invalid-input" }));
   });

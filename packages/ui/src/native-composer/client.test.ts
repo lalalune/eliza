@@ -5,6 +5,7 @@
  * duplicate op still no-ops and a deferred send still replays after reconnect.
  */
 
+import type { ChatSendResult } from "@elizaos/shared";
 import { describe, expect, it } from "vitest";
 import {
   createComposerBridgeClient,
@@ -13,6 +14,16 @@ import {
 import type { ComposerEvent } from "./contract";
 import { NATIVE_COMPOSER_SCHEMA } from "./contract";
 import { DEFAULT_COMPOSER_LIMITS } from "./reduce";
+
+const accepted: ChatSendResult = {
+  status: "accepted",
+  receipt: {
+    conversationId: "conversation-1",
+    clientMessageId: "s",
+    userMessageId: "m1",
+  },
+  completed: true,
+};
 
 describe("createComposerBridgeClient — boundary + events", () => {
   it("degrades malformed raw input to invalid-input, never throws", () => {
@@ -37,7 +48,7 @@ describe("createComposerBridgeClient — boundary + events", () => {
     ]);
   });
 
-  it("emits draft.changed + focus.changed for a focus op", () => {
+  it("reports focus only after the real observer sees it", () => {
     const client = createComposerBridgeClient();
     const events: ComposerEvent[] = [];
     client.subscribe((e) => events.push(e));
@@ -47,25 +58,29 @@ describe("createComposerBridgeClient — boundary + events", () => {
       focused: true,
       keyboard: "shown",
     });
+    expect(events).toEqual([]);
+    client.observeFocus(true, "shown");
     expect(events.map((e) => e.type)).toEqual([
       "draft.changed",
       "focus.changed",
     ]);
   });
 
-  it("emits voice.state for a voice op and send.result on completion", () => {
+  it("reports observed voice state and the persisted send receipt", () => {
     const client = createComposerBridgeClient();
     const events: ComposerEvent[] = [];
     client.subscribe((e) => events.push(e));
     client.dispatchRaw({ type: "text.set", opId: "t", text: "hi" });
     client.dispatchRaw({ type: "voice.handoff", opId: "v", phase: "start" });
+    expect(events.some((e) => e.type === "voice.state")).toBe(false);
+    client.observeVoice("start");
     client.dispatchRaw({ type: "send", opId: "s" });
-    client.completeSend("s", { ok: true, messageId: "m1" });
+    client.completeSend("s", accepted);
     expect(events.some((e) => e.type === "voice.state")).toBe(true);
     const sendResult = events.find((e) => e.type === "send.result");
     expect(sendResult).toBeDefined();
     if (sendResult && sendResult.type === "send.result")
-      expect(sendResult.outcome.ok).toBe(true);
+      expect(sendResult.outcome).toEqual(accepted);
     expect(client.getDraft().text).toBe(""); // cleared on successful send
   });
 
@@ -76,17 +91,46 @@ describe("createComposerBridgeClient — boundary + events", () => {
     client.dispatchRaw({ type: "text.set", opId: "t", text: "hi" });
     client.dispatchRaw({ type: "send", opId: "s" });
 
-    client.completeSend("stale", { ok: true, messageId: "wrong" });
+    client.completeSend("stale", accepted);
     expect(client.getDraft().text).toBe("hi");
     expect(events.filter((event) => event.type === "send.result")).toHaveLength(
       0,
     );
 
-    client.completeSend("s", { ok: true, messageId: "m1" });
-    client.completeSend("s", { ok: true, messageId: "m1" });
+    client.completeSend("s", accepted);
+    client.completeSend("s", accepted);
     expect(events.filter((event) => event.type === "send.result")).toHaveLength(
       1,
     );
+  });
+
+  it("reconciles manual typing without clearing it on send completion", () => {
+    const client = createComposerBridgeClient();
+    client.dispatchRaw({ type: "text.set", opId: "t", text: "submitted" });
+    client.dispatchRaw({ type: "send", opId: "s" });
+    client.reconcileDraft({
+      ...client.getDraft(),
+      text: "typed while sending",
+    });
+
+    client.completeSend("s", accepted);
+
+    expect(client.getDraft().text).toBe("typed while sending");
+  });
+
+  it("clears accepted content while preserving focus observed in flight", () => {
+    const client = createComposerBridgeClient();
+    client.dispatchRaw({ type: "text.set", opId: "t", text: "submitted" });
+    client.dispatchRaw({ type: "send", opId: "s" });
+    client.observeFocus(true, "shown");
+
+    client.completeSend("s", accepted);
+
+    expect(client.getDraft()).toMatchObject({
+      text: "",
+      focused: true,
+      keyboard: "shown",
+    });
   });
 });
 

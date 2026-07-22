@@ -49,7 +49,7 @@ export type KeyboardVisibility = "shown" | "hidden";
  */
 export type { ChatAttachmentSource as ComposerAttachmentSource } from "@elizaos/shared";
 
-import type { ChatAttachmentSource } from "@elizaos/shared";
+import type { ChatAttachmentSource, ChatSendResult } from "@elizaos/shared";
 
 /** A reply/quote target the composer threads onto the outgoing message. */
 export interface ComposerReplyContext {
@@ -211,9 +211,10 @@ export interface ComposerAttachment {
 }
 
 /**
- * The reduced composer draft. `revision` bumps on every applied mutation so the
- * shell can diff and a reload can detect staleness; it is the durable state the
- * bridge preserves across backgrounding, reload, and reconnect.
+ * The reduced composer draft. `revision` bumps on sendable-content mutations so
+ * send completion can distinguish later edits; observed focus/keyboard changes
+ * have their own events and do not make an unchanged sent body look edited.
+ * This is the durable state preserved across backgrounding and reconnect.
  */
 export interface ComposerDraft {
   text: string;
@@ -270,10 +271,8 @@ export type DispatchResult =
       draft: ComposerDraft;
     };
 
-/** Outcome of a submitted send, surfaced back to the shell. */
-export type SendOutcome =
-  | { ok: true; messageId: string }
-  | { ok: false; reason: ComposerRejectReason; message: string };
+/** Truthful terminal chat result surfaced back to the shell. */
+export type SendOutcome = ChatSendResult;
 
 // ── Events (renderer → native shell) ───────────────────────────────────
 

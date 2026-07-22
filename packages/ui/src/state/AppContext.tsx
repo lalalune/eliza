@@ -1166,6 +1166,16 @@ function AppProviderInner({
   } = chatCallbacks;
 
   useNativeComposerBridge({
+    activeConversationId,
+    chatInput,
+    chatPendingImages,
+    chatReplyTarget,
+    getCurrentComposerState: () => ({
+      activeConversationId: activeConversationIdRef.current,
+      chatInput: chatInputRef.current,
+      chatPendingImages: chatPendingImagesRef.current,
+      chatReplyTarget: chatReplyTargetRef.current,
+    }),
     sendChatText,
     setChatInput,
     setChatPendingImages,

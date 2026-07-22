@@ -96,6 +96,7 @@ import { copyTextToClipboard } from "../../utils/clipboard";
 import {
   bytesToMb,
   CHAT_UPLOAD_ACCEPT,
+  chatAttachmentClientIdentity,
   chatUploadKind,
   intakeAttachmentFiles,
   MAX_CHAT_IMAGES,
@@ -5532,7 +5533,7 @@ export function ContinuousChatOverlay({
                           ×
                         </Button>
                       );
-                      const tileKey = `${img.name}-${img.mimeType}-${img.data.length}`;
+                      const tileKey = chatAttachmentClientIdentity(img);
                       if (kind === "image") {
                         return (
                           <div

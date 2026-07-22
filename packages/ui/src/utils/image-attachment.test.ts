@@ -14,6 +14,7 @@ import {
   buildDroppedAttachmentNotice,
   bytesToMb,
   CHAT_UPLOAD_ACCEPT,
+  chatAttachmentClientIdentity,
   chatUploadKind,
   classifyComposerPaste,
   createImageThumbnail,
@@ -48,6 +49,24 @@ describe("chatUploadKind", () => {
     expect(chatUploadKind("video/mp4")).toBe("video");
     expect(chatUploadKind("application/pdf")).toBe("document");
     expect(chatUploadKind("text/plain")).toBe("document");
+  });
+});
+
+describe("chatAttachmentClientIdentity", () => {
+  it("uses explicit renderer ids and gives legacy payloads a stable fallback", () => {
+    const legacy = { data: "AAAA", mimeType: "image/png", name: "a.png" };
+    expect(chatAttachmentClientIdentity(legacy)).toBe(
+      chatAttachmentClientIdentity({ ...legacy }),
+    );
+    expect(
+      chatAttachmentClientIdentity({
+        ...legacy,
+        clientAttachmentId: "attachment-1",
+      }),
+    ).toBe("attachment-1");
+    expect(chatAttachmentClientIdentity({ ...legacy, data: "BBBB" })).not.toBe(
+      chatAttachmentClientIdentity(legacy),
+    );
   });
 });
 
@@ -389,6 +408,7 @@ describe("pastedTextToAttachment", () => {
 
   it("sets mimeType to text/markdown and a default name", () => {
     const att = pastedTextToAttachment("anything large enough");
+    expect(att.clientAttachmentId).toMatch(/^attachment-/);
     expect(att.mimeType).toBe("text/markdown");
     expect(att.name).toBe("pasted-text.md");
     expect(att.thumbnail).toBeUndefined();
