@@ -48,6 +48,23 @@ if (!serverAvailable) {
   );
 }
 
+describe("AgentMemory", () => {
+  it("stores and retrieves actions without a live Feed server", () => {
+    const memory = new AgentMemory({ maxEntries: 20 });
+    memory.add({
+      action: "TEST_ACTION",
+      params: { test: true },
+      result: { success: true },
+      timestamp: Date.now(),
+    });
+
+    const recent = memory.getRecent(1);
+    expect(recent).toHaveLength(1);
+    expect(recent[0]?.action).toBe("TEST_ACTION");
+    expect(memory.getSummary()).not.toHaveLength(0);
+  });
+});
+
 describe.skipIf(!serverAvailable)("E2E - Autonomous Agent Live Tests", () => {
   // Shared state across tests
   let agentIdentity: AgentIdentity;
@@ -209,24 +226,6 @@ describe.skipIf(!serverAvailable)("E2E - Autonomous Agent Live Tests", () => {
       console.log(`   Reasoning: ${decision.reasoning.substring(0, 80)}...`);
     }
   }, 15000);
-
-  it("Phase 5: should store and retrieve actions from memory", () => {
-    memory.add({
-      action: "TEST_ACTION",
-      params: { test: true },
-      result: { success: true },
-      timestamp: Date.now(),
-    });
-
-    const recent = memory.getRecent(1);
-    expect(recent.length).toBe(1);
-    expect(recent[0]?.action).toBe("TEST_ACTION");
-
-    const summary = memory.getSummary();
-    expect(summary).toBeDefined();
-    expect(summary.length).toBeGreaterThan(0);
-    console.log(`   Memory: ${summary}`);
-  });
 
   it("Phase 6: should handle HOLD action", async () => {
     const decision = {

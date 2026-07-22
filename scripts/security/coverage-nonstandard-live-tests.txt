@@ -1,9 +1,26 @@
 # Credentialed or host-dependent tests whose historical names predate the
 # canonical *.live.test.* / *.real.test.* suffixes. The changed-file coverage
-# lane is keyless; these suites run only in their dedicated live lanes.
+# lane is keyless; these suites require dedicated live/integration environments.
 packages/agent/test/crash-restart-supervisor.test.ts
 packages/app-core/test/dev-stack/dev-stack-probe.test.ts
+packages/cloud/api/__tests__/voice-kokoro-whisper-live.test.ts
 packages/cloud/shared/src/lib/services/__tests__/payout-fork.integration.test.ts
+packages/cloud/shared/src/lib/services/tenant-db/tenant-db-provisioning.integration.test.ts
+packages/cloud/shared/src/lib/services/voice-usage-meter.redis.integration.test.ts
+packages/feed/packages/engine/src/__tests__/integration/game-learnability.test.ts
+packages/feed/packages/engine/src/__tests__/integration/game-quality.test.ts
+packages/feed/packages/engine/src/__tests__/integration/game-validation.integration.test.ts
+packages/feed/packages/engine/src/__tests__/integration/narrative-state.integration.test.ts
+packages/feed/packages/engine/src/__tests__/integration/npc-post-voice.integration.test.ts
+packages/feed/packages/engine/src/__tests__/security/no-cheating.test.ts
+packages/feed/packages/engine/src/__tests__/token-stats-integration.integration.test.ts
+packages/feed/packages/examples/feed-typescript-agent/tests/actions-comprehensive.integration.test.ts
+packages/feed/packages/examples/feed-typescript-agent/tests/autonomous-agent-complete-e2e.test.ts
+packages/feed/packages/testing/integration/agent-actions-persistence.integration.test.ts
+packages/feed/packages/testing/integration/db-lazy-connection.integration.test.ts
+packages/feed/packages/testing/integration/trading-and-questions.integration.test.ts
+packages/feed/packages/testing/integration/world-facts/parody-headline-generator.test.ts
+packages/feed/packages/testing/integration/world-facts/world-facts-service.test.ts
 plugins/plugin-agent-orchestrator/src/__tests__/orchestrator-grilling-live-gemma.test.ts
 plugins/plugin-calendar/test/calendar.live-llm.test.ts
 plugins/plugin-goals/test/goals.live-llm.test.ts

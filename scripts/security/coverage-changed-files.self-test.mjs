@@ -15,6 +15,21 @@ import { dirname, join } from "node:path";
 
 const root = new URL("../..", import.meta.url).pathname;
 const script = join(root, "scripts/security/coverage-changed-files.sh");
+const nonstandardLiveManifestPath = join(
+  root,
+  "scripts/security/coverage-nonstandard-live-tests.txt",
+);
+const nonstandardLiveEntries = readFileSync(nonstandardLiveManifestPath, "utf8")
+  .split("\n")
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith("#"));
+const nonstandardLiveShapeFixtures = [
+  "packages/demo/src/calendar.live-llm.test.ts",
+  "packages/demo/src/integration.macos.test.ts",
+  "packages/demo/src/multilingual-action-routing.integration.test.ts",
+  "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+  "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+];
 
 function git(cwd, ...args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -95,16 +110,11 @@ function assertCase(name, fn) {
 assertCase(
   "nonstandard live-test manifest is sorted, unique, and tracked",
   () => {
-    const manifestPath = join(
-      root,
-      "scripts/security/coverage-nonstandard-live-tests.txt",
+    assert.deepEqual(
+      nonstandardLiveEntries,
+      [...new Set(nonstandardLiveEntries)].sort(),
     );
-    const entries = readFileSync(manifestPath, "utf8")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"));
-    assert.deepEqual(entries, [...new Set(entries)].sort());
-    for (const entry of entries) {
+    for (const entry of nonstandardLiveEntries) {
       assert.match(entry, /\.(?:test|spec)\./);
       assert.ok(existsSync(join(root, entry)), `${entry} does not exist`);
       assert.equal(git(root, "ls-files", "--error-unmatch", entry), entry);
@@ -157,14 +167,9 @@ try {
   write(
     dir,
     "coverage-nonstandard-live-tests.txt",
-    [
-      "packages/demo/src/calendar.live-llm.test.ts",
-      "packages/demo/src/integration.macos.test.ts",
-      "packages/demo/src/multilingual-action-routing.integration.test.ts",
-      "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
-      "packages/demo/src/voice-kokoro-whisper-live.test.ts",
-      "",
-    ].join("\n"),
+    `${[...nonstandardLiveEntries, ...nonstandardLiveShapeFixtures]
+      .sort()
+      .join("\n")}\n`,
   );
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -327,6 +332,17 @@ try {
     "packages/demo/src/voice-kokoro-whisper-live.test.ts",
     "import { test } from 'bun:test';\ntest('live voice', () => {});\n",
   );
+  for (const liveSuite of nonstandardLiveEntries) {
+    const source = readFileSync(join(root, liveSuite), "utf8");
+    const runner = /from ['"]vitest['"]|require\(['"]vitest['"]\)/.test(source)
+      ? "vitest"
+      : "bun:test";
+    write(
+      dir,
+      liveSuite,
+      `import { test } from '${runner}';\ntest('manifested live suite', () => {});\n`,
+    );
+  }
   write(
     dir,
     "packages/demo/src/real-live-suites.test.ts",
@@ -450,11 +466,8 @@ try {
     "manifested nonstandard live suites stay in their dedicated lane",
     () => {
       for (const liveSuite of [
-        "packages/demo/src/calendar.live-llm.test.ts",
-        "packages/demo/src/integration.macos.test.ts",
-        "packages/demo/src/multilingual-action-routing.integration.test.ts",
-        "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
-        "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+        ...nonstandardLiveEntries,
+        ...nonstandardLiveShapeFixtures,
       ]) {
         assert.ok(!out.bun_tests.includes(liveSuite));
         assert.ok(!out.vitest_tests.includes(liveSuite));

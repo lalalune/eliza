@@ -67,7 +67,7 @@ const requireLLMKey = () => {
   }
 };
 
-describe.skipIf(shouldSkipLiveLlmTests)("Engine Components Validation", () => {
+describe.skipIf(shouldSkipLiveLlmTests)("live model and database components", () => {
   beforeAll(() => {
     requireLLMKey();
     console.log("\n🔧 Testing Individual Engine Components");
@@ -371,7 +371,9 @@ describe.skipIf(shouldSkipLiveLlmTests)("Engine Components Validation", () => {
       }
     });
   });
+});
 
+describe("keyless engine components", () => {
   describe("GameClock Modes", () => {
     test("realtime mode tracks actual time", async () => {
       const { GameClock } = await import("../../GameClock");

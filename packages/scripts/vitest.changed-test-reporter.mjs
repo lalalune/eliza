@@ -27,6 +27,7 @@ export function serializeChangedTestResults(
 
 export default class ChangedTestReporter {
   onTestRunEnd(testModules, unhandledErrors, reason) {
+    // biome-ignore lint/suspicious/noUndeclaredEnvVars: the direct runner injects this per Vitest subprocess outside Turbo.
     const outputPath = process.env.ELIZA_CHANGED_VITEST_RESULTS;
     if (!outputPath) {
       throw new Error(

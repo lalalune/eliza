@@ -38,6 +38,37 @@ if (!serverAvailable) {
   );
 }
 
+describe("FeedA2AClient method availability", () => {
+  it("exposes the current domain methods exercised by the live suite", () => {
+    const client = new FeedA2AClient(TEST_CONFIG);
+    const expectedMethods = [
+      "getPredictions",
+      "getPerpetuals",
+      "getFeed",
+      "getTrendingTags",
+      "getUserProfile",
+      "searchUsers",
+      "getBalance",
+      "getPositions",
+      "getChats",
+      "getNotifications",
+      "getLeaderboard",
+      "getSystemStats",
+      "getReputation",
+      "getOrganizations",
+    ];
+
+    const missingMethods = expectedMethods.filter(
+      (method) =>
+        typeof (client as unknown as Record<string, unknown>)[method] !==
+        "function",
+    );
+
+    expect(missingMethods).toEqual([]);
+    expect(expectedMethods).toHaveLength(14);
+  });
+});
+
 describe.skipIf(!serverAvailable)("A2A Client Coverage E2E Tests", () => {
   let client: FeedA2AClient;
 
@@ -237,49 +268,4 @@ describe.skipIf(!serverAvailable)("A2A Client Coverage E2E Tests", () => {
     });
   });
 
-  describe("Method Availability Check", () => {
-    it("should expose the current domain methods exercised by this suite", () => {
-      const expectedMethods = [
-        // Market data
-        "getPredictions",
-        "getPerpetuals",
-        // Social
-        "getFeed",
-        "getTrendingTags",
-        // Users
-        "getUserProfile",
-        "searchUsers",
-        // Portfolio
-        "getBalance",
-        "getPositions",
-        // Messaging
-        "getChats",
-        // Notifications
-        "getNotifications",
-        // Stats
-        "getLeaderboard",
-        "getSystemStats",
-        "getReputation",
-        "getOrganizations",
-      ];
-
-      const missingMethods: string[] = [];
-
-      expectedMethods.forEach((method) => {
-        if (
-          typeof (client as unknown as Record<string, unknown>)[method] !==
-          "function"
-        ) {
-          missingMethods.push(method);
-        }
-      });
-
-      if (missingMethods.length > 0) {
-        console.error("❌ Missing methods:", missingMethods);
-      }
-
-      expect(missingMethods.length).toBe(0);
-      expect(expectedMethods.length).toBe(14);
-    });
-  });
 });
