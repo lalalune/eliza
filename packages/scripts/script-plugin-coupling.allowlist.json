@@ -153,6 +153,11 @@
     "reason": "invokes plugin-openai pointed at Cerebras to test native tool-calling trajectories"
   },
   {
+    "file": "packages/scripts/run-changed-vitest-coverage.mjs",
+    "tokens": ["plugins/plugin-personal-assistant"],
+    "reason": "routes personal-assistant integration tests between the package source-integration harness and the repository PGlite integration harness; this ownership cannot be inferred safely from nearest-config discovery"
+  },
+  {
     "file": "packages/scripts/run-eliza-cerebras.ts",
     "tokens": ["plugins/plugin-openai"],
     "reason": "boots a real runtime with plugin-openai wired to Cerebras to validate the runtime message stage"

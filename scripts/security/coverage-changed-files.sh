@@ -22,6 +22,12 @@ HEAD=$2
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 NODE_SELF_TEST_MANIFEST="$SCRIPT_DIR/coverage-node-self-tests.txt"
 SUBPROCESS_SOURCE_MANIFEST=${COVERAGE_SUBPROCESS_SOURCE_MANIFEST:-"$SCRIPT_DIR/coverage-subprocess-sources.txt"}
+NONSTANDARD_LIVE_TEST_MANIFEST=${COVERAGE_NONSTANDARD_LIVE_TEST_MANIFEST:-"$SCRIPT_DIR/coverage-nonstandard-live-tests.txt"}
+
+if [ ! -f "$NONSTANDARD_LIVE_TEST_MANIFEST" ]; then
+  echo "coverage-changed-files: missing nonstandard live-test manifest: $NONSTANDARD_LIVE_TEST_MANIFEST" >&2
+  exit 1
+fi
 
 # Fail fast: an empty merge-base means the two commits share no history (bad
 # fetch depth / wrong refs), which would otherwise silently diff the entire tree.
@@ -35,6 +41,9 @@ fi
 # `test/e2e/` directory segment) and Android specs. These run in dedicated lanes
 # and pull in heavy harnesses that the changed-file coverage gate must not.
 is_excluded_test() {
+  if grep -Fxq "$1" "$NONSTANDARD_LIVE_TEST_MANIFEST"; then
+    return 0
+  fi
   case "$1" in
     *.e2e.test.*|*.live.test.*|*.real.test.*|*.real.e2e.test.*|packages/app/test/android/*.android.spec.*) return 0 ;;
     packages/test/cloud-e2e/tests/*.spec.*) return 0 ;;

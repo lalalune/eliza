@@ -9,7 +9,13 @@
  * does every per-plugin harness config that imports `@elizaos/test-harness`.
  * Both consume this one builder so the alias set never drifts.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +37,171 @@ interface WorkspaceSourceEntry {
   packageName: string;
   indexPath: string;
   sourceDir: string;
+  exportedSubpaths: SourceAlias[];
+  exportedSubpathNames: string[];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function resolveConditionalTarget(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const conditions = value as Record<string, unknown>;
+  for (const condition of ["node", "import", "default", "browser", "types"]) {
+    const target = resolveConditionalTarget(conditions[condition]);
+    if (target) return target;
+  }
+  return undefined;
+}
+
+const SOURCE_SCRIPT_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+] as const;
+
+function expandScriptOutputPath(targetPath: string): string[] {
+  const declarationMatch = targetPath.match(/[.]d[.](?:ts|mts|cts)$/);
+  if (declarationMatch) {
+    const stem = targetPath.slice(0, -declarationMatch[0].length);
+    return SOURCE_SCRIPT_EXTENSIONS.map((extension) => `${stem}${extension}`);
+  }
+  const extension = path.extname(targetPath);
+  if ([".js", ".jsx", ".mjs", ".cjs"].includes(extension)) {
+    const stem = targetPath.slice(0, -extension.length);
+    return SOURCE_SCRIPT_EXTENSIONS.map(
+      (sourceExtension) => `${stem}${sourceExtension}`,
+    );
+  }
+  return [targetPath];
+}
+
+function findContainedSourceFile(
+  packageDir: string,
+  candidates: string[],
+): string | undefined {
+  const realPackageDir = realpathSync(packageDir);
+  for (const candidate of new Set(candidates)) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const realCandidate = realpathSync(candidate);
+      const relative = path.relative(realPackageDir, realCandidate);
+      if (
+        relative === ".." ||
+        relative.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relative) ||
+        !statSync(realCandidate).isFile()
+      ) {
+        continue;
+      }
+      const normalizedRelative = relative.split(path.sep).join("/");
+      if (
+        normalizedRelative === "dist" ||
+        normalizedRelative.startsWith("dist/")
+      ) {
+        continue;
+      }
+      return realCandidate;
+    } catch {
+      // error-policy:J3 A manifest target can disappear between discovery and resolution.
+    }
+  }
+  return undefined;
+}
+
+function getTargetSourceCandidates(
+  packageDir: string,
+  target: string,
+): string[] {
+  if (!target.startsWith("./") || target.includes("*")) return [];
+  const normalized = target.slice(2).split("/").join(path.sep);
+  const sourceRelative = normalized.startsWith(`dist${path.sep}`)
+    ? path.join("src", normalized.slice(`dist${path.sep}`.length))
+    : normalized;
+  return expandScriptOutputPath(path.resolve(packageDir, sourceRelative));
+}
+
+function getSubpathSourceCandidates(
+  sourceDir: string,
+  subpath: string,
+): string[] {
+  const relativeSubpath = subpath.slice(2).split("/").join(path.sep);
+  const basePath = path.resolve(sourceDir, relativeSubpath);
+  const candidates = [
+    basePath,
+    ...SOURCE_SCRIPT_EXTENSIONS.map((extension) => `${basePath}${extension}`),
+    ...SOURCE_SCRIPT_EXTENSIONS.map((extension) =>
+      path.join(basePath, `index${extension}`),
+    ),
+  ];
+  if (!relativeSubpath.includes(path.sep)) {
+    candidates.push(
+      ...SOURCE_SCRIPT_EXTENSIONS.map((extension) =>
+        path.join(sourceDir, `index.${relativeSubpath}${extension}`),
+      ),
+    );
+  }
+  return candidates;
+}
+
+interface ExportedSourceSubpaths {
+  aliases: SourceAlias[];
+  names: string[];
+}
+
+function getExportedSourceSubpaths(
+  packageDir: string,
+  packageName: string,
+  sourceDir: string,
+  exports: unknown,
+): ExportedSourceSubpaths {
+  if (!exports || typeof exports !== "object" || Array.isArray(exports)) {
+    return { aliases: [], names: [] };
+  }
+
+  const entries = Object.entries(exports as Record<string, unknown>).filter(
+    ([subpath]) =>
+      subpath !== "." && subpath.startsWith("./") && !subpath.includes("*"),
+  );
+  const aliases = entries.flatMap(([subpath, value]) => {
+    const conditionalValue =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+    const targets = [
+      resolveConditionalTarget(
+        conditionalValue?.["eliza-source"] ?? conditionalValue?.bun,
+      ),
+      resolveConditionalTarget(value),
+    ].filter((target): target is string => target !== undefined);
+    const replacement = findContainedSourceFile(packageDir, [
+      ...targets.flatMap((target) =>
+        getTargetSourceCandidates(packageDir, target),
+      ),
+      ...getSubpathSourceCandidates(sourceDir, subpath),
+    ]);
+    if (!replacement) return [];
+    const importPath = `${packageName}/${subpath.slice(2)}`;
+    return [
+      {
+        find: new RegExp(`^${escapeRegExp(importPath)}$`),
+        replacement,
+      },
+    ];
+  });
+  return {
+    aliases,
+    names: entries.map(([subpath]) => subpath.slice(2)),
+  };
 }
 
 function getWorkspaceSourceEntry(
@@ -40,27 +211,36 @@ function getWorkspaceSourceEntry(
   if (!existsSync(packageJsonPath)) return undefined;
   const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
     name?: string;
+    exports?: unknown;
   };
   if (!packageJson.name?.startsWith("@elizaos/")) return undefined;
   // The harness itself resolves via its package.json exports.
   if (packageJson.name === "@elizaos/test-harness") return undefined;
   const sourceIndex = path.join(packageDir, "src", "index.ts");
+  let indexPath: string;
+  let sourceDir: string;
   if (existsSync(sourceIndex)) {
-    return {
-      packageName: packageJson.name,
-      indexPath: sourceIndex,
-      sourceDir: path.join(packageDir, "src"),
-    };
+    indexPath = sourceIndex;
+    sourceDir = path.join(packageDir, "src");
+  } else {
+    const rootIndex = path.join(packageDir, "index.ts");
+    if (!existsSync(rootIndex)) return undefined;
+    indexPath = rootIndex;
+    sourceDir = packageDir;
   }
-  const rootIndex = path.join(packageDir, "index.ts");
-  if (existsSync(rootIndex)) {
-    return {
-      packageName: packageJson.name,
-      indexPath: rootIndex,
-      sourceDir: packageDir,
-    };
-  }
-  return undefined;
+  const exported = getExportedSourceSubpaths(
+    packageDir,
+    packageJson.name,
+    sourceDir,
+    packageJson.exports,
+  );
+  return {
+    packageName: packageJson.name,
+    indexPath,
+    sourceDir,
+    exportedSubpaths: exported.aliases,
+    exportedSubpathNames: exported.names,
+  };
 }
 
 /**
@@ -116,6 +296,12 @@ function collectWorkspacePackageDirs(root: string, maxDepth = 4): string[] {
   return out;
 }
 
+function buildExactExportExclusion(exportedSubpathNames: string[]): string {
+  if (exportedSubpathNames.length === 0) return "";
+  const alternatives = exportedSubpathNames.map(escapeRegExp).join("|");
+  return `(?!(?:${alternatives})$)`;
+}
+
 /**
  * Build the full alias list for a harness consumer. Explicit entries
  * (`@elizaos/core/testing`, `@elizaos/core/node`, `@elizaos/plugin-sql`) are
@@ -135,24 +321,48 @@ export function buildHarnessSourceAliases(
       ? collectWorkspacePackageDirs(dir)
           .map((packageDir) => getWorkspaceSourceEntry(packageDir))
           .filter((entry): entry is WorkspaceSourceEntry => entry !== undefined)
-          .flatMap(({ packageName, indexPath, sourceDir }) => [
-            { find: new RegExp(`^${packageName}$`), replacement: indexPath },
-            // Asset subpaths (JSON data imports like
-            // `@elizaos/registry/first-party/curated-app-definitions.json`)
-            // resolve to the source file as-is; the generic rule below would
-            // otherwise append `.ts` and break the resolve. First-match wins.
-            {
-              find: new RegExp(`^${packageName}/(.*\\.json)$`),
-              replacement: path.join(sourceDir, "$1"),
-            },
-            {
-              find: new RegExp(`^${packageName}/(.*)$`),
-              // Keep the target extensionless so Vite can resolve either a
-              // source file (`foo.ts`) or a public directory entry
-              // (`foo/index.ts`) through the same package-subpath rule.
-              replacement: path.join(sourceDir, "$1"),
-            },
-          ])
+          .flatMap((entry) => {
+            const {
+              packageName,
+              indexPath,
+              sourceDir,
+              exportedSubpaths,
+              exportedSubpathNames,
+            } = entry;
+            const packagePattern = escapeRegExp(packageName);
+            const exactExportExclusion =
+              buildExactExportExclusion(exportedSubpathNames);
+            return [
+              {
+                find: new RegExp(`^${packagePattern}$`),
+                replacement: indexPath,
+              },
+              // Exact public subpaths can target directory indexes, platform
+              // entrypoints, or JSON outside `src`. Honor package exports before
+              // the generic source fallback so those imports never become a
+              // fabricated path.
+              ...exportedSubpaths,
+              // Asset subpaths (JSON data imports like
+              // `@elizaos/registry/first-party/curated-app-definitions.json`)
+              // resolve to the source file as-is. Exact public exports are
+              // excluded from both fallbacks so an unresolved manifest target
+              // reaches package resolution instead of a made-up source path.
+              {
+                find: new RegExp(
+                  `^${packagePattern}/${exactExportExclusion}(.*\\.json)$`,
+                ),
+                replacement: path.join(sourceDir, "$1"),
+              },
+              {
+                find: new RegExp(
+                  `^${packagePattern}/${exactExportExclusion}(.*)$`,
+                ),
+                // Vite resolves TypeScript extensions and directory indexes
+                // after alias substitution; forcing `.ts` breaks index barrels.
+                replacement: path.join(sourceDir, "$1"),
+              },
+            ];
+          })
       : [],
   );
 

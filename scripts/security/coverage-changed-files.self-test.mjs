@@ -2,7 +2,14 @@
 /** Exercises changed-source/test classification against a real throwaway Git history. */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -51,15 +58,26 @@ function parseOutput(stdout) {
   return sections;
 }
 
-function runScript(cwd, base, head, subprocessManifest) {
-  const result = spawnSync("bash", [script, base, head], {
+function spawnScript(cwd, base, head, subprocessManifest, liveTestManifest) {
+  return spawnSync("bash", [script, base, head], {
     cwd,
     encoding: "utf8",
     env: {
       ...process.env,
       COVERAGE_SUBPROCESS_SOURCE_MANIFEST: subprocessManifest,
+      COVERAGE_NONSTANDARD_LIVE_TEST_MANIFEST: liveTestManifest,
     },
   });
+}
+
+function runScript(cwd, base, head, subprocessManifest, liveTestManifest) {
+  const result = spawnScript(
+    cwd,
+    base,
+    head,
+    subprocessManifest,
+    liveTestManifest,
+  );
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return parseOutput(result.stdout);
 }
@@ -74,9 +92,30 @@ function assertCase(name, fn) {
   }
 }
 
+assertCase(
+  "nonstandard live-test manifest is sorted, unique, and tracked",
+  () => {
+    const manifestPath = join(
+      root,
+      "scripts/security/coverage-nonstandard-live-tests.txt",
+    );
+    const entries = readFileSync(manifestPath, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    assert.deepEqual(entries, [...new Set(entries)].sort());
+    for (const entry of entries) {
+      assert.match(entry, /\.(?:test|spec)\./);
+      assert.ok(existsSync(join(root, entry)), `${entry} does not exist`);
+      assert.equal(git(root, "ls-files", "--error-unmatch", entry), entry);
+    }
+  },
+);
+
 const dir = mkdtempSync(join(tmpdir(), "coverage-changed-"));
 try {
   const subprocessManifest = join(dir, "coverage-subprocess-sources.txt");
+  const liveTestManifest = join(dir, "coverage-nonstandard-live-tests.txt");
   git(dir, "init", "-q");
   git(dir, "config", "user.email", "test@example.com");
   git(dir, "config", "user.name", "test");
@@ -114,6 +153,18 @@ try {
     dir,
     "coverage-subprocess-sources.txt",
     "packages/demo/src/process-entrypoint.mjs\n",
+  );
+  write(
+    dir,
+    "coverage-nonstandard-live-tests.txt",
+    [
+      "packages/demo/src/calendar.live-llm.test.ts",
+      "packages/demo/src/integration.macos.test.ts",
+      "packages/demo/src/multilingual-action-routing.integration.test.ts",
+      "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+      "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+      "",
+    ].join("\n"),
   );
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -253,6 +304,46 @@ try {
   );
   write(
     dir,
+    "packages/demo/src/calendar.live-llm.test.ts",
+    "import { test } from 'vitest';\ntest('live model', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+    "import { test } from 'vitest';\ntest('live model', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/multilingual-action-routing.integration.test.ts",
+    "import { test } from 'vitest';\ntest('live model', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/integration.macos.test.ts",
+    "import { test } from 'vitest';\ntest('host integration', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+    "import { test } from 'bun:test';\ntest('live voice', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/real-live-suites.test.ts",
+    "import { test } from 'vitest';\ntest('manifest audit', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/meeting-live.test.ts",
+    "import { test } from 'vitest';\ntest('deterministic meeting state', () => {});\n",
+  );
+  write(
+    dir,
+    "packages/demo/src/store.real-db.test.ts",
+    "import { test } from 'vitest';\ntest('in-memory database', () => {});\n",
+  );
+  write(
+    dir,
     "packages/test/cloud-e2e/tests/live-deploy.spec.ts",
     "import { test } from '../src/helpers/test-fixtures';\ntest('live', () => {});\n",
   );
@@ -270,7 +361,26 @@ try {
   git(dir, "commit", "-q", "-m", "feature work");
   const featureTip = git(dir, "rev-parse", "HEAD"); // HEAD
 
-  const out = runScript(dir, developTip, featureTip, subprocessManifest);
+  const out = runScript(
+    dir,
+    developTip,
+    featureTip,
+    subprocessManifest,
+    liveTestManifest,
+  );
+
+  assertCase("missing nonstandard live-test manifest fails closed", () => {
+    const missingManifest = join(dir, "missing-live-test-manifest.txt");
+    const result = spawnScript(
+      dir,
+      developTip,
+      featureTip,
+      subprocessManifest,
+      missingManifest,
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /missing nonstandard live-test manifest/);
+  });
 
   assertCase(
     "three-dot diff excludes develop-side files (issue #15845)",
@@ -312,9 +422,7 @@ try {
         `e2e-dir test leaked into vitest lane: ${out.vitest_tests.join(",")}`,
       );
       assert.ok(
-        !out.bun_tests.includes(
-          "packages/homepage/tests/e2e/visual.spec.ts",
-        ),
+        !out.bun_tests.includes("packages/homepage/tests/e2e/visual.spec.ts"),
         `Playwright spec leaked into bun lane: ${out.bun_tests.join(",")}`,
       );
       assert.ok(
@@ -337,6 +445,32 @@ try {
       `real suite leaked into vitest lane: ${out.vitest_tests.join(",")}`,
     );
   });
+
+  assertCase(
+    "manifested nonstandard live suites stay in their dedicated lane",
+    () => {
+      for (const liveSuite of [
+        "packages/demo/src/calendar.live-llm.test.ts",
+        "packages/demo/src/integration.macos.test.ts",
+        "packages/demo/src/multilingual-action-routing.integration.test.ts",
+        "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+        "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+      ]) {
+        assert.ok(!out.bun_tests.includes(liveSuite));
+        assert.ok(!out.vitest_tests.includes(liveSuite));
+      }
+      for (const deterministicLookalike of [
+        "packages/demo/src/meeting-live.test.ts",
+        "packages/demo/src/real-live-suites.test.ts",
+        "packages/demo/src/store.real-db.test.ts",
+      ]) {
+        assert.ok(
+          out.vitest_tests.includes(deterministicLookalike),
+          `${deterministicLookalike} must remain in the Vitest lane`,
+        );
+      }
+    },
+  );
 
   assertCase("cloud Playwright specs stay in their dedicated lane", () => {
     const liveSpec = "packages/test/cloud-e2e/tests/live-deploy.spec.ts";

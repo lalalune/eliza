@@ -2,18 +2,14 @@
  * Unit coverage for joinAppsAndWindows on Windows (#9170 / #9105 scene model).
  *
  * SceneBuilder joins the process list and the window list into a per-app
- * `SceneApp[]`. On Windows the join key is the window id (which IS the owning
- * pid). The linux path shells out to wmctrl, so this is win32-gated — and it
- * therefore runs on this Windows box, validating the pure win32 join. Untested
- * until now.
+ * `SceneApp[]`. The Windows join is a pure function over explicit platform
+ * input, so every host can validate the win32 mapping without invoking native
+ * window discovery.
  */
 
-import { platform } from "node:os";
 import { describe, expect, it } from "vitest";
 import { joinAppsAndWindows } from "../scene/apps.js";
 import type { WindowInfo } from "../types.js";
-
-const IS_WIN = platform() === "win32";
 
 const procs = [
   { pid: 100, name: "Notepad" },
@@ -26,7 +22,7 @@ const windows: WindowInfo[] = [
   { id: "999", title: "Orphan", app: "Ghost" },
 ];
 
-describe.skipIf(!IS_WIN)("joinAppsAndWindows (win32)", () => {
+describe("joinAppsAndWindows (win32)", () => {
   it("joins each window to its owning process by pid (win.id === pid)", () => {
     const apps = joinAppsAndWindows(procs, windows, "win32");
     const byPid = new Map(apps.map((a) => [a.pid, a]));
