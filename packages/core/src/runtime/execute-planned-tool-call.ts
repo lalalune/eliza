@@ -594,7 +594,8 @@ function flattenUndeclaredParametersEnvelope(
 	action: Action,
 	args: Record<string, unknown>,
 ): Record<string, unknown> {
-	const declaredParameters = action.parameters ?? [];
+	const declaredParameters = action.parameters;
+	if (!declaredParameters) return args;
 	if (declaredParameters.some((parameter) => parameter.name === "parameters")) {
 		return args;
 	}
@@ -789,10 +790,9 @@ export function normalizeParamAliases(
 	action: Action,
 	args: Record<string, unknown>,
 ): Record<string, unknown> {
-	const parameters = action.parameters ?? [];
-	const hasAliases = parameters.some(
-		(p) => p.aliases && p.aliases.length > 0,
-	);
+	const parameters = action.parameters;
+	if (!parameters) return args;
+	const hasAliases = parameters.some((p) => p.aliases && p.aliases.length > 0);
 	if (!hasAliases) return args;
 
 	const declaredNames = new Set(parameters.map((p) => p.name));

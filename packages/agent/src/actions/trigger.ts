@@ -21,19 +21,19 @@ import {
   type ActionExample,
   type ActionResult,
   AUTONOMY_SERVICE_TYPE,
-    type HandlerCallback,
+  type HandlerCallback,
   type HandlerOptions,
   type IAgentRuntime,
   type Memory,
   type State,
   stringToUuid,
-  validateUuid,
   type Task,
   TRIGGER_SCHEMA_VERSION,
   type TriggerConfig,
   type TriggerType,
   type TriggerWakeMode,
   type UUID,
+  validateUuid,
 } from "@elizaos/core";
 
 import {
@@ -106,7 +106,8 @@ function readUuid(value: unknown): UUID | undefined {
   // validateUuid, not asUUID: the id params accept planner-supplied strings
   // (names, fragments via aliases) — a non-UUID must fall through to the
   // name-fragment resolver, never throw out of the handler.
-  return validateUuid(readString(value) ?? "") ?? undefined;
+  const normalized = readString(value);
+  return normalized ? (validateUuid(normalized) ?? undefined) : undefined;
 }
 
 function readBool(value: unknown, fallback = false): boolean {
@@ -234,13 +235,9 @@ async function resolveTriggerRef(
     if (loaded) return loaded;
   }
   const rawId = readString(params.taskId);
-  const query = (
-    readString(params.displayName) ??
-    readString(params.instructions) ??
-    ""
-  )
-    .toLowerCase()
-    .replace(/^trigger:\s*/, "");
+  const querySource =
+    readString(params.displayName) ?? readString(params.instructions);
+  const query = querySource?.toLowerCase().replace(/^trigger:\s*/, "");
 
   const tasks = await runtime.getTasks({
     tags: [...TRIGGER_TASK_TAGS],
@@ -344,7 +341,8 @@ async function opCreate(
     delayMs !== undefined
       ? new Date(Date.now() + delayMs).toISOString()
       : undefined;
-  const scheduledAtIso = readString(params.scheduledAtIso) ?? scheduledFromDelay;
+  const scheduledAtIso =
+    readString(params.scheduledAtIso) ?? scheduledFromDelay;
   // A relative delay is one-shot by definition; a contradictory explicit
   // triggerType must not silently drop it.
   const triggerType =
@@ -397,8 +395,10 @@ async function opCreate(
   const usedDelay =
     delayMs !== undefined && scheduledAtIso === scheduledFromDelay;
   const scheduleKey = usedDelay ? `+${delayMs}` : (scheduledAtIso ?? "");
+  const workflowId = readString(params.workflowId);
+  const targetKey = workflowId ? `workflow:${workflowId}` : "prompt";
   const dedupeKey = dedupeHash(
-    `${triggerType}|${instructions.toLowerCase()}|${intervalMs}|${scheduleKey}|${cronExpression ?? ""}|${readString(params.workflowId) ?? ""}`,
+    `${triggerType}|${instructions.toLowerCase()}|${intervalMs}|${scheduleKey}|${cronExpression ?? ""}|${targetKey}`,
   );
 
   const existingTasks = await runtime.getTasks({
@@ -437,7 +437,6 @@ async function opCreate(
   // "prompt automation" (a reminder) that injects `instructions` as an agent
   // turn when it fires. Both are first-class TriggerConfig kinds — a reminder
   // is not a degenerate workflow, so we do not require a workflowId here.
-  const workflowId = readString(params.workflowId);
   const workflowName = readString(params.workflowName);
 
   const triggerId = stringToUuid(crypto.randomUUID());

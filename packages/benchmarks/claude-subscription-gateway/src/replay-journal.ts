@@ -6,8 +6,8 @@
 
 import {
   HashChainCorruptionError,
-  type HashChainedJsonlCursor,
   HashChainedJsonl,
+  type HashChainedJsonlCursor,
 } from "./hash-chained-jsonl.js";
 import {
   computeLogicalKeySha256,
@@ -42,7 +42,9 @@ export class ReplayMismatchError extends Error {
   readonly statusCode = 409;
 
   constructor() {
-    super("A replay ordinal was reused with different canonical request content.");
+    super(
+      "A replay ordinal was reused with different canonical request content.",
+    );
     this.name = "ReplayMismatchError";
   }
 }
@@ -115,7 +117,8 @@ export class ReplayJournal {
     while (true) {
       const pending = cursor.pending;
       if (pending !== null) cursor.pending = null;
-      const next = pending === null ? await this.log.readNext(cursor.stream) : null;
+      const next =
+        pending === null ? await this.log.readNext(cursor.stream) : null;
       if (pending === null) {
         if (next === null) {
           cursor.lastResult = null;
@@ -176,7 +179,14 @@ export class ReplayJournal {
       completion.result.credentialCapabilityHmacSha256,
       "capability",
     );
-    requiredResultHash(completion.result.credentialEpochHmacSha256, "epoch");
+    const epochHash = requiredResultHash(
+      completion.result.credentialEpochHmacSha256,
+      "epoch",
+    );
+    const subscriptionType = requiredString(
+      completion.result.subscriptionType,
+      "subscription tier",
+    );
     this.expectedTierHash = enforceParity(
       this.expectedTierHash,
       tierHash,
@@ -200,7 +210,13 @@ export class ReplayJournal {
       request_id: completion.requestId,
       created: completion.created,
       queue_wait_ms: completion.queueWaitMs,
-      result: completion.result as unknown as JsonObject,
+      result: completionResultToJson(
+        completion.result,
+        subscriptionType,
+        epochHash,
+        tierHash,
+        capabilityHash,
+      ),
     });
     this.lastOutcomeOrdinal.set(logical.harness, logical.ordinal);
   }
@@ -220,6 +236,38 @@ export class ReplayJournal {
   }
 }
 
+function completionResultToJson(
+  result: ClaudeCompletionResult,
+  subscriptionType: string,
+  epochHash: string,
+  tierHash: string,
+  capabilityHash: string,
+): JsonObject {
+  return {
+    text: result.text,
+    toolCalls: result.toolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.name,
+      arguments: toolCall.arguments,
+    })),
+    model: result.model,
+    claudeCodeVersion: result.claudeCodeVersion,
+    sdkApiKeySource: result.sdkApiKeySource,
+    resultSubtype: result.resultSubtype,
+    terminalReason: result.terminalReason,
+    subscriptionType,
+    credentialEpochHmacSha256: epochHash,
+    credentialTierHmacSha256: tierHash,
+    credentialCapabilityHmacSha256: capabilityHash,
+    usage: {
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      cacheReadInputTokens: result.usage.cacheReadInputTokens,
+      cacheCreationInputTokens: result.usage.cacheCreationInputTokens,
+    },
+  };
+}
+
 interface ParsedJournalRecord {
   harness: string;
   logicalNamespaceSha256: string;
@@ -236,7 +284,9 @@ interface ParsedJournalRecord {
 
 function parseJournalRecord(record: JsonObject): ParsedJournalRecord {
   if (record.kind !== "completion" || record.journal_schema_version !== 1) {
-    throw new HashChainCorruptionError("Replay journal record kind is invalid.");
+    throw new HashChainCorruptionError(
+      "Replay journal record kind is invalid.",
+    );
   }
   const harness = requiredString(record.harness, "harness");
   const logicalNamespaceSha256 = requiredHash(
@@ -317,7 +367,10 @@ function parseCompletionResult(value: unknown): ClaudeCompletionResult {
           })(),
     resultSubtype: requiredString(value.resultSubtype, "result subtype"),
     terminalReason: nullableString(value.terminalReason, "terminal reason"),
-    subscriptionType: requiredString(value.subscriptionType, "subscription tier"),
+    subscriptionType: requiredString(
+      value.subscriptionType,
+      "subscription tier",
+    ),
     credentialEpochHmacSha256: requiredHash(
       value.credentialEpochHmacSha256,
       "credential epoch",
@@ -410,11 +463,7 @@ function nullableString(value: unknown, label: string): string | null {
 }
 
 function requiredInteger(value: unknown, label: string): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < 0
-  ) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new HashChainCorruptionError(`Replay ${label} is invalid.`);
   }
   return value;

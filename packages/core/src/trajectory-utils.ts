@@ -652,9 +652,10 @@ export function attestLlmInputSubstring(details: RecordLlmCallDetails): void {
 		store.seenLogicalCalls.add(details);
 		store.modelCallCount += 1;
 		store.totalOccurrences += occurrences;
+		const previousModelCallCount = store.modelTypeCallCounts.get(modelType);
 		store.modelTypeCallCounts.set(
 			modelType,
-			(store.modelTypeCallCounts.get(modelType) ?? 0) + 1,
+			previousModelCallCount === undefined ? 1 : previousModelCallCount + 1,
 		);
 		if (occurrences === 1) {
 			store.matchingCallCount += 1;

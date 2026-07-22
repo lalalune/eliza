@@ -22,18 +22,12 @@ describe("gateway replay", () => {
   it("commits the private success before awaiting public audit and HTTP delivery", async () => {
     const directory = await mkdtemp(join(tmpdir(), "gateway-ordering-"));
     const journalPath = join(directory, "responses.jsonl");
-    let enterAudit: (() => void) | null = null;
-    const auditEntered = new Promise<void>((resolve) => {
-      enterAudit = resolve;
-    });
-    let releaseAudit: (() => void) | null = null;
-    const auditReleased = new Promise<void>((resolve) => {
-      releaseAudit = resolve;
-    });
+    const auditEntered = deferred();
+    const auditReleased = deferred();
     const auditSink: AuditSink = {
       append(_record: GatewayAuditRecord) {
-        enterAudit?.();
-        return auditReleased;
+        auditEntered.resolve();
+        return auditReleased.promise;
       },
     };
 
@@ -55,16 +49,16 @@ describe("gateway replay", () => {
         return response;
       });
 
-      await auditEntered;
+      await auditEntered.promise;
       expect((await readFile(journalPath, "utf8")).trim()).not.toBe("");
       await Promise.resolve();
       expect(delivered).toBe(false);
-      releaseAudit?.();
+      auditReleased.resolve();
       expect((await pendingResponse).status).toBe(200);
       await gateway.close();
       await journal.close();
     } finally {
-      releaseAudit?.();
+      auditReleased.resolve();
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -153,6 +147,22 @@ describe("gateway replay", () => {
     }
   });
 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolvePromise: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: () => {
+      if (!resolvePromise) {
+        throw new Error("deferred promise was not initialized");
+      }
+      resolvePromise();
+    },
+  };
+}
 
 function request(baseUrl: string, body: unknown): Promise<Response> {
   return fetch(`${baseUrl}/chat/completions`, {

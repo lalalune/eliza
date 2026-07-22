@@ -244,18 +244,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
+  return (
+    isRecord(value) &&
+    typeof value.name === 'string' &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every(isRecord) &&
+    isRecord(value.connections)
+  );
+}
+
 function readSmithersResumeWorkflow(execution: WorkflowExecution): WorkflowDefinition | undefined {
   const state = execution.customData?.[SMITHERS_RESUME_STATE_KEY];
-  if (!isRecord(state) || state.version !== 1 || !isRecord(state.workflow)) return undefined;
-  const workflow = state.workflow;
-  if (
-    typeof workflow.name !== 'string' ||
-    !Array.isArray(workflow.nodes) ||
-    !isRecord(workflow.connections)
-  ) {
+  if (!isRecord(state) || state.version !== 1 || !isWorkflowDefinition(state.workflow)) {
     return undefined;
   }
-  return cloneJson(workflow as unknown as WorkflowDefinition);
+  const workflow = state.workflow;
+  return cloneJson(workflow);
 }
 
 function normalizeWorkflowPayload(
