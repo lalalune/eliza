@@ -593,6 +593,15 @@ describe("Installed Snap smoke contract", () => {
       /must execute/,
     ],
     [
+      "missing shared packaged CLI verifier",
+      (source) =>
+        source.replace(
+          'run_capture shared-verifier node "$PACKAGED_CLI_VERIFIER" --expected "$EXPECTED_VERSION" -- snap run elizaos-app',
+          "echo skipped-shared-verifier",
+        ),
+      /must execute/,
+    ],
+    [
       "writable working directory",
       (source) =>
         source.replace('chmod 0555 "$CLEAN_CWD"', 'chmod 0755 "$CLEAN_CWD"'),

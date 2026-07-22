@@ -8,6 +8,8 @@ on:
       - 'packages/app-core/package.json'
       - 'packages/app-core/scripts/validate-snap-packaging-contract.mjs'
       - 'packages/app-core/scripts/validate-snap-packaging-contract.test.mjs'
+      - 'packages/scripts/verify-packaged-cli.mjs'
+      - 'packages/scripts/__tests__/verify-packaged-cli.test.ts'
       - 'packages/core/**'
       - 'plugins/*/typescript/**'
       - 'packages/app-core/scripts/pack-upstreams.mjs'
@@ -26,6 +28,8 @@ on:
       - 'packages/app-core/package.json'
       - 'packages/app-core/scripts/validate-snap-packaging-contract.mjs'
       - 'packages/app-core/scripts/validate-snap-packaging-contract.test.mjs'
+      - 'packages/scripts/verify-packaged-cli.mjs'
+      - 'packages/scripts/__tests__/verify-packaged-cli.test.ts'
       - 'packages/core/**'
       - 'plugins/*/typescript/**'
       - 'packages/elizaos/**'
@@ -87,6 +91,7 @@ jobs:
           set -euo pipefail
           node packages/app-core/scripts/validate-snap-packaging-contract.mjs
           node packages/scripts/run-vitest.mjs run packages/app-core/scripts/validate-snap-packaging-contract.test.mjs
+          bun test packages/scripts/__tests__/verify-packaged-cli.test.ts
 
       - name: Run packaging validation suite
         run: bash packages/app-core/packaging/test-packaging.sh

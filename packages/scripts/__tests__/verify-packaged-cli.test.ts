@@ -246,6 +246,7 @@ interface WorkflowStep {
 }
 
 interface WorkflowJob {
+  needs?: string | string[];
   steps?: WorkflowStep[];
 }
 
@@ -292,11 +293,10 @@ function stepIndex(path: string, job: string, stepName: string): number {
   return index;
 }
 
-function expectFailClosedSmoke(
+function expectFailClosedRun(
   path: string,
   job: string,
   stepName: string,
-  terminalCommand: RegExp,
 ): WorkflowStep {
   const step = workflowStep(path, job, stepName);
   if (!step.run) {
@@ -304,10 +304,47 @@ function expectFailClosedSmoke(
   }
 
   expect(step.run).toContain("set -euo pipefail");
-  expect(step.run).toContain("verify-packaged-cli.mjs");
-  expect(step.run.trimEnd()).toMatch(terminalCommand);
   expect(step["continue-on-error"]).toBeUndefined();
   return step;
+}
+
+function expectDirectVerifier(
+  path: string,
+  job: string,
+  stepName: string,
+  packagedCommand: RegExp,
+): WorkflowStep {
+  const step = expectFailClosedRun(path, job, stepName);
+  expect(step.run).toContain("packages/scripts/verify-packaged-cli.mjs");
+  expect(step.run).toMatch(packagedCommand);
+  expect(step.run).not.toMatch(/verify-packaged-cli\.mjs[^\n]*\|\|/);
+  return step;
+}
+
+function expectInstalledSnapScript(
+  path: string,
+  job: string,
+  stepName: string,
+): WorkflowStep {
+  const step = workflowStep(path, job, stepName);
+  expect(step.run).toContain(
+    "bash packages/app-core/packaging/snap/test-installed-snap.sh",
+  );
+  expect(step["continue-on-error"]).toBeUndefined();
+  return step;
+}
+
+function expectRunOrder(step: WorkflowStep, fragments: string[]): void {
+  if (!step.run) {
+    throw new Error(`Missing run body for ${step.name ?? "unnamed step"}`);
+  }
+
+  let previous = -1;
+  for (const fragment of fragments) {
+    const index = step.run.indexOf(fragment);
+    expect(index).toBeGreaterThan(previous);
+    previous = index;
+  }
 }
 
 function expectStepBefore(
@@ -321,68 +358,184 @@ function expectStepBefore(
   );
 }
 
+function expectJobNeeds(path: string, job: string, dependency: string): void {
+  const needs = workflow(path).jobs?.[job]?.needs;
+  const dependencies = Array.isArray(needs) ? needs : needs ? [needs] : [];
+  expect(dependencies).toContain(dependency);
+}
+
 describe("package workflows", () => {
   test("package builds rerun when the shared verifier changes", () => {
     const verifier = "packages/scripts/verify-packaged-cli.mjs";
+    const verifierTest =
+      "packages/scripts/__tests__/verify-packaged-cli.test.ts";
     const snap = workflow(".github/workflows/snap-build-test.yml");
     const flatpak = workflow(".github/workflows/test-flatpak.yml");
+    const packaging = workflow(".github/workflows/test-packaging.yml");
 
-    expect(snap.on?.push?.paths).toContain(verifier);
-    expect(snap.on?.pull_request?.paths).toContain(verifier);
+    expect(snap.on?.push?.branches).toEqual(["develop"]);
+    expect(snap.on?.pull_request?.branches).toEqual(["develop"]);
+    expect(snap.on?.push?.paths).toBeUndefined();
+    expect(snap.on?.pull_request?.paths).toBeUndefined();
     expect(flatpak.on?.pull_request?.paths).toContain(verifier);
-    expect(flatpak.on?.pull_request?.branches).toContain("develop");
-    expect(flatpak.on?.pull_request?.branches).toContain("main");
+    expect(flatpak.on?.pull_request?.branches).toEqual(["develop"]);
+    expect(packaging.on?.push?.paths).toEqual(
+      expect.arrayContaining([verifier, verifierTest]),
+    );
+    expect(packaging.on?.pull_request?.paths).toEqual(
+      expect.arrayContaining([verifier, verifierTest]),
+    );
   });
 
-  test("Snap and Flatpak validation use terminal fail-closed checks", () => {
-    const snap = expectFailClosedSmoke(
+  test("installed Snap and Flatpak validation use the shared fail-closed verifier", () => {
+    const installedSnapScript = readFileSync(
+      new URL(
+        "packages/app-core/packaging/snap/test-installed-snap.sh",
+        repoRoot,
+      ),
+      "utf8",
+    );
+    const snap = expectInstalledSnapScript(
       ".github/workflows/snap-build-test.yml",
       "build-snap",
       "Install and test snap",
-      /-- elizaos-app$/,
     );
-    const flatpak = expectFailClosedSmoke(
+    const flatpak = expectDirectVerifier(
       ".github/workflows/test-flatpak.yml",
       "build",
       "Install and test",
-      /-- flatpak run ai\.elizaos\.App$/,
+      /-- flatpak run ai\.elizaos\.App/,
     );
 
-    expect(snap.run).toContain("require('./package.json').version");
-    expect(flatpak.run).toContain(
-      "require('../../../../package.json').version",
+    expect(installedSnapScript).toContain("set -euo pipefail");
+    expect(installedSnapScript).toContain(
+      'run_capture shared-verifier node "$PACKAGED_CLI_VERIFIER" --expected "$EXPECTED_VERSION" -- snap run elizaos-app',
     );
+    expect(installedSnapScript).not.toMatch(/shared-verifier[^\n]*\|\|/);
+    const installIndex = installedSnapScript.indexOf(
+      'sudo snap install "$SNAP_PATH" --dangerous',
+    );
+    const readOnlyIndex = installedSnapScript.indexOf(
+      'chmod 0555 "$CLEAN_CWD"',
+    );
+    const verifierIndex = installedSnapScript.indexOf(
+      "run_capture shared-verifier",
+    );
+    expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(readOnlyIndex).toBeGreaterThan(installIndex);
+    expect(verifierIndex).toBeGreaterThan(readOnlyIndex);
+
+    expect(snap.run).toContain('require("./package.json").version');
+    expectRunOrder(flatpak, [
+      "flatpak --user install --reinstall",
+      "packages/scripts/verify-packaged-cli.mjs",
+      "flatpak run --command=node",
+      "flatpak-runtime.json",
+    ]);
   });
 
-  test("aggregate publish jobs verify installed launchers before publishing", () => {
-    const path = ".github/workflows/publish-packages.yml";
-    const checks = [
-      {
-        job: "publish-snap",
-        publication: "Publish to Snap Store",
-        smoke: "Test snap",
-        terminalCommand: /-- elizaos-app$/,
-      },
-      {
-        job: "build-deb",
-        publication: "Attach .deb to GitHub Release",
-        smoke: "Test .deb package",
-        terminalCommand: /-- elizaos-app$/,
-      },
-      {
-        job: "build-flatpak",
-        publication: "Attach Flatpak to GitHub Release",
-        smoke: "Test Flatpak",
-        terminalCommand: /-- flatpak run ai\.elizaos\.App$/,
-      },
-    ];
+  test("every release path verifies the installed launcher before artifacts leave the job", () => {
+    const aggregate = ".github/workflows/publish-packages.yml";
+    const standaloneSnap = ".github/workflows/snap-publish.yml";
+    const standaloneDeb = ".github/workflows/build-debian-package.yml";
 
-    for (const { job, publication, smoke, terminalCommand } of checks) {
-      const step = expectFailClosedSmoke(path, job, smoke, terminalCommand);
-      expect(step.env?.EXPECTED_VERSION).toBe(
-        "$" + "{{ needs.prepare.outputs.npm_version }}",
+    for (const { path, job } of [
+      { path: aggregate, job: "publish-snap" },
+      { path: standaloneSnap, job: "build-and-publish" },
+    ]) {
+      const smoke = expectInstalledSnapScript(
+        path,
+        job,
+        "Install and test snap",
       );
-      expectStepBefore(path, job, smoke, publication);
+      expect(smoke.env?.EXPECTED_VERSION).toBeDefined();
+      expectStepBefore(
+        path,
+        job,
+        "Install and test snap",
+        "Publish to Snap Store",
+      );
     }
+    expectStepBefore(
+      aggregate,
+      "publish-snap",
+      "Install and test snap",
+      "Upload Snap artifact and evidence",
+    );
+    expectStepBefore(
+      standaloneSnap,
+      "build-and-publish",
+      "Install and test snap",
+      "Upload snap artifact and evidence",
+    );
+
+    const aggregateDeb = expectDirectVerifier(
+      aggregate,
+      "build-deb",
+      "Test .deb package",
+      /-- elizaos-app/,
+    );
+    expectRunOrder(aggregateDeb, [
+      "sudo dpkg -i",
+      "packages/scripts/verify-packaged-cli.mjs",
+    ]);
+    for (const publication of [
+      "Attest Debian build provenance",
+      "Upload .deb artifact",
+      "Attach .deb to GitHub Release",
+    ]) {
+      expectStepBefore(
+        aggregate,
+        "build-deb",
+        "Test .deb package",
+        publication,
+      );
+    }
+
+    const aggregateFlatpak = expectDirectVerifier(
+      aggregate,
+      "build-flatpak",
+      "Test Flatpak",
+      /-- flatpak run ai\.elizaos\.App/,
+    );
+    expectRunOrder(aggregateFlatpak, [
+      "flatpak --user install --reinstall",
+      "packages/scripts/verify-packaged-cli.mjs",
+    ]);
+    for (const publication of [
+      "Checksum Flatpak bundle",
+      "Attest Flatpak build provenance",
+      "Upload Flatpak bundle",
+      "Attach Flatpak to GitHub Release",
+    ]) {
+      expectStepBefore(aggregate, "build-flatpak", "Test Flatpak", publication);
+    }
+
+    const deb = expectDirectVerifier(
+      standaloneDeb,
+      "build-deb",
+      "Install and verify .deb runtime",
+      /-- elizaos-app/,
+    );
+    expectRunOrder(deb, [
+      "sudo apt-get install",
+      "packages/scripts/verify-packaged-cli.mjs",
+    ]);
+    expectStepBefore(
+      standaloneDeb,
+      "build-deb",
+      "Install and verify .deb runtime",
+      "Upload .deb artifact",
+    );
+    expectJobNeeds(standaloneDeb, "collect-deb", "build-deb");
+    expectStepBefore(
+      standaloneDeb,
+      "collect-deb",
+      "Verify complete native package set",
+      "Upload combined Debian artifact",
+    );
+    expectJobNeeds(standaloneDeb, "attest-deb", "collect-deb");
+    expectJobNeeds(standaloneDeb, "release-deb", "collect-deb");
+    expectJobNeeds(standaloneDeb, "release-deb", "attest-deb");
   });
 });

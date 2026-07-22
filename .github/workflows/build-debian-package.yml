@@ -146,6 +146,9 @@ jobs:
           set -euo pipefail
           EXPECTED_VERSION=$(node -p "require('./package.json').version")
           sudo apt-get install -y "${{ steps.find_deb.outputs.deb_path }}"
+          node packages/scripts/verify-packaged-cli.mjs \
+            --expected "$EXPECTED_VERSION" \
+            -- elizaos-app
           ACTUAL_VERSION=$(elizaos-app --version)
           if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
             echo "ERROR: installed Debian CLI reported '$ACTUAL_VERSION', expected '$EXPECTED_VERSION'" >&2

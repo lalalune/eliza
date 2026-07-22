@@ -10,7 +10,12 @@ set -euo pipefail
 : "${EXPECTED_ARCH:?EXPECTED_ARCH must be amd64 or arm64}"
 : "${EVIDENCE_DIR:?EVIDENCE_DIR must retain the installed-runtime logs}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PACKAGED_CLI_VERIFIER="$REPO_ROOT/packages/scripts/verify-packaged-cli.mjs"
+
 test -f "$SNAP_PATH"
+test -f "$PACKAGED_CLI_VERIFIER"
 case "$EXPECTED_ARCH" in
   amd64) EXPECTED_NODE_ARCH=x64 ;;
   arm64) EXPECTED_NODE_ARCH=arm64 ;;
@@ -84,6 +89,7 @@ chmod 0555 "$CLEAN_CWD"
 pushd "$CLEAN_CWD" >/dev/null
 run_capture version snap run elizaos-app --version
 run_capture help snap run elizaos-app --help
+run_capture shared-verifier node "$PACKAGED_CLI_VERIFIER" --expected "$EXPECTED_VERSION" -- snap run elizaos-app
 # These expansions belong to the shell inside the installed Snap, not this
 # workflow shell, so the single quotes are an intentional execution boundary.
 # shellcheck disable=SC2016
