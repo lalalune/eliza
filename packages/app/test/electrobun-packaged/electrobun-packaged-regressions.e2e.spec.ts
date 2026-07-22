@@ -615,7 +615,14 @@ async function waitForResetUiState(
   const result = await waitForEval<
     EvalResult<{
       route: string;
-      overlayVisible: boolean;
+      overlayOpen: boolean;
+      overlayRendered: boolean;
+      sheetDetent: string | null;
+      composerDisabled: boolean;
+      composerPlaceholder: string | null;
+      firstRunBackdropOpaque: boolean;
+      onboardingProbe: string;
+      onboardingChoiceVisible: boolean;
       settingsVisible: boolean;
       rootHtmlLength: number;
       bodyText: string;
@@ -627,8 +634,50 @@ async function waitForResetUiState(
     harness,
     `(() => {
       try {
-        const overlayVisible = Boolean(
-          document.querySelector(${JSON.stringify(FIRST_RUN_SELECTOR)}),
+        const isPainted = (element) => {
+          if (!(element instanceof HTMLElement)) return false;
+          const rect = element.getBoundingClientRect();
+          if (
+            rect.width <= 0 ||
+            rect.height <= 0 ||
+            rect.right <= 0 ||
+            rect.bottom <= 0 ||
+            rect.left >= window.innerWidth ||
+            rect.top >= window.innerHeight
+          ) {
+            return false;
+          }
+          for (
+            let current = element;
+            current instanceof HTMLElement;
+            current = current.parentElement
+          ) {
+            const style = window.getComputedStyle(current);
+            if (
+              style.display === "none" ||
+              style.visibility === "hidden" ||
+              Number.parseFloat(style.opacity || "1") < 0.99
+            ) {
+              return false;
+            }
+          }
+          return true;
+        };
+        const overlay = document.querySelector(
+          ${JSON.stringify(FIRST_RUN_SELECTOR)},
+        );
+        const sheet = overlay?.querySelector('[data-testid="chat-sheet"]');
+        const composer = overlay?.querySelector(
+          '[data-testid="chat-composer-textarea"]',
+        );
+        const firstRunBackdrop = overlay?.querySelector(
+          '[data-testid="chat-first-run-backdrop"]',
+        );
+        const onboardingProbe = overlay?.querySelector(
+          '[data-testid="onboarding-state-probe"]',
+        );
+        const onboardingChoice = overlay?.querySelector(
+          '[data-testid^="choice-__first_run__:runtime:"]',
         );
         const settingsVisible = Boolean(
           document.querySelector(${JSON.stringify(SETTINGS_SELECTOR)}),
@@ -638,7 +687,16 @@ async function waitForResetUiState(
         return {
           ok: true,
           route: ${getCurrentRouteExpression()},
-          overlayVisible,
+          overlayOpen: overlay?.getAttribute("data-open") === "true",
+          overlayRendered: isPainted(overlay),
+          sheetDetent: sheet?.getAttribute("data-detent") ?? null,
+          composerDisabled:
+            composer instanceof HTMLTextAreaElement && composer.disabled,
+          composerPlaceholder: composer?.getAttribute("placeholder") ?? null,
+          firstRunBackdropOpaque:
+            firstRunBackdrop?.getAttribute("data-first-run-opaque") === "true",
+          onboardingProbe: (onboardingProbe?.textContent || "").trim(),
+          onboardingChoiceVisible: isPainted(onboardingChoice),
           settingsVisible,
           rootHtmlLength: document.getElementById("root")?.innerHTML.length ?? 0,
           bodyText: (document.body?.innerText || "")
@@ -658,7 +716,14 @@ async function waitForResetUiState(
     })()`,
     (current) =>
       current.ok &&
-      current.overlayVisible === true &&
+      current.overlayOpen === true &&
+      current.overlayRendered === true &&
+      current.sheetDetent === "full" &&
+      current.composerDisabled === true &&
+      current.composerPlaceholder === "Sign in to start chatting" &&
+      current.firstRunBackdropOpaque === true &&
+      current.onboardingProbe.includes("onboarding-step:runtime") &&
+      current.onboardingChoiceVisible === true &&
       current.firstRunComplete !== "1" &&
       current.activeServer == null,
     {
@@ -1010,6 +1075,12 @@ test("packaged desktop reset from the application menu returns the shell to firs
     await harness.menuAction("reset-app");
     await waitForResetRequest(api);
     await waitForResetUiState(harness);
+    await harness.showMainWindow();
+    await harness.focusMainWindow();
+    await harness.waitForState(
+      (state) => state.shell.windowVisible && state.shell.windowFocused,
+      "Expected the reset first-run shell to be frontmost before evidence capture.",
+    );
     await writeHarnessScreenshot(
       harness,
       testInfo,

@@ -510,7 +510,8 @@ jobs:
       - name: Actual app auto-discovered ui-smoke browser coverage
         run: |
           set -euo pipefail
-          read -r -a specs <<< "$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-auto)"
+          spec_output="$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-auto)"
+          read -r -a specs <<< "$spec_output"
           if (( ${#specs[@]} == 0 )); then
             echo "No auto-discovered ui-smoke specs to run (all covered by named slices or denied)."
             exit 0

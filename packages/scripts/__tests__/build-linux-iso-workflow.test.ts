@@ -7,8 +7,10 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 interface WorkflowStep {
+  env?: Record<string, string | number>;
   name?: string;
   run?: string;
+  uses?: string;
 }
 
 interface WorkflowJob {
@@ -87,5 +89,21 @@ describe("Build elizaOS Linux ISO workflow", () => {
     expect(buildScript).toContain(
       `-e "APT_SNAPSHOTS_SERIALS=\${APT_SNAPSHOTS_SERIALS:-}"`,
     );
+  });
+
+  test("uses the active Buildx cache instead of a dead live-build cache path", () => {
+    const names = buildJob.steps?.map((candidate) => candidate.name) ?? [];
+    const build = step("Build ISO (amd64)");
+
+    expect(names).not.toContain("Restore live-build cache");
+    expect(
+      buildJob.steps?.some((candidate) =>
+        candidate.uses?.startsWith("actions/cache@"),
+      ),
+    ).toBe(false);
+    expect(workflowSource).not.toContain(
+      ["$", "{{ env.LINUX_DIR }}/cache"].join(""),
+    );
+    expect(build.env?.ELIZAOS_DOCKER_BUILDX_GHA_CACHE).toBe(1);
   });
 });

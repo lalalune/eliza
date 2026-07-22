@@ -17,11 +17,33 @@ on:
     branches: [main, develop]
     paths:
       - "packages/lifeops-bench/**"
+      - "packages/agent/**"
+      - "packages/core/**"
+      - "packages/shared/**"
+      - "packages/cloud/routing/**"
+      - "packages/cloud/sdk/**"
+      - "plugins/plugin-groq/**"
+      - "plugins/plugin-local-inference/**"
+      - ".github/actions/setup-bun-workspace/**"
+      - ".github/ci-bun-version.json"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/benchmark-tests.yml"
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "packages/lifeops-bench/**"
+      - "packages/agent/**"
+      - "packages/core/**"
+      - "packages/shared/**"
+      - "packages/cloud/routing/**"
+      - "packages/cloud/sdk/**"
+      - "plugins/plugin-groq/**"
+      - "plugins/plugin-local-inference/**"
+      - ".github/actions/setup-bun-workspace/**"
+      - ".github/ci-bun-version.json"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/benchmark-tests.yml"
   workflow_dispatch:
 
@@ -41,7 +63,7 @@ jobs:
       matrix:
         include:
           - lane: benchmark-tests
-            command: bunx vitest run --config vitest.config.ts --root packages/lifeops-bench --passWithNoTests
+            command: bunx vitest run --config vitest.config.ts --root packages/lifeops-bench
           - lane: benchmark-lint
             command: bunx @biomejs/biome check packages/lifeops-bench/src
 

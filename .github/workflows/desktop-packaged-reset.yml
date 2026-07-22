@@ -11,20 +11,28 @@ on:
     branches: [develop]
     paths:
       - ".github/workflows/desktop-packaged-reset.yml"
+      - ".github/actions/setup-bun-workspace/**"
+      - ".github/ci-bun-version.json"
+      - "package.json"
+      - "bun.lock"
       - "packages/app/**"
       - "packages/agent/src/api/**"
       - "packages/app-core/**"
-      - "packages/ui/src/bridge/**"
-      - "packages/ui/src/state/**"
+      - "packages/cloud/routing/**"
+      - "packages/ui/**"
   push:
     branches: [develop]
     paths:
       - ".github/workflows/desktop-packaged-reset.yml"
+      - ".github/actions/setup-bun-workspace/**"
+      - ".github/ci-bun-version.json"
+      - "package.json"
+      - "bun.lock"
       - "packages/app/**"
       - "packages/agent/src/api/**"
       - "packages/app-core/**"
-      - "packages/ui/src/bridge/**"
-      - "packages/ui/src/state/**"
+      - "packages/cloud/routing/**"
+      - "packages/ui/**"
   workflow_dispatch:
 
 concurrency:
@@ -65,10 +73,21 @@ jobs:
           skip-avatar-clone: "true"
           no-vision-deps: "true"
 
+      # Keep compilation outside Playwright's per-test timeout so the acceptance
+      # budget measures only launching and driving the packaged application.
+      - name: Build cloud routing dependency
+        run: bun run --cwd packages/cloud/routing build
+
+      - name: Build packaged Electrobun application
+        timeout-minutes: 20
+        env:
+          ELECTROBUN_SKIP_CODESIGN: "1"
+        run: bun run --cwd packages/app-core/platforms/electrobun build
+
       - name: Drive reset through the real packaged application menu
         env:
           ELECTROBUN_SKIP_CODESIGN: "1"
-          ELIZA_TEST_PACKAGED_AUTO_BUILD: "1"
+          ELIZA_TEST_PACKAGED_AUTO_BUILD: "0"
         run: >-
           bun run --cwd packages/app test:desktop:packaged --grep
           "packaged desktop reset from the application menu"

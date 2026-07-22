@@ -295,6 +295,10 @@
     "@elizaos/cloud-api#typecheck": {
       "outputs": []
     },
+    "@elizaos/lifeops-bench#typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
     "@elizaos/cloud-shared#typecheck": {
       "dependsOn": ["@elizaos/plugin-cloud-apps#build"],
       "outputs": []

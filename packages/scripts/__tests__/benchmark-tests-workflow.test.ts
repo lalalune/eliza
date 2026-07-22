@@ -7,12 +7,19 @@ const workflow = readFileSync(
   new URL("../../../.github/workflows/benchmark-tests.yml", import.meta.url),
   "utf8",
 );
+const parsedWorkflow = Bun.YAML.parse(workflow) as {
+  on?: {
+    pull_request?: { branches?: string[]; paths?: string[] };
+    push?: { branches?: string[]; paths?: string[] };
+  };
+};
 
 describe("Benchmark Bridge Tests workflow", () => {
   test("resolves the Vitest config once from the package root", () => {
     expect(workflow).toContain(
-      "bunx vitest run --config vitest.config.ts --root packages/lifeops-bench --passWithNoTests",
+      "bunx vitest run --config vitest.config.ts --root packages/lifeops-bench",
     );
+    expect(workflow).not.toContain("--passWithNoTests");
     expect(workflow).not.toContain(
       "--config packages/lifeops-bench/vitest.config.ts --root packages/lifeops-bench",
     );
@@ -22,5 +29,35 @@ describe("Benchmark Bridge Tests workflow", () => {
     expect(workflow).toContain(
       "bunx @biomejs/biome check packages/lifeops-bench/src",
     );
+  });
+
+  test("runs for develop and every source or setup dependency it consumes", () => {
+    const requiredPaths = [
+      "packages/lifeops-bench/**",
+      "packages/agent/**",
+      "packages/core/**",
+      "packages/shared/**",
+      "packages/cloud/routing/**",
+      "packages/cloud/sdk/**",
+      "plugins/plugin-groq/**",
+      "plugins/plugin-local-inference/**",
+      ".github/actions/setup-bun-workspace/**",
+      ".github/ci-bun-version.json",
+      "package.json",
+      "bun.lock",
+      ".github/workflows/benchmark-tests.yml",
+    ];
+
+    expect(parsedWorkflow.on?.push?.branches).toEqual(["main", "develop"]);
+    expect(parsedWorkflow.on?.pull_request?.branches).toEqual([
+      "main",
+      "develop",
+    ]);
+    for (const paths of [
+      parsedWorkflow.on?.push?.paths,
+      parsedWorkflow.on?.pull_request?.paths,
+    ]) {
+      expect(paths).toEqual(expect.arrayContaining(requiredPaths));
+    }
   });
 });

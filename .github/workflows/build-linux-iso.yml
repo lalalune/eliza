@@ -60,14 +60,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore live-build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ${{ env.LINUX_DIR }}/cache
-          key: elizaos-iso-${{ env.ELIZAOS_ARCH }}-${{ hashFiles('packages/os/linux/tails/auto/config', 'packages/os/linux/tails/config/chroot_local-packageslists/**', 'packages/os/linux/Dockerfile') }}
-          restore-keys: elizaos-iso-${{ env.ELIZAOS_ARCH }}-
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 

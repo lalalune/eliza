@@ -2,6 +2,7 @@
  * Unit tests for the Ui Smoke Coverage app shell contract and coverage
  * guardrail.
  */
+import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -296,7 +297,11 @@ describe("ui-smoke spec coverage gate", () => {
       job ?? {},
       "Actual app auto-discovered ui-smoke browser coverage",
     );
-    expect(runStep.run).toContain("read -r -a specs");
+    expect(runStep.run).toContain(
+      'spec_output="$(node packages/app/scripts/ui-smoke-pr-specs.mjs --list-auto)"',
+    );
+    expect(runStep.run).toContain('read -r -a specs <<< "$spec_output"');
+    expect(runStep.run).not.toMatch(/read[^\n]*<<<[^\n]*\$\(node/);
     expect(runStep.run).toContain('"${specs[@]}"');
     expect(runStep.run).toContain("--fully-parallel");
     expect(runStep.run).toContain(
@@ -309,6 +314,26 @@ describe("ui-smoke spec coverage gate", () => {
     expect(artifactStep.with?.name).toBe(
       `scenario-pr-app-browser-auto-discovered-${githubExpression("matrix.shard.id")}`,
     );
+  });
+
+  it("propagates auto-discovery failures instead of reporting an empty inventory", () => {
+    const job = workflowJobs()["app-browser-auto-discovered"];
+    const runStep = workflowStep(
+      job ?? {},
+      "Actual app auto-discovered ui-smoke browser coverage",
+    );
+    const script = (runStep.run ?? "")
+      .replace(
+        "node packages/app/scripts/ui-smoke-pr-specs.mjs --list-auto",
+        "bash -c 'exit 23'",
+      )
+      .replace(githubExpression("matrix.shard.value"), "1/4");
+    const result = spawnSync("bash", ["-c", script], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(23);
   });
 
   it("named slices ∪ auto-discovered = every non-denied spec (nothing runs nowhere)", () => {

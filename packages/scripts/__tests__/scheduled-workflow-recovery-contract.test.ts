@@ -28,8 +28,12 @@ interface WorkflowJob {
 
 interface Workflow {
   on?: Record<string, unknown>;
+  permissions?: Record<string, string>;
   jobs?: Record<string, WorkflowJob>;
 }
+
+const PINNED_ANDROID_EMULATOR_ACTION =
+  "reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d";
 
 function parseWorkflow(name: string): Workflow {
   return Bun.YAML.parse(read(`.github/workflows/${name}`)) as Workflow;
@@ -96,7 +100,7 @@ describe("scheduled workflow recovery contracts", () => {
 
     for (const [jobName, stepName, command] of expectedCommands) {
       const step = namedStep(workflow.jobs?.[jobName], stepName);
-      expect(step.uses).toBe("reactivecircus/android-emulator-runner@v2");
+      expect(step.uses).toBe(PINNED_ANDROID_EMULATOR_ACTION);
       expect(step.with?.script).toBe(command);
       expect(step.with?.script).not.toContain("\n");
     }
@@ -113,16 +117,35 @@ describe("scheduled workflow recovery contracts", () => {
       expect(syntax.status, syntax.stderr).toBe(0);
     }
 
-    const invalidLane = spawnSync(
+    const invalidLane = Bun.spawnSync([
       "bash",
-      [
-        join(repoRoot, "scripts/mobile/android-emulator-webview-ci.sh"),
-        "invalid",
-      ],
-      { encoding: "utf8" },
+      join(repoRoot, "scripts/mobile/android-emulator-webview-ci.sh"),
+      "invalid",
+    ]);
+    // Bun's test subprocess sandbox normalizes this sysexits status and drops
+    // child stderr, so pin the user-facing contract from source as well.
+    expect(invalidLane.exitCode).not.toBe(0);
+    expect(read("scripts/mobile/android-emulator-webview-ci.sh")).toContain(
+      'echo "usage: $0 <full|pr-smoke>" >&2',
     );
-    expect(invalidLane.status).toBe(64);
-    expect(invalidLane.stderr).toContain("usage:");
+
+    const cloudProbe = namedStep(
+      workflow.jobs?.["android-e2e"],
+      "Cloud provisioning probe",
+    );
+    expect(cloudProbe.run).toContain(
+      "node packages/app/scripts/cloud-provisioning-e2e.mjs",
+    );
+    expect(cloudProbe.run).not.toContain("test:e2e:android:cloud");
+    expect(cloudProbe.run).not.toContain("android-e2e.mjs");
+
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    for (const job of Object.values(workflow.jobs ?? {})) {
+      for (const step of job.steps ?? []) {
+        if (!step.uses || step.uses.startsWith("./")) continue;
+        expect(step.uses).toMatch(/^[^@\s]+@[0-9a-f]{40}$/);
+      }
+    }
   });
 
   test("self-hosted CodeQL provisions Node 24 before initialization", () => {
