@@ -4,6 +4,7 @@
  * Imported broadly, so keep it type-only.
  */
 import type {
+  ChatSendResult,
   WalletChainKind,
   WalletEntry,
   WalletPrimaryMap,
@@ -756,7 +757,7 @@ export interface AppActions {
       /** Stable idempotency key for native/system callers replaying a send. */
       clientMessageId?: string;
     },
-  ) => Promise<void>;
+  ) => Promise<ChatSendResult>;
 
   // Triggers
   loadTriggers: (options?: { silent?: boolean }) => Promise<void>;

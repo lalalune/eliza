@@ -63,10 +63,11 @@ describe("native composer chat attachment materialization", () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(
-      Buffer.from(result.images?.[0]?.data ?? "", "base64").toString(),
-    ).toBe("stored");
-    expect(result.images?.[0]?.mimeType).toBe("text/plain");
+    const storedImage = result.images?.[0];
+    expect(storedImage).toBeDefined();
+    if (!storedImage) return;
+    expect(Buffer.from(storedImage.data, "base64").toString()).toBe("stored");
+    expect(storedImage.mimeType).toBe("text/plain");
   });
 
   it("rejects forged stored handles and loopback remote sources", async () => {
@@ -96,13 +97,14 @@ describe("native composer chat attachment materialization", () => {
   });
 
   it("rejects malformed source fields at the HTTP boundary", async () => {
+    const malformedInput: ChatAttachmentInput = {
+      source: "data-url",
+      dataUrl: "data:text/plain,valid",
+    };
+    Reflect.set(malformedInput, "dataUrl", 42);
+
     await expect(
-      materializeChatAttachmentInputs([
-        {
-          source: "data-url",
-          dataUrl: 42,
-        } as unknown as ChatAttachmentInput,
-      ]),
+      materializeChatAttachmentInputs([malformedInput]),
     ).resolves.toMatchObject({ ok: false, status: 400 });
   });
 });

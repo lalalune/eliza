@@ -13,6 +13,7 @@ import type { Conversation, CustomActionDef } from "../api";
 import {
   type ChatActionResultSummary,
   type ChatAttachmentInput,
+  type ChatSendResult,
   type ChatToolCallEvent,
   type ChatTurnStatus,
   type CodingAgentSession,
@@ -67,6 +68,76 @@ import {
 // ── Types ────────────────────────────────────────────────────────────
 
 const CONTEXT_ROUTING_METADATA_KEY = "__responseContext";
+const CHAT_SEND_RETRY_QUEUED = Symbol("chat-send-retry-queued");
+const CHAT_CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
+
+function failedChatSendResult(
+  clientMessageId: string,
+  conversationId: string | null,
+  reason: Extract<ChatSendResult, { status: "failed" }>["reason"],
+  message: string,
+  retryable: boolean,
+): ChatSendResult {
+  return {
+    status: "failed",
+    clientMessageId,
+    conversationId,
+    reason,
+    message,
+    retryable,
+  };
+}
+
+function cancelledChatSendResult(
+  clientMessageId: string,
+  conversationId: string | null,
+  message: string,
+): ChatSendResult {
+  return {
+    status: "cancelled",
+    clientMessageId,
+    conversationId,
+    message,
+  };
+}
+
+function resultFromStreamReceipt(
+  data: {
+    completed: boolean;
+    receipt?: {
+      conversationId: string;
+      clientMessageId: string;
+      userMessageId: string;
+    };
+  },
+  conversationId: string,
+  clientMessageId: string,
+  aborted: boolean,
+): ChatSendResult {
+  if (aborted) {
+    return cancelledChatSendResult(
+      clientMessageId,
+      conversationId,
+      "The send was cancelled before completion.",
+    );
+  }
+  const receipt = data.receipt;
+  if (
+    !receipt ||
+    receipt.conversationId !== conversationId ||
+    receipt.clientMessageId !== clientMessageId ||
+    !receipt.userMessageId
+  ) {
+    return failedChatSendResult(
+      clientMessageId,
+      conversationId,
+      "missing-receipt",
+      "The server did not confirm the persisted user message.",
+      true,
+    );
+  }
+  return { status: "accepted", receipt, completed: data.completed };
+}
 
 async function handoffCompletedViewAction(
   actionResults: ChatActionResultSummary[] | undefined,
@@ -593,7 +664,7 @@ export interface QueuedChatSend {
    * server-side during a blip is de-duped instead of double-delivered. Absent
    * on a fresh enqueue (the drain mints it); present on the retry re-enqueue.
    */
-  clientMessageId?: string;
+  clientMessageId: string;
   /**
    * True on the re-enqueued turn AFTER its one auto-retry-on-reconnect has been
    * spent — the guard that makes the auto-retry fire exactly once (never a
@@ -607,8 +678,7 @@ export interface QueuedChatSend {
     assistantMsgId: string;
     timestamp: number;
   };
-  resolve: () => void;
-  reject: (error: unknown) => void;
+  resolve: (result: ChatSendResult) => void;
 }
 
 function isByteBackedChatAttachment(
@@ -1089,7 +1159,15 @@ export function useChatSend(deps: UseChatSendDeps) {
       activeChatTurnRef.current = null;
       chatAbortRef.current = null;
       chatSendBusyRef.current = false;
-      chatSendQueueRef.current.splice(0);
+      for (const turn of chatSendQueueRef.current.splice(0)) {
+        turn.resolve(
+          cancelledChatSendResult(
+            turn.clientMessageId,
+            turn.conversationId ?? null,
+            "The send was cancelled because the chat surface closed.",
+          ),
+        );
+      }
     };
   }, [chatAbortRef, chatSendBusyRef]);
 
@@ -1097,7 +1175,13 @@ export function useChatSend(deps: UseChatSendDeps) {
     const queued = chatSendQueueRef.current.splice(0);
     if (queued.length === 0) return "";
     for (const turn of queued) {
-      turn.resolve();
+      turn.resolve(
+        cancelledChatSendResult(
+          turn.clientMessageId,
+          turn.conversationId ?? null,
+          "The queued send was cancelled before it started.",
+        ),
+      );
     }
     // These turns were accepted ("send another" while a reply streamed), the
     // composer was cleared at enqueue, and their optimistic bubble only paints
@@ -1495,10 +1579,20 @@ export function useChatSend(deps: UseChatSendDeps) {
   );
 
   const runQueuedChatSend = useCallback(
-    async (turn: Omit<QueuedChatSend, "resolve" | "reject">) => {
+    async (
+      turn: QueuedChatSend,
+    ): Promise<ChatSendResult | typeof CHAT_SEND_RETRY_QUEUED> => {
       const hasAttachedImages = Boolean(turn.images?.length);
       const rawText = turn.rawInput.trim();
-      if (!rawText && !hasAttachedImages) return;
+      if (!rawText && !hasAttachedImages) {
+        return failedChatSendResult(
+          turn.clientMessageId,
+          turn.conversationId ?? null,
+          "empty",
+          "Nothing was available to send.",
+          false,
+        );
+      }
 
       const channelType = turn.channelType;
       const imagesToSend = turn.images;
@@ -1506,8 +1600,7 @@ export function useChatSend(deps: UseChatSendDeps) {
       // single auto-retry (the re-enqueued turn carries it back in). A send
       // that actually landed server-side during a blip is then de-duped by the
       // server on the retry instead of double-delivered.
-      const clientMessageId =
-        turn.clientMessageId ?? generateChatClientMessageId();
+      const clientMessageId = turn.clientMessageId;
       let controller: AbortController | null = null;
       let abortServerTurn: (() => void) | null = null;
       let convRoomId: string | null = null;
@@ -1524,10 +1617,22 @@ export function useChatSend(deps: UseChatSendDeps) {
             rawText,
             `Command failed: ${err instanceof Error ? err.message : "unknown error"}`,
           );
-          return;
+          return failedChatSendResult(
+            clientMessageId,
+            turn.conversationId ?? null,
+            "command",
+            err instanceof Error ? err.message : "Command failed.",
+            false,
+          );
         }
         if (commandResult.handled) {
-          return;
+          return failedChatSendResult(
+            clientMessageId,
+            turn.conversationId ?? null,
+            "command",
+            "The input was handled locally and did not create a chat memory.",
+            false,
+          );
         }
         if (
           typeof commandResult.rewrittenText === "string" &&
@@ -1626,7 +1731,7 @@ export function useChatSend(deps: UseChatSendDeps) {
           setCompanionMessageCutoffTs(nextCutoffTs);
           convId = conversation.id;
           convRoomId = conversation.roomId;
-        } catch {
+        } catch (error) {
           // error-policy:J4 surfaced user-facing failure state.
           // First-message conversation creation failed (cold open on weak
           // signal). Remove the local accepted-turn rows and restore the draft:
@@ -1645,7 +1750,15 @@ export function useChatSend(deps: UseChatSendDeps) {
             "error",
             8_000,
           );
-          return;
+          return failedChatSendResult(
+            clientMessageId,
+            null,
+            "conversation-unavailable",
+            error instanceof Error
+              ? error.message
+              : "Could not create a conversation.",
+            true,
+          );
         }
       }
 
@@ -1892,6 +2005,12 @@ export function useChatSend(deps: UseChatSendDeps) {
           void pollCloudCredits();
         }
         clearPendingChatTurn(convId, clientMessageId);
+        return resultFromStreamReceipt(
+          data,
+          convId,
+          clientMessageId,
+          controller.signal.aborted,
+        );
       } catch (err) {
         // Commit any throttled-but-uncommitted token first so an abort/error
         // never drops a placeholder the user already saw fill with partial text.
@@ -1899,7 +2018,11 @@ export function useChatSend(deps: UseChatSendDeps) {
         const abortError = err as Error;
         if (abortError.name === "AbortError" || controller?.signal.aborted) {
           dropEmptyAssistantPlaceholder(convId, assistantMsgId);
-          return;
+          return cancelledChatSendResult(
+            clientMessageId,
+            convId || optimisticOwnerConversationId,
+            "The send was cancelled.",
+          );
         }
 
         // A terminal SSE `error` event that carried a structured gate must
@@ -1909,7 +2032,7 @@ export function useChatSend(deps: UseChatSendDeps) {
         // gate; a connect-account request → the AccountConnectBlock.
         if (
           isStreamGenerationError(err) &&
-          (err.failureKind || err.accountConnect)
+          (err.failureKind || err.accountConnect || err.receipt)
         ) {
           if (err.failureKind) {
             applyStreamingModificationForConversation(convId, {
@@ -1925,7 +2048,25 @@ export function useChatSend(deps: UseChatSendDeps) {
               accountConnect: err.accountConnect,
             });
           }
-          return;
+          if (err.receipt) {
+            if (!err.failureKind && !err.accountConnect) {
+              dropEmptyAssistantPlaceholder(convId, assistantMsgId);
+              setActionNotice(buildSendFailureNotice(err), "error", 8_000);
+            }
+            return resultFromStreamReceipt(
+              { completed: false, receipt: err.receipt },
+              convId,
+              clientMessageId,
+              Boolean(controller?.signal.aborted),
+            );
+          }
+          return failedChatSendResult(
+            clientMessageId,
+            convId || optimisticOwnerConversationId,
+            "generation",
+            err instanceof Error ? err.message : "Generation failed.",
+            true,
+          );
         }
 
         const status = (err as { status?: number }).status;
@@ -1958,7 +2099,13 @@ export function useChatSend(deps: UseChatSendDeps) {
                 10_000,
               );
               dropEmptyAssistantPlaceholder(convId, assistantMsgId);
-              return;
+              return failedChatSendResult(
+                clientMessageId,
+                convId,
+                "conversation-unavailable",
+                "The agent is no longer reachable.",
+                false,
+              );
             }
             // Non-cloud base, or a different create failure — the recovery
             // could not produce a conversation to replay into. Drop the empty
@@ -1966,7 +2113,15 @@ export function useChatSend(deps: UseChatSendDeps) {
             // lost message.
             dropEmptyAssistantPlaceholder(convId, assistantMsgId);
             setActionNotice(buildSendFailureNotice(createErr), "error", 8_000);
-            return;
+            return failedChatSendResult(
+              clientMessageId,
+              convId,
+              "conversation-unavailable",
+              createErr instanceof Error
+                ? createErr.message
+                : "Conversation recovery failed.",
+              true,
+            );
           }
 
           // Seed ids live above the try so the failure handler below can
@@ -2069,6 +2224,12 @@ export function useChatSend(deps: UseChatSendDeps) {
                   : {}),
               });
             }
+            return resultFromStreamReceipt(
+              retryData,
+              conversation.id,
+              clientMessageId,
+              Boolean(controller?.signal.aborted),
+            );
           } catch (replayErr) {
             // The re-seed above replaced the whole thread, so the ORIGINAL
             // placeholder id is gone — dropping it was a no-op that left the
@@ -2087,6 +2248,21 @@ export function useChatSend(deps: UseChatSendDeps) {
                 8_000,
               );
             }
+            return controller?.signal.aborted
+              ? cancelledChatSendResult(
+                  clientMessageId,
+                  conversation.id,
+                  "The replay was cancelled.",
+                )
+              : failedChatSendResult(
+                  clientMessageId,
+                  conversation.id,
+                  "transport",
+                  replayErr instanceof Error
+                    ? replayErr.message
+                    : "The replay failed.",
+                  true,
+                );
           }
         } else if (shouldAutoRetryOnReconnect(err) && !turn.autoRetried) {
           // Retryable transport failure (a network blip / timeout / 502/503)
@@ -2114,22 +2290,19 @@ export function useChatSend(deps: UseChatSendDeps) {
           if (reconnected && !controller?.signal.aborted) {
             // Re-enqueue at the FRONT so the retry runs before any turns the
             // user queued behind it, preserving send order. Same key + text +
-            // images + metadata; autoRetried stops a second auto-retry.
+            // images + metadata + resolver; autoRetried stops a second
+            // auto-retry. Keeping the original resolver is load-bearing: the
+            // native caller must settle from the retry's real receipt, not from
+            // the failed first attempt.
             chatSendQueueRef.current.unshift({
-              rawInput: turn.rawInput,
-              channelType: turn.channelType,
+              ...turn,
               conversationId: convId,
-              images: turn.images,
-              metadata: turn.metadata,
-              clientMessageId,
               autoRetried: true,
               optimisticTurn,
-              resolve: () => {},
-              reject: () => {},
             });
             // The drain loop (flushQueuedChatSends) re-invokes this for the
             // requeued turn; nothing more to do here.
-            return;
+            return CHAT_SEND_RETRY_QUEUED;
           }
           // Connectivity never returned (timeout) or the turn was superseded
           // (abort). An abort is a user Stop / navigation — stay silent, drop
@@ -2138,7 +2311,11 @@ export function useChatSend(deps: UseChatSendDeps) {
           // sending forever.
           if (controller?.signal.aborted) {
             dropEmptyAssistantPlaceholder(convId, assistantMsgId);
-            return;
+            return cancelledChatSendResult(
+              clientMessageId,
+              convId,
+              "The send was cancelled while waiting to reconnect.",
+            );
           }
           // Timed out waiting — surface the manual resend path (mirror the
           // generic branch: drop the placeholder, KEEP the user's message,
@@ -2157,6 +2334,13 @@ export function useChatSend(deps: UseChatSendDeps) {
                 : {}),
             });
           }
+          return failedChatSendResult(
+            clientMessageId,
+            convId,
+            "transport",
+            err instanceof Error ? err.message : "Reconnect timed out.",
+            true,
+          );
         } else {
           // Non-abort, non-404 send failure (network/timeout/5xx/auth/429/4xx).
           // Reaches here on a NON-retryable failure, or a retryable one whose
@@ -2227,6 +2411,15 @@ export function useChatSend(deps: UseChatSendDeps) {
               });
             }
           }
+          const validationFailure =
+            getSendValidationFailureMessage(err) !== null;
+          return failedChatSendResult(
+            clientMessageId,
+            convId,
+            validationFailure ? "validation" : "transport",
+            err instanceof Error ? err.message : buildSendFailureNotice(err),
+            !validationFailure && !isAuth,
+          );
         }
       } finally {
         // Belt-and-braces: cancel any frame still pending so it can't commit a
@@ -2319,10 +2512,19 @@ export function useChatSend(deps: UseChatSendDeps) {
         const nextTurn = chatSendQueueRef.current.shift();
         if (!nextTurn) break;
         try {
-          await runQueuedChatSend(nextTurn);
-          nextTurn.resolve();
+          const result = await runQueuedChatSend(nextTurn);
+          if (result === CHAT_SEND_RETRY_QUEUED) continue;
+          nextTurn.resolve(result);
         } catch (err) {
-          nextTurn.reject(err);
+          nextTurn.resolve(
+            failedChatSendResult(
+              nextTurn.clientMessageId,
+              nextTurn.conversationId ?? null,
+              "unknown",
+              err instanceof Error ? err.message : "Chat send failed.",
+              false,
+            ),
+          );
         }
       }
     } finally {
@@ -2382,10 +2584,33 @@ export function useChatSend(deps: UseChatSendDeps) {
         /** Stable idempotency key for native/system callers replaying a send. */
         clientMessageId?: string;
       },
-    ) => {
+    ): Promise<ChatSendResult> => {
+      const requestedClientMessageId = options?.clientMessageId;
+      if (
+        requestedClientMessageId !== undefined &&
+        (requestedClientMessageId.trim() !== requestedClientMessageId ||
+          requestedClientMessageId.length === 0 ||
+          requestedClientMessageId.length > CHAT_CLIENT_MESSAGE_ID_MAX_LENGTH)
+      ) {
+        return failedChatSendResult(
+          requestedClientMessageId,
+          options?.conversationId ?? activeConversationIdRef.current ?? null,
+          "validation",
+          "The client message id is invalid.",
+          false,
+        );
+      }
+      const clientMessageId =
+        requestedClientMessageId ?? generateChatClientMessageId();
       const hasAttachedImages = Boolean(options?.images?.length);
       if (!rawInput.trim() && !hasAttachedImages) {
-        return;
+        return failedChatSendResult(
+          clientMessageId,
+          options?.conversationId ?? activeConversationIdRef.current ?? null,
+          "empty",
+          "Nothing was available to send.",
+          false,
+        );
       }
 
       // Claim + clear the active reply target here — the single chokepoint every
@@ -2405,7 +2630,7 @@ export function useChatSend(deps: UseChatSendDeps) {
         setChatReplyTarget(null);
       }
 
-      await new Promise<void>((resolve, reject) => {
+      return new Promise<ChatSendResult>((resolve) => {
         chatSendQueueRef.current.push({
           rawInput,
           channelType: options?.channelType ?? "DM",
@@ -2423,9 +2648,8 @@ export function useChatSend(deps: UseChatSendDeps) {
             options?.conversationId ?? activeConversationIdRef.current ?? null,
           images: options?.images,
           metadata: buildChatViewMetadata(tab, metadata),
-          clientMessageId: options?.clientMessageId,
+          clientMessageId,
           resolve,
-          reject,
         });
         setChatSending(true);
         void flushQueuedChatSends();

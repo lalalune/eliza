@@ -496,9 +496,19 @@ export function cloneWithoutBlockedObjectKeys<T>(value: T): T {
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 const DATA_URL_RE = /^data:([^,]*),([\s\S]*)$/;
 
+type MaterializeChatAttachmentsFailure = {
+  ok: false;
+  status: 400 | 413 | 422;
+  error: string;
+};
+
 export type MaterializeChatAttachmentsResult =
   | { ok: true; images: ChatImageAttachment[] | undefined }
-  | { ok: false; status: 400 | 413 | 422; error: string };
+  | MaterializeChatAttachmentsFailure;
+
+type MaterializeDataUrlResult =
+  | { ok: true; image: ChatImageAttachment }
+  | MaterializeChatAttachmentsFailure;
 
 function attachmentNameFromUrl(url: string): string {
   try {
@@ -511,18 +521,30 @@ function attachmentNameFromUrl(url: string): string {
   }
 }
 
-function normalizedAttachmentMime(value: string | undefined): string {
-  return (value ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+function normalizedAttachmentMime(
+  value: string | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  const separatorIndex = value.indexOf(";");
+  const normalized = (
+    separatorIndex === -1 ? value : value.slice(0, separatorIndex)
+  )
+    .trim()
+    .toLowerCase();
+  return normalized || undefined;
 }
 
 function materializeDataUrl(
   dataUrl: string,
   name: string | undefined,
-): MaterializeChatAttachmentsResult {
+): MaterializeDataUrlResult {
   const match = DATA_URL_RE.exec(dataUrl.trim());
   if (!match) return { ok: false, status: 400, error: "Invalid data URL" };
-  const header = match[1] ?? "";
-  const payload = match[2] ?? "";
+  const header = match[1];
+  const payload = match[2];
+  if (header === undefined || payload === undefined) {
+    return { ok: false, status: 400, error: "Invalid data URL" };
+  }
   const tokens = header.split(";");
   const mimeType = normalizedAttachmentMime(tokens.shift());
   if (!mimeType) {
@@ -538,7 +560,7 @@ function materializeDataUrl(
     }
     return {
       ok: true,
-      images: [{ data: compact, mimeType, name: name ?? "attachment" }],
+      image: { data: compact, mimeType, name: name ?? "attachment" },
     };
   }
   try {
@@ -547,7 +569,7 @@ function materializeDataUrl(
     );
     return {
       ok: true,
-      images: [{ data, mimeType, name: name ?? "attachment" }],
+      image: { data, mimeType, name: name ?? "attachment" },
     };
   } catch {
     // error-policy:J3 malformed percent encoding is explicit invalid input.
@@ -623,7 +645,7 @@ export async function materializeChatAttachmentInputs(
         }
         const materialized = materializeDataUrl(input.dataUrl, input.name);
         if (!materialized.ok) return materialized;
-        images.push(...(materialized.images ?? []));
+        images.push(materialized.image);
         break;
       }
       case "remote": {
@@ -701,8 +723,16 @@ export async function materializeChatAttachmentInputs(
             error: "Stored media was not found",
           };
         }
-        const size = Number(head.headers["Content-Length"] ?? 0);
-        if (Number.isFinite(size) && size > MAX_CHAT_MEDIA_RAW_BYTES) {
+        const declaredSize = head.headers["Content-Length"];
+        const size = Number(declaredSize);
+        if (declaredSize === undefined || !Number.isFinite(size) || size < 0) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Stored media has invalid size metadata",
+          };
+        }
+        if (size > MAX_CHAT_MEDIA_RAW_BYTES) {
           return {
             ok: false,
             status: 413,
@@ -720,6 +750,13 @@ export async function materializeChatAttachmentInputs(
         const mimeType = normalizedAttachmentMime(
           stored.headers["Content-Type"] ?? input.mimeType,
         );
+        if (!mimeType) {
+          return {
+            ok: false,
+            status: 400,
+            error: "Stored attachment has no MIME type",
+          };
+        }
         images.push({
           data: stored.body.toString("base64"),
           mimeType,

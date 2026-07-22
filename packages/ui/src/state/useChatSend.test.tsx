@@ -11,6 +11,7 @@ import { act, renderHook } from "@testing-library/react";
 import type { MutableRefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  ChatSendResult,
   ChatToolCallEvent,
   ChatTurnStatus,
   CodingAgentSession,
@@ -235,7 +236,7 @@ describe("useChatSend stop handling", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hello", {
         conversationId: "conv-1",
@@ -267,7 +268,7 @@ describe("useChatSend stop handling", () => {
     const deps = makeDeps();
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hello");
       await started.promise;
@@ -298,7 +299,7 @@ describe("useChatSend stop handling", () => {
     const deps = makeDeps();
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hello");
       await Promise.resolve();
@@ -336,7 +337,7 @@ describe("useChatSend stop handling", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hello", {
         conversationId: "conv-1",
@@ -464,7 +465,7 @@ describe("useChatSend stop handling", () => {
     });
     const view = renderHook(() => useChatSend(deps));
 
-    let sendPromise!: Promise<void>;
+    let sendPromise!: Promise<unknown>;
     await act(async () => {
       sendPromise = view.result.current.sendChatText("survive reload", {
         conversationId: "conv-1",
@@ -492,7 +493,7 @@ describe("useChatSend stop handling", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise!: Promise<void>;
+    let sendPromise!: Promise<unknown>;
     await act(async () => {
       sendPromise = result.current.sendChatText("stop settles", {
         conversationId: "conv-1",
@@ -874,7 +875,7 @@ describe("useChatSend streaming-frame coalescing (text + status + tool)", () => 
     const setStatusSpy = deps.setServerTurnStatus as ReturnType<typeof vi.fn>;
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",
@@ -996,7 +997,7 @@ describe("useChatSend streaming-frame coalescing (text + status + tool)", () => 
     const setStatusSpy = deps.setServerTurnStatus as ReturnType<typeof vi.fn>;
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise!: Promise<void>;
+    let sendPromise!: Promise<unknown>;
     act(() => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",
@@ -1057,7 +1058,7 @@ describe("useChatSend streaming-frame coalescing (text + status + tool)", () => 
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise!: Promise<void>;
+    let sendPromise!: Promise<unknown>;
     await act(async () => {
       sendPromise = result.current.sendChatText("A send", {
         conversationId: "conv-A",
@@ -1097,6 +1098,32 @@ describe("useChatSend non-404 send failures", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.client.getBaseUrl.mockReturnValue("");
+  });
+
+  it("rejects a non-canonical caller id before the persistence boundary", async () => {
+    const deps = makeDeps({
+      activeConversationId: "conv-1",
+      conversations: [conversation("conv-1", "room-1")],
+    });
+    const { result } = renderHook(() => useChatSend(deps));
+
+    let outcome: ChatSendResult | undefined;
+    await act(async () => {
+      outcome = await result.current.sendChatText("hi", {
+        conversationId: "conv-1",
+        clientMessageId: " padded-id ",
+      });
+    });
+
+    expect(outcome).toEqual({
+      status: "failed",
+      conversationId: "conv-1",
+      clientMessageId: " padded-id ",
+      reason: "validation",
+      message: "The client message id is invalid.",
+      retryable: false,
+    });
+    expect(mocks.client.sendConversationMessageStream).not.toHaveBeenCalled();
   });
 
   it("surfaces a notice + keeps the user message on a transient (non-404) send failure", async () => {
@@ -1187,7 +1214,7 @@ describe("useChatSend non-404 send failures", () => {
       });
       const { result } = renderHook(() => useChatSend(deps));
 
-      let sendPromise: Promise<void> | undefined;
+      let sendPromise: Promise<unknown> | undefined;
       await act(async () => {
         sendPromise = result.current.sendChatText("hi", {
           conversationId: "conv-1",
@@ -1270,7 +1297,7 @@ describe("useChatSend freeze-on-shared during handoff (PR2)", () => {
     // once the message is actually delivered, so we don't await it here — it
     // must stay pending (queued) until the switch settles.
     let sendSettled = false;
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current
         .sendChatText("during handoff", { conversationId: "conv-1" })
@@ -1323,7 +1350,7 @@ describe("useChatSend freeze-on-shared during handoff (PR2)", () => {
 
     act(() => dispatchHandoffPhase("migrating"));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("during handoff", {
         conversationId: "conv-1",
@@ -1374,7 +1401,7 @@ describe("useChatSend freeze-on-shared during handoff (PR2)", () => {
 
     // Send A starts on the SHARED base BEFORE the handoff — it is not frozen, so
     // it enters the drain loop and parks mid-await (the drain loop stays busy).
-    let aPromise: Promise<void> | undefined;
+    let aPromise: Promise<unknown> | undefined;
     await act(async () => {
       aPromise = result.current.sendChatText("before handoff", {
         conversationId: "conv-1",
@@ -1385,7 +1412,7 @@ describe("useChatSend freeze-on-shared during handoff (PR2)", () => {
 
     // Handoff begins while A is still in flight, then the user fires B.
     act(() => dispatchHandoffPhase("migrating"));
-    let bPromise: Promise<void> | undefined;
+    let bPromise: Promise<unknown> | undefined;
     await act(async () => {
       bPromise = result.current.sendChatText("during handoff", {
         conversationId: "conv-1",
@@ -2231,6 +2258,62 @@ describe("useChatSend — structured SSE error surfaces the gate (#10231)", () =
     expect(deps.setActionNotice).not.toHaveBeenCalled();
   });
 
+  it("reports an accepted user turn when generation errors after persistence", async () => {
+    let sentClientMessageId = "";
+    mocks.client.sendConversationMessageStream.mockImplementation(
+      async (
+        _conversationId: string,
+        _text: string,
+        _onToken: unknown,
+        _channelType: unknown,
+        _signal: unknown,
+        _images: unknown,
+        _metadata: unknown,
+        _onStatus: unknown,
+        _onTool: unknown,
+        clientMessageId: string,
+      ) => {
+        sentClientMessageId = clientMessageId;
+        throw new StreamGenerationError({
+          message: "assistant persistence failed",
+          receipt: {
+            conversationId: "conv-1",
+            clientMessageId,
+            userMessageId: "persisted-user-memory",
+          },
+        });
+      },
+    );
+    const deps = makeDeps({
+      activeConversationId: "conv-1",
+      conversations: [conversation("conv-1", "room-1")],
+    });
+    const { result } = renderHook(() => useChatSend(deps));
+
+    let outcome: ChatSendResult | undefined;
+    await act(async () => {
+      outcome = await result.current.sendChatText("hi", {
+        conversationId: "conv-1",
+      });
+    });
+
+    expect(outcome).toEqual({
+      status: "accepted",
+      receipt: {
+        conversationId: "conv-1",
+        clientMessageId: sentClientMessageId,
+        userMessageId: "persisted-user-memory",
+      },
+      completed: false,
+    });
+    expect(deps.setActionNotice).toHaveBeenCalledTimes(1);
+    expect(
+      deps.conversationMessagesRef.current.some(
+        (message) => message.role === "assistant" && message.text === "",
+      ),
+    ).toBe(false);
+  });
+
   it("still shows a generic notice for a plain (unstructured) stream error", async () => {
     mocks.client.sendConversationMessageStream.mockRejectedValue(
       new Error("network blip"),
@@ -2567,7 +2650,15 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
         seenIds.push(clientMessageId);
         if (attempt === 1) throw networkError();
         onToken("hi there", "hi there");
-        return { text: "hi there", completed: true };
+        return {
+          text: "hi there",
+          completed: true,
+          receipt: {
+            conversationId: "conv-1",
+            clientMessageId: clientMessageId ?? "missing-client-id",
+            userMessageId: "persisted-user-memory",
+          },
+        };
       },
     );
     const deps = makeDeps({
@@ -2576,7 +2667,7 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<ChatSendResult> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",
@@ -2589,9 +2680,10 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     // it's sending.
     expect(deps.setActionNotice).not.toHaveBeenCalled();
 
+    let outcome: ChatSendResult | undefined;
     await act(async () => {
       await dispatchReconnectAndSettle();
-      await sendPromise;
+      outcome = await sendPromise;
     });
 
     // Exactly two attempts (original + one retry), no loop.
@@ -2600,6 +2692,15 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     expect(seenIds).toHaveLength(2);
     expect(seenIds[0]).toBeTruthy();
     expect(seenIds[1]).toBe(seenIds[0]);
+    expect(outcome).toEqual({
+      status: "accepted",
+      receipt: {
+        conversationId: "conv-1",
+        clientMessageId: seenIds[0],
+        userMessageId: "persisted-user-memory",
+      },
+      completed: true,
+    });
     expect(
       deps.conversationMessagesRef.current.map(({ role, text }) => ({
         role,
@@ -2631,7 +2732,7 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",
@@ -2690,7 +2791,7 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",
@@ -2727,7 +2828,7 @@ describe("useChatSend E2 auto-retry on reconnect", () => {
     });
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",

@@ -37,7 +37,7 @@ import {
   type UUID,
   validateUuid,
 } from "@elizaos/core";
-import type { ChatFailureKind } from "@elizaos/shared";
+import type { ChatFailureKind, ChatSendReceipt } from "@elizaos/shared";
 import {
   PatchConversationRequestSchema,
   PostConversationCleanupEmptyRequestSchema,
@@ -58,12 +58,15 @@ import type {
   LogEntry,
 } from "./chat-routes.ts";
 import {
+  allowChatMessageGenerationRetry,
+  claimChatMessageGenerationRetry,
   classifyChatFailure,
   createChatTokenStreamWriter,
   generateChatResponse,
   generateConversationTitle,
   getChatFailureReply,
   getChatMessageIdFirstSeenAt,
+  getChatMessageUserMemoryId,
   getRecentVisibleAssistantMemoryTextSince,
   hasRecentVisibleAssistantMemorySince,
   initSse,
@@ -73,6 +76,7 @@ import {
   persistAssistantConversationMemory,
   persistConversationMemory,
   readChatRequestPayload,
+  recordChatMessageUserMemoryId,
   releaseChatMessageId,
   resolveNoResponseFallback,
   writeChatStatusSse,
@@ -257,6 +261,15 @@ export interface ConversationRouteState {
 
 export interface ConversationRouteContext extends RouteRequestContext {
   state: ConversationRouteState;
+}
+
+function chatSendReceipt(
+  conversationId: string,
+  clientMessageId: string | undefined,
+  userMessageId: string | null | undefined,
+): ChatSendReceipt | undefined {
+  if (!clientMessageId || !userMessageId) return undefined;
+  return { conversationId, clientMessageId, userMessageId };
 }
 
 /**
@@ -2499,10 +2512,22 @@ export async function handleConversationRoutes(
     // placeholder on an empty completed turn and reconciles from history once
     // the first attempt lands. Requests without a clientMessageId are never
     // treated as duplicates.
-    if (isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)) {
+    const resumedUserMessageId = claimChatMessageGenerationRetry(
+      conv.roomId,
+      clientMessageId ?? null,
+    );
+    if (
+      !resumedUserMessageId &&
+      isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)
+    ) {
       const firstSeenAt = getChatMessageIdFirstSeenAt(
         conv.roomId,
         clientMessageId ?? null,
+      );
+      const receipt = chatSendReceipt(
+        conv.id,
+        clientMessageId,
+        getChatMessageUserMemoryId(conv.roomId, clientMessageId ?? null),
       );
       const persistedFirstReply =
         state.runtime && firstSeenAt !== null
@@ -2523,12 +2548,14 @@ export async function handleConversationRoutes(
               type: "done",
               fullText: persistedFirstReply,
               agentName: state.agentName,
+              ...(receipt ? { receipt } : {}),
             }
           : {
               type: "done",
               fullText: "",
               agentName: state.agentName,
               noResponseReason: "ignored",
+              ...(receipt ? { receipt } : {}),
             },
       );
       finishStreamResponse();
@@ -2559,6 +2586,15 @@ export async function handleConversationRoutes(
       writeConversationStreamHeartbeat(res, disconnectTracker);
     }, 5000);
     const failStream = (message: string): true => {
+      if (resumedUserMessageId) {
+        // A resumed request still owns the original persisted user turn. Make
+        // the generation retry available again if setup fails before the model.
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
+      } else {
+        // No user-memory receipt exists on a first-attempt setup failure. Let a
+        // reconnect retry re-enter instead of suppressing an unaccepted turn.
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      }
       writeSse(res, { type: "error", message });
       clearInterval(heartbeatInterval);
       finishStreamResponse();
@@ -2585,24 +2621,67 @@ export async function handleConversationRoutes(
       );
     }
 
-    const { userMessage, messageToStore } = await buildUserMessages({
-      images,
-      prompt,
-      userId,
-      agentId: runtime.agentId,
-      roomId: conv.roomId,
-      channelType,
-      messageSource: source,
-      metadata: chatMetadata,
-    });
-
-    try {
-      await persistConversationMemory(runtime, messageToStore);
-    } catch (err) {
-      return failStream(
-        `Failed to store user message: ${getErrorMessage(err)}`,
-      );
+    let userMessage: ReturnType<typeof createMessageMemory>;
+    let messageToStore: ReturnType<typeof createMessageMemory>;
+    if (resumedUserMessageId) {
+      let persistedUserMessage: Awaited<
+        ReturnType<typeof runtime.getMemoryById>
+      >;
+      try {
+        persistedUserMessage =
+          await runtime.getMemoryById(resumedUserMessageId);
+      } catch (err) {
+        // error-policy:J1 SSE route boundary translates receipt recovery failure.
+        return failStream(
+          `Failed to recover persisted user message: ${getErrorMessage(err)}`,
+        );
+      }
+      if (!persistedUserMessage) {
+        return failStream(
+          "Persisted user message receipt could not be recovered",
+        );
+      }
+      userMessage = persistedUserMessage;
+      messageToStore = persistedUserMessage;
+    } else {
+      try {
+        ({ userMessage, messageToStore } = await buildUserMessages({
+          images,
+          prompt,
+          userId,
+          agentId: runtime.agentId,
+          roomId: conv.roomId,
+          channelType,
+          messageSource: source,
+          metadata: chatMetadata,
+        }));
+      } catch (err) {
+        // error-policy:J1 SSE route boundary translates message construction failure.
+        return failStream(
+          `Failed to build user message: ${getErrorMessage(err)}`,
+        );
+      }
     }
+    const userMessageId = messageToStore.id;
+    if (!userMessageId)
+      return failStream("User message was created without a persistent id");
+
+    if (!resumedUserMessageId) {
+      try {
+        await persistConversationMemory(runtime, messageToStore);
+        recordChatMessageUserMemoryId(
+          conv.roomId,
+          clientMessageId ?? null,
+          userMessageId,
+        );
+      } catch (err) {
+        // error-policy:J1 SSE route boundary translates user-memory write failure.
+        return failStream(
+          `Failed to store user message: ${getErrorMessage(err)}`,
+        );
+      }
+    }
+    const receipt = chatSendReceipt(conv.id, clientMessageId, userMessageId);
 
     const walletModeGuidance = resolveWalletModeGuidanceReply(state, prompt);
     if (walletModeGuidance) {
@@ -2623,6 +2702,7 @@ export async function handleConversationRoutes(
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
+              ...(receipt ? { receipt } : {}),
             });
             return true;
           }
@@ -2630,6 +2710,7 @@ export async function handleConversationRoutes(
             type: "done",
             fullText: walletModeGuidance,
             agentName: state.agentName,
+            ...(receipt ? { receipt } : {}),
           });
         }
       } finally {
@@ -2755,6 +2836,7 @@ export async function handleConversationRoutes(
             type: "done",
             fullText: resolvedText,
             agentName: result.agentName,
+            ...(receipt ? { receipt } : {}),
             ...(result.thought ? { thought: result.thought } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.actionResults?.length
@@ -2806,6 +2888,7 @@ export async function handleConversationRoutes(
             fullText: "",
             agentName: result.agentName,
             noResponseReason: "ignored",
+            ...(receipt ? { receipt } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.actionResults?.length
               ? { actionResults: result.actionResults }
@@ -2819,11 +2902,10 @@ export async function handleConversationRoutes(
           { conversationId: conv.id, roomId: conv.roomId },
           "[ConversationStream] generation aborted",
         );
-        // The aborted turn persisted no assistant reply — release the
-        // idempotency key so the client's blip-retry re-runs the turn
-        // instead of being suppressed into dead air (the iOS-suspend →
-        // disconnect-abort → retry-eaten scenario).
-        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+        // The user memory already exists. Let one reconnect resume generation
+        // with that exact id instead of either suppressing the retry or writing
+        // a duplicate user turn.
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
       } else if (!disconnectTracker.isAborted()) {
         // If text was already streamed to the client (e.g. the initial
         // response succeeded but planner follow-up failed), use the
@@ -2850,11 +2932,13 @@ export async function handleConversationRoutes(
               type: "done",
               fullText: streamedText,
               agentName: state.agentName,
+              ...(receipt ? { receipt } : {}),
             });
           } catch (persistErr) {
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
+              ...(receipt ? { receipt } : {}),
             });
           }
         } else {
@@ -2884,6 +2968,7 @@ export async function handleConversationRoutes(
               type: "done",
               fullText: "",
               agentName: state.agentName,
+              ...(receipt ? { receipt } : {}),
             });
             return true;
           }
@@ -2901,6 +2986,7 @@ export async function handleConversationRoutes(
               type: "done",
               fullText: providerIssueReply,
               agentName: state.agentName,
+              ...(receipt ? { receipt } : {}),
               // See non-streaming branch — renderer gates chat input on
               // failureKind === "no_provider".
               failureKind,
@@ -2909,15 +2995,14 @@ export async function handleConversationRoutes(
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
+              ...(receipt ? { receipt } : {}),
             });
           }
         }
       } else {
-        // Error after the client already disconnected: no fallback reply is
-        // persisted (the gate above skips it), so nothing was delivered for
-        // this turn — release the idempotency key so the client's
-        // reconnect-retry re-runs it instead of being eaten.
-        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+        // No fallback reply was persisted after disconnect. Resume generation
+        // on one reconnect while retaining the original persisted user id.
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
       }
     } finally {
       clearInterval(heartbeatInterval);
@@ -2977,7 +3062,14 @@ export async function handleConversationRoutes(
     // `noResponseReason: "ignored"` to an empty reply — so it still reads as
     // success without starting a second LLM turn or persisting a duplicate
     // assistant memory.
-    if (isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)) {
+    const resumedUserMessageId = claimChatMessageGenerationRetry(
+      conv.roomId,
+      clientMessageId ?? null,
+    );
+    if (
+      !resumedUserMessageId &&
+      isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)
+    ) {
       const firstSeenAt = getChatMessageIdFirstSeenAt(
         conv.roomId,
         clientMessageId ?? null,
@@ -2993,13 +3085,23 @@ export async function handleConversationRoutes(
               0,
             )
           : null;
+      const receipt = chatSendReceipt(
+        conv.id,
+        clientMessageId,
+        getChatMessageUserMemoryId(conv.roomId, clientMessageId ?? null),
+      );
       if (persistedFirstReply) {
-        json(res, { text: persistedFirstReply, agentName: state.agentName });
+        json(res, {
+          text: persistedFirstReply,
+          agentName: state.agentName,
+          ...(receipt ? { receipt } : {}),
+        });
       } else {
         json(res, {
           text: "",
           agentName: state.agentName,
           noResponseReason: "ignored",
+          ...(receipt ? { receipt } : {}),
         });
       }
       return true;
@@ -3008,6 +3110,9 @@ export async function handleConversationRoutes(
     // instead of dropping it; the client already shows the optimistic bubble.
     const runtime = await resolveRuntimeForChatTurn(state);
     if (!runtime) {
+      if (resumedUserMessageId)
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
+      else releaseChatMessageId(conv.roomId, clientMessageId ?? null);
       error(res, "Agent is not running", 503);
       return true;
     }
@@ -3018,6 +3123,9 @@ export async function handleConversationRoutes(
     try {
       await ensureConversationRoom(state, conv, caller);
     } catch (err) {
+      if (resumedUserMessageId)
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
+      else releaseChatMessageId(conv.roomId, clientMessageId ?? null);
       error(
         res,
         `Failed to initialize conversation room: ${getErrorMessage(err)}`,
@@ -3026,23 +3134,83 @@ export async function handleConversationRoutes(
       return true;
     }
 
-    const { userMessage, messageToStore } = await buildUserMessages({
-      images,
-      prompt,
-      userId,
-      agentId: runtime.agentId,
-      roomId: conv.roomId,
-      channelType,
-      messageSource: source,
-      metadata: restMetadata,
-    });
-
-    try {
-      await persistConversationMemory(runtime, messageToStore);
-    } catch (err) {
-      error(res, `Failed to store user message: ${getErrorMessage(err)}`, 500);
+    const failUserMessageSetup = (message: string): true => {
+      if (resumedUserMessageId)
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
+      else releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      error(res, message, 500);
+      return true;
+    };
+    let userMessage: ReturnType<typeof createMessageMemory>;
+    let messageToStore: ReturnType<typeof createMessageMemory>;
+    if (resumedUserMessageId) {
+      let persistedUserMessage: Awaited<
+        ReturnType<typeof runtime.getMemoryById>
+      >;
+      try {
+        persistedUserMessage =
+          await runtime.getMemoryById(resumedUserMessageId);
+      } catch (err) {
+        // error-policy:J1 HTTP route boundary translates receipt recovery failure.
+        return failUserMessageSetup(
+          `Failed to recover persisted user message: ${getErrorMessage(err)}`,
+        );
+      }
+      if (!persistedUserMessage) {
+        return failUserMessageSetup(
+          "Persisted user message receipt could not be recovered",
+        );
+      }
+      userMessage = persistedUserMessage;
+      messageToStore = persistedUserMessage;
+    } else {
+      try {
+        ({ userMessage, messageToStore } = await buildUserMessages({
+          images,
+          prompt,
+          userId,
+          agentId: runtime.agentId,
+          roomId: conv.roomId,
+          channelType,
+          messageSource: source,
+          metadata: restMetadata,
+        }));
+      } catch (err) {
+        // error-policy:J1 HTTP route boundary translates message construction failure.
+        return failUserMessageSetup(
+          `Failed to build user message: ${getErrorMessage(err)}`,
+        );
+      }
+    }
+    const userMessageId = messageToStore.id;
+    if (!userMessageId) {
+      if (resumedUserMessageId)
+        allowChatMessageGenerationRetry(conv.roomId, clientMessageId ?? null);
+      else releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      error(res, "User message was created without a persistent id", 500);
       return true;
     }
+
+    if (!resumedUserMessageId) {
+      try {
+        await persistConversationMemory(runtime, messageToStore);
+        recordChatMessageUserMemoryId(
+          conv.roomId,
+          clientMessageId ?? null,
+          userMessageId,
+        );
+      } catch (err) {
+        // error-policy:J1 HTTP route boundary translates user-memory write failure.
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+        error(
+          res,
+          `Failed to store user message: ${getErrorMessage(err)}`,
+          500,
+        );
+        return true;
+      }
+    }
+    const receipt = chatSendReceipt(conv.id, clientMessageId, userMessageId);
 
     const walletModeGuidance = resolveWalletModeGuidanceReply(state, prompt);
     if (walletModeGuidance) {
@@ -3059,6 +3227,7 @@ export async function handleConversationRoutes(
         json(res, {
           text: walletModeGuidance,
           agentName: state.agentName,
+          ...(receipt ? { receipt } : {}),
         });
       } catch (persistErr) {
         error(res, getErrorMessage(persistErr), 500);
@@ -3115,6 +3284,7 @@ export async function handleConversationRoutes(
         json(res, {
           text: resolvedText,
           agentName: result.agentName,
+          ...(receipt ? { receipt } : {}),
           ...(result.actionResults?.length
             ? { actionResults: result.actionResults }
             : {}),
@@ -3134,6 +3304,7 @@ export async function handleConversationRoutes(
           text: "",
           agentName: result.agentName,
           noResponseReason: "ignored",
+          ...(receipt ? { receipt } : {}),
           ...(result.actionResults?.length
             ? { actionResults: result.actionResults }
             : {}),
@@ -3156,6 +3327,7 @@ export async function handleConversationRoutes(
         json(res, {
           text: providerIssueReply,
           agentName: state.agentName,
+          ...(receipt ? { receipt } : {}),
           // Renderer keys off this discriminator. "no_provider" means the
           // chat input should be gated with a "Connect a provider" CTA
           // instead of treating the message text as a normal assistant

@@ -49,6 +49,14 @@ type MockOptions = {
   generate?: GenerateFn;
 };
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const BUNDLE_INDEX_KEY = "eliza:ios-local-agent:eliza-1-bundles:v1";
 
 function eliza1MobileManifest(modelId = "eliza-1-2b"): Record<string, unknown> {
@@ -488,6 +496,292 @@ describe("iOS local-agent local inference flow", () => {
       }),
     );
     expect(load.mock.calls[0]?.[0]).not.toHaveProperty("draftModelPath");
+  });
+
+  it("dedupes a retried local send with the exact persisted user-message receipt", async () => {
+    const generate = vi.fn(async (_options: Record<string, unknown>) => ({
+      text: "local answer",
+      promptTokens: 4,
+      outputTokens: 2,
+      durationMs: 10,
+    }));
+    const kernel = await loadKernel({
+      generate,
+      availableModels: [
+        {
+          name: "eliza-1-2b-128k.gguf",
+          path: "/models/eliza-1-2b-128k.gguf",
+          size: 1_200_000_000,
+        },
+      ],
+      bundleRecords: [
+        verifiedEliza1BundleRecord(
+          "eliza-1-2b",
+          "/models/eliza-1-2b-128k.gguf",
+        ),
+      ],
+    });
+    await jsonRequest(kernel, "POST", "/api/local-inference/active", {
+      modelId: "eliza-1-2b",
+    });
+    const created = (await jsonRequest(kernel, "POST", "/api/conversations", {
+      title: "Receipt test",
+    })) as { conversation: { id: string } };
+    const path = `/api/conversations/${created.conversation.id}/messages`;
+    const body = { text: "hello", clientMessageId: "ios-retry-1" };
+
+    const first = (await jsonRequest(kernel, "POST", path, body)) as {
+      receipt: {
+        conversationId: string;
+        clientMessageId: string;
+        userMessageId: string;
+      };
+    };
+    const retry = (await jsonRequest(kernel, "POST", path, body)) as {
+      receipt: typeof first.receipt;
+    };
+    const history = (await jsonRequest(kernel, "GET", path)) as {
+      messages: Array<{ id: string; role: string }>;
+    };
+
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(retry.receipt).toEqual(first.receipt);
+    expect(first.receipt).toMatchObject({
+      conversationId: created.conversation.id,
+      clientMessageId: "ios-retry-1",
+    });
+    expect(first.receipt.userMessageId).toBe(
+      history.messages.find((message) => message.role === "user")?.id,
+    );
+  });
+
+  it("resumes a failed local generation from the persisted user turn exactly once", async () => {
+    type GeneratedReply = {
+      text: string;
+      promptTokens: number;
+      outputTokens: number;
+      durationMs: number;
+    };
+    const resumedGeneration = deferred<GeneratedReply>();
+    const aborted = Object.assign(new Error("first inference aborted"), {
+      name: "AbortError",
+    });
+    const generate = vi
+      .fn()
+      .mockRejectedValueOnce(aborted)
+      .mockImplementationOnce(async () => resumedGeneration.promise);
+    const kernel = await loadKernel({
+      generate,
+      availableModels: [
+        {
+          name: "eliza-1-2b-128k.gguf",
+          path: "/models/eliza-1-2b-128k.gguf",
+          size: 1_200_000_000,
+        },
+      ],
+      bundleRecords: [
+        verifiedEliza1BundleRecord(
+          "eliza-1-2b",
+          "/models/eliza-1-2b-128k.gguf",
+        ),
+      ],
+    });
+    await jsonRequest(kernel, "POST", "/api/local-inference/active", {
+      modelId: "eliza-1-2b",
+    });
+    const created = (await jsonRequest(kernel, "POST", "/api/conversations", {
+      title: "Failed receipt retry test",
+    })) as { conversation: { id: string } };
+    const path = `/api/conversations/${created.conversation.id}/messages`;
+    const body = { text: "original turn", clientMessageId: "ios-failed-1" };
+
+    await expect(
+      kernel.handleIosLocalAgentRequest(
+        new Request(`http://127.0.0.1:31337${path}`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        }),
+      ),
+    ).rejects.toThrow("first inference aborted");
+
+    const failedHistory = (await jsonRequest(kernel, "GET", path)) as {
+      messages: Array<{
+        id: string;
+        role: string;
+        generationState?: string;
+      }>;
+    };
+    const persistedUser = failedHistory.messages.find(
+      (message) => message.role === "user",
+    );
+    expect(persistedUser).toMatchObject({ generationState: "failed" });
+    expect(
+      failedHistory.messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(0);
+
+    const resumedPromise = jsonRequest(kernel, "POST", path, {
+      text: "tampered retry payload",
+      clientMessageId: body.clientMessageId,
+    });
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(2));
+
+    // A concurrent duplicate observes the durable receipt but may not launch a
+    // second regeneration while the retry owns the persisted user turn.
+    const concurrent = (await jsonRequest(kernel, "POST", path, body)) as {
+      text: string;
+      receipt: {
+        conversationId: string;
+        clientMessageId: string;
+        userMessageId: string;
+      };
+    };
+    expect(concurrent).toMatchObject({
+      text: "",
+      receipt: {
+        conversationId: created.conversation.id,
+        clientMessageId: body.clientMessageId,
+        userMessageId: persistedUser?.id,
+      },
+    });
+    expect(generate).toHaveBeenCalledTimes(2);
+
+    resumedGeneration.resolve({
+      text: "recovered answer",
+      promptTokens: 4,
+      outputTokens: 2,
+      durationMs: 12,
+    });
+    const resumed = (await resumedPromise) as {
+      text: string;
+      receipt: typeof concurrent.receipt;
+    };
+    expect(resumed).toMatchObject({
+      text: "recovered answer",
+      receipt: concurrent.receipt,
+    });
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(generate.mock.calls[1]?.[0]).toMatchObject({
+      prompt: expect.stringContaining("original turn"),
+    });
+    expect(generate.mock.calls[1]?.[0]).toMatchObject({
+      prompt: expect.not.stringContaining("tampered retry payload"),
+    });
+
+    const finalHistory = (await jsonRequest(kernel, "GET", path)) as {
+      messages: Array<{ role: string; generationState?: string }>;
+    };
+    expect(
+      finalHistory.messages.filter((message) => message.role === "user"),
+    ).toEqual([expect.objectContaining({ generationState: "completed" })]);
+    expect(
+      finalHistory.messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(1);
+  });
+
+  it("returns the durable receipt to a retry while local inference is in flight", async () => {
+    type GeneratedReply = {
+      text: string;
+      promptTokens: number;
+      outputTokens: number;
+      durationMs: number;
+    };
+    const firstGeneration = deferred<GeneratedReply>();
+    const secondGeneration = deferred<GeneratedReply>();
+    const generate = vi
+      .fn()
+      .mockImplementationOnce(async () => firstGeneration.promise)
+      .mockImplementationOnce(async () => secondGeneration.promise);
+    const kernel = await loadKernel({
+      generate,
+      availableModels: [
+        {
+          name: "eliza-1-2b-128k.gguf",
+          path: "/models/eliza-1-2b-128k.gguf",
+          size: 1_200_000_000,
+        },
+      ],
+      bundleRecords: [
+        verifiedEliza1BundleRecord(
+          "eliza-1-2b",
+          "/models/eliza-1-2b-128k.gguf",
+        ),
+      ],
+    });
+    await jsonRequest(kernel, "POST", "/api/local-inference/active", {
+      modelId: "eliza-1-2b",
+    });
+    const created = (await jsonRequest(kernel, "POST", "/api/conversations", {
+      title: "Concurrent receipt test",
+    })) as { conversation: { id: string } };
+    const path = `/api/conversations/${created.conversation.id}/messages`;
+    const body = { text: "hello", clientMessageId: "ios-concurrent-1" };
+    const firstPromise = jsonRequest(kernel, "POST", path, body);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(1));
+
+    const retry = (await jsonRequest(kernel, "POST", path, body)) as {
+      receipt: {
+        conversationId: string;
+        clientMessageId: string;
+        userMessageId: string;
+      };
+    };
+    const history = (await jsonRequest(kernel, "GET", path)) as {
+      messages: Array<{ id: string; role: string }>;
+    };
+    expect(retry.receipt.userMessageId).toBe(
+      history.messages.find((message) => message.role === "user")?.id,
+    );
+    expect(
+      history.messages.filter((message) => message.role === "user"),
+    ).toHaveLength(1);
+
+    // A distinct turn can persist and finish while the first inference waits.
+    // The first completion must merge into the latest store, not overwrite it.
+    const otherPromise = jsonRequest(kernel, "POST", path, {
+      text: "second turn",
+      clientMessageId: "ios-concurrent-2",
+    });
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(2));
+    secondGeneration.resolve({
+      text: "second answer",
+      promptTokens: 4,
+      outputTokens: 2,
+      durationMs: 10,
+    });
+    await otherPromise;
+    firstGeneration.resolve({
+      text: "local answer",
+      promptTokens: 4,
+      outputTokens: 2,
+      durationMs: 12,
+    });
+    const first = (await firstPromise) as { receipt: typeof retry.receipt };
+    expect(first.receipt).toEqual(retry.receipt);
+    expect(generate).toHaveBeenCalledTimes(2);
+    const finalHistory = (await jsonRequest(kernel, "GET", path)) as {
+      messages: Array<{ role: string }>;
+    };
+    expect(
+      finalHistory.messages.filter((message) => message.role === "user"),
+    ).toHaveLength(2);
+    expect(
+      finalHistory.messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(2);
+
+    const firstRetry = (await jsonRequest(kernel, "POST", path, body)) as {
+      text: string;
+      receipt: typeof retry.receipt;
+    };
+    const secondRetry = (await jsonRequest(kernel, "POST", path, {
+      text: "second turn",
+      clientMessageId: "ios-concurrent-2",
+    })) as { text: string };
+    expect(firstRetry).toMatchObject({
+      text: "local answer",
+      receipt: retry.receipt,
+    });
+    expect(secondRetry.text).toBe("second answer");
+    expect(generate).toHaveBeenCalledTimes(2);
   });
 
   it("reports bundled voice assets separately from TTS engine readiness", async () => {

@@ -34,6 +34,7 @@ import type {
   ChatActionResultSummary,
   ChatAttachmentInput,
   ChatFailureKind,
+  ChatSendReceipt,
   ChatTokenUsage,
   ChatToolCallEvent,
   ChatTurnStatus,
@@ -92,6 +93,7 @@ type StreamChatEvent = {
   accountConnect?: AccountConnectRequest;
   localInference?: LocalInferenceChatMetadata;
   actionResults?: ChatActionResultSummary[];
+  receipt?: ChatSendReceipt;
   // `type: "status"` carries the in-flight phase flat on the event (the server
   // spreads ChatTurnStatus into the SSE payload), so `kind` + the optional
   // action/tool name live alongside the discriminator. `type: "tool"` likewise
@@ -115,24 +117,26 @@ type StreamChatEvent = {
 };
 
 /**
- * A terminal SSE `error` event carries a structured reason — a `failureKind`
- * gate (e.g. `no_provider`) or a "connect another account" request — that a
- * generic `Error` would drop, leaving the caller unable to render the gate/CTA
- * and falling back to a plain error notice (#10231). Throw this instead so the
- * chat-send catch can surface the same gate UI the completed-response path does.
+ * A terminal SSE `error` event can carry a structured gate, account-connect
+ * request, or receipt proving the user turn persisted before generation failed.
+ * A generic `Error` would drop those fields and make the renderer misreport the
+ * turn, so this preserves them for the chat-send boundary.
  */
 export class StreamGenerationError extends Error {
   readonly failureKind?: ChatFailureKind;
   readonly accountConnect?: AccountConnectRequest;
+  readonly receipt?: ChatSendReceipt;
   constructor(options: {
     message: string;
     failureKind?: ChatFailureKind;
     accountConnect?: AccountConnectRequest;
+    receipt?: ChatSendReceipt;
   }) {
     super(options.message);
     this.name = "StreamGenerationError";
     this.failureKind = options.failureKind;
     this.accountConnect = options.accountConnect;
+    this.receipt = options.receipt;
   }
 }
 
@@ -217,8 +221,31 @@ type StreamChatState = {
   doneAccountConnect: AccountConnectRequest | undefined;
   doneLocalInference: LocalInferenceChatMetadata | undefined;
   doneActionResults: ChatActionResultSummary[] | undefined;
+  doneReceipt: ChatSendReceipt | undefined;
   receivedDone: boolean;
 };
+
+function parseChatSendReceipt(value: unknown): ChatSendReceipt | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const receipt = value as Record<string, unknown>;
+  if (
+    typeof receipt.conversationId !== "string" ||
+    receipt.conversationId.length === 0 ||
+    typeof receipt.clientMessageId !== "string" ||
+    receipt.clientMessageId.length === 0 ||
+    typeof receipt.userMessageId !== "string" ||
+    receipt.userMessageId.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    conversationId: receipt.conversationId,
+    clientMessageId: receipt.clientMessageId,
+    userMessageId: receipt.userMessageId,
+  };
+}
 
 function normalizeBaseUrl(value: string | null | undefined): string {
   const trimmed = value?.slice(0, 4096).trim() ?? "";
@@ -342,6 +369,7 @@ function applyStreamChatDoneEvent(
   if (Array.isArray(parsed.actionResults)) {
     state.doneActionResults = parsed.actionResults;
   }
+  state.doneReceipt = parseChatSendReceipt(parsed.receipt);
   if (parsed.usage) {
     state.doneUsage = {
       promptTokens: parsed.usage.promptTokens ?? 0,
@@ -392,6 +420,7 @@ function applyStreamChatDataLine(
       message: parsed.message ?? "generation failed",
       failureKind: parsed.failureKind,
       accountConnect: parsed.accountConnect,
+      receipt: parseChatSendReceipt(parsed.receipt),
     });
   }
   return false;
@@ -1822,6 +1851,7 @@ export class ElizaClient {
     accountConnect?: AccountConnectRequest;
     localInference?: LocalInferenceChatMetadata;
     actionResults?: ChatActionResultSummary[];
+    receipt?: ChatSendReceipt;
   }> {
     // Idempotency key for the chat send. The HTTP chat path (POST
     // /api/chat[/:conversationId]/stream) lives in
@@ -1878,6 +1908,7 @@ export class ElizaClient {
       doneAccountConnect: undefined,
       doneLocalInference: undefined,
       doneActionResults: undefined,
+      doneReceipt: undefined,
       receivedDone: false,
     };
 
@@ -2032,6 +2063,7 @@ export class ElizaClient {
       ...(streamState.doneActionResults?.length
         ? { actionResults: streamState.doneActionResults }
         : {}),
+      ...(streamState.doneReceipt ? { receipt: streamState.doneReceipt } : {}),
     };
   }
 }

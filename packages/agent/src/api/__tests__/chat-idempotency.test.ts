@@ -10,12 +10,18 @@
  * an idempotency key are completely unaffected.
  */
 
+import { stringToUuid } from "@elizaos/core";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   __getChatDedupeTtlMsForTests,
   __resetChatDedupeForTests,
+  allowChatMessageGenerationRetry,
+  claimChatMessageGenerationRetry,
+  getChatMessageUserMemoryId,
   isDuplicateChatMessage,
   normalizeClientMessageId,
+  recordChatMessageUserMemoryId,
+  releaseChatMessageId,
 } from "../chat-routes.ts";
 
 const OLD_ARRIVAL_TTL_MS = 30_000;
@@ -112,6 +118,29 @@ describe("isDuplicateChatMessage", () => {
     // Each scope deduplicates independently.
     expect(isDuplicateChatMessage("room-x", "shared-id", now)).toBe(true);
     expect(isDuplicateChatMessage("room-y", "shared-id", now)).toBe(true);
+  });
+
+  it("binds a duplicate to the first real persisted user-memory receipt", () => {
+    const firstMemoryId = stringToUuid("user-memory-1");
+    const laterMemoryId = stringToUuid("later-memory");
+    expect(isDuplicateChatMessage(SCOPE, "receipt-key", 5_500_000)).toBe(false);
+    expect(getChatMessageUserMemoryId(SCOPE, "receipt-key")).toBeNull();
+    recordChatMessageUserMemoryId(SCOPE, "receipt-key", firstMemoryId);
+    recordChatMessageUserMemoryId(SCOPE, "receipt-key", laterMemoryId);
+    expect(getChatMessageUserMemoryId(SCOPE, "receipt-key")).toBe(
+      firstMemoryId,
+    );
+    expect(isDuplicateChatMessage(SCOPE, "receipt-key", 5_500_001)).toBe(true);
+
+    allowChatMessageGenerationRetry(SCOPE, "receipt-key");
+    expect(claimChatMessageGenerationRetry(SCOPE, "receipt-key")).toBe(
+      firstMemoryId,
+    );
+    expect(claimChatMessageGenerationRetry(SCOPE, "receipt-key")).toBeNull();
+
+    releaseChatMessageId(SCOPE, "receipt-key");
+    expect(getChatMessageUserMemoryId(SCOPE, "receipt-key")).toBeNull();
+    expect(isDuplicateChatMessage(SCOPE, "receipt-key", 5_500_002)).toBe(false);
   });
 
   it("evicts expired entries so the cache stays bounded", () => {

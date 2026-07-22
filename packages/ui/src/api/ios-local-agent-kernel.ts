@@ -96,6 +96,12 @@ interface LocalMessage {
   role: Role;
   text: string;
   timestamp: number;
+  /** Stable logical-send key retained for retry receipt recovery. */
+  clientMessageId?: string;
+  /** Failed or interrupted generations resume from this persisted user turn. */
+  generationState?: "in-flight" | "failed" | "completed";
+  /** Associates an assistant reply with its exact persisted user turn. */
+  replyToUserMessageId?: string;
   localInference?: LocalReply["localInference"];
 }
 
@@ -270,6 +276,7 @@ let startedAt = Date.now();
 let running = false;
 let activeState: ActiveModelState = readActiveModelState();
 const downloads = new Map<string, DownloadJob>();
+const activeLocalGenerations = new Set<string>();
 let llamaAdapterPromise: Promise<CapacitorLlamaAdapter | null> | null = null;
 let llamaCppPromise: Promise<LlamaCppModule | null> | null = null;
 let loadedRuntimeSignature: string | null = null;
@@ -308,6 +315,7 @@ function resetIosLocalAgentState(): void {
     removeStorageItem(key);
   }
   downloads.clear();
+  activeLocalGenerations.clear();
   activeState = readActiveModelState();
   loadedRuntimeSignature = null;
   running = true;
@@ -3971,29 +3979,168 @@ export async function handleIosLocalAgentRequest(
       const body = await requestJson(request);
       const text = typeof body.text === "string" ? body.text.trim() : "";
       if (!text) return json({ error: "text is required" }, 400);
-      const userMessage: LocalMessage = {
-        id: randomId("msg"),
-        role: "user",
-        text,
-        timestamp: Date.now(),
-      };
-      conversation.messages.push(userMessage);
-      if (conversation.title === "New chat") {
-        conversation.title = text.slice(0, 60) || conversation.title;
+      const clientMessageId =
+        typeof body.clientMessageId === "string" &&
+        body.clientMessageId.trim().length > 0 &&
+        body.clientMessageId.trim().length <= 128
+          ? body.clientMessageId.trim()
+          : null;
+      const existingUserIndex = clientMessageId
+        ? conversation.messages.findIndex(
+            (message) =>
+              message.role === "user" &&
+              message.clientMessageId === clientMessageId,
+          )
+        : -1;
+      if (clientMessageId && existingUserIndex >= 0) {
+        const existingUser = conversation.messages[existingUserIndex];
+        const existingReply = conversation.messages
+          .slice(existingUserIndex + 1)
+          .find(
+            (message) =>
+              message.role === "assistant" &&
+              message.replyToUserMessageId === existingUser.id,
+          );
+        const receipt = {
+          conversationId,
+          clientMessageId,
+          userMessageId: existingUser.id,
+        };
+        if (
+          existingReply ||
+          activeLocalGenerations.has(`${conversationId}:${existingUser.id}`)
+        ) {
+          if (existingReply && existingUser.generationState !== "completed") {
+            existingUser.generationState = "completed";
+            conversation.updatedAt = nowIso();
+            writeStore(store);
+          }
+          const responseText = existingReply?.text ?? "";
+          if (pathname.endsWith("/stream")) {
+            return textEventStream([
+              ...(responseText
+                ? [
+                    {
+                      type: "token",
+                      text: responseText,
+                      fullText: responseText,
+                    },
+                  ]
+                : []),
+              {
+                type: "done",
+                fullText: responseText,
+                agentName: AGENT_NAME,
+                receipt,
+                ...(!existingReply ? { noResponseReason: "ignored" } : {}),
+                ...(existingReply?.localInference
+                  ? { localInference: existingReply.localInference }
+                  : {}),
+              },
+            ]);
+          }
+          return json({
+            text: responseText,
+            agentName: AGENT_NAME,
+            receipt,
+            ...(!existingReply ? { noResponseReason: "ignored" } : {}),
+            ...(existingReply?.localInference
+              ? { localInference: existingReply.localInference }
+              : {}),
+          });
+        }
       }
-      const reply = await generateLocalReply(conversation, text);
+      const userMessage =
+        existingUserIndex >= 0
+          ? conversation.messages[existingUserIndex]
+          : ({
+              id: randomId("msg"),
+              role: "user",
+              text,
+              timestamp: Date.now(),
+              ...(clientMessageId ? { clientMessageId } : {}),
+            } satisfies LocalMessage);
+      if (existingUserIndex < 0) {
+        conversation.messages.push(userMessage);
+        if (conversation.title === "New chat") {
+          conversation.title = text.slice(0, 60) || conversation.title;
+        }
+      }
+      // Persist the receipt-bearing user turn before generation. A concurrent
+      // retry can recover this exact id while the in-memory owner runs; after a
+      // failure or process restart, the same stored turn becomes resumable.
+      userMessage.generationState = "in-flight";
+      conversation.updatedAt = nowIso();
+      writeStore(store);
+      const generationKey = `${conversationId}:${userMessage.id}`;
+      activeLocalGenerations.add(generationKey);
+      let reply: LocalReply;
+      try {
+        // A retry must regenerate from the persisted original, never from a
+        // caller that reused the idempotency key with a different payload.
+        reply = await generateLocalReply(conversation, userMessage.text);
+      } catch (error) {
+        // error-policy:J1 The local chat route records a resumable terminal
+        // state before the transport boundary propagates the inference error.
+        const failedStore = readStore();
+        const failedConversation = failedStore.conversations.find(
+          (entry) => entry.id === conversationId,
+        );
+        const failedUser = failedConversation?.messages.find(
+          (message) => message.id === userMessage.id,
+        );
+        if (failedConversation && failedUser) {
+          failedUser.generationState = "failed";
+          failedConversation.updatedAt = nowIso();
+          writeStore(failedStore);
+        }
+        throw error;
+      } finally {
+        activeLocalGenerations.delete(generationKey);
+      }
       const assistantMessage: LocalMessage = {
         id: randomId("msg"),
         role: "assistant",
         text: reply.text,
         timestamp: Date.now(),
+        replyToUserMessageId: userMessage.id,
         ...(reply.localInference
           ? { localInference: reply.localInference }
           : {}),
       };
-      conversation.messages.push(assistantMessage);
-      conversation.updatedAt = nowIso();
-      writeStore(store);
+      // Inference yields to other local requests. Re-read before the assistant
+      // write so a concurrently persisted user turn is never overwritten by
+      // this request's older store snapshot.
+      const latestStore = readStore();
+      const latestConversation = latestStore.conversations.find(
+        (entry) => entry.id === conversationId,
+      );
+      if (!latestConversation) {
+        return json(
+          { error: "Conversation was removed during generation" },
+          409,
+        );
+      }
+      const latestUser = latestConversation.messages.find(
+        (message) => message.id === userMessage.id,
+      );
+      if (!latestUser) {
+        return json(
+          { error: "User message was removed during generation" },
+          409,
+        );
+      }
+      latestUser.generationState = "completed";
+      latestConversation.messages.push(assistantMessage);
+      latestConversation.updatedAt = nowIso();
+      writeStore(latestStore);
+      const receipt = clientMessageId
+        ? {
+            conversationId,
+            clientMessageId,
+            userMessageId: userMessage.id,
+          }
+        : undefined;
 
       if (pathname.endsWith("/stream")) {
         return textEventStream([
@@ -4003,6 +4150,7 @@ export async function handleIosLocalAgentRequest(
             fullText: reply.text,
             agentName: AGENT_NAME,
             usage: reply.usage,
+            ...(receipt ? { receipt } : {}),
             ...(reply.localInference
               ? { localInference: reply.localInference }
               : {}),
@@ -4014,6 +4162,7 @@ export async function handleIosLocalAgentRequest(
         text: reply.text,
         agentName: AGENT_NAME,
         blocks: [{ type: "text", text: reply.text }],
+        ...(receipt ? { receipt } : {}),
         ...(reply.localInference
           ? { localInference: reply.localInference }
           : {}),

@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   client: {
     abortConversationTurn: vi.fn(),
     createConversation: vi.fn(),
+    getBaseUrl: vi.fn(() => "http://127.0.0.1:3000"),
     sendConversationMessageStream: vi.fn(),
     sendWsMessage: vi.fn(),
     stopCodingAgent: vi.fn(),
@@ -264,7 +265,7 @@ describe("useChatSend.handleChatStop", () => {
     );
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hello", {
         conversationId: "conv-1",

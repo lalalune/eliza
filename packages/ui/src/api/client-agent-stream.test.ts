@@ -15,7 +15,7 @@ describe("ElizaClient agent streaming transport", () => {
         done: false,
         value: encoder.encode(
           'data: {"type":"token","text":"hi","fullText":"hi"}\n\n' +
-            'data: {"type":"done","fullText":"hi","agentName":"Eliza"}\n\n',
+            'data: {"type":"done","fullText":"hi","agentName":"Eliza","receipt":{"conversationId":"conversation-id","clientMessageId":"client-1","userMessageId":"memory-1"}}\n\n',
         ),
       })
       .mockRejectedValueOnce(new Error("read after terminal event"));
@@ -43,6 +43,11 @@ describe("ElizaClient agent streaming transport", () => {
       text: "hi",
       agentName: "Eliza",
       completed: true,
+      receipt: {
+        conversationId: "conversation-id",
+        clientMessageId: "client-1",
+        userMessageId: "memory-1",
+      },
     });
     expect(onToken).toHaveBeenCalledWith("hi", "hi");
     expect(read).toHaveBeenCalledTimes(1);
@@ -128,7 +133,7 @@ describe("ElizaClient agent streaming transport", () => {
     const read = vi.fn().mockResolvedValueOnce({
       done: false,
       value: encoder.encode(
-        'data: {"type":"error","message":"no provider configured","failureKind":"no_provider"}\n\n',
+        'data: {"type":"error","message":"no provider configured","failureKind":"no_provider","receipt":{"conversationId":"conversation-id","clientMessageId":"client-1","userMessageId":"memory-1"}}\n\n',
       ),
     });
     const request = vi.fn(async () => {
@@ -158,6 +163,11 @@ describe("ElizaClient agent streaming transport", () => {
     expect(thrown).toMatchObject({
       message: "no provider configured",
       failureKind: "no_provider",
+      receipt: {
+        conversationId: "conversation-id",
+        clientMessageId: "client-1",
+        userMessageId: "memory-1",
+      },
     });
   });
 

@@ -356,7 +356,7 @@ describe("streaming → useChatSend rAF token-coalescing throttle", () => {
       makeChatSendDeps();
     const { result } = renderHook(() => useChatSend(deps));
 
-    let sendPromise: Promise<void> | undefined;
+    let sendPromise: Promise<unknown> | undefined;
     await act(async () => {
       sendPromise = result.current.sendChatText("hi", {
         conversationId: "conv-1",

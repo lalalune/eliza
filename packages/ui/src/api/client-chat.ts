@@ -15,6 +15,7 @@ import type {
   ChatActionResultSummary,
   ChatAttachmentInput,
   ChatFailureKind,
+  ChatSendReceipt,
   ChatTokenUsage,
   ChatToolCallEvent,
   ChatTurnStatus,
@@ -315,6 +316,7 @@ declare module "./client-base" {
       failureKind?: ChatFailureKind;
       localInference?: LocalInferenceChatMetadata;
       actionResults?: ChatActionResultSummary[];
+      receipt?: ChatSendReceipt;
     }>;
     sendChatMessage(text: string, channelType?: ConversationChannelType): void;
     sendChatStream(
@@ -331,6 +333,7 @@ declare module "./client-base" {
       failureKind?: ChatFailureKind;
       localInference?: LocalInferenceChatMetadata;
       actionResults?: ChatActionResultSummary[];
+      receipt?: ChatSendReceipt;
     }>;
     listConversations(): Promise<{ conversations: Conversation[] }>;
     createConversation(
@@ -494,6 +497,7 @@ declare module "./client-base" {
       accountConnect?: AccountConnectRequest;
       localInference?: LocalInferenceChatMetadata;
       actionResults?: ChatActionResultSummary[];
+      receipt?: ChatSendReceipt;
     }>;
     sendConversationMessageStream(
       id: string,
@@ -523,6 +527,7 @@ declare module "./client-base" {
       accountConnect?: AccountConnectRequest;
       localInference?: LocalInferenceChatMetadata;
       actionResults?: ChatActionResultSummary[];
+      receipt?: ChatSendReceipt;
     }>;
     abortConversationTurn(
       roomId: string,
@@ -1275,6 +1280,7 @@ ElizaClient.prototype.sendConversationMessage = async function (
     accountConnect?: AccountConnectRequest;
     localInference?: LocalInferenceChatMetadata;
     actionResults?: ChatActionResultSummary[];
+    receipt?: ChatSendReceipt;
   }>(`/api/conversations/${encodeURIComponent(id)}/messages`, {
     method: "POST",
     body: JSON.stringify({

@@ -172,7 +172,7 @@ function getLocalInferenceChatApi(): Promise<LocalInferenceChatApi> {
 const CHAT_MAX_BODY_BYTES = 20 * 1024 * 1024; // 20 MB (image-capable)
 
 /** Max accepted client-supplied idempotency key length. Anything longer is a
- *  malformed/abusive client and is treated as absent (no dedupe). */
+ * malformed/abusive client and is treated as absent (no dedupe). */
 const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
 
 /**
@@ -193,7 +193,15 @@ const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
  * once per TTL window) — the same O(1)-check / amortized-eviction shape as the
  * WS cache.
  */
-const chatSeenMessageIds = new Map<string, number>();
+interface ChatMessageDedupeEntry {
+  firstSeenAt: number;
+  /** Set only after the first request's user memory write succeeds. */
+  userMessageId: UUID | null;
+  /** Allows one reconnect to resume generation without persisting the user twice. */
+  generationRetryAvailable: boolean;
+}
+
+const chatSeenMessageIds = new Map<string, ChatMessageDedupeEntry>();
 const DEFAULT_CHAT_GENERATION_TIMEOUT_MS = 180_000;
 const CHAT_DEDUPE_RECONNECT_WAIT_MS = 30_000;
 const CHAT_DEDUPE_SETTLE_BUFFER_MS = 30_000;
@@ -232,16 +240,24 @@ export function isDuplicateChatMessage(
 ): boolean {
   if (!clientMessageId) return false;
   const key = `${scope}:${clientMessageId}`;
-  const seenAt = chatSeenMessageIds.get(key);
-  if (seenAt !== undefined && now - seenAt <= CHAT_DEDUPE_TTL_MS) return true;
-  chatSeenMessageIds.set(key, now);
+  const seen = chatSeenMessageIds.get(key);
+  if (seen !== undefined && now - seen.firstSeenAt <= CHAT_DEDUPE_TTL_MS) {
+    return true;
+  }
+  chatSeenMessageIds.set(key, {
+    firstSeenAt: now,
+    userMessageId: null,
+    generationRetryAvailable: false,
+  });
   // Amortized eviction: sweep expired entries at most once per TTL window
   // rather than on every request, keeping the map bounded without a per-request
   // O(n) scan.
   if (now - chatSeenLastSweepAt > CHAT_DEDUPE_TTL_MS) {
     chatSeenLastSweepAt = now;
-    for (const [seenKey, ts] of chatSeenMessageIds) {
-      if (now - ts > CHAT_DEDUPE_TTL_MS) chatSeenMessageIds.delete(seenKey);
+    for (const [seenKey, entry] of chatSeenMessageIds) {
+      if (now - entry.firstSeenAt > CHAT_DEDUPE_TTL_MS) {
+        chatSeenMessageIds.delete(seenKey);
+      }
     }
   }
   return false;
@@ -252,14 +268,11 @@ export function isDuplicateChatMessage(
  *
  * The guard records at request ARRIVAL (so a duplicate landing while the
  * original is still mid-turn is suppressed — that's the blip-retry window it
- * exists for). But when the original turn dies WITHOUT persisting a visible
- * assistant reply — a client disconnect aborts generation, or an error hits
- * after a disconnect so no fallback reply is persisted — a suppressed retry
- * would eat the user's message entirely: no reply, no error, no retry chip.
- * Callers release the key on exactly those paths so the client's single
- * auto-retry legitimately re-runs the turn (it is not a duplicate of any
- * delivered outcome). Releasing is always safe: the worst case is the
- * pre-guard behavior (a second turn) on a turn that produced nothing.
+ * exists for). Callers release only while no user memory has been persisted,
+ * so a rejected/setup-failed request can legitimately re-enter. Once a receipt
+ * exists the entry must remain: a transport abort uses
+ * {@link allowChatMessageGenerationRetry} to resume generation against that
+ * same memory instead of creating a duplicate user turn.
  */
 export function releaseChatMessageId(
   scope: string,
@@ -284,7 +297,63 @@ export function getChatMessageIdFirstSeenAt(
   clientMessageId: string | null,
 ): number | null {
   if (!clientMessageId) return null;
-  return chatSeenMessageIds.get(`${scope}:${clientMessageId}`) ?? null;
+  return (
+    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.firstSeenAt ?? null
+  );
+}
+
+/**
+ * Attach the real persisted user-memory id to an idempotent chat send. The
+ * first successful write wins; a duplicate request can then return the exact
+ * same receipt without scanning or inventing an id from the client key.
+ */
+export function recordChatMessageUserMemoryId(
+  scope: string,
+  clientMessageId: string | null,
+  userMessageId: UUID,
+): void {
+  if (!clientMessageId || !userMessageId) return;
+  const entry = chatSeenMessageIds.get(`${scope}:${clientMessageId}`);
+  if (!entry || entry.userMessageId) return;
+  entry.userMessageId = userMessageId;
+}
+
+/** Return the persisted user-memory id for an idempotent send, when known. */
+export function getChatMessageUserMemoryId(
+  scope: string,
+  clientMessageId: string | null,
+): UUID | null {
+  if (!clientMessageId) return null;
+  return (
+    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.userMessageId ?? null
+  );
+}
+
+/**
+ * Permit one reconnect to rerun generation for an already-persisted user turn.
+ * This is used only after a transport abort: the retry reuses the original
+ * memory id and payload instead of creating a second user message.
+ */
+export function allowChatMessageGenerationRetry(
+  scope: string,
+  clientMessageId: string | null,
+): void {
+  if (!clientMessageId) return;
+  const entry = chatSeenMessageIds.get(`${scope}:${clientMessageId}`);
+  if (!entry?.userMessageId) return;
+  entry.generationRetryAvailable = true;
+}
+
+/** Claim the single generation retry and return its persisted user-memory id. */
+export function claimChatMessageGenerationRetry(
+  scope: string,
+  clientMessageId: string | null,
+): UUID | null {
+  if (!clientMessageId) return null;
+  const entry = chatSeenMessageIds.get(`${scope}:${clientMessageId}`);
+  if (!entry?.generationRetryAvailable || !entry.userMessageId) return null;
+  entry.generationRetryAvailable = false;
+  return entry.userMessageId;
 }
 
 /** Test-only: clear the HTTP chat idempotency cache between cases. */

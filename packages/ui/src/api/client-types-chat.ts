@@ -7,6 +7,8 @@
 import type {
   ChatFailureKind,
   ChatImageAttachment,
+  ChatSendReceipt,
+  ChatSendResult,
   ChatToolCallEvent,
   ChatTurnStatus,
   LinkedAccountProviderId,
@@ -22,7 +24,13 @@ import type {
 // here so existing `@elizaos/ui` `api` consumers keep their import path. Imported
 // (not export-from) because `failureKind` fields below reference the type in this
 // module's scope.
-export type { ChatFailureKind, ChatToolCallEvent, ChatTurnStatus };
+export type {
+  ChatFailureKind,
+  ChatSendReceipt,
+  ChatSendResult,
+  ChatToolCallEvent,
+  ChatTurnStatus,
+};
 
 // Conversations
 export interface Conversation {
@@ -81,6 +89,11 @@ export type ContentBlock = TextBlock | ConfigFormBlock | UiSpecBlock;
 
 /** An image attachment to send with a chat message. */
 export interface ImageAttachment extends ChatImageAttachment {
+  /**
+   * Stable renderer identity used to reconcile native and manual composer
+   * edits. It is UI-only; the server keys persisted media by content hash.
+   */
+  clientAttachmentId?: string;
   /** Base64-encoded image data (no data URL prefix). */
   data: string;
   mimeType: string;

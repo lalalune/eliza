@@ -286,3 +286,52 @@ export type ChatAttachmentSource =
 
 /** Additive input accepted by chat sends from web and native composers. */
 export type ChatAttachmentInput = ChatImageAttachment | ChatAttachmentSource;
+
+/**
+ * Durable proof that the chat boundary accepted one logical user turn. The
+ * server only emits this after the user memory has been persisted; retries
+ * carrying the same `clientMessageId` return the same `userMessageId`.
+ */
+export interface ChatSendReceipt {
+  conversationId: string;
+  clientMessageId: string;
+  userMessageId: string;
+}
+
+/** Machine-readable reasons a renderer-side chat send can fail. */
+export type ChatSendFailureReason =
+  | "empty"
+  | "command"
+  | "conversation-unavailable"
+  | "validation"
+  | "transport"
+  | "generation"
+  | "missing-receipt"
+  | "unknown";
+
+/**
+ * Truthful terminal result for one logical chat send. `accepted` always carries
+ * a server-issued persistence receipt; interruption and failure are distinct so
+ * native shells never infer success from an idempotency key or optimistic row.
+ */
+export type ChatSendResult =
+  | {
+      status: "accepted";
+      receipt: ChatSendReceipt;
+      /** Whether the assistant stream reached its terminal `done` frame. */
+      completed: boolean;
+    }
+  | {
+      status: "cancelled";
+      conversationId: string | null;
+      clientMessageId: string;
+      message: string;
+    }
+  | {
+      status: "failed";
+      conversationId: string | null;
+      clientMessageId: string;
+      reason: ChatSendFailureReason;
+      message: string;
+      retryable: boolean;
+    };
