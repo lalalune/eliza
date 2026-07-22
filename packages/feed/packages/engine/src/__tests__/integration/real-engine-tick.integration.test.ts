@@ -513,118 +513,6 @@ describe.skipIf(shouldSkipLiveLlmTests)(
       expect(invalidMarkets).toBe(0);
     });
 
-    test("should validate GameClock works in all modes", async () => {
-      const { GameClock } = await import("../../GameClock");
-
-      console.log("\n⏰ Testing GameClock modes...");
-
-      // Test realtime mode
-      const realtimeClock = GameClock.realtime();
-      const realtimeNow = realtimeClock.now();
-      expect(realtimeNow.tick).toBe(0);
-      expect(realtimeNow.day).toBeGreaterThan(0);
-      expect(realtimeNow.hour).toBeGreaterThanOrEqual(0);
-      expect(realtimeNow.hour).toBeLessThan(24);
-      console.log(
-        `   ✅ Realtime mode: Day ${realtimeNow.day}, Hour ${realtimeNow.hour}`,
-      );
-
-      // Test simulated mode
-      const startTime = new Date("2025-01-01T00:00:00Z");
-      const simulatedClock = GameClock.simulated(startTime, startTime);
-      const simulatedNow = simulatedClock.now();
-      expect(simulatedNow.tick).toBe(0);
-      expect(simulatedNow.day).toBe(1);
-      expect(simulatedNow.hour).toBe(0);
-      console.log(
-        `   ✅ Simulated mode: Day ${simulatedNow.day}, Hour ${simulatedNow.hour}`,
-      );
-
-      // Test tick advancement
-      const afterTick = simulatedClock.tick();
-      expect(afterTick.tick).toBe(1);
-      expect(afterTick.hour).toBe(1); // 1 hour per tick
-      console.log(
-        `   ✅ After tick: Day ${afterTick.day}, Hour ${afterTick.hour}, Tick ${afterTick.tick}`,
-      );
-
-      // Test fast-forward
-      const after24Hours = simulatedClock.advanceHours(23);
-      expect(after24Hours.day).toBe(2);
-      expect(after24Hours.hour).toBe(0);
-      expect(after24Hours.tick).toBe(24);
-      console.log(
-        `   ✅ After 24 hours: Day ${after24Hours.day}, Hour ${after24Hours.hour}, Tick ${after24Hours.tick}`,
-      );
-
-      // Test fed-in time (setting specific time)
-      simulatedClock.setTime(new Date("2025-01-15T12:00:00Z"));
-      const fedInTime = simulatedClock.now();
-      expect(fedInTime.day).toBe(15);
-      expect(fedInTime.hour).toBe(12);
-      console.log(
-        `   ✅ Fed-in time: Day ${fedInTime.day}, Hour ${fedInTime.hour}`,
-      );
-    });
-
-    test("should validate InMemoryStateStore for offline simulation", async () => {
-      const { InMemoryStateStore } = await import(
-        "../../adapters/InMemoryStateStore"
-      );
-
-      console.log("\n🧠 Testing InMemoryStateStore for offline mode...");
-
-      const store = new InMemoryStateStore({
-        numPredictionMarkets: 5,
-        numPerpMarkets: 3,
-        numAgents: 10,
-        durationDays: 30,
-        seed: 12345, // Deterministic for testing
-      });
-
-      // Get initial state
-      const state = store.getState();
-      expect(state.predictionMarkets.length).toBe(5);
-      expect(state.perpMarkets.length).toBe(3);
-      expect(state.agents.length).toBe(10);
-      console.log(
-        `   ✅ Initialized: ${state.predictionMarkets.length} prediction markets`,
-      );
-      console.log(
-        `   ✅ Initialized: ${state.perpMarkets.length} perp markets`,
-      );
-      console.log(`   ✅ Initialized: ${state.agents.length} agents`);
-
-      // Test trading
-      const agent = state.agents[0];
-      if (agent) {
-        const market = state.predictionMarkets[0];
-        if (market) {
-          const tradeResult = store.buyPredictionShares(
-            agent.id,
-            market.id,
-            "YES",
-            100,
-          );
-          expect(tradeResult.success).toBe(true);
-          expect(tradeResult.shares).toBeGreaterThan(0);
-          console.log(
-            `   ✅ Trade executed: ${tradeResult.shares?.toFixed(2)} shares`,
-          );
-        }
-      }
-
-      // Test tick advancement
-      store.advanceTick();
-      const progress = store.getProgress();
-      expect(progress.tick).toBe(1);
-      console.log(`   ✅ Tick advanced: ${progress.tick}`);
-
-      // Test completion detection
-      expect(store.isComplete()).toBe(false);
-      console.log(`   ✅ Simulation not complete (day ${progress.day} of 30)`);
-    });
-
     test("should verify engine produces valid outputs for training", async () => {
       expect(results.tickExecuted).toBe(true);
 
@@ -693,3 +581,56 @@ describe.skipIf(shouldSkipLiveLlmTests)(
     });
   },
 );
+
+describe("keyless engine primitives", () => {
+  test("GameClock supports realtime, simulated, and fed-in time", async () => {
+    const { GameClock } = await import("../../GameClock");
+    const realtimeNow = GameClock.realtime().now();
+    expect(realtimeNow.tick).toBe(0);
+    expect(realtimeNow.hour).toBeGreaterThanOrEqual(0);
+    expect(realtimeNow.hour).toBeLessThan(24);
+
+    const startTime = new Date("2025-01-01T00:00:00Z");
+    const simulatedClock = GameClock.simulated(startTime, startTime);
+    expect(simulatedClock.now()).toMatchObject({ day: 1, hour: 0, tick: 0 });
+    expect(simulatedClock.tick()).toMatchObject({ hour: 1, tick: 1 });
+    expect(simulatedClock.advanceHours(23)).toMatchObject({
+      day: 2,
+      hour: 0,
+      tick: 24,
+    });
+
+    simulatedClock.setTime(new Date("2025-01-15T12:00:00Z"));
+    expect(simulatedClock.now()).toMatchObject({ day: 15, hour: 12 });
+  });
+
+  test("InMemoryStateStore executes deterministic offline trades", async () => {
+    const { InMemoryStateStore } = await import(
+      "../../adapters/InMemoryStateStore"
+    );
+    const store = new InMemoryStateStore({
+      numPredictionMarkets: 5,
+      numPerpMarkets: 3,
+      numAgents: 10,
+      durationDays: 30,
+      seed: 12345,
+    });
+    const state = store.getState();
+    expect(state.predictionMarkets).toHaveLength(5);
+    expect(state.perpMarkets).toHaveLength(3);
+    expect(state.agents).toHaveLength(10);
+
+    const agent = state.agents[0];
+    const market = state.predictionMarkets[0];
+    expect(agent).toBeDefined();
+    expect(market).toBeDefined();
+    if (!agent || !market) throw new Error("seeded state is incomplete");
+
+    const trade = store.buyPredictionShares(agent.id, market.id, "YES", 100);
+    expect(trade.success).toBe(true);
+    expect(trade.shares).toBeGreaterThan(0);
+    store.advanceTick();
+    expect(store.getProgress().tick).toBe(1);
+    expect(store.isComplete()).toBe(false);
+  });
+});

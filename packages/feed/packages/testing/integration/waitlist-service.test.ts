@@ -35,6 +35,21 @@ type TopWaitlistUser = Awaited<
 const shouldSkip = !process.env.DATABASE_URL;
 const describeWaitlist = shouldSkip ? describe.skip : describe;
 
+describe("WaitlistService.generateInviteCode", () => {
+  it("should generate unique 8-character uppercase code", () => {
+    const codes = Array.from({ length: 10 }, () =>
+      WaitlistService.generateInviteCode(),
+    );
+
+    codes.forEach((code) => {
+      expect(code).toHaveLength(8);
+      expect(code).toMatch(/^[A-Z0-9_-]{8}$/);
+    });
+
+    expect(new Set(codes).size).toBeGreaterThan(1);
+  });
+});
+
 describeWaitlist("WaitlistService", () => {
   // Test data cleanup
   const testUserIds: string[] = [];
@@ -74,25 +89,6 @@ describeWaitlist("WaitlistService", () => {
 
       testUserIds.length = 0;
     }
-  });
-
-  describe("generateInviteCode", () => {
-    it("should generate unique 8-character uppercase code", () => {
-      // Generate multiple codes to test uniqueness
-      const codes = Array.from({ length: 10 }, () =>
-        WaitlistService.generateInviteCode(),
-      );
-
-      // All should be 8 characters
-      codes.forEach((code) => {
-        expect(code).toHaveLength(8);
-        expect(code).toMatch(/^[A-Z0-9_-]{8}$/);
-      });
-
-      // At least some should be unique (nanoid has tiny collision probability)
-      const uniqueCodes = new Set(codes);
-      expect(uniqueCodes.size).toBeGreaterThan(1);
-    });
   });
 
   describe("markAsWaitlisted", () => {
