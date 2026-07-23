@@ -11,8 +11,10 @@
  * <p>Layering model mirrors iOS: the WebView composites its own pixels, so a
  * native material can never live INSIDE the DOM. The web layer reports a rect,
  * a panel View is inserted in the Capacitor container BELOW the WebView, and
- * the page keeps that region transparent so the native material shows
- * through. On first attach the WebView background is set transparent —
+ * the page keeps that region translucent and blur-free so the native material
+ * shows through. The fill remains because a WebView is one native layer: DOM
+ * siblings behind a surface cannot be interleaved below the panel. On first
+ * attach the WebView background is set transparent —
  * without that Android paints an opaque backing and the panel is invisible.
  * {@code setBackdrop} hosts the wallpaper (pre-downsampled bytes piped from
  * the page — never a URL, never a network fetch, never cookies) at container
@@ -244,11 +246,12 @@ public class GlassBridgePlugin extends Plugin {
             ViewGroup.LayoutParams params = new ViewGroup.LayoutParams(
                     Math.round(px.width()), Math.round(px.height()));
             panel.setLayoutParams(params);
-            // Translation-based positioning keeps the panel parent-agnostic:
-            // it works identically whether Capacitor's container is a
-            // FrameLayout or a CoordinatorLayout.
-            panel.setX(px.left + webView.getX());
-            panel.setY(px.top + webView.getY());
+            // Translation is stable when the parent relays out the new child.
+            // setX/setY derive a translation from the current laid-out edge;
+            // calling them before addView lets the first layout change that
+            // edge and silently displace the requested viewport coordinate.
+            panel.setTranslationX(px.left + webView.getX());
+            panel.setTranslationY(px.top + webView.getY());
 
             container.addView(panel, container.indexOfChild(webView));
             regions.put(id, panel);
@@ -289,8 +292,8 @@ public class GlassBridgePlugin extends Plugin {
             ViewGroup.LayoutParams params = panel.getLayoutParams();
             int startW = params.width;
             int startH = params.height;
-            float startX = panel.getX();
-            float startY = panel.getY();
+            float startX = panel.getTranslationX();
+            float startY = panel.getTranslationY();
 
             // One animator lerps position and size together — the Android
             // mirror of the iOS 0.15s UIView.animate frame change.
@@ -298,12 +301,15 @@ public class GlassBridgePlugin extends Plugin {
             animator.setDuration(RECT_ANIMATION_MS);
             animator.addUpdateListener(animation -> {
                 float t = (float) animation.getAnimatedValue();
-                panel.setX(startX + (targetX - startX) * t);
-                panel.setY(startY + (targetY - startY) * t);
                 ViewGroup.LayoutParams lp = panel.getLayoutParams();
                 lp.width = Math.round(startW + (targetW - startW) * t);
                 lp.height = Math.round(startH + (targetH - startH) * t);
                 panel.setLayoutParams(lp);
+                // LayoutParams invalidation may run a parent layout between
+                // animation frames; translations remain parent-relative and
+                // therefore keep geometry continuous while width/height move.
+                panel.setTranslationX(startX + (targetX - startX) * t);
+                panel.setTranslationY(startY + (targetY - startY) * t);
             });
             animator.start();
             call.resolve();

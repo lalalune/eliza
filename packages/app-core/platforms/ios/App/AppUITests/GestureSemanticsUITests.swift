@@ -254,7 +254,6 @@ final class GestureSemanticsUITests: XCTestCase {
         var skipTaps = 0
         let gateDeadline = Date().addingTimeInterval(90)
         while Date() < gateDeadline {
-            if markerValue(Self.detentPrefix, in: app) != nil { break }
             if gateTaps < 2, openApp.exists, openApp.isHittable {
                 attachScreenshot(named: "glass-01-startup-gate")
                 openApp.tap()
@@ -264,6 +263,15 @@ final class GestureSemanticsUITests: XCTestCase {
                 attachScreenshot(named: "glass-01-setup-sheet")
                 skipSetup.tap()
                 skipTaps += 1
+            }
+            // The renderer can expose its AX probes behind the native setup
+            // sheet. A probe alone is not an interactive-shell precondition;
+            // keep dismissing any hittable gate before continuing.
+            if markerValue(Self.detentPrefix, in: app) != nil,
+                !(openApp.exists && openApp.isHittable),
+                !(skipSetup.exists && skipSetup.isHittable)
+            {
+                break
             }
             Thread.sleep(forTimeInterval: 1.0)
         }

@@ -12,7 +12,9 @@ import WebKit
 /// never live INSIDE the DOM. Instead the web layer reports a viewport-relative
 /// rect (CSS px == UIKit points), we position a native glass effect view at
 /// that rect in the Capacitor container BELOW the webview, and the page keeps
-/// that region transparent so the native material shows through. On first
+/// that region translucent and blur-free so the native material shows through.
+/// Its fill is still needed because WKWebView is one native layer: DOM siblings
+/// behind a surface cannot be interleaved below this native view. On first
 /// attach the webview is made non-opaque with a clear background — without
 /// that, WKWebView paints an opaque backing and the glass is invisible.
 ///
@@ -349,7 +351,7 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
 
     /// WKWebView paints an opaque backing by default, which would hide any
     /// view layered beneath it. First attach flips it transparent so the
-    /// page's transparent regions actually reveal the glass.
+    /// page's translucent regions actually reveal the glass.
     private func makeWebViewTransparentOnce(_ webView: WKWebView) {
         guard !webViewMadeTransparent else { return }
         webViewMadeTransparent = true
@@ -409,7 +411,7 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
             let width = properties[kCGImagePropertyPixelWidth] as? Int,
             let height = properties[kCGImagePropertyPixelHeight] as? Int,
             width > 0, height > 0,
-            width * height <= Self.maxBackdropPixels
+            width <= Self.maxBackdropPixels / height
         else {
             CAPLog.print("⚡️  GlassBridge setBackdrop: image dimensions over bound or unreadable")
             return nil

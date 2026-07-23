@@ -64,6 +64,8 @@ describe("native GlassBridge wallpaper contract", () => {
     // full bitmap allocation a decompression bomb relies on.
     expect(ios).toContain("maxBackdropEncodedChars");
     expect(ios).toContain("maxBackdropPixels");
+    expect(ios).toContain("width <= Self.maxBackdropPixels / height");
+    expect(ios).not.toContain("width * height <= Self.maxBackdropPixels");
     expect(ios).toContain("CGImageSourceCopyPropertiesAtIndex");
     expect(android).toContain("MAX_BACKDROP_ENCODED_CHARS");
     expect(android).toContain("MAX_BACKDROP_PIXELS");
@@ -85,6 +87,18 @@ describe("native GlassBridge wallpaper contract", () => {
     expect(android).toContain("shutdownNow");
     expect(android).toContain("RejectedExecutionException");
     expect(android).toContain("pendingBackdropCalls");
+  });
+
+  it("keeps Android region coordinates stable through parent relayout", () => {
+    // Width/height animation invalidates LayoutParams every frame. Position
+    // therefore lives in parent-relative translation rather than setX/setY,
+    // whose derived offset changes when the parent lays the panel out again.
+    expect(android).toContain("panel.setTranslationX");
+    expect(android).toContain("panel.setTranslationY");
+    expect(android).toContain("panel.getTranslationX()");
+    expect(android).toContain("panel.getTranslationY()");
+    expect(android).not.toContain("panel.setX(");
+    expect(android).not.toContain("panel.setY(");
   });
 
   it("settles every iOS call even on plugin deallocation", () => {

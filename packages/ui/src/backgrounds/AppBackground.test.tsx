@@ -49,6 +49,26 @@ function installNativeGlassBridge() {
   return bridge;
 }
 
+function installPendingNativeGlassBridge() {
+  let resolveReset: () => void = () => {};
+  const bridge = installNativeGlassBridge();
+  bridge.reset.mockImplementation(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveReset = resolve;
+      }),
+  );
+  return { bridge, resolveReset: () => resolveReset() };
+}
+
+async function finishNativeBootReset(
+  bridge: ReturnType<typeof installNativeGlassBridge>,
+): Promise<void> {
+  await act(async () => {
+    await bridge.reset.mock.results[0]?.value;
+  });
+}
+
 afterEach(() => {
   cleanup();
   __setAppValueForTests(null);
@@ -244,13 +264,40 @@ describe("AppBackground", () => {
       imageUrl: "/wallpapers/canopy.webp",
     });
     const { container } = render(<AppBackground />);
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     expect(bridge.setBackdrop).not.toHaveBeenCalled();
     const image = container.querySelector<HTMLElement>(
       '[data-testid="app-background-image"]',
     );
     expect(image?.style.backgroundImage).toContain("canopy.webp");
     expect(image?.dataset.nativeHosted).toBe("false");
+  });
+
+  it("does not publish or anchor until the previous native document is reset", async () => {
+    const { bridge, resolveReset } = installPendingNativeGlassBridge();
+    seed({
+      mode: "image",
+      color: "#160d07",
+      imageUrl: "/wallpapers/canopy.webp",
+    });
+    render(<AppBackground />);
+    expect(bridge.reset).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      expect(await acquireNativeBackdrop()).toBeNull();
+    });
+    expect(bridge.setBackdrop).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveReset();
+    });
+    await act(async () => {
+      const lease = await acquireNativeBackdrop();
+      expect(lease).not.toBeNull();
+      releaseNativeBackdrop(lease as NativeBackdropLease);
+    });
+    expect(bridge.setBackdrop).toHaveBeenCalledTimes(1);
   });
 
   it("hides only the image paint while native hosts it — the scrim stays", async () => {
@@ -261,6 +308,7 @@ describe("AppBackground", () => {
       imageUrl: "/wallpapers/canopy.webp",
     });
     const { container } = render(<AppBackground />);
+    await finishNativeBootReset(bridge);
     // Simulate the chat-sheet anchor's lease + atomic flip.
     await act(async () => {
       const lease = await acquireNativeBackdrop();
@@ -299,6 +347,7 @@ describe("AppBackground", () => {
       imageUrl: "/wallpapers/canopy.webp",
     });
     const { container } = render(<AppBackground />);
+    await finishNativeBootReset(bridge);
     let lease: NativeBackdropLease | null = null;
     await act(async () => {
       lease = await acquireNativeBackdrop();

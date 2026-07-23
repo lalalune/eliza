@@ -2161,7 +2161,7 @@ export function InventoryAppView() {
       data-testid="wallet-shell"
       className="h-full min-h-0 w-full overflow-y-auto bg-bg"
     >
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-5 pt-6 pb-12">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-5 pt-6 pb-32 sm:pb-12">
         {walletError ? (
           <div className="px-1 py-2 text-sm text-danger">{walletError}</div>
         ) : null}
@@ -2183,7 +2183,7 @@ export function InventoryAppView() {
         {showMarketPulseHero ? <MarketPulseHero /> : null}
 
         {!showMarketPulseHero ? (
-          <div className="flex flex-col gap-8">
+          <div className="flex flex-col gap-8 pt-16 sm:pt-0">
             <DashboardSection
               action={
                 <div className="flex gap-1">

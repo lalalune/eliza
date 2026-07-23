@@ -224,24 +224,27 @@ describe("GlassSurface", () => {
     );
   });
 
-  it("keeps Android on the CSS tier — the near-opaque panel is churn, not glass (#16200)", async () => {
+  it("anchors Android's API-31+ Material panel over the native wallpaper", async () => {
     const bridge = fakeBridge();
     installCapacitor(bridge, "android");
     seedWallpaper();
     const { getByTestId } = render(
       <GlassSurface variant="menu" data-testid="s" />,
     );
-    await new Promise((r) => setTimeout(r, 20));
-    expect(getByTestId("s").dataset.glassTier).toMatch(/^css-/);
-    expect(bridge.setBackdrop).not.toHaveBeenCalled();
-    expect(bridge.attachGlass).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(getByTestId("s").dataset.glassTier).toBe("native"),
+    );
+    expect(bridge.setBackdrop).toHaveBeenCalledTimes(1);
+    expect(bridge.attachGlass).toHaveBeenCalledTimes(1);
   });
 
   it("stays CSS with no image wallpaper published — nothing to sample natively", async () => {
     const bridge = fakeBridge();
     installCapacitor(bridge);
     const { getByTestId } = render(<AnchorHarness enabled />);
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     expect(getByTestId("anchor").dataset.glassTier).toMatch(/^css-/);
     expect(bridge.setBackdrop).not.toHaveBeenCalled();
     expect(bridge.attachGlass).not.toHaveBeenCalled();
@@ -255,7 +258,9 @@ describe("GlassSurface", () => {
     seedWallpaper();
     const { getByTestId } = render(<AnchorHarness enabled />);
     await waitFor(() => expect(bridge.setBackdrop).toHaveBeenCalledTimes(1));
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     expect(getByTestId("anchor").dataset.glassTier).toMatch(/^css-/);
     expect(bridge.attachGlass).not.toHaveBeenCalled();
   });
@@ -312,10 +317,36 @@ describe("GlassSurface", () => {
     await act(async () => {
       resolveAttach({ attached: true });
     });
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     // Never native over stale pixels; the anchor released its lease.
     expect(getByTestId("anchor").dataset.glassTier).toMatch(/^css-/);
     await waitFor(() => expect(bridge.detachGlass).toHaveBeenCalledTimes(1));
+  });
+
+  it("clears a backdrop that finishes decoding after its source was removed", async () => {
+    let resolveBackdrop: (value: { applied: boolean }) => void = () => {};
+    const bridge = fakeBridge({
+      setBackdrop: vi.fn(
+        () =>
+          new Promise<{ applied: boolean }>((resolve) => {
+            resolveBackdrop = resolve;
+          }),
+      ),
+    });
+    installCapacitor(bridge);
+    seedWallpaper();
+    render(<AnchorHarness enabled />);
+    await waitFor(() => expect(bridge.setBackdrop).toHaveBeenCalledTimes(1));
+    act(() => {
+      setNativeWallpaperSource(null);
+    });
+    await act(async () => {
+      resolveBackdrop({ applied: true });
+    });
+    await waitFor(() => expect(bridge.clearBackdrop).toHaveBeenCalledTimes(1));
+    expect(bridge.attachGlass).not.toHaveBeenCalled();
   });
 
   it("drops to CSS and tears down when the wallpaper switches away while anchored", async () => {
@@ -343,7 +374,9 @@ describe("GlassSurface", () => {
       <GlassSurface variant="card" data-testid="s" />,
     );
     // Let the availability probe settle, then assert no upgrade happened.
-    await new Promise((r) => setTimeout(r, 20));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     expect(getByTestId("s").dataset.glassTier).toMatch(/^css-/);
     expect(bridge.attachGlass).not.toHaveBeenCalled();
     expect(bridge.setBackdrop).not.toHaveBeenCalled();

@@ -64,6 +64,7 @@ import {
 import { useNativeGlassAnchor } from "../../glass/GlassSurface";
 import { useNativeGlassDiag } from "../../glass/native-backdrop";
 import {
+  GLASS_NATIVE_SHEET_SCRIM,
   GLASS_SHEET_BACKDROP_FILTER,
   GLASS_SHEET_FILL,
 } from "../../glass/tokens";
@@ -3298,6 +3299,8 @@ export function ChatOverlay({
       stopOpenProgressAnimation();
       threadHeight.set(liveBaseH);
       openProgress.set(open);
+      setSheetSettled(true);
+      setDraggingState(false);
     } else {
       animateThreadHeight(liveBaseH);
       animateOpenProgress(open);
@@ -3322,6 +3325,7 @@ export function ChatOverlay({
     settleFullBleed,
     overpullCapT,
     setDragPreviewMounted,
+    setDraggingState,
   ]);
   // Keep the ref the (earlier-declared) viewport-resize effect calls pointing at
   // the latest settleDrag, so a rotation re-settles with current geometry.
@@ -3364,6 +3368,8 @@ export function ChatOverlay({
       threadHeight.set(0);
       openProgress.set(1);
       setDragPreviewMounted(false);
+      setSheetSettled(true);
+      setDraggingState(false);
     } else {
       // Keep the transcript MOUNTED through the collapse spring. `setMode("input")`
       // above flips `sheetOpen` false, which alone would unmount the thread this
@@ -3390,6 +3396,7 @@ export function ChatOverlay({
     animateThreadHeight,
     animateOpenProgress,
     setDragPreviewMounted,
+    setDraggingState,
   ]);
 
   // Collapse the whole chat to the bottom pill capsule — the shared landing for
@@ -3405,7 +3412,11 @@ export function ChatOverlay({
     setMode("pill");
     inputRef.current?.blur();
     detentHaptic();
-  }, [setDragPreviewMounted]);
+    if (reduce) {
+      setSheetSettled(true);
+      setDraggingState(false);
+    }
+  }, [reduce, setDragPreviewMounted, setDraggingState]);
 
   // Landing for a drag released AT THE BOTTOM (thread height within the detent
   // magnet of 0): PILL when the gesture carried past the bottom into the
@@ -3539,6 +3550,11 @@ export function ChatOverlay({
         stopOpenProgressAnimation();
         threadHeight.set(target);
         openProgress.set(1);
+        // With no release spring there is no `.finished` callback to restore
+        // the true-rest gate. A detent snap is already complete synchronously,
+        // so native material may attach again as soon as React commits it.
+        setSheetSettled(true);
+        setDraggingState(false);
       } else {
         animateThreadHeight(target);
         // Every detent is on the input side of the pill morph. A drag that
@@ -3566,6 +3582,7 @@ export function ChatOverlay({
       openProgress,
       stopThreadAnimation,
       stopOpenProgressAnimation,
+      setDraggingState,
       animateThreadHeight,
       animateOpenProgress,
       animateFullBleedTo,
@@ -4554,12 +4571,11 @@ export function ChatOverlay({
         overpullCapT.set(0);
       }
       draggingRef.current = true;
-      // Promote the panel + thread to their own GPU layer for the duration of
-      // the drag (dropped on settle) so the live morph composites instead of
-      // repainting per frame on iOS Safari. Skipped under reduced-motion: there
-      // is no settle spring to composite, and the async clear below only runs on
-      // the animated release path.
-      if (!reduce) setDraggingState(true);
+      // This state is also the native-material safety gate, so every live drag
+      // sets it even under reduced motion. Only the compositor hint below is
+      // reduced-motion-specific; native regions must always detach before the
+      // panel starts following a finger.
+      setDraggingState(true);
       // Integrate this frame's travel and clamp at the continuum edges. The
       // clamp IS the consumption: the next frame integrates from the clamped
       // value, so beyond-the-edge travel evaporates instead of becoming debt a
@@ -5046,6 +5062,10 @@ export function ChatOverlay({
         setFreeH(h);
         setMode("half");
         setMaximized(false);
+        // A free rest has no release spring, so it must close the motion gate
+        // synchronously just like a reduced-motion detent snap.
+        setSheetSettled(true);
+        setDraggingState(false);
       }
     },
   });
@@ -5156,6 +5176,8 @@ export function ChatOverlay({
       setFreeH(h);
       setMode("half");
       setMaximized(false);
+      setSheetSettled(true);
+      setDraggingState(false);
     }
   }, [
     pinnedOpen,
@@ -5169,6 +5191,7 @@ export function ChatOverlay({
     animateFullBleedTo,
     overpullCapT,
     setDragPreviewMounted,
+    setDraggingState,
   ]);
   // Cancel/tap on the strip: drop the drag flag and spring back to the current
   // detent (a tap keeps it maximized; a rotation-canceled drag re-settles).
@@ -5269,7 +5292,8 @@ export function ChatOverlay({
   // hook holds its CSS tier until BOTH the wallpaper and the region are
   // acknowledged natively — no transparent frame at either handoff edge.
   // Full-bleed stays opaque web paint (nothing to see through); onboarding
-  // keeps its bespoke masking. iOS-only inside the hook (see its header).
+  // keeps its bespoke masking. The native material is UIGlassEffect on iOS
+  // and the dynamic-palette Material panel on Android.
   const nativeSheetTier = useNativeGlassAnchor(glassSurfaceRef, {
     enabled:
       sheetOpen &&
@@ -5519,7 +5543,7 @@ export function ChatOverlay({
             // repainting the frosted glass each frame (the installed-PWA
             // micro-stutter). Dropped on settle — a permanent hint keeps the
             // layer (and its memory) resident for no benefit at rest.
-            willChange: isDragging ? "transform" : undefined,
+            willChange: isDragging && !reduce ? "transform" : undefined,
             // Pilled: span the (invisible) input area but pass taps through to the
             // home screen — only the pill-capsule child re-enables pointer events.
             pointerEvents: pilled ? "none" : "auto",
@@ -5534,9 +5558,11 @@ export function ChatOverlay({
         >
           {/* SURFACE — absolute fill; the frosted-glass bg/border + the live
               corner radius. Crossfades in by openProgress (compositor opacity).
-              On the native tier the fill + blur drop and the OS material shows
-              through from below the WebView; border, bevel, and sheen stay —
-              they are the branded edge on every tier (GlassSurface contract). */}
+              On the native tier the CSS blur drops and the OS material shows
+              through from below the WebView. The translucent fill remains as
+              a foreground scrim: sibling DOM is part of the same native
+              WebView layer and would otherwise paint sharply over material
+              that only samples the native wallpaper below it. */}
           <motion.div
             ref={glassSurfaceRef}
             aria-hidden="true"
@@ -5577,11 +5603,12 @@ export function ChatOverlay({
               // fieldset, not the orange app theme behind. Full-bleed stays fully
               // opaque (it covers the whole screen — there is nothing to see
               // through, and the blur would be wasted battery).
-              backgroundColor:
-                firstRunOpen || nativeInsetSheet
-                  ? "transparent"
-                  : fullBleed
-                    ? "var(--bg)"
+              backgroundColor: firstRunOpen
+                ? "transparent"
+                : fullBleed
+                  ? "var(--bg)"
+                  : nativeInsetSheet
+                    ? GLASS_NATIVE_SHEET_SCRIM
                     : GLASS_SHEET_FILL,
               backdropFilter:
                 fullBleed || nativeInsetSheet

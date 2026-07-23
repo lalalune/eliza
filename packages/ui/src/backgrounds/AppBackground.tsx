@@ -9,7 +9,10 @@ import {
   setNativeWallpaperSource,
   useNativeBackdropActive,
 } from "../glass/native-backdrop";
-import { resetNativeGlassHost } from "../glass/native-bridge";
+import {
+  nativeGlassPlatform,
+  resetNativeGlassHost,
+} from "../glass/native-bridge";
 import type { ShaderConfig } from "../state/ui-preferences";
 import { DEFAULT_BACKGROUND_COLOR } from "../state/ui-preferences";
 import { useBackgroundConfig } from "../state/useBackgroundConfig";
@@ -80,6 +83,9 @@ export function AppBackground({
 }: AppBackgroundProps = {}): React.JSX.Element | null {
   const { backgroundConfig } = useBackgroundConfig();
   const nativeBackdropActive = useNativeBackdropActive();
+  const [nativeHostReady, setNativeHostReady] = useState(
+    () => nativeGlassPlatform() === null,
+  );
   useBackgroundApplyChannel();
   useAppearanceApplyChannel();
   useVoiceSettingsApplyChannel();
@@ -89,7 +95,18 @@ export function AppBackground({
   // This component mounts once per document at the shell root, making it the
   // renderer's boot boundary: clear any state a previous document left.
   useEffect(() => {
-    void resetNativeGlassHost();
+    if (nativeGlassPlatform() === null) return;
+    let alive = true;
+    // HMR can retain this module's coordinator state even though the native
+    // views belong to the previous React document. Force CSS while reset is in
+    // flight; publishing/anchoring resumes only after the native ack.
+    setNativeWallpaperSource(null);
+    void resetNativeGlassHost().then((reset) => {
+      if (alive) setNativeHostReady(reset);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // Publish the image wallpaper (resolved to an absolute renderer URL) to the
@@ -101,7 +118,12 @@ export function AppBackground({
       backgroundConfig && typeof backgroundConfig === "object"
         ? backgroundConfig
         : null;
-    if (!visible || config?.mode !== "image" || !config.imageUrl) {
+    if (
+      !nativeHostReady ||
+      !visible ||
+      config?.mode !== "image" ||
+      !config.imageUrl
+    ) {
       setNativeWallpaperSource(null);
       return;
     }
@@ -122,7 +144,7 @@ export function AppBackground({
       imageUrl: absolute,
       color: config.color ?? DEFAULT_BACKGROUND_COLOR,
     });
-  }, [backgroundConfig, visible]);
+  }, [backgroundConfig, nativeHostReady, visible]);
 
   // Mirror the active background onto the ROOT element so the viewport CANVAS —
   // the surface behind every box, which ALWAYS covers the full drawable screen
