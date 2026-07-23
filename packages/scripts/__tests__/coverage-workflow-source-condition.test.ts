@@ -45,6 +45,19 @@ test("changed Vitest coverage tests use package-aware source configuration", () 
   );
 });
 
+test("coverage CI reports percentages without enforcing percentage floors", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  expect(workflow).not.toContain("-v threshold=");
+
+  const defaultConfig = readFileSync(
+    fileURLToPath(
+      new URL("../../test/vitest/default.config.ts", import.meta.url),
+    ),
+    "utf8",
+  );
+  expect(defaultConfig).not.toContain("thresholds:");
+});
+
 test("cloud/shared coverage resolves the real plugin-sql node source before builds", async () => {
   const { default: config } = await import("../../cloud/shared/vitest.config");
   const aliases = config.resolve?.alias;

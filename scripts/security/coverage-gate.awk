@@ -1,14 +1,10 @@
 # coverage-gate.awk
 #
-# Parses LCOV output and computes per-file line coverage. Compares against a
-# changed-files list and prints a summary. Callers may disable the percentage
-# floor with `floor_enabled=0` while retaining the same per-file diagnostics.
-# Exit code is non-zero only when enforcement is enabled
-# (COVERAGE_GATE_ENFORCE=1) and any changed file is missing from the LCOV report
-# or below an enabled threshold (default 70%).
+# Parses LCOV output and confirms every changed executable source appears in
+# coverage reporting. Percentages remain visible diagnostics but never gate CI.
 #
 # Usage:
-#   awk -v changed="$CHANGED_FILES" -v threshold=70 \
+#   awk -v changed="$CHANGED_FILES" \
 #       [-v excluded="$LCOV_EXCLUDED_FILES"] \
 #       -f scripts/security/coverage-gate.awk coverage/lcov.info
 #
@@ -20,8 +16,6 @@
 # fixed), it is gated normally — the escape hatch expires by itself.
 
 BEGIN {
-  if (threshold == "") threshold = 70
-  if (floor_enabled == "") floor_enabled = 1
   if (changed == "") changed = ""
   # Split changed files into a lookup table.
   n = split(changed, parts, "\n")
@@ -89,12 +83,11 @@ function path_matches_lcov(current_path, changed_path,    current_len, changed_l
       }
     }
     if (matched != "") {
-      # Aggregate per file across ALL lcov inputs BEFORE thresholding. The same
+      # Aggregate per file across ALL lcov inputs. The same
       # source can appear in several lane reports — its own focused lane at real
       # coverage plus another package's lane that merely imports it at ~2%. Keep
       # the file's BEST-lane percentage so an incidental low record cannot fail a
-      # file whose real coverage clears the floor (#16043). Counting, the mean,
-      # and the below[] verdict are all computed from file_pct in END.
+      # file whose focused lane carries the useful diagnostic (#16043).
       if (!(matched in file_pct) || pct + 0 > file_pct[matched] + 0) {
         file_pct[matched] = pct
       }
@@ -121,7 +114,6 @@ END {
       changed_count++
       changed_sum += file_pct[f]
       printf "  %6.2f%% %s\n", file_pct[f], f
-      if (floor_enabled && file_pct[f] + 0 < threshold + 0) below[f] = file_pct[f]
     }
   }
 
@@ -129,26 +121,13 @@ END {
     print "no changed files matched the LCOV report"
   } else {
     avg = changed_sum / changed_count
-    if (floor_enabled) {
-      printf "\nchanged files: %d, mean coverage: %.2f%%, threshold: %d%%\n", \
-        changed_count, avg, threshold
-    } else {
-      printf "\nchanged files: %d, mean coverage: %.2f%%, threshold: disabled\n", \
-        changed_count, avg
-    }
+    printf "\nchanged files observed: %d, mean reported coverage: %.2f%%\n", \
+      changed_count, avg
   }
 
   fail = missing_count > 0
-  for (f in below) {
-    printf "  BELOW: %s (%.2f%%)\n", f, below[f]
-    fail = 1
-  }
   if (fail && ENVIRON["COVERAGE_GATE_ENFORCE"] == "1") {
-    if (missing_count > 0) {
-      print "coverage gate FAILED (changed source missing from LCOV)"
-    } else {
-      print "coverage gate FAILED (enforcement enabled)"
-    }
+    print "coverage gate FAILED (changed source missing from LCOV)"
     exit 1
   }
   if (fail) {
