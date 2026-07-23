@@ -72,6 +72,13 @@ function staleControlPlaneContext() {
   } as never;
 }
 
+const sharedAgent = {
+  id: "agent-1",
+  organization_id: "org-1",
+  user_id: "user-1",
+  execution_tier: "shared",
+} as never;
+
 describe("agent bridge runtime routing", () => {
   test("bridge ignores stale control-plane env and uses sandbox service", async () => {
     globalThis.fetch = deadControlPlaneFetch as unknown as typeof fetch;
@@ -103,15 +110,7 @@ describe("agent bridge runtime routing", () => {
       result: { text: "pong" },
     });
     expect(deadControlPlaneFetch).not.toHaveBeenCalled();
-    // 4th arg: the Workers executionCtx that defers the shared-turn billing
-    // tail — this fixture has none, so the route degrades to undefined
-    // (inline settlement).
-    expect(bridge).toHaveBeenCalledWith(
-      "agent-1",
-      "org-1",
-      rpcRequest,
-      undefined,
-    );
+    expect(bridge).toHaveBeenCalledWith("agent-1", "org-1", rpcRequest);
   });
 
   test("stream ignores stale control-plane env and uses sandbox service", async () => {
@@ -143,5 +142,69 @@ describe("agent bridge runtime routing", () => {
     expect(deadControlPlaneFetch).not.toHaveBeenCalled();
     expect(bridgeStream).toHaveBeenCalledWith("agent-1", "org-1", rpcRequest);
     expect(bridge).not.toHaveBeenCalled();
+  });
+
+  test("resolved Worker bridge uses the conversation cache without a second auth lookup", async () => {
+    const fetch = mock(async () =>
+      Response.json({
+        jsonrpc: "2.0",
+        id: "rpc-cache",
+        result: { text: "cached" },
+      }),
+    );
+    const getByName = mock(() => ({ fetch }));
+    const rpcRequest = {
+      jsonrpc: "2.0",
+      id: "rpc-cache",
+      method: "heartbeat",
+      params: {},
+    };
+
+    const response = await bridgeRoute.__agentBridgeTestHooks.handlePost(
+      makeJsonRequest("/api/v1/eliza/agents/agent-1/bridge", rpcRequest),
+      { params: Promise.resolve({ agentId: "agent-1" }) },
+      staleControlPlaneContext(),
+      {
+        agent: sharedAgent,
+        namespace: { getByName } as never,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(requireAuthOrApiKeyWithOrg).not.toHaveBeenCalled();
+    expect(bridge).not.toHaveBeenCalled();
+    expect(getByName).toHaveBeenCalledWith("agent-1:default");
+  });
+
+  test("resolved Worker stream uses the conversation cache without a second auth lookup", async () => {
+    const fetch = mock(
+      async () =>
+        new Response('event: done\ndata: {"text":"cached"}\n\n', {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+    );
+    const getByName = mock(() => ({ fetch }));
+    const rpcRequest = {
+      jsonrpc: "2.0",
+      id: "rpc-stream-cache",
+      method: "message.send",
+      params: { text: "say hello", roomId: "room-1" },
+    };
+
+    const response = await streamRoute.__agentStreamTestHooks.handlePost(
+      makeJsonRequest("/api/v1/eliza/agents/agent-1/stream", rpcRequest),
+      { params: Promise.resolve({ agentId: "agent-1" }) },
+      staleControlPlaneContext(),
+      {
+        agent: sharedAgent,
+        namespace: { getByName } as never,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("cached");
+    expect(requireAuthOrApiKeyWithOrg).not.toHaveBeenCalled();
+    expect(bridgeStream).not.toHaveBeenCalled();
+    expect(getByName).toHaveBeenCalledWith("agent-1:room-1");
   });
 });

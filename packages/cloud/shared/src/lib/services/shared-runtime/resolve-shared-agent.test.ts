@@ -12,6 +12,7 @@
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { createHash } from "node:crypto";
 
 const requireUserOrApiKeyWithOrgLookup = mock(
   async <T>(_: unknown, lookup: (organizationId: string) => Promise<T>) => ({
@@ -179,6 +180,37 @@ describe("resolveSharedAgent", () => {
       agentName: "Shared Agent",
     });
     expect(findByIdAndOrg).toHaveBeenCalledWith("agent-1", "org-1");
+  });
+
+  test("cache-only miss warms in waitUntil and performs no inline DB hydration", async () => {
+    findByIdAndOrg.mockResolvedValue(agent());
+    const waited: Promise<unknown>[] = [];
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => waited.push(promise) },
+      }),
+    ).resolves.toEqual({
+      error: "Agent authorization cache is warming. Retry shortly.",
+      status: 503,
+    });
+    expect(waited).toHaveLength(1);
+    await waited[0];
+    expect(findByIdAndOrg).toHaveBeenCalledTimes(1);
+    cacheStore.set(
+      CacheKeys.apiKey.validation(
+        createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
+      ),
+      { is_active: true, organization_id: "org-1", expires_at: null },
+    );
+
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+      }),
+    ).resolves.toMatchObject({ agentId: "agent-1", orgId: "org-1" });
+    expect(findByIdAndOrg).toHaveBeenCalledTimes(1);
+    expect(validateApiKey).not.toHaveBeenCalled();
   });
 
   test("allows a dedicated agent only during its first bootstrap window", async () => {

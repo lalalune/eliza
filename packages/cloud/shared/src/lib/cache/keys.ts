@@ -50,6 +50,8 @@ export const CacheKeys = {
   sharedAgentScope: {
     resolve: (keyHashPrefix: string, agentId: string) =>
       `shared-agent-scope:${keyHashPrefix}:${agentId}:v1`,
+    voice: (organizationId: string, userId: string, agentId: string) =>
+      `shared-agent-scope:voice:${organizationId}:${userId}:${agentId}:v1`,
   },
   /**
    * Inference hot-path caches (#9899). The IAC entry collapses auth + org +
@@ -304,7 +306,8 @@ export const CacheTTL = {
    */
   inference: {
     authContext: 300, // 5 min - backstop only; revoke paths invalidate explicitly (fail-closed)
-    orgBalance: 15, // 15 seconds - optimistic-billing gate hint, kept tight to bound drift
+    orgBalance: 15, // 15 seconds - freshness window; stale hints are served while an authoritative refresh runs off-path
+    orgBalanceStale: 300, // 5 min - physical lifetime preserving a stale hint for non-blocking revalidation
     pendingCharge: 3600, // 60 min - sweep window = TTL - grace(20m) = 40m, survives cron hiccups
   },
   /**
