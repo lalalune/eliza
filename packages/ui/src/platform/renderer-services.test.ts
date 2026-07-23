@@ -287,6 +287,31 @@ describe("teardown", () => {
       "cleanup",
     );
   });
+
+  it("quarantines a service whose cleanup failed instead of overlapping a successor", async () => {
+    const reportError = vi.fn();
+    const start = vi.fn(() => async () => {
+      throw new Error("native ownership release failed");
+    });
+    registerRendererService({
+      id: "a.cleanup-quarantine",
+      shells: ["main"],
+      start,
+    });
+    startRendererServiceHost({ shell: "main", reportError });
+    await settleRendererServices();
+
+    startRendererServiceHost({ shell: "main", reportError });
+    await settleRendererServices();
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(stateOf("a.cleanup-quarantine")).toBe("failed");
+    expect(reportError).toHaveBeenCalledWith(
+      "a.cleanup-quarantine",
+      expect.any(Error),
+      "cleanup",
+    );
+  });
 });
 
 describe("serialized ownership", () => {

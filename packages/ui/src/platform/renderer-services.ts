@@ -93,6 +93,8 @@ interface ServiceInstance {
   startPromise: Promise<void>;
   /** Shared by every stop request so cleanup is invoked and awaited once. */
   stopPromise: Promise<void> | null;
+  /** A rejected cleanup leaves ownership uncertain and blocks successors. */
+  cleanupFailed: boolean;
   /** Pre-#17110 field retained only while an HMR store is upgraded in place. */
   settled?: Promise<void>;
 }
@@ -113,6 +115,8 @@ interface RendererServiceStore {
   definitions: Map<string, RendererServiceDefinition>;
   definitionVersions: Map<string, number>;
   nextDefinitionVersion: number;
+  /** Services whose prior generation could not prove complete release. */
+  blockedServiceIds: Set<string>;
   host: HostState | null;
   /** The tail of the ownership queue; every successor is chained here. */
   transition: Promise<void>;
@@ -140,6 +144,7 @@ function getStore(): RendererServiceStore {
       definitions: new Map(),
       definitionVersions: new Map(),
       nextDefinitionVersion: 0,
+      blockedServiceIds: new Set(),
       host: null,
       transition: Promise.resolve(),
     };
@@ -152,6 +157,7 @@ function getStore(): RendererServiceStore {
   // fields or leaking the old pagehide listener.
   store.definitionVersions ??= new Map();
   store.nextDefinitionVersion ??= 0;
+  store.blockedServiceIds ??= new Set();
   store.transition ??= Promise.resolve();
   for (const id of store.definitions.keys()) {
     if (!store.definitionVersions.has(id)) {
@@ -170,6 +176,7 @@ function getStore(): RendererServiceStore {
       instance.definitionVersion ??= store.definitionVersions.get(id) ?? 0;
       instance.startPromise ??= instance.settled ?? Promise.resolve();
       instance.stopPromise ??= null;
+      instance.cleanupFailed ??= false;
     }
   }
   return store;
@@ -227,8 +234,11 @@ async function runCleanup(
   try {
     await cleanup();
   } catch (error) {
+    instance.cleanupFailed = true;
+    getStore().blockedServiceIds.add(instance.definition.id);
     // error-policy:J6 best-effort teardown — a throwing cleanup must not block
-    // the remaining services' teardown; it is reported, never swallowed.
+    // the remaining services' teardown. The failed service is quarantined so
+    // uncertain old ownership cannot overlap a claimed-running successor.
     reportServiceError(host, instance.definition.id, error, "cleanup");
   }
 }
@@ -286,6 +296,7 @@ function startInstance(
     cleanup: null,
     startPromise: Promise.resolve(),
     stopPromise: null,
+    cleanupFailed: false,
   };
   host.instances.set(definition.id, instance);
 
@@ -361,6 +372,7 @@ async function reconcileService(
   if (
     !definition ||
     definitionVersion === undefined ||
+    store.blockedServiceIds.has(serviceId) ||
     (expectedVersion !== undefined && definitionVersion !== expectedVersion)
   ) {
     return;
@@ -382,6 +394,7 @@ async function reconcileService(
     store.host !== host ||
     store.definitions.get(serviceId) !== definition ||
     store.definitionVersions.get(serviceId) !== definitionVersion ||
+    store.blockedServiceIds.has(serviceId) ||
     !isEligible(definition, host.shell)
   ) {
     return;
@@ -553,13 +566,17 @@ export function getRendererServiceStates(): {
   const services: RendererServiceState[] = [];
   for (const definition of store.definitions.values()) {
     const instance = host?.instances.get(definition.id);
-    const status: RendererServiceStatus = instance
-      ? instance.status
-      : host
-        ? isEligible(definition, host.shell)
-          ? "stopped"
-          : "ineligible"
-        : "registered";
+    const status: RendererServiceStatus = store.blockedServiceIds.has(
+      definition.id,
+    )
+      ? "failed"
+      : instance
+        ? instance.status
+        : host
+          ? isEligible(definition, host.shell)
+            ? "stopped"
+            : "ineligible"
+          : "registered";
     services.push({ id: definition.id, shells: definition.shells, status });
   }
   return { hostShell: host?.shell ?? null, services };
@@ -587,11 +604,13 @@ export async function resetRendererServicesForTest(): Promise<void> {
   const store = getStore();
   store.definitions.clear();
   store.definitionVersions.clear();
+  store.blockedServiceIds.clear();
   if (store.host) await disposeHost(store.host);
   await settleRendererServices();
   // Cleanup code is arbitrary service code and may register definitions.
   // Clear again only after teardown has fully settled for strict test isolation.
   store.definitions.clear();
   store.definitionVersions.clear();
+  store.blockedServiceIds.clear();
   store.nextDefinitionVersion = 0;
 }

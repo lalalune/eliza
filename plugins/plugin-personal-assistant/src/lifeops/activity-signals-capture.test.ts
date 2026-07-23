@@ -451,6 +451,25 @@ describe("startLifeOpsActivitySignalCapture", () => {
     expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalled();
   });
 
+  it("refuses to schedule background work when the bridge cannot cancel it", async () => {
+    mockNativeMobile();
+    const cancelBackgroundRefresh = h.mobile.cancelBackgroundRefresh;
+    h.mobile.cancelBackgroundRefresh = undefined as never;
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    h.mobile.cancelBackgroundRefresh = cancelBackgroundRefresh;
+
+    expect(h.mobile.scheduleBackgroundRefresh).not.toHaveBeenCalled();
+    expect(h.dispatchStatus).toHaveBeenCalledWith({
+      status: "background_refresh_unavailable",
+      reason: "cancel_unavailable",
+    });
+
+    await stop();
+    stop = undefined;
+  });
+
   it("rolls back a rejected native start and retries cleanly on resume", async () => {
     mockNativeMobile();
     const firstRemove = vi.fn(async () => {});
@@ -576,7 +595,40 @@ describe("startLifeOpsActivitySignalCapture", () => {
     );
   });
 
-  it("attempts every native release and rejects when teardown is incomplete", async () => {
+  it("waits for late background scheduling and then cancels the accepted job", async () => {
+    mockNativeMobile();
+    const events: string[] = [];
+    let finishSchedule:
+      | ((result: { scheduled: boolean; reason?: string }) => void)
+      | undefined;
+    h.mobile.scheduleBackgroundRefresh.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          events.push("schedule:start");
+          finishSchedule = (result) => {
+            events.push("schedule:end");
+            resolve(result);
+          };
+        }),
+    );
+    h.mobile.cancelBackgroundRefresh.mockImplementation(async () => {
+      events.push("cancel");
+      return { cancelled: true };
+    });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() => expect(finishSchedule).toBeTypeOf("function"));
+    const stopping = stop();
+    expect(events).toEqual(["schedule:start"]);
+
+    finishSchedule?.({ scheduled: true });
+    await stopping;
+    stop = undefined;
+
+    expect(events).toEqual(["schedule:start", "schedule:end", "cancel"]);
+  });
+
+  it("retains failed native ownership and retries every incomplete release", async () => {
     mockNativeMobile();
     const remove = vi.fn(async () => {
       throw new Error("listener remove failed");
@@ -590,12 +642,21 @@ describe("startLifeOpsActivitySignalCapture", () => {
     const cleanup = stop;
     stop = undefined;
     await expect(cleanup()).rejects.toThrow(
-      "Failed to fully stop LifeOps native activity capture",
+      "Failed to fully release mobile activity monitoring ownership",
     );
 
     expect(remove).toHaveBeenCalledTimes(1);
     expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
     expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalledTimes(1);
+    expect(isLifeOpsActivitySignalCaptureActive()).toBe(true);
+    expect(startLifeOpsActivitySignalCapture(true)).toBe(cleanup);
+
+    remove.mockResolvedValue(undefined);
+    h.mobile.stopMonitoring.mockResolvedValue({ stopped: true });
+    await cleanup();
+
+    expect(remove).toHaveBeenCalledTimes(2);
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(2);
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
   });
 

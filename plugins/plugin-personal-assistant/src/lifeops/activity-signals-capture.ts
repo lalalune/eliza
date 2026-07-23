@@ -203,8 +203,9 @@ function mapMobileSignal(
 export type LifeOpsActivitySignalCaptureCleanup = () => Promise<void>;
 
 // One capture per renderer window. The active cleanup remains installed until
-// its asynchronous native teardown has settled, so a replacement cannot race
-// an old generation's late stopMonitoring/remove/background-cancel calls.
+// asynchronous native teardown succeeds; failed releases retain their
+// ownership ledger for retry instead of allowing a replacement to overlap an
+// old generation's stopMonitoring/remove/background-cancel calls.
 let activeCaptureStop: LifeOpsActivitySignalCaptureCleanup | null = null;
 
 export function startLifeOpsActivitySignalCapture(
@@ -449,12 +450,14 @@ export function startLifeOpsActivitySignalCapture(
 
   const mobileSignals =
     isNativeCapacitorRuntime() && !isElectrobunRuntime() ? MobileSignals : null;
+  let pendingMobileSignalsHandle: { remove: () => Promise<void> } | null = null;
   let mobileSignalsHandle: { remove: () => Promise<void> } | null = null;
   let mobileSignalsStarted = false;
+  let mobileSignalsCommitted = false;
   let mobileSignalsStartTask: Promise<void> | null = null;
   let mobileSignalsStartupAttempted = false;
+  let mobileBackgroundRefreshNeedsCancel = false;
   let mobileHealthPoller: number | null = null;
-  const nativeTeardownFailures: unknown[] = [];
 
   const refreshMobileHealthSnapshot = async (reason: string): Promise<void> => {
     if (!mobileSignals || typeof mobileSignals.getSnapshot !== "function") {
@@ -471,32 +474,63 @@ export function startLifeOpsActivitySignalCapture(
     }
   };
 
-  const cleanPartialNativeStart = async (
-    handle: { remove: () => Promise<void> } | null,
-  ): Promise<void> => {
+  const hasNativeOwnership = (): boolean =>
+    pendingMobileSignalsHandle !== null ||
+    mobileSignalsHandle !== null ||
+    mobileSignalsStartupAttempted ||
+    mobileBackgroundRefreshNeedsCancel;
+
+  const releaseNativeOwnership = async (): Promise<void> => {
     if (!mobileSignals) return;
-    const cleanupResults = await Promise.allSettled([
-      handle?.remove() ?? Promise.resolve(),
-      mobileSignals.stopMonitoring(),
-      typeof mobileSignals.cancelBackgroundRefresh === "function"
-        ? mobileSignals.cancelBackgroundRefresh()
-        : Promise.resolve(),
-    ]);
-    mobileSignalsStartupAttempted = false;
-    const failures = cleanupResults.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
+    const failures: unknown[] = [];
+    const handles = new Set(
+      [pendingMobileSignalsHandle, mobileSignalsHandle].filter(
+        (handle): handle is { remove: () => Promise<void> } => handle !== null,
+      ),
     );
+    for (const handle of handles) {
+      try {
+        await handle.remove();
+        if (pendingMobileSignalsHandle === handle) {
+          pendingMobileSignalsHandle = null;
+        }
+        if (mobileSignalsHandle === handle) {
+          mobileSignalsHandle = null;
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (mobileSignalsStarted || mobileSignalsStartupAttempted) {
+      try {
+        await mobileSignals.stopMonitoring();
+        mobileSignalsStarted = false;
+        mobileSignalsCommitted = false;
+        mobileSignalsStartupAttempted = false;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (
+      mobileBackgroundRefreshNeedsCancel &&
+      typeof mobileSignals.cancelBackgroundRefresh === "function"
+    ) {
+      try {
+        await mobileSignals.cancelBackgroundRefresh();
+        mobileBackgroundRefreshNeedsCancel = false;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     if (failures.length > 0) {
-      nativeTeardownFailures.push(...failures);
       throw new AggregateError(
         failures,
-        "Failed to roll back partially started mobile activity monitoring",
+        "Failed to fully release mobile activity monitoring ownership",
       );
     }
   };
 
   const startMobileSignals = async (): Promise<void> => {
-    if (mobileSignalsHandle || mobileSignalsStarted) return;
     if (
       !mobileSignals ||
       typeof mobileSignals.addListener !== "function" ||
@@ -506,9 +540,13 @@ export function startLifeOpsActivitySignalCapture(
     ) {
       return;
     }
+    if (mobileSignalsCommitted) return;
+    if (hasNativeOwnership()) {
+      await releaseNativeOwnership();
+    }
 
-    let pendingHandle: { remove: () => Promise<void> } | null = null;
     let committed = false;
+    let rollbackStarted = false;
     try {
       const permissions = await mobileSignals.checkPermissions();
       if (!mounted) return;
@@ -525,7 +563,7 @@ export function startLifeOpsActivitySignalCapture(
         return;
       }
 
-      pendingHandle = await mobileSignals.addListener(
+      pendingMobileSignalsHandle = await mobileSignals.addListener(
         "signal",
         (signal: MobileSignalsSignal) => {
           void track(sendSignal(mapMobileSignal(signal))).catch(
@@ -534,30 +572,41 @@ export function startLifeOpsActivitySignalCapture(
         },
       );
       if (!mounted) {
-        await cleanPartialNativeStart(pendingHandle);
+        rollbackStarted = true;
+        await releaseNativeOwnership();
         return;
       }
 
       mobileSignalsStartupAttempted = true;
+      // Cancellation is required from the moment native startup is attempted:
+      // a bridge rejection can occur after the OS accepted background work.
+      mobileBackgroundRefreshNeedsCancel =
+        typeof mobileSignals.cancelBackgroundRefresh === "function";
       const initial = await mobileSignals.startMonitoring({
         emitInitial: true,
       });
       if (!mounted || !initial.enabled) {
-        await cleanPartialNativeStart(pendingHandle);
+        rollbackStarted = true;
+        await releaseNativeOwnership();
         return;
       }
 
       // Commit the handle and monitor as one generation only after native
-      // startup succeeds. A rejection or disabled result above leaves no
-      // durable handle, so a later resume can retry instead of wedging forever.
-      mobileSignalsHandle = pendingHandle;
-      pendingHandle = null;
+      // startup succeeds. A rejection or disabled result above is rolled back;
+      // any release that fails remains recorded and must succeed on a later
+      // retry before another generation can acquire native ownership.
+      mobileSignalsHandle = pendingMobileSignalsHandle;
+      pendingMobileSignalsHandle = null;
       mobileSignalsStarted = initial.enabled;
+      mobileSignalsCommitted = true;
       committed = true;
       await sendSnapshotResult(initial);
       await refreshMobileHealthSnapshot("start");
       if (!mounted) return;
-      if (typeof mobileSignals.scheduleBackgroundRefresh === "function") {
+      if (
+        typeof mobileSignals.scheduleBackgroundRefresh === "function" &&
+        typeof mobileSignals.cancelBackgroundRefresh === "function"
+      ) {
         try {
           const result = await mobileSignals.scheduleBackgroundRefresh();
           if (mounted && !result.scheduled && result.reason) {
@@ -571,6 +620,15 @@ export function startLifeOpsActivitySignalCapture(
           // its failure is reported without killing the started capture.
           reportCaptureError(error);
         }
+      } else if (
+        mounted &&
+        typeof mobileSignals.scheduleBackgroundRefresh === "function"
+      ) {
+        // A schedulable job without a cancellation boundary is not ownable.
+        dispatchLifeOpsActivitySignalsStatus({
+          status: "background_refresh_unavailable",
+          reason: "cancel_unavailable",
+        });
       }
       if (!mounted) return;
       mobileHealthPoller = window.setInterval(() => {
@@ -579,9 +637,9 @@ export function startLifeOpsActivitySignalCapture(
         );
       }, MOBILE_HEALTH_POLL_MS);
     } catch (error) {
-      if (!committed && (pendingHandle || mobileSignalsStartupAttempted)) {
+      if (!committed && !rollbackStarted && hasNativeOwnership()) {
         try {
-          await cleanPartialNativeStart(pendingHandle);
+          await releaseNativeOwnership();
         } catch (cleanupError) {
           throw new AggregateError(
             [error, cleanupError],
@@ -671,55 +729,21 @@ export function startLifeOpsActivitySignalCapture(
 
     stopPromise = (async () => {
       await settleInFlight();
-
-      const teardownFailures = [...nativeTeardownFailures];
-      const handle = mobileSignalsHandle;
-      mobileSignalsHandle = null;
-      const shouldStopMonitoring =
-        mobileSignalsStarted || mobileSignalsStartupAttempted;
-      mobileSignalsStarted = false;
-      mobileSignalsStartupAttempted = false;
-
-      if (handle) {
-        try {
-          await handle.remove();
-        } catch (error) {
-          // error-policy:J6 native teardown continues so one failed resource
-          // release cannot strand the remaining monitor/background job.
-          teardownFailures.push(error);
+      // error-policy:J6 releaseNativeOwnership attempts every owned native
+      // resource before rejecting. Failed resources remain recorded so the
+      // same idempotent stop can retry instead of permitting duplicate owners.
+      await releaseNativeOwnership();
+    })().then(
+      () => {
+        if (activeCaptureStop === stop) {
+          activeCaptureStop = null;
         }
-      }
-      if (mobileSignals && shouldStopMonitoring) {
-        try {
-          await mobileSignals.stopMonitoring();
-        } catch (error) {
-          // error-policy:J6 see listener removal above.
-          teardownFailures.push(error);
-        }
-      }
-      if (
-        mobileSignals &&
-        typeof mobileSignals.cancelBackgroundRefresh === "function"
-      ) {
-        try {
-          await mobileSignals.cancelBackgroundRefresh();
-        } catch (error) {
-          // error-policy:J6 see listener removal above.
-          teardownFailures.push(error);
-        }
-      }
-
-      if (teardownFailures.length > 0) {
-        throw new AggregateError(
-          teardownFailures,
-          "Failed to fully stop LifeOps native activity capture",
-        );
-      }
-    })().finally(() => {
-      if (activeCaptureStop === stop) {
-        activeCaptureStop = null;
-      }
-    });
+      },
+      (error) => {
+        stopPromise = null;
+        throw error;
+      },
+    );
     return stopPromise;
   };
 
