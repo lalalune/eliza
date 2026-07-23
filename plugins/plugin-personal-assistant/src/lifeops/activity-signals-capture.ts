@@ -130,6 +130,10 @@ function errorMessage(error: unknown): string {
     : String(error);
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function fingerprintSignal(
   signal: CaptureLifeOpsActivitySignalRequest,
 ): string {
@@ -196,14 +200,19 @@ function mapMobileSignal(
   };
 }
 
-// One capture per renderer window. The active stop function doubles as the
-// idempotency token: repeated starts hand back the same stop instead of
-// duplicating listeners/pollers, and stop releases it so re-init works.
-let activeCaptureStop: (() => void) | null = null;
+export type LifeOpsActivitySignalCaptureCleanup = () => Promise<void>;
 
-export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
+// One capture per renderer window. The active cleanup remains installed until
+// its asynchronous native teardown has settled, so a replacement cannot race
+// an old generation's late stopMonitoring/remove/background-cancel calls.
+let activeCaptureStop: LifeOpsActivitySignalCaptureCleanup | null = null;
+
+export function startLifeOpsActivitySignalCapture(
+  enabled = true,
+  serviceSignal?: AbortSignal,
+): LifeOpsActivitySignalCaptureCleanup {
   if (!enabled || typeof window === "undefined") {
-    return () => {};
+    return async () => {};
   }
   if (activeCaptureStop) {
     return activeCaptureStop;
@@ -211,8 +220,24 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
 
   const platform = resolveActivityPlatform();
   const lastSent = new Map<string, SignalFingerprint>();
+  const captureController = new AbortController();
+  const inFlight = new Set<Promise<unknown>>();
   let runtimeReady = false;
   let mounted = true;
+
+  const track = <T>(operation: Promise<T>): Promise<T> => {
+    const tracked = operation.finally(() => {
+      inFlight.delete(tracked);
+    });
+    inFlight.add(tracked);
+    return tracked;
+  };
+
+  const settleInFlight = async (): Promise<void> => {
+    while (inFlight.size > 0) {
+      await Promise.allSettled([...inFlight]);
+    }
+  };
 
   const isRuntimeUnavailableError = (error: unknown): boolean =>
     isApiError(error) &&
@@ -224,6 +249,9 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
     isApiError(error) && (error.kind === "network" || error.kind === "timeout");
 
   const reportCaptureError = (error: unknown): void => {
+    if (!mounted || isAbortError(error)) {
+      return;
+    }
     if (isRuntimeUnavailableError(error)) {
       runtimeReady = false;
       return;
@@ -291,11 +319,21 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
     }
     lastSent.set(dedupeKey, { fingerprint, sentAtMs: nowMs });
     try {
-      const { signal: persisted } =
-        await client.captureLifeOpsActivitySignal(normalized);
+      const { signal: persisted } = await client.captureLifeOpsActivitySignal(
+        normalized,
+        {
+          signal: captureController.signal,
+        },
+      );
+      if (!mounted) {
+        return null;
+      }
       return persisted;
     } catch (error) {
       lastSent.delete(dedupeKey);
+      if (!mounted || isAbortError(error)) {
+        return null;
+      }
       if (isRuntimeUnavailableError(error)) {
         runtimeReady = false;
         return null;
@@ -317,7 +355,7 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
   };
 
   const fireAndForget = (signal: CaptureLifeOpsActivitySignalRequest): void => {
-    void sendSignal(signal).catch(reportCaptureError);
+    void track(sendSignal(signal)).catch(reportCaptureError);
   };
 
   const emitPageState = (reason: string): void => {
@@ -386,35 +424,37 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
   };
   const handleFocus = (): void => {
     emitPageState("focus");
-    void emitDesktopSnapshot("focus");
+    void track(emitDesktopSnapshot("focus"));
   };
   const handleBlur = (): void => {
     emitPageState("blur");
-    void emitDesktopSnapshot("blur");
+    void track(emitDesktopSnapshot("blur"));
   };
   const handleResume = (): void => {
     emitLifecycleState("active");
     emitPageState("resume");
-    void refreshMobileHealthSnapshot("resume").catch(reportCaptureError);
-    void emitDesktopSnapshot("resume");
+    void track(refreshMobileHealthSnapshot("resume")).catch(reportCaptureError);
+    void track(emitDesktopSnapshot("resume"));
     // A permission granted in OS Settings while the app was backgrounded
     // becomes effective here: startMobileSignals re-checks consent and is a
     // cheap no-op when monitoring is already running.
-    void startMobileSignals().catch(reportCaptureError);
+    void requestMobileSignalsStart().catch(reportCaptureError);
   };
   const handlePause = (): void => {
     emitLifecycleState("background");
     emitPageState("pause");
-    void refreshMobileHealthSnapshot("pause").catch(reportCaptureError);
-    void emitDesktopSnapshot("pause");
+    void track(refreshMobileHealthSnapshot("pause")).catch(reportCaptureError);
+    void track(emitDesktopSnapshot("pause"));
   };
 
   const mobileSignals =
     isNativeCapacitorRuntime() && !isElectrobunRuntime() ? MobileSignals : null;
   let mobileSignalsHandle: { remove: () => Promise<void> } | null = null;
   let mobileSignalsStarted = false;
-  let mobileSignalsStarting = false;
+  let mobileSignalsStartTask: Promise<void> | null = null;
+  let mobileSignalsStartupAttempted = false;
   let mobileHealthPoller: number | null = null;
+  const nativeTeardownFailures: unknown[] = [];
 
   const refreshMobileHealthSnapshot = async (reason: string): Promise<void> => {
     if (!mobileSignals || typeof mobileSignals.getSnapshot !== "function") {
@@ -431,13 +471,32 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
     }
   };
 
-  const startMobileSignals = async (): Promise<void> => {
-    // The starting flag closes the concurrency window two callers (initial
-    // ready check + ready poller + resume) would otherwise race through: the
-    // handle/started guards below are only assigned after awaits.
-    if (mobileSignalsStarting || mobileSignalsHandle || mobileSignalsStarted) {
-      return;
+  const cleanPartialNativeStart = async (
+    handle: { remove: () => Promise<void> } | null,
+  ): Promise<void> => {
+    if (!mobileSignals) return;
+    const cleanupResults = await Promise.allSettled([
+      handle?.remove() ?? Promise.resolve(),
+      mobileSignals.stopMonitoring(),
+      typeof mobileSignals.cancelBackgroundRefresh === "function"
+        ? mobileSignals.cancelBackgroundRefresh()
+        : Promise.resolve(),
+    ]);
+    mobileSignalsStartupAttempted = false;
+    const failures = cleanupResults.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      nativeTeardownFailures.push(...failures);
+      throw new AggregateError(
+        failures,
+        "Failed to roll back partially started mobile activity monitoring",
+      );
     }
+  };
+
+  const startMobileSignals = async (): Promise<void> => {
+    if (mobileSignalsHandle || mobileSignalsStarted) return;
     if (
       !mobileSignals ||
       typeof mobileSignals.addListener !== "function" ||
@@ -448,7 +507,8 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
       return;
     }
 
-    mobileSignalsStarting = true;
+    let pendingHandle: { remove: () => Promise<void> } | null = null;
+    let committed = false;
     try {
       const permissions = await mobileSignals.checkPermissions();
       if (!mounted) return;
@@ -465,40 +525,42 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
         return;
       }
 
-      const handle = await mobileSignals.addListener(
+      pendingHandle = await mobileSignals.addListener(
         "signal",
         (signal: MobileSignalsSignal) => {
-          void sendSignal(mapMobileSignal(signal)).catch(reportCaptureError);
+          void track(sendSignal(mapMobileSignal(signal))).catch(
+            reportCaptureError,
+          );
         },
       );
       if (!mounted) {
-        // Stopped while the listener registered: remove the late handle.
-        void handle.remove().catch(() => {
-          // error-policy:J6 best-effort removal of a just-created listener on
-          // a torn-down capture; nothing observes this handle anymore.
-        });
+        await cleanPartialNativeStart(pendingHandle);
         return;
       }
-      mobileSignalsHandle = handle;
 
+      mobileSignalsStartupAttempted = true;
       const initial = await mobileSignals.startMonitoring({
         emitInitial: true,
       });
-      if (!mounted) {
-        // Stopped while monitoring engaged: stand the native monitor down.
-        if (initial.enabled) {
-          void mobileSignals.stopMonitoring().catch(reportCaptureError);
-        }
+      if (!mounted || !initial.enabled) {
+        await cleanPartialNativeStart(pendingHandle);
         return;
       }
+
+      // Commit the handle and monitor as one generation only after native
+      // startup succeeds. A rejection or disabled result above leaves no
+      // durable handle, so a later resume can retry instead of wedging forever.
+      mobileSignalsHandle = pendingHandle;
+      pendingHandle = null;
       mobileSignalsStarted = initial.enabled;
+      committed = true;
       await sendSnapshotResult(initial);
       await refreshMobileHealthSnapshot("start");
       if (!mounted) return;
       if (typeof mobileSignals.scheduleBackgroundRefresh === "function") {
         try {
           const result = await mobileSignals.scheduleBackgroundRefresh();
-          if (!result.scheduled && result.reason) {
+          if (mounted && !result.scheduled && result.reason) {
             dispatchLifeOpsActivitySignalsStatus({
               status: "background_refresh_unavailable",
               reason: result.reason,
@@ -512,28 +574,51 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
       }
       if (!mounted) return;
       mobileHealthPoller = window.setInterval(() => {
-        void refreshMobileHealthSnapshot("poll").catch(reportCaptureError);
+        void track(refreshMobileHealthSnapshot("poll")).catch(
+          reportCaptureError,
+        );
       }, MOBILE_HEALTH_POLL_MS);
-    } finally {
-      mobileSignalsStarting = false;
+    } catch (error) {
+      if (!committed && (pendingHandle || mobileSignalsStartupAttempted)) {
+        try {
+          await cleanPartialNativeStart(pendingHandle);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "Mobile activity monitoring startup and rollback failed",
+          );
+        }
+      }
+      throw error;
     }
+  };
+
+  const requestMobileSignalsStart = (): Promise<void> => {
+    if (mobileSignalsStartTask) return mobileSignalsStartTask;
+    const task = track(startMobileSignals()).finally(() => {
+      if (mobileSignalsStartTask === task) {
+        mobileSignalsStartTask = null;
+      }
+    });
+    mobileSignalsStartTask = task;
+    return task;
   };
 
   const emitCurrentState = (reason: string): void => {
     emitLifecycleState("active");
     emitPageState(reason);
-    void emitDesktopSnapshot(reason);
-    void refreshMobileHealthSnapshot(reason).catch(reportCaptureError);
+    void track(emitDesktopSnapshot(reason));
+    void track(refreshMobileHealthSnapshot(reason)).catch(reportCaptureError);
   };
 
-  void refreshRuntimeReady()
-    .then((ready) => {
+  void track(
+    refreshRuntimeReady().then(async (ready) => {
       if (ready && mounted) {
         emitCurrentState("mount");
-        void startMobileSignals().catch(reportCaptureError);
+        await requestMobileSignalsStart();
       }
-    })
-    .catch(reportCaptureError);
+    }),
+  ).catch(reportCaptureError);
 
   document.addEventListener("visibilitychange", handleVisibilityChange);
   document.addEventListener(APP_RESUME_EVENT, handleResume);
@@ -543,15 +628,15 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
 
   const runtimePoller = window.setInterval(() => {
     const wasReady = runtimeReady;
-    void refreshRuntimeReady()
-      .then((ready) => {
+    void track(
+      refreshRuntimeReady().then(async (ready) => {
         if (!mounted || !ready || wasReady) {
           return;
         }
         emitCurrentState("runtime-ready");
-        void startMobileSignals().catch(reportCaptureError);
-      })
-      .catch(reportCaptureError);
+        await requestMobileSignalsStart();
+      }),
+    ).catch(reportCaptureError);
   }, RUNTIME_READY_POLL_MS);
   const pageHeartbeat = window.setInterval(() => {
     if (document.visibilityState === "visible") {
@@ -559,31 +644,23 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
     }
   }, PAGE_HEARTBEAT_MS);
   const desktopPoller = window.setInterval(() => {
-    void emitDesktopSnapshot("poll");
+    void track(emitDesktopSnapshot("poll"));
   }, DESKTOP_POWER_POLL_MS);
 
-  const stop = (): void => {
-    if (!mounted) return;
+  let stopPromise: Promise<void> | null = null;
+  let detachServiceAbort = (): void => {};
+  const stop = (): Promise<void> => {
+    if (stopPromise) return stopPromise;
     mounted = false;
-    if (activeCaptureStop === stop) {
-      activeCaptureStop = null;
-    }
+    runtimeReady = false;
+    captureController.abort();
+    detachServiceAbort();
+    detachServiceAbort = () => {};
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     document.removeEventListener(APP_RESUME_EVENT, handleResume);
     document.removeEventListener(APP_PAUSE_EVENT, handlePause);
     window.removeEventListener("focus", handleFocus);
     window.removeEventListener("blur", handleBlur);
-    if (mobileSignalsHandle) {
-      void mobileSignalsHandle.remove().catch(() => {
-        // error-policy:J6 best-effort native listener removal on teardown; the
-        // capture is already stopped and nothing consumes the handle.
-      });
-      mobileSignalsHandle = null;
-    }
-    if (mobileSignalsStarted) {
-      void mobileSignals?.stopMonitoring().catch(reportCaptureError);
-      mobileSignalsStarted = false;
-    }
     if (mobileHealthPoller !== null) {
       window.clearInterval(mobileHealthPoller);
       mobileHealthPoller = null;
@@ -591,9 +668,73 @@ export function startLifeOpsActivitySignalCapture(enabled = true): () => void {
     window.clearInterval(runtimePoller);
     window.clearInterval(pageHeartbeat);
     window.clearInterval(desktopPoller);
+
+    stopPromise = (async () => {
+      await settleInFlight();
+
+      const teardownFailures = [...nativeTeardownFailures];
+      const handle = mobileSignalsHandle;
+      mobileSignalsHandle = null;
+      const shouldStopMonitoring =
+        mobileSignalsStarted || mobileSignalsStartupAttempted;
+      mobileSignalsStarted = false;
+      mobileSignalsStartupAttempted = false;
+
+      if (handle) {
+        try {
+          await handle.remove();
+        } catch (error) {
+          // error-policy:J6 native teardown continues so one failed resource
+          // release cannot strand the remaining monitor/background job.
+          teardownFailures.push(error);
+        }
+      }
+      if (mobileSignals && shouldStopMonitoring) {
+        try {
+          await mobileSignals.stopMonitoring();
+        } catch (error) {
+          // error-policy:J6 see listener removal above.
+          teardownFailures.push(error);
+        }
+      }
+      if (
+        mobileSignals &&
+        typeof mobileSignals.cancelBackgroundRefresh === "function"
+      ) {
+        try {
+          await mobileSignals.cancelBackgroundRefresh();
+        } catch (error) {
+          // error-policy:J6 see listener removal above.
+          teardownFailures.push(error);
+        }
+      }
+
+      if (teardownFailures.length > 0) {
+        throw new AggregateError(
+          teardownFailures,
+          "Failed to fully stop LifeOps native activity capture",
+        );
+      }
+    })().finally(() => {
+      if (activeCaptureStop === stop) {
+        activeCaptureStop = null;
+      }
+    });
+    return stopPromise;
   };
 
   activeCaptureStop = stop;
+  if (serviceSignal) {
+    const onServiceAbort = () => {
+      void stop();
+    };
+    serviceSignal.addEventListener("abort", onServiceAbort, { once: true });
+    detachServiceAbort = () =>
+      serviceSignal.removeEventListener("abort", onServiceAbort);
+    if (serviceSignal.aborted) {
+      void stop();
+    }
+  }
   return stop;
 }
 

@@ -311,6 +311,7 @@ export interface LifeOpsElizaClientMethods {
   ): Promise<{ session: LifeOpsBrowserSession }>;
   captureLifeOpsActivitySignal(
     data: CaptureLifeOpsActivitySignalRequest,
+    options?: { signal?: AbortSignal },
   ): Promise<{ signal: LifeOpsActivitySignal }>;
   captureLifeOpsManualOverride(
     data: CaptureLifeOpsManualOverrideRequest,
@@ -910,10 +911,12 @@ lifeOpsClientPrototype.completeLifeOpsBrowserSession = async function (
 lifeOpsClientPrototype.captureLifeOpsActivitySignal = async function (
   this: ElizaClient,
   data,
+  options,
 ) {
   return this.fetch("/api/lifeops/activity-signals", {
     method: "POST",
     body: JSON.stringify(data),
+    signal: options?.signal,
   });
 };
 

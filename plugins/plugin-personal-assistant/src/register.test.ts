@@ -112,7 +112,7 @@ async function settle(turns = 4): Promise<void> {
 }
 
 describe("personal-assistant renderer registration entry", () => {
-  let host: { dispose: () => void } | undefined;
+  let host: { dispose: () => Promise<void> } | undefined;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -120,7 +120,7 @@ describe("personal-assistant renderer registration entry", () => {
   });
 
   afterEach(async () => {
-    host?.dispose();
+    await host?.dispose();
     host = undefined;
     await settle();
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
@@ -141,7 +141,7 @@ describe("personal-assistant renderer registration entry", () => {
     expect(serviceState()?.status).toBe("ineligible");
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
     expect(h.getStatus).not.toHaveBeenCalled();
-    host.dispose();
+    await host.dispose();
 
     host = startRendererServiceHost({ shell: "detached" });
     await settleRendererServices();
@@ -161,7 +161,7 @@ describe("personal-assistant renderer registration entry", () => {
     expect(h.getStatus).toHaveBeenCalled();
     expect(h.captureLifeOpsActivitySignal).toHaveBeenCalled();
 
-    host.dispose();
+    await host.dispose();
     host = undefined;
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
     expect(removeDoc).toHaveBeenCalledWith(
@@ -193,6 +193,7 @@ describe("personal-assistant renderer registration entry", () => {
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(true);
 
     window.dispatchEvent(new Event("pagehide"));
+    await settleRendererServices();
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
     host = undefined;
   });

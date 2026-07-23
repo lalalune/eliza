@@ -93,6 +93,8 @@ interface ServiceInstance {
   startPromise: Promise<void>;
   /** Shared by every stop request so cleanup is invoked and awaited once. */
   stopPromise: Promise<void> | null;
+  /** Pre-#17110 field retained only while an HMR store is upgraded in place. */
+  settled?: Promise<void>;
 }
 
 interface HostState {
@@ -100,6 +102,8 @@ interface HostState {
   reportError: RendererServiceErrorReporter;
   instances: Map<string, ServiceInstance>;
   detachPageEvents: (() => void) | null;
+  /** Pre-#17110 pagehide disposer retained for in-place HMR store upgrades. */
+  detachPagehide?: (() => void) | null;
   disposed: boolean;
   suspended: boolean;
   disposePromise: Promise<void> | null;
@@ -131,14 +135,44 @@ const STORE_KEY = Symbol.for("elizaos.renderer-services.store");
 
 function getStore(): RendererServiceStore {
   const holder = globalThis as { [STORE_KEY]?: RendererServiceStore };
-  holder[STORE_KEY] ??= {
-    definitions: new Map(),
-    definitionVersions: new Map(),
-    nextDefinitionVersion: 0,
-    host: null,
-    transition: Promise.resolve(),
-  };
-  return holder[STORE_KEY];
+  if (!holder[STORE_KEY]) {
+    holder[STORE_KEY] = {
+      definitions: new Map(),
+      definitionVersions: new Map(),
+      nextDefinitionVersion: 0,
+      host: null,
+      transition: Promise.resolve(),
+    };
+  }
+  const store = holder[STORE_KEY];
+
+  // HMR deliberately preserves this global store across module evaluations.
+  // Upgrade the pre-#17110 shape in place so the lifecycle fix can take
+  // ownership of already-running services instead of crashing on missing queue
+  // fields or leaking the old pagehide listener.
+  store.definitionVersions ??= new Map();
+  store.nextDefinitionVersion ??= 0;
+  store.transition ??= Promise.resolve();
+  for (const id of store.definitions.keys()) {
+    if (!store.definitionVersions.has(id)) {
+      store.nextDefinitionVersion += 1;
+      store.definitionVersions.set(id, store.nextDefinitionVersion);
+    }
+  }
+  const host = store.host;
+  if (host) {
+    host.suspended ??= false;
+    host.disposePromise ??= null;
+    if (!host.detachPageEvents && host.detachPagehide) {
+      host.detachPageEvents = host.detachPagehide;
+    }
+    for (const [id, instance] of host.instances) {
+      instance.definitionVersion ??= store.definitionVersions.get(id) ?? 0;
+      instance.startPromise ??= instance.settled ?? Promise.resolve();
+      instance.stopPromise ??= null;
+    }
+  }
+  return store;
 }
 
 const LOG_PREFIX = "[RendererServices]";

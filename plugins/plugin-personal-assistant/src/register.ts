@@ -15,5 +15,5 @@ import { startLifeOpsActivitySignalCapture } from "./lifeops/activity-signals-ca
 registerRendererService({
   id: "personal-assistant.lifeops-activity-signals",
   shells: ["main"],
-  start: () => startLifeOpsActivitySignalCapture(),
+  start: ({ signal }) => startLifeOpsActivitySignalCapture(true, signal),
 });

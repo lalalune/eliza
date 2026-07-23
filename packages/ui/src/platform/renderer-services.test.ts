@@ -101,6 +101,46 @@ describe("registration and host startup ordering", () => {
       }),
     ).toThrow(/declares no shells/);
   });
+
+  it("upgrades an active pre-queue HMR store without leaking its generation", async () => {
+    await resetRendererServicesForTest();
+    const cleanup = vi.fn();
+    const detachPagehide = vi.fn();
+    const definition = {
+      id: "a.legacy-hmr",
+      shells: ["main"] as const,
+      start: vi.fn(() => () => {}),
+    };
+    const controller = new AbortController();
+    const legacyInstance = {
+      definition,
+      controller,
+      status: "running",
+      cleanup,
+      settled: Promise.resolve(),
+    };
+    const legacyHost = {
+      shell: "main",
+      reportError: vi.fn(),
+      instances: new Map([[definition.id, legacyInstance]]),
+      detachPagehide,
+      disposed: false,
+    };
+    const holder = globalThis as unknown as Record<PropertyKey, unknown>;
+    holder[Symbol.for("elizaos.renderer-services.store")] = {
+      definitions: new Map([[definition.id, definition]]),
+      host: legacyHost,
+    };
+
+    startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(detachPagehide).toHaveBeenCalledTimes(1);
+    expect(definition.start).toHaveBeenCalledTimes(1);
+    expect(stateOf(definition.id)).toBe("running");
+  });
 });
 
 describe("shell scoping", () => {
