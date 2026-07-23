@@ -234,7 +234,7 @@ export async function writeOrgBalanceHint(
     balanceUsd,
     balanceAt,
   };
-  await cache.set(CacheKeys.inference.orgBalance(orgId), hint, CacheTTL.inference.orgBalance);
+  await cache.set(CacheKeys.inference.orgBalance(orgId), hint, CacheTTL.inference.orgBalanceStale);
 }
 
 /** Drop the org-balance gate hint so the next request re-reads it fresh. */

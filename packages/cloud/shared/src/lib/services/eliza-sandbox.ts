@@ -37,7 +37,6 @@ import { getElizaAgentPublicWebUiUrl } from "../eliza-agent-web-ui";
 import { getCloudAwareEnv } from "../runtime/cloud-bindings";
 import { assertSafeOutboundUrl } from "../security/outbound-url";
 import { logger } from "../utils/logger";
-import { settleOffResponsePath } from "../utils/settle-off-response-path";
 import { withTimeout } from "../utils/with-timeout";
 import {
   computeStateHash,
@@ -364,14 +363,6 @@ export interface BridgeRequest {
   method: string;
   params?: Record<string, unknown>;
 }
-
-/**
- * Structural subset of the Cloudflare Workers `ExecutionContext` the shared-tier
- * bridge needs to defer its post-reply billing tail off the response path.
- * Routes pass `c.executionCtx`; non-Worker callers (tests, Node) omit it and
- * the tail runs inline, preserving fully-synchronous settlement.
- */
-export type BridgeExecutionContext = { waitUntil(promise: Promise<unknown>): void };
 
 /**
  * JSON-RPC error code for a shared-runtime turn rejected by the credit
@@ -2554,7 +2545,6 @@ export class ElizaSandboxService {
   private async bridgeSharedMessageSend(
     rec: AgentSandbox,
     rpc: BridgeRequest,
-    executionCtx?: BridgeExecutionContext,
   ): Promise<BridgeResponse> {
     const params = rpc.params && typeof rpc.params === "object" ? rpc.params : {};
     const text = typeof params.text === "string" ? params.text : "";
@@ -2626,10 +2616,7 @@ export class ElizaSandboxService {
     // (it runs OUTSIDE the inner billing try/catch) — would otherwise propagate
     // without ever refunding, stranding the hold and over-charging the org.
     // settleReservation is idempotent (reservationSettled), so refunding here
-    // never double-refunds a turn that already settled on a normal path. The
-    // deferred billing tail below owns its own settle-or-refund end-to-end, so
-    // this catch never races it: by the time the tail is registered, every
-    // throw it can produce is contained inside the tail's own try/catch.
+    // never double-refunds a turn that already settled on a normal path.
     try {
       const turn = await runSharedAgentTurn({
         character,
@@ -2647,66 +2634,40 @@ export class ElizaSandboxService {
       } else {
         await this.saveSharedRuntimeHistory(rec.id, channelId, turn.history);
         if (billingContext) {
-          // The reply is final once the turn ran and history persisted, but the
-          // billing tail (billUsage → settleReservation → analytics → audit) is
-          // ~1.7s of cross-region Worker→DB RTT. On a Worker, defer it via
-          // executionCtx.waitUntil so it completes off the response path;
-          // without an executionCtx (tests, non-Worker callers) it runs inline,
-          // exactly as before. The deferred task ALWAYS settles the hold:
-          // success settles at billing.totalCost, any failure refunds via the
-          // idempotent settleReservation(0), and a refund throw is contained
-          // and logged (never an unhandled waitUntil rejection) — the #11169
-          // sweep-credit-reservations cron backstops a hold stranded by a
-          // dropped waitUntil or a failed refund.
-          await settleOffResponsePath(executionCtx, async () => {
-            try {
-              const billing = await billUsage(
-                billingContext,
-                this.sharedRuntimeBillingUsage(turn, estimatedInputTokens),
-              );
-              const settlement = await settleReservation(billing.totalCost);
-              const usageRecord = await recordUsageAnalytics(billingContext, billing, {
-                type: "chat",
-                content: turn.reply,
-                prompt: text,
-              });
-              if (usageRecord) {
-                await aiBillingRecordsService
-                  .record({
-                    context: billingContext,
-                    billing,
-                    usageRecord,
-                    idempotencyKey,
-                    reconciliation: settlement,
-                  })
-                  .catch((error) => {
-                    logger.error("[shared-runtime] AI billing audit record failed", {
-                      error: error instanceof Error ? error.message : String(error),
-                      agentId: rec.id,
-                    });
-                  });
-              }
-            } catch (error) {
-              // error-policy:J1 deferred-settlement boundary — the response may
-              // already be gone, so the refund is the handling: settle(0) is
-              // idempotent, and a refund failure is logged for the cron sweep.
-              try {
-                await settleReservation(0);
-              } catch (refundError) {
-                logger.error(
-                  "[shared-runtime] deferred billing refund failed; sweep-credit-reservations will reclaim the hold",
-                  {
-                    error: refundError instanceof Error ? refundError.message : String(refundError),
+          try {
+            const billing = await billUsage(
+              billingContext,
+              this.sharedRuntimeBillingUsage(turn, estimatedInputTokens),
+            );
+            const settlement = await settleReservation(billing.totalCost);
+            const usageRecord = await recordUsageAnalytics(billingContext, billing, {
+              type: "chat",
+              content: turn.reply,
+              prompt: text,
+            });
+            if (usageRecord) {
+              await aiBillingRecordsService
+                .record({
+                  context: billingContext,
+                  billing,
+                  usageRecord,
+                  idempotencyKey,
+                  reconciliation: settlement,
+                })
+                .catch((error) => {
+                  logger.error("[shared-runtime] AI billing audit record failed", {
+                    error: error instanceof Error ? error.message : String(error),
                     agentId: rec.id,
-                  },
-                );
-              }
-              logger.error("[shared-runtime] billing failed", {
-                error: error instanceof Error ? error.message : String(error),
-                agentId: rec.id,
-              });
+                  });
+                });
             }
-          });
+          } catch (error) {
+            await settleReservation(0);
+            logger.error("[shared-runtime] billing failed", {
+              error: error instanceof Error ? error.message : String(error),
+              agentId: rec.id,
+            });
+          }
         }
       }
 
@@ -2991,12 +2952,7 @@ export class ElizaSandboxService {
 
   // Bridge
 
-  async bridge(
-    agentId: string,
-    orgId: string,
-    rpc: BridgeRequest,
-    executionCtx?: BridgeExecutionContext,
-  ): Promise<BridgeResponse> {
+  async bridge(agentId: string, orgId: string, rpc: BridgeRequest): Promise<BridgeResponse> {
     const rec = await agentSandboxesRepository.findRunningSandbox(agentId, orgId);
     if (!rec) {
       // Bootstrap window: a freshly-created dedicated agent whose container is
@@ -3006,7 +2962,7 @@ export class ElizaSandboxService {
       // yet "running", so re-resolve by id+org.)
       const bootstrap = await agentSandboxesRepository.findByIdAndOrg(agentId, orgId);
       if (bootstrap && isDedicatedBootstrapWindow(bootstrap)) {
-        return this.bridgeSharedBootstrap(bootstrap, rpc, executionCtx);
+        return this.bridgeSharedBootstrap(bootstrap, rpc);
       }
       logger.warn("[agent-sandbox] Bridge call to non-running sandbox", {
         agentId,
@@ -3025,7 +2981,7 @@ export class ElizaSandboxService {
           return await this.bridgeSharedStatus(rec, rpc);
         }
         if (rpc.method === "message.send") {
-          return await this.bridgeSharedMessageSend(rec, rpc, executionCtx);
+          return await this.bridgeSharedMessageSend(rec, rpc);
         }
         return {
           jsonrpc: "2.0",
@@ -3082,14 +3038,13 @@ export class ElizaSandboxService {
   private async bridgeSharedBootstrap(
     rec: AgentSandbox,
     rpc: BridgeRequest,
-    executionCtx?: BridgeExecutionContext,
   ): Promise<BridgeResponse> {
     try {
       if (rpc.method === "status.get" || rpc.method === "heartbeat") {
         return await this.bridgeSharedStatus(rec, rpc);
       }
       if (rpc.method === "message.send") {
-        return await this.bridgeSharedMessageSend(rec, rpc, executionCtx);
+        return await this.bridgeSharedMessageSend(rec, rpc);
       }
       return {
         jsonrpc: "2.0",

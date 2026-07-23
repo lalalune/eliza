@@ -124,12 +124,96 @@ export function isPendingInferenceCharge(value: unknown): value is PendingInfere
  * fast-vs-safe decision is therefore made on a number at most `orgBalance` TTL
  * old (plus KV lag), which the threshold must account for.
  */
-export async function getGateBalanceUsd(organizationId: string): Promise<number> {
+export interface GateBalanceReadOptions {
+  /**
+   * Worker lifetime hook for stale/full-miss revalidation. Supplying this keeps
+   * every authoritative refresh observable and alive without joining it to the
+   * response promise.
+   */
+  executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+  /**
+   * Fail closed on a full cache miss instead of performing a synchronous
+   * Postgres read in the inference path. The caller should return a retryable
+   * cache-warming response; the authoritative hydration is registered with
+   * `executionCtx`.
+   */
+  cacheOnly?: boolean;
+}
+
+export class InferenceBalanceCacheWarmingError extends Error {
+  constructor() {
+    super("Inference billing cache is warming; retry the request");
+    this.name = "InferenceBalanceCacheWarmingError";
+  }
+}
+
+const balanceRevalidationInFlight = new Map<string, Promise<number>>();
+
+function refreshOrgBalanceHint(organizationId: string): Promise<number> {
+  const existing = balanceRevalidationInFlight.get(organizationId);
+  if (existing) return existing;
+
+  const refresh = creditsService
+    .getOrganizationBalanceUsd(organizationId)
+    .then(async (fresh) => {
+      await writeOrgBalanceHint(organizationId, fresh, Date.now());
+      return fresh;
+    })
+    .finally(() => {
+      balanceRevalidationInFlight.delete(organizationId);
+    });
+  balanceRevalidationInFlight.set(organizationId, refresh);
+  return refresh;
+}
+
+function observeBackgroundBalanceRefresh(
+  organizationId: string,
+  refresh: Promise<number>,
+): Promise<void> {
+  return refresh.then(
+    () => undefined,
+    (error) => {
+      // error-policy:J7 the inference response is deliberately independent of
+      // cache refresh; log the failed hydration so the next miss can retry.
+      logger.warn("[InferenceBilling] org-balance revalidation failed", {
+        organizationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+  );
+}
+
+export async function getGateBalanceUsd(
+  organizationId: string,
+  options: GateBalanceReadOptions = {},
+): Promise<number> {
   const hint = await readOrgBalanceHint(organizationId);
-  if (hint) return hint.balanceUsd;
-  const fresh = await creditsService.getOrganizationBalanceUsd(organizationId);
-  await writeOrgBalanceHint(organizationId, fresh, Date.now());
-  return fresh;
+  if (hint) {
+    if (Date.now() - hint.balanceAt > CacheTTL.inference.orgBalance * 1000) {
+      const refresh = observeBackgroundBalanceRefresh(
+        organizationId,
+        refreshOrgBalanceHint(organizationId),
+      );
+      if (options.executionCtx) {
+        options.executionCtx.waitUntil(refresh);
+      } else {
+        void refresh;
+      }
+    }
+    return hint.balanceUsd;
+  }
+
+  const refresh = refreshOrgBalanceHint(organizationId);
+  if (options.cacheOnly) {
+    const observed = observeBackgroundBalanceRefresh(organizationId, refresh);
+    if (options.executionCtx) {
+      options.executionCtx.waitUntil(observed);
+    } else {
+      await observed;
+    }
+    throw new InferenceBalanceCacheWarmingError();
+  }
+  return await refresh;
 }
 
 /**
