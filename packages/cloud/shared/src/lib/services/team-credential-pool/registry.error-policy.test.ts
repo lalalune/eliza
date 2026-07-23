@@ -15,6 +15,8 @@ const mockRefresh = mock(async () => undefined);
 const mockSecretIdFor = mock();
 const mockGetDecryptedValue = mock();
 const mockWarn = mock();
+const mockRecordDailyUsage = mock(async () => undefined);
+const mockUpdatePoolState = mock(async () => undefined);
 
 mock.module("../../utils/logger", () => ({
   logger: { warn: mockWarn, info: mock(), error: mock(), debug: mock() },
@@ -38,8 +40,8 @@ mock.module("./pool-deps", () => ({
 
 mock.module("../../../db/repositories/pooled-credentials", () => ({
   pooledCredentialsRepository: {
-    recordDailyUsage: mock(),
-    updatePoolStateForOrganization: mock(),
+    recordDailyUsage: mockRecordDailyUsage,
+    updatePoolStateForOrganization: mockUpdatePoolState,
   },
 }));
 
@@ -55,6 +57,8 @@ async function freshRegistry(): Promise<TeamPoolRegistry> {
   mockSecretIdFor.mockReset();
   mockGetDecryptedValue.mockReset();
   mockWarn.mockReset();
+  mockRecordDailyUsage.mockClear();
+  mockUpdatePoolState.mockClear();
   mockRefresh.mockClear();
   mockRefresh.mockResolvedValue(undefined);
   const { TeamPoolRegistry } = await import("./registry");
@@ -129,5 +133,90 @@ describe("TeamPoolRegistry.selectCredential error policy", () => {
       label: "team-key",
     });
     expect(mockWarn).not.toHaveBeenCalled();
+  });
+});
+
+describe("TeamPoolRegistry.selectCredentialCacheOnly", () => {
+  it("returns warming on a cold isolate and serves the hydrated secret from memory", async () => {
+    const registry = await freshRegistry();
+    mockSelect.mockResolvedValue({ id: "cred-1", label: "team-key" });
+    mockSecretIdFor.mockReturnValue("secret-1");
+    mockGetDecryptedValue.mockResolvedValue("sk-real-key");
+    const background: Promise<unknown>[] = [];
+
+    expect(
+      await registry.selectCredentialCacheOnly(PARAMS, {
+        executionCtx: { waitUntil: (promise) => background.push(promise) },
+      }),
+    ).toEqual({ kind: "warming" });
+    expect(background).toHaveLength(1);
+    await background[0];
+
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "ready",
+      credential: {
+        credentialId: "cred-1",
+        providerId: "anthropic-api",
+        envKey: "ANTHROPIC_API_KEY",
+        apiKey: "sk-real-key",
+        label: "team-key",
+      },
+    });
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(mockGetDecryptedValue).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not query pool metadata or the secret store without waitUntil", async () => {
+    const registry = await freshRegistry();
+
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "unavailable",
+    });
+    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(mockSelect).not.toHaveBeenCalled();
+    expect(mockGetDecryptedValue).not.toHaveBeenCalled();
+  });
+
+  it("negative-caches a legitimately empty pool and coalesces cold hydration", async () => {
+    const registry = await freshRegistry();
+    mockSelect.mockResolvedValue(null);
+    const background: Promise<unknown>[] = [];
+    const executionCtx = {
+      waitUntil: (promise: Promise<unknown>) => background.push(promise),
+    };
+
+    expect(
+      await Promise.all([
+        registry.selectCredentialCacheOnly(PARAMS, { executionCtx }),
+        registry.selectCredentialCacheOnly(PARAMS, { executionCtx }),
+      ]),
+    ).toEqual([{ kind: "warming" }, { kind: "warming" }]);
+    expect(background).toHaveLength(2);
+    expect(background[0]).toBe(background[1]);
+    await background[0];
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "ready",
+      credential: null,
+    });
+  });
+
+  it("retains usage attribution under waitUntil instead of joining it to output", async () => {
+    const registry = await freshRegistry();
+    const background: Promise<unknown>[] = [];
+
+    registry.recordUseOffPath(
+      {
+        organizationId: "org-1",
+        credentialId: "cred-1",
+        userId: "user-1",
+      },
+      { waitUntil: (promise) => background.push(promise) },
+    );
+
+    expect(background).toHaveLength(1);
+    await background[0];
+    expect(mockRecordDailyUsage).toHaveBeenCalledTimes(1);
+    expect(mockUpdatePoolState).toHaveBeenCalledTimes(1);
   });
 });

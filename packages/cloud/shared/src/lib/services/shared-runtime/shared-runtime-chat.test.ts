@@ -16,8 +16,21 @@ let billError: Error | null;
 let billingGate: Promise<void> | null;
 let releaseBilling = () => {};
 const settleCalls: number[] = [];
+let settleUnknownCalls = 0;
 const billCalls: unknown[] = [];
 let characterReads = 0;
+const payoutAwareReservation = {
+  reservedAmount: 0.01,
+  reservationTransactionId: "reservation-1",
+  affiliateAttribution: {
+    affiliateCodeId: "00000000-0000-4000-8000-000000000010",
+    affiliateUserId: "00000000-0000-4000-8000-000000000011",
+    affiliateCode: "PARTNER",
+    markupPercent: 0.2,
+  },
+  affiliatePayoutSourceId: "ai_billing:affiliate:shared-runtime-test",
+  reconcile: async () => undefined,
+};
 
 mock.module("../organization-inference-admission", () => ({
   admitOrganizationInference: async (params: {
@@ -31,6 +44,11 @@ mock.module("../organization-inference-admission", () => ({
         settleCalls.push(cost);
         return null;
       },
+      settleUnknown: async () => {
+        settleUnknownCalls++;
+        return null;
+      },
+      reservation: payoutAwareReservation,
     };
   },
 }));
@@ -118,6 +136,7 @@ function harness() {
 
 beforeEach(() => {
   settleCalls.length = 0;
+  settleUnknownCalls = 0;
   billCalls.length = 0;
   admissionError = null;
   billError = null;
@@ -178,6 +197,7 @@ describe("SharedRuntimeChatService", () => {
     releaseBilling();
     await Promise.all(h.background);
     expect(billCalls).toHaveLength(1);
+    expect((billCalls[0] as unknown[])[2]).toBe(payoutAwareReservation);
     expect(settleCalls).toEqual([0.004]);
   });
 
@@ -197,6 +217,24 @@ describe("SharedRuntimeChatService", () => {
 
     expect((await service.bridge(linkedAgent, rpc, h)).result?.text).toBe("hello back");
     expect(characterReads).toBe(1);
+  });
+
+  test("cache-only character miss requires waitUntil before repository hydration", async () => {
+    const service = new SharedRuntimeChatService();
+    const h = harness();
+    const linkedAgent = {
+      ...agent,
+      character_id: "00000000-0000-4000-8000-000000000098",
+    };
+
+    await expect(
+      service.bridge(linkedAgent, rpc, { historyStore: h.historyStore }),
+    ).rejects.toMatchObject({
+      name: "SharedRuntimeCacheWarmingError",
+      message: "Character cache context is unavailable. Retry shortly.",
+    });
+    expect(characterReads).toBe(0);
+    expect(h.background).toHaveLength(0);
   });
 
   test("degraded and failed turns release admission at zero", async () => {
@@ -221,13 +259,14 @@ describe("SharedRuntimeChatService", () => {
     expect(settleCalls.at(-1)).toBe(0);
   });
 
-  test("billing failure is contained and retries settlement without changing cost", async () => {
+  test("billing failure after a delivered reply conservatively settles unknown usage", async () => {
     const service = new SharedRuntimeChatService();
     const h = harness();
     billError = new Error("meter unavailable");
     await service.bridge(agent, rpc, h);
     await Promise.all(h.background);
-    expect(settleCalls).toEqual([0]);
+    expect(settleCalls).toEqual([]);
+    expect(settleUnknownCalls).toBe(1);
   });
 
   test("translates insufficient admission to the bridge credit code", async () => {

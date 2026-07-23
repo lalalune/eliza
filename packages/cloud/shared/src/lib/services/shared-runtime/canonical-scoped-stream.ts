@@ -23,13 +23,18 @@ const STREAM_HEADERS = {
 } as const;
 
 export interface CanonicalScopedStreamRequest {
+  /**
+   * Tenancy-resolved agent supplied by the caller. Requiring this at the type
+   * boundary prevents Worker callers from falling through to the legacy
+   * repository-backed bridge when cache authorization is unavailable.
+   */
+  agent: AgentSandbox;
   agentId: string;
   orgId: string;
   conversationId: string;
   userId?: string;
-  agent?: AgentSandbox;
-  namespace?: RuntimeDurableObjectNamespace;
-  executionCtx?: BridgeExecutionContext;
+  namespace: RuntimeDurableObjectNamespace;
+  executionCtx: BridgeExecutionContext;
   body: unknown;
   origin?: string | null;
   timings?: Record<string, number>;
@@ -93,17 +98,13 @@ export async function handleCanonicalScopedAgentStream(
     },
   };
 
-  let upstream: Response | null;
+  let upstream: Response;
   const bridgeStartedAt = nowMs();
   try {
-    upstream = request.agent
-      ? await coordinateSharedStream(request.agent, rpc, {
-          namespace: request.namespace,
-          executionCtx: request.executionCtx,
-        })
-      : await import("../eliza-sandbox").then(({ elizaSandboxService }) =>
-          elizaSandboxService.bridgeStream(request.agentId, request.orgId, rpc),
-        );
+    upstream = await coordinateSharedStream(request.agent, rpc, {
+      namespace: request.namespace,
+      executionCtx: request.executionCtx,
+    });
     timings.bridge = elapsedMs(bridgeStartedAt);
   } catch (error) {
     timings.bridge = elapsedMs(bridgeStartedAt);
@@ -157,7 +158,7 @@ export async function handleCanonicalScopedAgentStream(
     });
   }
 
-  if (!upstream?.body) {
+  if (!upstream.body) {
     const body = `event: error\ndata: ${JSON.stringify({
       message: "Agent produced no streamed response",
     })}\n\n`;

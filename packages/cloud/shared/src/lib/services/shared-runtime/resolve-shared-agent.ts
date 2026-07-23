@@ -1,14 +1,16 @@
-// Coordinates cloud service resolve shared agent behavior behind route handlers.
+/**
+ * Resolves shared-agent identity and tenancy for Cloudflare request handlers.
+ *
+ * Production chat callers use the cache-only mode: misses schedule
+ * authoritative hydration under waitUntil and return retryable unavailability.
+ */
 
 import { createHash } from "node:crypto";
 import { ElizaError } from "@elizaos/core";
 import type { Context } from "hono";
 
-import {
-  type AgentSandbox,
-  agentSandboxesRepository,
-} from "../../../db/repositories/agent-sandboxes";
-import type { AppEnv } from "../../../types/cloud-worker-env";
+import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
+import type { AppEnv, RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-env";
 import {
   apiKeyScopeHashPrefix,
   requireUserOrApiKeyWithOrgLookup,
@@ -18,12 +20,15 @@ import {
 import { cache } from "../../cache/client";
 import { CacheKeys, CacheTTL } from "../../cache/keys";
 import { logger } from "../../utils/logger";
-import { charactersService } from "../characters/characters";
 import { isDedicatedBootstrapWindow } from "./dedicated-bootstrap";
 
 export type ResolvedSharedAgent =
-  | { error: string; status: 400 | 404 | 503 }
+  | { error: string; status: 400 | 401 | 404 | 503 }
   | { agent: AgentSandbox; agentId: string; orgId: string; agentName: string };
+
+export interface SharedRuntimeExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
 
 export interface ResolveSharedAgentOptions {
   /**
@@ -32,7 +37,50 @@ export interface ResolveSharedAgentOptions {
    * retryable warming response.
    */
   cacheOnly?: boolean;
-  executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+  executionCtx?: SharedRuntimeExecutionContext;
+}
+
+export type SharedRuntimeWorkerRequestContext =
+  | {
+      namespace: RuntimeDurableObjectNamespace;
+      executionCtx: SharedRuntimeExecutionContext;
+    }
+  | {
+      error: string;
+      code: "shared_runtime_context_unavailable";
+      retryable: true;
+      status: 503;
+    };
+
+/**
+ * Resolve the two Cloudflare capabilities required by every production shared
+ * chat request. Treating either capability as optional previously turned a
+ * deployment/configuration fault into a synchronous legacy database path.
+ */
+export function resolveSharedRuntimeWorkerRequestContext(
+  c: Context<AppEnv>,
+): SharedRuntimeWorkerRequestContext {
+  const namespace = c.env?.SHARED_RUNTIME_CONVERSATIONS;
+  let executionCtx: SharedRuntimeExecutionContext | undefined;
+  try {
+    const candidate = c.executionCtx;
+    if (candidate && typeof candidate.waitUntil === "function") {
+      executionCtx = candidate;
+    }
+  } catch {
+    // error-policy:J4 Hono intentionally throws when a route is invoked outside
+    // Workers; the caller renders a retryable unavailable response.
+    executionCtx = undefined;
+  }
+  if (!namespace || typeof namespace.getByName !== "function" || !executionCtx) {
+    return {
+      error: "Shared runtime cache context is unavailable. Retry shortly.",
+      code: "shared_runtime_context_unavailable",
+      retryable: true,
+      status: 503,
+    };
+  }
+  return { namespace, executionCtx };
 }
 
 /**
@@ -153,13 +201,11 @@ interface CachedSharedAgentScope {
 }
 
 /**
- * Confirm a scope-cache HIT is still authorized WITHOUT the cold user/org+agent
- * hydration (COLDPATH-FIX-2026-07-21). Validates the presented API key via the
- * revoke-invalidated validation cache (a 1-read warm check, or one cold DB trip
- * on a genuinely cold validation entry) and confirms it still belongs to the
- * cached org. Returns false on any not-OK state so the caller falls back to the
- * full authoritative gate — the exact 401/403 taxonomy is preserved, we only
- * fast-path the HAPPY case. Session/JWT requests never reach here (no api key).
+ * Confirm a scope-cache hit is still authorized without user/org or agent
+ * hydration. Cache-only callers validate from the revoke-invalidated API-key
+ * cache; administrative callers may use the authoritative validator. The
+ * credential must still belong to the cached organization. Session/JWT
+ * requests use the separate session revalidation path.
  */
 async function revalidateCachedScope(
   c: Context<AppEnv>,
@@ -214,6 +260,13 @@ export async function resolveSharedAgent(
 ): Promise<ResolvedSharedAgent> {
   const agentId = c.req.param("agentId");
   if (!agentId) return { error: "Missing agent id", status: 400 };
+  const executionCtx = options.executionCtx;
+  if (options.cacheOnly && !executionCtx) {
+    return {
+      error: "Agent authorization cache context is unavailable. Retry shortly.",
+      status: 503,
+    };
+  }
 
   // COLD-PATH fast lane (COLDPATH-FIX-2026-07-21): on the API-key path, a fresh
   // browser session pays 2 serial cold Hyperdrive waves here (key validation +
@@ -226,13 +279,19 @@ export async function resolveSharedAgent(
   // namespace so a session hash can never collide with an API-key hash
   // (#SHADOW-ACCOUNT-DEBUG). Whichever credential the request carries wins;
   // requests carrying neither skip the cache and hit the authoritative gate.
-  const apiKeyPrefix = await apiKeyScopeHashPrefix(c).catch(() => null);
-  const sessionPrefix = apiKeyPrefix ? null : await sessionScopeHashPrefix(c).catch(() => null);
+  const apiKeyPrefix = await apiKeyScopeHashPrefix(c);
+  const sessionPrefix = apiKeyPrefix ? null : await sessionScopeHashPrefix(c);
   const isSessionScope = apiKeyPrefix == null && sessionPrefix != null;
   const scopeKeyPrefix = apiKeyPrefix ?? (sessionPrefix ? `s:${sessionPrefix}` : null);
   const scopeCacheKey = scopeKeyPrefix
     ? CacheKeys.sharedAgentScope.resolve(scopeKeyPrefix, agentId)
     : null;
+  if (options.cacheOnly && !scopeCacheKey) {
+    return {
+      error: "A supported API key or session credential is required.",
+      status: 401,
+    };
+  }
   // A cache HIT reproduces the resolved scope WITHOUT the cold DB waves, but must
   // STILL run the per-request credential gate (see revalidateResolvedScope). This
   // is shared by the direct pre-hydration hit below AND by a single-flight waiter
@@ -250,10 +309,20 @@ export async function resolveSharedAgent(
     // SAME steward user the entry was written for. Either way a
     // revoked/expired/re-scoped credential falls back to the authoritative
     // gate inside the 30s TTL window; we only skip the cold DB waves.
-    const stillAuthorized = isSessionScope
-      ? cached.stewardUserId != null &&
-        (await revalidateSessionScope(c, cached.stewardUserId).catch(() => false))
-      : await revalidateCachedScope(c, cached.orgId, options.cacheOnly === true).catch(() => false);
+    let stillAuthorized: boolean;
+    try {
+      stillAuthorized = isSessionScope
+        ? cached.stewardUserId != null && (await revalidateSessionScope(c, cached.stewardUserId))
+        : await revalidateCachedScope(c, cached.orgId, options.cacheOnly === true);
+    } catch (error) {
+      // error-policy:J4 a cache credential dependency failure cannot authorize
+      // the request; cache-only callers receive the explicit warming response.
+      logger.warn("[resolveSharedAgent] cached scope revalidation failed", {
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      stillAuthorized = false;
+    }
     if (!stillAuthorized) return null;
     // Restore the DATE contract lost to the cache's JSON round-trip before
     // handing the agent to route consumers (e.g. conversations route calls
@@ -300,7 +369,23 @@ export async function resolveSharedAgent(
   };
 
   if (scopeCacheKey) {
-    const cached = await cache.get<CachedSharedAgentScope>(scopeCacheKey).catch(() => null);
+    let cached: CachedSharedAgentScope | null = null;
+    try {
+      cached = await cache.get<CachedSharedAgentScope>(scopeCacheKey);
+    } catch (error) {
+      // error-policy:J4 a cache outage is an explicit retryable failure on the
+      // Worker path; only non-Worker compatibility may use the DB fallback.
+      logger.warn("[resolveSharedAgent] scope cache read failed", {
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (options.cacheOnly) {
+        return {
+          error: "Agent authorization cache is unavailable. Retry shortly.",
+          status: 503,
+        };
+      }
+    }
     if (cached) {
       const resolved = await revalidateResolvedScope(cached);
       if (resolved) {
@@ -326,11 +411,13 @@ export async function resolveSharedAgent(
   // slow past the poll window (getOrSet's own fall-through), so this can never
   // hang a turn — worst case it degrades to today's stampede behavior.
   const hydrateScope = async (): Promise<CachedSharedAgentScope | null> => {
+    const { agentSandboxesRepository } = await import("../../../db/repositories/agent-sandboxes");
     const { user, orgLookupResult: agent } = await requireUserOrApiKeyWithOrgLookup(c, (orgId) =>
       agentSandboxesRepository.findByIdAndOrg(agentId, orgId),
     );
     if (!agent || agent.execution_tier !== "shared") return null;
     if (agent.character_id) {
+      const { charactersService } = await import("../characters/characters");
       await charactersService.getById(agent.character_id);
     }
     const base =
@@ -345,6 +432,12 @@ export async function resolveSharedAgent(
   };
 
   if (scopeCacheKey && options.cacheOnly) {
+    if (!executionCtx) {
+      return {
+        error: "Agent authorization cache context is unavailable. Retry shortly.",
+        status: 503,
+      };
+    }
     const hydration = cache
       .getOrSet<CachedSharedAgentScope | null>(
         scopeCacheKey,
@@ -361,11 +454,7 @@ export async function resolveSharedAgent(
           error: error instanceof Error ? error.message : String(error),
         });
       });
-    if (options.executionCtx) {
-      options.executionCtx.waitUntil(hydration);
-    } else {
-      void hydration;
-    }
+    executionCtx.waitUntil(hydration);
     return {
       error: "Agent authorization cache is warming. Retry shortly.",
       status: 503,
@@ -391,6 +480,7 @@ export async function resolveSharedAgent(
     }
   }
 
+  const { agentSandboxesRepository } = await import("../../../db/repositories/agent-sandboxes");
   const { user, orgLookupResult: agent } = await requireUserOrApiKeyWithOrgLookup(c, (orgId) =>
     agentSandboxesRepository.findByIdAndOrg(agentId, orgId),
   );

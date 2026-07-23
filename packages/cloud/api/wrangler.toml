@@ -100,9 +100,25 @@ simple = { limit = 200, period = 60 }
 name = "SHARED_RUNTIME_CONVERSATIONS"
 class_name = "SharedRuntimeConversation"
 
+[[durable_objects.bindings]]
+name = "INFERENCE_ADMISSION_GATES"
+class_name = "InferenceAdmissionGate"
+
+[[durable_objects.bindings]]
+name = "ANONYMOUS_CHAT_GATES"
+class_name = "AnonymousChatGate"
+
 [[migrations]]
 tag = "shared-runtime-conversations-v1"
 new_sqlite_classes = ["SharedRuntimeConversation"]
+
+[[migrations]]
+tag = "inference-admission-gates-v1"
+new_sqlite_classes = ["InferenceAdmissionGate"]
+
+[[migrations]]
+tag = "anonymous-chat-gates-v1"
+new_sqlite_classes = ["AnonymousChatGate"]
 
 # Exact organization limits and non-native route limits use Railway TCP Redis
 # via REDIS_URL (in-Worker SocketRedis, RESP2 over cloudflare:sockets). The
@@ -188,10 +204,9 @@ INFERENCE_OPTIMISTIC_BILLING = "false"
 # Thin chat-only bootstrap. Keep production off until staging parity/latency soak passes.
 THIN_INFERENCE_ENTRY_ENABLED = "false"
 SAFE_BALANCE_THRESHOLD = ""
-# Optimistic-billing durable backstop: "db" = inference_pending_charges ledger
-# (atomic overdraw bound + exactly-once settle + age-ordered sweep); "" = KV
-# backstop (current). Off until soaked; cutover is an ops flip (#9899).
-INFERENCE_BILLING_LEDGER = ""
+# The Durable Object performs cache-only admission before provider dispatch;
+# the deferred Postgres ledger owns crash-safe, exactly-once settlement.
+INFERENCE_BILLING_LEDGER = "db"
 # Tier-3 deferred admission (#9899): "true" moves the durable admission WRITE
 # (ledger insert / KV pending charge) off the pre-forward critical path via
 # executionCtx.waitUntil; the critical path keeps a cached 402 gate (15s
@@ -423,10 +438,9 @@ REDIS_RATE_LIMITING = "true"
 # (no flag); a cache miss falls back to the authoritative slow path.
 INFERENCE_OPTIMISTIC_BILLING = "true"
 SAFE_BALANCE_THRESHOLD = "5.00"
-# Optimistic-billing durable backstop: "db" = inference_pending_charges ledger
-# (atomic overdraw bound + exactly-once settle + age-ordered sweep); "" = KV
-# backstop (current). Off until soaked; cutover is an ops flip (#9899).
-INFERENCE_BILLING_LEDGER = ""
+# The Durable Object performs cache-only admission before provider dispatch;
+# the deferred Postgres ledger owns crash-safe, exactly-once settlement.
+INFERENCE_BILLING_LEDGER = "db"
 # Tier-3 deferred admission (#9899): "true" moves the durable admission WRITE
 # (ledger insert / KV pending charge) off the pre-forward critical path via
 # executionCtx.waitUntil; the critical path keeps a cached 402 gate (15s
@@ -494,6 +508,14 @@ id = "f7e24faaff734e7c8cd8e12b093c3571"
 [[env.staging.durable_objects.bindings]]
 name = "SHARED_RUNTIME_CONVERSATIONS"
 class_name = "SharedRuntimeConversation"
+
+[[env.staging.durable_objects.bindings]]
+name = "INFERENCE_ADMISSION_GATES"
+class_name = "InferenceAdmissionGate"
+
+[[env.staging.durable_objects.bindings]]
+name = "ANONYMOUS_CHAT_GATES"
+class_name = "AnonymousChatGate"
 
 [[env.staging.ratelimits]]
 name = "GLOBAL_RATE_LIMITER"
@@ -615,10 +637,9 @@ REDIS_RATE_LIMITING = "true"
 # (no flag); a cache miss falls back to the authoritative slow path.
 INFERENCE_OPTIMISTIC_BILLING = "true"
 SAFE_BALANCE_THRESHOLD = "5.00"
-# Optimistic-billing durable backstop: "db" = inference_pending_charges ledger
-# (atomic overdraw bound + exactly-once settle + age-ordered sweep); "" = KV
-# backstop (current). Off until soaked; cutover is an ops flip (#9899).
-INFERENCE_BILLING_LEDGER = ""
+# The Durable Object performs cache-only admission before provider dispatch;
+# the deferred Postgres ledger owns crash-safe, exactly-once settlement.
+INFERENCE_BILLING_LEDGER = "db"
 # Tier-3 deferred admission (#9899): "true" moves the durable admission WRITE
 # (ledger insert / KV pending charge) off the pre-forward critical path via
 # executionCtx.waitUntil; the critical path keeps a cached 402 gate (15s
@@ -679,6 +700,14 @@ id = "1dafabf1293d4b6b97f61c5cc22d6fec"
 [[env.production.durable_objects.bindings]]
 name = "SHARED_RUNTIME_CONVERSATIONS"
 class_name = "SharedRuntimeConversation"
+
+[[env.production.durable_objects.bindings]]
+name = "INFERENCE_ADMISSION_GATES"
+class_name = "InferenceAdmissionGate"
+
+[[env.production.durable_objects.bindings]]
+name = "ANONYMOUS_CHAT_GATES"
+class_name = "AnonymousChatGate"
 
 [[env.production.ratelimits]]
 name = "GLOBAL_RATE_LIMITER"

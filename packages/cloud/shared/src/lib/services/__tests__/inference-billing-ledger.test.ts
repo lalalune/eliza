@@ -413,7 +413,12 @@ describe("createLedgerDebitSettler — exactly-once inline settlement", () => {
         thresholdUsd: 1,
       });
       const settle = ledger.createLedgerDebitSettler(charge(reqId));
-      await settle(2.5);
+      await expect(settle(2.5)).resolves.toEqual({
+        reservedAmount: 2.5,
+        actualCost: 2.5,
+        settlementTransactionIds: [],
+        adjustmentType: "none",
+      });
 
       expect(await readBalance()).toBeCloseTo(7.5, 6);
       expect(await debitCount()).toBe(1);
@@ -453,7 +458,12 @@ describe("createLedgerDebitSettler — exactly-once inline settlement", () => {
         estimatedCostUsd: 3,
         thresholdUsd: 1,
       });
-      await ledger.createLedgerDebitSettler(charge(reqId))(0);
+      await expect(ledger.createLedgerDebitSettler(charge(reqId))(0)).resolves.toEqual({
+        reservedAmount: 0,
+        actualCost: 0,
+        settlementTransactionIds: [],
+        adjustmentType: "none",
+      });
 
       expect(await readBalance()).toBeCloseTo(10, 6);
       expect(await debitCount()).toBe(0);
@@ -523,7 +533,12 @@ describe("createLedgerDebitSettler — exactly-once inline settlement", () => {
       await dbWrite.execute(
         `UPDATE organizations SET credit_balance = '0.500000' WHERE id = '${ORG_ID}';`,
       );
-      await ledger.createLedgerDebitSettler(charge(reqId))(5);
+      await expect(ledger.createLedgerDebitSettler(charge(reqId))(5)).resolves.toEqual({
+        reservedAmount: 0,
+        actualCost: 5,
+        settlementTransactionIds: [],
+        adjustmentType: "uncollected_overage",
+      });
 
       // CHECK(credit_balance >= 0) refused the debit → balance untouched, no debit row.
       expect(await readBalance()).toBeCloseTo(0.5, 6);

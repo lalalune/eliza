@@ -3,6 +3,7 @@
  */
 
 import { sql } from "drizzle-orm";
+import Decimal from "decimal.js";
 import { type SqlExecutor, sqlRows } from "../../db/execute-helpers";
 import { dbWrite, writeTransaction } from "../../db/helpers";
 import {
@@ -21,7 +22,9 @@ import { calculateCost, getProviderFromModel } from "../pricing";
 import { PROVIDER_DEFAULT_MAX_RETRIES, PROVIDER_MAX_BACKOFF_DELAY_MS } from "../providers/_http";
 import { logger } from "../utils/logger";
 import { getRouteTimeoutMs } from "../utils/request-timeout";
+import type { AffiliateBillingAttribution } from "./affiliate-billing-attribution";
 import type { PricingBillingSource } from "./ai-pricing-definitions";
+import { enqueueCollectedAffiliatePayout } from "./affiliate-payout-outbox";
 import { emailService } from "./email";
 import { organizationsService } from "./organizations";
 import { userSessionsService } from "./user-sessions";
@@ -89,6 +92,10 @@ export class InsufficientCreditsError extends Error {
 export interface CreditReservation {
   reservedAmount: number;
   reservationTransactionId?: string | null;
+  /** Immutable affiliate policy pinned before provider dispatch. */
+  affiliateAttribution?: AffiliateBillingAttribution | null;
+  /** Global money identity shared by the payout outbox and earnings ledger. */
+  affiliatePayoutSourceId?: string | null;
   reconcile: (actualCost: number) => Promise<CreditReconciliationResult | void>;
 }
 
@@ -98,6 +105,11 @@ export interface CreditReconciliationResult {
   reservationTransactionId?: string | null;
   settlementTransactionIds: string[];
   adjustmentType: "none" | "refund" | "overage" | "uncollected_overage";
+}
+
+export interface OrganizationBalanceSnapshot {
+  balanceUsd: number;
+  revision: string;
 }
 
 export interface ReserveCreditsParams {
@@ -112,6 +124,11 @@ export interface ReserveCreditsParams {
   estimatedOutputTokens?: number;
   /** Multiplies model-estimated reservations for caller-known markups. */
   estimatedCostMultiplier?: number;
+  /**
+   * Server-owned settlement facts persisted on the reservation. Affiliate
+   * attribution uses this to enqueue its payout atomically with collection.
+   */
+  metadata?: Record<string, unknown>;
   /**
    * Optional idempotency key for the LOGICAL operation — e.g. one TTS
    * utterance whose client retries the same request over a fallback transport
@@ -138,6 +155,17 @@ export interface ReservationSweepStats {
   uncollectedOverages: number;
   batches: number;
   capHit: boolean;
+}
+
+export interface AffiliateInferenceFallbackParams {
+  organizationId: string;
+  userId: string;
+  requestId: string;
+  model: string;
+  provider: string;
+  billingSource: string;
+  actualCost: number;
+  reservationMetadata: Record<string, unknown>;
 }
 
 /**
@@ -482,11 +510,36 @@ export class CreditsService {
    * `getCreditBalanceResponse`, serialized to the client as `balance: null`
    * (#12268 fallback-slop: failed data must not become a success-shaped value).
    */
-  async getOrganizationBalanceUsd(organizationId: string): Promise<number> {
-    const org = await organizationsRepository.findById(organizationId);
+  async getOrganizationBalanceSnapshot(
+    organizationId: string,
+  ): Promise<OrganizationBalanceSnapshot> {
+    const rows = await sqlRows<{
+      credit_balance: string | number | null;
+      balance_revision: string | number | null;
+    }>(
+      dbWrite,
+      sql`
+        SELECT credit_balance, balance_revision
+        FROM organizations
+        WHERE id = ${organizationId}
+        LIMIT 1
+      `,
+    );
+    const org = rows[0];
     // error-policy:J6 missing org → 0 is the documented fail-safe (gate slow-paths).
-    if (!org) return 0;
-    return parseNumeric(org.credit_balance, "credit_balance");
+    if (!org) return { balanceUsd: 0, revision: "0" };
+    const revision = String(org.balance_revision);
+    if (!/^(0|[1-9]\d*)$/.test(revision)) {
+      throw new Error("[CreditsService] Invalid organization balance revision");
+    }
+    return {
+      balanceUsd: parseNumeric(org.credit_balance, "credit_balance"),
+      revision,
+    };
+  }
+
+  async getOrganizationBalanceUsd(organizationId: string): Promise<number> {
+    return (await this.getOrganizationBalanceSnapshot(organizationId)).balanceUsd;
   }
 
   async getTransactionByStripePaymentIntent(
@@ -1208,11 +1261,12 @@ export class CreditsService {
       const reservationRows = await sqlRows<{
         id: string;
         amount: string | number;
+        metadata: Record<string, unknown> | string | null;
         settled_at: Date | string | null;
       }>(
         tx,
         sql`
-          SELECT id, amount, settled_at
+          SELECT id, amount, metadata, settled_at
           FROM credit_transactions
           WHERE id = ${reservationTransactionId}
             AND organization_id = ${organizationId}
@@ -1233,16 +1287,33 @@ export class CreditsService {
       }
 
       const reservedAmount = Math.abs(parseNumeric(reservation.amount, "reservation_amount"));
+      const reservationMetadata = parseMetadata(reservation.metadata);
+      const normalizedActualCost = Math.max(actualCost, 0);
+      const enqueueAffiliatePayout = async (
+        collectedTotalCost: number,
+      ): Promise<void> => {
+        await enqueueCollectedAffiliatePayout(tx, {
+          reservationMetadata,
+          actualTotalCost: normalizedActualCost,
+          collectedTotalCost,
+        });
+      };
 
       if (reservation.settled_at !== null) {
+        const settlementTransactionIds = await existingSettlementIds(tx);
+        await enqueueAffiliatePayout(
+          normalizedActualCost > reservedAmount && settlementTransactionIds.length === 0
+            ? reservedAmount
+            : normalizedActualCost,
+        );
         return {
           kind: "handled" as const,
           claimed: false,
           result: {
             reservedAmount,
-            actualCost,
+            actualCost: normalizedActualCost,
             reservationTransactionId,
-            settlementTransactionIds: await existingSettlementIds(tx),
+            settlementTransactionIds,
             adjustmentType: "none" as const,
           },
         };
@@ -1269,12 +1340,13 @@ export class CreditsService {
             RETURNING id
           `,
         );
+        await enqueueAffiliatePayout(normalizedActualCost);
         return {
           kind: "handled" as const,
           claimed: markedRows.length > 0,
           result: {
             reservedAmount,
-            actualCost,
+            actualCost: normalizedActualCost,
             reservationTransactionId,
             settlementTransactionIds: preexistingSettlementIds,
             adjustmentType: "none" as const,
@@ -1306,21 +1378,26 @@ export class CreditsService {
       );
       const claimed = claimedRows[0];
       if (!claimed) {
+        const settlementTransactionIds = await existingSettlementIds(tx);
+        await enqueueAffiliatePayout(
+          normalizedActualCost > reservedAmount && settlementTransactionIds.length === 0
+            ? reservedAmount
+            : normalizedActualCost,
+        );
         return {
           kind: "handled" as const,
           claimed: false,
           result: {
             reservedAmount,
-            actualCost,
+            actualCost: normalizedActualCost,
             reservationTransactionId,
-            settlementTransactionIds: await existingSettlementIds(tx),
+            settlementTransactionIds,
             adjustmentType: "none" as const,
           },
         };
       }
 
       const claimedReservedAmount = Math.abs(parseNumeric(claimed.amount, "reservation_amount"));
-      const normalizedActualCost = Math.max(actualCost, 0);
       const difference = claimedReservedAmount - normalizedActualCost;
       const baseMetadata = {
         ...metadata,
@@ -1330,6 +1407,7 @@ export class CreditsService {
       };
 
       if (Math.abs(difference) < EPSILON) {
+        await enqueueAffiliatePayout(normalizedActualCost);
         return {
           kind: "handled" as const,
           claimed: true,
@@ -1400,6 +1478,7 @@ export class CreditsService {
         if (!refund?.id) {
           throw new Error("[CreditsService] Reservation refund settlement did not insert a row");
         }
+        await enqueueAffiliatePayout(normalizedActualCost);
         return {
           kind: "handled" as const,
           claimed: true,
@@ -1472,6 +1551,7 @@ export class CreditsService {
       );
       const overageRow = overageRows[0];
       if (!isPgTrue(overageRow?.debited)) {
+        await enqueueAffiliatePayout(claimedReservedAmount);
         return {
           kind: "handled" as const,
           claimed: true,
@@ -1487,6 +1567,7 @@ export class CreditsService {
       if (!overageRow?.id) {
         throw new Error("[CreditsService] Reservation overage settlement did not insert a row");
       }
+      await enqueueAffiliatePayout(normalizedActualCost);
       return {
         kind: "handled" as const,
         claimed: true,
@@ -1519,6 +1600,191 @@ export class CreditsService {
       this.notifyBalanceDecrease(organizationId, result.newBalance, result.balanceDecreaseMetadata);
     }
     return result;
+  }
+
+  /**
+   * Collect a deferred affiliate request whose authoritative hold was refused.
+   *
+   * The payer debit and payout intent share one transaction. Available balance
+   * is collected up to the actual charge, while the outbox derives earnings
+   * only from the affiliate-markup portion of that collected amount.
+   */
+  async collectAffiliateInferenceFallback(
+    params: AffiliateInferenceFallbackParams,
+  ): Promise<CreditReconciliationResult> {
+    const actual = new Decimal(params.actualCost);
+    if (!actual.isFinite() || actual.isNegative()) {
+      throw new Error("[CreditsService] Affiliate fallback actual cost is invalid");
+    }
+    if (actual.isZero()) {
+      return {
+        reservedAmount: 0,
+        actualCost: 0,
+        settlementTransactionIds: [],
+        adjustmentType: "none",
+      };
+    }
+
+    const debitKey = `inference-debit:${params.organizationId}:${params.requestId}`;
+    const actualCost = actual.toDecimalPlaces(6).toNumber();
+    const payoutSourceId = (
+      params.reservationMetadata.affiliatePayout as
+        | { sourceId?: unknown }
+        | undefined
+    )?.sourceId;
+    const outcome = await writeTransaction(async (tx) => {
+      const [org] = await sqlRows<{ current_balance: string | number }>(
+        tx,
+        sql`
+          SELECT credit_balance::numeric AS current_balance
+          FROM organizations
+          WHERE id = ${params.organizationId}
+          FOR UPDATE
+        `,
+      );
+      if (!org) {
+        return {
+          collectedAmount: 0,
+          newBalance: 0,
+          transactionId: null,
+          inserted: false,
+        };
+      }
+
+      const [existing] = await sqlRows<{
+        id: string;
+        organization_id: string;
+        amount: string | number;
+        metadata: Record<string, unknown> | string | null;
+      }>(
+        tx,
+        sql`
+          SELECT id, organization_id, amount, metadata
+          FROM credit_transactions
+          WHERE stripe_payment_intent_id = ${debitKey}
+          LIMIT 1
+        `,
+      );
+      if (existing) {
+        const existingMetadata = parseMetadata(existing.metadata);
+        const collectedAmount = Math.abs(parseNumeric(existing.amount, "affiliate_fallback_amount"));
+        if (
+          existing.organization_id !== params.organizationId ||
+          existingMetadata.requestId !== params.requestId ||
+          existingMetadata.actualCostUsd !== actual.toFixed(6) ||
+          existingMetadata.affiliatePayoutSourceId !== payoutSourceId
+        ) {
+          throw new Error("[CreditsService] Affiliate fallback replay mismatch");
+        }
+        await enqueueCollectedAffiliatePayout(tx, {
+          reservationMetadata: params.reservationMetadata,
+          actualTotalCost: actualCost,
+          collectedTotalCost: collectedAmount,
+        });
+        return {
+          collectedAmount,
+          newBalance: parseNumeric(org.current_balance, "current_balance"),
+          transactionId: existing.id,
+          inserted: false,
+        };
+      }
+
+      const currentBalance = new Decimal(org.current_balance);
+      if (!currentBalance.isFinite() || currentBalance.isNegative()) {
+        throw new Error("[CreditsService] Affiliate fallback balance is invalid");
+      }
+      const collected = Decimal.min(currentBalance, actual).toDecimalPlaces(6);
+      if (!collected.gt(0)) {
+        return {
+          collectedAmount: 0,
+          newBalance: currentBalance.toNumber(),
+          transactionId: null,
+          inserted: false,
+        };
+      }
+
+      const newBalance = currentBalance.minus(collected);
+      const transactionMetadata = JSON.stringify({
+        ...params.reservationMetadata,
+        user_id: params.userId,
+        requestId: params.requestId,
+        model: params.model,
+        provider: params.provider,
+        billingSource: params.billingSource,
+        type: "inference_optimistic",
+        source: "deferred_affiliate_fallback",
+        actualCostUsd: actual.toFixed(6),
+        collectedAmountUsd: collected.toFixed(6),
+        affiliatePayoutSourceId: payoutSourceId,
+      });
+      const [transaction] = await sqlRows<{ id: string }>(
+        tx,
+        sql`
+          WITH updated AS (
+            UPDATE organizations
+            SET credit_balance = ${newBalance.toFixed(6)}::numeric,
+                updated_at = NOW()
+            WHERE id = ${params.organizationId}
+            RETURNING id
+          )
+          INSERT INTO credit_transactions (
+            organization_id,
+            amount,
+            type,
+            description,
+            metadata,
+            stripe_payment_intent_id,
+            created_at
+          )
+          SELECT
+            id,
+            ${collected.negated().toFixed(6)}::numeric,
+            'debit',
+            ${`Inference (deferred affiliate fallback): ${params.model}`},
+            ${transactionMetadata}::jsonb,
+            ${debitKey},
+            NOW()
+          FROM updated
+          RETURNING id
+        `,
+      );
+      if (!transaction) {
+        throw new Error("[CreditsService] Affiliate fallback debit did not insert");
+      }
+      await enqueueCollectedAffiliatePayout(tx, {
+        reservationMetadata: params.reservationMetadata,
+        actualTotalCost: actualCost,
+        collectedTotalCost: collected.toNumber(),
+      });
+      return {
+        collectedAmount: collected.toNumber(),
+        newBalance: newBalance.toNumber(),
+        transactionId: transaction.id,
+        inserted: true,
+      };
+    });
+
+    if (outcome.inserted) {
+      await CacheInvalidation.onCreditMutation(params.organizationId);
+      invalidateOrganizationCache(params.organizationId).catch((error) => {
+        // error-policy:J7 the authoritative debit and shared invalidation have
+        // committed; this legacy cache eviction is separately observable.
+        logger.error("[CreditsService] Failed to invalidate org cache:", error);
+      });
+      this.notifyBalanceDecrease(params.organizationId, outcome.newBalance, {
+        requestId: params.requestId,
+        model: params.model,
+        source: "deferred_affiliate_fallback",
+      });
+    }
+
+    return {
+      reservedAmount: outcome.collectedAmount,
+      actualCost,
+      settlementTransactionIds: outcome.transactionId ? [outcome.transactionId] : [],
+      adjustmentType:
+        outcome.collectedAmount + EPSILON >= actualCost ? "none" : "uncollected_overage",
+    };
   }
 
   async markReservationSettled(params: {
@@ -1606,6 +1872,8 @@ export class CreditsService {
           }
           break;
         } catch (error) {
+          // error-policy:J2 retry the same transaction-scoped settlement, then
+          // surface its failure so a durable reservation remains recoverable.
           if (attempt === MAX_RETRIES) {
             logger.error("[Credits] Reservation reconciliation failed after retries", {
               organizationId,
@@ -1615,13 +1883,7 @@ export class CreditsService {
               difference,
               error: error instanceof Error ? error.message : "Unknown error",
             });
-            return {
-              reservedAmount,
-              actualCost,
-              reservationTransactionId: reservationTxId,
-              settlementTransactionIds: [],
-              adjustmentType: difference < 0 ? "uncollected_overage" : "none",
-            };
+            throw error;
           }
           logger.warn("[Credits] Reservation reconciliation retry", {
             attempt,
@@ -1971,6 +2233,17 @@ export class CreditsService {
           : null;
     const appName =
       typeof reservationMetadata.appName === "string" ? reservationMetadata.appName : appId;
+    if (markupPercentage > 0 && !storedCreatorUserId) {
+      stats.skipped++;
+      logger.error(
+        "[Credits] Stale app-chat reservation has no charge-time creator — skipping",
+        {
+          reservationTransactionId: row.id,
+          appId,
+        },
+      );
+      return;
+    }
     const app =
       currentApp ??
       (storedCreatorUserId || markupPercentage === 0
@@ -1999,6 +2272,7 @@ export class CreditsService {
     }
     const chargeTimeApp = {
       ...app,
+      created_by_user_id: storedCreatorUserId ?? app.created_by_user_id,
       monetization_enabled: markupPercentage > 0,
       platform_offset_amount: 0,
       purchase_share_percentage: 0,
@@ -2132,6 +2406,7 @@ export class CreditsService {
         description: `${description} (reserved)`,
         ...(idempotencyMarker && { stripePaymentIntentId: idempotencyMarker }),
         metadata: {
+          ...(params.metadata ?? {}),
           user_id: userId,
           type: "reservation",
           settlement_marker: RESERVATION_SETTLEMENT_MARKER,
@@ -2201,6 +2476,7 @@ export class CreditsService {
           actualCost,
           description,
           metadata: {
+            ...(params.metadata ?? {}),
             user_id: userId,
             reservation_transaction_id: reservationTransactionId,
             ...(model && { model }),

@@ -24,6 +24,7 @@
  */
 
 import { pooledCredentialsRepository } from "../../../db/repositories/pooled-credentials";
+import { InMemoryLRUCache } from "../../cache/in-memory-lru-cache";
 import { logger } from "../../utils/logger";
 import { secretsService } from "../secrets/secrets";
 import { TeamCredentialAccountPool } from "./account-pool";
@@ -38,6 +39,7 @@ import {
 
 const DEFAULT_MAX_ORG_POOLS = 200;
 const SNAPSHOT_TTL_MS = 15_000;
+const HOT_PATH_SELECTION_TTL_MS = 15_000;
 const KEEP_ALIVE_INTERVAL_MS = 5 * 60_000;
 const KEEP_ALIVE_PROBES_PER_SWEEP = 8;
 /** Healthy credentials get re-verified when older than this. */
@@ -65,8 +67,20 @@ export interface SelectedPooledCredential {
   label: string;
 }
 
+export interface TeamPoolCacheExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+export type PooledCredentialCacheResolution =
+  | { kind: "ready"; credential: SelectedPooledCredential | null }
+  | { kind: "warming" | "unavailable" };
+
 export class TeamPoolRegistry {
   private readonly pools = new Map<string, OrgPoolEntry>();
+  private readonly hotPathSelections = new InMemoryLRUCache<{
+    credential: SelectedPooledCredential | null;
+  }>(4096, HOT_PATH_SELECTION_TTL_MS);
+  private readonly hotPathHydrations = new Map<string, Promise<void>>();
   private readonly maxOrgPools: number;
   private keepAlive: ReturnType<typeof setInterval> | null = null;
 
@@ -82,6 +96,16 @@ export class TeamPoolRegistry {
   /** Drop an org's cached pool so the next acquire re-reads the DB. */
   invalidate(organizationId: string): void {
     this.pools.delete(organizationId);
+    this.hotPathSelections.deleteByPrefix(`${organizationId}\u0000`);
+  }
+
+  private hotPathSelectionKey(params: SelectPooledCredentialParams): string {
+    return [
+      params.organizationId,
+      params.providerId,
+      params.sessionKey ?? "",
+      params.strategy ?? "round-robin",
+    ].join("\u0000");
   }
 
   /**
@@ -165,6 +189,50 @@ export class TeamPoolRegistry {
   }
 
   /**
+   * Select from isolate memory only. Cold selection never opens Postgres or
+   * decrypts a vault secret on the inference request promise; the authoritative
+   * selection is coalesced and retained under `waitUntil` for the retry.
+   *
+   * Raw keys intentionally stay in isolate memory rather than shared KV.
+   */
+  async selectCredentialCacheOnly(
+    params: SelectPooledCredentialParams,
+    options: { executionCtx?: TeamPoolCacheExecutionContext } = {},
+  ): Promise<PooledCredentialCacheResolution> {
+    const key = this.hotPathSelectionKey(params);
+    const cached = this.hotPathSelections.get(key);
+    if (cached) {
+      return { kind: "ready", credential: cached.credential };
+    }
+
+    if (!options.executionCtx) return { kind: "unavailable" };
+
+    let hydration = this.hotPathHydrations.get(key);
+    if (!hydration) {
+      hydration = this.selectCredential(params)
+        .then((credential) => {
+          this.hotPathSelections.set(key, { credential });
+        })
+        .catch((error) => {
+          // error-policy:J7 the selection path normally translates failures to
+          // null, but this observer prevents a future stricter implementation
+          // from creating an unhandled waitUntil rejection.
+          logger.warn("[TeamPoolRegistry] hot-path credential hydration failed", {
+            organizationId: params.organizationId,
+            providerId: params.providerId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .finally(() => {
+          this.hotPathHydrations.delete(key);
+        });
+      this.hotPathHydrations.set(key, hydration);
+    }
+    options.executionCtx.waitUntil(hydration);
+    return { kind: "warming" };
+  }
+
+  /**
    * Attribute one call to (credential, member, UTC day) and bump the pool's
    * last-used stamp. Replaces the self-host JSONL usage log.
    */
@@ -197,6 +265,18 @@ export class TeamPoolRegistry {
       // error-policy:J7 usage attribution diagnostics must not block the
       // provider response path; the warning carries the failed write context.
     }
+  }
+
+  /** Retain usage attribution after provider dispatch without delaying output. */
+  recordUseOffPath(
+    params: {
+      organizationId: string;
+      credentialId: string;
+      userId: string;
+    },
+    executionCtx: TeamPoolCacheExecutionContext,
+  ): void {
+    executionCtx.waitUntil(this.recordUse(params));
   }
 
   /**
@@ -236,6 +316,20 @@ export class TeamPoolRegistry {
       // error-policy:J7 writeback is diagnostic health feedback; the provider
       // failure remains observable to the caller that triggered it.
     }
+  }
+
+  /** Retain provider-health writeback without delaying the error response. */
+  recordProviderFailureOffPath(
+    params: {
+      organizationId: string;
+      credentialId: string;
+      providerId: PooledDirectProvider;
+      status: number;
+      detail?: string;
+    },
+    executionCtx: TeamPoolCacheExecutionContext,
+  ): void {
+    executionCtx.waitUntil(this.recordProviderFailure(params));
   }
 
   private evictLru(): void {

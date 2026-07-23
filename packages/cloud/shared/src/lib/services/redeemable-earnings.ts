@@ -204,7 +204,10 @@ class RedeemableEarningsService {
     sourceId: string;
   }): Promise<boolean> {
     const ledgerSourceId = normalizeLedgerSourceId(params.sourceId);
-    const [existing] = await dbRead
+    // This is also the commit-ack verification seam for creator accounting.
+    // Read the primary so an immediately committed earning cannot appear
+    // absent under replica lag and trigger an unbacked consumer refund.
+    const [existing] = await dbWrite
       .select({ id: redeemableEarningsLedger.id })
       .from(redeemableEarningsLedger)
       .where(
@@ -523,7 +526,7 @@ class RedeemableEarningsService {
           earnings.available_balance,
           "available_balance",
         );
-        if (new Decimal(currentBalance).lessThan(amount)) {
+        if (new Decimal(currentBalance).lessThan(amountDecimal)) {
           return {
             earnings: null,
             ledgerEntryId: "",

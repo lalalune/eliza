@@ -207,6 +207,7 @@ describe("resolveSharedAgent", () => {
     await expect(
       resolveSharedAgent(apiKeyContext("agent-1") as never, {
         cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => waited.push(promise) },
       }),
     ).resolves.toMatchObject({ agentId: "agent-1", orgId: "org-1" });
     expect(findByIdAndOrg).toHaveBeenCalledTimes(1);
@@ -248,6 +249,42 @@ describe("resolveSharedAgent", () => {
       error: "Agent not found",
       status: 404,
     });
+  });
+
+  test("cache-only rejects unsupported credential identity without repository work", async () => {
+    scopeHashPrefixBehavior = async () => null;
+    sessionHashPrefixBehavior = async () => null;
+    const background: Promise<unknown>[] = [];
+
+    await expect(
+      resolveSharedAgent(contextWithAgentId("agent-1") as never, {
+        cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => background.push(promise) },
+      }),
+    ).resolves.toEqual({
+      error: "A supported API key or session credential is required.",
+      status: 401,
+    });
+    expect(background).toHaveLength(0);
+    expect(cacheGet).not.toHaveBeenCalled();
+    expect(cacheGetOrSet).not.toHaveBeenCalled();
+    expect(requireUserOrApiKeyWithOrgLookup).not.toHaveBeenCalled();
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
+  });
+
+  test("cache-only rejects a missing Worker lifetime without hydration", async () => {
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+      }),
+    ).resolves.toEqual({
+      error: "Agent authorization cache context is unavailable. Retry shortly.",
+      status: 503,
+    });
+    expect(cacheGet).not.toHaveBeenCalled();
+    expect(cacheGetOrSet).not.toHaveBeenCalled();
+    expect(requireUserOrApiKeyWithOrgLookup).not.toHaveBeenCalled();
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
   });
 });
 

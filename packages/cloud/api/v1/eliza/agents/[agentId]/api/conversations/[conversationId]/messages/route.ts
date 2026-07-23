@@ -1,13 +1,20 @@
-// Handles v1 cloud API v1 eliza agents agentid api conversations conversationid messages route traffic with route-local auth expectations.
+/**
+ * Serves shared-agent REST conversation history and message sends.
+ *
+ * Scope authorization and conversation execution are cache-only through the
+ * shared Durable Object; cold hydration returns retryable unavailability.
+ */
 import { Hono } from "hono";
 import { InsufficientCreditsError } from "@/lib/api/errors";
 import { applyCorsHeaders, handleCorsOptions } from "@/lib/services/proxy/cors";
-import { resolveSharedAgent } from "@/lib/services/shared-runtime/resolve-shared-agent";
+import {
+  resolveSharedAgent,
+  resolveSharedRuntimeWorkerRequestContext,
+} from "@/lib/services/shared-runtime/resolve-shared-agent";
 import {
   sharedRestMessageSend,
   sharedRestMessagesGet,
 } from "@/lib/services/shared-runtime/shared-rest-adapter";
-import type { BridgeExecutionContext } from "@/lib/services/shared-runtime/shared-runtime-chat";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
@@ -29,37 +36,105 @@ app.options("/", (c) =>
 
 app.get("/", async (c) => {
   const origin = c.req.header("origin");
-  const r = await resolveSharedAgent(c);
+  const worker = resolveSharedRuntimeWorkerRequestContext(c);
+  if ("error" in worker) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: worker.error,
+          code: worker.code,
+          retryable: worker.retryable,
+        },
+        { status: worker.status },
+      ),
+      CORS_METHODS,
+      origin,
+    );
+  }
+  const r = await resolveSharedAgent(c, {
+    cacheOnly: true,
+    executionCtx: worker.executionCtx,
+  });
   if ("error" in r) {
     return applyCorsHeaders(
-      Response.json({ success: false, error: r.error }, { status: r.status }),
+      Response.json(
+        {
+          success: false,
+          error: r.error,
+          ...(r.status === 503 ? { retryable: true } : {}),
+        },
+        { status: r.status },
+      ),
       CORS_METHODS,
       origin,
     );
   }
   const conversationId = c.req.param("conversationId") ?? r.agentId;
-  const namespace = c.env?.SHARED_RUNTIME_CONVERSATIONS;
-  const body = namespace
-    ? await sharedRestMessagesGet(r.agentId, conversationId, namespace)
-    : await sharedRestMessagesGet(r.agentId, conversationId);
-  return applyCorsHeaders(Response.json(body), CORS_METHODS, origin);
+  try {
+    const body = await sharedRestMessagesGet(
+      r.agentId,
+      conversationId,
+      worker.namespace,
+    );
+    return applyCorsHeaders(Response.json(body), CORS_METHODS, origin);
+  } catch (error) {
+    // error-policy:J1 history is coordinator-owned, so a cold Durable Object
+    // remains a retryable response instead of surfacing as an opaque route 500.
+    if (
+      error instanceof Error &&
+      error.name === "SharedRuntimeCacheWarmingError"
+    ) {
+      return applyCorsHeaders(
+        Response.json(
+          {
+            success: false,
+            error: error.message,
+            code: "shared_runtime_cache_warming",
+            retryable: true,
+          },
+          { status: 503 },
+        ),
+        CORS_METHODS,
+        origin,
+      );
+    }
+    throw error;
+  }
 });
 
 app.post("/", async (c) => {
   const origin = c.req.header("origin");
-  let executionCtx: BridgeExecutionContext | undefined;
-  try {
-    executionCtx = c.executionCtx;
-  } catch {
-    executionCtx = undefined;
+  const worker = resolveSharedRuntimeWorkerRequestContext(c);
+  if ("error" in worker) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: worker.error,
+          code: worker.code,
+          retryable: worker.retryable,
+        },
+        { status: worker.status },
+      ),
+      CORS_METHODS,
+      origin,
+    );
   }
   const r = await resolveSharedAgent(c, {
-    cacheOnly: Boolean(c.env?.SHARED_RUNTIME_CONVERSATIONS),
-    executionCtx,
+    cacheOnly: true,
+    executionCtx: worker.executionCtx,
   });
   if ("error" in r) {
     return applyCorsHeaders(
-      Response.json({ success: false, error: r.error }, { status: r.status }),
+      Response.json(
+        {
+          success: false,
+          error: r.error,
+          ...(r.status === 503 ? { retryable: true } : {}),
+        },
+        { status: r.status },
+      ),
       CORS_METHODS,
       origin,
     );
@@ -82,34 +157,36 @@ app.post("/", async (c) => {
       origin,
     );
   }
-  // Workers only: pass an executionCtx so the shared turn defers its billing
-  // tail off the response path via waitUntil. Hono's executionCtx getter
-  // THROWS outside a Worker (tests, Node) — degrade to undefined there so the
-  // turn settles inline, preserving fully-synchronous behavior.
   let result: { text: string; agentName: string };
   try {
-    const namespace = c.env?.SHARED_RUNTIME_CONVERSATIONS;
-    result = namespace
-      ? await sharedRestMessageSend(
-          r.agentId,
-          r.orgId,
-          conversationId,
-          text,
-          r.agentName,
-          executionCtx,
-          r.agent,
-          namespace,
-        )
-      : await sharedRestMessageSend(
-          r.agentId,
-          r.orgId,
-          conversationId,
-          text,
-          r.agentName,
-          executionCtx,
-        );
+    result = await sharedRestMessageSend(
+      r.agent,
+      conversationId,
+      text,
+      r.agentName,
+      worker.executionCtx,
+      worker.namespace,
+    );
   } catch (error) {
     // error-policy:J1 route boundary translates bridge/billing failures to HTTP responses.
+    if (
+      error instanceof Error &&
+      error.name === "SharedRuntimeCacheWarmingError"
+    ) {
+      return applyCorsHeaders(
+        Response.json(
+          {
+            success: false,
+            error: error.message,
+            code: "shared_runtime_cache_warming",
+            retryable: true,
+          },
+          { status: 503 },
+        ),
+        CORS_METHODS,
+        origin,
+      );
+    }
     // Insufficient credits is a PERMANENT condition until the org tops up —
     // hiding it behind the generic retryable 503 below reads as "try again"
     // forever to every welcome-bonus-withheld signup and drained org. Return

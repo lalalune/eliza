@@ -163,6 +163,11 @@ mock.module("@/lib/pricing", () => ({
 mock.module("@/lib/services/model-catalog", () => ({
   ...modelCatalogActual,
   getCachedGatewayModelById: async () => null,
+  getGatewayModelByIdCacheOnly: async () => ({
+    kind: "ready",
+    model: null,
+    stale: false,
+  }),
 }));
 
 // Pooled-credential selection is not under test. Keep this route harness away
@@ -172,6 +177,10 @@ mock.module("@/lib/services/team-credential-pool", () => ({
   ...teamPoolActual,
   getTeamPoolRegistry: () => ({
     selectCredential: async () => null,
+    selectCredentialCacheOnly: async () => ({
+      kind: "ready",
+      credential: null,
+    }),
     recordUse: async () => undefined,
     recordProviderFailure: async () => undefined,
   }),
@@ -391,6 +400,7 @@ describe("chat/completions optimistic-billing route decision (#9899/#10066)", ()
   });
 
   test("an allowed native route decision reaches the handler and preserves limiter headers", async () => {
+    deferredEnabled = true;
     const keys: string[] = [];
     const waitUntilPromises: Promise<unknown>[] = [];
     const response = await chatCompletionsRouter.fetch(
@@ -615,19 +625,15 @@ describe("chat/completions optimistic-billing route decision (#9899/#10066)", ()
       expect(reserveCredits).not.toHaveBeenCalled();
     });
 
-    test("402 still fires: a cached balance below threshold falls to the synchronous reserve and surfaces insufficient_credits", async () => {
+    test("402 still fires from the cached balance gate without a synchronous reserve", async () => {
       deferredEnabled = true;
       gateBalanceUsd = 2; // < threshold 5 → cached gate refuses the deferred path
-      const { InsufficientCreditsError } = await import(
-        "@/lib/services/ai-billing"
-      );
-      reserveCreditsThrows = new InsufficientCreditsError(0.05, 0.01);
       const captured: Promise<unknown>[] = [];
 
       const res = await driveWithCtx(captured);
 
       expect(captured).toHaveLength(0); // nothing deferred for a broke org
-      expect(reserveCredits).toHaveBeenCalledTimes(1);
+      expect(reserveCredits).not.toHaveBeenCalled();
       expect(res.status).toBe(402);
       const body = (await res.json()) as {
         error?: { code?: string; type?: string };
@@ -635,7 +641,7 @@ describe("chat/completions optimistic-billing route decision (#9899/#10066)", ()
       expect(body.error?.code).toBe("insufficient_credits");
     });
 
-    test("a refused deferred admission blocklists the org: the NEXT request takes the synchronous reserve", async () => {
+    test("a refused deferred admission blocklists the org without reintroducing synchronous reserve", async () => {
       deferredEnabled = true;
       backstopPersists = false; // deferred KV admission resolves { admitted: false }
       const captured: Promise<unknown>[] = [];
@@ -650,22 +656,23 @@ describe("chat/completions optimistic-billing route decision (#9899/#10066)", ()
       expect(reserveCredits).not.toHaveBeenCalled();
 
       writePendingInferenceCharge.mockClear();
-      await driveWithCtx(captured);
-      // Blocklisted org skips the deferred path; the Tier-2 branch attempts the
-      // backstop synchronously, and (still non-durable) falls back to the
-      // synchronous reserve — never forwards on an un-recorded charge.
+      const second = await driveWithCtx(captured);
+      // A Worker retry remains fail-closed; it never falls through to the
+      // database-backed compatibility admission.
       expect(captured).toHaveLength(1);
-      expect(writePendingInferenceCharge).toHaveBeenCalledTimes(1);
-      expect(reserveCredits).toHaveBeenCalledTimes(1);
+      expect(writePendingInferenceCharge).not.toHaveBeenCalled();
+      expect(reserveCredits).not.toHaveBeenCalled();
+      expect(second.status).toBe(503);
     });
 
-    test("flag OFF leaves the executionCtx-carrying request on the Tier-2 synchronous admission", async () => {
+    test("flag OFF fails Worker admission closed instead of joining synchronous storage", async () => {
       deferredEnabled = false;
       const captured: Promise<unknown>[] = [];
-      await driveWithCtx(captured);
+      const response = await driveWithCtx(captured);
       expect(captured).toHaveLength(0);
-      expect(writePendingInferenceCharge).toHaveBeenCalledTimes(1);
+      expect(writePendingInferenceCharge).not.toHaveBeenCalled();
       expect(reserveCredits).not.toHaveBeenCalled();
+      expect(response.status).toBe(503);
     });
   });
 });

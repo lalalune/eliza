@@ -33,6 +33,7 @@ import * as creditsActual from "@/lib/services/credits";
 import * as inferenceAuthActual from "@/lib/services/inference-auth-context";
 import * as redeemableEarningsActual from "@/lib/services/redeemable-earnings";
 import * as usageActual from "@/lib/services/usage";
+import { createCreditReservationSettler } from "@/lib/utils/credit-reservation";
 
 process.env.DATABASE_URL ||= "pglite://memory";
 // Force the synchronous-reserve path (the one #12017 is about): optimistic
@@ -140,6 +141,31 @@ mock.module("@/lib/services/credits", () => ({
     get: (target, prop, receiver) =>
       prop === "reserve" ? reserve : Reflect.get(target, prop, receiver),
   }),
+}));
+
+mock.module("@/lib/services/organization-inference-admission", () => ({
+  InferenceAdmissionUnavailableError: class extends Error {},
+  InferenceAffiliateCacheUnavailableError: class extends Error {},
+  InferencePricingCacheUnavailableError: class extends Error {},
+  admitOrganizationInference: async (params: {
+    context: { organizationId: string };
+    estimatedInputTokens: number;
+    estimatedOutputTokens: number;
+    affiliateCode?: string | null;
+  }) => {
+    const billableAffiliate =
+      params.affiliateCode && affiliateActive && affiliateUserId !== USER;
+    const reservation = await reserve({
+      ...params.context,
+      estimatedCostMultiplier: billableAffiliate ? 11 : undefined,
+    });
+    const settle = createCreditReservationSettler(reservation);
+    return {
+      mode: "synchronous_reservation",
+      settle,
+      settleUnknown: () => settle(reservation.reservedAmount),
+    };
+  },
 }));
 
 // --- The cashable write that must never exceed collected money. --------------
@@ -260,8 +286,13 @@ beforeEach(() => {
     };
   });
   resolveInferenceAuthContext.mockResolvedValue({
-    kind: "slow_path",
-    reason: "non_api_key",
+    kind: "authorized",
+    source: "cache",
+    ctx: {
+      userId: USER,
+      orgId: ORG,
+      apiKeyId: API_KEY_ID,
+    },
   });
   enforceOrgRateLimit.mockResolvedValue(null);
   usageCreate.mockResolvedValue({ id: "usage-1" });

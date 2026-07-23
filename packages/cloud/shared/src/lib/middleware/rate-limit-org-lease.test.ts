@@ -17,6 +17,12 @@ let redisChecks = 0;
 let redisResult: rateLimitRedisActual.RateLimitResult;
 let tierReads = 0;
 let tierConfig = { windowMs: 60_000, maxRequests: 120 };
+let tierCacheResolution:
+  | { kind: "ready"; config: { windowMs: number; maxRequests: number } }
+  | {
+      kind: "warming" | "unavailable";
+      cacheRead: "miss" | "invalid" | "unavailable" | "error";
+    } = { kind: "ready", config: tierConfig };
 /** carriedCount received per authoritative check, in order. */
 let carriedCounts: number[] = [];
 /**
@@ -73,6 +79,10 @@ mock.module("../services/org-rate-limits", () => ({
     tierReads++;
     return tierConfig;
   },
+  getOrgRpmForEndpointCacheOnly: async () => {
+    tierReads++;
+    return tierCacheResolution;
+  },
 }));
 
 const {
@@ -84,6 +94,7 @@ const {
   mcpOrgRateLimitRedisKey,
   rateLimitExceededPayload,
   rateLimitExceededResponse,
+  OrgRateLimitCacheNotReadyError,
   withRateLimit,
 } = await import("./rate-limit");
 
@@ -119,6 +130,7 @@ describe("enforceOrgRateLimit lease (#9899 Tier-3)", () => {
     simulateWindow = false;
     windowCount = 0;
     tierConfig = { windowMs: 60_000, maxRequests: 120 };
+    tierCacheResolution = { kind: "ready", config: tierConfig };
     redisResult = {
       allowed: true,
       remaining: 100,
@@ -155,6 +167,32 @@ describe("enforceOrgRateLimit lease (#9899 Tier-3)", () => {
     // 120 rpm × 5s/60s window → local budget 10; 5 repeats fit in it.
     expect(redisChecks).toBe(1);
     expect(tierReads).toBe(1);
+  });
+
+  test("cache-only mode uses the cached tier before the Redis decision", async () => {
+    const org = uid();
+    expect(
+      await enforceOrgRateLimit(org, "completions", {
+        cacheOnly: true,
+        executionCtx: { waitUntil: () => undefined },
+      }),
+    ).toBeNull();
+    expect(tierReads).toBe(1);
+    expect(redisChecks).toBe(1);
+  });
+
+  test("cache-only mode surfaces warming without contacting Redis", async () => {
+    tierCacheResolution = { kind: "warming", cacheRead: "miss" };
+    const result = enforceOrgRateLimit(uid(), "completions", {
+      cacheOnly: true,
+      executionCtx: { waitUntil: () => undefined },
+    });
+    await expect(result).rejects.toBeInstanceOf(OrgRateLimitCacheNotReadyError);
+    await expect(result).rejects.toMatchObject({
+      state: "warming",
+      cacheRead: "miss",
+    });
+    expect(redisChecks).toBe(0);
   });
 
   test("leases are keyed per (org, endpoint) — a different org or endpoint is authoritative", async () => {

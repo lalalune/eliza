@@ -70,11 +70,14 @@ import { users } from "@/db/schemas/users";
 import * as realAuth from "@/lib/auth/workers-hono-auth";
 import * as realRateLimit from "@/lib/middleware/rate-limit";
 import { PLATFORM_MARKUP_MULTIPLIER } from "@/lib/pricing";
+import { reserveCredits } from "@/lib/services/ai-billing";
 import * as realAutoTopUp from "@/lib/services/auto-top-up";
 import * as realEmail from "@/lib/services/email";
 import * as realInferenceAuth from "@/lib/services/inference-auth-context";
+import * as realAdmission from "@/lib/services/organization-inference-admission";
 import * as realUsage from "@/lib/services/usage";
 import * as realWaifu from "@/lib/services/waifu-webhook";
+import { createCreditReservationSettler } from "@/lib/utils/credit-reservation";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
 const ENV = {
@@ -121,8 +124,13 @@ mock.module("@/lib/auth/workers-hono-auth", () => ({
 }));
 
 const resolveInferenceAuthContext = mock(async () => ({
-  kind: "slow_path" as const,
-  reason: "non_api_key",
+  kind: "authorized" as const,
+  source: "cache" as const,
+  ctx: {
+    userId: authUserId,
+    orgId: authOrgId,
+    apiKeyId: null,
+  },
 }));
 mock.module("@/lib/services/inference-auth-context", () => ({
   ...realInferenceAuth,
@@ -132,6 +140,28 @@ mock.module("@/lib/services/inference-auth-context", () => ({
 mock.module("@/lib/middleware/rate-limit", () => ({
   ...realRateLimit,
   enforceOrgRateLimit: mock(async () => null),
+}));
+
+mock.module("@/lib/services/organization-inference-admission", () => ({
+  ...realAdmission,
+  admitOrganizationInference: async (
+    params: realAdmission.OrganizationInferenceAdmissionParams,
+  ) => {
+    const reservation = await reserveCredits(
+      {
+        ...params.context,
+        affiliateCode: params.affiliateCode ?? undefined,
+      },
+      params.estimatedInputTokens,
+      params.estimatedOutputTokens,
+    );
+    const settle = createCreditReservationSettler(reservation);
+    return {
+      mode: "synchronous_reservation",
+      settle,
+      settleUnknown: () => settle(reservation.reservedAmount),
+    };
+  },
 }));
 
 mock.module("@/lib/providers/language-model", () => ({
@@ -199,6 +229,10 @@ afterAll(async () => {
   mock.module("@/lib/auth/workers-hono-auth", () => realAuth);
   mock.module("@/lib/services/inference-auth-context", () => realInferenceAuth);
   mock.module("@/lib/middleware/rate-limit", () => realRateLimit);
+  mock.module(
+    "@/lib/services/organization-inference-admission",
+    () => realAdmission,
+  );
   mock.module("@/lib/services/usage", () => realUsage);
   mock.module("@/lib/services/email", () => realEmail);
   mock.module("@/lib/services/waifu-webhook", () => realWaifu);

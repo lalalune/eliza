@@ -42,6 +42,7 @@ import { getCloudAwareEnv } from "../runtime/cloud-bindings";
 import { logger } from "../utils/logger";
 import { apiKeysService } from "./api-keys";
 import { type CreditReconciliationResult, creditsService } from "./credits";
+import { clearOrgAdmissionRefused, markOrgAdmissionRefused } from "./inference-admission-refusal";
 import {
   INFERENCE_AUTH_CONTEXT_VERSION,
   invalidateOrgBalanceHint,
@@ -153,17 +154,32 @@ export class InferenceBalanceCacheWarmingError extends Error {
   }
 }
 
-const balanceRevalidationInFlight = new Map<string, Promise<number>>();
+export interface GateBalanceSnapshot {
+  balanceUsd: number;
+  balanceAt: number;
+  balanceRevision: string;
+}
 
-function refreshOrgBalanceHint(organizationId: string): Promise<number> {
+const balanceRevalidationInFlight = new Map<string, Promise<GateBalanceSnapshot>>();
+
+function refreshOrgBalanceHint(organizationId: string): Promise<GateBalanceSnapshot> {
   const existing = balanceRevalidationInFlight.get(organizationId);
   if (existing) return existing;
 
+  // This timestamp marks when the authoritative read started, not when its
+  // cache write completed. A delayed old query must never masquerade as newer
+  // than a debit that committed while it was in flight.
+  const balanceAt = Date.now();
   const refresh = creditsService
-    .getOrganizationBalanceUsd(organizationId)
+    .getOrganizationBalanceSnapshot(organizationId)
     .then(async (fresh) => {
-      await writeOrgBalanceHint(organizationId, fresh, Date.now());
-      return fresh;
+      await writeOrgBalanceHint(organizationId, fresh.balanceUsd, balanceAt, fresh.revision);
+      clearOrgAdmissionRefused(organizationId);
+      return {
+        balanceUsd: fresh.balanceUsd,
+        balanceAt,
+        balanceRevision: fresh.revision,
+      };
     })
     .finally(() => {
       balanceRevalidationInFlight.delete(organizationId);
@@ -174,7 +190,7 @@ function refreshOrgBalanceHint(organizationId: string): Promise<number> {
 
 function observeBackgroundBalanceRefresh(
   organizationId: string,
-  refresh: Promise<number>,
+  refresh: Promise<GateBalanceSnapshot>,
 ): Promise<void> {
   return refresh.then(
     () => undefined,
@@ -189,10 +205,20 @@ function observeBackgroundBalanceRefresh(
   );
 }
 
-export async function getGateBalanceUsd(
+/** Start an authoritative balance refresh without joining the request promise. */
+export function scheduleOrgBalanceHintHydration(
+  organizationId: string,
+  executionCtx: { waitUntil(promise: Promise<unknown>): void },
+): void {
+  executionCtx.waitUntil(
+    observeBackgroundBalanceRefresh(organizationId, refreshOrgBalanceHint(organizationId)),
+  );
+}
+
+export async function getGateBalanceHint(
   organizationId: string,
   options: GateBalanceReadOptions = {},
-): Promise<number> {
+): Promise<GateBalanceSnapshot> {
   const hint = await readOrgBalanceHint(organizationId);
   if (hint) {
     if (Date.now() - hint.balanceAt > CacheTTL.inference.orgBalance * 1000) {
@@ -206,7 +232,11 @@ export async function getGateBalanceUsd(
         void refresh;
       }
     }
-    return hint.balanceUsd;
+    return {
+      balanceUsd: hint.balanceUsd,
+      balanceAt: hint.balanceAt,
+      balanceRevision: hint.balanceRevision,
+    };
   }
 
   const refresh = refreshOrgBalanceHint(organizationId);
@@ -220,6 +250,13 @@ export async function getGateBalanceUsd(
     throw new InferenceBalanceCacheWarmingError();
   }
   return await refresh;
+}
+
+export async function getGateBalanceUsd(
+  organizationId: string,
+  options: GateBalanceReadOptions = {},
+): Promise<number> {
+  return (await getGateBalanceHint(organizationId, options)).balanceUsd;
 }
 
 /**
@@ -283,10 +320,55 @@ export interface DebitContext {
   billingSource: string;
 }
 
+/** Authoritative result of one idempotent direct inference debit. */
+export type InferenceDebitCollectionOutcome =
+  | {
+      status: "collected";
+      attemptedAmountUsd: number;
+      collectedAmountUsd: number;
+      newBalanceUsd: number;
+      transactionId: string;
+    }
+  | {
+      status: "uncollected";
+      attemptedAmountUsd: number;
+      collectedAmountUsd: 0;
+      newBalanceUsd: number;
+      transactionId: null;
+      reason: "insufficient_balance" | "below_minimum" | "org_not_found";
+    };
+
+/** Infrastructure failure while the authoritative debit outcome is unknown. */
+export class InferenceDebitInfrastructureError extends Error {
+  constructor(
+    readonly requestId: string,
+    readonly organizationId: string,
+    cause: unknown,
+  ) {
+    super(`Inference debit failed for request ${requestId}`, { cause });
+    this.name = "InferenceDebitInfrastructureError";
+  }
+}
+
+/** Persisted idempotent debit does not match the logical request being settled. */
+export class InferenceDebitReplayMismatchError extends Error {
+  constructor(
+    readonly requestId: string,
+    readonly organizationId: string,
+    readonly attemptedAmountUsd: number,
+    readonly persistedAmountUsd: number,
+  ) {
+    super(`Inference debit replay mismatch for request ${requestId}`);
+    this.name = "InferenceDebitReplayMismatchError";
+  }
+}
+
 /**
  * Debit an inference cost and refresh the org-balance hint. On a failed debit
  * (insufficient balance — the DB forbids negative) record the uncollected
- * amount and force the org back onto the safe path. Never throws.
+ * amount and force the org back onto the safe path. A database or transport
+ * failure rejects with an explicit infrastructure error: callers must not
+ * report an unknown money outcome as a successful settlement.
  *
  * Exported for the deferred-admission settler (`inference-billing-deferred`),
  * which uses it as the fail-closed fallback charge when a deferred durable
@@ -296,12 +378,17 @@ export async function debitInferenceCost(
   ctx: DebitContext,
   amountUsd: number,
   source: "inline" | "backstop" | "deferred",
-): Promise<void> {
+): Promise<InferenceDebitCollectionOutcome> {
+  let result: Awaited<ReturnType<typeof creditsService.deductCredits>>;
   try {
-    const result = await creditsService.deductCredits({
+    result = await creditsService.deductCredits({
       organizationId: ctx.organizationId,
       amount: amountUsd,
       description: `Inference (${source}): ${ctx.model}`,
+      // The same server request may be retried by a post-response task or
+      // claimed by a backstop after an acknowledgement loss. One key across
+      // sources makes the database row the exactly-once collection gate.
+      stripePaymentIntentId: `inference-debit:${ctx.organizationId}:${ctx.requestId}`,
       metadata: {
         user_id: ctx.userId,
         requestId: ctx.requestId,
@@ -312,45 +399,134 @@ export async function debitInferenceCost(
         source,
       },
     });
-    if (result.success) {
-      // Lower-only: a debit can only REDUCE the balance, so never let an
-      // out-of-order concurrent debit raise the cached gate hint (#9899 #12).
-      // Top-ups go through a separate path that invalidates the hint.
-      await lowerOrgBalanceHint(ctx.organizationId, result.newBalance, Date.now());
-      return;
+  } catch (cause) {
+    logger.error("[InferenceBilling] inference debit infrastructure failure", {
+      organizationId: ctx.organizationId,
+      requestId: ctx.requestId,
+      amountUsd,
+      source,
+      error: cause instanceof Error ? cause.message : String(cause),
+    });
+    try {
+      await invalidateOrgBalanceHint(ctx.organizationId);
+    } catch (invalidationError) {
+      // error-policy:J7 the authoritative debit failure remains the primary
+      // signal; cache eviction failure is separately observable for operators.
+      logger.error("[InferenceBilling] failed to invalidate balance after debit failure", {
+        organizationId: ctx.organizationId,
+        requestId: ctx.requestId,
+        error:
+          invalidationError instanceof Error
+            ? invalidationError.message
+            : String(invalidationError),
+      });
     }
-    // Uncollected: balance can't go negative, so the debit was refused. Record
-    // it and force the org off the fast path until it tops up.
-    logger.error("[InferenceBilling] uncollected inference charge", {
+    // error-policy:J2 preserve the infrastructure cause so the waitUntil
+    // boundary can surface and retry the deterministic money operation.
+    throw new InferenceDebitInfrastructureError(ctx.requestId, ctx.organizationId, cause);
+  }
+
+  if (result.success) {
+    const transaction = result.transaction;
+    const persistedAmountUsd = transaction ? Math.abs(Number(transaction.amount)) : Number.NaN;
+    const transactionMetadata =
+      transaction?.metadata && typeof transaction.metadata === "object" ? transaction.metadata : {};
+    if (
+      !transaction ||
+      transaction.organization_id !== ctx.organizationId ||
+      transactionMetadata.requestId !== ctx.requestId ||
+      !Number.isFinite(persistedAmountUsd)
+    ) {
+      markOrgAdmissionRefused(ctx.organizationId);
+      try {
+        await invalidateOrgBalanceHint(ctx.organizationId);
+      } catch (invalidationError) {
+        logger.error("[InferenceBilling] failed to invalidate mismatched debit replay", {
+          organizationId: ctx.organizationId,
+          requestId: ctx.requestId,
+          error:
+            invalidationError instanceof Error
+              ? invalidationError.message
+              : String(invalidationError),
+        });
+      }
+      throw new InferenceDebitReplayMismatchError(
+        ctx.requestId,
+        ctx.organizationId,
+        amountUsd,
+        persistedAmountUsd,
+      );
+    }
+    if (Math.abs(persistedAmountUsd - amountUsd) > 0.000001) {
+      logger.warn("[InferenceBilling] idempotent debit replay used the first committed amount", {
+        organizationId: ctx.organizationId,
+        requestId: ctx.requestId,
+        attemptedAmountUsd: amountUsd,
+        persistedAmountUsd,
+      });
+    }
+    // Lower-only: a debit can only REDUCE the balance, so never let an
+    // out-of-order concurrent debit raise the cached gate hint (#9899 #12).
+    // Top-ups go through a separate path that invalidates the hint.
+    try {
+      await lowerOrgBalanceHint(ctx.organizationId, result.newBalance, Date.now());
+    } catch (cause) {
+      markOrgAdmissionRefused(ctx.organizationId);
+      try {
+        await invalidateOrgBalanceHint(ctx.organizationId);
+      } catch (invalidationError) {
+        logger.error("[InferenceBilling] failed to invalidate after balance-hint write failure", {
+          organizationId: ctx.organizationId,
+          requestId: ctx.requestId,
+          error:
+            invalidationError instanceof Error
+              ? invalidationError.message
+              : String(invalidationError),
+        });
+      }
+      // error-policy:J2 the debit committed and is safe to replay by its
+      // deterministic key; preserve the cache failure for task retry.
+      throw new InferenceDebitInfrastructureError(ctx.requestId, ctx.organizationId, cause);
+    }
+    return {
+      status: "collected",
+      attemptedAmountUsd: amountUsd,
+      collectedAmountUsd: persistedAmountUsd,
+      newBalanceUsd: result.newBalance,
+      transactionId: transaction.id,
+    };
+  }
+
+  // Uncollected: balance can't go negative, so the debit was refused. Record
+  // it and force the org off the fast path until it tops up.
+  logger.error("[InferenceBilling] uncollected inference charge", {
+    organizationId: ctx.organizationId,
+    userId: ctx.userId,
+    requestId: ctx.requestId,
+    amountUsd,
+    source,
+    reason: result.reason,
+  });
+  await invalidateOrgBalanceHint(ctx.organizationId);
+  void apiKeysService.invalidateInferenceContextForUser(ctx.userId).catch((error) => {
+    // error-policy:J5 - the org balance hint is already invalidated above,
+    // so the next request leaves the optimistic path. User IAC eviction is
+    // a best-effort acceleration here; contain cache brownouts explicitly.
+    logger.error("[InferenceBilling] failed to invalidate user inference auth context", {
       organizationId: ctx.organizationId,
       userId: ctx.userId,
       requestId: ctx.requestId,
-      amountUsd,
-      source,
-      reason: result.reason,
-    });
-    await invalidateOrgBalanceHint(ctx.organizationId);
-    void apiKeysService.invalidateInferenceContextForUser(ctx.userId).catch((error) => {
-      // error-policy:J5 - the org balance hint is already invalidated above,
-      // so the next request leaves the optimistic path. User IAC eviction is
-      // a best-effort acceleration here; contain cache brownouts explicitly.
-      logger.error("[InferenceBilling] failed to invalidate user inference auth context", {
-        organizationId: ctx.organizationId,
-        userId: ctx.userId,
-        requestId: ctx.requestId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
-  } catch (error) {
-    logger.error("[InferenceBilling] inference debit threw", {
-      organizationId: ctx.organizationId,
-      requestId: ctx.requestId,
-      amountUsd,
-      source,
       error: error instanceof Error ? error.message : String(error),
     });
-    await invalidateOrgBalanceHint(ctx.organizationId);
-  }
+  });
+  return {
+    status: "uncollected",
+    attemptedAmountUsd: amountUsd,
+    collectedAmountUsd: 0,
+    newBalanceUsd: result.newBalance,
+    transactionId: null,
+    reason: result.reason ?? "insufficient_balance",
+  };
 }
 
 /**
@@ -363,16 +539,71 @@ export async function debitInferenceCost(
 export function createOptimisticDebitSettler(
   ctx: DebitContext,
 ): (actualCostUsd: number) => Promise<CreditReconciliationResult | null> {
-  return async (actualCostUsd: number) => {
-    const claimed = await cache.getAndDelete<PendingInferenceCharge>(
-      CacheKeys.inference.pendingCharge(ctx.requestId),
-    );
+  let claimAttempted = false;
+  let claimed: PendingInferenceCharge | null = null;
+  let firstActualCostUsd: number | null = null;
+  let settlement: Promise<CreditReconciliationResult | null> | null = null;
+
+  const settle = async (): Promise<CreditReconciliationResult | null> => {
+    if (!claimAttempted) {
+      claimed = await cache.getAndDelete<PendingInferenceCharge>(
+        CacheKeys.inference.pendingCharge(ctx.requestId),
+      );
+      claimAttempted = true;
+    }
     // claimed === null → the sweep already settled this request; do nothing.
     if (!claimed) return null;
-    if (actualCostUsd > 0) {
-      await debitInferenceCost(ctx, actualCostUsd, "inline");
+    const actualCostUsd = firstActualCostUsd ?? 0;
+    if (actualCostUsd <= 0) {
+      return {
+        reservedAmount: 0,
+        actualCost: 0,
+        settlementTransactionIds: [],
+        adjustmentType: "none",
+      };
     }
-    return null;
+    let outcome: InferenceDebitCollectionOutcome;
+    try {
+      outcome = await debitInferenceCost(ctx, actualCostUsd, "inline");
+    } catch (error) {
+      const { v: _version, enqueuedAt: _enqueuedAt, ...charge } = claimed;
+      const requeued = await writePendingInferenceCharge(
+        { ...charge, estimatedCostUsd: actualCostUsd },
+        Date.now(),
+      );
+      if (!requeued) {
+        logger.error("[InferenceBilling] failed to requeue rejected inline debit", {
+          requestId: ctx.requestId,
+          organizationId: ctx.organizationId,
+        });
+      }
+      throw error;
+    }
+    return {
+      reservedAmount: outcome.collectedAmountUsd,
+      actualCost: actualCostUsd,
+      settlementTransactionIds: outcome.transactionId ? [outcome.transactionId] : [],
+      adjustmentType:
+        outcome.status === "collected" && outcome.collectedAmountUsd + 0.000001 >= actualCostUsd
+          ? "none"
+          : "uncollected_overage",
+    };
+  };
+
+  return (actualCostUsd: number) => {
+    if (firstActualCostUsd === null) firstActualCostUsd = actualCostUsd;
+    if (settlement) return settlement;
+    const current = settle();
+    settlement = current;
+    current.then(
+      () => undefined,
+      () => {
+        // error-policy:J5 the caller observes the debit rejection. The claimed
+        // record and first actual cost remain in memory for a keyed retry.
+        if (settlement === current) settlement = null;
+      },
+    );
+    return current;
   };
 }
 
@@ -456,18 +687,38 @@ export async function sweepStalePendingInferenceCharges(opts?: {
       const claimed = await cache.getAndDelete<PendingInferenceCharge>(key);
       if (!claimed || !isPendingInferenceCharge(claimed)) continue;
       if (claimed.estimatedCostUsd > 0) {
-        await debitInferenceCost(
-          {
-            requestId: claimed.requestId,
-            organizationId: claimed.organizationId,
-            userId: claimed.userId,
-            model: claimed.model,
-            provider: claimed.provider,
-            billingSource: claimed.billingSource,
-          },
-          claimed.estimatedCostUsd,
-          "backstop",
-        );
+        let outcome: InferenceDebitCollectionOutcome;
+        try {
+          outcome = await debitInferenceCost(
+            {
+              requestId: claimed.requestId,
+              organizationId: claimed.organizationId,
+              userId: claimed.userId,
+              model: claimed.model,
+              provider: claimed.provider,
+              billingSource: claimed.billingSource,
+            },
+            claimed.estimatedCostUsd,
+            "backstop",
+          );
+        } catch (error) {
+          const { v: _version, enqueuedAt: _enqueuedAt, ...charge } = claimed;
+          const requeued = await writePendingInferenceCharge(charge, Date.now());
+          if (!requeued) {
+            logger.error("[InferenceBilling] failed to requeue rejected backstop debit", {
+              requestId: claimed.requestId,
+              organizationId: claimed.organizationId,
+            });
+          }
+          throw error;
+        }
+        if (
+          outcome.status === "uncollected" ||
+          outcome.collectedAmountUsd + 0.000001 < claimed.estimatedCostUsd
+        ) {
+          stats.uncollectedOrStale++;
+          continue;
+        }
       }
       stats.settled++;
     }

@@ -24,7 +24,7 @@ import {
   recordUsageAnalytics,
 } from "../ai-billing";
 import { aiBillingRecordsService } from "../ai-billing-records";
-import type { CreditReconciliationResult } from "../credits";
+import type { CreditReconciliationResult, CreditReservation } from "../credits";
 import type { BridgeRequest, BridgeResponse } from "../eliza-sandbox-bridge";
 import { InferenceBalanceCacheWarmingError } from "../inference-billing-fast-path";
 import { admitOrganizationInference } from "../organization-inference-admission";
@@ -138,17 +138,32 @@ async function characterFor(
 ): Promise<SharedAgentCharacter> {
   const config = record(agent.agent_config) ?? {};
   const configuredCharacter = record(config.character) ?? config;
-  const linked = agent.character_id
-    ? options.cacheOnly
-      ? await cache.get<UserCharacter>(`character:data:${agent.character_id}`)
-      : await import("../../../db/repositories/characters").then(({ userCharactersRepository }) =>
+  let linked: UserCharacter | null | undefined;
+  if (agent.character_id) {
+    if (options.cacheOnly) {
+      try {
+        linked = await cache.get<UserCharacter>(`character:data:${agent.character_id}`);
+      } catch {
+        // error-policy:J4 a cache dependency failure cannot fall through to
+        // the linked-character repository on an inference request.
+        throw new SharedRuntimeCacheWarmingError("Character cache is unavailable. Retry shortly.");
+      }
+    } else {
+      linked = await import("../../../db/repositories/characters").then(
+        ({ userCharactersRepository }) =>
           userCharactersRepository.findByIdInOrganization(
             agent.character_id!,
             agent.organization_id,
           ),
-        )
-    : undefined;
+      );
+    }
+  }
   if (options.cacheOnly && agent.character_id && !linked) {
+    if (!options.executionCtx) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Character cache context is unavailable. Retry shortly.",
+      );
+    }
     const characterId = agent.character_id;
     const hydration = import("../../../db/repositories/characters")
       .then(({ userCharactersRepository }) =>
@@ -168,8 +183,7 @@ async function characterFor(
           error: error instanceof Error ? error.message : String(error),
         });
       });
-    if (options.executionCtx) options.executionCtx.waitUntil(hydration);
-    else void hydration;
+    options.executionCtx.waitUntil(hydration);
     throw new SharedRuntimeCacheWarmingError("Character cache is warming. Retry shortly.");
   }
   if (linked && linked.organization_id !== agent.organization_id) {
@@ -243,7 +257,9 @@ interface BillingTurn {
   };
   idempotencyKey: string;
   estimatedInputTokens: number;
+  reservation?: CreditReservation;
   settle(actualCost: number): Promise<CreditReconciliationResult | null>;
+  settleUnknown(): Promise<CreditReconciliationResult | null>;
 }
 
 async function admitTurn(
@@ -296,7 +312,9 @@ async function admitTurn(
     context,
     idempotencyKey,
     estimatedInputTokens,
+    reservation: admission.reservation,
     settle: admission.settle,
+    settleUnknown: admission.settleUnknown,
   };
 }
 
@@ -311,6 +329,7 @@ async function finishBilling(
     const result = await billUsage(
       billing.context,
       billingUsage(reply, usage, billing.estimatedInputTokens),
+      billing.reservation,
     );
     const reconciliation = await billing.settle(result.totalCost);
     const record = await recordUsageAnalytics(billing.context, result, {
@@ -328,9 +347,10 @@ async function finishBilling(
       });
     }
   } catch (error) {
-    // error-policy:J1 the reply may already be delivered. The settler releases
-    // pre-meter admission at zero or retries the first observed actual cost.
-    await billing.settle(0);
+    // error-policy:J1 the reply may already be delivered, so an unavailable
+    // meter is not evidence of zero provider work. Preserve the admitted
+    // estimate unless an earlier actual-cost settlement already won.
+    await billing.settleUnknown();
     logger.error("[SharedRuntimeChatService] billing failed", {
       agentId: agent.id,
       error: error instanceof Error ? error.message : String(error),
@@ -353,8 +373,11 @@ export class SharedRuntimeChatService {
     return await loadHistory(agentId, channelId(agentId, { roomId }), store);
   }
 
-  async getCharacter(agent: AgentSandbox): Promise<SharedAgentCharacter> {
-    return await characterFor(agent, { cacheOnly: false });
+  async getCharacter(
+    agent: AgentSandbox,
+    executionCtx: BridgeExecutionContext,
+  ): Promise<SharedAgentCharacter> {
+    return await characterFor(agent, { cacheOnly: true, executionCtx });
   }
 
   async bridge(

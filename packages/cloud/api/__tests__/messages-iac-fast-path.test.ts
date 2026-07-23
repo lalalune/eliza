@@ -123,6 +123,9 @@ mock.module("@/lib/services/ai-billing", () => ({
 }));
 
 mock.module("@/lib/services/credits", () => ({
+  COST_BUFFER: 1.5,
+  InsufficientCreditsError: TestInsufficientCreditsError,
+  MIN_RESERVATION: 0.01,
   creditsService: {
     createAnonymousReservation: () => ({
       reservedAmount: 0,
@@ -142,11 +145,29 @@ mock.module("@/lib/services/app-credits", () => ({
 }));
 
 const getAuthorizedMonetizedAppForUser = mock();
+const getAuthorizedMonetizedAppForUserCacheOnly = mock();
 mock.module("@/lib/services/apps", () => ({
   appsService: {
     getAuthorizedMonetizedAppForUser,
+    getAuthorizedMonetizedAppForUserCacheOnly,
     getById: async () => null,
   },
+}));
+
+const admitAppInferenceCacheOnly = mock();
+class TestInferenceAppAffiliateUnsupportedError extends Error {}
+const assertInferenceAppAffiliateSupported = mock(
+  (_appId: string, affiliateCode: string | null | undefined) => {
+    if (affiliateCode?.trim()) {
+      throw new TestInferenceAppAffiliateUnsupportedError();
+    }
+  },
+);
+mock.module("@/lib/services/app-inference-admission", () => ({
+  admitAppInferenceCacheOnly,
+  assertInferenceAppAffiliateSupported,
+  InferenceAppAffiliateUnsupportedError:
+    TestInferenceAppAffiliateUnsupportedError,
 }));
 
 const createCreditReservationSettler = mock();
@@ -194,6 +215,9 @@ beforeEach(() => {
   recordUsageAnalytics.mockReset();
   reserveInferenceCredits.mockReset();
   getAuthorizedMonetizedAppForUser.mockReset();
+  getAuthorizedMonetizedAppForUserCacheOnly.mockReset();
+  admitAppInferenceCacheOnly.mockReset();
+  assertInferenceAppAffiliateSupported.mockClear();
   createCreditReservationSettler.mockReset();
   generateText.mockReset();
   jsonSchemaMock.mockReset();
@@ -211,6 +235,16 @@ beforeEach(() => {
   shouldBlockUser.mockResolvedValue(false);
   estimateInputTokens.mockReturnValue(8);
   getAuthorizedMonetizedAppForUser.mockResolvedValue(null);
+  getAuthorizedMonetizedAppForUserCacheOnly.mockResolvedValue({
+    kind: "ready",
+    app: null,
+  });
+  admitAppInferenceCacheOnly.mockResolvedValue({
+    mode: "deferred_app_reservation",
+    estimatedTotalCostUsd: 0.002,
+    settle: async () => null,
+    settleUnknown: async () => null,
+  });
   reserveCredits.mockResolvedValue({
     reservedAmount: 0.01,
     reconcile: async () => null,
@@ -248,7 +282,7 @@ function postMessages(
   });
 }
 
-function postMessagesInWorker() {
+function postMessagesInWorker(extraHeaders: Record<string, string> = {}) {
   return messagesRoute.request(
     "/",
     {
@@ -256,6 +290,7 @@ function postMessagesInWorker() {
       headers: {
         "content-type": "application/json",
         "x-api-key": "eliza_test_key",
+        ...extraHeaders,
       },
       body: JSON.stringify({
         model: "claude-3-5-sonnet-20241022",
@@ -385,6 +420,89 @@ describe("/v1/messages IAC fast path", () => {
     expect(createCreditReservationSettler).toHaveBeenCalledWith(appReservation);
     expect(settleAppReservation).toHaveBeenCalledWith(0.002);
     expect(recordUsageAnalytics).toHaveBeenCalledTimes(1);
+  });
+
+  test("Worker monetized-app admission uses only cache resolution and deferred reservation", async () => {
+    const app = {
+      id: "00000000-0000-4000-8000-0000000000dd",
+      organization_id: ORG,
+      created_by_user_id: USER,
+      monetization_enabled: true,
+      inference_markup_percentage: "100",
+    };
+    getAuthorizedMonetizedAppForUserCacheOnly.mockResolvedValueOnce({
+      kind: "ready",
+      app,
+    });
+
+    const response = await postMessagesInWorker({
+      "X-App-Id": app.id,
+    });
+
+    expect(response.status).toBe(500);
+    expect(getAuthorizedMonetizedAppForUserCacheOnly).toHaveBeenCalledWith(
+      app.id,
+      { id: USER, organization_id: ORG },
+      expect.objectContaining({ executionCtx: expect.any(Object) }),
+    );
+    expect(getAuthorizedMonetizedAppForUser).not.toHaveBeenCalled();
+    expect(admitAppInferenceCacheOnly).toHaveBeenCalledWith(
+      expect.objectContaining({
+        app,
+        appId: app.id,
+        organizationId: ORG,
+        userId: USER,
+      }),
+    );
+    expect(reserveInferenceCredits).not.toHaveBeenCalled();
+    expect(generateText).toHaveBeenCalledTimes(1);
+  });
+
+  test("Worker app cache miss returns retryable 503 before admission or provider dispatch", async () => {
+    getAuthorizedMonetizedAppForUserCacheOnly.mockResolvedValueOnce({
+      kind: "warming",
+      cacheRead: "miss",
+    });
+
+    const response = await postMessagesInWorker({
+      "X-App-Id": "00000000-0000-4000-8000-0000000000dd",
+    });
+
+    expect(response.status).toBe(503);
+    expect(admitAppInferenceCacheOnly).not.toHaveBeenCalled();
+    expect(reserveInferenceCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+  });
+
+  test("app monetization plus affiliate attribution fails closed before provider dispatch", async () => {
+    const app = {
+      id: "00000000-0000-4000-8000-0000000000dd",
+      organization_id: ORG,
+      created_by_user_id: USER,
+      monetization_enabled: true,
+      inference_markup_percentage: "100",
+    };
+    getAuthorizedMonetizedAppForUserCacheOnly.mockResolvedValueOnce({
+      kind: "ready",
+      app,
+    });
+
+    const response = await postMessagesInWorker({
+      "X-App-Id": app.id,
+      "X-Affiliate-Code": "partner",
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { type: "invalid_request_error" },
+    });
+    expect(assertInferenceAppAffiliateSupported).toHaveBeenCalledWith(
+      app.id,
+      "partner",
+    );
+    expect(admitAppInferenceCacheOnly).not.toHaveBeenCalled();
+    expect(reserveInferenceCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
   });
 
   test("refunds the reservation when post-reserve payload conversion throws", async () => {

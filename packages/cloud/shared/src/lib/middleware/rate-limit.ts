@@ -13,7 +13,11 @@ import { createHash } from "node:crypto";
 import type { RouteParams } from "../api/hono-next-style-params";
 import { isHotPathCachesEnabled } from "../services/inference-hot-path-caches";
 import type { EndpointType, OrgRateLimitConfig } from "../services/org-rate-limits";
-import { getOrgRpmForEndpoint } from "../services/org-rate-limits";
+import {
+  getOrgRpmForEndpoint,
+  getOrgRpmForEndpointCacheOnly,
+  type OrgTierCacheExecutionContext,
+} from "../services/org-rate-limits";
 import { logger } from "../utils/logger";
 import { getRequestCookie } from "../utils/request-cookie";
 import { checkRateLimitRedis, type RateLimitResult } from "./rate-limit-redis";
@@ -397,6 +401,25 @@ export function __clearOrgRateLimitLeases(): void {
   orgRateLimitLeases.clear();
 }
 
+export class OrgRateLimitCacheNotReadyError extends Error {
+  readonly state: "warming" | "unavailable";
+  readonly cacheRead: "miss" | "invalid" | "unavailable" | "error";
+
+  constructor(
+    state: "warming" | "unavailable",
+    cacheRead: "miss" | "invalid" | "unavailable" | "error",
+  ) {
+    super(
+      state === "warming"
+        ? "Organization rate-limit policy is warming"
+        : "Organization rate-limit policy cache is unavailable",
+    );
+    this.name = "OrgRateLimitCacheNotReadyError";
+    this.state = state;
+    this.cacheRead = cacheRead;
+  }
+}
+
 /**
  * Per-org tier-based rate limit. Returns a 429 `Response` when denied, or `null` when allowed.
  * Call INSIDE the handler AFTER auth — same pattern as enforceMcpOrganizationRateLimit.
@@ -404,6 +427,10 @@ export function __clearOrgRateLimitLeases(): void {
 export async function enforceOrgRateLimit(
   organizationId: string,
   endpointType: EndpointType,
+  options: {
+    cacheOnly?: boolean;
+    executionCtx?: OrgTierCacheExecutionContext;
+  } = {},
 ): Promise<Response | null> {
   // Mirror withRateLimit: skip when Redis is not configured (dev/staging)
   if (process.env.REDIS_RATE_LIMITING !== "true") return null;
@@ -442,7 +469,18 @@ export async function enforceOrgRateLimit(
     ownsLeaseFlush = true;
   }
 
-  const config = await getOrgRpmForEndpoint(organizationId, endpointType);
+  let config: OrgRateLimitConfig;
+  if (options.cacheOnly) {
+    const resolution = await getOrgRpmForEndpointCacheOnly(organizationId, endpointType, {
+      executionCtx: options.executionCtx,
+    });
+    if (resolution.kind !== "ready") {
+      throw new OrgRateLimitCacheNotReadyError(resolution.kind, resolution.cacheRead);
+    }
+    config = resolution.config;
+  } else {
+    config = await getOrgRpmForEndpoint(organizationId, endpointType);
+  }
   const { windowMs, maxRequests } = config;
   const key = `org:${organizationId}:${endpointType}`;
   const result = await checkRateLimitRedis(key, windowMs, maxRequests, { carriedCount });

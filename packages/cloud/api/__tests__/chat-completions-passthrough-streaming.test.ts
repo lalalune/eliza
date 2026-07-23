@@ -258,6 +258,7 @@ function callStreaming(
     effectiveMaxTokens?: number;
     pooledCredential?: unknown;
     executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+    settleUnknown?: () => Promise<unknown> | unknown;
     providerDispatchTelemetry?: {
       capture(): void;
       emit(): void;
@@ -280,6 +281,8 @@ function callStreaming(
     30_000,
     options.estimatedInputTokens ?? 1,
     settleReservation as never,
+    (options.settleUnknown ?? (async () => null)) as never,
+    undefined,
     {} as never,
     options.effectiveMaxTokens,
     {} as never,
@@ -295,6 +298,10 @@ function callNonStreaming(
   model: string,
   reasoningEffort: "none" | "low",
   promptCacheKey?: string,
+  settlement?: {
+    settle(actualCost: number): Promise<unknown>;
+    settleUnknown(): Promise<unknown>;
+  },
 ) {
   return handleNonStreamingRequest(
     model,
@@ -315,7 +322,9 @@ function callNonStreaming(
     Date.now(),
     undefined,
     30_000,
-    async () => null,
+    (settlement?.settle ?? (async () => null)) as never,
+    (settlement?.settleUnknown ?? (async () => null)) as never,
+    undefined,
     {} as never,
     512,
     {} as never,
@@ -539,6 +548,22 @@ describe("passthrough streaming — qualifying request pipes bytes verbatim and 
     expect(aiBillingRecord).toHaveBeenCalledTimes(1);
   });
 
+  test("usage-bearing passthrough keeps the admitted estimate when local billing fails", async () => {
+    const ledger = makeLedgerReservation(100, 0.9);
+    const settle = createCreditReservationSettler(ledger.reservation);
+    fetchImpl = async () => sseResponse(UPSTREAM_SSE);
+    billUsage.mockRejectedValueOnce(new Error("pricing backend unavailable"));
+
+    const res = await callStreaming(settle, {
+      settleUnknown: () => settle(ledger.hold),
+    });
+    expect(await res.text()).toBe(UPSTREAM_SSE);
+
+    expect(ledger.reconcileCalls).toBe(1);
+    expect(ledger.actualCosts).toEqual([ledger.hold]);
+    expect(ledger.balance).toBeCloseTo(ledger.startBalance - ledger.hold, 10);
+  });
+
   test("bills with the same context and token amounts as the SDK path", async () => {
     // Fast path.
     fetchImpl = async () => sseResponse(UPSTREAM_SSE);
@@ -725,6 +750,33 @@ describe("passthrough streaming — fallthrough to the SDK path", () => {
     });
   });
 
+  test("SDK non-streaming keeps the admitted estimate when billing fails after provider output", async () => {
+    generateTextImpl = () => ({
+      text: "Hello",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: { inputTokens: 72, outputTokens: 1, totalTokens: 73 },
+    });
+    billUsage.mockRejectedValueOnce(new Error("pricing backend unavailable"));
+    const actualSettles: number[] = [];
+    let unknownSettles = 0;
+
+    const res = await callNonStreaming("zai-glm-4.7", "none", undefined, {
+      settle: async (actualCost) => {
+        actualSettles.push(actualCost);
+        return null;
+      },
+      settleUnknown: async () => {
+        unknownSettles++;
+        return null;
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(unknownSettles).toBe(1);
+    expect(actualSettles).toEqual([]);
+  });
+
   test("missing provider key → SDK path (no half-configured passthrough)", async () => {
     delete process.env.CEREBRAS_API_KEY;
     sdkFaithfulStream();
@@ -869,7 +921,7 @@ describe("passthrough streaming — client abort cancels upstream and settles th
   });
 });
 
-describe("passthrough streaming — upstream errors fail closed and refund the hold", () => {
+describe("passthrough streaming — upstream errors settle by provable outcome", () => {
   test("upstream 429 surfaces as 429 rate_limit_error with the upstream message; hold refunded", async () => {
     const ledger = makeLedgerReservation(100, 0.9);
     const settle = createCreditReservationSettler(ledger.reservation);
@@ -920,18 +972,20 @@ describe("passthrough streaming — upstream errors fail closed and refund the h
     expect(body).not.toContain(promptCacheKey);
   });
 
-  test("upstream 500 surfaces as 503 service_unavailable; hold refunded", async () => {
+  test("upstream 500 surfaces as 503 and retains the estimate as an ambiguous outcome", async () => {
     const ledger = makeLedgerReservation(100, 0.9);
     const settle = createCreditReservationSettler(ledger.reservation);
     fetchImpl = async () =>
       new Response("internal provider explosion", { status: 500 });
 
-    const res = await callStreaming(settle, {});
+    const res = await callStreaming(settle, {
+      settleUnknown: () => settle(ledger.hold),
+    });
     expect(res.status).toBe(503);
     const json = (await res.json()) as { error: { type: string } };
     expect(json.error.type).toBe("service_unavailable");
-    expect(ledger.actualCosts).toEqual([0]);
-    expect(ledger.balance).toBeCloseTo(ledger.startBalance, 10);
+    expect(ledger.actualCosts).toEqual([ledger.hold]);
+    expect(ledger.balance).toBeCloseTo(ledger.startBalance - ledger.hold, 10);
   });
 
   test("upstream 401 maps to 503 and never leaks the upstream auth body", async () => {
@@ -952,35 +1006,40 @@ describe("passthrough streaming — upstream errors fail closed and refund the h
     expect(ledger.actualCosts).toEqual([0]);
   });
 
-  test("upstream fetch failure surfaces 503; hold refunded", async () => {
+  test("ambiguous upstream fetch failure surfaces 503 and retains the estimate", async () => {
     const ledger = makeLedgerReservation(100, 0.9);
     const settle = createCreditReservationSettler(ledger.reservation);
     fetchImpl = async () => {
       throw new TypeError("network down");
     };
 
-    const res = await callStreaming(settle, {});
+    const res = await callStreaming(settle, {
+      settleUnknown: () => settle(ledger.hold),
+    });
     expect(res.status).toBe(503);
     expect(ledger.reconcileCalls).toBe(1);
-    expect(ledger.actualCosts).toEqual([0]);
+    expect(ledger.actualCosts).toEqual([ledger.hold]);
     expect(billUsage).not.toHaveBeenCalled();
   });
 
-  test("in-stream error frame without usage refunds in full (onError parity)", async () => {
+  test("partial output followed by an in-stream error retains the admitted estimate", async () => {
     const ledger = makeLedgerReservation(100, 0.9);
     const settle = createCreditReservationSettler(ledger.reservation);
     fetchImpl = async () =>
       sseResponse(
+        `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"usage":null}\n\n` +
         `data: {"error":{"message":"model overloaded","type":"overloaded_error"}}\n\n` +
           `data: [DONE]\n\n`,
       );
 
-    const res = await callStreaming(settle, {});
+    const res = await callStreaming(settle, {
+      settleUnknown: () => settle(ledger.hold),
+    });
     await res.text();
 
     expect(ledger.reconcileCalls).toBe(1);
-    expect(ledger.actualCosts).toEqual([0]);
-    expect(ledger.balance).toBeCloseTo(ledger.startBalance, 10);
+    expect(ledger.actualCosts).toEqual([ledger.hold]);
+    expect(ledger.balance).toBeCloseTo(ledger.startBalance - ledger.hold, 10);
     expect(billUsage).not.toHaveBeenCalled();
   });
 });

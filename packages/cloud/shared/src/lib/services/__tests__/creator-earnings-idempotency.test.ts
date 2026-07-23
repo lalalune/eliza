@@ -14,6 +14,8 @@
  *   2. The OLD behavior (no dedupe, appId-keyed) DOUBLE-credits — pinning the bug.
  *   3. `normalizeLedgerSourceId` maps the composite key deterministically, so a
  *      retry of the same request dedupes while distinct requests do not.
+ *   4. Versioned affiliate payout keys are globally unique across beneficiaries
+ *      while legacy, unversioned rows remain migration-compatible.
  *
  * Fails loudly (via the `pgliteReady` guard) if PGlite/pushSchema ever fails to initialize — never a silent skip.
  */
@@ -33,7 +35,10 @@ process.env.MOCK_REDIS = "1";
 import { pushSchema } from "drizzle-kit/api";
 import { and, eq } from "drizzle-orm";
 import { closeDatabaseConnectionsForTests, dbWrite } from "../../../db/client";
-import { organizations } from "../../../db/schemas/organizations";
+import {
+  organizationBalanceRevisionSequence,
+  organizations,
+} from "../../../db/schemas/organizations";
 import {
   earningsSourceEnum,
   ledgerEntryTypeEnum,
@@ -87,6 +92,7 @@ beforeAll(async () => {
     ({ redeemableEarningsService } = await import("../redeemable-earnings"));
     const schema = {
       organizations,
+      organizationBalanceRevisionSequence,
       users,
       redeemableEarnings,
       redeemableEarningsLedger,
@@ -191,6 +197,69 @@ describe("creator earnings idempotency (#10423)", () => {
     });
     expect(await balanceOf(userId)).toBeCloseTo(0.6, 6);
     expect(await earningLedgerCount(userId)).toBe(2);
+  });
+});
+
+describe("affiliate payout global identity", () => {
+  test("one versioned request key cannot credit two affiliate owners", async () => {
+    if (!pgliteReady) return;
+    const firstOwner = await seedUser();
+    const secondOwner = await seedUser();
+    const sourceId = uniq("affiliate-payout-request");
+
+    await expect(
+      redeemableEarningsService.addEarnings({
+        userId: firstOwner,
+        amount: 0.5,
+        source: "affiliate",
+        sourceId,
+        dedupeBySourceId: true,
+        description: "Affiliate inference payout",
+        metadata: { affiliatePayoutVersion: 1 },
+      }),
+    ).resolves.toMatchObject({ success: true, deduplicated: false });
+
+    await expect(
+      redeemableEarningsService.addEarnings({
+        userId: secondOwner,
+        amount: 0.5,
+        source: "affiliate",
+        sourceId,
+        dedupeBySourceId: true,
+        description: "Conflicting affiliate inference payout",
+        metadata: { affiliatePayoutVersion: 1 },
+      }),
+    ).rejects.toThrow();
+
+    expect(await balanceOf(firstOwner)).toBeCloseTo(0.5, 6);
+    expect(await balanceOf(secondOwner)).toBe(0);
+  });
+
+  test("the versioned index does not reject historical unversioned identities", async () => {
+    if (!pgliteReady) return;
+    const firstOwner = await seedUser();
+    const secondOwner = await seedUser();
+    const sourceId = uniq("legacy-affiliate-payout");
+
+    await redeemableEarningsService.addEarnings({
+      userId: firstOwner,
+      amount: 0.25,
+      source: "affiliate",
+      sourceId,
+      dedupeBySourceId: true,
+      description: "Legacy affiliate payout",
+    });
+    await redeemableEarningsService.addEarnings({
+      userId: secondOwner,
+      amount: 0.25,
+      source: "affiliate",
+      sourceId,
+      dedupeBySourceId: true,
+      description: "Legacy affiliate payout under historical owner",
+    });
+
+    expect(await balanceOf(firstOwner)).toBeCloseTo(0.25, 6);
+    expect(await balanceOf(secondOwner)).toBeCloseTo(0.25, 6);
   });
 });
 

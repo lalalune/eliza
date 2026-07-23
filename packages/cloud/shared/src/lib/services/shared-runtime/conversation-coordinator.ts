@@ -2,7 +2,8 @@
  * Dispatches shared-runtime turns through a conversation-scoped coordinator.
  *
  * Production Workers use a Durable Object for ordered cache-local history;
- * tests and non-Worker runtimes call the resolved-agent service directly.
+ * callers must supply the namespace and execution context explicitly so a
+ * deployment fault cannot fall through to repository-backed execution.
  */
 
 import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
@@ -12,8 +13,12 @@ import type { SharedTurnMessage } from "./run-shared-agent-turn";
 import type { BridgeExecutionContext } from "./shared-runtime-chat";
 
 export interface SharedConversationCoordinatorOptions {
-  namespace?: RuntimeDurableObjectNamespace;
-  executionCtx?: BridgeExecutionContext;
+  namespace: RuntimeDurableObjectNamespace;
+  executionCtx: BridgeExecutionContext;
+}
+
+export interface SharedConversationHistoryCoordinatorOptions {
+  namespace: RuntimeDurableObjectNamespace;
 }
 
 function coordinatorName(agentId: string, rpc: BridgeRequest): string {
@@ -32,6 +37,35 @@ function coordinatorStub(
   roomId: string,
 ) {
   return namespace.getByName(`${agentId}:${roomId}`);
+}
+
+function cacheContextUnavailable(): Error {
+  const error = new Error("Shared runtime cache context is unavailable. Retry shortly.");
+  error.name = "SharedRuntimeCacheWarmingError";
+  return error;
+}
+
+function requireTurnCoordinator(
+  options: SharedConversationCoordinatorOptions,
+): RuntimeDurableObjectNamespace {
+  if (
+    !options?.namespace ||
+    typeof options.namespace.getByName !== "function" ||
+    !options.executionCtx ||
+    typeof options.executionCtx.waitUntil !== "function"
+  ) {
+    throw cacheContextUnavailable();
+  }
+  return options.namespace;
+}
+
+function requireHistoryCoordinator(
+  options: SharedConversationHistoryCoordinatorOptions,
+): RuntimeDurableObjectNamespace {
+  if (!options?.namespace || typeof options.namespace.getByName !== "function") {
+    throw cacheContextUnavailable();
+  }
+  return options.namespace;
 }
 
 async function requireCoordinatorResponse(response: Response, surface: string): Promise<Response> {
@@ -59,18 +93,10 @@ async function requireCoordinatorResponse(response: Response, surface: string): 
 export async function coordinateSharedBridge(
   agent: AgentSandbox,
   rpc: BridgeRequest,
-  options: SharedConversationCoordinatorOptions = {},
+  options: SharedConversationCoordinatorOptions,
 ): Promise<BridgeResponse> {
-  if (!options.namespace) {
-    const { elizaSandboxService } = await import("../eliza-sandbox");
-    return await elizaSandboxService.bridge(
-      agent.id,
-      agent.organization_id,
-      rpc,
-      options.executionCtx,
-    );
-  }
-  const response = await options.namespace
+  const namespace = requireTurnCoordinator(options);
+  const response = await namespace
     .getByName(coordinatorName(agent.id, rpc))
     .fetch("https://shared-runtime.internal/bridge", {
       method: "POST",
@@ -84,13 +110,10 @@ export async function coordinateSharedBridge(
 export async function coordinateSharedStream(
   agent: AgentSandbox,
   rpc: BridgeRequest,
-  options: SharedConversationCoordinatorOptions = {},
-): Promise<Response | null> {
-  if (!options.namespace) {
-    const { elizaSandboxService } = await import("../eliza-sandbox");
-    return await elizaSandboxService.bridgeStream(agent.id, agent.organization_id, rpc);
-  }
-  const response = await options.namespace
+  options: SharedConversationCoordinatorOptions,
+): Promise<Response> {
+  const namespace = requireTurnCoordinator(options);
+  const response = await namespace
     .getByName(coordinatorName(agent.id, rpc))
     .fetch("https://shared-runtime.internal/stream", {
       method: "POST",
@@ -103,13 +126,10 @@ export async function coordinateSharedStream(
 export async function coordinateSharedHistory(
   agentId: string,
   roomId: string,
-  options: SharedConversationCoordinatorOptions = {},
+  options: SharedConversationHistoryCoordinatorOptions,
 ): Promise<SharedTurnMessage[]> {
-  if (!options.namespace) {
-    const { elizaSandboxService } = await import("../eliza-sandbox");
-    return await elizaSandboxService.getSharedConversationHistory(agentId, roomId);
-  }
-  const response = await coordinatorStub(options.namespace, agentId, roomId).fetch(
+  const namespace = requireHistoryCoordinator(options);
+  const response = await coordinatorStub(namespace, agentId, roomId).fetch(
     "https://shared-runtime.internal/history",
     {
       method: "POST",

@@ -351,8 +351,23 @@ export function createLedgerDebitSettler(
   ctx: LedgerChargeContext,
 ): (actualCostUsd: number) => Promise<CreditReconciliationResult | null> {
   return async (actualCostUsd: number) => {
-    await settleLedgerCharge(ctx, actualCostUsd, "inline");
-    return null;
+    const amount = Math.max(actualCostUsd, 0);
+    const outcome = await settleLedgerCharge(ctx, amount, "inline");
+    if (!outcome.claimed) return null;
+    if (outcome.uncollected) {
+      return {
+        reservedAmount: 0,
+        actualCost: amount,
+        settlementTransactionIds: [],
+        adjustmentType: "uncollected_overage",
+      };
+    }
+    return {
+      reservedAmount: amount,
+      actualCost: amount,
+      settlementTransactionIds: [],
+      adjustmentType: "none",
+    };
   };
 }
 
