@@ -389,6 +389,38 @@ describe("serialized ownership", () => {
     await latest.dispose();
     expect(successorCleanup).toHaveBeenCalledTimes(1);
   });
+
+  it("does not let a throwing error reporter poison later ownership transitions", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    registerRendererService({
+      id: "a.reporter-failure",
+      shells: ["main"],
+      start: () => () => {
+        throw new Error("cleanup failed");
+      },
+    });
+    const host = startRendererServiceHost({
+      shell: "main",
+      reportError: () => {
+        throw new Error("reporter failed");
+      },
+    });
+    await settleRendererServices();
+    await host.dispose();
+
+    const successor = makeService("a.after-reporter-failure");
+    registerRendererService(successor.definition);
+    startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    expect(successor.start).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("a.reporter-failure"),
+      expect.any(AggregateError),
+    );
+  });
 });
 
 describe("race-safe async start", () => {

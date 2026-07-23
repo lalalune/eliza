@@ -185,6 +185,29 @@ const defaultReportError: RendererServiceErrorReporter = (
   console.error(`${LOG_PREFIX} service "${serviceId}" ${phase} failed:`, error);
 };
 
+function reportServiceError(
+  host: HostState,
+  serviceId: string,
+  error: unknown,
+  phase: "start" | "cleanup",
+): void {
+  try {
+    host.reportError(serviceId, error, phase);
+  } catch (reporterError) {
+    // The reporter is an observability boundary, not part of resource
+    // ownership. Its own failure must stay visible without poisoning the
+    // serialized lifecycle queue and stranding every later transition.
+    defaultReportError(
+      serviceId,
+      new AggregateError(
+        [error, reporterError],
+        `renderer service error reporter failed during ${phase}`,
+      ),
+      phase,
+    );
+  }
+}
+
 function enqueueTransition(
   store: RendererServiceStore,
   transition: () => Promise<void>,
@@ -206,7 +229,7 @@ async function runCleanup(
   } catch (error) {
     // error-policy:J6 best-effort teardown — a throwing cleanup must not block
     // the remaining services' teardown; it is reported, never swallowed.
-    host.reportError(instance.definition.id, error, "cleanup");
+    reportServiceError(host, instance.definition.id, error, "cleanup");
   }
 }
 
@@ -287,13 +310,14 @@ function startInstance(
       instance.status = "failed";
       // error-policy:J1 host boundary — a service failing to start must not
       // take down the renderer boot path; it is surfaced via the reporter.
-      host.reportError(definition.id, error, "start");
+      reportServiceError(host, definition.id, error, "start");
       return;
     }
 
     if (typeof cleanup !== "function") {
       if (!controller.signal.aborted) instance.status = "failed";
-      host.reportError(
+      reportServiceError(
+        host,
         definition.id,
         new Error(
           `renderer service "${definition.id}" start() returned ${String(
