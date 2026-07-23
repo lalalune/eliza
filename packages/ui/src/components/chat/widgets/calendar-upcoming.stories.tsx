@@ -25,6 +25,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const NeedsAttention: Story = {
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,

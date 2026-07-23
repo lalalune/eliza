@@ -1,88 +1,122 @@
 /**
- * Coverage gate asserting every story ships a play function (interaction
- * coverage). Reads the stories tree, no runtime.
+ * Source contract for Storybook interaction stories. Every exported story with
+ * a play function must opt into the browser-enforced interaction tag, and the
+ * tag may not outlive the play function it promises.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
 
-/**
- * Storybook interaction-coverage ratchet (issue #9943).
- *
- * The story gate (`test/story-gate/run-story-gate.mjs`) is render-smoke only —
- * it proves a story MOUNTS, not that the component WORKS. ~91% of stories are
- * render-only with no `play`. This guard makes interaction coverage a forward
- * ratchet instead of permanently advisory:
- *
- *   1. The total number of stories exporting a `play` (an interaction test that
- *      drives clicks/fills/state and asserts) may only GROW. Adding an
- *      interactive component without a `play` cannot lower the floor; removing a
- *      `play` from any story fails this test. Raise `MIN_INTERACTION_PLAYS` when
- *      you add plays so the floor tracks reality.
- *   2. A curated set of high-traffic interactive components MUST always ship a
- *      `play`. Deleting the interaction test from any of these fails CI — the
- *      exact "an interactive story shipped without a play" regression #9943 calls
- *      out. Extend `REQUIRED_PLAY` as more components get real interaction tests.
- *
- * Source-level (no Storybook build needed) so it runs in the fast unit lane.
- */
-
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
-
-/** A story exports an interaction test when it has a top-level `play:` / `play =`. */
-const PLAY_RE = /^[ \t]*play[ \t]*[:=]/m;
+const INTERACTION_REQUIRED_TAG = "interaction-required";
 
 function listStoryFiles(dir: string): string[] {
-  const out: string[] = [];
+  const files: string[] = [];
   for (const entry of readdirSync(dir)) {
     const full = path.join(dir, entry);
     if (statSync(full).isDirectory()) {
-      out.push(...listStoryFiles(full));
+      files.push(...listStoryFiles(full));
     } else if (entry.endsWith(".stories.tsx")) {
-      out.push(full);
+      files.push(full);
     }
   }
-  return out;
+  return files;
 }
 
-function exportsPlay(absPath: string): boolean {
-  return PLAY_RE.test(readFileSync(absPath, "utf8"));
+function propertyName(property: ts.ObjectLiteralElementLike): string | null {
+  if (
+    !ts.isPropertyAssignment(property) &&
+    !ts.isMethodDeclaration(property) &&
+    !ts.isShorthandPropertyAssignment(property)
+  ) {
+    return null;
+  }
+  const name = property.name;
+  return ts.isIdentifier(name) || ts.isStringLiteral(name) ? name.text : null;
 }
 
-// Floor: stories that currently export a `play`. RATCHET — only ever raise this.
-const MIN_INTERACTION_PLAYS = 17;
+function hasInteractionRequiredTag(
+  object: ts.ObjectLiteralExpression,
+): boolean {
+  const tags = object.properties.find(
+    (property) => propertyName(property) === "tags",
+  );
+  if (!tags || !ts.isPropertyAssignment(tags)) return false;
+  if (!ts.isArrayLiteralExpression(tags.initializer)) return false;
+  return tags.initializer.elements.some(
+    (element) =>
+      ts.isStringLiteral(element) && element.text === INTERACTION_REQUIRED_TAG,
+  );
+}
 
-// High-traffic interactive components whose interaction test must never be
-// dropped. Paths are relative to packages/ui/src. Grow this list as components
-// gain real plays (chat composer, settings forms, command palette, springboard …).
-const REQUIRED_PLAY = [
-  "components/shell/ShortcutsOverlay.stories.tsx", // keyboard shortcuts overlay
-  "components/shell/RestartBanner.stories.tsx", // shell restart banner
-  "components/pages/Launcher.stories.tsx", // springboard / app launcher
-  "components/chat/widgets/needs-attention.stories.tsx", // home attention widget
-  "components/composites/chat/chat-message-actions.stories.tsx", // chat message actions
-] as const;
+function exportedStoryContracts(file: string): Array<{
+  id: string;
+  hasPlay: boolean;
+  requiresInteraction: boolean;
+}> {
+  const source = readFileSync(file, "utf8");
+  const sourceFile = ts.createSourceFile(
+    file,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const contracts: Array<{
+    id: string;
+    hasPlay: boolean;
+    requiresInteraction: boolean;
+  }> = [];
 
-describe("Storybook interaction coverage (#9943)", () => {
-  const storyFiles = listStoryFiles(SRC_DIR);
-  const withPlay = storyFiles.filter(exportsPlay);
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    if (
+      !statement.modifiers?.some(
+        (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+      )
+    ) {
+      continue;
+    }
+    for (const declaration of statement.declarationList.declarations) {
+      if (
+        !ts.isIdentifier(declaration.name) ||
+        !declaration.initializer ||
+        !ts.isObjectLiteralExpression(declaration.initializer)
+      ) {
+        continue;
+      }
+      const object = declaration.initializer;
+      contracts.push({
+        id: `${path.relative(SRC_DIR, file)}:${declaration.name.text}`,
+        hasPlay: object.properties.some(
+          (property) => propertyName(property) === "play",
+        ),
+        requiresInteraction: hasInteractionRequiredTag(object),
+      });
+    }
+  }
+  return contracts;
+}
 
-  it("discovers the story corpus", () => {
-    // Guard against a glob/path regression silently passing the ratchet on zero
-    // files — the suite is large.
-    expect(storyFiles.length).toBeGreaterThan(100);
-  });
+describe("Storybook interaction execution contract (#9943)", () => {
+  it("classifies every play story for real browser execution with no stale tags", () => {
+    const contracts = listStoryFiles(SRC_DIR).flatMap(exportedStoryContracts);
+    const unclassified = contracts
+      .filter((story) => story.hasPlay && !story.requiresInteraction)
+      .map((story) => story.id);
+    const staleTags = contracts
+      .filter((story) => story.requiresInteraction && !story.hasPlay)
+      .map((story) => story.id);
 
-  it("never regresses below the interaction-play floor (ratchet up only)", () => {
-    expect(withPlay.length).toBeGreaterThanOrEqual(MIN_INTERACTION_PLAYS);
-  });
-
-  it("requires an interaction `play` on every high-traffic interactive component", () => {
-    const missing = REQUIRED_PLAY.filter((rel) => {
-      const abs = path.join(SRC_DIR, rel);
-      return !exportsPlay(abs);
-    });
-    expect(missing).toEqual([]);
+    expect(
+      unclassified,
+      `Stories with play functions must declare tags: ["${INTERACTION_REQUIRED_TAG}"] so the browser gate executes them: ${unclassified.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      staleTags,
+      `Interaction-required stories lost their play function: ${staleTags.join(", ")}`,
+    ).toEqual([]);
   });
 });

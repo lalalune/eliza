@@ -29,6 +29,7 @@ type Story = StoryObj<typeof meta>;
 
 /** The oldest pending decision is the single datum; the mock's oldest is stale. */
 export const NeedsAttention: Story = {
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,
@@ -57,6 +58,7 @@ export const NeedsAttention: Story = {
  * option-carrying items).
  */
 export const ClickPrefillsChat: Story = {
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,

@@ -1,6 +1,6 @@
 /**
- * Unit tests for the Ui Smoke Coverage app shell contract and coverage
- * guardrail.
+ * Proves that every UI-smoke spec is either runnable in keyless PR CI or carries
+ * an explicit, current exclusion with a reason.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * UI-smoke spec-coverage ratchet gate (vitest, boot-free).
+ * UI-smoke spec-coverage authority (vitest, boot-free).
  *
  * Sibling to the action-coverage and route-coverage gates. Those gates prove
  * that every action/route is *enumerated* in the smoke matrix — but a spec that
@@ -24,13 +24,12 @@ import { describe, expect, it } from "vitest";
  * effect: a NEW spec is on the PR path by default, and the ONLY way to exclude
  * one is to record it in the deny-list with a category and a reason.
  *
- * This gate enforces that contract:
+ * This test enforces that contract:
  *   1. The deny-list is well-formed (real specs, valid category, non-empty
  *      reason, no duplicates).
- *   2. The keyless-debt bucket is a non-growing ratchet (MAX_KEYLESS_DEBT).
- *   3. A spec that is hand-named in the workflow is never simultaneously
+ *   2. A spec that is hand-named in the workflow is never simultaneously
  *      deny-listed (that would run it despite the exclusion).
- *   4. The directory-driven catch-all job stays wired into scenario-pr.yml, so
+ *   3. The directory-driven catch-all job stays wired into scenario-pr.yml, so
  *      every non-denied spec actually runs (named slices ∪ auto-discovered =
  *      all non-denied specs).
  */
@@ -56,14 +55,6 @@ interface DenyEntry {
   category: DenyCategory;
   reason: string;
 }
-
-/**
- * Hard ceiling on the keyless-debt bucket — specs that are fixture-capable and
- * SHOULD run keyless but are not yet verified. Decrement every time a debt spec
- * is wired into the keyless lane (remove it from the deny-list). This is the
- * ratchet that prevents new dark specs from being parked in debt indefinitely.
- */
-const MAX_KEYLESS_DEBT = 3;
 
 function specFileNames(): string[] {
   const specs: string[] = [];
@@ -146,16 +137,6 @@ describe("ui-smoke spec coverage gate", () => {
     ).toEqual([]);
   });
 
-  it("keyless-debt bucket is a non-growing ratchet", () => {
-    const debt = denyList().filter((e) => e.category === "keyless-debt");
-    expect(
-      debt.length,
-      `keyless-debt entries (${debt.length}) exceed the ceiling (${MAX_KEYLESS_DEBT}). ` +
-        `Do not park new dark specs in debt — wire them into keyless CI instead, or pay ` +
-        `off existing debt and lower the ceiling.`,
-    ).toBeLessThanOrEqual(MAX_KEYLESS_DEBT);
-  });
-
   it("a hand-named slice spec is never also deny-listed", () => {
     const denied = new Set(denyList().map((e) => e.spec));
     const named = namedInWorkflow();
@@ -192,7 +173,7 @@ describe("ui-smoke spec coverage gate", () => {
     ).toBe(true);
   });
 
-  it("named slices ∪ auto-discovered = every non-denied spec (nothing runs nowhere)", () => {
+  it("partitions every discovered spec between an exclusion and keyless execution", () => {
     const denied = new Set(denyList().map((e) => e.spec));
     const named = namedInWorkflow();
     const allSpecs = specFileNames();
@@ -212,8 +193,16 @@ describe("ui-smoke spec coverage gate", () => {
       `Runnable specs covered by neither a named slice nor the auto-discovered ` +
         `job: ${uncovered.join(", ")}`,
     ).toEqual([]);
-
-    // Sanity: the deny-list never swallows the whole directory.
-    expect(denied.size).toBeLessThan(allSpecs.length);
+    const multiplyClassified = allSpecs.filter(
+      (name) => denied.has(name) && covered.has(name),
+    );
+    expect(
+      multiplyClassified,
+      `Specs cannot be both excluded and runnable: ${multiplyClassified.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      [...new Set([...denied, ...covered])].sort(),
+      "Every discovered spec must have exactly one current CI classification.",
+    ).toEqual(allSpecs);
   });
 });

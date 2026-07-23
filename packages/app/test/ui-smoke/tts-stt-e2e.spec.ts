@@ -288,6 +288,8 @@ async function installTtsCloudMock(page: Page): Promise<{
       body: TINY_WAV,
     });
   });
+  // external-api-mock: elevenlabs -- Binary TTS fixtures remain explicitly
+  // classified until the provider's JSON voice contract has recorded evidence.
   await page.route("**/api/tts/elevenlabs", async (route) => {
     if (route.request().method() !== "POST") {
       await route.fallback();

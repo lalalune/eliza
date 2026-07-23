@@ -97,6 +97,7 @@ export const Restarting: Story = {
       triggerRestart: () => new Promise<void>(() => {}),
     }),
   ],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     canvasElement
       .querySelector<HTMLButtonElement>("button:last-of-type")

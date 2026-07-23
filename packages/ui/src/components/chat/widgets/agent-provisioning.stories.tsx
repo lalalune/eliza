@@ -108,6 +108,7 @@ async function waitForCardText(
 
 export const Provisioning: Story = {
   decorators: [frame("migrating")],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForCardText(canvasElement, "Setting up");
     assert(card instanceof HTMLButtonElement, "the whole card is a button");
@@ -116,6 +117,7 @@ export const Provisioning: Story = {
 
 export const ErrorWithRetry: Story = {
   decorators: [frame("failed")],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForCardText(canvasElement, "Setup paused");
     assert(card.textContent?.includes("Retry"), "offers a retry control");

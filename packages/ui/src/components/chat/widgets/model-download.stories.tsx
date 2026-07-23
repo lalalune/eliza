@@ -175,6 +175,7 @@ export const Downloading: Story = {
       ),
     ),
   ],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,
@@ -198,6 +199,7 @@ export const Loading: Story = {
       ),
     ),
   ],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,
@@ -210,6 +212,7 @@ export const Loading: Story = {
 /** Queued — assigned but not yet downloading. */
 export const Queued: Story = {
   decorators: [withHub(makeHub(makeSlot({ state: "missing" })))],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,
@@ -233,6 +236,7 @@ export const DownloadFailed: Story = {
       ),
     ),
   ],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const card = await waitForTestId(
       canvasElement,
@@ -263,6 +267,7 @@ export const NotRequiredRendersNull: Story = {
       ),
     ),
   ],
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     // Give the mount fetch a few ticks, then assert the card never rendered.
     for (let i = 0; i < 5; i += 1) {

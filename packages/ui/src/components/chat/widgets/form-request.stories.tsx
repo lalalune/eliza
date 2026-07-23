@@ -225,6 +225,7 @@ export const SubmittedCollapsed: Story = {
     },
     onSubmit: () => {},
   },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const submit = canvasElement.querySelector("button[type='submit']");
     assert(submit instanceof HTMLButtonElement, "submit button is visible");

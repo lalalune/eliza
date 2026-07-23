@@ -42,7 +42,10 @@ const waitForSplash = async ({
  * The wired `StartupScreen`. With no backend in Storybook the startup
  * coordinator never advances, so it renders its loading (boot) state.
  */
-export const Default: Story = { play: waitForSplash };
+export const Default: Story = {
+  tags: ["interaction-required"],
+  play: waitForSplash,
+};
 
 // The presentational shell drives every startup state from its `view` prop,
 // so the variants below exercise each branch directly.
@@ -51,6 +54,7 @@ function ShellStory({ view }: { view: StartupShellView }) {
 }
 
 export const Loading: Story = {
+  tags: ["interaction-required"],
   play: waitForSplash,
   render: () => (
     <ShellStory

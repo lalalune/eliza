@@ -456,7 +456,7 @@ async function renderStory(context, baseUrl, story, axeSource, opts) {
     logCapture: null,
     a11y: [],
     play: {
-      expected: Boolean(story.tags?.includes("play-fn")),
+      expected: Boolean(story.tags?.includes("interaction-required")),
       prepared: false,
       phase: null,
     },
@@ -540,7 +540,13 @@ async function renderStory(context, baseUrl, story, axeSource, opts) {
     if (result.play.expected && !result.play.prepared) {
       result.verdict = "broken";
       result.issues.push(
-        "play-missing: story index is tagged play-fn but runtime playFunction was not prepared",
+        "play-missing: story is tagged interaction-required but runtime playFunction was not prepared",
+      );
+    }
+    if (!result.play.expected && result.play.prepared) {
+      result.verdict = "broken";
+      result.issues.push(
+        "play-unclassified: runtime playFunction exists without the interaction-required tag",
       );
     }
 
