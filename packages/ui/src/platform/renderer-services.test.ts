@@ -4,8 +4,9 @@
  * Exercises the renderer-service lifecycle registry with real service
  * definitions and the real global store — no mocked lifecycle: registration
  * order-independence, shell-scope gating, disposer retention and invocation on
- * dispose/pagehide/host replacement/re-registration (HMR), race-safe stop
- * during a pending async start, and observable failure states.
+ * dispose/pagehide/host replacement/re-registration (HMR), serialized async
+ * cleanup, replacement coalescing, race-safe pending starts, and observable
+ * failure states.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -30,8 +31,19 @@ function stateOf(id: string) {
   return getRendererServiceStates().services.find((s) => s.id === id)?.status;
 }
 
-afterEach(() => {
-  resetRendererServicesForTest();
+function createGate() {
+  let release: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    promise,
+    release: () => release?.(),
+  };
+}
+
+afterEach(async () => {
+  await resetRendererServicesForTest();
 });
 
 describe("registration and host startup ordering", () => {
@@ -70,7 +82,7 @@ describe("registration and host startup ordering", () => {
     const host = startRendererServiceHost({ shell: "main" });
     await settleRendererServices();
     expect(seen).toEqual({ shell: "main", aborted: false });
-    host.dispose();
+    await host.dispose();
   });
 
   it("rejects definitions with an empty id or no shells", () => {
@@ -100,12 +112,12 @@ describe("shell scoping", () => {
     await settleRendererServices();
     expect(svc.start).not.toHaveBeenCalled();
     expect(stateOf("a.main-only")).toBe("ineligible");
-    popout.dispose();
+    await popout.dispose();
 
     const detached = startRendererServiceHost({ shell: "detached" });
     await settleRendererServices();
     expect(svc.start).not.toHaveBeenCalled();
-    detached.dispose();
+    await detached.dispose();
   });
 
   it("starts a multi-shell service in each declared shell", async () => {
@@ -115,7 +127,7 @@ describe("shell scoping", () => {
     const popout = startRendererServiceHost({ shell: "popout" });
     await settleRendererServices();
     expect(svc.start).toHaveBeenCalledTimes(1);
-    popout.dispose();
+    await popout.dispose();
     expect(svc.cleanup).toHaveBeenCalledTimes(1);
 
     startRendererServiceHost({ shell: "main" });
@@ -133,11 +145,11 @@ describe("teardown", () => {
     const host = startRendererServiceHost({ shell: "main" });
     await settleRendererServices();
 
-    host.dispose();
+    await host.dispose();
     expect(a.cleanup).toHaveBeenCalledTimes(1);
     expect(b.cleanup).toHaveBeenCalledTimes(1);
     // Dispose is idempotent.
-    host.dispose();
+    await host.dispose();
     expect(a.cleanup).toHaveBeenCalledTimes(1);
   });
 
@@ -148,33 +160,35 @@ describe("teardown", () => {
     await settleRendererServices();
 
     window.dispatchEvent(new Event("pagehide"));
+    await settleRendererServices();
     expect(svc.cleanup).toHaveBeenCalledTimes(1);
     expect(getRendererServiceStates().hostShell).toBeNull();
   });
 
-  it("disposes on a real pagehide but survives a bfcache round trip", async () => {
+  it("suspends resources in bfcache and starts a fresh generation on restore", async () => {
     const svc = makeService("a.bfcache");
     registerRendererService(svc.definition);
     startRendererServiceHost({ shell: "main" });
     await settleRendererServices();
 
-    // bfcache entry: persisted=true (iOS Safari back-nav) — the page can come
-    // back via pageshow, so the host must keep every service alive.
     const persisted = new Event("pagehide") as Event & { persisted: boolean };
     Object.defineProperty(persisted, "persisted", { value: true });
     window.dispatchEvent(persisted);
-    expect(svc.cleanup).not.toHaveBeenCalled();
-    expect(stateOf("a.bfcache")).toBe("running");
+    await settleRendererServices();
+    expect(svc.cleanup).toHaveBeenCalledTimes(1);
+    expect(stateOf("a.bfcache")).toBe("stopped");
     expect(getRendererServiceStates().hostShell).toBe("main");
 
-    // Restore from bfcache, then a real teardown: persisted=false disposes.
     const pageshow = new Event("pageshow") as Event & { persisted: boolean };
     Object.defineProperty(pageshow, "persisted", { value: true });
     window.dispatchEvent(pageshow);
+    await settleRendererServices();
+    expect(svc.start).toHaveBeenCalledTimes(2);
     expect(stateOf("a.bfcache")).toBe("running");
 
     window.dispatchEvent(new Event("pagehide"));
-    expect(svc.cleanup).toHaveBeenCalledTimes(1);
+    await settleRendererServices();
+    expect(svc.cleanup).toHaveBeenCalledTimes(2);
     expect(getRendererServiceStates().hostShell).toBeNull();
   });
 
@@ -209,12 +223,13 @@ describe("teardown", () => {
     expect(stateOf("a.hmr")).toBe("running");
   });
 
-  it("reports a throwing cleanup and still tears down the remaining services", async () => {
+  it("reports a rejecting cleanup and still tears down the remaining services", async () => {
     const reportError = vi.fn();
     const bad = {
       id: "a.bad-cleanup",
       shells: ["main"] as const,
-      start: () => () => {
+      start: () => async () => {
+        await Promise.resolve();
         throw new Error("cleanup exploded");
       },
     };
@@ -224,13 +239,115 @@ describe("teardown", () => {
     const host = startRendererServiceHost({ shell: "main", reportError });
     await settleRendererServices();
 
-    host.dispose();
+    await host.dispose();
     expect(good.cleanup).toHaveBeenCalledTimes(1);
     expect(reportError).toHaveBeenCalledWith(
       "a.bad-cleanup",
       expect.any(Error),
       "cleanup",
     );
+  });
+});
+
+describe("serialized ownership", () => {
+  it("awaits an old generation's async cleanup before starting its replacement", async () => {
+    const cleanupGate = createGate();
+    const events: string[] = [];
+    registerRendererService({
+      id: "a.serial-re-register",
+      shells: ["main"],
+      start: () => {
+        events.push("old:start");
+        return async () => {
+          events.push("old:cleanup:start");
+          await cleanupGate.promise;
+          events.push("old:cleanup:end");
+        };
+      },
+    });
+    startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    registerRendererService({
+      id: "a.serial-re-register",
+      shells: ["main"],
+      start: () => {
+        events.push("new:start");
+        return () => {};
+      },
+    });
+    await vi.waitFor(() =>
+      expect(events).toEqual(["old:start", "old:cleanup:start"]),
+    );
+    expect(events).not.toContain("new:start");
+
+    cleanupGate.release();
+    await settleRendererServices();
+    expect(events).toEqual([
+      "old:start",
+      "old:cleanup:start",
+      "old:cleanup:end",
+      "new:start",
+    ]);
+    expect(stateOf("a.serial-re-register")).toBe("running");
+  });
+
+  it("shares one idempotent async stop and aborts ownership immediately", async () => {
+    const cleanupGate = createGate();
+    const cleanup = vi.fn(() => cleanupGate.promise);
+    let signal: AbortSignal | undefined;
+    registerRendererService({
+      id: "a.idempotent-stop",
+      shells: ["main"],
+      start: (context) => {
+        signal = context.signal;
+        return cleanup;
+      },
+    });
+    const host = startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    const firstStop = host.dispose();
+    const secondStop = host.dispose();
+    expect(secondStop).toBe(firstStop);
+    expect(signal?.aborted).toBe(true);
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(1));
+
+    cleanupGate.release();
+    await firstStop;
+    expect(host.dispose()).toBe(firstStop);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces concurrent host replacements while old cleanup is pending", async () => {
+    const cleanupGate = createGate();
+    const oldCleanup = vi.fn(() => cleanupGate.promise);
+    const successorCleanup = vi.fn();
+    let generation = 0;
+    const start = vi.fn(() => {
+      generation += 1;
+      return generation === 1 ? oldCleanup : successorCleanup;
+    });
+    registerRendererService({
+      id: "a.coalesced-host",
+      shells: ["main"],
+      start,
+    });
+    startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    const superseded = startRendererServiceHost({ shell: "main" });
+    const latest = startRendererServiceHost({ shell: "main" });
+    await vi.waitFor(() => expect(oldCleanup).toHaveBeenCalledTimes(1));
+    expect(start).toHaveBeenCalledTimes(1);
+
+    cleanupGate.release();
+    await settleRendererServices();
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(stateOf("a.coalesced-host")).toBe("running");
+    await superseded.dispose();
+    await latest.dispose();
+    expect(successorCleanup).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -249,17 +366,16 @@ describe("race-safe async start", () => {
       },
     });
     const host = startRendererServiceHost({ shell: "main" });
-    expect(stateOf("a.slow-start")).toBe("starting");
+    await vi.waitFor(() => expect(stateOf("a.slow-start")).toBe("starting"));
 
     // Stop while start is still pending — no cleanup exists yet.
-    host.dispose();
+    const disposal = host.dispose();
     expect(cleanup).not.toHaveBeenCalled();
 
     // The start finishes late; its cleanup must run immediately, leaving no
     // orphaned listeners/intervals behind.
     releaseStart?.();
-    await settleRendererServices();
-    await Promise.resolve();
+    await disposal;
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
 
@@ -277,9 +393,10 @@ describe("race-safe async start", () => {
       },
     });
     const host = startRendererServiceHost({ shell: "main", reportError });
-    host.dispose();
+    await vi.waitFor(() => expect(rejectStart).toBeTypeOf("function"));
+    const disposal = host.dispose();
     rejectStart?.(new Error("torn down mid-start"));
-    await settleRendererServices();
+    await disposal;
     expect(reportError).not.toHaveBeenCalled();
   });
 });
