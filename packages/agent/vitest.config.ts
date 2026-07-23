@@ -153,15 +153,10 @@ export default defineConfig({
   test: {
     ...baseConfig.test,
     environment: "node",
-    // "forks" (not "vmForks"): the vmForks pool shares one worker process whose
-    // VM-context module interception races across test files — vi.mock factories
-    // nondeterministically leak into (or vanish from) a NEIGHBORING file's module
-    // graph when several conversation-route suites run in one invocation. Seen as
-    // conversation-failurekind-roundtrip losing its chat-routes mock (real
-    // readChatRequestPayload → "text is required") and
-    // conversation-greeting-idempotency inheriting a foreign no-op persist mock
-    // (zero greeting rows). The forks pool keeps mock registries strictly
-    // per-file, matching the root suite's pool.
+    // Vitest reuses vmForks workers between files, but these route suites mock
+    // relative modules whose transformed graphs have crossed VM boundaries in
+    // grouped runs. A process fork keeps each file's mock registry isolated and
+    // matches the root harness.
     pool: "forks",
     setupFiles: ["test/setup.ts"],
     testTimeout: 120_000,
