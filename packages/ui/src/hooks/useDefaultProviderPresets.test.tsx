@@ -8,6 +8,8 @@ vi.mock("../api/runtime-mode-client", () => ({
 }));
 
 import { fetchRuntimeModeSnapshot } from "../api/runtime-mode-client";
+import { authenticateOwnerForTests } from "../testing/auth-status";
+import { __resetAuthStatusForTests } from "./useAuthStatus";
 import {
   type UseDefaultProviderPresetsResult,
   useDefaultProviderPresets,
@@ -26,11 +28,13 @@ function HookProbe(props: {
 }
 
 beforeEach(() => {
+  authenticateOwnerForTests();
   __resetRuntimeModeCacheForTests();
   fetchMock.mockReset();
 });
 
 afterEach(() => {
+  __resetAuthStatusForTests();
   __resetRuntimeModeCacheForTests();
 });
 

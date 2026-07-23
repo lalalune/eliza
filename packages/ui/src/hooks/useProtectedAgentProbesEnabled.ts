@@ -2,33 +2,27 @@
  * Gate for shell data loaders that hit protected (auth-required) agent API
  * routes on mount.
  *
- * The one origin where the shell must NOT probe those routes before a session
- * exists is the shared Eliza Cloud web app (`app.elizacloud.ai` and the other
- * control-plane hosts): its same-origin `/api/*` is the managed cloud endpoint,
- * so every protected GET fired during fresh onboarding 401s and Chromium logs
- * each as a console error — the first-run noise of #16242. The in-chat first-run
- * conductor owns Cloud sign-in there; once a session exists the probes resume.
- *
- * Everywhere else (localhost, desktop/mobile local agents, self-hosted remotes)
- * the same-origin agent needs no cloud auth, so probes fire immediately — no
- * auth round-trip is inserted into those hot paths. Consumers:
+ * Protected routes are session-gated on every origin. A self-hosted/remote
+ * agent can require an owner password just as a Cloud host can; inferring
+ * authorization from `localhost` or an arbitrary hostname makes fresh login
+ * screens issue a burst of 401s and can exhaust the invalid-auth limiter before
+ * the owner submits valid credentials. The app-level auth probe is shared, so
+ * this gate adds no extra round trip. Consumers:
  * `notifications-boot`, `useWeather`, `useRuntimeMode`, `useSlashCommandController`.
  */
 
-import { isElizaCloudControlPlaneAgentlessBase } from "../utils/cloud-agent-base";
 import { useIsAuthenticated } from "./useAuthStatus";
 
 /**
- * Pure decision behind {@link useProtectedAgentProbesEnabled}: probes are
- * allowed once authenticated, or on any origin that is not a bare Eliza Cloud
- * control-plane host (where the same-origin agent needs no cloud session).
+ * Pure decision behind {@link useProtectedAgentProbesEnabled}. `origin` stays
+ * in the signature for module-store callers and compatibility, but no origin
+ * is itself proof of authorization.
  */
 export function protectedAgentProbesEnabled(
   authenticated: boolean,
-  origin: string | null | undefined,
+  _origin: string | null | undefined,
 ): boolean {
-  if (authenticated) return true;
-  return !isElizaCloudControlPlaneAgentlessBase(origin ?? "");
+  return authenticated;
 }
 
 export function useProtectedAgentProbesEnabled(): boolean {

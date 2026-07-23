@@ -28,6 +28,9 @@ vi.mock("../api", () => ({
 vi.mock("../api/app-shell-capabilities", () => ({
   supportsFullAppShellRoutes: () => true,
 }));
+vi.mock("../hooks/useProtectedAgentProbesEnabled", () => ({
+  useProtectedAgentProbesEnabled: () => true,
+}));
 
 import { AGENT_READY_EVENT } from "../events";
 import { useAppShellState } from "./useAppShellState";

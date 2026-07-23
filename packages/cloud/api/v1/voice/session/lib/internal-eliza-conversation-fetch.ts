@@ -197,6 +197,7 @@ async function dispatchInternalElizaConversationFetch(
     orgId: claims.organizationId,
     conversationId: claims.conversationId,
     userId: claims.userId,
+    source: "voice",
     body,
     origin: headers.get("origin"),
   });

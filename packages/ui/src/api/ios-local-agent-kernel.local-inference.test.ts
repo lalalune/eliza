@@ -3,6 +3,7 @@
  * In-process, no real device.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { findCatalogModel } from "../services/local-inference/catalog";
 
 type KernelModule = Pick<
   typeof import("./ios-local-agent-kernel"),
@@ -52,15 +53,11 @@ type MockOptions = {
 const BUNDLE_INDEX_KEY = "eliza:ios-local-agent:eliza-1-bundles:v1";
 
 function eliza1MobileManifest(modelId = "eliza-1-2b"): Record<string, unknown> {
-  // Must match the catalog's ggufFile for the tier — the kernel's manifest
-  // validation requires files.text to contain model.ggufFile exactly. The 4B
-  // bundle ships the 128k GGUF (run at a 64k context on mobile via load args).
-  const textPath =
-    modelId === "eliza-1-4b"
-      ? "text/eliza-1-4b-128k.gguf"
-      : "text/eliza-1-2b-128k.gguf";
-  const drafterPath =
-    modelId === "eliza-1-4b" ? "mtp/drafter-4b.gguf" : "mtp/drafter-2b.gguf";
+  const model = findCatalogModel(modelId);
+  if (!model)
+    throw new Error(`Missing local-inference catalog model ${modelId}`);
+  const textPath = model.ggufFile;
+  const drafterPath = model.runtime?.mtp?.drafterFile;
 
   return {
     id: modelId,
@@ -87,13 +84,15 @@ function eliza1MobileManifest(modelId = "eliza-1-2b"): Record<string, unknown> {
         },
       ],
       vision: [],
-      mtp: [
-        {
-          path: drafterPath,
-          sha256: "0".repeat(64),
-          ctx: 32768,
-        },
-      ],
+      mtp: drafterPath
+        ? [
+            {
+              path: drafterPath,
+              sha256: "0".repeat(64),
+              ctx: 32768,
+            },
+          ]
+        : [],
       cache: [
         {
           path: `cache/${modelId}.kvcache`,
@@ -258,13 +257,13 @@ async function loadKernel(options: MockOptions = {}): Promise<KernelModule> {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request) => {
-      // The kernel builds a tier-agnostic manifest URL (eliza-1.manifest.json),
-      // so the only signal is an explicit 2B id in the URL. Everything else —
-      // including the recommended-default download — resolves to the 4B
-      // manifest, matching the shipped mobile default.
+      // Product ids stay stable while bundle directory slugs may follow the
+      // underlying architecture, so recognize both forms at this test boundary.
       const url = String(input);
       const modelId =
-        url.includes("eliza-1-2b") || url.includes("/2b/")
+        url.includes("eliza-1-2b") ||
+        url.includes("/2b/") ||
+        url.includes("/e2b/")
           ? "eliza-1-2b"
           : "eliza-1-4b";
       return Response.json(eliza1MobileManifest(modelId), {
@@ -364,13 +363,17 @@ describe("iOS local-agent local inference flow", () => {
 
     await eventually(() => {
       const filenames = downloadModel.mock.calls.map((call) => call[1]);
+      const textFilename = findCatalogModel("eliza-1-4b")
+        ?.ggufFile.split("/")
+        .pop();
+      expect(textFilename).toBeTruthy();
       expect(filenames).toContain("eliza-1-4b.manifest.json");
-      expect(filenames).toContain("eliza-1-4b-128k.gguf");
+      expect(filenames).toContain(textFilename);
       expect(mockState.hashFile).toHaveBeenCalledWith(
         "/models/eliza-1-4b.manifest.json",
       );
       expect(mockState.hashFile).toHaveBeenCalledWith(
-        "/models/eliza-1-4b-128k.gguf",
+        `/models/${textFilename}`,
       );
     });
   }, 30_000);

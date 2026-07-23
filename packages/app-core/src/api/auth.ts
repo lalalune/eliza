@@ -1,8 +1,9 @@
 /**
- * API authentication helpers extracted from server.ts.
+ * Central API authentication and boundary-role resolution for app-core routes.
  *
- * Centralises token extraction from multiple header formats and
- * timing-safe comparison so route handlers don't reimplement it.
+ * Session cookies, bearer credentials, local-owner trust, CSRF enforcement, and
+ * invalid-credential throttling converge here so every route fails closed with
+ * the same principal and role semantics.
  */
 
 import type http from "node:http";
@@ -159,16 +160,17 @@ export function ensureCompatApiAuthorized(
     return false;
   }
 
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    sendJsonError(res, 429, "Too many authentication attempts");
-    return false;
-  }
-
   const providedToken = getProvidedApiToken(req);
   if (providedToken && tokenMatches(expectedToken, providedToken)) return true;
 
-  recordFailedAuth(ip);
+  if (providedToken) {
+    const ip = req.socket.remoteAddress ?? null;
+    if (isAuthRateLimited(ip)) {
+      sendJsonError(res, 429, "Too many authentication attempts");
+      return false;
+    }
+    recordFailedAuth(ip);
+  }
   sendJsonError(res, 401, "Unauthorized");
   return false;
 }
@@ -293,11 +295,6 @@ export type AuthSessionOrBootstrapResult =
 export function ensureAuthSessionOrBootstrap(
   req: Pick<http.IncomingMessage, "headers" | "socket">,
 ): AuthSessionOrBootstrapResult {
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    return { kind: "denied", status: 429, reason: "rate_limited" };
-  }
-
   const cookie = readCookie(req, SESSION_COOKIE_NAME);
   if (cookie) {
     // Caller is expected to look up the session by id and confirm it is
@@ -311,7 +308,6 @@ export function ensureAuthSessionOrBootstrap(
     return { kind: "bootstrap", token: bearer, bearer };
   }
 
-  recordFailedAuth(ip);
   return { kind: "denied", status: 401, reason: "auth_required" };
 }
 
@@ -435,15 +431,6 @@ export async function resolveAuthorizedRouteRole(
   req: Pick<http.IncomingMessage, "headers" | "socket" | "method">,
   options: AuthorizedRouteRoleOptions,
 ): Promise<RouteRoleResolution> {
-  const ip = req.socket.remoteAddress ?? null;
-  if (isAuthRateLimited(ip)) {
-    return {
-      ok: false,
-      status: 429,
-      reason: "Too many authentication attempts",
-    };
-  }
-
   if (isTrustedLocalRequest(req)) return { ok: true, role: "OWNER" };
 
   const state = "state" in options ? options.state : undefined;
@@ -458,7 +445,6 @@ export async function resolveAuthorizedRouteRole(
   if (!store) {
     const expectedToken = getCompatApiToken();
     if (!expectedToken) {
-      recordFailedAuth(ip);
       return { ok: false, status: 401, reason: "Unauthorized" };
     }
 
@@ -467,7 +453,17 @@ export async function resolveAuthorizedRouteRole(
       return { ok: true, role: "OWNER" };
     }
 
-    recordFailedAuth(ip);
+    if (providedToken) {
+      const ip = req.socket.remoteAddress ?? null;
+      if (isAuthRateLimited(ip)) {
+        return {
+          ok: false,
+          status: 429,
+          reason: "Too many authentication attempts",
+        };
+      }
+      recordFailedAuth(ip);
+    }
     return { ok: false, status: 401, reason: "Unauthorized" };
   }
 
@@ -541,7 +537,17 @@ export async function resolveAuthorizedRouteRole(
     }
   }
 
-  recordFailedAuth(ip);
+  if (provided) {
+    const ip = req.socket.remoteAddress ?? null;
+    if (isAuthRateLimited(ip)) {
+      return {
+        ok: false,
+        status: 429,
+        reason: "Too many authentication attempts",
+      };
+    }
+    recordFailedAuth(ip);
+  }
   return { ok: false, status: 401, reason: "Unauthorized" };
 }
 

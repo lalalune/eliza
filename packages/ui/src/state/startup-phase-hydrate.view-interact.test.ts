@@ -10,7 +10,9 @@ import {
   NAVIGATE_VIEW_EVENT,
   SHELL_NAVIGATE_VIEW_WS_EVENT,
 } from "@elizaos/shared/events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { __resetAuthStatusForTests } from "../hooks/useAuthStatus";
+import { authenticateOwnerForTests } from "../testing/auth-status";
 import { bindReadyPhase, type ReadyPhaseDeps } from "./startup-phase-hydrate";
 
 const clientMock = vi.hoisted(() => {
@@ -67,6 +69,14 @@ function makeDeps(): ReadyPhaseDeps {
     elizaCloudLoginPollTimer: { current: null },
   };
 }
+
+beforeEach(() => {
+  authenticateOwnerForTests();
+});
+
+afterEach(() => {
+  __resetAuthStatusForTests();
+});
 
 describe("bindReadyPhase pty hydration readiness gate", () => {
   it("only polls coding-agent status once the agent is running", () => {

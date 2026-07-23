@@ -176,7 +176,6 @@ describe("useAgentSessionRecovery", () => {
     await waitFor(() => {
       expect(statuses[statuses.length - 1]).toBe("cloud-sign-in-required");
     });
-    expect(mockEnsureCloudSession).toHaveBeenCalledTimes(1);
     expect(mockRunRecovery).not.toHaveBeenCalled();
   });
 

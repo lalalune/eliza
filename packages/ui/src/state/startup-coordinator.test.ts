@@ -170,6 +170,12 @@ describe("startup coordinator", () => {
     ).toEqual({ phase: "restoring-session" });
   });
 
+  it("rehydrates after a login completes from the ready password wall", () => {
+    expect(startupReducer({ phase: "ready" }, { type: "RETRY" })).toEqual({
+      phase: "restoring-session",
+    });
+  });
+
   it("keeps the healthy polling path unchanged: retries increment attempts, then BACKEND_REACHED advances", () => {
     const retried = startupReducer(
       { phase: "polling-backend", target: "embedded-local", attempts: 0 },

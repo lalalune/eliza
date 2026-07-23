@@ -3963,6 +3963,18 @@ ElizaClient.prototype.stopAppBlock = async function (this: ElizaClient) {
 ElizaClient.prototype.getCodingAgentStatus = async function (
   this: ElizaClient,
 ) {
+  // Coding-agent routes are contributed by the optional orchestrator plugin.
+  // Ask the core self-status route which plugins are actually active before
+  // touching those endpoints; probing three absent routes on every ordinary
+  // chat launch produced avoidable 404s in an otherwise healthy session.
+  const selfStatus = await this.getAgentSelfStatus();
+  const orchestratorLoaded = selfStatus.plugins.active.some(
+    (name) =>
+      name === "@elizaos/plugin-agent-orchestrator" ||
+      name === "agent-orchestrator",
+  );
+  if (!orchestratorLoaded) return null;
+
   const [acpResult, orchestratorStatusResult, taskThreadsResult] =
     await Promise.allSettled([
       this.fetch<RawAcpSession[]>("/api/coding-agents"),

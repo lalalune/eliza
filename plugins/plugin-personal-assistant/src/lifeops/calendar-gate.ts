@@ -13,7 +13,7 @@ import type { IAgentRuntime } from "@elizaos/core";
 import {
   type CalendarHostGate,
   CalendarService,
-} from "@elizaos/plugin-calendar";
+} from "@elizaos/plugin-calendar/service/index";
 import type {
   LifeOpsAuditEvent,
   LifeOpsConnectorMode,

@@ -1,4 +1,7 @@
-// Exercises cloud API tests shared agent messages route.test behavior with deterministic Worker route fixtures.
+/**
+ * Exercises the shared-agent message route boundary with deterministic Worker
+ * fixtures, including caller identity, retry identity, and billing deferral.
+ */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { InsufficientCreditsError } from "@/lib/api/errors";
@@ -50,6 +53,7 @@ afterAll(() => {
 
 const AGENT = "de42b5ff-72d3-4a1a-8a16-19aee293bfea";
 const ORG = "org-1";
+const USER = "user-1";
 const APP_ORIGIN = "https://localhost";
 
 function postMessage(body: unknown, origin?: string) {
@@ -103,6 +107,7 @@ describe("shared agent messages route", () => {
       agentId: AGENT,
       orgId: ORG,
       agentName: "Eliza",
+      callerUserId: USER,
     });
   });
 
@@ -112,22 +117,26 @@ describe("shared agent messages route", () => {
       agentName: "Eliza",
     });
 
-    const res = await postMessage({ text: "say hi" });
+    const res = await postMessage({
+      text: "say hi",
+      clientMessageId: "client-message-1",
+    });
 
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       text: "hello",
       agentName: "Eliza",
     });
-    // 6th arg: the Workers executionCtx that defers the billing tail — the
-    // Hono test harness has none, so the route degrades to undefined (inline
-    // settlement).
+    // The caller and client ids are part of the exact-once turn contract. The
+    // Hono test harness has no execution context, so settlement stays inline.
     expect(sharedRestMessageSend).toHaveBeenCalledWith(
       AGENT,
       ORG,
       AGENT,
       "say hi",
       "Eliza",
+      USER,
+      "client-message-1",
       undefined,
     );
   });

@@ -26,10 +26,18 @@ import {
 	resolveLocalInferenceLoadArgs,
 	resolveMmprojPath,
 } from "../src/services/active-model";
-import { findCatalogModel } from "../src/services/catalog";
+import {
+	type Eliza1TierId,
+	findCatalogModel,
+	tierBundleSlug,
+} from "../src/services/catalog";
 import type { InstalledModel } from "../src/services/types";
 
 const tmpRoots: string[] = [];
+
+function bundleSlugForTier(tier: string): string {
+	return tierBundleSlug(`eliza-1-${tier}` as Eliza1TierId);
+}
 
 function makeTempBundle(args: {
 	hasMmproj: boolean;
@@ -38,20 +46,21 @@ function makeTempBundle(args: {
 }): { bundleRoot: string; textPath: string } {
 	const root = mkdtempSync(pathJoin(tmpdir(), "eliza-ws2-mmproj-"));
 	tmpRoots.push(root);
+	const slug = bundleSlugForTier(args.tier);
 	mkdirSync(pathJoin(root, "text"), { recursive: true });
-	const textPath = pathJoin(root, "text", `eliza-1-${args.tier}-32k.gguf`);
+	const textPath = pathJoin(root, "text", `eliza-1-${slug}-32k.gguf`);
 	writeFileSync(textPath, "fake-text-gguf");
 	if (args.hasMmproj) {
 		mkdirSync(pathJoin(root, "vision"), { recursive: true });
 		writeFileSync(
-			pathJoin(root, "vision", `mmproj-${args.tier}.gguf`),
+			pathJoin(root, "vision", `mmproj-${slug}.gguf`),
 			"fake-mmproj-gguf",
 		);
 	}
 	if (args.hasMtp !== false) {
 		mkdirSync(pathJoin(root, "mtp"), { recursive: true });
 		writeFileSync(
-			pathJoin(root, "mtp", `drafter-${args.tier}.gguf`),
+			pathJoin(root, "mtp", `drafter-${slug}.gguf`),
 			"fake-mtp-drafter-gguf",
 		);
 	}
@@ -102,7 +111,11 @@ describe("WS2 mmproj routing", () => {
 		const resolved = await resolveLocalInferenceLoadArgs(installed);
 		expect(resolved.modelPath).toBe(bundle.textPath);
 		expect(resolved.mmprojPath).toBe(
-			pathJoin(bundle.bundleRoot, "vision", `mmproj-${tier}.gguf`),
+			pathJoin(
+				bundle.bundleRoot,
+				"vision",
+				`mmproj-${bundleSlugForTier(tier)}.gguf`,
+			),
 		);
 	});
 
@@ -159,7 +172,11 @@ describe("WS2 mmproj routing", () => {
 			const resolved = await resolveLocalInferenceLoadArgs(installed);
 			expect(resolved.modelPath).toBe(bundle.textPath);
 			expect(resolved.draftModelPath).toBe(
-				pathJoin(bundle.bundleRoot, "mtp", `drafter-${tier}.gguf`),
+				pathJoin(
+					bundle.bundleRoot,
+					"mtp",
+					`drafter-${bundleSlugForTier(tier)}.gguf`,
+				),
 			);
 			expect(resolved.draftMin).toBe(catalog?.runtime?.mtp?.draftMin);
 			expect(resolved.draftMax).toBe(catalog?.runtime?.mtp?.draftMax);
@@ -242,7 +259,11 @@ describe("WS2 mmproj routing", () => {
 		const catalog = findCatalogModel(installed.id);
 		const path = resolveMmprojPath(installed, catalog);
 		expect(path).toBe(
-			pathJoin(bundle.bundleRoot, "vision", `mmproj-${tier}.gguf`),
+			pathJoin(
+				bundle.bundleRoot,
+				"vision",
+				`mmproj-${bundleSlugForTier(tier)}.gguf`,
+			),
 		);
 	});
 
@@ -259,7 +280,11 @@ describe("WS2 mmproj routing", () => {
 		});
 		const resolved = await resolveLocalInferenceLoadArgs(installed);
 		expect(resolved.mmprojPath).toBe(
-			pathJoin(bundle.bundleRoot, "vision", `mmproj-${tier}.gguf`),
+			pathJoin(
+				bundle.bundleRoot,
+				"vision",
+				`mmproj-${bundleSlugForTier(tier)}.gguf`,
+			),
 		);
 	});
 });

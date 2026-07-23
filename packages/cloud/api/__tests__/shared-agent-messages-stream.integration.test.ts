@@ -72,7 +72,7 @@ afterAll(() => {
 });
 
 const AGENT = "de42b5ff-72d3-4a1a-8a16-19aee293bfea";
-const CONVERSATION = "11111111-2222-4333-8444-555555555555";
+const CONVERSATION = AGENT;
 const ORG = "org-e9";
 const APP_ORIGIN = "https://localhost";
 const MOUNT =

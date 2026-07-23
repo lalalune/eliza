@@ -56,6 +56,7 @@ import {
   __resetAuthStatusForTests,
   __setAuthStatusForTests,
 } from "../../hooks/useAuthStatus";
+import { authenticateOwnerForTests } from "../../testing/auth-status";
 import {
   __getStateForTests,
   __ingestEphemeralNotificationForTests,
@@ -97,6 +98,7 @@ async function flushDelivery(): Promise<void> {
 
 describe("notification-store", () => {
   beforeEach(() => {
+    authenticateOwnerForTests();
     __resetNotificationStoreForTests();
     listNotifications.mockReset().mockResolvedValue({
       notifications: [],
@@ -126,6 +128,7 @@ describe("notification-store", () => {
   });
 
   afterEach(() => {
+    __resetAuthStatusForTests();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -783,9 +786,23 @@ describe("notification-store — protected hydrate gate (#16242)", () => {
     await vi.waitFor(() => expect(listNotifications).toHaveBeenCalledTimes(1));
   });
 
-  it("hydrates on mount on a non-Cloud origin regardless of auth (unchanged)", async () => {
+  it("holds protected hydration on localhost until the owner session exists", async () => {
     setOrigin("http://localhost:2138/");
     initNotifications();
+    await Promise.resolve();
+    expect(listNotifications).not.toHaveBeenCalled();
+
+    __setAuthStatusForTests({
+      phase: "authenticated",
+      identity: { id: "u-1", displayName: "Owner", kind: "owner" },
+      session: { id: "s-1", kind: "browser", expiresAt: null },
+      access: {
+        mode: "session",
+        passwordConfigured: true,
+        ownerConfigured: true,
+        role: "OWNER",
+      },
+    });
     await vi.waitFor(() => expect(listNotifications).toHaveBeenCalledTimes(1));
   });
 });

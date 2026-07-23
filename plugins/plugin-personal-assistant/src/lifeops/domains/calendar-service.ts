@@ -15,7 +15,7 @@
  */
 
 import type { IAgentRuntime } from "@elizaos/core";
-import { CalendarService } from "@elizaos/plugin-calendar";
+import { CalendarService } from "@elizaos/plugin-calendar/service/index";
 import type {
   CreateLifeOpsCalendarEventAttendee,
   CreateLifeOpsCalendarEventRequest,

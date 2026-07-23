@@ -40,6 +40,7 @@ export {
   RelationshipStore,
   resolveKnowledgeGraphService,
 } from "../../../../packages/agent/src/services/knowledge-graph/index.ts";
+export { pendantSessionSchema } from "../../../../packages/agent/src/services/pendant-session/index.ts";
 // Cache-backed runtime stores promoted from LifeOps (Slice 3). Like the
 // knowledge graph above, they are self-contained (only @elizaos/core) and the
 // personal-assistant store shims import them from `@elizaos/agent`, so re-export

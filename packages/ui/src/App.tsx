@@ -113,7 +113,6 @@ import { useRole } from "./hooks/useRole";
 import { useSecretsManagerModalState } from "./hooks/useSecretsManagerModal";
 import { useSecretsManagerShortcut } from "./hooks/useSecretsManagerShortcut";
 import { cn } from "./lib/utils";
-import { resolveUnauthenticatedAuthSurface } from "./state/unauthenticated-auth-surface";
 import {
   APPS_ENABLED,
   getAppSlugFromPath,
@@ -145,6 +144,7 @@ import {
   firstRunOwnsLoginSurface,
   topLevelAuthGateOwnsSurface,
 } from "./state/top-level-auth-gate";
+import { resolveUnauthenticatedAuthSurface } from "./state/unauthenticated-auth-surface";
 import {
   isBootstrapGateRequired,
   isLoopbackGatewayHost,
@@ -1633,7 +1633,6 @@ function ViewRouter({
   // for a fixed path, tabFromPath's answer only changes when a registration
   // lands.
   const shellPageRegistryVersion = useAppShellPageRegistryVersion();
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the registry version is an event counter whose change intentionally retriggers path resolution
   useEffect(() => {
     // The version is the re-run trigger (same pattern as useResolvedDynamicPage).
     void shellPageRegistryVersion;
@@ -2842,11 +2841,13 @@ function AppContent() {
               // optimistic first-run state before remounting the shell.
               setState("authRequired", false);
               setState("firstRunComplete", true);
-              // Login can surface from either pairing-required or
-              // first-run-required. RETRY is the shared transition back into
-              // authenticated session restoration.
-              startupCoordinator.dispatch({ type: "RETRY" });
-              refetchAuth();
+              // Publish the new session before re-entering hydration. This
+              // prevents protected conversation/plugin loads from racing the
+              // auth probe, and guarantees the ready-state password wall also
+              // traverses the normal restore pipeline.
+              void refetchAuth().then(() => {
+                startupCoordinator.dispatch({ type: "RETRY" });
+              });
             }}
             reason={authState.reason}
           />

@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import {
   type EntityStore,
   knowledgeGraphSchema,
+  pendantSessionSchema,
   type RelationshipStore,
   resolveKnowledgeGraphService,
 } from "@elizaos/agent";
@@ -2533,7 +2534,13 @@ export class LifeOpsRepository {
         // bootstrapSchema still get the app_lifeops graph tables.
         {
           name: "eliza",
-          schema: knowledgeGraphSchema,
+          // The runtime registers both families under this one plugin name.
+          // Reconciliation must present the complete owned schema or the SQL
+          // migrator correctly interprets omitted pendant tables as drops.
+          schema: {
+            ...knowledgeGraphSchema,
+            ...pendantSessionSchema,
+          },
         },
       ],
       {

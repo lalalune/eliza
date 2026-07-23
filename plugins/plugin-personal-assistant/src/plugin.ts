@@ -30,10 +30,10 @@ import {
 } from "@elizaos/plugin-blocker/services/website-blocker/index";
 import { BrowserBridgeAdapter } from "@elizaos/plugin-browser";
 import {
-  calendarPlugin,
   handleMeetingJoinDispatch,
   MEETING_JOIN_CHANNEL_KEY,
-} from "@elizaos/plugin-calendar";
+} from "@elizaos/plugin-calendar/meetings/meeting-join-dispatch";
+import { calendarPlugin } from "@elizaos/plugin-calendar/plugin";
 import { CalendlyAdapter } from "@elizaos/plugin-calendly";
 import { financesPlugin } from "@elizaos/plugin-finances/plugin";
 import { goalsPlugin } from "@elizaos/plugin-goals/plugin";
@@ -50,6 +50,7 @@ import {
 import { inboxPlugin } from "@elizaos/plugin-inbox/plugin";
 import { remindersPlugin } from "@elizaos/plugin-reminders";
 import { remoteDesktopPlugin } from "@elizaos/plugin-remote-desktop";
+import { waitForScheduledTaskRunnerService } from "@elizaos/plugin-scheduling";
 import { XDmAdapter } from "@elizaos/plugin-x/lifeops-message-adapter";
 import type {
   IPermissionsRegistry,
@@ -1101,6 +1102,7 @@ const rawPersonalAssistantPlugin: Plugin = {
         prefix: "[lifeops]",
         label: "default-pack boot seed",
         ensure: async () => {
+          await waitForScheduledTaskRunnerService(runtime);
           const runner = getProductionScheduledTaskRunner(runtime, {
             agentId: runtime.agentId,
           });

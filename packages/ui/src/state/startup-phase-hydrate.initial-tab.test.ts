@@ -19,10 +19,28 @@ const clientMock = vi.hoisted(() => ({
   getConfig: vi.fn(async () => ({}) as Record<string, never>),
   getStreamSettings: vi.fn(async () => ({ settings: {} })),
 }));
+const authMock = vi.hoisted(() => ({
+  state: {
+    phase: "authenticated",
+    identity: { id: "owner", displayName: "Owner", kind: "owner" },
+    session: { id: "session", kind: "browser", expiresAt: null },
+    access: {
+      mode: "session",
+      passwordConfigured: true,
+      ownerConfigured: true,
+      role: "OWNER",
+    },
+  } as Record<string, unknown>,
+}));
 
 vi.mock("../api", () => ({ client: clientMock }));
 vi.mock("../components/apps/load-apps-catalog", () => ({
   prefetchAppsCatalog: vi.fn(async () => undefined),
+}));
+vi.mock("../hooks/useAuthStatus", () => ({
+  isAuthenticatedNow: () => authMock.state.phase === "authenticated",
+  resolveAuthStatusForStartup: vi.fn(async () => authMock.state),
+  subscribeAuthStatus: vi.fn(() => () => undefined),
 }));
 
 import { type HydratingDeps, runHydrating } from "./startup-phase-hydrate";
@@ -31,6 +49,7 @@ function makeDeps(): HydratingDeps {
   return {
     setStartupError: vi.fn(),
     setFirstRunLoading: vi.fn(),
+    firstRunComplete: false,
     hydrateInitialConversationState: vi.fn(async () => null),
     requestGreetingWhenRunningRef: { current: vi.fn(async () => undefined) },
     loadWorkbench: vi.fn(async () => {}),
@@ -63,6 +82,17 @@ function setPath(path: string): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  authMock.state = {
+    phase: "authenticated",
+    identity: { id: "owner", displayName: "Owner", kind: "owner" },
+    session: { id: "session", kind: "browser", expiresAt: null },
+    access: {
+      mode: "session",
+      passwordConfigured: true,
+      ownerConfigured: true,
+      role: "OWNER",
+    },
+  };
   window.localStorage.clear();
   setPath("/");
 });
@@ -98,5 +128,27 @@ describe("runHydrating initial tab routing", () => {
     await run(deps);
 
     expect(deps.setTab).not.toHaveBeenCalled();
+  });
+
+  it("makes a returning login screen paintable without touching protected loaders", async () => {
+    setPath("/settings");
+    authMock.state = {
+      phase: "unauthenticated",
+      reason: "remote_auth_required",
+    };
+    const deps = makeDeps();
+    deps.firstRunComplete = true;
+    const events = await run(deps);
+
+    expect(events).toEqual([{ type: "HYDRATION_COMPLETE" }]);
+    expect(deps.setFirstRunLoading).toHaveBeenCalledWith(false);
+    expect(deps.setTabRaw).toHaveBeenCalledWith("settings");
+    expect(clientMock.connectWs).not.toHaveBeenCalled();
+    expect(deps.hydrateInitialConversationState).not.toHaveBeenCalled();
+    expect(deps.loadWorkbench).not.toHaveBeenCalled();
+    expect(deps.loadPlugins).not.toHaveBeenCalled();
+    expect(deps.loadCharacter).not.toHaveBeenCalled();
+    expect(deps.loadWalletConfig).not.toHaveBeenCalled();
+    expect(deps.pollCloudCredits).not.toHaveBeenCalled();
   });
 });

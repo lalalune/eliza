@@ -10,8 +10,8 @@
  */
 
 import type { CustomActionDef } from "@elizaos/shared";
-import { renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SlashCommandCatalogItem } from "../api/client-types-commands";
 import {
   ApiError,
@@ -54,6 +54,8 @@ vi.mock("../state", () => ({
     }),
 }));
 
+import { __resetAuthStatusForTests } from "../hooks/useAuthStatus";
+import { authenticateOwnerForTests } from "../testing/auth-status";
 import { useSlashCommandController } from "./useSlashCommandController";
 
 function cmd(
@@ -123,11 +125,17 @@ function apiError(status: number, message: string): ApiError {
 }
 
 beforeEach(() => {
+  authenticateOwnerForTests();
   listCommands.mockReset();
   listCustomActions.mockReset();
   getModelsCatalog.mockReset();
   listCustomActions.mockResolvedValue([]);
   window.localStorage.clear();
+});
+
+afterEach(() => {
+  cleanup();
+  __resetAuthStatusForTests();
 });
 
 describe("useSlashCommandController — models choice source", () => {

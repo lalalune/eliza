@@ -1,5 +1,9 @@
 /**
- * Auth, CORS, pairing, terminal, and WebSocket auth helpers extracted from server.ts.
+ * Authentication and origin-policy primitives for the agent HTTP boundary.
+ *
+ * The API server composes these helpers across normal HTTP, pairing, terminal,
+ * SSE, and WebSocket transports so every entry point applies the same trust and
+ * token rules.
  */
 
 import crypto from "node:crypto";
@@ -737,13 +741,12 @@ export function rejectWebSocketUpgrade(
           ? "Not Found"
           : "Bad Request";
   const body = `${message}\n`;
-  socket.write(
+  socket.end(
     `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
       "Connection: close\r\n" +
       "Content-Type: text/plain; charset=utf-8\r\n" +
       `Content-Length: ${Buffer.byteLength(body)}\r\n` +
       "\r\n" +
       body,
-    () => socket.end(),
   );
 }

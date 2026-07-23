@@ -7,11 +7,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Plugin } from "@elizaos/core";
 import {
   AgentRuntime,
+  createBasicCapabilitiesPlugin,
   createCharacter,
   DEFAULT_CEREBRAS_TEXT_MODEL,
   logger,
 } from "@elizaos/core";
-import { configureLocalEmbeddingPlugin } from "../../../agent/src/runtime/eliza";
+import {
+  configureLocalEmbeddingPlugin,
+  deduplicatePluginActions,
+} from "../../../agent/src/runtime/eliza";
 import type { LiveProviderConfig, LiveProviderName } from "./live-provider";
 
 const helperDir = path.dirname(fileURLToPath(import.meta.url));
@@ -331,6 +335,19 @@ export async function createRealTestRuntime(
       advancedCapabilities: options?.advancedCapabilities ?? false,
       enableAutonomy: false,
     });
+    const callerPlugins = (options?.plugins ?? []).map((plugin) => ({
+      ...plugin,
+      ...(plugin.actions ? { actions: [...plugin.actions] } : {}),
+    }));
+    // Production assembles basic capabilities first and removes later duplicate
+    // actions before AgentRuntime registration. Mirror that composition here
+    // without mutating shared plugin singletons between tests.
+    deduplicatePluginActions([
+      createBasicCapabilitiesPlugin({
+        advancedCapabilities: options?.advancedCapabilities ?? false,
+      }),
+      ...callerPlugins,
+    ]);
 
     // Always register plugin-sql for PGLite database.
     await runtime.registerPlugin(await importPluginSql());
@@ -476,7 +493,7 @@ export async function createRealTestRuntime(
     }
 
     // Register any additional plugins
-    for (const plugin of options?.plugins ?? []) {
+    for (const plugin of callerPlugins) {
       await runtime.registerPlugin(plugin);
     }
 
@@ -498,11 +515,10 @@ export async function createRealTestRuntime(
     // production boots them. Failures are non-fatal: a service that fails to
     // start surfaces at the call site with its real error, and services that
     // are intentionally optional in a given test stay best-effort.
-    for (const plugin of options?.plugins ?? []) {
+    for (const plugin of callerPlugins) {
       for (const service of plugin.services ?? []) {
-        const serviceType = (
-          service as unknown as { serviceType?: string }
-        ).serviceType;
+        const serviceType = (service as unknown as { serviceType?: string })
+          .serviceType;
         if (!serviceType) continue;
         try {
           await runtime.getServiceLoadPromise(serviceType);

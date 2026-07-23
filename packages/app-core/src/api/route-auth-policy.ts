@@ -192,6 +192,7 @@ export const COMPAT_ROUTE_AUTH_POLICIES: readonly CompatRouteAuthPolicy[] = [
   sessionExact("agents.list", "GET", "/api/agents"),
   sessionExact("config.read", "GET", "/api/config"),
 
+  ownerExact("config.write", "PUT", "/api/config"),
   ownerPrefix("secrets", "/api/secrets/"),
   ownerExact("drop.status", "GET", "/api/drop/status"),
   ownerExact("agent.reset", "POST", "/api/agent/reset"),

@@ -67,7 +67,11 @@ import type {
   ImageAttachment,
 } from "../../api/client-types-chat";
 import { reportComposerActivity } from "../../chat/report-composer-activity";
-import { CHAT_PREFILL_EVENT, ELIZA_BACK_INTENT_EVENT } from "../../events";
+import {
+  CHAT_OPEN_EVENT,
+  CHAT_PREFILL_EVENT,
+  ELIZA_BACK_INTENT_EVENT,
+} from "../../events";
 import {
   GLASS_SHEET_BACKDROP_FILTER,
   GLASS_SHEET_FILL,
@@ -390,6 +394,35 @@ describe("ChatOverlay", () => {
     await waitFor(() => expect(document.activeElement).toBe(input));
     expect(input.selectionStart).toBe(0);
     expect(input.selectionEnd).toBe(input.value.length);
+  });
+
+  it("opens the conversation when the shared chat-open event is dispatched", () => {
+    render(<ChatOverlay controller={makeController()} />);
+    const sheet = screen.getByTestId("chat-sheet");
+    expect(sheet.getAttribute("data-detent")).toBe("collapsed");
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(CHAT_OPEN_EVENT));
+    });
+
+    expect(sheet.getAttribute("data-detent")).toBe("half");
+  });
+
+  it("reveals a system message below half without opening the keyboard", () => {
+    render(<ChatOverlay controller={makeController()} />);
+    const sheet = screen.getByTestId("chat-sheet");
+    const input = screen.getByPlaceholderText("Ask Eliza");
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(CHAT_OPEN_EVENT, {
+          detail: { presentation: "preview", focusComposer: false },
+        }),
+      );
+    });
+
+    expect(sheet.getAttribute("data-chat-state")).toBe("OPEN_UNDER_HALF");
+    expect(document.activeElement).not.toBe(input);
   });
 
   it("cancels pending prefill focus work on unmount", () => {

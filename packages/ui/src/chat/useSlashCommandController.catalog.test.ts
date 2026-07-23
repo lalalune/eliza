@@ -57,6 +57,7 @@ import {
   __resetAuthStatusForTests,
   __setAuthStatusForTests,
 } from "../hooks/useAuthStatus";
+import { authenticateOwnerForTests } from "../testing/auth-status";
 import { useSlashCommandController } from "./useSlashCommandController";
 
 function cmd(
@@ -89,6 +90,7 @@ function apiError(status: number, message: string): ApiError {
 }
 
 beforeEach(() => {
+  authenticateOwnerForTests();
   listCommands.mockReset();
   listCustomActions.mockReset();
   listCustomActions.mockResolvedValue([]);
@@ -101,7 +103,10 @@ beforeEach(() => {
 // Without this unmount that task flushes after jsdom is torn down and React
 // dereferences `window`, surfacing as an "unhandled" ReferenceError that fails
 // the shard even though every assertion passed.
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  __resetAuthStatusForTests();
+});
 
 describe("useSlashCommandController — catalog load (#11112)", () => {
   it("resolves commands whenever the catalog fetch resolves, hiding auth-gated commands under the fail-closed defaults (#12087 Item 20)", async () => {

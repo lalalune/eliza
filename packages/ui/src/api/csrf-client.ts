@@ -17,7 +17,7 @@ import { getBootConfig } from "../config/boot-config";
 import { hydrateAndroidLocalAgentTokenForUrl } from "../first-run/local-agent-token";
 import { resolveApiUrl } from "../utils/asset-url";
 import { androidNativeAgentTransportForUrl } from "./android-native-agent-transport";
-import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "./auth/sessions";
+import { CSRF_HEADER_NAME, readCsrfTokenFromCookie } from "./auth/sessions";
 import { desktopHttpTransportForUrl } from "./desktop-http-transport";
 import { desktopLocalAgentTransportForUrl } from "./desktop-local-agent-transport";
 import { iosInProcessAgentTransportForUrl } from "./ios-local-agent-transport";
@@ -25,21 +25,7 @@ import { nativeCloudHttpTransportForUrl } from "./native-cloud-http-transport";
 import { defaultFetchTimeoutMs } from "./request-timeout";
 import { type AgentRequestContext, fetchAgentTransport } from "./transport";
 
-/**
- * Reads the current CSRF token from `document.cookie`.
- * Returns null when the cookie is absent (no active session).
- */
-export function readCsrfTokenFromCookie(): string | null {
-  if (typeof document === "undefined") return null;
-  const prefix = `${CSRF_COOKIE_NAME}=`;
-  for (const part of document.cookie.split(";")) {
-    const trimmed = part.trim();
-    if (trimmed.startsWith(prefix)) {
-      return decodeURIComponent(trimmed.slice(prefix.length));
-    }
-  }
-  return null;
-}
+export { readCsrfTokenFromCookie };
 
 const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 

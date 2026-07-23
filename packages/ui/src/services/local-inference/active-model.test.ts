@@ -4,7 +4,7 @@
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { dirname, join as pathJoin } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   isForkOnlyKvCacheType,
@@ -40,16 +40,25 @@ function makeTempElizaBundle(
   tier: string,
   options: { hasMtp?: boolean } = {},
 ): { bundleRoot: string; textPath: string; drafterPath: string } {
+  const modelId = `eliza-1-${tier}`;
+  const catalog = findCatalogModel(modelId);
   const bundleRoot = mkdtempSync(pathJoin(tmpdir(), "eliza-ui-mtp-"));
   mkdirSync(pathJoin(bundleRoot, "text"), { recursive: true });
-  const textPath = pathJoin(bundleRoot, "text", `eliza-1-${tier}-32k.gguf`);
+  const textPath = pathJoin(
+    bundleRoot,
+    catalog?.ggufFile ?? `text/eliza-1-${tier}-32k.gguf`,
+  );
+  mkdirSync(dirname(textPath), { recursive: true });
   // Shape a separate-drafter MTP file. The resolver wires it only for tiers
   // whose drafter is hosted in the shared catalog (ELIZA_1_HOSTED_MTP_TIER_IDS)
   // and ignores stray on-disk drafters for every other tier.
-  const drafterPath = pathJoin(bundleRoot, "mtp", `drafter-${tier}.gguf`);
+  const drafterPath = pathJoin(
+    bundleRoot,
+    catalog?.runtime?.mtp?.drafterFile ?? `mtp/drafter-${tier}.gguf`,
+  );
   writeFileSync(textPath, "fake-text-gguf");
   if (options.hasMtp !== false) {
-    mkdirSync(pathJoin(bundleRoot, "mtp"), { recursive: true });
+    mkdirSync(dirname(drafterPath), { recursive: true });
     writeFileSync(drafterPath, "fake-mtp-drafter-gguf");
   }
   return { bundleRoot, textPath, drafterPath };

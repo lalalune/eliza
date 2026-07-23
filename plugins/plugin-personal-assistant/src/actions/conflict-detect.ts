@@ -25,10 +25,8 @@ import type {
   Memory,
 } from "@elizaos/core";
 import { logger } from "@elizaos/core";
-import {
-  CalendarService,
-  CalendarServiceError,
-} from "@elizaos/plugin-calendar";
+import { CalendarServiceError } from "@elizaos/plugin-calendar/internal/errors";
+import { CalendarService } from "@elizaos/plugin-calendar/service/index";
 import { hasLifeOpsAccess, INTERNAL_URL } from "../lifeops/access.js";
 
 const ACTION_NAME = "CONFLICT_DETECT";

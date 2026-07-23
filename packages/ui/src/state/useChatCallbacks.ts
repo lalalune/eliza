@@ -21,6 +21,7 @@ import {
   client,
   type ImageAttachment,
 } from "../api";
+import { dispatchChatOpen } from "../events";
 import type { Tab } from "../navigation";
 import { isTtsDebugEnabled } from "../utils/tts-debug";
 import type { ChatReplyTarget } from "./ChatComposerContext.hooks";
@@ -693,6 +694,29 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
               }),
             );
             greetingFiredRef.current = true;
+            if (greetingKind === "post_sign_in_activation") {
+              // The native shell keeps the conversation behind a collapsed
+              // pull-sheet. Reveal this one product event after React commits
+              // the new transcript so signing in cannot appear to do nothing.
+              // A replay returns no text, so cold relaunches do not force the
+              // sheet open again.
+              const revealActivation = () => {
+                if (activeConversationIdRef.current === convId) {
+                  dispatchChatOpen({
+                    presentation: "preview",
+                    focusComposer: false,
+                  });
+                }
+              };
+              if (
+                typeof window !== "undefined" &&
+                typeof window.requestAnimationFrame === "function"
+              ) {
+                window.requestAnimationFrame(revealActivation);
+              } else {
+                revealActivation();
+              }
+            }
           }
           return stillActive;
         }

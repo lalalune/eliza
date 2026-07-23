@@ -561,9 +561,9 @@ function mergeOverrides(
  *     unavailable for the session but the text load still succeeds.
  *
  * Path layout: the catalog's `sourceModel.components.vision.file` is the
- * Hugging Face-relative path, e.g. `bundles/2b/vision/mmproj-2b.gguf`.
- * Locally the bundleRoot already represents the per-tier "bundles/<tier>"
- * subtree, so we strip the leading `bundles/<tier>/` segment before
+ * Hugging Face-relative path, e.g. `bundles/e2b/vision/mmproj-e2b.gguf`.
+ * Locally the bundleRoot already represents the per-tier architecture subtree,
+ * so we strip the leading `bundles/<architecture>/` segment before
  * joining against the local bundleRoot. When that prefix isn't present
  * (e.g. a custom bundle layout), we fall through to the original path
  * unchanged. Manifest-validated bundles (`bundleRoot` set) are the only
@@ -579,7 +579,7 @@ export function resolveMmprojPath(
 	if (!visionComponent?.file) return undefined;
 	const bundleRoot = installed.bundleRoot;
 	if (!bundleRoot) return undefined;
-	const local = stripBundlePrefix(visionComponent.file, installed.id);
+	const local = stripBundlePrefix(visionComponent.file, catalog);
 	const candidate = pathJoin(bundleRoot, local);
 	if (!existsSync(candidate)) return undefined;
 	return candidate;
@@ -603,7 +603,7 @@ function resolveMtpDrafterPath(
 		catalog?.runtime?.mtp?.drafterFile ??
 		catalog?.sourceModel?.components?.mtp?.file;
 	if (!catalogFile) return undefined;
-	const local = stripBundlePrefix(catalogFile, installed.id);
+	const local = stripBundlePrefix(catalogFile, catalog);
 	const candidate = pathJoin(bundleRoot, local);
 	if (!existsSync(candidate)) return undefined;
 	return candidate;
@@ -620,7 +620,7 @@ function expectedMtpDrafterPath(
 		catalog?.sourceModel?.components?.mtp?.file;
 	const expected = manifestPath ?? catalogFile;
 	if (!expected) return undefined;
-	const local = stripBundlePrefix(expected, installed.id);
+	const local = stripBundlePrefix(expected, catalog);
 	return installed.bundleRoot ? pathJoin(installed.bundleRoot, local) : local;
 }
 
@@ -667,17 +667,19 @@ export class MissingMtpDrafterError extends Error {
 }
 
 /**
- * Strip the `bundles/<tier-slug>/` prefix the catalog uses for HF
- * paths so the remaining string is bundle-root-relative. When the
- * prefix isn't present, return the input unchanged.
+ * Strip the catalog's Hugging Face path prefix so the remaining string is
+ * bundle-root-relative. Product tier ids deliberately differ from architecture
+ * slugs (`eliza-1-2b` maps to `bundles/e2b`), so the catalog prefix is the
+ * authority; deriving a directory from the public id points at nonexistent
+ * local projector and drafter files.
  */
-function stripBundlePrefix(catalogFile: string, modelId: string): string {
-	const slug = modelId.startsWith("eliza-1-")
-		? modelId.slice("eliza-1-".length)
-		: modelId;
-	const prefix = `bundles/${slug}/`;
-	if (catalogFile.startsWith(prefix)) {
-		return catalogFile.slice(prefix.length);
+function stripBundlePrefix(
+	catalogFile: string,
+	catalog: CatalogModel | undefined,
+): string {
+	const prefix = catalog?.hfPathPrefix?.replace(/^\/+|\/+$/g, "");
+	if (prefix && catalogFile.startsWith(`${prefix}/`)) {
+		return catalogFile.slice(prefix.length + 1);
 	}
 	return catalogFile;
 }

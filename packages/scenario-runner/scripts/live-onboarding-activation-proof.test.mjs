@@ -155,18 +155,51 @@ describe("live onboarding proof provider isolation", () => {
       {
         CEREBRAS_API_KEY: "cerebras-secret",
         OPENAI_API_KEY: "openai-secret",
-        CEREBRAS_MODEL: "gpt-oss-live",
+        LIVE_ONBOARDING_CEREBRAS_MODEL: "gpt-oss-live",
       },
       "cerebras",
     );
     expect(childEnv).toMatchObject({
       CEREBRAS_API_KEY: "cerebras-secret",
+      CEREBRAS_MODEL: "gpt-oss-live",
       OPENAI_BASE_URL: "https://api.cerebras.ai/v1",
       OPENAI_SMALL_MODEL: "gpt-oss-live",
       OPENAI_LARGE_MODEL: "gpt-oss-live",
       ELIZA_PROVIDER: "cerebras",
     });
     expect(childEnv.OPENAI_API_KEY).toBe("");
+  });
+
+  it("defaults Cerebras to the non-reasoning model that completes tool calls", () => {
+    const childEnv = buildLiveScenarioEnv(
+      { CEREBRAS_API_KEY: "cerebras-secret" },
+      "cerebras",
+    );
+    expect(childEnv).toMatchObject({
+      CEREBRAS_API_KEY: "cerebras-secret",
+      CEREBRAS_MODEL: "gemma-4-31b",
+      OPENAI_BASE_URL: "https://api.cerebras.ai/v1",
+      OPENAI_SMALL_MODEL: "gemma-4-31b",
+      OPENAI_LARGE_MODEL: "gemma-4-31b",
+    });
+  });
+
+  it("removes inherited compatible-endpoint overrides for real OpenAI", () => {
+    const childEnv = buildLiveScenarioEnv(
+      {
+        OPENAI_API_KEY: "openai-secret",
+        OPENAI_BASE_URL: "https://api.cerebras.ai/v1",
+        OPENAI_SMALL_MODEL: "gpt-oss-120b",
+        OPENAI_LARGE_MODEL: "gpt-oss-120b",
+        ELIZA_PROVIDER: "cerebras",
+      },
+      "openai",
+    );
+    expect(childEnv.OPENAI_API_KEY).toBe("openai-secret");
+    expect(childEnv.OPENAI_BASE_URL).toBe("https://api.openai.com/v1");
+    expect(childEnv.OPENAI_SMALL_MODEL).toBe("gpt-5.4-mini");
+    expect(childEnv.OPENAI_LARGE_MODEL).toBe("gpt-5.4-mini");
+    expect(childEnv.ELIZA_PROVIDER).toBe("openai");
   });
 });
 

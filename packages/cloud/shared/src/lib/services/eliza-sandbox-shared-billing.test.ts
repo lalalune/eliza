@@ -500,41 +500,30 @@ describe("ElizaSandboxService shared runtime billing", () => {
       agentSandboxesRepository,
       "findRunningSandbox",
     ).mockResolvedValue(sandbox);
-    const acquireSpy = spyOn(
-      sharedRuntimeTurnClaimsRepository,
-      "acquire",
-    ).mockImplementation(async (input) => ({
-      status: "claimed",
-      claimToken: input.claimToken,
-      history: [],
-    }));
-    const abandonSpy = spyOn(
-      sharedRuntimeTurnClaimsRepository,
-      "abandon",
-    ).mockResolvedValue(true);
-    const activationSpy = spyOn(
-      agentActivationGreetingsRepository,
-      "find",
-    ).mockRejectedValue(new Error("activation database unavailable"));
+    const acquireSpy = spyOn(sharedRuntimeTurnClaimsRepository, "acquire").mockImplementation(
+      async (input) => ({
+        status: "claimed",
+        claimToken: input.claimToken,
+        history: [],
+      }),
+    );
+    const abandonSpy = spyOn(sharedRuntimeTurnClaimsRepository, "abandon").mockResolvedValue(true);
+    const activationSpy = spyOn(agentActivationGreetingsRepository, "find").mockRejectedValue(
+      new Error("activation database unavailable"),
+    );
 
     try {
-      const response = await runWithCloudBindings(
-        { CEREBRAS_API_KEY: "test-key" },
-        () =>
-          new ElizaSandboxService().bridge(
-            sandbox.id,
-            sandbox.organization_id,
-            {
-              jsonrpc: "2.0",
-              id: "activation-read-failure",
-              method: "message.send",
-              params: {
-                text: "my launch problem",
-                userId: sandbox.user_id,
-                clientMessageId: "stable-activation-read-failure",
-              },
-            },
-          ),
+      const response = await runWithCloudBindings({ CEREBRAS_API_KEY: "test-key" }, () =>
+        new ElizaSandboxService().bridge(sandbox.id, sandbox.organization_id, {
+          jsonrpc: "2.0",
+          id: "activation-read-failure",
+          method: "message.send",
+          params: {
+            text: "my launch problem",
+            userId: sandbox.user_id,
+            clientMessageId: "stable-activation-read-failure",
+          },
+        }),
       );
 
       expect(response.result).toBeUndefined();

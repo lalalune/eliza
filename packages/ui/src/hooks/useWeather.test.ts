@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { authenticateOwnerForTests } from "../testing/auth-status";
 import {
   __resetAuthStatusForTests,
   __setAuthStatusForTests,
@@ -87,8 +88,13 @@ function denyGeolocation(): void {
   });
 }
 
+beforeEach(() => {
+  authenticateOwnerForTests();
+});
+
 afterEach(() => {
   cleanup();
+  __resetAuthStatusForTests();
   vi.restoreAllMocks();
   if (originalFetch) {
     globalThis.fetch = originalFetch;

@@ -146,6 +146,15 @@ export const CHAT_PREFILL_EVENT = "eliza:chat:prefill" as const;
  * mounted {@link ChatOverlay} is the one listener.
  */
 export const CHAT_OPEN_EVENT = "eliza:chat:open" as const;
+export interface ChatOpenEventDetail {
+  /**
+   * A preview reveals a short system-initiated message without taking over half
+   * the launcher. Direct user navigation keeps the regular half detent.
+   */
+  presentation?: "half" | "preview";
+  /** Defaults to true for direct user navigation. */
+  focusComposer?: boolean;
+}
 /** Open the keyword message-search panel (fired by the chat search affordance). */
 export const CHAT_MESSAGE_SEARCH_EVENT = "eliza:chat:message-search" as const;
 /**
@@ -172,9 +181,9 @@ export function dispatchChatPrefill(detail: ChatPrefillEventDetail): void {
 }
 
 /** Dispatch a request to open (expand) the floating chat. See {@link CHAT_OPEN_EVENT}. */
-export function dispatchChatOpen(): void {
+export function dispatchChatOpen(detail: ChatOpenEventDetail = {}): void {
   if (typeof window === "undefined") return;
-  window.dispatchEvent(new CustomEvent(CHAT_OPEN_EVENT));
+  window.dispatchEvent(new CustomEvent(CHAT_OPEN_EVENT, { detail }));
 }
 
 /** Request the notification center to open (surface-agnostic — see

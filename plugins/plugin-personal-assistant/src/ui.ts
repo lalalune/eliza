@@ -5,6 +5,7 @@
 // hooks. Keep this facade thin so Vite never follows the server-side plugin
 // entrypoint into connector/native dependencies.
 import "./api/client-lifeops.js";
+import { useProtectedAgentProbesEnabled } from "@elizaos/ui/hooks";
 import React from "react";
 import { AppBlockerSettingsCard as AppBlockerSettingsCardImpl } from "./components/AppBlockerSettingsCard.js";
 import { WebsiteBlockerSettingsCard as WebsiteBlockerSettingsCardImpl } from "./components/WebsiteBlockerSettingsCard.js";
@@ -21,7 +22,7 @@ import type {
 } from "./types/website-blocker-settings-card.js";
 
 export function LifeOpsActivitySignalsEffect() {
-  useLifeOpsActivitySignals();
+  useLifeOpsActivitySignals(useProtectedAgentProbesEnabled());
   return null;
 }
 

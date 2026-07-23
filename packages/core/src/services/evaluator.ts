@@ -48,15 +48,37 @@ function stringifyForPrompt(value: unknown): string {
 	}
 }
 
-function coerceObjectOutput(raw: unknown): Record<string, unknown> | null {
-	if (isRecord(raw)) return raw;
-	if (typeof raw !== "string") return null;
+function parseObjectText(raw: string): Record<string, unknown> | null {
 	try {
 		const parsed = JSON.parse(raw);
 		return isRecord(parsed) ? parsed : null;
 	} catch {
 		return null;
 	}
+}
+
+function coerceObjectOutput(raw: unknown): Record<string, unknown> | null {
+	if (typeof raw === "string") return parseObjectText(raw);
+	if (!isRecord(raw)) return null;
+
+	// Native text providers return a result envelope whenever callers supply
+	// messages or a response schema. The evaluator's JSON lives in `text`; the
+	// sibling usage/tool fields describe the model call rather than evaluator
+	// sections. Unwrap before accepting arbitrary records so a valid live-model
+	// result cannot silently process zero evaluators.
+	if (typeof raw.text === "string") {
+		const parsedText = parseObjectText(raw.text);
+		if (parsedText) return parsedText;
+		const nativeEnvelopeKeys = [
+			"toolCalls",
+			"finishReason",
+			"usage",
+			"providerMetadata",
+		];
+		if (nativeEnvelopeKeys.some((key) => key in raw)) return null;
+	}
+
+	return raw;
 }
 
 function mergeStates(base: State | undefined, providerState: State): State {

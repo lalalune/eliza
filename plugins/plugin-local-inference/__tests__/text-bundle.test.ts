@@ -31,6 +31,7 @@ import {
 	ELIZA_1_HF_REPO,
 	ELIZA_1_TIER_IDS,
 	findCatalogModel,
+	tierBundleSlug,
 } from "../src/services/catalog.ts";
 
 /**
@@ -54,6 +55,7 @@ describe("per-tier text + embedding bundle resolution", () => {
 	for (const tierId of ELIZA_1_TIER_IDS) {
 		describe(tierId, () => {
 			const model = findCatalogModel(tierId);
+			const slug = tierBundleSlug(tierId);
 
 			it("resolves to a visible catalog entry", () => {
 				expect(model, `${tierId} missing from MODEL_CATALOG`).toBeTruthy();
@@ -78,7 +80,6 @@ describe("per-tier text + embedding bundle resolution", () => {
 				}
 				// Separate-drafter MTP is enabled only after the tier's hosted
 				// Gemma drafter GGUF is present under `mtp/drafter-<tier>.gguf`.
-				const slug = tierId.slice("eliza-1-".length);
 				expect(model?.sourceModel?.components.mtp?.repo).toBe(
 					ELIZA_1_HF_REPO,
 				);
@@ -102,7 +103,7 @@ describe("per-tier text + embedding bundle resolution", () => {
 					// One canonical embedding file per tier — the catalog uses
 					// a single filename for every tier that ships one.
 					expect(components?.embedding?.file).toBe(
-						`bundles/${tierId.slice("eliza-1-".length)}/embedding/eliza-1-embedding.gguf`,
+						`bundles/${slug}/embedding/eliza-1-embedding.gguf`,
 					);
 				}
 			});
@@ -113,7 +114,7 @@ describe("per-tier text + embedding bundle resolution", () => {
 				if (!model || !file) return;
 				const url = buildHuggingFaceResolveUrlForPath(model, file);
 				expect(url).toContain(`/${ELIZA_1_HF_REPO}/resolve/main/`);
-				expect(url).toContain(`bundles/${tierId.slice("eliza-1-".length)}/`);
+				expect(url).toContain(`bundles/${slug}/`);
 				expect(url).toMatch(/\.gguf\?download=true$/);
 			});
 

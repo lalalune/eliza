@@ -68,6 +68,7 @@ async function syncFirstRunConfigState(
     "linkedAccounts",
     "serviceRouting",
     "features",
+    "plugins",
     "connectors",
     "cloud",
   ]) {

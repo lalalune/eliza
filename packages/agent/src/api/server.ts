@@ -1730,7 +1730,12 @@ async function handleRequest(
   }
   const pathname = url.pathname;
   const isAuthEndpoint = pathname.startsWith("/api/auth/");
-  const isHealthEndpoint = method === "GET" && pathname === "/api/health";
+  // Readiness must be available before a browser session exists: the startup
+  // coordinator uses it to reach the login surface. Both responses contain
+  // operational state only; every data/config/action route remains protected.
+  const isPublicReadinessEndpoint =
+    method === "GET" &&
+    (pathname === "/api/health" || pathname === "/api/status");
   let isCloudProvisionedContainer = (): boolean => false;
   let handleCloudStatusRoutes = async (_args: unknown): Promise<boolean> =>
     false;
@@ -1946,7 +1951,7 @@ async function handleRequest(
     method !== "OPTIONS" &&
     isAuthProtectedPath &&
     !isAuthEndpoint &&
-    !isHealthEndpoint &&
+    !isPublicReadinessEndpoint &&
     !isCloudFirstRunStatusEndpoint &&
     !isAppCoreSessionCloudRead &&
     !isPublicRuntimePluginRoute({
@@ -4738,6 +4743,26 @@ export async function startApiServer(opts?: {
     });
   }
 
+  // A browser session is owned by app-core and intentionally opaque to the
+  // standalone agent auth helpers. Remember the host's decision across the
+  // upgrade callback so the connection handler does not demand a second,
+  // unrelated API-token authentication after the cookie was already accepted.
+  const hostAuthorizedWsRequests = new WeakSet<http.IncomingMessage>();
+
+  const isHostWebSocketRequestAuthorized = async (
+    request: http.IncomingMessage,
+  ): Promise<boolean> => {
+    const bridge = getAgentHostBridge();
+    const resolveAuthorization = bridge.resolveHttpRequestAuthorization;
+    if (typeof resolveAuthorization === "function") {
+      return (await resolveAuthorization(request, state.runtime)).ok;
+    }
+    const authorize = bridge.isHttpRequestAuthorized;
+    return typeof authorize === "function"
+      ? await authorize(request, state.runtime)
+      : false;
+  };
+
   // Handle upgrade requests for WebSocket
   server.on("upgrade", (request, socket, head) => {
     // The raw upgrade socket can emit 'error' (client RST mid-handshake) before
@@ -4754,37 +4779,46 @@ export async function startApiServer(opts?: {
         // destroyed after the failed upgrade; nothing more to do.
       }
     });
-    try {
-      const wsUrl = new URL(
-        request.url ?? "/",
-        `http://${request.headers.host ?? "localhost"}`,
-      );
-      if (wsUrl.pathname === "/api/local-inference/device-bridge") {
-        return;
-      }
-      const rejection = resolveWebSocketUpgradeRejection(request, wsUrl);
-      if (rejection) {
-        rejectWebSocketUpgrade(socket, rejection.status, rejection.reason);
-        return;
-      }
-      wss.handleUpgrade(request, socket, head, (ws: WebSocket) => {
-        // Attach an 'error' listener IMMEDIATELY — before emit('connection')
-        // runs the (long) connection handler that only attaches its own error
-        // listener near the end. A client that RSTs in that window otherwise
-        // emits an unhandled 'error' on the ws and crashes the process.
-        ws.on("error", (err: unknown) => {
-          logger.warn(
-            `[eliza-api] WebSocket error: ${err instanceof Error ? err.message : err}`,
-          );
+    void (async () => {
+      try {
+        const wsUrl = new URL(
+          request.url ?? "/",
+          `http://${request.headers.host ?? "localhost"}`,
+        );
+        if (wsUrl.pathname === "/api/local-inference/device-bridge") {
+          return;
+        }
+        const hostAuthorized = await isHostWebSocketRequestAuthorized(request);
+        const rejection = resolveWebSocketUpgradeRejection(request, wsUrl);
+        // Origin and path failures are never overridable. A 401 may be
+        // satisfied by the embedding host's cookie/session authority, exactly
+        // as the normal HTTP request gate is.
+        if (rejection && !(rejection.status === 401 && hostAuthorized)) {
+          rejectWebSocketUpgrade(socket, rejection.status, rejection.reason);
+          return;
+        }
+        if (hostAuthorized) {
+          hostAuthorizedWsRequests.add(request);
+        }
+        wss.handleUpgrade(request, socket, head, (ws: WebSocket) => {
+          // Attach an 'error' listener IMMEDIATELY — before emit('connection')
+          // runs the (long) connection handler that only attaches its own error
+          // listener near the end. A client that RSTs in that window otherwise
+          // emits an unhandled 'error' on the ws and crashes the process.
+          ws.on("error", (err: unknown) => {
+            logger.warn(
+              `[eliza-api] WebSocket error: ${err instanceof Error ? err.message : err}`,
+            );
+          });
+          wss.emit("connection", ws, request);
         });
-        wss.emit("connection", ws, request);
-      });
-    } catch (err) {
-      logger.error(
-        `[eliza-api] WebSocket upgrade error: ${err instanceof Error ? err.message : err}`,
-      );
-      rejectWebSocketUpgrade(socket, 404, "Not found");
-    }
+      } catch (err) {
+        logger.error(
+          `[eliza-api] WebSocket upgrade error: ${err instanceof Error ? err.message : err}`,
+        );
+        rejectWebSocketUpgrade(socket, 404, "Not found");
+      }
+    })();
   });
 
   // Handle WebSocket connections
@@ -4806,7 +4840,9 @@ export async function startApiServer(opts?: {
       wsUrl = new URL("ws://localhost/ws");
     }
 
-    let isAuthenticated = isWebSocketAuthorized(request, wsUrl);
+    let isAuthenticated =
+      hostAuthorizedWsRequests.delete(request) ||
+      isWebSocketAuthorized(request, wsUrl);
 
     // Optional reconnect cursor: a client that tracks the highest buffered
     // event sequence it has applied can pass it back as `?lastEventId=` so the

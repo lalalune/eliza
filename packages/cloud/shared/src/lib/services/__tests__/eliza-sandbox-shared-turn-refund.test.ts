@@ -115,7 +115,10 @@ describe("bridgeSharedMessageSend — refunds the hold on a post-reserve throw (
     turnImpl = () => ({
       degraded: false,
       reply: "hi there",
-      history: [],
+      history: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi there" },
+      ],
       model: "openai/gpt-oss-120b",
     });
     const svc = makeService();

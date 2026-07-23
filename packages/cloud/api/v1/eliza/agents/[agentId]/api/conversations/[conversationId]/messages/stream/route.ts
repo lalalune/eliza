@@ -225,7 +225,14 @@ app.post("/", async (c) => {
   }
 
   const conversationId = c.req.param("conversationId") ?? r.agentId;
-  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+  // Voice sessions mint a conversation-scoped credential and verify every
+  // identity field above, so their selected room is authoritative. Interactive
+  // REST callers use the one-room shared-runtime contract and must not be able
+  // to create hidden history under a forged room id.
+  if (
+    !("source" in r) &&
+    !isCanonicalSharedRestConversation(r.agentId, conversationId)
+  ) {
     return applyCorsHeaders(
       Response.json(
         {

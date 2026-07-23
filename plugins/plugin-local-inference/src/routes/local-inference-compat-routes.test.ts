@@ -404,6 +404,44 @@ describe("POST /api/local-inference/active", () => {
 	});
 });
 
+describe("host session authorization", () => {
+	beforeAll(async () => {
+		handleLocalInferenceCompatRoutes = (
+			await import("./local-inference-compat-routes")
+		).handleLocalInferenceCompatRoutes;
+	}, 120_000);
+
+	it("accepts an app-core-validated session for a regular hub read", async () => {
+		const previous = process.env.ELIZA_REQUIRE_LOCAL_AUTH;
+		process.env.ELIZA_REQUIRE_LOCAL_AUTH = "1";
+		try {
+			const { localInferenceService } = await import("../services/service");
+			vi.mocked(localInferenceService.snapshot).mockResolvedValue({
+				catalog: [],
+			} as never);
+			const res = fakeRes();
+			const handled = await handleLocalInferenceCompatRoutes(
+				fakeReq({
+					method: "GET",
+					pathname: "/api/local-inference/hub",
+				}),
+				res.res,
+				{ ...STATE, requestAuthorization: "session" },
+			);
+
+			expect(handled).toBe(true);
+			expect(res.status()).toBe(200);
+			expect(res.body()).toEqual({ catalog: [] });
+		} finally {
+			if (previous === undefined) {
+				delete process.env.ELIZA_REQUIRE_LOCAL_AUTH;
+			} else {
+				process.env.ELIZA_REQUIRE_LOCAL_AUTH = previous;
+			}
+		}
+	});
+});
+
 describe("GET /api/local-inference/device-tier", () => {
 	beforeAll(async () => {
 		handleLocalInferenceCompatRoutes = (

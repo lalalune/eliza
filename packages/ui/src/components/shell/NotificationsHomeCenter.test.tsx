@@ -40,6 +40,7 @@ vi.mock("../../state/notifications/navigate-deep-link", async (orig) => ({
 }));
 
 import type { AgentNotification } from "@elizaos/core";
+import { __resetAuthStatusForTests } from "../../hooks/useAuthStatus";
 import {
   __getStateForTests,
   __ingestNotificationForTests,
@@ -47,6 +48,7 @@ import {
   __setHydratedForTests,
   __setHydrationFailureForTests,
 } from "../../state/notifications/notification-store";
+import { authenticateOwnerForTests } from "../../testing/auth-status";
 import {
   dampenPull,
   groupDashboardNotifications,
@@ -117,12 +119,14 @@ function setOverflowingListGeometry(list: HTMLElement): void {
 }
 
 beforeEach(() => {
+  authenticateOwnerForTests();
   vi.useFakeTimers();
   seq = 0;
 });
 
 afterEach(() => {
   cleanup();
+  __resetAuthStatusForTests();
   vi.clearAllTimers();
   vi.useRealTimers();
   __resetNotificationStoreForTests();

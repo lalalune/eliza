@@ -869,9 +869,23 @@ const COMPAT_ROUTE_CHAIN: readonly CompatRouteChainEntry[] = [
         handleLocalInferenceCompatRoutes,
         handleLocalInferenceTtsRoute,
       } = await getLocalInferenceRoutes();
-      if (await handleLocalInferenceCompatRoutes(req, res, state)) return true;
-      if (await handleLocalInferenceAsrRoute(req, res, state)) return true;
-      if (await handleLocalInferenceTtsRoute(req, res, state)) return true;
+      // The ordered compat policy already validated this request's browser
+      // session. Carry that result into the lower plugin so it does not demand
+      // a second API-token credential that browser sessions intentionally do
+      // not possess. Sensitive plugin branches ignore this marker.
+      const authorizedState = {
+        ...state,
+        requestAuthorization: "session" as const,
+      };
+      if (await handleLocalInferenceCompatRoutes(req, res, authorizedState)) {
+        return true;
+      }
+      if (await handleLocalInferenceAsrRoute(req, res, authorizedState)) {
+        return true;
+      }
+      if (await handleLocalInferenceTtsRoute(req, res, authorizedState)) {
+        return true;
+      }
       // WebView -> agent PCM transport for live on-device speaker diarization.
       return handleLiveDiarizationRoute(req, res, state);
     },

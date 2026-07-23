@@ -37,6 +37,7 @@ import { onViewEvent } from "../views/view-event-bus";
 import { VIEW_EVENTS } from "../views/view-event-types";
 import { startPolling } from "./resource-cache";
 import { useCachedResource } from "./useCachedResource";
+import { useProtectedAgentProbesEnabled } from "./useProtectedAgentProbesEnabled";
 
 export interface ViewRegistryEntry {
   /** Stable unique identifier for the view, e.g. "wallet.inventory". */
@@ -564,6 +565,8 @@ export function withBuiltinShellViews(
 
 function useDefaultViewsNetworkEnabled(): boolean {
   const phase = useAppSelector((s) => s.startupCoordinator?.phase);
+  const protectedProbesEnabled = useProtectedAgentProbesEnabled();
+  if (!protectedProbesEnabled) return false;
   if (!supportsFullAppShellRoutes(client.getBaseUrl())) return false;
   if (typeof phase !== "string") return true;
   // first-run-required is now shell-paintable (onboarding runs in the live

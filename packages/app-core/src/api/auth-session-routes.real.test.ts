@@ -15,7 +15,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStore, type DrizzleDatabase } from "../services/auth-store";
 import { _resetSensitiveLimiters } from "./auth/sensitive-rate-limit";
 import { createMachineSession, SESSION_COOKIE_NAME } from "./auth/sessions";
-import { _resetAuthRateLimiter } from "./auth.ts";
+import {
+  _resetAuthRateLimiter,
+  ensureCompatApiAuthorizedAsync,
+} from "./auth.ts";
 import {
   _resetAuthSessionRoutesLimiter,
   handleAuthSessionRoutes,
@@ -380,6 +383,125 @@ describe("P1 session routes (real pglite)", () => {
     expect(body.session.kind).toBe("machine");
     expect(body.access.mode).toBe("session");
     expect(body.access.role).toBe("USER");
+  });
+
+  it("anonymous route probes cannot lock out a newly authenticated session", async () => {
+    const setupRes = fakeRes();
+    await handleAuthSessionRoutes(
+      fakeReq({
+        method: "POST",
+        pathname: "/api/auth/setup",
+        body: {
+          password: "probe-safe password 1234!",
+          displayName: "alice",
+        },
+      }),
+      setupRes.res,
+      harness.state,
+    );
+    expect(setupRes.status()).toBe(200);
+    const sessionId = extractSessionCookieValue(setupRes.cookies());
+    expect(sessionId).not.toBeNull();
+
+    const clientIp = "10.0.0.44";
+    for (let index = 0; index < 25; index += 1) {
+      const anonymousRes = fakeRes();
+      const authorized = await ensureCompatApiAuthorizedAsync(
+        fakeReq({
+          method: "GET",
+          pathname: `/api/protected/${index}`,
+          ip: clientIp,
+          headers: { host: "app.example.test" },
+        }),
+        anonymousRes.res,
+        { store: harness.store },
+      );
+      expect(authorized).toBe(false);
+      expect(anonymousRes.status()).toBe(401);
+    }
+
+    const authenticatedRes = fakeRes();
+    const authorized = await ensureCompatApiAuthorizedAsync(
+      fakeReq({
+        method: "GET",
+        pathname: "/api/protected",
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        ip: clientIp,
+        headers: { host: "app.example.test" },
+      }),
+      authenticatedRes.res,
+      { store: harness.store },
+    );
+    expect(authorized).toBe(true);
+    expect(authenticatedRes.status()).toBe(200);
+  });
+
+  it("invalid bearer throttling never blocks a valid session", async () => {
+    const setupRes = fakeRes();
+    await handleAuthSessionRoutes(
+      fakeReq({
+        method: "POST",
+        pathname: "/api/auth/setup",
+        body: {
+          password: "bearer-safe password 1234!",
+          displayName: "alice",
+        },
+      }),
+      setupRes.res,
+      harness.state,
+    );
+    const sessionId = extractSessionCookieValue(setupRes.cookies());
+    expect(sessionId).not.toBeNull();
+
+    const clientIp = "10.0.0.45";
+    for (let index = 0; index < 20; index += 1) {
+      const invalidRes = fakeRes();
+      const authorized = await ensureCompatApiAuthorizedAsync(
+        fakeReq({
+          method: "GET",
+          pathname: "/api/protected",
+          bearer: `invalid-bearer-${index}`,
+          ip: clientIp,
+          headers: { host: "app.example.test" },
+        }),
+        invalidRes.res,
+        { store: harness.store },
+      );
+      expect(authorized).toBe(false);
+      expect(invalidRes.status()).toBe(401);
+    }
+
+    const throttledRes = fakeRes();
+    expect(
+      await ensureCompatApiAuthorizedAsync(
+        fakeReq({
+          method: "GET",
+          pathname: "/api/protected",
+          bearer: "invalid-bearer-throttled",
+          ip: clientIp,
+          headers: { host: "app.example.test" },
+        }),
+        throttledRes.res,
+        { store: harness.store },
+      ),
+    ).toBe(false);
+    expect(throttledRes.status()).toBe(429);
+
+    const authenticatedRes = fakeRes();
+    expect(
+      await ensureCompatApiAuthorizedAsync(
+        fakeReq({
+          method: "GET",
+          pathname: "/api/protected",
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          ip: clientIp,
+          headers: { host: "app.example.test" },
+        }),
+        authenticatedRes.res,
+        { store: harness.store },
+      ),
+    ).toBe(true);
+    expect(authenticatedRes.status()).toBe(200);
   });
 
   it("setup is one-shot — second call returns 409", async () => {

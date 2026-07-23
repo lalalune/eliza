@@ -52,6 +52,11 @@ describe("ElizaClient.getCodingAgentStatus", () => {
   it("includes durable task threads even when the legacy ACP endpoint fails", async () => {
     const client = new ElizaClient("http://agent.example:31337", "token");
     client.fetch = vi.fn(async (path: string) => {
+      if (path === "/api/agent/self-status") {
+        return {
+          plugins: { active: ["@elizaos/plugin-agent-orchestrator"] },
+        };
+      }
       if (path === "/api/coding-agents") throw new Error("ACP unavailable");
       if (path === "/api/orchestrator/status") {
         return {
@@ -86,6 +91,11 @@ describe("ElizaClient.getCodingAgentStatus", () => {
   it("limits the durable task-thread preview used by status polling", async () => {
     const client = new ElizaClient("http://agent.example:31337", "token");
     const fetch = vi.fn(async (path: string) => {
+      if (path === "/api/agent/self-status") {
+        return {
+          plugins: { active: ["@elizaos/plugin-agent-orchestrator"] },
+        };
+      }
       if (path === "/api/coding-agents") return [];
       if (path === "/api/orchestrator/status") return { taskCount: 0 };
       if (path === "/api/orchestrator/tasks?limit=20") return { tasks: [] };
@@ -96,5 +106,22 @@ describe("ElizaClient.getCodingAgentStatus", () => {
     await client.getCodingAgentStatus();
 
     expect(fetch).toHaveBeenCalledWith("/api/orchestrator/tasks?limit=20");
+  });
+
+  it("does not probe coding routes when the orchestrator plugin is absent", async () => {
+    const client = new ElizaClient("http://agent.example:31337", "token");
+    const fetch = vi.fn(async (path: string) => {
+      if (path === "/api/agent/self-status") {
+        return {
+          plugins: { active: ["eliza", "@elizaos/plugin-scheduling"] },
+        };
+      }
+      throw new Error(`unexpected path: ${path}`);
+    });
+    client.fetch = fetch as typeof client.fetch;
+
+    await expect(client.getCodingAgentStatus()).resolves.toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("/api/agent/self-status");
   });
 });

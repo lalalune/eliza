@@ -300,6 +300,11 @@ export function startupReducer(
 
     case "ready":
       switch (event.type) {
+        case "RETRY":
+          // A password login can complete after the unauthenticated boot already
+          // reached ready. Re-enter the normal restore pipeline so protected
+          // conversation/data hydration runs under the newly minted session.
+          return { phase: "restoring-session" };
         case "SWITCH_AGENT":
           // Switch to a different agent profile — re-enter polling
           return {

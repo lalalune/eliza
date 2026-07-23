@@ -205,6 +205,20 @@ async function ensureAuthStatusProbe(): Promise<void> {
 }
 
 /**
+ * Resolve the shared auth snapshot at the startup hydration boundary.
+ *
+ * Returning installations call this before any protected conversation,
+ * WebSocket, plugin, wallet, or notification work begins. It joins the
+ * restore-phase prime when present and otherwise performs the normal probe,
+ * guaranteeing hydration makes its authorization decision from a terminal
+ * snapshot instead of guessing from the current origin.
+ */
+export async function resolveAuthStatusForStartup(): Promise<AuthStatusState> {
+  await ensureAuthStatusProbe();
+  return authStatusSnapshot;
+}
+
+/**
  * True once the app-level auth probe (App.tsx's `useAuthStatus`) has resolved
  * to an authenticated session. Read-only: subscribes to the shared snapshot
  * without starting its own fetch or poll, so gating on it adds zero network
@@ -275,7 +289,7 @@ export function __resetAuthStatusForTests(): void {
 
 export function useAuthStatus(options: UseAuthStatusOptions = {}): {
   state: AuthStatusState;
-  refetch: () => void;
+  refetch: () => Promise<void>;
 } {
   const {
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,

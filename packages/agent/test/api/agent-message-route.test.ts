@@ -175,6 +175,7 @@ function createRuntime(
     getService: vi.fn(() => null),
     getServicesByType: vi.fn(() => []),
     emitEvent: vi.fn(async () => undefined),
+    reportError: vi.fn(),
     drainChatPreHandlers: vi.fn(async () => null),
     ...overrides,
   };

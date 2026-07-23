@@ -364,6 +364,7 @@ export {
   RelationshipStore,
   resolveKnowledgeGraphService,
 } from "./services/knowledge-graph/index.ts";
+export { pendantSessionSchema } from "./services/pendant-session/index.ts";
 // Cache-backed runtime stores promoted from LifeOps (pending-prompts /
 // global-pause / handoff). Named re-exports — same rationale as the knowledge
 // graph above: keep them out of the broad services barrel to avoid TS2308.

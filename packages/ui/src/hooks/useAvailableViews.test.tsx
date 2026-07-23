@@ -26,6 +26,9 @@ const { client, fetchWithCsrf, getFrontendPlatform } = vi.hoisted(() => ({
 vi.mock("../api", () => ({ client }));
 vi.mock("../api/csrf-client", () => ({ fetchWithCsrf }));
 vi.mock("../platform/platform-guards", () => ({ getFrontendPlatform }));
+vi.mock("./useProtectedAgentProbesEnabled", () => ({
+  useProtectedAgentProbesEnabled: () => true,
+}));
 
 function response(status: number, body: unknown) {
   return {

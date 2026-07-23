@@ -13,6 +13,21 @@ const apiPort = Number(process.env.ELIZA_AUTH_ACTIVATION_API_PORT || 22_139);
 process.env.ELIZA_UI_PORT = String(uiPort);
 process.env.ELIZA_API_PORT = String(apiPort);
 
+function rendererNodeOptions(): string {
+  const tokens = (process.env.NODE_OPTIONS ?? "").split(/\s+/).filter(Boolean);
+  return tokens
+    .filter((token, index) => {
+      if (token === "--conditions=eliza-source") return false;
+      if (token === "--conditions" && tokens[index + 1] === "eliza-source") {
+        return false;
+      }
+      return !(
+        token === "eliza-source" && tokens[index - 1] === "--conditions"
+      );
+    })
+    .join(" ");
+}
+
 export default defineConfig({
   testDir: "./test/auth-activation-live",
   timeout: 600_000,
@@ -41,6 +56,10 @@ export default defineConfig({
       ELIZA_UI_PORT: String(uiPort),
       FORCE_COLOR: "0",
       NODE_NO_WARNINGS: "1",
+      // Playwright needs source-conditioned package exports to collect the
+      // TypeScript spec. Vite's Node-loaded config needs built exports because
+      // native ESM does not remap source-level `.js` specifiers to `.ts`.
+      NODE_OPTIONS: rendererNodeOptions(),
     },
     url: `http://127.0.0.1:${uiPort}`,
     reuseExistingServer: false,

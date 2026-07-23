@@ -147,6 +147,43 @@ describe("EvaluatorService", () => {
 		expect(result.errors).toEqual([]);
 	});
 
+	it("unwraps the native text-result envelope returned by live providers", async () => {
+		const runtime = makeRuntime();
+		const processed: string[] = [];
+
+		runtime.registerEvaluator({
+			name: "native",
+			description: "native provider result",
+			schema: schema(),
+			shouldRun: async () => true,
+			prompt: () => "Extract native.",
+			parse: (output) => output as never,
+			processors: [
+				{
+					name: "storeNative",
+					process: async () => {
+						processed.push("native");
+						return { success: true };
+					},
+				},
+			],
+		});
+
+		runtime.useModel = vi.fn(async () => ({
+			text: '{"native":{"ok":true}}',
+			toolCalls: [],
+			finishReason: "stop",
+			usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 },
+			providerMetadata: { modelName: "live-provider-model" },
+		})) as AgentRuntime["useModel"];
+
+		const result = await new EvaluatorService(runtime).run(makeMessage());
+
+		expect(processed).toEqual(["native"]);
+		expect(result.processedEvaluators).toEqual(["native"]);
+		expect(result.errors).toEqual([]);
+	});
+
 	it("isolates invalid sections and processor failures", async () => {
 		const runtime = makeRuntime();
 		const processed: string[] = [];

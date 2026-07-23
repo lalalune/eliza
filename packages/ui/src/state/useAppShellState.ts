@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 import { client } from "../api";
 import { supportsFullAppShellRoutes } from "../api/app-shell-capabilities";
 import { AGENT_READY_EVENT } from "../events";
+import { useProtectedAgentProbesEnabled } from "../hooks/useProtectedAgentProbesEnabled";
 import {
   fetchServerFavoriteApps,
   loadFavoriteApps,
@@ -35,6 +36,7 @@ interface UseAppShellStateOptions {
 export function useAppShellState({
   syncServerFavorites = true,
 }: UseAppShellStateOptions = {}) {
+  const protectedProbesEnabled = useProtectedAgentProbesEnabled();
   const [ownerName, setOwnerNameState] = useState<string | null>(null);
   const [appsSubTab, setAppsSubTabRaw] = useState<
     "browse" | "running" | "games"
@@ -76,16 +78,23 @@ export function useAppShellState({
     }
   }, []);
 
-  const setFavoriteApps = useCallback((apps: string[]) => {
-    setFavoriteAppsRaw(apps);
-    saveFavoriteApps(apps);
-    if (supportsFullAppShellRoutes(client.getBaseUrl())) {
-      void replaceServerFavoriteApps(apps);
-    }
-  }, []);
+  const setFavoriteApps = useCallback(
+    (apps: string[]) => {
+      setFavoriteAppsRaw(apps);
+      saveFavoriteApps(apps);
+      if (
+        protectedProbesEnabled &&
+        supportsFullAppShellRoutes(client.getBaseUrl())
+      ) {
+        void replaceServerFavoriteApps(apps);
+      }
+    },
+    [protectedProbesEnabled],
+  );
 
   useEffect(() => {
     if (!syncServerFavorites) return;
+    if (!protectedProbesEnabled) return;
     if (!supportsFullAppShellRoutes(client.getBaseUrl())) return;
     let cancelled = false;
     let hydrated = false;
@@ -122,7 +131,7 @@ export function useAppShellState({
       cancelled = true;
       document.removeEventListener(AGENT_READY_EVENT, onAgentReady);
     };
-  }, [syncServerFavorites]);
+  }, [syncServerFavorites, protectedProbesEnabled]);
 
   const setRecentApps = useCallback((apps: string[]) => {
     setRecentAppsRaw(apps);

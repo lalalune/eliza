@@ -32,10 +32,10 @@ import {
 } from "@elizaos/core";
 import {
   type CalendarActionDeps,
-  CalendarService,
-  CalendarServiceError,
   createCalendarActionRunner,
-} from "@elizaos/plugin-calendar";
+} from "@elizaos/plugin-calendar/actions/index";
+import { CalendarServiceError } from "@elizaos/plugin-calendar/internal/errors";
+import { CalendarService } from "@elizaos/plugin-calendar/service/index";
 import type { LifeOpsCalendarEvent } from "@elizaos/shared";
 import { hasLifeOpsAccess, INTERNAL_URL } from "../lifeops/access.js";
 import { resolveDefaultTimeZone } from "../lifeops/defaults.js";
@@ -135,7 +135,7 @@ const googleCalendarAction = createCalendarActionRunner(calendarActionDeps);
 // test). The implementation lives in `@elizaos/plugin-calendar`; importing this
 // module first runs `createCalendarActionRunner` above, so the extractor's
 // injected LLM dependencies are wired before any caller invokes it.
-export { extractCalendarPlanWithLlm } from "@elizaos/plugin-calendar";
+export { extractCalendarPlanWithLlm } from "@elizaos/plugin-calendar/actions/index";
 
 type OwnerCalendarSubaction =
   // Calendar reads/writes

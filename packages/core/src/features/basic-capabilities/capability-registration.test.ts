@@ -135,6 +135,22 @@ describe("basic-capabilities registration through the declaring plugin", () => {
 		expect(actionNames(runtime).has(ADVANCED_ACTION)).toBe(true);
 	});
 
+	it("keeps relationship services without double-registering advanced components", async () => {
+		const runtime = await bootRuntime({
+			character: { name: "cap-extended-relationship-services" } as Character,
+			enableExtendedCapabilities: true,
+		});
+		const relationships = runtime.plugins.find(
+			(plugin) => plugin.name === "relationships",
+		);
+
+		expect(relationships?.services?.length).toBeGreaterThan(0);
+		expect(relationships?.actions).toEqual([]);
+		expect(relationships?.providers).toEqual([]);
+		expect(relationships?.evaluators).toEqual([]);
+		expect(actionNames(runtime).has("MESSAGE")).toBe(true);
+	});
+
 	it("lets a constructor option override an on character setting (explicit wins)", async () => {
 		const runtime = await bootRuntime({
 			character: {

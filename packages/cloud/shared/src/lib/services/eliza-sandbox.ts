@@ -2983,12 +2983,7 @@ export class ElizaSandboxService {
     // Resolve character dependencies before admitting the turn. A failed
     // character lookup must not leave a five-minute processing lease behind.
     const character = await this.buildSharedRuntimeCharacter(rec);
-    const preparedTurn = await this.prepareSharedTurn(
-      rec.id,
-      channelId,
-      text.trim(),
-      messageIds,
-    );
+    const preparedTurn = await this.prepareSharedTurn(rec.id, channelId, text.trim(), messageIds);
     if (preparedTurn.cachedReply !== undefined) {
       return {
         jsonrpc: "2.0",
@@ -3006,9 +3001,7 @@ export class ElizaSandboxService {
     }
     const history = preparedTurn.history;
     const claimToken = preparedTurn.claimToken;
-    let ownerActivation: Awaited<
-      ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>
-    >;
+    let ownerActivation: Awaited<ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>>;
     try {
       ownerActivation = await this.loadSharedOwnerActivation(rec, params);
     } catch (error) {
@@ -3170,11 +3163,7 @@ export class ElizaSandboxService {
             try {
               const billing = await billUsage(
                 billingContext,
-                this.sharedRuntimeBillingUsageForReply(
-                  reply,
-                  billableUsage,
-                  estimatedInputTokens,
-                ),
+                this.sharedRuntimeBillingUsageForReply(reply, billableUsage, estimatedInputTokens),
               );
               const settlement = await settleReservation(billing.totalCost);
               const usageRecord = await recordUsageAnalytics(billingContext, billing, {
@@ -3270,20 +3259,13 @@ export class ElizaSandboxService {
     // Resolve character dependencies before admitting the turn. A failed
     // character lookup must not leave a five-minute processing lease behind.
     const character = await this.buildSharedRuntimeCharacter(rec);
-    const preparedTurn = await this.prepareSharedTurn(
-      rec.id,
-      channelId,
-      text.trim(),
-      messageIds,
-    );
+    const preparedTurn = await this.prepareSharedTurn(rec.id, channelId, text.trim(), messageIds);
     if (preparedTurn.cachedReply !== undefined) {
       return this.createBridgeSseTextResponse(preparedTurn.cachedReply);
     }
     const history = preparedTurn.history;
     const claimToken = preparedTurn.claimToken;
-    let ownerActivation: Awaited<
-      ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>
-    >;
+    let ownerActivation: Awaited<ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>>;
     try {
       ownerActivation = await this.loadSharedOwnerActivation(rec, params);
     } catch (error) {

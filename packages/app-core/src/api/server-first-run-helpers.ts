@@ -246,6 +246,21 @@ export function persistFirstRunDefaults(
     agentEntry.messageExamples = body.messageExamples;
   }
 
+  // A new owner's first post-sign-in turn is also the LifeOps goal-discovery
+  // handoff, so the runtime booted from this config must include the plugin
+  // that owns that lifecycle and its durable owner facts. Preserve an explicit
+  // pre-existing opt-out so non-destructive onboarding replay never re-enables
+  // a capability the owner disabled.
+  config.plugins ??= {};
+  config.plugins.entries ??= {};
+  const personalAssistant = config.plugins.entries["personal-assistant"];
+  if (personalAssistant?.enabled === undefined) {
+    config.plugins.entries["personal-assistant"] = {
+      ...personalAssistant,
+      enabled: true,
+    };
+  }
+
   if (!config.ui || typeof config.ui !== "object") {
     (config as Record<string, unknown>).ui = {};
   }

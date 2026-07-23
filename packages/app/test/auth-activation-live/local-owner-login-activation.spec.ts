@@ -3,13 +3,31 @@
  * PGLite runtime, followed by the durable activation and a live-model turn.
  */
 
-import type { Plugin } from "@elizaos/core";
+import { writeFile } from "node:fs/promises";
+import type {
+  AgentRuntime,
+  EvaluatorRunOptions,
+  EvaluatorRunResult,
+  Memory,
+  Plugin,
+  State,
+} from "@elizaos/core";
 import {
+  FTU_GOAL_CONFIDENCE_THRESHOLD,
   POST_SIGN_IN_ACTIVATION_GREETING,
   POST_SIGN_IN_ACTIVATION_VERSION,
 } from "@elizaos/shared";
 import { expect, type Page, test } from "@playwright/test";
+import { createFirstRunStateStore } from "../../../../plugins/plugin-personal-assistant/src/lifeops/first-run/state";
+import { createFtuGoalStateStore } from "../../../../plugins/plugin-personal-assistant/src/lifeops/ftu-goal/state";
+import { createOwnerFactStore } from "../../../../plugins/plugin-personal-assistant/src/lifeops/owner/fact-store";
+import { personalAssistantPlugin } from "../../../../plugins/plugin-personal-assistant/src/plugin";
+import { personalAssistantRoutesPlugin } from "../../../../plugins/plugin-personal-assistant/src/routes/plugin";
+import { schedulingPlugin } from "../../../../plugins/plugin-scheduling/src/plugin";
+import { getScheduledTaskRunner } from "../../../../plugins/plugin-scheduling/src/scheduled-task/runner-service";
+import { createElizaPlugin } from "../../../agent/src/runtime/eliza-plugin";
 import { startApiServer } from "../../../app-core/src/api/server";
+import { installAgentHostBridge } from "../../../app-core/src/runtime/install-agent-host-bridge";
 import { useIsolatedConfigEnv } from "../../../app-core/test/helpers/isolated-config";
 import {
   type LiveProviderConfig,
@@ -25,13 +43,40 @@ const API_PORT = Number(
 );
 const PROBLEM_MARKER = "OWNER_ACTIVATION_LIVE_OK";
 const CONCRETE_PROBLEM =
-  `I have a concrete problem: plan a two-week launch checklist for a small open-source release. ` +
-  `Acknowledge the problem and include the exact marker ${PROBLEM_MARKER}.`;
+  `The problem I want us to solve is shipping the iOS version of my app by the end of September without breaking the Android release. ` +
+  `Please acknowledge that you understand and include the exact marker ${PROBLEM_MARKER}; we'll plan it next.`;
 
 type StartedApi = {
   baseUrl: string;
   provider: LiveProviderConfig;
+  runtime: AgentRuntime;
+  readLifeOpsEvidence: () => Promise<LifeOpsEvidence>;
   close: () => Promise<void>;
+};
+
+type LifeOpsEvidence = {
+  firstRun: Awaited<
+    ReturnType<ReturnType<typeof createFirstRunStateStore>["read"]>
+  >;
+  ftuGoal: Awaited<
+    ReturnType<ReturnType<typeof createFtuGoalStateStore>["read"]>
+  >;
+  primaryGoal: string | null;
+  primaryGoalProvenance: string | null;
+  registeredEvaluators: string[];
+  evaluatorRuns: Array<{
+    messageId: string | null;
+    messageText: string | null;
+    activeEvaluators: string[];
+    processedEvaluators: string[];
+    errors: EvaluatorRunResult["errors"];
+  }>;
+  scheduledTasks: Array<{
+    taskId: string;
+    kind: string;
+    status: string;
+    idempotencyKey: string | null;
+  }>;
 };
 
 type PersistedMessage = {
@@ -101,6 +146,24 @@ async function expectOk(response: Response, label: string): Promise<void> {
   }
 }
 
+async function waitForValue<T>(
+  label: string,
+  read: () => Promise<T>,
+  accept: (value: T) => boolean,
+  timeoutMs = 90_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let last: T | undefined;
+  while (Date.now() < deadline) {
+    last = await read();
+    if (accept(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(
+    `Timed out waiting for ${label}; last=${JSON.stringify(last)}`,
+  );
+}
+
 async function startOwnerApi(): Promise<StartedApi> {
   const provider = await requireLiveProvider();
   const env = saveEnv(
@@ -110,33 +173,41 @@ async function startOwnerApi(): Promise<StartedApi> {
     "ELIZA_CLOUD_PROVISIONED",
     "ELIZA_DEV_AUTH_BYPASS",
     "ELIZA_CONFIG_PATH",
+    "ELIZA_DISABLE_ACTIVITY_TRACKER",
+    "ELIZA_DISABLE_PROACTIVE_AGENT",
+    "ELIZA_DEVICE_KIND",
   );
   delete process.env.ELIZA_API_TOKEN;
   process.env.ELIZA_PAIRING_DISABLED = "1";
   delete process.env.ELIZA_REQUIRE_LOCAL_AUTH;
   delete process.env.ELIZA_CLOUD_PROVISIONED;
   delete process.env.ELIZA_DEV_AUTH_BYPASS;
+  process.env.ELIZA_DISABLE_ACTIVITY_TRACKER = "1";
+  process.env.ELIZA_DISABLE_PROACTIVE_AGENT = "1";
+  process.env.ELIZA_DEVICE_KIND = "desktop";
 
   const configEnv = useIsolatedConfigEnv("eliza-auth-activation-live-");
   let runtimeResult: Awaited<ReturnType<typeof createRealTestRuntime>> | null =
     null;
+  let bootstrapServer: Awaited<ReturnType<typeof startApiServer>> | null = null;
   let server: Awaited<ReturnType<typeof startApiServer>> | null = null;
 
   try {
-    const liveProviderPlugin = await loadLiveProviderPlugin(provider);
-    runtimeResult = await createRealTestRuntime({
-      characterName: "ActivationE2E",
-      plugins: [liveProviderPlugin],
-    });
-
-    server = await startApiServer({
-      port: API_PORT,
-      runtime: runtimeResult.runtime,
+    // Match a fresh local installation: onboarding commits durable config
+    // before the first agent runtime boot. LifeOps then sees the completed
+    // app setup during its normal plugin initialization instead of relying on
+    // a test-only state mutation or racing a delayed reconciliation.
+    installAgentHostBridge();
+    bootstrapServer = await startApiServer({
+      // Keep the config-only bootstrap off the renderer's fixed proxy port.
+      // Playwright starts Vite before this hook; binding and immediately
+      // replacing its upstream produces a real WebSocket disconnect that
+      // obscures the flow under test.
+      port: 0,
       skipDeferredStartupWork: true,
     });
-    const baseUrl = `http://127.0.0.1:${server.port}`;
-
-    const firstRun = await fetch(`${baseUrl}/api/first-run`, {
+    const bootstrapBaseUrl = `http://127.0.0.1:${bootstrapServer.port}`;
+    const firstRun = await fetch(`${bootstrapBaseUrl}/api/first-run`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -152,6 +223,61 @@ async function startOwnerApi(): Promise<StartedApi> {
       }),
     });
     await expectOk(firstRun, "first-run completion");
+    await bootstrapServer.close();
+    bootstrapServer = null;
+
+    const liveProviderPlugin = await loadLiveProviderPlugin(provider);
+    runtimeResult = await createRealTestRuntime({
+      characterName: "ActivationE2E",
+      advancedCapabilities: true,
+      plugins: [
+        createElizaPlugin(),
+        schedulingPlugin,
+        personalAssistantPlugin,
+        // App-core discovers this renderer-facing companion through the plugin
+        // registry. The isolated runtime mirrors that production composition
+        // explicitly so the browser exercises the real LifeOps HTTP surface.
+        personalAssistantRoutesPlugin,
+        liveProviderPlugin,
+      ],
+    });
+    const runtime = runtimeResult.runtime;
+    const evaluatorRuns: LifeOpsEvidence["evaluatorRuns"] = [];
+    const evaluatorService = (await runtime.getServiceLoadPromise(
+      "evaluator",
+    )) as {
+      run: (
+        message: Memory,
+        state?: State,
+        options?: EvaluatorRunOptions,
+      ) => Promise<EvaluatorRunResult>;
+    };
+    const runEvaluator = evaluatorService.run.bind(evaluatorService);
+    evaluatorService.run = async (message, state, options) => {
+      const result = await runEvaluator(message, state, options);
+      evaluatorRuns.push({
+        messageId: typeof message.id === "string" ? message.id : null,
+        messageText:
+          typeof message.content.text === "string"
+            ? message.content.text
+            : null,
+        activeEvaluators: [...result.activeEvaluators],
+        processedEvaluators: [...result.processedEvaluators],
+        errors: [...result.errors],
+      });
+      return result;
+    };
+
+    // Production installs this downward auth/session bridge before the agent
+    // server starts. The live lane must do the same so the owner cookie is
+    // resolved by both app-core routes and agent-owned HTTP/WebSocket routes.
+    server = await startApiServer({
+      port: API_PORT,
+      runtime,
+      skipDeferredStartupWork: true,
+    });
+    const baseUrl = `http://127.0.0.1:${server.port}`;
+
     const firstRunStatus = await fetch(`${baseUrl}/api/first-run/status`);
     await expectOk(firstRunStatus, "first-run status");
     const firstRunState = (await firstRunStatus.json()) as {
@@ -162,6 +288,20 @@ async function startOwnerApi(): Promise<StartedApi> {
         `first-run status did not persist completion: ${JSON.stringify(firstRunState)}`,
       );
     }
+
+    await waitForValue(
+      "LifeOps app first-run handoff",
+      () => createFirstRunStateStore(runtime).read(),
+      (record) => record.status === "complete" && record.path === "app_handoff",
+    );
+    await waitForValue(
+      "LifeOps default scheduled-task seed",
+      () =>
+        getScheduledTaskRunner(runtime, {
+          agentId: runtime.agentId,
+        }).list({}),
+      (tasks) => tasks.length > 0,
+    );
 
     const setup = await fetch(`${baseUrl}/api/auth/setup`, {
       method: "POST",
@@ -178,6 +318,35 @@ async function startOwnerApi(): Promise<StartedApi> {
     return {
       baseUrl,
       provider,
+      runtime,
+      readLifeOpsEvidence: async () => {
+        const [firstRun, ftuGoal, ownerFacts, scheduledTasks] =
+          await Promise.all([
+            createFirstRunStateStore(runtime).read(),
+            createFtuGoalStateStore(runtime).read(),
+            createOwnerFactStore(runtime).read(),
+            getScheduledTaskRunner(runtime, {
+              agentId: runtime.agentId,
+            }).list({}),
+          ]);
+        return {
+          firstRun,
+          ftuGoal,
+          primaryGoal: ownerFacts.primaryGoal?.value ?? null,
+          primaryGoalProvenance:
+            ownerFacts.primaryGoal?.provenance.source ?? null,
+          registeredEvaluators: runtime.evaluators.map(
+            (evaluator) => evaluator.name,
+          ),
+          evaluatorRuns: [...evaluatorRuns],
+          scheduledTasks: scheduledTasks.map((task) => ({
+            taskId: task.taskId,
+            kind: task.kind,
+            status: task.status,
+            idempotencyKey: task.idempotencyKey ?? null,
+          })),
+        };
+      },
       close: async () => {
         await server?.close();
         await runtimeResult?.cleanup();
@@ -186,6 +355,7 @@ async function startOwnerApi(): Promise<StartedApi> {
       },
     };
   } catch (error) {
+    await bootstrapServer?.close().catch(() => undefined);
     await server?.close().catch(() => undefined);
     await runtimeResult?.cleanup().catch(() => undefined);
     await configEnv.restore().catch(() => undefined);
@@ -200,16 +370,28 @@ async function seedCompletedFirstRun(page: Page): Promise<void> {
     localStorage.setItem("eliza:setup:step", "activate");
     localStorage.setItem("eliza:ui-shell-mode", "native");
     localStorage.setItem("eliza:chat:voiceMuted", "true");
-    localStorage.removeItem("elizaos:active-server");
+    // The shipped dev renderer reaches the isolated API through Vite's
+    // same-origin proxy. Persist that production connection choice so startup
+    // does not probe the default desktop port and misclassify this live lane as
+    // an unreachable returning installation.
+    const apiBase = location.origin;
+    localStorage.setItem(
+      "elizaos:active-server",
+      JSON.stringify({
+        id: `remote:${apiBase}`,
+        kind: "remote",
+        label: "Live auth activation API",
+        apiBase,
+      }),
+    );
   });
 }
 
 async function readPersistedTranscripts(
   page: Page,
-  baseUrl: string,
 ): Promise<PersistedTranscript[]> {
-  return page.evaluate(async (apiBase) => {
-    const listResponse = await fetch(`${apiBase}/api/conversations`, {
+  return page.evaluate(async () => {
+    const listResponse = await fetch("/api/conversations", {
       credentials: "include",
     });
     if (!listResponse.ok) {
@@ -227,7 +409,7 @@ async function readPersistedTranscripts(
     for (const conversation of list.conversations ?? []) {
       if (!conversation.id) continue;
       const response = await fetch(
-        `${apiBase}/api/conversations/${encodeURIComponent(conversation.id)}/messages`,
+        `/api/conversations/${encodeURIComponent(conversation.id)}/messages`,
         { credentials: "include" },
       );
       if (!response.ok) {
@@ -244,7 +426,7 @@ async function readPersistedTranscripts(
       });
     }
     return transcripts;
-  }, baseUrl);
+  });
 }
 
 function flattenMessages(
@@ -269,12 +451,61 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
   test.setTimeout(600_000);
   const api = await startOwnerApi();
   const failures: string[] = [];
-  page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
-  page.on("response", (response) => {
-    if (response.status() >= 500) {
-      failures.push(`${response.status()} ${response.url()}`);
-    }
-  });
+  const auditedResponses: Array<{
+    method: string;
+    path: string;
+    status: number;
+  }> = [];
+  const monitorPage = (candidate: Page) => {
+    candidate.on("pageerror", (error) =>
+      failures.push(`pageerror: ${error.message}`),
+    );
+    candidate.on("console", (message) => {
+      if (message.type() === "error") {
+        // Chromium emits a generic duplicate for every audited HTTP failure;
+        // the response listener below records the actionable method + URL.
+        if (
+          /^Failed to load resource: the server responded with a status of \d+/i.test(
+            message.text(),
+          )
+        ) {
+          return;
+        }
+        failures.push(`console: ${message.text()}`);
+      }
+    });
+    candidate.on("response", (response) => {
+      const request = response.request();
+      const url = new URL(response.url());
+      if (
+        url.pathname.startsWith("/api/auth/") ||
+        url.pathname.startsWith("/api/lifeops/") ||
+        url.pathname.startsWith("/api/conversations")
+      ) {
+        auditedResponses.push({
+          method: request.method(),
+          path: `${url.pathname}${url.search}`,
+          status: response.status(),
+        });
+      }
+      if (response.status() < 400) return;
+      // The unauthenticated GET is the canonical browser-session discovery
+      // probe. Its 401 is asserted by the login surface and a post-login 200
+      // read below; every other non-2xx remains a live-lane failure.
+      if (
+        response.status() === 401 &&
+        request.method() === "GET" &&
+        url.pathname === "/api/auth/me"
+      ) {
+        return;
+      }
+      failures.push(
+        `${response.status()} ${request.method()} ${url.pathname}${url.search}`,
+      );
+    });
+  };
+  monitorPage(page);
+  page.context().on("page", monitorPage);
 
   try {
     await seedCompletedFirstRun(page);
@@ -293,6 +524,13 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
     await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
       timeout: 90_000,
     });
+    const authenticatedStatus = await page.evaluate(async () => {
+      const response = await fetch("/api/auth/me", {
+        credentials: "include",
+      });
+      return response.status;
+    });
+    expect(authenticatedStatus).toBe(200);
     const activation = page
       .getByTestId("thread-line")
       .filter({ hasText: POST_SIGN_IN_ACTIVATION_GREETING });
@@ -308,7 +546,51 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
     await expect(liveReply.first()).toBeVisible({ timeout: 180_000 });
     await attachScreenshot(page, testInfo, "02-live-problem-reply");
 
-    const firstTranscripts = await readPersistedTranscripts(page, api.baseUrl);
+    const lifeOpsEvidence = await waitForValue(
+      "persisted LifeOps FTU goal",
+      () => api.readLifeOpsEvidence(),
+      (evidence) =>
+        evidence.ftuGoal.status === "complete" ||
+        evidence.evaluatorRuns.some((run) =>
+          run.processedEvaluators.includes("ftu_goal_discovery"),
+        ),
+      120_000,
+    );
+    expect(lifeOpsEvidence.firstRun).toMatchObject({
+      status: "complete",
+      path: "app_handoff",
+    });
+    expect(lifeOpsEvidence.ftuGoal.status).toBe("complete");
+    expect(lifeOpsEvidence.primaryGoal).toMatch(
+      /iOS|app|release|shipping|ship/i,
+    );
+    expect(lifeOpsEvidence.primaryGoalProvenance).toBe("agent_inferred");
+    expect(lifeOpsEvidence.scheduledTasks.length).toBeGreaterThan(0);
+    expect(lifeOpsEvidence.ftuGoal.goal?.confidence).toBeGreaterThanOrEqual(
+      FTU_GOAL_CONFIDENCE_THRESHOLD,
+    );
+    expect(
+      lifeOpsEvidence.evaluatorRuns.some(
+        (run) =>
+          run.activeEvaluators.includes("ftu_goal_discovery") &&
+          run.processedEvaluators.includes("ftu_goal_discovery") &&
+          run.errors.length === 0,
+      ),
+    ).toBe(true);
+    const lifeOpsArtifactPath = testInfo.outputPath(
+      "lifeops-domain-artifacts.json",
+    );
+    await writeFile(
+      lifeOpsArtifactPath,
+      `${JSON.stringify(lifeOpsEvidence, null, 2)}\n`,
+      "utf8",
+    );
+    await testInfo.attach("lifeops-domain-artifacts", {
+      path: lifeOpsArtifactPath,
+      contentType: "application/json",
+    });
+
+    const firstTranscripts = await readPersistedTranscripts(page);
     const firstMessages = flattenMessages(firstTranscripts);
     expect(
       firstMessages.filter(
@@ -333,9 +615,18 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
     await page.close();
     const relaunched = await context.newPage();
     await relaunched.goto("/chat", { waitUntil: "domcontentloaded" });
-    await expect(relaunched.getByTestId("chat-composer-textarea")).toBeVisible({
+    const relaunchedComposer = relaunched.getByTestId("chat-composer-textarea");
+    await expect(relaunchedComposer).toBeVisible({
       timeout: 90_000,
     });
+    // A cold relaunch intentionally leaves the ambient chat collapsed. Open it
+    // through the shipped composer affordance before inspecting the restored
+    // transcript; the activation itself must not force-open again.
+    await relaunchedComposer.click();
+    await expect(relaunched.getByTestId("chat-sheet")).toHaveAttribute(
+      "data-detent",
+      /half|full/,
+    );
     await expect(
       relaunched
         .getByTestId("thread-line")
@@ -352,10 +643,7 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
         .filter({ hasText: PROBLEM_MARKER }),
     ).toHaveCount(1);
 
-    const relaunchedTranscripts = await readPersistedTranscripts(
-      relaunched,
-      api.baseUrl,
-    );
+    const relaunchedTranscripts = await readPersistedTranscripts(relaunched);
     const relaunchedMessages = flattenMessages(relaunchedTranscripts);
     expect(
       relaunchedMessages.filter(
@@ -366,11 +654,49 @@ test("owner signs in, gets one activation, solves a problem, and relaunches with
     ).toHaveLength(1);
     await attachScreenshot(relaunched, testInfo, "03-cold-relaunch-no-replay");
 
+    const proofPath = testInfo.outputPath("auth-activation-live-proof.json");
+    await writeFile(
+      proofPath,
+      `${JSON.stringify(
+        {
+          provider: {
+            name: api.provider.name,
+            model: api.provider.largeModel,
+          },
+          authenticatedStatus,
+          activation: {
+            text: POST_SIGN_IN_ACTIVATION_GREETING,
+            version: POST_SIGN_IN_ACTIVATION_VERSION,
+            persistedCount: relaunchedMessages.filter(
+              (message) =>
+                message.greetingKind === "post_sign_in_activation" &&
+                message.activationVersion === POST_SIGN_IN_ACTIVATION_VERSION,
+            ).length,
+          },
+          lifeOps: lifeOpsEvidence,
+          transcripts: {
+            beforeRelaunch: firstTranscripts,
+            afterRelaunch: relaunchedTranscripts,
+          },
+          auditedResponses,
+          failures,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await testInfo.attach("auth-activation-live-proof", {
+      path: proofPath,
+      contentType: "application/json",
+    });
+
     expect(
       failures,
       `browser/API failures while using ${api.provider.name}:${api.provider.largeModel}`,
     ).toEqual([]);
   } finally {
+    await page.context().close();
     await api.close();
   }
 });

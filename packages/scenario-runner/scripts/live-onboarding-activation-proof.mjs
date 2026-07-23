@@ -142,6 +142,9 @@ export function buildLiveScenarioEnv(
     LIVE_PROVIDER_KEYS.map((key) => [key, childEnv[key]]),
   );
   for (const key of LIVE_PROVIDER_KEYS) {
+    // Bun auto-loads ancestor .env files in the child process. Keep explicit
+    // empty sentinels for non-selected credentials so those files cannot
+    // silently re-enable a different provider.
     childEnv[key] = "";
   }
   childEnv.SMALL_MODEL = "";
@@ -156,16 +159,28 @@ export function buildLiveScenarioEnv(
   }
 
   if (requestedProvider === "openai") {
-    childEnv.OPENAI_BASE_URL = "";
-    childEnv.OPENAI_SMALL_MODEL = "";
-    childEnv.OPENAI_LARGE_MODEL = "";
-    childEnv.ELIZA_PROVIDER = "";
+    const model =
+      String(childEnv.LIVE_ONBOARDING_OPENAI_MODEL ?? "").trim() ||
+      "gpt-5.4-mini";
+    // Pin every compatible-endpoint setting because Bun auto-loads ancestor
+    // .env files after process spawn. Merely deleting inherited Groq/Cerebras
+    // overrides lets them reappear and routes the "OpenAI" proof elsewhere.
+    childEnv.OPENAI_BASE_URL = "https://api.openai.com/v1";
+    childEnv.OPENAI_SMALL_MODEL = model;
+    childEnv.OPENAI_LARGE_MODEL = model;
+    childEnv.SMALL_MODEL = model;
+    childEnv.LARGE_MODEL = model;
+    childEnv.ELIZA_PROVIDER = "openai";
   } else if (requestedProvider === "cerebras") {
     const model =
-      String(childEnv.CEREBRAS_MODEL ?? "").trim() || "gpt-oss-120b";
+      String(childEnv.LIVE_ONBOARDING_CEREBRAS_MODEL ?? "").trim() ||
+      "gemma-4-31b";
+    childEnv.CEREBRAS_MODEL = model;
     childEnv.OPENAI_BASE_URL = "https://api.cerebras.ai/v1";
     childEnv.OPENAI_SMALL_MODEL = model;
     childEnv.OPENAI_LARGE_MODEL = model;
+    childEnv.SMALL_MODEL = model;
+    childEnv.LARGE_MODEL = model;
     childEnv.ELIZA_PROVIDER = "cerebras";
   }
   return childEnv;
@@ -553,6 +568,8 @@ export async function main(argv = process.argv.slice(2)) {
     nativeJsonl,
     modelCalls,
   });
+  verdict.selectedProvider =
+    providerInputs.requestedProvider ?? verdict.providerName;
   writeFileSync(validationPath, `${JSON.stringify(verdict, null, 2)}\n`);
   process.stdout.write(
     `[live-onboarding-proof] PASS provider=${verdict.providerName} nativeRows=${verdict.nativeRows} trajectories=${verdict.trajectoryFiles.length}\n[live-onboarding-proof] validation: ${validationPath}\n`,

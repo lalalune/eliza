@@ -35,10 +35,14 @@ const makeReservation = () => ({
 let reservation = makeReservation();
 
 // Controllable seams: the turn result and the billUsage behavior.
+const completedHistory = (reply: string) => [
+  { role: "user", content: "hello" },
+  { role: "assistant", content: reply },
+];
 let turnImpl: () => unknown = () => ({
   degraded: false,
   reply: "hi there",
-  history: [],
+  history: completedHistory("hi there"),
   model: "openai/gpt-oss-120b",
 });
 let billUsageImpl: () => Promise<{ totalCost: number }> = async () => ({ totalCost: 0.0042 });
@@ -101,7 +105,7 @@ function reset() {
   turnImpl = () => ({
     degraded: false,
     reply: "hi there",
-    history: [],
+    history: completedHistory("hi there"),
     model: "openai/gpt-oss-120b",
   });
   billUsageImpl = async () => ({ totalCost: 0.0042 });
@@ -184,7 +188,7 @@ describe("bridgeSharedMessageSend — billing tail deferred via executionCtx.wai
     turnImpl = () => ({
       degraded: true,
       reply: "degraded reply",
-      history: [],
+      history: completedHistory("degraded reply"),
       model: "openai/gpt-oss-120b",
     });
     const ctx = makeExecutionCtx();

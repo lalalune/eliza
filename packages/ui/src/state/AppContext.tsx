@@ -34,6 +34,7 @@ import {
   activeServerKindToFirstRunRuntimeTarget,
   type FirstRunRuntimeTarget,
 } from "../first-run/runtime-target";
+import { useIsAuthenticated } from "../hooks/useAuthStatus";
 import type { UiLanguage } from "../i18n";
 import {
   getWindowNavigationPath,
@@ -142,6 +143,7 @@ function AppProviderInner({
   children: ReactNode;
   branding?: Partial<import("../config/branding").BrandingConfig>;
 }) {
+  const authenticated = useIsAuthenticated();
   // --- Core state ---
   const [tab, _setTabRawInner] = useState<Tab>(() =>
     resolveInitialTabForPath(getWindowNavigationPath(), DEFAULT_LANDING_TAB),
@@ -816,7 +818,7 @@ function AppProviderInner({
     promptModal,
     agentName: agentStatus?.agentName,
     characterName: characterDraft?.name,
-    hydrateServerConfig: firstRunComplete,
+    hydrateServerConfig: firstRunComplete && authenticated,
   });
   const {
     state: {
@@ -1505,6 +1507,7 @@ function AppProviderInner({
     setFirstRunRemoteApiBase,
     setFirstRunRemoteToken,
     setFirstRunCloudProvisionedContainer,
+    firstRunComplete,
     hydrateInitialConversationState,
     loadWorkbench,
     loadPlugins,

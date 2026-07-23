@@ -51,6 +51,7 @@ import {
   type BackIntentEventDetail,
   CHAT_OPEN_EVENT,
   CHAT_PREFILL_EVENT,
+  type ChatOpenEventDetail,
   type ChatPrefillEventDetail,
   ELIZA_BACK_INTENT_EVENT,
 } from "../../events";
@@ -294,6 +295,9 @@ export type ChatMode = "pill" | "input" | "half" | "full";
 type MotionControls = { stop: () => void };
 
 const SHEET_HALF_VH = 0.46; // fraction of viewport height at the HALF detent
+// System-initiated one-message reveals (the signed-in activation) sit below the
+// reading detent so the launcher remains visible and the keyboard stays down.
+const SHEET_PREVIEW_VH = 0.4;
 // A landscape phone still needs room for the attach, mic, voice, and text
 // controls. The old 208px cap squeezed the editable field to ~46px and made a
 // rotation look like the composer had broken. Keep the corner treatment, but
@@ -3578,15 +3582,35 @@ export function ChatOverlay({
   // yet), then focus the input. Gated by the onboarding lock like the tour.
   React.useEffect(() => {
     if (typeof window === "undefined") return undefined;
-    const onOpen = () => {
+    const onOpen = (event: Event) => {
       if (pinnedOpen) return;
-      setMode((m) => (m === "pill" ? "input" : m));
-      expand();
-      requestAnimationFrame(() => inputRef.current?.focus());
+      const detail = (event as CustomEvent<ChatOpenEventDetail>).detail;
+      const presentation = detail?.presentation ?? "half";
+      if (
+        presentation === "preview" &&
+        hasRevealableThread &&
+        (modeRef.current === "pill" || modeRef.current === "input")
+      ) {
+        pendingExpandOnRevealRef.current = false;
+        setMaximized(false);
+        setMode("half");
+        setFreeH(
+          Math.min(
+            halfH - 1,
+            Math.max(160, Math.round(viewportH * SHEET_PREVIEW_VH)),
+          ),
+        );
+      } else {
+        setMode((m) => (m === "pill" ? "input" : m));
+        expand();
+      }
+      if (detail?.focusComposer !== false) {
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
     };
     window.addEventListener(CHAT_OPEN_EVENT, onOpen);
     return () => window.removeEventListener(CHAT_OPEN_EVENT, onOpen);
-  }, [pinnedOpen, expand]);
+  }, [pinnedOpen, expand, hasRevealableThread, halfH, viewportH]);
 
   // OS assistant / deep-link entry (Siri, Shortcuts, App Actions, the assistant
   // entry point) routes into `#chat?text=…&source=…&voice=1`. On desktop the

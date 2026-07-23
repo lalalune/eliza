@@ -28,6 +28,11 @@ import {
   dispatchVoiceControl,
 } from "../events";
 import {
+  isAuthenticatedNow,
+  resolveAuthStatusForStartup,
+  subscribeAuthStatus,
+} from "../hooks/useAuthStatus";
+import {
   getWindowNavigationPath,
   isRouteRootPath,
   resolveDefaultLandingTab,
@@ -56,6 +61,9 @@ import { switchRuntimeNonDestructive } from "./switch-runtime";
 export interface HydratingDeps {
   setStartupError: (v: null) => void;
   setFirstRunLoading: (v: boolean) => void;
+  /** Current app first-run completion, used to distinguish returning-login
+   * hydration from the intentionally unauthenticated first-run conductor. */
+  firstRunComplete: boolean;
   hydrateInitialConversationState: () => Promise<string | null>;
   requestGreetingWhenRunningRef: React.RefObject<
     (convId: string) => Promise<void>
@@ -147,6 +155,42 @@ function normalizeAppEmoteEvent(
   };
 }
 
+function routeInitialTab(
+  deps: HydratingDeps,
+  hydrateProtectedTabData: boolean,
+): void {
+  // A root open lands on the default tab; an explicit deep link wins. Routing
+  // itself is safe before login, but its view-specific loaders are protected
+  // and therefore wait until authenticated hydration re-enters this phase.
+  const navPath = getWindowNavigationPath();
+  const urlTab = tabFromPath(navPath);
+  const isRoot = isRouteRootPath(navPath);
+  if (!deps.initialTabSetRef.current) {
+    deps.initialTabSetRef.current = true;
+    if (isRoot) deps.setTab(resolveDefaultLandingTab());
+  }
+  if (!urlTab || urlTab === "chat") return;
+
+  deps.setTabRaw(urlTab);
+  if (!hydrateProtectedTabData) return;
+
+  if (urlTab === "plugins") {
+    void deps.loadPlugins();
+    void deps.loadSkills();
+  }
+  if (urlTab === "settings") {
+    void deps.checkExtensionStatus();
+    void deps.loadWalletConfig();
+    void deps.loadCharacter();
+    void deps.loadUpdateStatus();
+    void deps.loadPlugins();
+  }
+  if (urlTab === "character" || urlTab === "character-select") {
+    void deps.loadCharacter();
+  }
+  if (urlTab === "inventory") void deps.loadInventory();
+}
+
 /**
  * Runs the hydrating phase.
  * Loads initial conversation state, wallet, avatar, plugins, and sets the tab.
@@ -165,6 +209,20 @@ export async function runHydrating(
   };
 
   deps.setStartupError(null);
+  if (deps.firstRunComplete) {
+    const authState = await resolveAuthStatusForStartup();
+    if (authState.phase !== "authenticated") {
+      // A returning password-protected installation must become paintable so
+      // LoginView can render, but it must not touch any protected route first.
+      // Login success publishes the session and dispatches RETRY, which re-enters
+      // this phase and performs the complete hydration exactly once authorized.
+      deps.setFirstRunLoading(false);
+      routeInitialTab(deps, false);
+      dispatch({ type: "HYDRATION_COMPLETE" });
+      return;
+    }
+  }
+
   // Start the WS bridge before history hydration finishes so restored-session
   // flows regain live updates without waiting for conversation restore.
   client.connectWs();
@@ -256,37 +314,7 @@ export async function runHydrating(
     })();
   };
 
-  // Tab routing. A root open lands on the default tab; a URL that names a
-  // specific view is an explicit deep link and wins via the `setTabRaw(urlTab)`
-  // pass below. Cloud-only onboarding lands the user straight in chat (#14362):
-  // `completeFirstRun` sets the landing tab and marks `initialTabSetRef`, so on
-  // the first post-onboarding paint this pass is a no-op. There is no automatic
-  // character-select landing — character customization is reached explicitly
-  // from Settings/launcher.
-  const navPath = getWindowNavigationPath();
-  const urlTab = tabFromPath(navPath);
-  const isRoot = isRouteRootPath(navPath);
-  if (!deps.initialTabSetRef.current) {
-    deps.initialTabSetRef.current = true;
-    if (isRoot) deps.setTab(resolveDefaultLandingTab());
-  }
-  if (urlTab && urlTab !== "chat") {
-    deps.setTabRaw(urlTab);
-    if (urlTab === "plugins") {
-      void deps.loadPlugins();
-      void deps.loadSkills();
-    }
-    if (urlTab === "settings") {
-      void deps.checkExtensionStatus();
-      void deps.loadWalletConfig();
-      void deps.loadCharacter();
-      void deps.loadUpdateStatus();
-      void deps.loadPlugins();
-    }
-    if (urlTab === "character" || urlTab === "character-select")
-      void deps.loadCharacter();
-    if (urlTab === "inventory") void deps.loadInventory();
-  }
+  routeInitialTab(deps, true);
 
   // HYDRATION_COMPLETE is the only signal that advances the coordinator out of
   // the "hydrating" phase. It must fire even if this run was cancelled: the
@@ -317,6 +345,7 @@ export function bindReadyPhase(
   let handleVis: (() => void) | null = null;
 
   const doHydratePty = () => {
+    if (!isAuthenticatedNow()) return;
     const baseUrl =
       typeof client.getBaseUrl === "function" ? client.getBaseUrl() : "";
     if (!supportsFullAppShellRoutes(baseUrl)) return;
@@ -374,7 +403,12 @@ export function bindReadyPhase(
     if (running && depsRef.current?.hasPtySessionsRef.current) doHydratePty();
   }, 5_000);
 
-  client.connectWs();
+  if (isAuthenticatedNow()) client.connectWs();
+  const unbindAuth = subscribeAuthStatus((state) => {
+    if (state.phase !== "authenticated") return;
+    client.connectWs();
+    hydratePty();
+  });
 
   const unbindEmotes = client.onWsEvent(
     "emote",
@@ -900,6 +934,7 @@ export function bindReadyPhase(
     unbindViewInteract();
     unbindConvUp();
     unbindPty();
+    unbindAuth();
     if (ptyPollInterval) clearInterval(ptyPollInterval);
     if (handleVis) document.removeEventListener("visibilitychange", handleVis);
     client.disconnectWs();

@@ -2495,9 +2495,21 @@ export class AgentRuntime implements IAgentRuntime {
 		) as NativeRuntimeFeature[]) {
 			const enabled = this.resolveNativeFeatureEnabled(feature);
 			if (enabled) {
-				pluginRegistrationPromises.push(
-					this.registerPlugin(getNativeRuntimeFeaturePlugin(feature)),
-				);
+				const nativePlugin = getNativeRuntimeFeaturePlugin(feature);
+				// Extended capabilities already own the relationship bundle's
+				// actions, providers, and evaluators. Keep the native plugin's
+				// long-lived services, but do not register the same named
+				// components twice and leave their winner to boot timing.
+				const plugin =
+					feature === "relationships" && this.capabilityOptions.enableExtended
+						? {
+								...nativePlugin,
+								actions: [],
+								providers: [],
+								evaluators: [],
+							}
+						: nativePlugin;
+				pluginRegistrationPromises.push(this.registerPlugin(plugin));
 			}
 		}
 

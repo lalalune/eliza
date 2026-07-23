@@ -25,6 +25,14 @@ export interface CompatRuntimeState {
 	current: AgentRuntime | null;
 	pendingAgentName?: string | null;
 	pendingRestartReasons?: string[];
+	/**
+	 * App-core sets this only after its cookie/session policy gate succeeds.
+	 * It lets regular local-inference reads accept a host-owned browser session
+	 * without teaching this lower plugin how to open app-core's auth store.
+	 * Sensitive mutations deliberately ignore it and retain their token/owner
+	 * authorization boundary.
+	 */
+	requestAuthorization?: "session";
 }
 
 function firstHeaderValue(value: string | string[] | undefined): string | null {
@@ -241,8 +249,9 @@ export function ensureCompatSensitiveRouteAuthorized(
 export async function ensureRouteAuthorized(
 	req: Pick<http.IncomingMessage, "headers" | "socket" | "method">,
 	res: http.ServerResponse,
-	_state: CompatRuntimeState,
+	state: CompatRuntimeState,
 ): Promise<boolean> {
+	if (state.requestAuthorization === "session") return true;
 	return ensureCompatApiAuthorized(req, res);
 }
 

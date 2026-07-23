@@ -24,8 +24,10 @@ import {
   fetchRuntimeModeSnapshot,
   type RuntimeModeSnapshot,
 } from "../api/runtime-mode-client";
+import { authenticateOwnerForTests } from "../testing/auth-status";
 import { isLocalInferenceTtsReady } from "../voice/local-tts-status";
 import { BROWSER_TTS_PROVIDER } from "../voice/voice-provider-defaults";
+import { __resetAuthStatusForTests } from "./useAuthStatus";
 import {
   type UseResolvedTtsDefaultResult,
   useResolvedTtsDefault,
@@ -58,6 +60,7 @@ async function resolveOnce(
 }
 
 beforeEach(() => {
+  authenticateOwnerForTests();
   __resetRuntimeModeCacheForTests();
   fetchMock.mockReset();
   ttsReadyMock.mockReset();
@@ -65,6 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __resetAuthStatusForTests();
   __resetRuntimeModeCacheForTests();
 });
 

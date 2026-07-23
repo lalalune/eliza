@@ -43,6 +43,7 @@ function makeDeps(): HydratingDeps {
   return {
     setStartupError: vi.fn(),
     setFirstRunLoading: vi.fn(),
+    firstRunComplete: false,
     hydrateInitialConversationState: vi.fn(async () => null),
     requestGreetingWhenRunningRef: { current: vi.fn(async () => undefined) },
     loadWorkbench: vi.fn(async () => {}),
