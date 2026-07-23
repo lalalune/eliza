@@ -27,6 +27,45 @@ describe("classifyDestructiveCommand — fires", () => {
     expect(v.destructive).toBe(true);
     expect(v.reason).toBe("recursive delete");
   });
+  it.each([
+    ["ri -Recurse old-dir"],
+    ["del -Recurse old-dir"],
+    ["rd -Recurse old-dir"],
+    ["erase -Recurse old-dir"],
+    ["rmdir -Recurse old-dir"],
+  ])("PowerShell Remove-Item alias: %s", (command) => {
+    const v = classifyDestructiveCommand(command);
+    expect(v.destructive).toBe(true);
+    expect(v.reason).toBe("recursive delete");
+    expect(v.targets).toContain("old-dir");
+  });
+  it.each([
+    ["Remove-Item -r old-dir"],
+    ["Remove-Item -re old-dir"],
+    ["Remove-Item -Rec old-dir"],
+    ["Remove-Item -Recu old-dir"],
+    ["Remove-Item -recurs old-dir"],
+    ["Remove-Item -RECURSE old-dir"],
+    ["Remove-Item -Recurse:$true old-dir"],
+    ["Remove-Item -Rec:$true old-dir"],
+  ])("PowerShell -Recurse abbreviation: %s", (command) => {
+    const v = classifyDestructiveCommand(command);
+    expect(v.destructive).toBe(true);
+    expect(v.reason).toBe("recursive delete");
+    expect(v.targets).toContain("old-dir");
+  });
+  it("case-insensitive cmdlet name", () => {
+    expect(
+      classifyDestructiveCommand("REMOVE-ITEM -recurse C:\\temp\\junk")
+        .destructive,
+    ).toBe(true);
+  });
+  it("full path to the cmdlet-shaped bin still classifies", () => {
+    expect(
+      classifyDestructiveCommand("C:\\Windows\\del -Recurse old-dir")
+        .destructive,
+    ).toBe(true);
+  });
   it("forced glob delete", () => {
     expect(
       classifyDestructiveCommand("rm -f /var/log/app/*.log").destructive,
@@ -70,6 +109,13 @@ describe("classifyDestructiveCommand — must NOT fire", () => {
     ["find . -name '*.ts' -print"],
     ["dd if=/dev/urandom of=./random.bin count=1"],
     ["mkdir -p new/dir"],
+    ["Remove-Item single-file.txt"],
+    ["Remove-Item -Force one-exact-file.log"],
+    ["del stale-file.txt"],
+    ["rmdir empty-dir"],
+    ["ri -Path single-file.txt"],
+    // -Recurse:$false explicitly disables recursion — a single-item delete.
+    ["Remove-Item -Recurse:$false single-file.txt"],
   ])("%s", (command) => {
     expect(classifyDestructiveCommand(command).destructive).toBe(false);
   });

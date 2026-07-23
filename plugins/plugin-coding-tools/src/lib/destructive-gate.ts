@@ -21,6 +21,31 @@ const FORCE_ONLY_FLAG = /^-[a-z]*f[a-z]*$/;
 const DESTRUCTIVE_BINS = new Set(["mkfs", "shred", "wipefs"]);
 const DROP_SQL = /\bdrop\s+(database|table|schema)\s+(\S+)/i;
 
+// Every PowerShell name that resolves to Remove-Item: the cmdlet itself plus
+// its built-in aliases. `rm` is also an alias but is handled by the POSIX rm
+// branch below (RECURSIVE_RM_FLAG already matches -r and -Recurse).
+const REMOVE_ITEM_BINS = new Set([
+  "remove-item",
+  "ri",
+  "del",
+  "rd",
+  "erase",
+  "rmdir",
+]);
+
+/**
+ * PowerShell resolves any unambiguous parameter prefix, so -R, -Rec, -Recu, …
+ * all mean -Recurse on Remove-Item, and switch parameters accept an explicit
+ * `:$true`. Match all of those; `-Recurse:$false` explicitly disables
+ * recursion and intentionally does not match.
+ */
+function isRecurseSwitch(arg: string): boolean {
+  let tok = arg.toLowerCase();
+  if (tok.endsWith(":$true")) tok = tok.slice(0, -6);
+  if (!tok.startsWith("-") || tok.length < 2) return false;
+  return "recurse".startsWith(tok.slice(1));
+}
+
 function splitSegments(command: string): string[] {
   // Chain + pipeline split; quotes are respected coarsely — a metacharacter
   // inside quotes stays put because we only split on unquoted operators.
@@ -78,14 +103,9 @@ export function classifyDestructiveCommand(
     const bin = ((argv[i] ?? "").split(/[\\/]/).pop() ?? "").toLowerCase();
     const rest = argv.slice(i + 1);
 
-    if (bin === "remove-item") {
-      const recursive = rest.some(
-        (arg) => arg.toLowerCase() === "-recurse" || arg.toLowerCase() === "-r",
-      );
-      if (recursive) {
-        const targets = rest.filter((arg) => !arg.startsWith("-"));
-        return { destructive: true, reason: "recursive delete", targets };
-      }
+    if (REMOVE_ITEM_BINS.has(bin) && rest.some(isRecurseSwitch)) {
+      const targets = rest.filter((arg) => !arg.startsWith("-"));
+      return { destructive: true, reason: "recursive delete", targets };
     }
 
     if (bin === "rm") {
