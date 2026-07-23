@@ -1,0 +1,473 @@
+/**
+ * Strongly ordered anonymous chat identity and quota cache.
+ *
+ * Each object owns one session's lifetime/hourly counters, idempotent leases,
+ * and late refunds. It never queries Postgres; off-path callers initialize it
+ * once and mirror revisioned snapshots asynchronously.
+ */
+
+import type { AppEnv } from "@/types/cloud-worker-env";
+
+interface ActiveLease {
+  hourlyResetAtMs: number;
+}
+
+interface TerminalLease {
+  requestId: string;
+  outcome: "committed" | "refunded";
+}
+
+interface ReadyLedger {
+  status: "ready";
+  sessionId: string;
+  userId: string;
+  messageCount: number;
+  messagesLimit: number;
+  hourlyMessageCount: number;
+  hourlyResetAtMs: number | null;
+  hourlyLimit: number;
+  expiresAtMs: number;
+  revision: number;
+  blocked: boolean;
+  lastMessageAtMs: number;
+  activeLeases: Record<string, ActiveLease>;
+  terminalLeases: TerminalLease[];
+}
+
+interface InvalidLedger {
+  status: "invalid";
+}
+
+type GateLedger = ReadyLedger | InvalidLedger;
+
+interface HydrateRequest {
+  sessionId: string;
+  userId: string;
+  messageCount: number;
+  messagesLimit: number;
+  hourlyMessageCount: number;
+  hourlyResetAtMs: number | null;
+  hourlyLimit: number;
+  expiresAtMs: number;
+  revision: number;
+  blocked: boolean;
+}
+
+interface LeaseRequest {
+  requestId: string;
+}
+
+interface ModerationRequest {
+  blocked: boolean;
+}
+
+const LEDGER_KEY = "ledger";
+const HOUR_MS = 60 * 60 * 1_000;
+const MAX_ACTIVE_LEASES = 256;
+const MAX_TERMINAL_LEASES = 1_024;
+
+function validId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function positiveInteger(value: unknown): value is number {
+  return nonNegativeInteger(value) && value > 0;
+}
+
+function finiteTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function validOptionalTimestamp(value: unknown): value is number | null {
+  return value === null || finiteTimestamp(value);
+}
+
+function jsonError(message: string, status: 400 | 409 | 410 | 503): Response {
+  return Response.json({ success: false, error: message }, { status });
+}
+
+function cloneLedger(ledger: ReadyLedger): ReadyLedger {
+  return {
+    ...ledger,
+    activeLeases: Object.fromEntries(
+      Object.entries(ledger.activeLeases).map(([requestId, lease]) => [
+        requestId,
+        { ...lease },
+      ]),
+    ),
+    terminalLeases: ledger.terminalLeases.map((lease) => ({ ...lease })),
+  };
+}
+
+function rememberTerminal(
+  ledger: ReadyLedger,
+  requestId: string,
+  outcome: TerminalLease["outcome"],
+): void {
+  ledger.terminalLeases.push({ requestId, outcome });
+  if (ledger.terminalLeases.length > MAX_TERMINAL_LEASES) {
+    ledger.terminalLeases.splice(
+      0,
+      ledger.terminalLeases.length - MAX_TERMINAL_LEASES,
+    );
+  }
+}
+
+function terminalLease(
+  ledger: ReadyLedger,
+  requestId: string,
+): TerminalLease | undefined {
+  return ledger.terminalLeases.find(
+    (terminal) => terminal.requestId === requestId,
+  );
+}
+
+function rotateHourlyWindow(ledger: ReadyLedger, now: number): void {
+  if (
+    ledger.hourlyResetAtMs === null ||
+    ledger.hourlyResetAtMs < now - HOUR_MS
+  ) {
+    ledger.hourlyMessageCount = 0;
+    ledger.hourlyResetAtMs = now;
+  }
+}
+
+function snapshot(ledger: ReadyLedger): Record<string, number | string | null> {
+  return {
+    sessionId: ledger.sessionId,
+    revision: ledger.revision,
+    messageCount: ledger.messageCount,
+    hourlyMessageCount: ledger.hourlyMessageCount,
+    hourlyResetAtMs: ledger.hourlyResetAtMs,
+    lastMessageAtMs: ledger.lastMessageAtMs,
+  };
+}
+
+function contextResponse(ledger: ReadyLedger): Response {
+  return Response.json({
+    context: {
+      sessionId: ledger.sessionId,
+      userId: ledger.userId,
+      messageCount: ledger.messageCount,
+      messagesLimit: ledger.messagesLimit,
+    },
+    blocked: ledger.blocked,
+  });
+}
+
+export class AnonymousChatGate {
+  private readonly state: DurableObjectState;
+  private ledger: GateLedger | undefined;
+  private operationQueue: Promise<void> = Promise.resolve();
+
+  constructor(state: DurableObjectState, _env: AppEnv["Bindings"]) {
+    this.state = state;
+  }
+
+  private async load(): Promise<GateLedger | undefined> {
+    this.ledger ??= await this.state.storage.get<GateLedger>(LEDGER_KEY);
+    return this.ledger;
+  }
+
+  private async save(ledger: GateLedger): Promise<void> {
+    const stored =
+      ledger.status === "ready"
+        ? cloneLedger(ledger)
+        : ({ ...ledger } as const);
+    await this.state.storage.put(LEDGER_KEY, stored);
+    this.ledger = stored;
+  }
+
+  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.operationQueue;
+    let release: () => void = () => undefined;
+    this.operationQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async requireReady(): Promise<
+    { ledger: ReadyLedger } | { response: Response }
+  > {
+    const ledger = await this.load();
+    if (!ledger) {
+      return {
+        response: Response.json(
+          {
+            success: false,
+            code: "anonymous_chat_gate_uninitialized",
+            error: "Anonymous chat gate is warming",
+          },
+          { status: 503 },
+        ),
+      };
+    }
+    if (ledger.status === "invalid") {
+      return {
+        response: jsonError("Anonymous chat session is no longer active", 410),
+      };
+    }
+    if (ledger.expiresAtMs <= Date.now()) {
+      await this.save({ status: "invalid" });
+      return {
+        response: jsonError("Anonymous chat session has expired", 410),
+      };
+    }
+    return { ledger };
+  }
+
+  private async hydrate(request: HydrateRequest): Promise<Response> {
+    if (
+      !validId(request.sessionId) ||
+      !validId(request.userId) ||
+      !nonNegativeInteger(request.messageCount) ||
+      !positiveInteger(request.messagesLimit) ||
+      !nonNegativeInteger(request.hourlyMessageCount) ||
+      !validOptionalTimestamp(request.hourlyResetAtMs) ||
+      !positiveInteger(request.hourlyLimit) ||
+      !finiteTimestamp(request.expiresAtMs) ||
+      !nonNegativeInteger(request.revision) ||
+      typeof request.blocked !== "boolean"
+    ) {
+      return jsonError("Invalid anonymous chat hydration", 400);
+    }
+
+    const existing = await this.load();
+    if (existing) {
+      return Response.json({ hydrated: true, initialized: false });
+    }
+    await this.save({
+      status: "ready",
+      sessionId: request.sessionId,
+      userId: request.userId,
+      messageCount: request.messageCount,
+      messagesLimit: request.messagesLimit,
+      hourlyMessageCount: request.hourlyMessageCount,
+      hourlyResetAtMs: request.hourlyResetAtMs,
+      hourlyLimit: request.hourlyLimit,
+      expiresAtMs: request.expiresAtMs,
+      revision: request.revision,
+      blocked: request.blocked,
+      lastMessageAtMs: Date.now(),
+      activeLeases: {},
+      terminalLeases: [],
+    });
+    return Response.json({ hydrated: true, initialized: true });
+  }
+
+  private async context(): Promise<Response> {
+    const ready = await this.requireReady();
+    if ("response" in ready) return ready.response;
+    return contextResponse(ready.ledger);
+  }
+
+  private async lease(request: LeaseRequest): Promise<Response> {
+    if (!validId(request.requestId)) {
+      return jsonError("Invalid anonymous chat lease", 400);
+    }
+    const ready = await this.requireReady();
+    if ("response" in ready) return ready.response;
+    const ledger = cloneLedger(ready.ledger);
+
+    const existing = ledger.activeLeases[request.requestId];
+    if (existing) {
+      return Response.json({
+        admitted: true,
+        duplicate: true,
+        remaining: Math.max(0, ledger.messagesLimit - ledger.messageCount),
+        limit: ledger.messagesLimit,
+        snapshot: snapshot(ledger),
+      });
+    }
+    if (terminalLease(ledger, request.requestId)) {
+      return jsonError("Anonymous chat lease was already finalized", 409);
+    }
+    if (Object.keys(ledger.activeLeases).length >= MAX_ACTIVE_LEASES) {
+      return jsonError("Anonymous chat gate capacity is exhausted", 503);
+    }
+    if (ledger.blocked) {
+      return jsonError("Anonymous chat user is suspended", 410);
+    }
+
+    const now = Date.now();
+    rotateHourlyWindow(ledger, now);
+    if (ledger.messageCount >= ledger.messagesLimit) {
+      return Response.json(
+        {
+          admitted: false,
+          reason: "message_limit",
+          remaining: 0,
+          limit: ledger.messagesLimit,
+        },
+        { status: 429 },
+      );
+    }
+    if (ledger.hourlyMessageCount >= ledger.hourlyLimit) {
+      return Response.json(
+        {
+          admitted: false,
+          reason: "hourly_limit",
+          remaining: 0,
+          limit: ledger.hourlyLimit,
+        },
+        { status: 429 },
+      );
+    }
+
+    ledger.messageCount += 1;
+    ledger.hourlyMessageCount += 1;
+    ledger.revision += 1;
+    ledger.lastMessageAtMs = now;
+    if (ledger.hourlyResetAtMs === null) {
+      return jsonError("Anonymous chat hourly window is unavailable", 503);
+    }
+    ledger.activeLeases[request.requestId] = {
+      hourlyResetAtMs: ledger.hourlyResetAtMs,
+    };
+    await this.save(ledger);
+    return Response.json({
+      admitted: true,
+      duplicate: false,
+      remaining: Math.max(0, ledger.messagesLimit - ledger.messageCount),
+      limit: ledger.messagesLimit,
+      snapshot: snapshot(ledger),
+    });
+  }
+
+  private async refund(request: LeaseRequest): Promise<Response> {
+    if (!validId(request.requestId)) {
+      return jsonError("Invalid anonymous chat refund", 400);
+    }
+    const ready = await this.requireReady();
+    if ("response" in ready) return ready.response;
+    const ledger = cloneLedger(ready.ledger);
+    const terminal = terminalLease(ledger, request.requestId);
+    if (terminal) {
+      if (terminal.outcome !== "refunded") {
+        return jsonError("Anonymous chat lease was already committed", 409);
+      }
+      return Response.json({
+        refunded: true,
+        duplicate: true,
+        snapshot: snapshot(ledger),
+      });
+    }
+
+    const active = ledger.activeLeases[request.requestId];
+    if (!active) {
+      return jsonError("Anonymous chat lease was not found", 409);
+    }
+    const now = Date.now();
+    rotateHourlyWindow(ledger, now);
+    ledger.messageCount = Math.max(0, ledger.messageCount - 1);
+    if (active.hourlyResetAtMs === ledger.hourlyResetAtMs) {
+      ledger.hourlyMessageCount = Math.max(0, ledger.hourlyMessageCount - 1);
+    }
+    ledger.revision += 1;
+    ledger.lastMessageAtMs = now;
+    delete ledger.activeLeases[request.requestId];
+    rememberTerminal(ledger, request.requestId, "refunded");
+    await this.save(ledger);
+    return Response.json({
+      refunded: true,
+      duplicate: false,
+      snapshot: snapshot(ledger),
+    });
+  }
+
+  private async commit(request: LeaseRequest): Promise<Response> {
+    if (!validId(request.requestId)) {
+      return jsonError("Invalid anonymous chat commit", 400);
+    }
+    const ready = await this.requireReady();
+    if ("response" in ready) return ready.response;
+    const ledger = cloneLedger(ready.ledger);
+    const terminal = terminalLease(ledger, request.requestId);
+    if (terminal) {
+      if (terminal.outcome !== "committed") {
+        return jsonError("Anonymous chat lease was already refunded", 409);
+      }
+      return Response.json({ committed: true, duplicate: true });
+    }
+    if (!ledger.activeLeases[request.requestId]) {
+      return jsonError("Anonymous chat lease was not found", 409);
+    }
+    delete ledger.activeLeases[request.requestId];
+    rememberTerminal(ledger, request.requestId, "committed");
+    await this.save(ledger);
+    return Response.json({ committed: true, duplicate: false });
+  }
+
+  private async moderation(request: ModerationRequest): Promise<Response> {
+    if (typeof request.blocked !== "boolean") {
+      return jsonError("Invalid anonymous chat moderation state", 400);
+    }
+    const ready = await this.requireReady();
+    if ("response" in ready) return ready.response;
+    const ledger = cloneLedger(ready.ledger);
+    ledger.blocked = request.blocked;
+    await this.save(ledger);
+    return Response.json({ updated: true });
+  }
+
+  private async invalidate(): Promise<Response> {
+    await this.save({ status: "invalid" });
+    return Response.json({ invalidated: true });
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      // error-policy:J3 malformed internal requests are rejected explicitly.
+      return jsonError("Invalid JSON body", 400);
+    }
+    const path = new URL(request.url).pathname;
+    if (path === "/context") {
+      return await this.serialize(() => this.context());
+    }
+    if (path === "/hydrate") {
+      return await this.serialize(() =>
+        this.hydrate(body as unknown as HydrateRequest),
+      );
+    }
+    if (path === "/lease") {
+      return await this.serialize(() =>
+        this.lease(body as unknown as LeaseRequest),
+      );
+    }
+    if (path === "/refund") {
+      return await this.serialize(() =>
+        this.refund(body as unknown as LeaseRequest),
+      );
+    }
+    if (path === "/commit") {
+      return await this.serialize(() =>
+        this.commit(body as unknown as LeaseRequest),
+      );
+    }
+    if (path === "/moderation") {
+      return await this.serialize(() =>
+        this.moderation(body as unknown as ModerationRequest),
+      );
+    }
+    if (path === "/invalidate") {
+      return await this.serialize(() => this.invalidate());
+    }
+    return new Response("Not found", { status: 404 });
+  }
+}
