@@ -3,7 +3,13 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BOOT_CONFIG,
@@ -129,6 +135,41 @@ describe("CloudPairRelay", () => {
     );
   });
 
+  it("includes the token-bound Origin for a native in-process exchange", async () => {
+    const fetchFn = vi.fn(async () => jsonResponse({ apiKey: "agent-key" }));
+
+    await exchangeCloudPairToken("pair-token", {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      cloudApiBase: "https://elizacloud.ai",
+      pairingOrigin: "https://agent-1.elizacloud.ai",
+    });
+
+    expect(fetchFn).toHaveBeenCalledWith(
+      "https://elizacloud.ai/api/auth/pair",
+      expect.objectContaining({
+        headers: {
+          "content-type": "application/json",
+          Origin: "https://agent-1.elizacloud.ai",
+        },
+      }),
+    );
+  });
+
+  it("rejects a malformed pairing origin before sending the token", async () => {
+    const fetchFn = vi.fn();
+
+    await expect(
+      exchangeCloudPairToken("pair-token", {
+        fetchFn: fetchFn as unknown as typeof fetch,
+        pairingOrigin: "https://agent.elizacloud.ai/untrusted-path",
+      }),
+    ).rejects.toMatchObject({
+      name: "CloudPairExchangeError",
+      status: 400,
+    });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it("persists the paired API key into the app token channels", () => {
     persistCloudPairApiToken(" agent-key ");
 
@@ -204,6 +245,19 @@ describe("CloudPairRelay", () => {
     expect(screen.queryByText("Display name")).toBeNull();
     expect(screen.queryByText("Password")).toBeNull();
     expect(screen.queryByText("Remember this device for 30 days")).toBeNull();
+  });
+
+  it("starts in-app Cloud reauthentication for a native managed agent", async () => {
+    const onReauthenticate = vi.fn(async () => undefined);
+    render(<CloudHostedAgentAuthNotice onReauthenticate={onReauthenticate} />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sign in to Eliza Cloud" }),
+    );
+
+    await waitFor(() => expect(onReauthenticate).toHaveBeenCalledOnce());
+    expect(screen.queryByText("Password")).toBeNull();
+    expect(screen.queryByText("Display name")).toBeNull();
   });
 
   it("resolves production, staging, and agent-specific Cloud reopen URLs", () => {

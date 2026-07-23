@@ -62,7 +62,9 @@ describe("ftuGoal provider gating", () => {
       EMPTY_STATE,
     );
     expect(result.values?.ftuGoalPending).toBe(true);
-    expect(result.text).toMatch(/discover what they value/i);
+    expect(result.text).toMatch(/acknowledge the problem/i);
+    expect(result.text).toMatch(/at most ONE useful clarifying question/i);
+    expect(result.text).toMatch(/never ask again what they want help with/i);
     expect(result.data?.affordance).toMatchObject({
       kind: "ftu_goal_discovery_pending",
     });
@@ -162,7 +164,7 @@ describe("ftu_goal_discovery output parsing", () => {
     ).toBeNull();
   });
 
-  it("normalizes valid output: trims goal, clamps confidence, empties goalFound without text", () => {
+  it("normalizes valid output and rejects non-finite confidence", () => {
     expect(
       parseFtuGoalOutput({
         goalFound: true,
@@ -179,7 +181,7 @@ describe("ftu_goal_discovery output parsing", () => {
         goal: "",
         confidence: Number.NaN,
       }),
-    ).toEqual({ goalFound: false, goal: "", confidence: 0 });
+    ).toBeNull();
   });
 });
 
@@ -281,5 +283,35 @@ describe("ftu_goal_discovery processor", () => {
       options: {},
     });
     expect(active).toBe(false);
+  });
+
+  it("keeps the lifecycle snapshot and owner fact on the same first concurrent write", async () => {
+    const runtime = createOwnerRuntimeStub();
+    await completeFirstRun(runtime);
+
+    const results = await Promise.all([
+      persistProcessor.process(
+        processorContext(runtime, {
+          goalFound: true,
+          goal: "Ship the iOS app",
+          confidence: 0.9,
+        }),
+      ),
+      persistProcessor.process(
+        processorContext(runtime, {
+          goalFound: true,
+          goal: "Train for a marathon",
+          confidence: 0.95,
+        }),
+      ),
+    ]);
+
+    expect(results.filter((result) => result !== undefined)).toHaveLength(1);
+    const record = await createFtuGoalStateStore(runtime).read();
+    const facts = await createOwnerFactStore(runtime).read();
+    expect(record.goal?.goal).toBe(facts.primaryGoal?.value);
+    expect(["Ship the iOS app", "Train for a marathon"]).toContain(
+      record.goal?.goal,
+    );
   });
 });

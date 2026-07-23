@@ -9,7 +9,7 @@
  *
  * Routes covered:
  *   POST  /api/conversations
- *     { title?, includeGreeting?, lang?, metadata? }
+ *     { title?, includeGreeting?, greetingKind?, lang?, metadata? }
  *   POST  /api/conversations/:id/messages/truncate
  *     { messageId, inclusive? }
  *   PATCH /api/conversations/:id
@@ -19,6 +19,19 @@
  */
 
 import z from "zod";
+
+export const ConversationGreetingKindSchema = z.enum([
+  "conversation",
+  "post_sign_in_activation",
+]);
+
+export type ConversationGreetingKind = z.infer<
+  typeof ConversationGreetingKindSchema
+>;
+
+export const POST_SIGN_IN_ACTIVATION_VERSION = "1" as const;
+export const POST_SIGN_IN_ACTIVATION_GREETING =
+  "You’re signed in — I’m ready. What would you like to work on first? If you’ve got a problem you want to solve, tell me what’s going on.";
 
 // Must stay in sync with the `ConversationScope` TS type in
 // `packages/agent/src/api/server-types.ts` and the runtime allowlist
@@ -80,6 +93,7 @@ export const PostConversationRequestSchema = z
   .object({
     title: z.string().optional(),
     includeGreeting: z.boolean().optional(),
+    greetingKind: ConversationGreetingKindSchema.optional(),
     lang: z.string().optional(),
     metadata: ConversationMetadataSchema.optional(),
   })

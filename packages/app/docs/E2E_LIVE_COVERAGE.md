@@ -63,13 +63,14 @@ So, in the gating lanes:
 | Onboarding (Android Capacitor device) | **REAL installed WebView + real first-run write, wired in CI dispatch** — `android-device-e2e.yml` starts a deterministic host `startApiServer`, exposes it to the emulator through `adb reverse`, then `test/android/onboarding-to-home.android.spec.ts` resets the installed app, opens the first-run remote deep link, posts `/api/first-run`, and asserts `home-launcher-surface[data-page="home"]` + chat composer. Uploads `home-landing.png`, `onboarding-to-home.mp4`, and host-agent logs. |
 | Onboarding (iOS Capacitor simulator) | **REAL installed WKWebView + real first-run write, wired in CI dispatch** — `mobile-build-smoke.yml` starts the same deterministic host `startApiServer`, installs the freshly built Simulator `.app`, clears Capacitor Preferences, then `scripts/ios-onboarding-smoke.mjs` writes an in-WebView smoke request and fires the first-run remote deep link. The app adopts the remote, posts `/api/first-run`, and returns a Preferences result asserting the home launcher + chat composer are visible. Uploads `fresh-onboarding.png`, `home-landing.png`, `onboarding-to-home.mp4`, `result.json`, and host-agent logs. WKWebView is not CDP-drivable on CI, so this uses an in-app smoke request/result instead of Playwright. |
 | Onboarding (local/remote branch) | **Reachable in the app keyless lane** — first-run paints the real chat overlay with transcript choices; `onboarding-to-home*.spec.ts` drives Local/on-device, local+Eliza Cloud inference, Other→Settings handoff, Cloud, and remote adoption without rendering the removed onboarding screen. |
-| Cloud login | In the **app** keyless lane: larp (`page.route` canned token; the stub has no `/api/cloud/login`). The **real** cloud auth contract is tested for real in `packages/test/cloud-e2e/tests/auth-errors.spec.ts` against a real cloud-api (see "Real cloud" below). |
+| Cloud login | In the **app** keyless lane: larp (`page.route` canned token; the stub has no `/api/cloud/login`). The Cloud `cloud-live.spec.ts` lane also does **not** perform interactive sign-in: it preloads a workflow API bearer with `seedCloudLiveBrowserAuth`, then proves authenticated onboarding/provisioning/chat. The real cloud-api auth endpoint contract is exercised in `packages/test/cloud-e2e/tests/auth-errors.spec.ts`; a browser/device email, OAuth, passkey, or wallet sign-in-to-session flow remains missing. |
 | Cloud provisioning | In the **app** keyless lane: `page.route` canned job, now driving a real `pending→in_progress→completed` transition. The **real, not-larp** provisioning lifecycle is tested in `packages/test/cloud-e2e/tests/provision.spec.ts` against a real cloud-api (see "Real cloud" below). |
 | Local provisioning (desktop) | **REAL, executed, gates every PR** — `check-real-local-provisioning.ts` boots an actual `AgentRuntime` on PGLite + the real app-core API and asserts it provisions and serves (no model/secret/stub). Wired into `scenario-pr.yml` as `app-core test:local-provisioning`. |
 | Local provisioning (android) | Real on-device GGUF smoke exists (`scripts/mobile-local-chat-smoke.mjs`) but runs in **no** workflow |
 | Local provisioning (web) | **Not a product capability** — web is cloud-only (`canRunLocal()` is false on prod web, `shared/src/config/cloud-only.ts`) |
 | Chat (local) | **REAL pipeline, executed, gates every PR** — `check-real-local-chat.ts` runs a real runtime + real conversation routes + real message handling + real history with a deterministic in-process model (no key/llama). Plus real-model turns in `dev-smoke.yml` + `app-live-e2e.yml`. |
-| Chat (cloud) | No real cloud-chat turn exists anywhere; "cloud chat" in `cloud-provisioning-startup.spec.ts` asserts the **local** stub fixture |
+| Chat (cloud) | `cloud-provisioning-startup.spec.ts` still asserts a local stub fixture. The gated `cloud-live.spec.ts` lane reaches a real provisioned Cloud agent and requires a non-fixture reply, but starts from a preloaded bearer rather than interactive sign-in. |
+| Post-sign-in activation → LifeOps goal | `bun run --cwd packages/scenario-runner test:live:onboarding-activation` invokes the production durable activation helper, sends the owner’s stated problem through the real live-model message loop, and requires the merged evaluator to persist FTU goal state + the canonical owner fact. It does not claim the browser/device authentication trigger; see `packages/scenario-runner/LIVE_ONBOARDING_ACTIVATION_PROOF.md`. |
 
 ## Real local provisioning in the keyless lane (no secret needed)
 
@@ -353,7 +354,7 @@ cleanly when that secret is absent (a failing real test is a signal, not larp).
 | Job | Dimension | What it proves | Trigger |
 |---|---|---|---|
 | `app-live-chat` | chat (local) | real provider model turn from the UI, exact marker `APP_LIVE_AGENT_OK` (un-skips the live half of `live-agent-chat.spec.ts`) | nightly + dispatch |
-| `cloud-live` | cloud login + provisioning + chat | `cloud-live.spec.ts`, **un-mocked**, drives real onboarding → real `agents → provision → jobs/{id}` → real `bridgeUrl` → a real (non-fixture) chat reply against real Eliza Cloud (`ELIZAOS_CLOUD_API_KEY` + `ELIZA_UI_SMOKE_CLOUD_LIVE=1`) | nightly + dispatch |
+| `cloud-live` | pre-authenticated Cloud onboarding + provisioning + chat | `cloud-live.spec.ts`, **un-mocked after auth seeding**, injects a validated workflow bearer into browser storage, then drives onboarding → real `agents → provision → jobs/{id}` → real `bridgeUrl` → a real (non-fixture) chat reply against Eliza Cloud (`ELIZAOS_CLOUD_API_KEY` + `ELIZA_UI_SMOKE_CLOUD_LIVE=1`). It does not prove interactive login. | nightly + dispatch |
 | `android-local-chat` | local provisioning (android) + chat | builds/installs the APK on an emulator, starts the native local runtime, asserts a real on-device GGUF reply (`test:sim:local-chat:android:live`) | dispatch (input `run_android_local_chat`) |
 | `android-device-e2e` / `android-onboarding-to-home` | mobile first-run (Android Capacitor) | builds/installs the APK on an emulator, starts a real deterministic host agent on `:31337`, drives the installed WebView through Remote onboarding via Playwright Android, and uploads screenshot + screenrecord artifacts | dispatch |
 | `mobile-build-smoke` / `ios-onboarding-to-home` | mobile first-run (iOS Capacitor) | builds the iOS Simulator `.app`, installs it into a booted simulator, starts a real deterministic host agent on `:31337`, drives Remote onboarding inside WKWebView via a Capacitor Preferences smoke request, and uploads screenshot + video artifacts | PR path gate + dispatch |
@@ -368,11 +369,11 @@ The Android and iOS device-onboarding lanes are intentionally keyless and
 deterministic: they prove Capacitor first-run mechanics, native WebView input,
 the real remote-agent first-run write, and the home landing state. They do
 **not** claim real Eliza Cloud sign-in because that requires a real cloud account
-token and live hosted provisioning capacity. The real cloud-api auth contract
-remains covered repo-wide by `packages/test/cloud-e2e/tests/auth-errors.spec.ts`
-in `cloud-e2e.yml`, and the app-level real cloud
-sign-in/provisioning/chat path remains the gated `cloud-live` job in
-`app-live-e2e.yml` when `ELIZAOS_CLOUD_API_KEY` is present.
+session and live hosted capacity. The cloud-api auth endpoint contract remains
+covered repo-wide by `packages/test/cloud-e2e/tests/auth-errors.spec.ts` in
+`cloud-e2e.yml`. The app `cloud-live` job proves the post-authentication
+provisioning/chat path with a preloaded workflow bearer; it must not be cited as
+evidence that interactive browser or device sign-in works.
 
 ## Follow-on real lanes (recipes, not yet wired)
 

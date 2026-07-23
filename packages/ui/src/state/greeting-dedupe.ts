@@ -16,11 +16,10 @@
  * DIFFERENT text. A text-equality dedupe then lets both through and the thread
  * shows a duplicated "Hey, I'm …" bubble (the device-review defect).
  *
- * The invariant is therefore by SOURCE, not text: at most one assistant message
- * whose `source` is the greeting marker survives, and it's the FIRST one (the
- * earliest-seeded bubble wins so the visible greeting never swaps under the user
- * once painted). This is the single dedupe seam every greeting mutation routes
- * through.
+ * The invariant is therefore by SOURCE + KIND, not text: at most one ordinary
+ * conversation greeting and one account-activation greeting survive. The
+ * activation is a separate durable product event and must not be swallowed by
+ * a legacy hello that happened to land first.
  */
 import { MESSAGE_SOURCE_AGENT_GREETING } from "@elizaos/core";
 import type { ConversationMessage } from "../api";
@@ -33,33 +32,36 @@ export function isAgentGreetingMessage(message: ConversationMessage): boolean {
   );
 }
 
+function greetingIdentity(message: ConversationMessage): string {
+  return message.greetingKind ?? "conversation";
+}
+
 /**
- * Collapse a message list to the single-greeting invariant: keep every
- * non-greeting message untouched and in order, and keep only the FIRST greeting
- * bubble (dropping any later duplicates regardless of text). Returns the SAME
- * array reference when it already satisfies the invariant, so it is safe to run
- * inside a state setter without forcing a spurious re-render.
+ * Collapse a message list to one greeting per semantic kind, keeping the first
+ * of each kind and every non-greeting message in order.
  */
 export function dedupeGreetings(
   messages: ConversationMessage[],
 ): ConversationMessage[] {
-  let seenGreeting = false;
+  const seenGreetings = new Set<string>();
   let duplicateFound = false;
   for (const message of messages) {
     if (!isAgentGreetingMessage(message)) continue;
-    if (seenGreeting) {
+    const identity = greetingIdentity(message);
+    if (seenGreetings.has(identity)) {
       duplicateFound = true;
       break;
     }
-    seenGreeting = true;
+    seenGreetings.add(identity);
   }
   if (!duplicateFound) return messages;
 
-  let kept = false;
+  const kept = new Set<string>();
   return messages.filter((message) => {
     if (!isAgentGreetingMessage(message)) return true;
-    if (kept) return false;
-    kept = true;
+    const identity = greetingIdentity(message);
+    if (kept.has(identity)) return false;
+    kept.add(identity);
     return true;
   });
 }
@@ -74,6 +76,15 @@ export function appendGreetingOnce(
   messages: ConversationMessage[],
   greeting: ConversationMessage,
 ): ConversationMessage[] {
-  if (messages.some(isAgentGreetingMessage)) return messages;
+  const incomingIdentity = greetingIdentity(greeting);
+  if (
+    messages.some(
+      (message) =>
+        isAgentGreetingMessage(message) &&
+        greetingIdentity(message) === incomingIdentity,
+    )
+  ) {
+    return messages;
+  }
   return [...messages, greeting];
 }

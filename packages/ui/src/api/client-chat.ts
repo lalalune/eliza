@@ -531,13 +531,8 @@ declare module "./client-base" {
     requestGreeting(
       id: string,
       lang?: string,
-    ): Promise<{
-      text: string;
-      agentName: string;
-      generated: boolean;
-      persisted?: boolean;
-      localInference?: LocalInferenceChatMetadata;
-    }>;
+      greetingKind?: ConversationGreeting["greetingKind"],
+    ): Promise<ConversationGreeting>;
     renameConversation(
       id: string,
       title: string,
@@ -1006,6 +1001,7 @@ ElizaClient.prototype.createConversation = async function (
       options?.bootstrapGreeting === true
         ? { includeGreeting: true }
         : {}),
+      ...(options?.greetingKind ? { greetingKind: options.greetingKind } : {}),
       ...(typeof options?.lang === "string" && options.lang.trim()
         ? { lang: options.lang.trim() }
         : {}),
@@ -1336,17 +1332,18 @@ ElizaClient.prototype.requestGreeting = async function (
   this: ElizaClient,
   id,
   lang?,
+  greetingKind?,
 ) {
-  const qs = lang ? `?lang=${encodeURIComponent(lang)}` : "";
-  const response = await this.fetch<{
-    text: string;
-    agentName: string;
-    generated: boolean;
-    persisted?: boolean;
-    localInference?: LocalInferenceChatMetadata;
-  }>(`/api/conversations/${encodeURIComponent(id)}/greeting${qs}`, {
-    method: "POST",
-  });
+  const search = new URLSearchParams();
+  if (lang) search.set("lang", lang);
+  if (greetingKind) search.set("greetingKind", greetingKind);
+  const query = search.size > 0 ? `?${search.toString()}` : "";
+  const response = await this.fetch<ConversationGreeting>(
+    `/api/conversations/${encodeURIComponent(id)}/greeting${query}`,
+    {
+      method: "POST",
+    },
+  );
   return {
     ...response,
     text: this.normalizeGreetingText(response.text),

@@ -527,7 +527,7 @@ describe("ElizaSandboxService shared runtime bridge", () => {
         "findRunningSandbox",
       ).mockResolvedValue(sandbox);
       const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-      const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+      const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
         undefined,
       );
 
@@ -560,11 +560,11 @@ describe("ElizaSandboxService shared runtime bridge", () => {
           },
         });
         expect(historyGetSpy).toHaveBeenCalled();
-        expect(historyUpsertSpy).not.toHaveBeenCalled();
+        expect(historyAppendSpy).not.toHaveBeenCalled();
       } finally {
         findRunningSandboxSpy.mockRestore();
         historyGetSpy.mockRestore();
-        historyUpsertSpy.mockRestore();
+        historyAppendSpy.mockRestore();
       }
     },
   );
@@ -579,7 +579,7 @@ describe("ElizaSandboxService shared runtime bridge", () => {
         "findRunningSandbox",
       ).mockResolvedValue(sandbox);
       const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-      const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+      const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
         undefined,
       );
 
@@ -605,11 +605,11 @@ describe("ElizaSandboxService shared runtime bridge", () => {
         expect(body).toContain("no shared model configured");
         expect(body).toContain("event: done");
         expect(historyGetSpy).toHaveBeenCalled();
-        expect(historyUpsertSpy).not.toHaveBeenCalled();
+        expect(historyAppendSpy).not.toHaveBeenCalled();
       } finally {
         findRunningSandboxSpy.mockRestore();
         historyGetSpy.mockRestore();
-        historyUpsertSpy.mockRestore();
+        historyAppendSpy.mockRestore();
       }
     },
   );

@@ -16,6 +16,7 @@
 
 import type { IAgentRuntime } from "@elizaos/core";
 import { asCacheRuntime } from "../runtime-cache.js";
+import { withRuntimeTransitionLock } from "../runtime-transition-lock.js";
 
 export type FtuGoalStatus = "pending" | "complete";
 
@@ -37,8 +38,16 @@ export interface FtuGoalRecord {
 
 export interface FtuGoalStateStore {
   read(): Promise<FtuGoalRecord>;
-  /** Flip to `complete` with the discovered goal snapshot. Idempotent: a second call overwrites the snapshot but the status stays `complete`. */
+  /** Flip to `complete` with the discovered goal snapshot. The first valid write wins. */
   complete(goal: DiscoveredFtuGoal): Promise<FtuGoalRecord>;
+  /**
+   * Run the durable side effect and lifecycle write exactly once while the
+   * record is pending. Concurrent callers receive the winning record.
+   */
+  completeIfPending(
+    goal: DiscoveredFtuGoal,
+    onFirstCompletion?: () => Promise<void>,
+  ): Promise<{ record: FtuGoalRecord; didComplete: boolean }>;
   /** Clear the lifecycle back to `pending` (tests / owner-requested re-discovery). */
   reset(): Promise<void>;
 }
@@ -99,19 +108,44 @@ export function createFtuGoalStateStore(
     return normalizeRecord(stored);
   };
 
+  const completeIfPending = async (
+    goal: DiscoveredFtuGoal,
+    onFirstCompletion?: () => Promise<void>,
+  ): Promise<{ record: FtuGoalRecord; didComplete: boolean }> => {
+    const normalized = normalizeGoal(goal);
+    if (!normalized) {
+      throw new Error(
+        "[ftu-goal-state] complete() requires a goal with goal text, confidence in [0,1], and an ISO discoveredAt",
+      );
+    }
+
+    return await withRuntimeTransitionLock(
+      runtime,
+      FTU_GOAL_CACHE_KEY,
+      async () => {
+        const current = await read();
+        if (current.status === "complete") {
+          return { record: current, didComplete: false };
+        }
+        if (onFirstCompletion) {
+          await onFirstCompletion();
+        }
+        const next: FtuGoalRecord = { status: "complete", goal: normalized };
+        await cache.setCache<FtuGoalRecord>(FTU_GOAL_CACHE_KEY, next);
+        return {
+          record: { status: next.status, goal: { ...normalized } },
+          didComplete: true,
+        };
+      },
+    );
+  };
+
   return {
     read,
     async complete(goal: DiscoveredFtuGoal): Promise<FtuGoalRecord> {
-      const normalized = normalizeGoal(goal);
-      if (!normalized) {
-        throw new Error(
-          "[ftu-goal-state] complete() requires a goal with goal text, confidence in [0,1], and an ISO discoveredAt",
-        );
-      }
-      const next: FtuGoalRecord = { status: "complete", goal: normalized };
-      await cache.setCache<FtuGoalRecord>(FTU_GOAL_CACHE_KEY, next);
-      return { status: next.status, goal: { ...normalized } };
+      return (await completeIfPending(goal)).record;
     },
+    completeIfPending,
     async reset(): Promise<void> {
       if (typeof cache.deleteCache === "function") {
         await cache.deleteCache(FTU_GOAL_CACHE_KEY);

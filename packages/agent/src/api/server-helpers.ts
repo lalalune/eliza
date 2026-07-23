@@ -36,11 +36,6 @@ import {
   MAX_CHAT_MEDIA_BASE64_BYTES as MAX_MEDIA_DATA_BYTES,
 } from "@elizaos/shared/chat-upload-limits";
 import type { ConversationMetadata } from "@elizaos/shared/contracts/conversation-routes";
-import {
-  normalizeFirstRunProviderId,
-  resolveDeploymentTargetInConfig,
-  resolveServiceRoutingInConfig,
-} from "@elizaos/shared/contracts/first-run-options";
 import type { ElizaConfig } from "../config/config.ts";
 import { resolveStateDir } from "../config/paths.ts";
 import {
@@ -212,48 +207,10 @@ export interface ConversationMeta {
 // First-run & config helpers
 // ---------------------------------------------------------------------------
 
-export function hasPersistedFirstRunState(config: ElizaConfig): boolean {
-  if (config.meta?.firstRunComplete === true) {
-    return true;
-  }
-
-  const deploymentTarget = resolveDeploymentTargetInConfig(
-    config as Record<string, unknown>,
-  );
-  const llmText = resolveServiceRoutingInConfig(
-    config as Record<string, unknown>,
-  )?.llmText;
-  const backend = normalizeFirstRunProviderId(llmText?.backend);
-  const remoteApiBase =
-    llmText?.remoteApiBase?.trim() ?? deploymentTarget.remoteApiBase?.trim();
-  const hasCompleteCanonicalRouting =
-    (llmText?.transport === "direct" &&
-      Boolean(backend && backend !== "elizacloud")) ||
-    (llmText?.transport === "remote" && Boolean(remoteApiBase)) ||
-    (llmText?.transport === "cloud-proxy" &&
-      backend === "elizacloud" &&
-      Boolean(llmText.smallModel?.trim() && llmText.largeModel?.trim())) ||
-    (deploymentTarget.runtime === "remote" &&
-      Boolean(deploymentTarget.remoteApiBase?.trim()));
-
-  if (hasCompleteCanonicalRouting) {
-    return true;
-  }
-
-  const agents = config.agents;
-  if (!agents) {
-    return false;
-  }
-
-  if (Array.isArray(agents.list) && agents.list.length > 0) {
-    return true;
-  }
-
-  return Boolean(
-    agents.defaults?.workspace?.trim() ||
-      agents.defaults?.adminEntityId?.trim(),
-  );
-}
+export {
+  hasPersistedFirstRunState,
+  isAppFirstRunComplete,
+} from "./first-run-completion.ts";
 
 const APP_OWNER_NAME_MAX_LENGTH = 60;
 

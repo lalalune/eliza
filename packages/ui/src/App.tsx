@@ -113,6 +113,7 @@ import { useRole } from "./hooks/useRole";
 import { useSecretsManagerModalState } from "./hooks/useSecretsManagerModal";
 import { useSecretsManagerShortcut } from "./hooks/useSecretsManagerShortcut";
 import { cn } from "./lib/utils";
+import { resolveUnauthenticatedAuthSurface } from "./state/unauthenticated-auth-surface";
 import {
   APPS_ENABLED,
   getAppSlugFromPath,
@@ -1632,6 +1633,7 @@ function ViewRouter({
   // for a fixed path, tabFromPath's answer only changes when a registration
   // lands.
   const shellPageRegistryVersion = useAppShellPageRegistryVersion();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the registry version is an event counter whose change intentionally retriggers path resolution
   useEffect(() => {
     // The version is the re-run trigger (same pattern as useResolvedDynamicPage).
     void shellPageRegistryVersion;
@@ -2078,6 +2080,7 @@ function AppContent() {
     uiShellMode,
     uiLanguage,
     t,
+    handleCloudLogin,
   } = useAppSelectorShallow((s) => ({
     startupError: s.startupError,
     startupCoordinator: s.startupCoordinator,
@@ -2096,6 +2099,7 @@ function AppContent() {
     uiShellMode: s.uiShellMode,
     uiLanguage: s.uiLanguage,
     t: s.t,
+    handleCloudLogin: s.handleCloudLogin,
   }));
   const isPopout = useIsPopout();
   const shellMode = useShellMode();
@@ -2799,12 +2803,11 @@ function AppContent() {
       );
     }
     if (authState.phase === "unauthenticated") {
-      // #15132: a stale post-upgrade agent credential with a valid cloud session
-      // is recoverable, so hold the startup surface while the re-pair runs (it
-      // ends in a full-page navigation to `/pair`) instead of flashing the
-      // password wall. Recovery drops back to "idle" if it can't proceed, and
-      // the wall renders then.
-      if (agentSessionRecoveryStatus === "recovering") {
+      const authSurface = resolveUnauthenticatedAuthSurface(
+        agentSessionRecoveryStatus,
+        isElizaCloudHosted,
+      );
+      if (authSurface === "recovering") {
         return (
           <BugReportProvider value={bugReport}>
             <StartupScreen />
@@ -2812,10 +2815,20 @@ function AppContent() {
           </BugReportProvider>
         );
       }
-      if (isElizaCloudHosted) {
+      if (authSurface === "cloud-sign-in") {
         return (
           <BugReportProvider value={bugReport}>
-            <CloudHostedAgentAuthNotice />
+            <CloudHostedAgentAuthNotice
+              onReauthenticate={
+                agentSessionRecoveryStatus === "cloud-sign-in-required"
+                  ? async () => {
+                      await handleCloudLogin();
+                      retryStartup();
+                      refetchAuth();
+                    }
+                  : undefined
+              }
+            />
             <BugReportModal />
           </BugReportProvider>
         );

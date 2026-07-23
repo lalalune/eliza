@@ -53,6 +53,13 @@ export {
 } from "./dispatch-route.ts";
 export * from "./documents-service-loader.ts";
 export * from "./early-logs.ts";
+// The Android in-process bridge serves /api/first-run/* itself (the stdio
+// dispatch bypasses the HTTP server layer that owns those routes) and needs
+// the same completion predicate the server uses.
+export {
+  hasPersistedFirstRunState,
+  isAppFirstRunComplete,
+} from "./first-run-completion.ts";
 export * from "./memory-bounds.ts";
 export * from "./memory-routes.ts";
 export * from "./model-catalog.ts";
@@ -74,10 +81,6 @@ export {
   matchPluginRoutePath,
   tryHandleRuntimePluginRoute,
 } from "./runtime-plugin-routes.ts";
-// The Android in-process bridge serves /api/first-run/* itself (the stdio
-// dispatch bypasses the HTTP server layer that owns those routes) and needs
-// the same completion predicate the server uses.
-export { hasPersistedFirstRunState } from "./server-helpers.ts";
 export * from "./subscription-routes.ts";
 export * from "./terminal-run-limits.ts";
 export * from "./training-backend-check.ts";

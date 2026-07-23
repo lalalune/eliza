@@ -16,7 +16,11 @@ import { createHash } from "node:crypto";
 
 const requireUserOrApiKeyWithOrgLookup = mock(
   async <T>(_: unknown, lookup: (organizationId: string) => Promise<T>) => ({
-    user: { organization_id: "org-1", steward_id: "steward-user-1" },
+    user: {
+      id: "user-1",
+      organization_id: "org-1",
+      steward_id: "steward-user-1",
+    },
     orgLookupResult: await lookup("org-1"),
   }),
 );
@@ -88,6 +92,7 @@ mock.module("../../cache/client", () => ({
 // validateApiKey double for the cache-HIT re-validation gate.
 let validateBehavior: () => Promise<unknown> = async () => ({
   is_active: true,
+  user_id: "user-1",
   organization_id: "org-1",
   expires_at: null,
 });
@@ -125,6 +130,7 @@ function agent(overrides: Record<string, unknown> = {}) {
   return {
     id: "agent-1",
     organization_id: "org-1",
+    user_id: "user-1",
     execution_tier: "shared",
     status: "running",
     bridge_url: null,
@@ -158,7 +164,12 @@ beforeEach(() => {
   scopeHashPrefixBehavior = async () => "keyhashpref0000";
   sessionHashPrefixBehavior = async () => null;
   sessionRevalidateBehavior = async () => true;
-  validateBehavior = async () => ({ is_active: true, organization_id: "org-1", expires_at: null });
+  validateBehavior = async () => ({
+    is_active: true,
+    user_id: "user-1",
+    organization_id: "org-1",
+    expires_at: null,
+  });
 });
 
 describe("resolveSharedAgent", () => {
@@ -178,6 +189,7 @@ describe("resolveSharedAgent", () => {
       agentId: "agent-1",
       orgId: "org-1",
       agentName: "Shared Agent",
+      callerUserId: "user-1",
     });
     expect(findByIdAndOrg).toHaveBeenCalledWith("agent-1", "org-1");
   });
@@ -201,7 +213,12 @@ describe("resolveSharedAgent", () => {
       CacheKeys.apiKey.validation(
         createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
       ),
-      { is_active: true, organization_id: "org-1", expires_at: null },
+      {
+        is_active: true,
+        user_id: "user-1",
+        organization_id: "org-1",
+        expires_at: null,
+      },
     );
 
     await expect(
@@ -275,7 +292,11 @@ describe("resolveSharedAgent", () => {
 
     requireUserOrApiKeyWithOrgLookup.mockImplementation(
       async <T>(_: unknown, lookup: (organizationId: string) => Promise<T>) => ({
-        user: { organization_id: "org-1", steward_id: "steward-user-1" },
+        user: {
+          id: "user-1",
+          organization_id: "org-1",
+          steward_id: "steward-user-1",
+        },
         orgLookupResult: await lookup("org-1"),
       }),
     );
@@ -329,7 +350,10 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
     expect(cacheSet).toHaveBeenCalledTimes(1);
     // Cached bundle carries the org + agent so the next hit skips the DB waves.
     const [, cachedValue] = cacheSet.mock.calls[0];
-    expect(cachedValue).toMatchObject({ orgId: "org-1" });
+    expect(cachedValue).toMatchObject({
+      orgId: "org-1",
+      callerUserId: "user-1",
+    });
   });
 
   test("second cold-session hit skips the user/org+agent DB waves", async () => {
@@ -358,6 +382,7 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
     // Key revoked between turns: validation now returns inactive.
     validateBehavior = async () => ({
       is_active: false,
+      user_id: "user-1",
       organization_id: "org-1",
       expires_at: null,
     });
@@ -375,7 +400,24 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
     // Key moved to a different org (detach): the cached org no longer matches.
     validateBehavior = async () => ({
       is_active: true,
+      user_id: "user-1",
       organization_id: "org-2",
+      expires_at: null,
+    });
+
+    await resolveSharedAgent(apiKeyContext("agent-1") as never);
+    expect(requireUserOrApiKeyWithOrgLookup).toHaveBeenCalledTimes(1);
+  });
+
+  test("a different user in the same org cannot inherit the cached caller identity", async () => {
+    findByIdAndOrg.mockResolvedValue(agent());
+    await resolveSharedAgent(apiKeyContext("agent-1") as never);
+    requireUserOrApiKeyWithOrgLookup.mockClear();
+
+    validateBehavior = async () => ({
+      is_active: true,
+      user_id: "user-2",
+      organization_id: "org-1",
       expires_at: null,
     });
 
@@ -429,7 +471,12 @@ describe("resolveSharedAgent sliding TTL (COLDPATH-FIX-2026-07-22)", () => {
       CacheKeys.apiKey.validation(
         createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
       ),
-      { is_active: true, organization_id: "org-1", expires_at: null },
+      {
+        is_active: true,
+        user_id: "user-1",
+        organization_id: "org-1",
+        expires_at: null,
+      },
     );
     const background: Promise<unknown>[] = [];
     // Second hit within the cap: served from cache AND refreshes the TTL under
@@ -481,6 +528,7 @@ describe("resolveSharedAgent sliding TTL (COLDPATH-FIX-2026-07-22)", () => {
     // Key revoked between turns.
     validateBehavior = async () => ({
       is_active: false,
+      user_id: "user-1",
       organization_id: "org-1",
       expires_at: null,
     });
@@ -510,7 +558,10 @@ describe("resolveSharedAgent stampede single-flight (CONTENTION-2026-07-22)", ()
       await gateOpened;
       const a = agent();
       const orgLookupResult = await lookup((a as { organization_id: string }).organization_id);
-      return { user: { organization_id: "org-1" }, orgLookupResult };
+      return {
+        user: { id: "user-1", organization_id: "org-1" },
+        orgLookupResult,
+      };
     });
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -532,7 +583,11 @@ describe("resolveSharedAgent stampede single-flight (CONTENTION-2026-07-22)", ()
     // Restore the default implementation (mockClear keeps impls across tests).
     requireUserOrApiKeyWithOrgLookup.mockImplementation(
       async (_c: unknown, lookup: (o: string) => unknown) => ({
-        user: { organization_id: "org-1", steward_id: "steward-user-1" },
+        user: {
+          id: "user-1",
+          organization_id: "org-1",
+          steward_id: "steward-user-1",
+        },
         orgLookupResult: await lookup("org-1"),
       }),
     );
@@ -559,6 +614,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
     expect(String(cacheKey)).toContain("s:sesshashpref0000");
     expect(cachedValue).toMatchObject({
       orgId: "org-1",
+      callerUserId: "user-1",
       stewardUserId: "steward-user-1",
     });
   });
@@ -636,6 +692,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
       const key = CacheKeys.sharedAgentScope.resolve("keyhashpref0000", "agent-1");
       const liveEntry = {
         orgId: "org-1",
+        callerUserId: "user-1",
         agent: agent({ created_at: CREATED, updated_at: CREATED, ...agentOverrides }),
         firstWrittenAtMs: Date.now(),
       };

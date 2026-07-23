@@ -55,6 +55,15 @@ function makeRuntime(adapter: InMemoryDatabaseAdapter): unknown {
         count: params.limit,
       });
     },
+    async getMemoryById(id: UUID) {
+      return (await adapter.getMemoriesByIds([id]))[0] ?? null;
+    },
+    async getCache<T>(key: string): Promise<T | undefined> {
+      return (await adapter.getCaches<T>([key])).get(key);
+    },
+    async setCache<T>(key: string, value: T) {
+      return adapter.setCaches([{ key, value }]);
+    },
     // World/room plumbing exercised by ensureConversationRoom on the greeting
     // route. The world is a mutable in-shim record so ownership/role writes
     // round-trip like the real adapter's.
@@ -113,12 +122,18 @@ interface Captured {
   body: Record<string, unknown> & { error?: string; text?: string };
 }
 
-function greetingRequest(state: ConversationRouteState): Promise<Captured> {
+function greetingRequest(
+  state: ConversationRouteState,
+  greetingKind?: string,
+): Promise<Captured> {
   return new Promise((resolve) => {
     const captured: Partial<Captured> = {};
+    const query = greetingKind
+      ? `?greetingKind=${encodeURIComponent(greetingKind)}`
+      : "";
     const ctx = {
       req: {
-        url: `/api/conversations/${CONV_ID}/greeting`,
+        url: `/api/conversations/${CONV_ID}/greeting${query}`,
         headers: { host: "localhost" },
       },
       res: {},
@@ -192,5 +207,38 @@ describe("POST /api/conversations/:id/greeting — concurrent ensure coalescing"
 
     const rows = await greetingRows(adapter);
     expect(rows).toHaveLength(1);
+  });
+
+  it("persists a stable post-sign-in activation through the real route", async () => {
+    const state = makeState(adapter);
+    const first = await greetingRequest(state, "post_sign_in_activation");
+    const restored = await greetingRequest(
+      makeState(adapter),
+      "post_sign_in_activation",
+    );
+
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({
+      generated: true,
+      persisted: true,
+      source: MESSAGE_SOURCE_AGENT_GREETING,
+      greetingKind: "post_sign_in_activation",
+      activationVersion: "1",
+      conversationId: CONV_ID,
+    });
+    expect(String(first.body.text)).toContain(
+      "What would you like to work on first",
+    );
+    expect(restored.body.messageId).toBe(first.body.messageId);
+    expect(restored.body.timestamp).toBe(first.body.timestamp);
+    expect(restored.body.text).toBe("");
+    expect(restored.body.generated).toBe(false);
+    expect(restored.body.persisted).toBe(false);
+  });
+
+  it("rejects an unknown greeting kind at the HTTP boundary", async () => {
+    const response = await greetingRequest(makeState(adapter), "surprise");
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("Invalid greetingKind");
   });
 });

@@ -4,9 +4,11 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 
+import { agentActivationGreetingsRepository } from "../../db/repositories/agent-activation-greetings";
 import type { AgentSandbox } from "../../db/repositories/agent-sandboxes";
 import { agentSandboxesRepository } from "../../db/repositories/agent-sandboxes";
 import { sharedRuntimeHistoryRepository } from "../../db/repositories/shared-runtime-history";
+import { sharedRuntimeTurnClaimsRepository } from "../../db/repositories/shared-runtime-turn-claims";
 import { runWithCloudBindings } from "../runtime/cloud-bindings";
 import * as realAiBillingNs from "./ai-billing";
 import * as realAiBillingRecordsNs from "./ai-billing-records";
@@ -323,7 +325,7 @@ describe("ElizaSandboxService shared runtime billing", () => {
       "findRunningSandbox",
     ).mockResolvedValue(sandbox);
     const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-    const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+    const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
       undefined,
     );
 
@@ -388,11 +390,169 @@ describe("ElizaSandboxService shared runtime billing", () => {
         }),
       );
       expect(historyGetSpy).toHaveBeenCalled();
-      expect(historyUpsertSpy).toHaveBeenCalled();
+      expect(historyAppendSpy).toHaveBeenCalled();
     } finally {
       findRunningSandboxSpy.mockRestore();
       historyGetSpy.mockRestore();
-      historyUpsertSpy.mockRestore();
+      historyAppendSpy.mockRestore();
+    }
+  });
+
+  test("concurrent retries with one stable client id run and bill the model exactly once", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const sandbox = sharedSandbox();
+    const findRunningSandboxSpy = spyOn(
+      agentSandboxesRepository,
+      "findRunningSandbox",
+    ).mockResolvedValue(sandbox);
+    let processingToken: string | undefined;
+    let completedReply: string | undefined;
+    const acquireSpy = spyOn(sharedRuntimeTurnClaimsRepository, "acquire").mockImplementation(
+      async (input) => {
+        if (completedReply) {
+          return { status: "completed", assistantReply: completedReply };
+        }
+        if (!processingToken) {
+          processingToken = input.claimToken;
+          return {
+            status: "claimed",
+            claimToken: input.claimToken,
+            history: [],
+          };
+        }
+        return { status: "waiting" };
+      },
+    );
+    const completeSpy = spyOn(sharedRuntimeTurnClaimsRepository, "complete").mockImplementation(
+      async (input) => {
+        expect(input.claimToken).toBe(processingToken);
+        completedReply = input.assistantText;
+        return { assistantReply: input.assistantText, persisted: true };
+      },
+    );
+    const abandonSpy = spyOn(sharedRuntimeTurnClaimsRepository, "abandon").mockResolvedValue(false);
+    let finishModel!: () => void;
+    const modelGate = new Promise<void>((resolve) => {
+      finishModel = resolve;
+    });
+    let markModelStarted!: () => void;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    runSharedAgentTurn.mockImplementationOnce(async () => {
+      markModelStarted();
+      await modelGate;
+      return {
+        reply: "one durable reply",
+        history: [
+          { role: "user" as const, content: "same problem" },
+          { role: "assistant" as const, content: "one durable reply" },
+        ],
+        model: "gpt-oss-120b",
+        degraded: false,
+        usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18 },
+      };
+    });
+
+    try {
+      const service = new ElizaSandboxService();
+      const rpc = {
+        jsonrpc: "2.0" as const,
+        id: "stable-retry",
+        method: "message.send",
+        params: {
+          text: "same problem",
+          clientMessageId: "stable-client-turn",
+        },
+      };
+      const first = runWithCloudBindings({ CEREBRAS_API_KEY: "test-key" }, () =>
+        service.bridge(sandbox.id, sandbox.organization_id, rpc),
+      );
+      await modelStarted;
+      const retry = runWithCloudBindings({ CEREBRAS_API_KEY: "test-key" }, () =>
+        service.bridge(sandbox.id, sandbox.organization_id, rpc),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      finishModel();
+
+      const [firstResponse, retryResponse] = await Promise.all([first, retry]);
+      expect(firstResponse.result?.text).toBe("one durable reply");
+      expect(retryResponse.result?.text).toBe("one durable reply");
+      expect(runSharedAgentTurn).toHaveBeenCalledTimes(1);
+      expect(reserveCredits).toHaveBeenCalledTimes(1);
+      expect(billUsage).toHaveBeenCalledTimes(1);
+      expect(completeSpy).toHaveBeenCalledTimes(1);
+      expect(acquireSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(abandonSpy).not.toHaveBeenCalled();
+    } finally {
+      finishModel();
+      findRunningSandboxSpy.mockRestore();
+      acquireSpy.mockRestore();
+      completeSpy.mockRestore();
+      abandonSpy.mockRestore();
+    }
+  });
+
+  test("a goal-state read failure releases an admitted stable turn", async () => {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const sandbox = sharedSandbox();
+    const findRunningSandboxSpy = spyOn(
+      agentSandboxesRepository,
+      "findRunningSandbox",
+    ).mockResolvedValue(sandbox);
+    const acquireSpy = spyOn(
+      sharedRuntimeTurnClaimsRepository,
+      "acquire",
+    ).mockImplementation(async (input) => ({
+      status: "claimed",
+      claimToken: input.claimToken,
+      history: [],
+    }));
+    const abandonSpy = spyOn(
+      sharedRuntimeTurnClaimsRepository,
+      "abandon",
+    ).mockResolvedValue(true);
+    const activationSpy = spyOn(
+      agentActivationGreetingsRepository,
+      "find",
+    ).mockRejectedValue(new Error("activation database unavailable"));
+
+    try {
+      const response = await runWithCloudBindings(
+        { CEREBRAS_API_KEY: "test-key" },
+        () =>
+          new ElizaSandboxService().bridge(
+            sandbox.id,
+            sandbox.organization_id,
+            {
+              jsonrpc: "2.0",
+              id: "activation-read-failure",
+              method: "message.send",
+              params: {
+                text: "my launch problem",
+                userId: sandbox.user_id,
+                clientMessageId: "stable-activation-read-failure",
+              },
+            },
+          ),
+      );
+
+      expect(response.result).toBeUndefined();
+      expect(response.error?.message).toBe("Sandbox bridge is unreachable");
+      expect(acquireSpy).toHaveBeenCalledTimes(1);
+      expect(abandonSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: sandbox.id,
+          clientMessageId: "stable-activation-read-failure",
+        }),
+      );
+      expect(runSharedAgentTurn).not.toHaveBeenCalled();
+      expect(reserveCredits).not.toHaveBeenCalled();
+    } finally {
+      findRunningSandboxSpy.mockRestore();
+      acquireSpy.mockRestore();
+      abandonSpy.mockRestore();
+      activationSpy.mockRestore();
     }
   });
 
@@ -502,7 +662,7 @@ describe("ElizaSandboxService shared runtime billing", () => {
       "findRunningSandbox",
     ).mockResolvedValue(sandbox);
     const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-    const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+    const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
       undefined,
     );
     runSharedAgentTurnStream.mockImplementationOnce(async () => ({
@@ -523,12 +683,12 @@ describe("ElizaSandboxService shared runtime billing", () => {
       expect(response).toBeInstanceOf(Response);
       expect(await response?.text()).toContain("Shared runtime stream did not start");
       expect(reconcileReservation).toHaveBeenCalledWith(0);
-      expect(historyUpsertSpy).not.toHaveBeenCalled();
+      expect(historyAppendSpy).not.toHaveBeenCalled();
       expect(billUsage).not.toHaveBeenCalled();
     } finally {
       findRunningSandboxSpy.mockRestore();
       historyGetSpy.mockRestore();
-      historyUpsertSpy.mockRestore();
+      historyAppendSpy.mockRestore();
     }
   });
 
@@ -540,7 +700,7 @@ describe("ElizaSandboxService shared runtime billing", () => {
       "findRunningSandbox",
     ).mockResolvedValue(sandbox);
     const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-    const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+    const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
       undefined,
     );
     let finishModel!: () => void;
@@ -601,7 +761,7 @@ describe("ElizaSandboxService shared runtime billing", () => {
       expect(events[1]?.data.fullText).toBe("metered reply");
       expect(events[2]?.data.text).toBe("metered reply");
       expect(reserveCredits).toHaveBeenCalledTimes(1);
-      expect(historyUpsertSpy).toHaveBeenCalledTimes(1);
+      expect(historyAppendSpy).toHaveBeenCalledTimes(1);
       expect(billUsage).toHaveBeenCalledWith(
         expect.objectContaining({
           organizationId: sandbox.organization_id,
@@ -619,7 +779,7 @@ describe("ElizaSandboxService shared runtime billing", () => {
       finishModel();
       findRunningSandboxSpy.mockRestore();
       historyGetSpy.mockRestore();
-      historyUpsertSpy.mockRestore();
+      historyAppendSpy.mockRestore();
     }
   });
 });

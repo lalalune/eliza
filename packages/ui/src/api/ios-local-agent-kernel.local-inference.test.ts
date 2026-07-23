@@ -388,15 +388,28 @@ describe("iOS local-agent local inference flow", () => {
       `/api/conversations/${created.conversation.id}/greeting`,
     )) as {
       text: string;
+      generated?: boolean;
+      persisted?: boolean;
+      greetingKind?: string;
       localInference?: { status?: string; modelId?: string | null };
     };
 
     expect(greeting.text).not.toContain("I'm running locally on this device.");
     expect(greeting.text.toLowerCase()).toContain("downloading");
+    expect(greeting.generated).toBe(true);
+    expect(greeting.persisted).toBe(false);
+    expect(greeting).not.toHaveProperty("greetingKind");
     expect(greeting.localInference).toMatchObject({
       status: "downloading",
       modelId: "eliza-1-4b",
     });
+    await expect(
+      jsonRequest(
+        kernel,
+        "GET",
+        `/api/conversations/${created.conversation.id}/messages`,
+      ),
+    ).resolves.toEqual({ messages: [] });
   });
 
   it("fails an Eliza-1 bundle download when a native SHA256 check mismatches", async () => {

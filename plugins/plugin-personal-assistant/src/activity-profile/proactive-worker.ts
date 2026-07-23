@@ -24,7 +24,10 @@
  * from here.
  */
 
-import { loadElizaConfig } from "@elizaos/agent";
+import {
+  isAppFirstRunComplete as isConfiguredAppFirstRunComplete,
+  loadElizaConfig,
+} from "@elizaos/agent";
 import type { IAgentRuntime, Task, TaskMetadata, UUID } from "@elizaos/core";
 import { logger, ModelType, stringToUuid } from "@elizaos/core";
 import { loadLifeOpsAppState } from "../lifeops/app-state.js";
@@ -60,11 +63,7 @@ const TASK_DESCRIPTION =
   "Activity-profile maintenance + background-planner tick (proactive dispatch is owned by the scheduled-task runner)";
 
 export function isAppFirstRunComplete(): boolean {
-  try {
-    return loadElizaConfig().meta?.firstRunComplete === true;
-  } catch {
-    return false;
-  }
+  return isConfiguredAppFirstRunComplete(loadElizaConfig());
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -26,7 +26,13 @@ export { type CachedAgentSandbox, rehydrateCachedAgentDates } from "./cached-age
 
 export type ResolvedSharedAgent =
   | { error: string; status: 400 | 404 | 503 }
-  | { agent: AgentSandbox; agentId: string; orgId: string; agentName: string };
+  | {
+      agent: AgentSandbox;
+      agentId: string;
+      orgId: string;
+      agentName: string;
+      callerUserId: string;
+    };
 
 export interface ResolveSharedAgentOptions {
   /**
@@ -39,9 +45,9 @@ export interface ResolveSharedAgentOptions {
 }
 
 /**
- * What the shared-agent SCOPE cache stores (COLDPATH-FIX-2026-07-21): the two
- * facts the cold auth+scope gate produces — the caller's organization id and
- * the org-scoped agent row. Everything else in the success return is derived
+ * What the shared-agent SCOPE cache stores (COLDPATH-FIX-2026-07-21): the facts
+ * the cold auth+scope gate produces — caller user, caller organization, and the
+ * org-scoped agent row. Everything else in the success return is derived
  * cheaply in-memory from these, so a cache hit reproduces the exact same result
  * WITHOUT the two cold Hyperdrive waves (key validation + user/org hydration +
  * agent lookup). Only cached for a settled SHARED-tier agent — never for the
@@ -50,6 +56,8 @@ export interface ResolveSharedAgentOptions {
  */
 interface CachedSharedAgentScope {
   orgId: string;
+  /** Local Cloud user id bound to the credential that populated this scope. */
+  callerUserId: string;
   agent: CachedAgentSandbox;
   /**
    * Steward user id the entry was written for, present ONLY on session-keyed
@@ -99,13 +107,15 @@ function isNegativeScopeEntry(
  * hydration (COLDPATH-FIX-2026-07-21). Validates the presented API key via the
  * revoke-invalidated validation cache (a 1-read warm check, or one cold DB trip
  * on a genuinely cold validation entry) and confirms it still belongs to the
- * cached org. Returns false on any not-OK state so the caller falls back to the
- * full authoritative gate — the exact 401/403 taxonomy is preserved, we only
- * fast-path the HAPPY case. Session/JWT requests never reach here (no api key).
+ * cached org and caller. Returns false on any not-OK state so the caller falls
+ * back to the full authoritative gate — the exact 401/403 taxonomy is
+ * preserved, we only fast-path the HAPPY case. Session/JWT requests never
+ * reach here (no api key).
  */
 async function revalidateCachedScope(
   c: Context<AppEnv>,
   cachedOrgId: string,
+  cachedCallerUserId: string,
   cacheOnly: boolean,
 ): Promise<boolean> {
   const apiKey =
@@ -117,11 +127,12 @@ async function revalidateCachedScope(
     null;
   if (!apiKey) return false;
   const validated = cacheOnly
-    ? await cache.get<{
-        is_active?: boolean;
-        organization_id?: string;
-        expires_at?: Date | string | null;
-      }>(
+      ? await cache.get<{
+          is_active?: boolean;
+          organization_id?: string;
+          user_id?: string;
+          expires_at?: Date | string | null;
+        }>(
         CacheKeys.apiKey.validation(
           createHash("sha256").update(apiKey).digest("hex").substring(0, 16),
         ),
@@ -131,9 +142,10 @@ async function revalidateCachedScope(
       );
   if (!validated || !validated.is_active) return false;
   if (validated.expires_at && new Date(validated.expires_at) < new Date()) return false;
-  // The key must still be scoped to the org the cached agent belongs to. A
-  // detach/re-scope changes organization_id, so a stale cross-org read fails here.
-  return validated.organization_id === cachedOrgId;
+  // The key must still identify the same user and org. A detach/re-scope or a
+  // second member's key must not inherit the cached caller identity used by
+  // owner-only routes.
+  return validated.organization_id === cachedOrgId && validated.user_id === cachedCallerUserId;
 }
 
 /**
@@ -182,7 +194,14 @@ export async function resolveSharedAgent(
   const revalidateResolvedScope = async (
     cached: CachedSharedAgentScope,
   ): Promise<ResolvedSharedAgent | null> => {
-    if (!(cached?.agent && cached.orgId && cached.agent.execution_tier === "shared")) {
+    if (
+      !(
+        cached?.agent &&
+        cached.orgId &&
+        cached.callerUserId &&
+        cached.agent.execution_tier === "shared"
+      )
+    ) {
       return null;
     }
     // SECURITY: a hit skips the expensive user/org+agent DB hydration, but it
@@ -195,7 +214,12 @@ export async function resolveSharedAgent(
     const stillAuthorized = isSessionScope
       ? cached.stewardUserId != null &&
         (await revalidateSessionScope(c, cached.stewardUserId).catch(() => false))
-      : await revalidateCachedScope(c, cached.orgId, options.cacheOnly === true).catch(() => false);
+      : await revalidateCachedScope(
+          c,
+          cached.orgId,
+          cached.callerUserId,
+          options.cacheOnly === true,
+        ).catch(() => false);
     if (!stillAuthorized) return null;
     // Restore the DATE contract lost to the cache's JSON round-trip before
     // handing the agent to route consumers (e.g. conversations route calls
@@ -207,6 +231,7 @@ export async function resolveSharedAgent(
       agentId,
       orgId: cached.orgId,
       agentName: agent.agent_name ?? "Eliza",
+      callerUserId: cached.callerUserId,
     };
   };
 
@@ -284,10 +309,11 @@ export async function resolveSharedAgent(
       isSessionScope && typeof user.steward_id === "string"
         ? {
             orgId: user.organization_id,
+            callerUserId: user.id,
             agent,
             stewardUserId: user.steward_id,
           }
-        : { orgId: user.organization_id, agent };
+        : { orgId: user.organization_id, callerUserId: user.id, agent };
     return { ...base, firstWrittenAtMs: Date.now() };
   };
 
@@ -381,8 +407,13 @@ export async function resolveSharedAgent(
     // user); its absence just means the hit safely falls back to the slow gate.
     const entry: CachedSharedAgentScope = {
       ...(isSessionScope && typeof user.steward_id === "string"
-        ? { orgId: user.organization_id, agent, stewardUserId: user.steward_id }
-        : { orgId: user.organization_id, agent }),
+        ? {
+            orgId: user.organization_id,
+            callerUserId: user.id,
+            agent,
+            stewardUserId: user.steward_id,
+          }
+        : { orgId: user.organization_id, callerUserId: user.id, agent }),
       firstWrittenAtMs: Date.now(),
     };
     const write = cache
@@ -398,5 +429,11 @@ export async function resolveSharedAgent(
     else void write;
   }
 
-  return { agent, agentId, orgId: user.organization_id, agentName: agent.agent_name ?? "Eliza" };
+  return {
+    agent,
+    agentId,
+    orgId: user.organization_id,
+    agentName: agent.agent_name ?? "Eliza",
+    callerUserId: user.id,
+  };
 }

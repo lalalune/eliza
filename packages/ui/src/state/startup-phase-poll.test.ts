@@ -568,6 +568,65 @@ describe("runPollingBackend", () => {
     });
   });
 
+  it("preserves an initialized pairing-disabled remote for owner password login", async () => {
+    const deps = createDeps();
+    const dispatch = vi.fn();
+    (globalThis as { window?: unknown }).window = {
+      location: { origin: "http://localhost:2138", protocol: "http:" },
+    };
+    clientMock.getBaseUrl.mockReturnValue("https://self-hosted.example");
+    clientMock.hasToken.mockReturnValue(false);
+    clientMock.getAuthStatus.mockResolvedValue({
+      required: true,
+      authenticated: false,
+      loginRequired: true,
+      passwordConfigured: true,
+      pairingEnabled: false,
+      expiresAt: null,
+    });
+    const remote = {
+      id: "remote:self-hosted",
+      kind: "remote" as const,
+      label: "Self-hosted agent",
+      apiBase: "https://self-hosted.example",
+    };
+    const ctx: RestoringSessionCtx = {
+      persistedActiveServer: remote,
+      restoredActiveServer: remote,
+      shouldPreserveCompletedFirstRun: true,
+      hadPriorFirstRun: true,
+    };
+
+    await runPollingBackend(
+      deps,
+      dispatch,
+      {
+        supportsLocalRuntime: true,
+        backendTimeoutMs: 1000,
+        agentReadyTimeoutMs: 1000,
+        probeForExistingInstall: true,
+        defaultTarget: "embedded-local",
+      },
+      ctx,
+      1,
+      { current: 1 },
+      { current: false },
+      { current: null },
+    );
+
+    expect(clearPersistedActiveServer).not.toHaveBeenCalled();
+    expect(clientMock.setBaseUrl).not.toHaveBeenCalledWith(null);
+    expect(deps.setAuthRequired).toHaveBeenCalledWith(false);
+    expect(deps.setFirstRunComplete).toHaveBeenCalledWith(true);
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "BACKEND_REACHED",
+      firstRunComplete: true,
+    });
+    expect(dispatch).not.toHaveBeenCalledWith({
+      type: "BACKEND_AUTH_REQUIRED",
+    });
+  });
+
   it("recovers to local even for a returning user when the saved remote dead-ends on pairing-disabled", async () => {
     // Regression: a returning user (hadPriorFirstRun=true, e.g. they completed
     // onboarding against the cloud in a past session) whose saved remote now

@@ -11,6 +11,7 @@ vi.mock("@capacitor/core", () => ({
 
 import { ElizaClient } from "./client-base";
 import "./client-chat";
+import type { AgentRequestTransport } from "./transport";
 
 /**
  * A serverless / shared-runtime Cloud agent returns conversation objects
@@ -137,5 +138,47 @@ describe("conversation updatedAt boundary normalization", () => {
     expect(listConversations).not.toHaveBeenCalled();
     expect(res.conversations[0]?.id).toBe("cloud");
     expect(res.conversations[0]?.updatedAt).toBe(CREATED);
+  });
+
+  it("requests the server-owned post-sign-in activation kind and preserves its durable identity", async () => {
+    const request = vi.fn<AgentRequestTransport["request"]>(
+      async () =>
+        new Response(
+          JSON.stringify({
+            text: "You're signed in and I'm ready.",
+            agentName: "Eliza",
+            generated: true,
+            persisted: true,
+            messageId: "activation-id",
+            timestamp: 42,
+            source: "agent_greeting",
+            greetingKind: "post_sign_in_activation",
+            activationVersion: "1",
+            conversationId: "c1",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+    );
+    const client = new ElizaClient(BASE);
+    client.setRequestTransport({ request });
+
+    const greeting = await client.requestGreeting(
+      "c1",
+      "en",
+      "post_sign_in_activation",
+    );
+
+    expect(request.mock.calls[0]?.[0]).toBe(
+      `${BASE}/api/conversations/c1/greeting?lang=en&greetingKind=post_sign_in_activation`,
+    );
+    expect(greeting).toMatchObject({
+      messageId: "activation-id",
+      timestamp: 42,
+      greetingKind: "post_sign_in_activation",
+      activationVersion: "1",
+    });
   });
 });

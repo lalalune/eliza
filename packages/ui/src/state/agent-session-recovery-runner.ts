@@ -13,9 +13,9 @@
  * in-process instead (#15483).
  *
  * SECURITY NOTE (auth-adjacent): no auth is bypassed or weakened. The pairing
- * token is minted server-side ONLY for a caller holding a valid cloud session;
- * an unauthenticated caller gets a 401/403 here and falls through to the
- * password wall exactly as before.
+ * token is minted server-side only for a caller holding a valid cloud session.
+ * Managed Cloud callers that cannot refresh are returned to Cloud sign-in;
+ * only self-hosted agents may expose their own owner-password challenge.
  */
 
 import {
@@ -66,7 +66,10 @@ export interface RunAgentSessionRecoveryDeps {
    */
   consumeRedirectInProcess?: boolean;
   /** Injected pair-token exchange (tests). Defaults to CloudPairRelay's exchange. */
-  exchangePairToken?: (token: string) => Promise<string>;
+  exchangePairToken?: (
+    token: string,
+    options: { pairingOrigin: string },
+  ) => Promise<string>;
   /** Injected API-key persistence (tests). Defaults to CloudPairRelay's persistence. */
   persistPairApiToken?: (apiToken: string) => void;
   /**
@@ -107,11 +110,14 @@ function retryAfterMs(res: Response, data: PairingTokenResponse): number {
   return DEFAULT_RETRY_AFTER_MS;
 }
 
-function pairTokenFromRedirectUrl(redirectUrl: string): string | null {
+function parsePairRedirectUrl(
+  redirectUrl: string,
+): { token: string; origin: string } | null {
   try {
     const parsed = new URL(redirectUrl);
     if (parsed.pathname.replace(/\/+$/, "") !== "/pair") return null;
-    return parsed.searchParams.get("token")?.trim() || null;
+    const token = parsed.searchParams.get("token")?.trim();
+    return token ? { token, origin: parsed.origin } : null;
   } catch {
     return null;
   }
@@ -123,7 +129,8 @@ function pairTokenFromRedirectUrl(redirectUrl: string): string | null {
  * credential and redirects to `/`, so a successful run does not return control
  * to the caller, it hands off to a full-page navigation. Returns a failure
  * result (without navigating) when the agent never becomes ready, the caller is
- * unauthorized, or the request errors, so the caller can fall back to the wall.
+ * unauthorized, or the request errors. The caller then selects the managed
+ * Cloud sign-in or self-hosted owner-password boundary from target provenance.
  */
 export async function runAgentSessionRecovery(
   deps: RunAgentSessionRecoveryDeps,
@@ -134,8 +141,7 @@ export async function runAgentSessionRecovery(
     cloudToken,
     navigate,
     consumeRedirectInProcess = false,
-    exchangePairToken = (token: string) =>
-      exchangeCloudPairToken(token, { cloudApiBase }),
+    exchangePairToken,
     persistPairApiToken = persistCloudPairApiToken,
     clearStalePairCredentials,
     onPairedInProcess,
@@ -143,6 +149,14 @@ export async function runAgentSessionRecovery(
     sleepFn = realSleep,
     nowFn = Date.now,
   } = deps;
+  const exchangePairTokenInProcess =
+    exchangePairToken ??
+    ((token: string, options: { pairingOrigin: string }) =>
+      exchangeCloudPairToken(token, {
+        cloudApiBase,
+        pairingOrigin: options.pairingOrigin,
+        fetchFn,
+      }));
 
   const base = cloudApiBase.replace(/\/+$/, "");
   const url = `${base}/api/v1/eliza/agents/${encodeURIComponent(
@@ -214,8 +228,8 @@ export async function runAgentSessionRecovery(
         };
       }
       if (consumeRedirectInProcess) {
-        const pairToken = pairTokenFromRedirectUrl(redirectUrl);
-        if (!pairToken) {
+        const pairRedirect = parsePairRedirectUrl(redirectUrl);
+        if (!pairRedirect) {
           return {
             ok: false,
             reason: "error",
@@ -223,7 +237,12 @@ export async function runAgentSessionRecovery(
           };
         }
         try {
-          const apiToken = await exchangePairToken(pairToken);
+          const apiToken = await exchangePairTokenInProcess(
+            pairRedirect.token,
+            {
+              pairingOrigin: pairRedirect.origin,
+            },
+          );
           persistPairApiToken(apiToken);
           await onPairedInProcess?.(apiToken);
           return { ok: true, redirectUrl, mode: "in-process" };

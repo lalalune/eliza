@@ -92,7 +92,11 @@ const workspaceSourceAliases = workspacePluginDirs.flatMap((workspaceDir) =>
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts", "src/__tests__/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      "src/__tests__/**/*.test.ts",
+      "scripts/**/*.test.mjs",
+    ],
     exclude: ["dist/**", "**/node_modules/**"],
     testTimeout: 180_000,
   },

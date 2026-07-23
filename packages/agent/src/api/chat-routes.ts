@@ -2044,16 +2044,24 @@ function isDuplicateMemoryError(err: unknown): boolean {
   );
 }
 
+export async function persistConversationMemoryOnce(
+  runtime: AgentRuntime,
+  memory: ReturnType<typeof createMessageMemory>,
+): Promise<boolean> {
+  try {
+    await runtime.createMemory(memory, "messages");
+    return true;
+  } catch (err) {
+    if (isDuplicateMemoryError(err)) return false;
+    throw err;
+  }
+}
+
 export async function persistConversationMemory(
   runtime: AgentRuntime,
   memory: ReturnType<typeof createMessageMemory>,
 ): Promise<void> {
-  try {
-    await runtime.createMemory(memory, "messages");
-  } catch (err) {
-    if (isDuplicateMemoryError(err)) return;
-    throw err;
-  }
+  await persistConversationMemoryOnce(runtime, memory);
 }
 
 async function hasRecentAssistantMemory(

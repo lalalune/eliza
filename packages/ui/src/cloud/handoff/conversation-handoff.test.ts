@@ -86,14 +86,17 @@ describe("runConversationHandoff", () => {
   });
 
   it("fails closed (no switch) when an I/O step throws", async () => {
+    const releaseSharedHandoff = vi.fn(async () => {});
     const deps = baseDeps({
       readSharedMessages: vi.fn(async () => {
         throw new Error("shared read 500");
       }),
+      releaseSharedHandoff,
     });
     const result = await runConversationHandoff(deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("shared read 500");
+    expect(releaseSharedHandoff).toHaveBeenCalledTimes(1);
     expect(deps.switchToPersonal).not.toHaveBeenCalled();
   });
 

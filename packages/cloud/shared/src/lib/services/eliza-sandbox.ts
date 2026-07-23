@@ -5,9 +5,15 @@
 
 import crypto from "node:crypto";
 import { isIP } from "node:net";
+import { ElizaError } from "@elizaos/core";
+import {
+  type FtuGoalDiscoveryOutput,
+  POST_SIGN_IN_ACTIVATION_VERSION,
+} from "@elizaos/shared/contracts";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { DbTransaction } from "../../db/client";
 import { type Database, dbWrite } from "../../db/helpers";
+import { agentActivationGreetingsRepository } from "../../db/repositories/agent-activation-greetings";
 import { agentBillingRepository } from "../../db/repositories/agent-billing";
 import {
   type AgentBackupSnapshotType,
@@ -21,6 +27,8 @@ import {
 import { userCharactersRepository } from "../../db/repositories/characters";
 import { dockerNodesRepository } from "../../db/repositories/docker-nodes";
 import { sharedRuntimeHistoryRepository } from "../../db/repositories/shared-runtime-history";
+import { sharedRuntimeTurnClaimsRepository } from "../../db/repositories/shared-runtime-turn-claims";
+import type { AgentActivationGreeting } from "../../db/schemas/agent-activation-greetings";
 import {
   type AgentBackupStateData,
   type AgentExecutionTier,
@@ -85,7 +93,6 @@ import {
 } from "./sandbox-provider";
 import { isDedicatedBootstrapWindow } from "./shared-runtime/dedicated-bootstrap";
 import {
-  type RunSharedAgentTurnResult,
   resolveSharedAgentTurnModel,
   runSharedAgentTurn,
   runSharedAgentTurnStream,
@@ -93,6 +100,7 @@ import {
   type SharedAgentTurnUsage,
   type SharedTurnMessage,
 } from "./shared-runtime/run-shared-agent-turn";
+import { extractSharedFtuGoal } from "./shared-runtime/shared-ftu-goal";
 import { navIntentActionResult } from "./shared-runtime/shared-nav-intent";
 import { applyPooledCredentialsToBootstrapEnv } from "./team-credential-pool/bootstrap-env";
 import {
@@ -433,6 +441,9 @@ export const SNAPSHOT_ENDPOINT_UNSUPPORTED = "Snapshot endpoint not supported by
 
 const MAX_BACKUPS = 10;
 const SHARED_RUNTIME_HISTORY_MAX_MESSAGES = 40;
+const SHARED_RUNTIME_TURN_LEASE_MS = 5 * 60 * 1000;
+const SHARED_RUNTIME_TURN_WAIT_MS = 60 * 1000;
+const SHARED_RUNTIME_TURN_POLL_MS = 100;
 // Heartbeat probes the agent over the headscale tailnet. When idle the path
 // goes cold, so the first probe after a quiet period can fail while it
 // re-establishes — retry before evicting a healthy agent.
@@ -2571,13 +2582,302 @@ export class ElizaSandboxService {
   private async saveSharedRuntimeHistory(
     agentId: string,
     channelId: string,
-    history: SharedTurnMessage[],
+    completedMessages: SharedTurnMessage[],
   ): Promise<void> {
-    const capped =
-      history.length > SHARED_RUNTIME_HISTORY_MAX_MESSAGES
-        ? history.slice(history.length - SHARED_RUNTIME_HISTORY_MAX_MESSAGES)
-        : history;
-    await sharedRuntimeHistoryRepository.upsert(agentId, channelId, capped);
+    await sharedRuntimeHistoryRepository.append(
+      agentId,
+      channelId,
+      completedMessages,
+      SHARED_RUNTIME_HISTORY_MAX_MESSAGES,
+    );
+  }
+
+  private sharedTurnMessageIds(params: Record<string, unknown>): {
+    ownerMessageId: string;
+    assistantMessageId: string;
+    idempotent: boolean;
+  } {
+    const stableClientMessageId =
+      typeof params.clientMessageId === "string" &&
+      params.clientMessageId.trim().length > 0 &&
+      params.clientMessageId.trim().length <= 256
+        ? params.clientMessageId.trim()
+        : null;
+    const requested = stableClientMessageId ?? crypto.randomUUID();
+    return {
+      ownerMessageId: requested,
+      assistantMessageId: this.stableBridgeUuid(`shared-assistant:${requested}`),
+      idempotent: stableClientMessageId !== null,
+    };
+  }
+
+  private async prepareSharedTurn(
+    agentId: string,
+    channelId: string,
+    ownerText: string,
+    ids: {
+      ownerMessageId: string;
+      assistantMessageId: string;
+      idempotent: boolean;
+    },
+  ): Promise<{
+    history: SharedTurnMessage[];
+    claimToken?: string;
+    cachedReply?: string;
+  }> {
+    if (!ids.idempotent) {
+      const history = await this.loadSharedRuntimeHistory(agentId, channelId);
+      const cached = this.findCompletedSharedTurn(history, ids);
+      return {
+        history,
+        ...(cached ? { cachedReply: cached.assistant.content } : {}),
+      };
+    }
+
+    const claimToken = crypto.randomUUID();
+    const deadline = Date.now() + SHARED_RUNTIME_TURN_WAIT_MS;
+    for (;;) {
+      const result = await sharedRuntimeTurnClaimsRepository.acquire({
+        agentId,
+        channelId,
+        clientMessageId: ids.ownerMessageId,
+        assistantMessageId: ids.assistantMessageId,
+        ownerText,
+        claimToken,
+        leaseMs: SHARED_RUNTIME_TURN_LEASE_MS,
+      });
+      if (result.status === "completed") {
+        return { history: [], cachedReply: result.assistantReply };
+      }
+      if (result.status === "handoff-fenced") {
+        throw new ElizaError("Shared conversation is switching to its dedicated runtime", {
+          code: "SHARED_TURN_HANDOFF_FENCED",
+          context: {
+            agentId,
+            channelId,
+            clientMessageId: ids.ownerMessageId,
+            retryAfterMs: result.retryAfterMs,
+          },
+          severity: "ephemeral",
+        });
+      }
+      if (result.status === "claimed") {
+        return {
+          history: result.history.filter((message): message is SharedTurnMessage =>
+            this.isSharedTurnMessage(message),
+          ),
+          claimToken: result.claimToken,
+        };
+      }
+      if (Date.now() >= deadline) {
+        throw new ElizaError(
+          "Another shared-runtime turn is still processing for this conversation",
+          {
+            code: "SHARED_TURN_WAIT_TIMEOUT",
+            context: {
+              agentId,
+              channelId,
+              clientMessageId: ids.ownerMessageId,
+            },
+            severity: "ephemeral",
+          },
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, SHARED_RUNTIME_TURN_POLL_MS));
+    }
+  }
+
+  private async commitSharedTurn(input: {
+    rec: AgentSandbox;
+    channelId: string;
+    ids: {
+      ownerMessageId: string;
+      assistantMessageId: string;
+      idempotent: boolean;
+    };
+    claimToken?: string;
+    completedMessages: [
+      SharedTurnMessage & { id: string; role: "user" },
+      SharedTurnMessage & { id: string; role: "assistant" },
+    ];
+    activationExtraction?: {
+      output: FtuGoalDiscoveryOutput;
+      model: string;
+    };
+  }): Promise<string> {
+    const [ownerMessage, assistantMessage] = input.completedMessages;
+    if (input.ids.idempotent) {
+      if (!input.claimToken) {
+        throw new ElizaError("Stable shared turn is missing its database claim", {
+          code: "SHARED_TURN_CLAIM_MISSING",
+          context: {
+            agentId: input.rec.id,
+            channelId: input.channelId,
+            clientMessageId: input.ids.ownerMessageId,
+          },
+          severity: "fatal",
+        });
+      }
+      const committed = await sharedRuntimeTurnClaimsRepository.complete({
+        agentId: input.rec.id,
+        channelId: input.channelId,
+        clientMessageId: input.ids.ownerMessageId,
+        assistantMessageId: input.ids.assistantMessageId,
+        ownerText: ownerMessage.content,
+        assistantText: assistantMessage.content,
+        ownerCreatedAt: ownerMessage.createdAt ?? Date.now(),
+        assistantCreatedAt:
+          assistantMessage.createdAt ?? (ownerMessage.createdAt ?? Date.now()) + 1,
+        claimToken: input.claimToken,
+        maxMessages: SHARED_RUNTIME_HISTORY_MAX_MESSAGES,
+        ...(input.activationExtraction
+          ? {
+              activation: {
+                ownerUserId: input.rec.user_id,
+                activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+                extraction: input.activationExtraction.output,
+                extractionModel: input.activationExtraction.model,
+              },
+            }
+          : {}),
+      });
+      return committed.assistantReply;
+    }
+
+    if (input.activationExtraction) {
+      const committed = await agentActivationGreetingsRepository.appendResponseTurn({
+        agentId: input.rec.id,
+        ownerUserId: input.rec.user_id,
+        activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+        channelId: input.channelId,
+        completedMessages: input.completedMessages,
+        maxMessages: SHARED_RUNTIME_HISTORY_MAX_MESSAGES,
+        extraction: input.activationExtraction.output,
+        extractionModel: input.activationExtraction.model,
+      });
+      return committed.assistantReply;
+    }
+    await this.saveSharedRuntimeHistory(input.rec.id, input.channelId, input.completedMessages);
+    return assistantMessage.content;
+  }
+
+  private async abandonSharedTurn(input: {
+    rec: AgentSandbox;
+    channelId: string;
+    ids: {
+      ownerMessageId: string;
+      assistantMessageId: string;
+      idempotent: boolean;
+    };
+    claimToken?: string;
+  }): Promise<void> {
+    if (!input.ids.idempotent || !input.claimToken) return;
+    await sharedRuntimeTurnClaimsRepository.abandon({
+      agentId: input.rec.id,
+      channelId: input.channelId,
+      clientMessageId: input.ids.ownerMessageId,
+      claimToken: input.claimToken,
+    });
+  }
+
+  private completedSharedTurnMessages(
+    history: SharedTurnMessage[],
+    nextHistory: SharedTurnMessage[],
+    ids: { ownerMessageId: string; assistantMessageId: string },
+  ): [
+    SharedTurnMessage & { id: string; role: "user" },
+    SharedTurnMessage & { id: string; role: "assistant" },
+  ] {
+    const completed = nextHistory.slice(history.length);
+    const owner = completed[0];
+    const assistant = completed[1];
+    if (!owner || owner.role !== "user" || !assistant || assistant.role !== "assistant") {
+      throw new Error(
+        "[shared-runtime] completed turn did not contain one user and one assistant message",
+      );
+    }
+    return [
+      { ...owner, id: ids.ownerMessageId, role: "user" },
+      { ...assistant, id: ids.assistantMessageId, role: "assistant" },
+    ];
+  }
+
+  private findCompletedSharedTurn(
+    history: SharedTurnMessage[],
+    ids: { ownerMessageId: string; assistantMessageId: string },
+  ): { owner: SharedTurnMessage; assistant: SharedTurnMessage } | null {
+    const owner = history.find(
+      (message) => message.id === ids.ownerMessageId && message.role === "user",
+    );
+    if (!owner) return null;
+    const assistant = history.find(
+      (message) => message.id === ids.assistantMessageId && message.role === "assistant",
+    );
+    if (!assistant) {
+      throw new Error(
+        `[shared-runtime] idempotent turn ${ids.ownerMessageId} has no assistant reply`,
+      );
+    }
+    return { owner, assistant };
+  }
+
+  private combineSharedTurnUsage(
+    left: SharedAgentTurnUsage | undefined,
+    right: SharedAgentTurnUsage | undefined,
+  ): SharedAgentTurnUsage | undefined {
+    if (!left && !right) return undefined;
+    const read = (
+      usage: SharedAgentTurnUsage | undefined,
+      primary: keyof SharedAgentTurnUsage,
+      alternate: keyof SharedAgentTurnUsage,
+    ): number =>
+      typeof usage?.[primary] === "number"
+        ? usage[primary]
+        : typeof usage?.[alternate] === "number"
+          ? usage[alternate]
+          : 0;
+    const inputTokens =
+      read(left, "inputTokens", "promptTokens") + read(right, "inputTokens", "promptTokens");
+    const outputTokens =
+      read(left, "outputTokens", "completionTokens") +
+      read(right, "outputTokens", "completionTokens");
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+    };
+  }
+
+  private async loadSharedOwnerActivation(
+    rec: AgentSandbox,
+    params: Record<string, unknown>,
+  ): Promise<{
+    activation: AgentActivationGreeting | undefined;
+    context: { status: "pending" } | { status: "accepted"; goal: string } | undefined;
+  }> {
+    if (typeof params.userId !== "string" || params.userId !== rec.user_id) {
+      return { activation: undefined, context: undefined };
+    }
+    const activation = await agentActivationGreetingsRepository.find(
+      rec.id,
+      rec.user_id,
+      POST_SIGN_IN_ACTIVATION_VERSION,
+    );
+    if (!activation || activation.projected_at === null) {
+      return { activation, context: undefined };
+    }
+    if (activation.goal_status === "accepted") {
+      if (!activation.goal_text?.trim()) {
+        throw new Error(
+          `[shared-runtime] accepted activation goal is missing text (agent=${rec.id})`,
+        );
+      }
+      return {
+        activation,
+        context: { status: "accepted", goal: activation.goal_text.trim() },
+      };
+    }
+    return { activation, context: { status: "pending" } };
   }
 
   private sharedRuntimeBillingPrompt(
@@ -2591,13 +2891,6 @@ export class ElizaSandboxService {
       ...history.map((turn) => ({ content: turn.content })),
       { content: message },
     ].filter((entry) => entry.content.trim().length > 0);
-  }
-
-  private sharedRuntimeBillingUsage(
-    turn: RunSharedAgentTurnResult,
-    estimatedInputTokens: number,
-  ): AIUsage {
-    return this.sharedRuntimeBillingUsageForReply(turn.reply, turn.usage, estimatedInputTokens);
   }
 
   private sharedRuntimeBillingUsageForReply(
@@ -2686,16 +2979,58 @@ export class ElizaSandboxService {
     }
 
     const channelId = this.stableBridgeChannelId(rec.id, params);
-    const [character, history] = await Promise.all([
-      this.buildSharedRuntimeCharacter(rec),
-      this.loadSharedRuntimeHistory(rec.id, channelId),
-    ]);
+    const messageIds = this.sharedTurnMessageIds(params);
+    // Resolve character dependencies before admitting the turn. A failed
+    // character lookup must not leave a five-minute processing lease behind.
+    const character = await this.buildSharedRuntimeCharacter(rec);
+    const preparedTurn = await this.prepareSharedTurn(
+      rec.id,
+      channelId,
+      text.trim(),
+      messageIds,
+    );
+    if (preparedTurn.cachedReply !== undefined) {
+      return {
+        jsonrpc: "2.0",
+        id: rpc.id,
+        result: {
+          text: preparedTurn.cachedReply,
+          agentName: character.name,
+          channelId,
+          model: "persisted",
+          degraded: false,
+          runtime: "shared",
+          transport: "shared-runtime",
+        },
+      };
+    }
+    const history = preparedTurn.history;
+    const claimToken = preparedTurn.claimToken;
+    let ownerActivation: Awaited<
+      ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>
+    >;
+    try {
+      ownerActivation = await this.loadSharedOwnerActivation(rec, params);
+    } catch (error) {
+      await this.abandonSharedTurn({
+        rec,
+        channelId,
+        ids: messageIds,
+        claimToken,
+      });
+      throw error;
+    }
     const billingModel = resolveSharedAgentTurnModel(character.model);
-    const estimatedInputTokens = billingModel
+    const baseEstimatedInputTokens = billingModel
       ? estimateInputTokens(this.sharedRuntimeBillingPrompt(character, history, text))
       : 0;
-    const idempotencyKey = `shared-runtime:${rec.id}:${channelId}:${crypto.randomUUID()}`;
-    const requestId = `shared-runtime-${crypto.randomUUID()}`;
+    const estimatedInputTokens =
+      baseEstimatedInputTokens +
+      (billingModel && ownerActivation.context?.status === "pending"
+        ? estimateInputTokens([{ content: text }, { content: "structured FTU goal extraction" }])
+        : 0);
+    const idempotencyKey = `shared-runtime:${rec.id}:${channelId}:${messageIds.ownerMessageId}`;
+    const requestId = `shared-runtime-${messageIds.assistantMessageId}`;
     const billingContext: BillingContext | null = billingModel
       ? {
           organizationId: rec.organization_id,
@@ -2727,6 +3062,12 @@ export class ElizaSandboxService {
         reservation = await reserveCredits(billingContext, estimatedInputTokens, 500);
       } catch (error) {
         if (error instanceof InsufficientCreditsError) {
+          await this.abandonSharedTurn({
+            rec,
+            channelId,
+            ids: messageIds,
+            claimToken,
+          });
           return {
             jsonrpc: "2.0",
             id: rpc.id,
@@ -2736,6 +3077,12 @@ export class ElizaSandboxService {
             },
           };
         }
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
         throw error;
       }
     }
@@ -2749,22 +3096,64 @@ export class ElizaSandboxService {
     // deferred billing tail below owns its own settle-or-refund end-to-end, so
     // this catch never races it: by the time the tail is registered, every
     // throw it can produce is contained inside the tail's own try/catch.
+    let claimCompleted = false;
     try {
       const turn = await runSharedAgentTurn({
         character,
         history,
         message: text,
+        ...(ownerActivation.context ? { ownerGoalContext: ownerActivation.context } : {}),
       });
+      const completedMessages = this.completedSharedTurnMessages(history, turn.history, messageIds);
+      let reply = turn.reply;
+      let billableUsage = turn.usage;
       if (turn.degraded) {
         // A failed/degraded turn isn't persisted or billed — just refund the hold.
         await settleReservation(0);
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
       } else if (turn.navIntent) {
         // A deterministic navigation turn ran NO model: persist the turn but
         // refund the hold (nothing to meter). See shared-nav-intent.ts.
-        await this.saveSharedRuntimeHistory(rec.id, channelId, turn.history);
+        reply = await this.commitSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+          completedMessages,
+        });
+        claimCompleted = true;
         await settleReservation(0);
       } else {
-        await this.saveSharedRuntimeHistory(rec.id, channelId, turn.history);
+        let activationExtraction: { output: FtuGoalDiscoveryOutput; model: string } | undefined;
+        if (ownerActivation.context?.status === "pending") {
+          if (!billingModel) {
+            throw new Error("[shared-runtime] pending FTU goal turn had no billable model");
+          }
+          const extraction = await extractSharedFtuGoal({
+            model: billingModel,
+            ownerMessage: text.trim(),
+            assistantReply: turn.reply,
+          });
+          activationExtraction = {
+            output: extraction.output,
+            model: extraction.model,
+          };
+          billableUsage = this.combineSharedTurnUsage(turn.usage, extraction.usage);
+        }
+        reply = await this.commitSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+          completedMessages,
+          ...(activationExtraction ? { activationExtraction } : {}),
+        });
+        claimCompleted = true;
         if (billingContext) {
           // The reply is final once the turn ran and history persisted, but the
           // billing tail (billUsage → settleReservation → analytics → audit) is
@@ -2781,12 +3170,16 @@ export class ElizaSandboxService {
             try {
               const billing = await billUsage(
                 billingContext,
-                this.sharedRuntimeBillingUsage(turn, estimatedInputTokens),
+                this.sharedRuntimeBillingUsageForReply(
+                  reply,
+                  billableUsage,
+                  estimatedInputTokens,
+                ),
               );
               const settlement = await settleReservation(billing.totalCost);
               const usageRecord = await recordUsageAnalytics(billingContext, billing, {
                 type: "chat",
-                content: turn.reply,
+                content: reply,
                 prompt: text,
               });
               if (usageRecord) {
@@ -2833,7 +3226,7 @@ export class ElizaSandboxService {
         jsonrpc: "2.0",
         id: rpc.id,
         result: {
-          text: turn.reply,
+          text: reply,
           agentName: character.name,
           channelId,
           model: turn.model,
@@ -2849,6 +3242,14 @@ export class ElizaSandboxService {
     } catch (settleError) {
       // Refund the upfront hold on any post-reserve failure, then rethrow.
       await settleReservation(0);
+      if (!claimCompleted) {
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
+      }
       throw settleError;
     }
   }
@@ -2865,16 +3266,46 @@ export class ElizaSandboxService {
     }
 
     const channelId = this.stableBridgeChannelId(rec.id, params);
-    const [character, history] = await Promise.all([
-      this.buildSharedRuntimeCharacter(rec),
-      this.loadSharedRuntimeHistory(rec.id, channelId),
-    ]);
+    const messageIds = this.sharedTurnMessageIds(params);
+    // Resolve character dependencies before admitting the turn. A failed
+    // character lookup must not leave a five-minute processing lease behind.
+    const character = await this.buildSharedRuntimeCharacter(rec);
+    const preparedTurn = await this.prepareSharedTurn(
+      rec.id,
+      channelId,
+      text.trim(),
+      messageIds,
+    );
+    if (preparedTurn.cachedReply !== undefined) {
+      return this.createBridgeSseTextResponse(preparedTurn.cachedReply);
+    }
+    const history = preparedTurn.history;
+    const claimToken = preparedTurn.claimToken;
+    let ownerActivation: Awaited<
+      ReturnType<ElizaSandboxService["loadSharedOwnerActivation"]>
+    >;
+    try {
+      ownerActivation = await this.loadSharedOwnerActivation(rec, params);
+    } catch (error) {
+      await this.abandonSharedTurn({
+        rec,
+        channelId,
+        ids: messageIds,
+        claimToken,
+      });
+      throw error;
+    }
     const billingModel = resolveSharedAgentTurnModel(character.model);
-    const estimatedInputTokens = billingModel
+    const baseEstimatedInputTokens = billingModel
       ? estimateInputTokens(this.sharedRuntimeBillingPrompt(character, history, text))
       : 0;
-    const idempotencyKey = `shared-runtime:${rec.id}:${channelId}:${crypto.randomUUID()}`;
-    const requestId = `shared-runtime-${crypto.randomUUID()}`;
+    const estimatedInputTokens =
+      baseEstimatedInputTokens +
+      (billingModel && ownerActivation.context?.status === "pending"
+        ? estimateInputTokens([{ content: text }, { content: "structured FTU goal extraction" }])
+        : 0);
+    const idempotencyKey = `shared-runtime:${rec.id}:${channelId}:${messageIds.ownerMessageId}`;
+    const requestId = `shared-runtime-${messageIds.assistantMessageId}`;
     const billingContext: BillingContext | null = billingModel
       ? {
           organizationId: rec.organization_id,
@@ -2894,6 +3325,7 @@ export class ElizaSandboxService {
       : null;
     let reservation: CreditReservation | null = null;
     let reservationSettled = false;
+    let claimCompleted = false;
     const settleReservation = async (
       actualCost: number,
     ): Promise<CreditReconciliationResult | null> => {
@@ -2908,10 +3340,22 @@ export class ElizaSandboxService {
         // error-policy:J1 boundary translation — no SSE bytes exist before credit
         // reservation, so the HTTP route can still return the canonical 402.
         if (error instanceof InsufficientCreditsError) {
+          await this.abandonSharedTurn({
+            rec,
+            channelId,
+            ids: messageIds,
+            claimToken,
+          });
           throw new InsufficientCreditsApiError(
             `Insufficient credits. Required: $${error.required.toFixed(4)}, Available: $${error.available.toFixed(4)}`,
           );
         }
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
         throw error;
       }
     }
@@ -2921,18 +3365,31 @@ export class ElizaSandboxService {
         character,
         history,
         message: text,
+        ...(ownerActivation.context ? { ownerGoalContext: ownerActivation.context } : {}),
       });
       if (turn.degraded) {
         await settleReservation(0);
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
         return this.createBridgeSseTextResponse(turn.reply ?? "");
       }
       const parts = turn.parts;
       if (!parts) {
         await settleReservation(0);
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
         return this.createBridgeSseErrorResponse("Shared runtime stream did not start");
       }
 
-      const messageId = crypto.randomUUID();
+      const messageId = messageIds.assistantMessageId;
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
         start: async (controller) => {
@@ -2965,92 +3422,153 @@ export class ElizaSandboxService {
               }
 
               finished = true;
-              const finalReply = part.text.trim() || reply.trim() || "…";
+              const generatedReply = part.text.trim() || reply.trim() || "…";
               const sentAt = Date.now();
-              const nextHistory: SharedTurnMessage[] = [
-                ...history,
-                { role: "user", content: text.trim(), createdAt: sentAt },
-                { role: "assistant", content: finalReply, createdAt: sentAt + 1 },
+              const completedMessages: [
+                SharedTurnMessage & { id: string; role: "user" },
+                SharedTurnMessage & { id: string; role: "assistant" },
+              ] = [
+                {
+                  role: "user",
+                  content: text.trim(),
+                  createdAt: sentAt,
+                  id: messageIds.ownerMessageId,
+                },
+                {
+                  role: "assistant",
+                  content: generatedReply,
+                  createdAt: sentAt + 1,
+                  id: messageIds.assistantMessageId,
+                },
               ];
-              await this.saveSharedRuntimeHistory(rec.id, channelId, nextHistory);
+              let finalReply = generatedReply;
+              let billableUsage = part.usage;
               // A deterministic navigation turn ran NO model, so it must not be
               // billed — just refund the upfront hold. Only real LLM turns meter.
               if (turn.navIntent) {
+                finalReply = await this.commitSharedTurn({
+                  rec,
+                  channelId,
+                  ids: messageIds,
+                  claimToken,
+                  completedMessages,
+                });
+                claimCompleted = true;
                 await settleReservation(0);
-              } else if (billingContext) {
-                // The reply is final once the last token arrived and history
-                // persisted, but the billing tail (billUsage → settleReservation
-                // → analytics → audit) is ~4 serial cross-region Worker→DB
-                // round-trips (~1.5-2s) that previously ran INLINE before the
-                // `done` SSE frame — the exact firstText≈1.4s / done≈4s gap
-                // measured on staging. Same deferral the non-stream send got
-                // (#8759 / settleOffResponsePath): on a Worker the tail runs via
-                // executionCtx.waitUntil OFF the `done` path; without an
-                // executionCtx (tests, non-Worker callers) it runs inline,
-                // exactly as before. The deferred task ALWAYS settles the hold:
-                // success settles at billing.totalCost, any failure refunds via
-                // the idempotent settleReservation(0), and a refund throw is
-                // contained and logged (never an unhandled waitUntil rejection)
-                // — the #11169 sweep-credit-reservations cron backstops a hold
-                // stranded by a dropped waitUntil or a failed refund.
-                billingTailOwnsSettlement = true;
-                await settleOffResponsePath(executionCtx, async () => {
-                  try {
-                    const billing = await billUsage(
-                      billingContext,
-                      this.sharedRuntimeBillingUsageForReply(
-                        finalReply,
-                        part.usage,
-                        estimatedInputTokens,
-                      ),
+              } else {
+                let activationExtraction:
+                  | { output: FtuGoalDiscoveryOutput; model: string }
+                  | undefined;
+                if (ownerActivation.context?.status === "pending") {
+                  if (!billingModel) {
+                    throw new Error(
+                      "[shared-runtime] pending streamed FTU goal turn had no billable model",
                     );
-                    const settlement = await settleReservation(billing.totalCost);
-                    const usageRecord = await recordUsageAnalytics(billingContext, billing, {
-                      type: "chat",
-                      content: finalReply,
-                      prompt: text,
-                    });
-                    if (usageRecord) {
-                      await aiBillingRecordsService
-                        .record({
-                          context: billingContext,
-                          billing,
-                          usageRecord,
-                          idempotencyKey,
-                          reconciliation: settlement,
-                        })
-                        .catch((error) => {
-                          logger.error("[shared-runtime] AI billing audit record failed", {
-                            error: error instanceof Error ? error.message : String(error),
-                            agentId: rec.id,
-                          });
-                        });
-                    }
-                  } catch (error) {
-                    // error-policy:J1 deferred-settlement boundary — the `done`
-                    // frame may already be flushed, so the refund is the
-                    // handling: settle(0) is idempotent, and a refund failure is
-                    // logged for the cron sweep.
+                  }
+                  const extraction = await extractSharedFtuGoal({
+                    model: billingModel,
+                    ownerMessage: text.trim(),
+                    assistantReply: generatedReply,
+                  });
+                  activationExtraction = {
+                    output: extraction.output,
+                    model: extraction.model,
+                  };
+                  billableUsage = this.combineSharedTurnUsage(
+                    part.usage,
+                    extraction.usage,
+                  );
+                }
+                finalReply = await this.commitSharedTurn({
+                  rec,
+                  channelId,
+                  ids: messageIds,
+                  claimToken,
+                  completedMessages,
+                  ...(activationExtraction ? { activationExtraction } : {}),
+                });
+                claimCompleted = true;
+
+                if (billingContext) {
+                  // The reply is final once the last token arrived and history
+                  // persisted, but the billing tail (billUsage →
+                  // settleReservation → analytics → audit) is ~4 serial
+                  // cross-region Worker→DB round-trips. Defer it through
+                  // waitUntil on Workers while keeping tests and non-Worker
+                  // callers synchronous.
+                  billingTailOwnsSettlement = true;
+                  await settleOffResponsePath(executionCtx, async () => {
                     try {
-                      await settleReservation(0);
-                    } catch (refundError) {
-                      logger.error(
-                        "[shared-runtime] deferred billing refund failed; sweep-credit-reservations will reclaim the hold",
+                      const billing = await billUsage(
+                        billingContext,
+                        this.sharedRuntimeBillingUsageForReply(
+                          finalReply,
+                          billableUsage,
+                          estimatedInputTokens,
+                        ),
+                      );
+                      const settlement = await settleReservation(
+                        billing.totalCost,
+                      );
+                      const usageRecord = await recordUsageAnalytics(
+                        billingContext,
+                        billing,
                         {
-                          error:
-                            refundError instanceof Error
-                              ? refundError.message
-                              : String(refundError),
-                          agentId: rec.id,
+                          type: "chat",
+                          content: finalReply,
+                          prompt: text,
                         },
                       );
+                      if (usageRecord) {
+                        await aiBillingRecordsService
+                          .record({
+                            context: billingContext,
+                            billing,
+                            usageRecord,
+                            idempotencyKey,
+                            reconciliation: settlement,
+                          })
+                          .catch((error) => {
+                            logger.error(
+                              "[shared-runtime] AI billing audit record failed",
+                              {
+                                error:
+                                  error instanceof Error
+                                    ? error.message
+                                    : String(error),
+                                agentId: rec.id,
+                              },
+                            );
+                          });
+                      }
+                    } catch (error) {
+                      // error-policy:J1 deferred-settlement boundary — the
+                      // `done` frame may already be flushed, so refund the
+                      // idempotent hold and leave the cron sweep as backstop.
+                      try {
+                        await settleReservation(0);
+                      } catch (refundError) {
+                        logger.error(
+                          "[shared-runtime] deferred billing refund failed; sweep-credit-reservations will reclaim the hold",
+                          {
+                            error:
+                              refundError instanceof Error
+                                ? refundError.message
+                                : String(refundError),
+                            agentId: rec.id,
+                          },
+                        );
+                      }
+                      logger.error("[shared-runtime] billing failed", {
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                        agentId: rec.id,
+                      });
                     }
-                    logger.error("[shared-runtime] billing failed", {
-                      error: error instanceof Error ? error.message : String(error),
-                      agentId: rec.id,
-                    });
-                  }
-                });
+                  });
+                }
               }
               // Attach a VIEWS navigation handoff for a deterministic nav turn so
               // the PWA opens the view (findViewActionHandoff → navigate event in
@@ -3069,6 +3587,12 @@ export class ElizaSandboxService {
             }
             if (!finished) {
               await settleReservation(0);
+              await this.abandonSharedTurn({
+                rec,
+                channelId,
+                ids: messageIds,
+                claimToken,
+              });
               controller.enqueue(
                 encoder.encode(
                   `event: error\ndata: ${JSON.stringify({ message: "Shared runtime stream ended without completion" })}\n\n`,
@@ -3082,6 +3606,14 @@ export class ElizaSandboxService {
             // settle — once the billing tail is registered it owns the hold.
             if (!billingTailOwnsSettlement) {
               await settleReservation(0);
+            }
+            if (!claimCompleted) {
+              await this.abandonSharedTurn({
+                rec,
+                channelId,
+                ids: messageIds,
+                claimToken,
+              });
             }
             logger.warn("[shared-runtime] stream failed", {
               error: error instanceof Error ? error.message : String(error),
@@ -3109,8 +3641,27 @@ export class ElizaSandboxService {
       // error-policy:J2 context is added by runSharedAgentTurnStream; the bridge
       // boundary only owns releasing the reservation before rethrowing.
       await settleReservation(0);
+      if (!claimCompleted) {
+        await this.abandonSharedTurn({
+          rec,
+          channelId,
+          ids: messageIds,
+          claimToken,
+        });
+      }
       throw error;
     }
+  }
+
+  /**
+   * Resolve the durable shared-runtime channel key for a REST conversation.
+   *
+   * Greeting persistence and model turns must use the same normalized key;
+   * otherwise a greeting can appear to store successfully while remaining
+   * invisible to both transcript reads and the next model turn.
+   */
+  getSharedConversationChannelId(agentId: string, roomId: string): string {
+    return this.stableBridgeChannelId(agentId, { roomId });
   }
 
   /**
@@ -3124,9 +3675,7 @@ export class ElizaSandboxService {
     agentId: string,
     roomId?: string,
   ): Promise<SharedTurnMessage[]> {
-    const channelId = this.stableBridgeChannelId(agentId, {
-      roomId: roomId ?? agentId,
-    });
+    const channelId = this.getSharedConversationChannelId(agentId, roomId ?? agentId);
     return this.loadSharedRuntimeHistory(agentId, channelId);
   }
 

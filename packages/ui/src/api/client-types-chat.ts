@@ -8,6 +8,7 @@ import type {
   ChatFailureKind,
   ChatToolCallEvent,
   ChatTurnStatus,
+  ConversationGreetingKind,
   LinkedAccountProviderId,
 } from "@elizaos/shared";
 import type { NativeToolCallEvent } from "./client-types-cloud";
@@ -37,12 +38,19 @@ export interface ConversationGreeting {
   agentName: string;
   generated: boolean;
   persisted?: boolean;
+  messageId?: string;
+  source?: string;
+  timestamp?: number;
+  greetingKind?: ConversationGreetingKind;
+  activationVersion?: string;
+  conversationId?: string;
   localInference?: LocalInferenceChatMetadata;
 }
 
 export interface CreateConversationOptions {
   includeGreeting?: boolean;
   bootstrapGreeting?: boolean;
+  greetingKind?: ConversationGreetingKind;
   lang?: string;
   metadata?: ConversationMetadata;
 }
@@ -316,6 +324,10 @@ export interface ConversationMessage {
   attachments?: MessageAttachment[];
   /** Source channel when forwarded from another channel (e.g. "autonomy"). */
   source?: string;
+  /** Distinguishes the per-conversation hello from the one-time signed-in activation. */
+  greetingKind?: ConversationGreetingKind;
+  /** Server-owned contract version for a durable activation greeting. */
+  activationVersion?: string;
   /**
    * Short topic labels extracted for this turn (Stage-1 `topics`). Drives the
    * transcript topic grouping + chips bar (#8928). Absent when the turn had no

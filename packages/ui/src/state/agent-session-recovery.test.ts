@@ -63,7 +63,7 @@ describe("resolveAgentSessionRecovery", () => {
     expect(decision.action).toBe("show-wall");
   });
 
-  it("does NOT re-pair a cloud agent when the cloud session is also gone", () => {
+  it("sends a cloud agent to Cloud sign-in when the cloud session is gone", () => {
     const decision = resolveAgentSessionRecovery({
       reason: "remote_auth_required",
       activeServer: cloudServer("agent-1"),
@@ -72,11 +72,10 @@ describe("resolveAgentSessionRecovery", () => {
       alreadyAttempted: false,
     });
 
-    // No cloud session ⇒ nothing to re-pair with ⇒ wall is the honest state.
-    expect(decision.action).toBe("show-wall");
+    expect(decision.action).toBe("show-cloud-sign-in");
   });
 
-  it("does not loop: after an attempt already ran, show the wall", () => {
+  it("does not loop: after an attempt already ran, show Cloud sign-in", () => {
     const decision = resolveAgentSessionRecovery({
       reason: "remote_auth_required",
       activeServer: cloudServer("agent-1"),
@@ -85,12 +84,10 @@ describe("resolveAgentSessionRecovery", () => {
       alreadyAttempted: true,
     });
 
-    expect(decision.action).toBe("show-wall");
+    expect(decision.action).toBe("show-cloud-sign-in");
   });
 
-  it("does not re-pair the password-not-configured wall (no agent credential to refresh)", () => {
-    // remote_password_not_configured means the host never set an owner password;
-    // re-pairing cannot manufacture one. Keep the actionable setup wall.
+  it("never offers the local password wall for a managed Cloud target", () => {
     const decision = resolveAgentSessionRecovery({
       reason: "remote_password_not_configured",
       activeServer: cloudServer("agent-1"),
@@ -99,7 +96,7 @@ describe("resolveAgentSessionRecovery", () => {
       alreadyAttempted: false,
     });
 
-    expect(decision.action).toBe("show-wall");
+    expect(decision.action).toBe("show-cloud-sign-in");
   });
 
   it("does not re-pair a local runtime (same-origin, not a cloud dedicated agent)", () => {

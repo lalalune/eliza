@@ -9,6 +9,11 @@ import os from "node:os";
 import path from "node:path";
 
 export {
+  hasPersistedFirstRunState,
+  isAppFirstRunComplete,
+} from "../../../../packages/agent/src/api/first-run-completion.ts";
+
+export {
   createGlobalPauseStore,
   GLOBAL_PAUSE_SERVICE,
   GlobalPauseService,
@@ -270,8 +275,30 @@ export function resolveDefaultAgentWorkspaceDir(): string {
   return path.join(os.tmpdir(), "eliza-lifeops-test-workspace");
 }
 
+const ELIZA_CONFIG_STUB_STATE = Symbol.for(
+  "eliza.lifeops.test.elizaConfigStubState",
+);
+
+function getElizaConfigStubState(): {
+  config: Record<string, unknown>;
+} {
+  const globalWithState = globalThis as typeof globalThis & {
+    [ELIZA_CONFIG_STUB_STATE]?: { config: Record<string, unknown> };
+  };
+  globalWithState[ELIZA_CONFIG_STUB_STATE] ??= { config: {} };
+  return globalWithState[ELIZA_CONFIG_STUB_STATE];
+}
+
+export function setElizaConfigStubState(config: Record<string, unknown>): void {
+  getElizaConfigStubState().config = config;
+}
+
+export function resetElizaConfigStubState(): void {
+  getElizaConfigStubState().config = {};
+}
+
 export function loadElizaConfig(): Record<string, unknown> {
-  return {};
+  return getElizaConfigStubState().config;
 }
 
 function readTestElizaConfig(): Record<string, unknown> {

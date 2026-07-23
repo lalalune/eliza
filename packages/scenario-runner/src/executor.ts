@@ -50,6 +50,7 @@ import {
   isJudgeIndependent,
   judgeIndependenceRequired,
 } from "./judge-independence.ts";
+import { executePostSignInActivationTurn } from "./post-sign-in-activation-turn.ts";
 import { redactForScenarioReport } from "./redaction.ts";
 import { applyScenarioSeedStep } from "./seeds.ts";
 import type {
@@ -2297,6 +2298,7 @@ export async function runScenario(
         kind !== "api" &&
         kind !== "tick" &&
         kind !== "wait" &&
+        kind !== "post_sign_in_activation" &&
         kind !== "voice"
       ) {
         report.turns.push({
@@ -2354,26 +2356,42 @@ export async function runScenario(
                       opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
                     )),
                   }
-                : kind === "wait"
+                : kind === "post_sign_in_activation"
                   ? {
                       actionsCalled: [],
-                      ...(await executeWaitTurn(
-                        turn,
-                        opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
+                      ...(await withTimeout(
+                        executePostSignInActivationTurn({
+                          runtime,
+                          ownerId: resolveTurnRoom(turn, rooms).userId,
+                          roomId: resolveTurnRoom(turn, rooms).roomId,
+                          conversationId: `scenario:${scenario.id}:${resolveTurnRoom(turn, rooms).id}`,
+                        }),
+                        typeof turn.timeoutMs === "number"
+                          ? turn.timeoutMs
+                          : opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
+                        `postSignInActivation(${turn.name})`,
                       )),
                     }
-                  : {
-                      actionsCalled: [],
-                      ...(await executeMessageTurn(
-                        runtime,
-                        turn,
-                        resolveTurnRoom(turn, rooms),
-                        logicalNow,
-                        opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
-                        scenario.id,
-                        ctx.runId,
-                      )),
-                    };
+                  : kind === "wait"
+                    ? {
+                        actionsCalled: [],
+                        ...(await executeWaitTurn(
+                          turn,
+                          opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
+                        )),
+                      }
+                    : {
+                        actionsCalled: [],
+                        ...(await executeMessageTurn(
+                          runtime,
+                          turn,
+                          resolveTurnRoom(turn, rooms),
+                          logicalNow,
+                          opts.turnTimeoutMs || DEFAULT_TURN_TIMEOUT_MS,
+                          scenario.id,
+                          ctx.runId,
+                        )),
+                      };
       let actionsThisTurn = interceptor.actions.slice(actionsBefore);
       // Synthesize an implicit REPLY capture when the runtime emitted text
       // via the message callback but the LLM failed to select REPLY in its

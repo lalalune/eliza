@@ -413,7 +413,7 @@ import { handleRuntimeSwitchRoutes } from "./runtime-switch-routes.ts";
 import {
   cloneWithoutBlockedObjectKeys,
   decodePathComponent,
-  hasPersistedFirstRunState,
+  isAppFirstRunComplete,
   isUuidLike,
   patchTouchesProviderSelection,
   resolveMirroredAvatarPresetId,
@@ -2305,7 +2305,7 @@ async function handleRequest(
       error,
       readJsonBody,
       isCloudProvisionedContainer,
-      hasPersistedFirstRunState,
+      isAppFirstRunComplete,
       ensureWalletKeysInEnvAndConfig,
       getWalletAddresses:
         pathname === "/api/wallet/keys"

@@ -17,7 +17,7 @@ packages/scenario-runner/
   src/
     index.ts                 # Public re-exports
     cli.ts                   # `eliza-scenarios run|list` — arg parsing + orchestration
-    executor.ts              # runScenario() — core execution loop (message/action/api/tick turns)
+    executor.ts              # runScenario() — core execution loop (message/action/api/tick/activation turns)
     runtime-factory.ts       # createScenarioRuntime() — boots AgentRuntime with PGLite + LLM
     loader.ts                # discoverScenarios / loadAllScenarios / listScenarioMetadata / expandScenarioDefinition / countScenarioCorpus / validateScenarioCorpus
     interceptor.ts           # attachInterceptor() — wraps action handlers to capture CapturedAction[]
@@ -113,6 +113,7 @@ bun run --cwd packages/scenario-runner test
 bun run --cwd packages/scenario-runner typecheck
 bun run --cwd packages/scenario-runner test:deterministic:e2e
 bun run --cwd packages/scenario-runner test:live:e2e
+bun run --cwd packages/scenario-runner test:live:onboarding-activation
 bun run --cwd packages/scenario-runner test:pr:e2e
 bun run --cwd packages/scenario-runner clean
 ```
@@ -176,6 +177,7 @@ Loader discovers files recursively; entries starting with `_` are ignored. The `
 - `action` — calls a named action's `validate` + `handler` directly (bypasses LLM routing).
 - `api` — sends an HTTP request to the scenario's loopback API server (routes registered on the runtime).
 - `tick` — invokes `executeLifeOpsSchedulerTask` from `@elizaos/plugin-personal-assistant/plugin` (tests scheduler ticks at a logical clock time).
+- `post_sign_in_activation` — invokes the production durable conversation-activation helper for the simulated signed-in owner; use this before a `message` turn when proving the handoff from authentication into goal discovery.
 
 ## Final check types (from `schema/index.js`)
 
@@ -204,6 +206,7 @@ and update the owning pack catalog.
 - **Template tokens in turn text.** `{{now}}`, `{{now+1h}}`, `{{now-2d}}`, `{{definitionId:<title>}}`, `{{occurrenceId:<title>}}` are resolved at execution time.
 - **Clock seeding.** `seed` steps of type `advanceClock` shift `ctx.now`; all subsequent template tokens are relative to the shifted clock.
 - **Schema vs dist exports.** `ScenarioDefinition` and schema types come from `@elizaos/scenario-runner/schema` (the `schema/` directory, not `dist/`). Do not import them from `@elizaos/scenario-runner` directly.
+- **Post-sign-in live proof.** `LIVE_ONBOARDING_ACTIVATION_PROOF.md` documents the fail-closed command and the boundary between the real activation/model/evaluator proof and app-level interactive authentication coverage.
 
 <!-- BEGIN: evidence-and-e2e-mandate (managed; canonical standard = repo-root AGENTS.md) -->
 ## ⛔ NON-NEGOTIABLE — evidence, trajectories & real end-to-end tests

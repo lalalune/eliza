@@ -17,7 +17,18 @@
  * bridge already writes.
  */
 
+import { stringToUuid } from "@elizaos/core";
+import {
+  type ActivationGoalHandoffEnvelope,
+  POST_SIGN_IN_ACTIVATION_GREETING,
+  POST_SIGN_IN_ACTIVATION_VERSION as SHARED_POST_SIGN_IN_ACTIVATION_VERSION,
+} from "@elizaos/shared/contracts";
+import { agentActivationGreetingsRepository } from "../../../db/repositories/agent-activation-greetings";
 import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
+import { sharedRuntimeHistoryRepository } from "../../../db/repositories/shared-runtime-history";
+import { sharedRuntimeTurnClaimsRepository } from "../../../db/repositories/shared-runtime-turn-claims";
+import type { AgentActivationGreeting } from "../../../db/schemas/agent-activation-greetings";
+import type { SharedRuntimeHistoryMessage } from "../../../db/schemas/shared-runtime-history";
 import type { RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-env";
 import { InsufficientCreditsError } from "../../api/errors";
 import type { BridgeRequest } from "../eliza-sandbox-bridge";
@@ -48,11 +59,52 @@ export interface SharedRestMessage {
   role: "user" | "assistant";
   text: string;
   timestamp: number;
+  source?: string;
+  greetingKind?: "conversation" | "post_sign_in_activation";
+  activationVersion?: string;
+}
+
+export const SHARED_REST_AGENT_GREETING_SOURCE = "agent_greeting" as const;
+export const POST_SIGN_IN_ACTIVATION_KIND = "post_sign_in_activation" as const;
+export const POST_SIGN_IN_ACTIVATION_VERSION = SHARED_POST_SIGN_IN_ACTIVATION_VERSION;
+export const POST_SIGN_IN_ACTIVATION_TEXT = POST_SIGN_IN_ACTIVATION_GREETING;
+
+interface SharedRestGreetingResponse {
+  text: string;
+  agentName: string;
+  generated: boolean;
+  persisted: boolean;
+}
+
+export interface SharedRestActivationGreetingResponse extends SharedRestGreetingResponse {
+  messageId: string;
+  source: typeof SHARED_REST_AGENT_GREETING_SOURCE;
+  timestamp: number;
+  greetingKind: typeof POST_SIGN_IN_ACTIVATION_KIND;
+  activationVersion: typeof POST_SIGN_IN_ACTIVATION_VERSION;
+  conversationId: string;
 }
 
 /** The canonical (single) conversation id for a shared agent === its agent id. */
-function canonicalConversationId(agentId: string): string {
+export function canonicalSharedRestConversationId(agentId: string): string {
   return agentId;
+}
+
+/** Reject stale or forged room ids before they can create hidden history. */
+export function isCanonicalSharedRestConversation(
+  agentId: string,
+  conversationId: string,
+): boolean {
+  return conversationId === canonicalSharedRestConversationId(agentId);
+}
+
+async function sharedConversationChannelId(
+  agentId: string,
+  conversationId: string,
+): Promise<string> {
+  return await import("../eliza-sandbox").then(({ elizaSandboxService }) =>
+    elizaSandboxService.getSharedConversationChannelId(agentId, conversationId),
+  );
 }
 
 function makeConversation(
@@ -60,7 +112,7 @@ function makeConversation(
   agentName: string,
   createdAt: string,
 ): SharedRestConversation {
-  const id = canonicalConversationId(agentId);
+  const id = canonicalSharedRestConversationId(agentId);
   // updatedAt === createdAt: the canonical conversation is never renamed/moved.
   return { id, title: agentName || "Chat", roomId: id, createdAt, updatedAt: createdAt };
 }
@@ -313,6 +365,105 @@ export function sharedRestConversationDelete(): { ok: true } {
   return { ok: true };
 }
 
+/**
+ * Seed an ordinary per-room greeting only while that room is empty.
+ *
+ * This remains conversation-scoped and is intentionally separate from the
+ * global activation ledger: opening another conversation may greet again, while
+ * signing in must activate only once for the owner and contract version.
+ */
+export async function sharedRestConversationGreeting(
+  agentId: string,
+  conversationId: string,
+  agentName: string,
+): Promise<SharedRestGreetingResponse> {
+  const normalizedName = agentName.trim() || "Eliza";
+  const candidate = {
+    role: "assistant" as const,
+    content: `Hey, I'm ${normalizedName}. What can I help you with?`,
+    id: stringToUuid(`conversation-greeting:${agentId}:${conversationId}`),
+    source: SHARED_REST_AGENT_GREETING_SOURCE,
+    greetingKind: "conversation" as const,
+    createdAt: Date.now(),
+  };
+  const channelId = await sharedConversationChannelId(agentId, conversationId);
+  const ensured = await sharedRuntimeHistoryRepository.ensureConversationGreeting(
+    agentId,
+    channelId,
+    candidate,
+  );
+  return {
+    text: ensured.greeting?.content ?? "",
+    agentName: normalizedName,
+    generated: ensured.greeting !== null,
+    persisted: ensured.persisted,
+  };
+}
+
+/**
+ * Ensure the signed-in owner's activation message exactly once.
+ *
+ * The deterministic message id provides parity across runtimes, while the
+ * database row is authoritative for the winning room and timestamp. The route
+ * performs the owner check before calling this use-case.
+ */
+export async function sharedRestPostSignInActivation(
+  agentId: string,
+  ownerUserId: string,
+  conversationId: string,
+  agentName: string,
+): Promise<SharedRestActivationGreetingResponse> {
+  const normalizedName = agentName.trim() || "Eliza";
+  const messageId = stringToUuid(
+    `post-sign-in-activation:${agentId}:${ownerUserId}:${POST_SIGN_IN_ACTIVATION_VERSION}`,
+  );
+  const ensured = await agentActivationGreetingsRepository.ensure({
+    agent_id: agentId,
+    owner_user_id: ownerUserId,
+    activation_version: POST_SIGN_IN_ACTIVATION_VERSION,
+    conversation_id: conversationId,
+    message_id: messageId,
+    source: SHARED_REST_AGENT_GREETING_SOURCE,
+    greeting_kind: POST_SIGN_IN_ACTIVATION_KIND,
+    text: POST_SIGN_IN_ACTIVATION_TEXT,
+    agent_name: normalizedName,
+  });
+  const greeting = ensured.greeting;
+  let projected = false;
+  if (greeting.projected_at === null) {
+    const channelId = await sharedConversationChannelId(
+      agentId,
+      greeting.conversation_id,
+    );
+    projected = await sharedRuntimeHistoryRepository.ensureMessage(agentId, channelId, {
+      role: "assistant",
+      content: greeting.text,
+      id: greeting.message_id,
+      source: greeting.source,
+      greetingKind: POST_SIGN_IN_ACTIVATION_KIND,
+      activationVersion: greeting.activation_version,
+      createdAt: greeting.created_at.getTime(),
+    });
+    await agentActivationGreetingsRepository.markProjected(
+      agentId,
+      ownerUserId,
+      POST_SIGN_IN_ACTIVATION_VERSION,
+    );
+  }
+  return {
+    text: projected ? greeting.text : "",
+    agentName: greeting.agent_name,
+    generated: projected,
+    persisted: projected,
+    messageId: greeting.message_id,
+    source: SHARED_REST_AGENT_GREETING_SOURCE,
+    timestamp: greeting.created_at.getTime(),
+    greetingKind: POST_SIGN_IN_ACTIVATION_KIND,
+    activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+    conversationId: greeting.conversation_id,
+  };
+}
+
 function sharedRestMessageTimestamp(
   turn: { createdAt?: unknown },
   index: number,
@@ -327,6 +478,88 @@ function sharedRestMessageTimestamp(
   return Date.now() - 5 * 60_000 - (total - index);
 }
 
+function toSharedRestMessages(
+  history: SharedRuntimeHistoryMessage[],
+  conversationId: string,
+  includeActivation: boolean,
+): SharedRestMessage[] {
+  const visibleHistory = includeActivation
+    ? history
+    : history.filter((turn) => turn.greetingKind !== POST_SIGN_IN_ACTIVATION_KIND);
+  const messages = visibleHistory.map((turn, index) => ({
+    id: typeof turn.id === "string" && turn.id.length > 0 ? turn.id : `${conversationId}:${index}`,
+    role: turn.role,
+    text: turn.content,
+    timestamp: sharedRestMessageTimestamp(turn, index, visibleHistory.length),
+    ...(typeof turn.source === "string" ? { source: turn.source } : {}),
+    ...(turn.greetingKind === "conversation" || turn.greetingKind === POST_SIGN_IN_ACTIVATION_KIND
+      ? { greetingKind: turn.greetingKind }
+      : {}),
+    ...(typeof turn.activationVersion === "string"
+      ? { activationVersion: turn.activationVersion }
+      : {}),
+  }));
+  messages.sort(
+    (left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id),
+  );
+  return messages;
+}
+
+function activationGoalEnvelope(
+  agentId: string,
+  activation: AgentActivationGreeting | undefined,
+): ActivationGoalHandoffEnvelope | undefined {
+  if (!activation || activation.projected_at === null) return undefined;
+
+  const response =
+    activation.response_message_id && activation.response_text && activation.response_created_at
+      ? {
+          messageId: activation.response_message_id,
+          text: activation.response_text,
+          createdAt: activation.response_created_at.getTime(),
+        }
+      : undefined;
+  const hasPartialResponse =
+    Boolean(activation.response_message_id) ||
+    Boolean(activation.response_text) ||
+    Boolean(activation.response_created_at);
+  if (hasPartialResponse && !response) {
+    throw new Error(
+      `[shared-runtime] activation response envelope is incomplete (agent=${agentId})`,
+    );
+  }
+
+  if (activation.goal_status === "accepted") {
+    if (
+      !response ||
+      !activation.goal_text ||
+      typeof activation.goal_confidence !== "number" ||
+      !activation.goal_model ||
+      !activation.goal_recorded_at
+    ) {
+      throw new Error(
+        `[shared-runtime] accepted activation goal envelope is incomplete (agent=${agentId})`,
+      );
+    }
+    return {
+      activationVersion: activation.activation_version,
+      status: "accepted",
+      response,
+      goal: {
+        text: activation.goal_text,
+        confidence: activation.goal_confidence,
+        model: activation.goal_model,
+        recordedAt: activation.goal_recorded_at.getTime(),
+      },
+    };
+  }
+  return {
+    activationVersion: activation.activation_version,
+    status: "pending",
+    ...(response ? { response } : {}),
+  };
+}
+
 /**
  * GET .../api/conversations/:id/messages — read the bridge's persisted turn
  * history for this room and present it in the REST message shape. Ids are
@@ -336,15 +569,83 @@ export async function sharedRestMessagesGet(
   agentId: string,
   conversationId: string,
   namespace?: RuntimeDurableObjectNamespace,
-): Promise<{ messages: SharedRestMessage[] }> {
+  activationOwnerUserId?: string,
+): Promise<{
+  messages: SharedRestMessage[];
+  activationGoal?: ActivationGoalHandoffEnvelope;
+}> {
   const history = await coordinateSharedHistory(agentId, conversationId, { namespace });
-  const messages = history.map((turn, index) => ({
-    id: `${conversationId}:${index}`,
-    role: turn.role,
-    text: turn.content,
-    timestamp: sharedRestMessageTimestamp(turn, index, history.length),
-  }));
-  return { messages };
+  const messages = toSharedRestMessages(history, conversationId, Boolean(activationOwnerUserId));
+  if (!activationOwnerUserId) return { messages };
+
+  const activation = await agentActivationGreetingsRepository.find(
+    agentId,
+    activationOwnerUserId,
+    POST_SIGN_IN_ACTIVATION_VERSION,
+  );
+  const activationGoal = activationGoalEnvelope(agentId, activation);
+  return {
+    messages,
+    ...(activationGoal ? { activationGoal } : {}),
+  };
+}
+
+/**
+ * Establish a short-lived write fence and return one atomic handoff snapshot.
+ *
+ * The repository refuses to fence while any shared model turn is admitted.
+ * Once fenced, later sends fail retryably until the client switches or a
+ * failed handoff releases the token.
+ */
+export async function sharedRestHandoffSnapshot(input: {
+  agentId: string;
+  conversationId: string;
+  ownerUserId: string;
+  fenceToken: string;
+  leaseMs: number;
+}): Promise<
+  | { ready: false; retryAfterMs: number }
+  | {
+      ready: true;
+      messages: SharedRestMessage[];
+      activationGoal?: ActivationGoalHandoffEnvelope;
+    }
+> {
+  const channelId = await sharedConversationChannelId(
+    input.agentId,
+    input.conversationId,
+  );
+  const snapshot = await sharedRuntimeTurnClaimsRepository.beginHandoffSnapshot({
+    agentId: input.agentId,
+    channelId,
+    ownerUserId: input.ownerUserId,
+    activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+    fenceToken: input.fenceToken,
+    leaseMs: input.leaseMs,
+  });
+  if (!snapshot.ready) return snapshot;
+  const activationGoal = activationGoalEnvelope(input.agentId, snapshot.activation);
+  return {
+    ready: true,
+    messages: toSharedRestMessages(snapshot.messages, input.conversationId, true),
+    ...(activationGoal ? { activationGoal } : {}),
+  };
+}
+
+export async function releaseSharedRestHandoffFence(input: {
+  agentId: string;
+  conversationId: string;
+  fenceToken: string;
+}): Promise<boolean> {
+  const channelId = await sharedConversationChannelId(
+    input.agentId,
+    input.conversationId,
+  );
+  return await sharedRuntimeTurnClaimsRepository.releaseHandoffFence({
+    agentId: input.agentId,
+    channelId,
+    fenceToken: input.fenceToken,
+  });
 }
 
 /**
@@ -358,6 +659,8 @@ export async function sharedRestMessageSend(
   conversationId: string,
   text: string,
   agentName: string,
+  callerUserId = "",
+  clientMessageId?: string,
   executionCtx?: BridgeExecutionContext,
   agent?: AgentSandbox,
   namespace?: RuntimeDurableObjectNamespace,
@@ -366,7 +669,12 @@ export async function sharedRestMessageSend(
     jsonrpc: "2.0",
     id: crypto.randomUUID(),
     method: "message.send",
-    params: { text, roomId: conversationId },
+    params: {
+      text,
+      roomId: conversationId,
+      userId: callerUserId,
+      clientMessageId: clientMessageId ?? crypto.randomUUID(),
+    },
   };
   // executionCtx (Workers only) lets the bridge defer the post-reply billing
   // tail off the response path; without it the turn settles inline as before.

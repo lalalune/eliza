@@ -107,9 +107,46 @@ describe("runAgentSessionRecovery", () => {
 
     expect(result).toEqual({ ok: true, redirectUrl, mode: "in-process" });
     expect(navigate).not.toHaveBeenCalled();
-    expect(exchangePairToken).toHaveBeenCalledWith("one-time");
+    expect(exchangePairToken).toHaveBeenCalledWith("one-time", {
+      pairingOrigin: "https://agent.elizacloud.ai",
+    });
     expect(persistPairApiToken).toHaveBeenCalledWith("agent-api-key");
     expect(onPairedInProcess).toHaveBeenCalledWith("agent-api-key");
+  });
+
+  it("sends the authenticated redirect origin during the real in-process exchange", async () => {
+    const redirectUrl =
+      "https://agent.elizacloud.ai/pair?token=origin-bound-token";
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, { data: { redirectUrl } }))
+      .mockResolvedValueOnce(jsonResponse(200, { apiKey: "agent-api-key" }));
+    const persistPairApiToken = vi.fn();
+
+    const result = await runAgentSessionRecovery({
+      ...baseDeps,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      navigate: vi.fn(),
+      consumeRedirectInProcess: true,
+      persistPairApiToken,
+    });
+
+    expect(result).toEqual({ ok: true, redirectUrl, mode: "in-process" });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(fetchFn.mock.calls[1]?.[0]).toBe(
+      "https://elizacloud.ai/api/auth/pair",
+    );
+    expect(fetchFn.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Origin: "https://agent.elizacloud.ai",
+        },
+        body: JSON.stringify({ token: "origin-bound-token" }),
+      }),
+    );
+    expect(persistPairApiToken).toHaveBeenCalledWith("agent-api-key");
   });
 
   it("does NOT navigate on 401, the cloud session is invalid, wall stands", async () => {

@@ -35,6 +35,7 @@ export interface CanonicalScopedStreamRequest {
    * callers) the tail settles inline as before.
    */
   executionCtx?: BridgeExecutionContext;
+  source?: "voice";
   body: unknown;
   origin?: string | null;
   timings?: Record<string, number>;
@@ -78,6 +79,14 @@ export async function handleCanonicalScopedAgentStream(
     typeof (request.body as { text?: unknown }).text === "string"
       ? (request.body as { text: string }).text
       : "";
+  const clientMessageId =
+    request.body &&
+    typeof request.body === "object" &&
+    typeof (request.body as { clientMessageId?: unknown }).clientMessageId === "string" &&
+    (request.body as { clientMessageId: string }).clientMessageId.trim().length > 0 &&
+    (request.body as { clientMessageId: string }).clientMessageId.trim().length <= 256
+      ? (request.body as { clientMessageId: string }).clientMessageId.trim()
+      : undefined;
   timings.parse = elapsedMs(parseStartedAt);
   if (!text.trim()) {
     return applyCorsHeaders(
@@ -94,7 +103,9 @@ export async function handleCanonicalScopedAgentStream(
     params: {
       text,
       roomId: request.conversationId,
-      ...(request.userId ? { userId: request.userId, source: "voice" } : {}),
+      ...(request.userId ? { userId: request.userId } : {}),
+      ...(request.source ? { source: request.source } : {}),
+      clientMessageId: clientMessageId ?? crypto.randomUUID(),
     },
   };
 

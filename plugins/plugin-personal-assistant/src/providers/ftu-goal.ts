@@ -2,8 +2,8 @@
  * `ftuGoalProvider` — surfaces the post-first-run goal-discovery affordance
  * to the planner: once setup is complete but the assistant has not yet
  * learned what the owner primarily wants help with, it injects a compact
- * instruction to discover that conversationally (one natural question woven
- * into the reply — never a survey). Goes silent the moment the
+ * instruction to acknowledge the problem the owner just stated and, only
+ * when useful, ask one focused clarifier. Goes silent the moment the
  * `ftu_goal_discovery` evaluator records a goal.
  *
  * Position `-5`: after `firstRun` (`-10`) so the setup affordance always wins
@@ -21,6 +21,7 @@ import type {
   State,
 } from "@elizaos/core";
 import { ChannelType, logger } from "@elizaos/core";
+import { FTU_GOAL_PENDING_RESPONSE_INSTRUCTION } from "@elizaos/shared";
 import { createFirstRunStateStore } from "../lifeops/first-run/state.js";
 import { createFtuGoalStateStore } from "../lifeops/ftu-goal/state.js";
 
@@ -34,9 +35,6 @@ const QUIET_RESULT: ProviderResult = {
   values: { ftuGoalPending: false },
   data: {},
 };
-
-const ONE_LINE =
-  "You haven't learned what the owner mainly wants your help with. Weave ONE natural, curious question into your reply to discover what they value or want to get done — conversational, never a survey.";
 
 function isPrivateSurface(message: Memory): boolean {
   const channelType = message.content.channelType;
@@ -95,10 +93,10 @@ export const ftuGoalProvider: Provider = {
 
     const affordance: FtuGoalAffordance = {
       kind: "ftu_goal_discovery_pending",
-      oneLine: ONE_LINE,
+      oneLine: FTU_GOAL_PENDING_RESPONSE_INSTRUCTION,
     };
     return {
-      text: ONE_LINE,
+      text: FTU_GOAL_PENDING_RESPONSE_INSTRUCTION,
       values: { ftuGoalPending: true },
       data: { affordance },
     };

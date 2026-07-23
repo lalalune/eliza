@@ -17,6 +17,7 @@ import {
   handleCanonicalScopedAgentStream,
 } from "@/lib/services/shared-runtime/canonical-scoped-stream";
 import { resolveSharedAgent } from "@/lib/services/shared-runtime/resolve-shared-agent";
+import { isCanonicalSharedRestConversation } from "@/lib/services/shared-runtime/shared-rest-adapter";
 import type { BridgeExecutionContext } from "@/lib/services/shared-runtime/shared-runtime-chat";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -161,13 +162,16 @@ async function resolveAgentScope(
       agentId: agent.id,
       orgId,
       userId,
+      source: "voice" as const,
       agentName: agent.agent_name ?? "Agent",
     };
   }
-  return resolveSharedAgent(c, {
+  const resolved = await resolveSharedAgent(c, {
     cacheOnly: Boolean(c.env?.SHARED_RUNTIME_CONVERSATIONS),
     executionCtx,
   });
+  if ("error" in resolved) return resolved;
+  return { ...resolved, userId: resolved.callerUserId };
 }
 
 app.options("/", (c) =>
@@ -221,12 +225,27 @@ app.post("/", async (c) => {
   }
 
   const conversationId = c.req.param("conversationId") ?? r.agentId;
+  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: "Conversation not found",
+          code: "conversation_not_found",
+        },
+        { status: 404 },
+      ),
+      CORS_METHODS,
+      origin,
+    );
+  }
   return handleCanonicalScopedAgentStream({
     agent: r.agent,
     agentId: r.agentId,
     orgId: r.orgId,
     conversationId,
     ...("userId" in r ? { userId: r.userId } : {}),
+    ...("source" in r ? { source: r.source } : {}),
     body: raw,
     origin,
     namespace: c.env?.SHARED_RUNTIME_CONVERSATIONS,

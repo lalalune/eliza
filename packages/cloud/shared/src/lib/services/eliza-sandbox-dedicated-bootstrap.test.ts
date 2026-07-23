@@ -191,7 +191,7 @@ describe("ElizaSandboxService bridge — dedicated bootstrap window", () => {
       sandbox,
     );
     const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-    const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+    const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
       undefined,
     );
 
@@ -213,7 +213,7 @@ describe("ElizaSandboxService bridge — dedicated bootstrap window", () => {
       findRunningSpy.mockRestore();
       findByIdSpy.mockRestore();
       historyGetSpy.mockRestore();
-      historyUpsertSpy.mockRestore();
+      historyAppendSpy.mockRestore();
     }
   });
 
@@ -272,7 +272,7 @@ describe("ElizaSandboxService bridge — dedicated bootstrap window", () => {
       sandbox,
     );
     const historyGetSpy = spyOn(sharedRuntimeHistoryRepository, "get").mockResolvedValue([]);
-    const historyUpsertSpy = spyOn(sharedRuntimeHistoryRepository, "upsert").mockResolvedValue(
+    const historyAppendSpy = spyOn(sharedRuntimeHistoryRepository, "append").mockResolvedValue(
       undefined,
     );
 
@@ -299,7 +299,7 @@ describe("ElizaSandboxService bridge — dedicated bootstrap window", () => {
       findRunningSpy.mockRestore();
       findByIdSpy.mockRestore();
       historyGetSpy.mockRestore();
-      historyUpsertSpy.mockRestore();
+      historyAppendSpy.mockRestore();
     }
   });
 

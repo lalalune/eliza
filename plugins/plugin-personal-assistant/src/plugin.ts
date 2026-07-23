@@ -120,10 +120,12 @@ import { applyMockoonEnvOverrides } from "./lifeops/connectors/mockoon-redirect.
 import { createDelegationInboundMessageHandler } from "./lifeops/delegation-contracts/inbound-event.js";
 import { processDelegationInboundTurn } from "./lifeops/delegation-contracts/index.js";
 import { handleVoiceTurnObserved } from "./lifeops/entities/voice-observer-bridge.js";
+import { reconcilePersistedAppFirstRunCompletion } from "./lifeops/first-run/app-completion-reconciliation.js";
 import { installFirstRunChannelInspector } from "./lifeops/first-run/channel-inspector.js";
 import { setRuntimeChannelInspector } from "./lifeops/first-run/questions.js";
 import { FirstRunService } from "./lifeops/first-run/service.js";
 import { ftuGoalDiscoveryEvaluator } from "./lifeops/ftu-goal/evaluator.js";
+import { LifeOpsActivationGoalHandoffService } from "./lifeops/ftu-goal/handoff-service.js";
 import { createOwnerLocaleExamplesProvider } from "./lifeops/i18n/localized-examples-provider.js";
 import {
   createMultilingualPromptRegistry,
@@ -719,6 +721,7 @@ const rawPersonalAssistantPlugin: Plugin = {
   ],
   services: [
     BrowserBridgePluginService,
+    LifeOpsActivationGoalHandoffService,
     ActivityTrackerService,
     PresenceSignalBridgeService,
     // The ScheduledTaskRunnerService is now registered by the always-loaded
@@ -954,6 +957,18 @@ const rawPersonalAssistantPlugin: Plugin = {
 
     const ownerFactStore = createOwnerFactStore(runtime);
     registerOwnerFactStore(runtime, ownerFactStore);
+    // Plugin init runs before the SQL adapter has applied its schema. Schedule
+    // cache-backed app handoff on the same post-init seam as durable task
+    // registration so a real cold runtime never queries a missing cache table.
+    scheduleTaskEnsureAfterRuntimeInit({
+      runtime,
+      prefix: "[lifeops:first-run]",
+      label: "app completion reconciliation",
+      ensure: async () => {
+        await reconcilePersistedAppFirstRunCompletion(runtime);
+      },
+      delays: [100, 500, 1_000],
+    });
     registerCoreFactMemoryBridge(runtime);
 
     const promptRegistry = createMultilingualPromptRegistry();

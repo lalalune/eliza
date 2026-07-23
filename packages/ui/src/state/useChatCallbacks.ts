@@ -7,6 +7,7 @@
 
 import { MESSAGE_SOURCE_AGENT_GREETING } from "@elizaos/core";
 import { logger } from "@elizaos/logger";
+import type { ConversationGreetingKind } from "@elizaos/shared";
 import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
 import type {
   ChatTurnStatus,
@@ -39,6 +40,7 @@ import {
   type LoadConversationMessagesResult,
   loadActiveConversationId,
 } from "./internal";
+import { requestPostSignInActivationWithRetry } from "./post-sign-in-activation-client";
 import { deriveAgentReady } from "./types";
 
 import { useChatLifecycle } from "./useChatLifecycle";
@@ -224,16 +226,16 @@ async function resolveRestoredConversationWithMessages(
 /**
  * Hydrate the app's single active conversation on boot.
  *
- * INVARIANT: the ChatOverlay is mounted over EVERY surface, so the
- * chat must ALWAYS end up with an active, greeted conversation — never an empty
- * thread — regardless of which route the shell launched on. So when the server
- * has zero conversations this ALWAYS creates one with a bootstrap greeting (it
- * is NOT gated on the URL being /chat, the bug that left the overlay
- * permanently empty when the shell booted at /views or a cached app slug).
+ * INVARIANT: the ContinuousChatOverlay is mounted over EVERY surface, so the
+ * chat must always end up with an active conversation regardless of which
+ * route the shell launched on. When the server has none, this creates an empty
+ * thread on every route; the authenticated startup phase then asks the server
+ * for the independently versioned activation greeting.
  *
- * Returns a conversation id when the caller should still backfill a greeting
- * (restored-but-empty, or created without an inline greeting), else null.
- * Extracted from the hook so it can be tested directly with a fake client.
+ * Returns the active conversation id so the authenticated startup phase can
+ * request the durable post-sign-in activation. The server owns its global
+ * exactly-once ledger, so restored sessions and repeated hydrations safely make
+ * the same request without relying on renderer storage.
  */
 export async function hydrateInitialConversation(
   deps: HydrateInitialConversationDeps,
@@ -290,7 +292,7 @@ export async function hydrateInitialConversation(
           ? restoredConversation.id
           : null;
         setConversationMessages(nextMessages);
-        return nextMessages.length === 0 ? restoredConversation.id : null;
+        return restoredConversation.id;
       } catch {
         if (!isCurrentHydration()) {
           return null;
@@ -320,7 +322,6 @@ export async function hydrateInitialConversation(
     try {
       const { conversation: rawConversation, greeting: inlineGreeting } =
         await api.createConversation(undefined, {
-          bootstrapGreeting: true,
           lang: uiLanguage,
         });
       if (!isConversationRecord(rawConversation)) {
@@ -348,11 +349,17 @@ export async function hydrateInitialConversation(
       if (greetingText) {
         const nextMessages: ConversationMessage[] = [
           {
-            id: `greeting-${Date.now()}`,
+            id: inlineGreeting?.messageId ?? `greeting-${Date.now()}`,
             role: "assistant",
             text: greetingText,
-            timestamp: Date.now(),
-            source: MESSAGE_SOURCE_AGENT_GREETING,
+            timestamp: inlineGreeting?.timestamp ?? Date.now(),
+            source: inlineGreeting?.source ?? MESSAGE_SOURCE_AGENT_GREETING,
+            ...(inlineGreeting?.greetingKind
+              ? { greetingKind: inlineGreeting.greetingKind }
+              : {}),
+            ...(inlineGreeting?.activationVersion
+              ? { activationVersion: inlineGreeting.activationVersion }
+              : {}),
             ...(inlineGreeting?.localInference
               ? { localInference: inlineGreeting.localInference }
               : {}),
@@ -362,7 +369,7 @@ export async function hydrateInitialConversation(
         conversationMessagesRef.current = nextMessages;
         loadedConversationIdRef.current = conversation.id;
         setConversationMessages(nextMessages);
-        return null;
+        return conversation.id;
       }
 
       return conversation.id;
@@ -631,21 +638,33 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
   // ── Greeting / hydration (defined here; passed into lifecycle) ──────
 
   const fetchGreeting = useCallback(
-    async (convId: string): Promise<boolean> => {
+    async (
+      convId: string,
+      greetingKind: ConversationGreetingKind = "conversation",
+    ): Promise<boolean> => {
       if (greetingInFlightConversationRef.current === convId) {
         traceGreeting("fetchGreeting:skip_duplicate_in_flight", {
           convId,
+          greetingKind,
         });
         return false;
       }
       greetingInFlightConversationRef.current = convId;
-      traceGreeting("fetchGreeting:request", { convId });
+      traceGreeting("fetchGreeting:request", { convId, greetingKind });
       try {
-        const data = await client.requestGreeting(convId, uiLanguage);
+        const data =
+          greetingKind === "post_sign_in_activation"
+            ? await requestPostSignInActivationWithRetry({
+                client,
+                conversationId: convId,
+                language: uiLanguage,
+              })
+            : await client.requestGreeting(convId, uiLanguage, greetingKind);
         if (data.text) {
           const stillActive = activeConversationIdRef.current === convId;
           traceGreeting("fetchGreeting:response", {
             convId,
+            greetingKind,
             stillActive,
             textLength: data.text.length,
             persisted: data.persisted === true,
@@ -659,11 +678,15 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
             // late one, so the visible greeting never doubles or swaps.
             setConversationMessages((prev: ConversationMessage[]) =>
               appendGreetingOnce(prev, {
-                id: `greeting-${Date.now()}`,
+                id: data.messageId ?? `greeting-${Date.now()}`,
                 role: "assistant",
                 text: data.text,
-                timestamp: Date.now(),
-                source: MESSAGE_SOURCE_AGENT_GREETING,
+                timestamp: data.timestamp ?? Date.now(),
+                source: data.source ?? MESSAGE_SOURCE_AGENT_GREETING,
+                greetingKind: data.greetingKind ?? greetingKind,
+                ...(data.activationVersion
+                  ? { activationVersion: data.activationVersion }
+                  : {}),
                 ...(data.localInference
                   ? { localInference: data.localInference }
                   : {}),
@@ -673,15 +696,35 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
           }
           return stillActive;
         }
-        traceGreeting("fetchGreeting:empty_or_whitespace", { convId });
-        greetingFiredRef.current = false;
+        traceGreeting("fetchGreeting:empty_or_whitespace", {
+          convId,
+          greetingKind,
+        });
+        if (greetingKind === "conversation") {
+          greetingFiredRef.current = false;
+        }
       } catch (err) {
+        // error-policy:J4 the activation runner already exhausted bounded
+        // retries and stable-id transcript recovery. Keep chat usable while
+        // rendering a distinguishable failure instead of a healthy empty state.
+        logger.warn(
+          { err, conversationId: convId, greetingKind },
+          "[useChatCallbacks] greeting request failed",
+        );
         traceGreeting("fetchGreeting:request_failed", {
           convId,
+          greetingKind,
           error: err instanceof Error ? err.message : String(err),
         });
-        greetingFiredRef.current = false;
-        /* greeting failed silently — user can still chat */
+        if (greetingKind === "conversation") {
+          greetingFiredRef.current = false;
+        } else {
+          setActionNotice(
+            "You're signed in, but the welcome message could not be loaded. You can still start chatting.",
+            "error",
+            6_000,
+          );
+        }
       } finally {
         if (greetingInFlightConversationRef.current === convId) {
           greetingInFlightConversationRef.current = null;
@@ -695,31 +738,19 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
       greetingFiredRef,
       greetingInFlightConversationRef,
       setConversationMessages,
+      setActionNotice,
     ],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: greetingFiredRef is intentionally read from the ref at call time
   const requestGreetingWhenRunning = useCallback(
     async (convId: string | null): Promise<void> => {
-      if (!convId || greetingFiredRef.current) {
+      if (!convId) {
         traceGreeting("requestGreetingWhenRunning:skip", {
           convId: convId ?? null,
-          greetingFired: greetingFiredRef.current,
         });
         return;
       }
-      try {
-        const status = await client.getStatus();
-        traceGreeting("requestGreetingWhenRunning:status", {
-          convId,
-          state: status.state,
-        });
-        if (status.state === "running" && !greetingFiredRef.current) {
-          await fetchGreeting(convId);
-        }
-      } catch {
-        // best-effort greeting; will be triggered on next connect
-      }
+      await fetchGreeting(convId, "post_sign_in_activation");
     },
     [fetchGreeting],
   );
@@ -751,28 +782,17 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
     ],
   );
 
-  // Backfill the bootstrap greeting once the agent first becomes ready. The
-  // initial post-hydrate `requestGreetingWhenRunning` is one-shot and bails when
-  // the agent isn't running yet (a slow on-device model still warming, or no
-  // provider wired at boot) — without this retry a restored/created conversation
-  // that hydrated empty would stay permanently blank, so the chat would have no
-  // chat in it even though an active conversation exists. The helper self-gates
-  // on `greetingFiredRef`, so this never double-greets.
+  // Retry the durable activation once the agent first becomes ready. The
+  // initial post-hydrate request can arrive while an on-device model is still
+  // warming; the server ledger makes this retry safe even with existing
+  // history or a concurrent startup request.
   const agentReady = deriveAgentReady(agentStatus);
   useEffect(() => {
     if (!agentReady) return;
-    if (greetingFiredRef.current) return;
-    if (conversationMessagesRef.current.length > 0) return;
     const convId = activeConversationIdRef.current;
     if (!convId) return;
     void requestGreetingWhenRunning(convId);
-  }, [
-    agentReady,
-    requestGreetingWhenRunning,
-    activeConversationIdRef,
-    conversationMessagesRef,
-    greetingFiredRef,
-  ]);
+  }, [agentReady, requestGreetingWhenRunning, activeConversationIdRef]);
 
   // ── Send sub-hook ───────────────────────────────────────────────────
 
@@ -968,6 +988,7 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
         activeConversationIdRef.current = conversation.id;
         setCompanionMessageCutoffTs(nextCutoffTs);
         // Try inline greeting first; fall back to dedicated greeting endpoint
+        let greetingRecord = inlineGreeting;
         let greetingText = inlineGreeting?.text?.trim() || "";
         let greetingLocalInference = inlineGreeting?.localInference;
         if (!greetingText) {
@@ -983,6 +1004,7 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
               conversation.id,
               uiLanguage,
             );
+            greetingRecord = resp;
             greetingText = resp.text?.trim() || "";
             greetingLocalInference = resp.localInference;
           } catch {
@@ -1007,11 +1029,15 @@ export function useChatCallbacks(deps: UseChatCallbacksDeps) {
           greetingFiredRef.current = true;
           const initMessages: ConversationMessage[] = [
             {
-              id: `greeting-${Date.now()}`,
+              id: greetingRecord?.messageId ?? `greeting-${Date.now()}`,
               role: "assistant",
               text: greetingText,
-              timestamp: Date.now(),
-              source: MESSAGE_SOURCE_AGENT_GREETING,
+              timestamp: greetingRecord?.timestamp ?? Date.now(),
+              source: greetingRecord?.source ?? MESSAGE_SOURCE_AGENT_GREETING,
+              greetingKind: greetingRecord?.greetingKind ?? "conversation",
+              ...(greetingRecord?.activationVersion
+                ? { activationVersion: greetingRecord.activationVersion }
+                : {}),
               ...(greetingLocalInference
                 ? { localInference: greetingLocalInference }
                 : {}),

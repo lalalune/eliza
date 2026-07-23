@@ -1,5 +1,15 @@
 // Defines the shared runtime history Drizzle table shape used by cloud repositories and services.
-import { jsonb, pgTable, primaryKey, text, timestamp } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  check,
+  index,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uuid,
+} from "drizzle-orm/pg-core";
 
 /** One persisted turn in a shared-runtime conversation. Mirrors `SharedTurnMessage`. */
 export type SharedRuntimeHistoryMessage = {
@@ -7,6 +17,10 @@ export type SharedRuntimeHistoryMessage = {
   content: string;
   /** Epoch-ms timestamp; used to order turns merged from concurrent writers. */
   createdAt?: number;
+  id?: string;
+  source?: string;
+  greetingKind?: "conversation" | "post_sign_in_activation";
+  activationVersion?: string;
 };
 
 /**
@@ -30,10 +44,25 @@ export const sharedRuntimeHistory = pgTable(
     agent_id: text("agent_id").notNull(),
     channel_id: text("channel_id").notNull(),
     messages: jsonb("messages").$type<SharedRuntimeHistoryMessage[]>().notNull(),
+    handoff_fence_token: uuid("handoff_fence_token"),
+    handoff_fence_expires_at: timestamp("handoff_fence_expires_at", {
+      withTimezone: true,
+    }),
     updated_at: timestamp("updated_at").notNull().defaultNow(),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.agent_id, table.channel_id] }),
+    handoffFenceExpiry: index("shared_runtime_history_handoff_fence_expiry_idx").on(
+      table.handoff_fence_expires_at,
+    ),
+    handoffFenceShape: check(
+      "shared_runtime_history_handoff_fence_shape_check",
+      sql`(
+        (${table.handoff_fence_token} IS NULL AND ${table.handoff_fence_expires_at} IS NULL)
+        OR
+        (${table.handoff_fence_token} IS NOT NULL AND ${table.handoff_fence_expires_at} IS NOT NULL)
+      )`,
+    ),
   }),
 );
 

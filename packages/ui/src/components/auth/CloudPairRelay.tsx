@@ -64,14 +64,41 @@ export async function exchangeCloudPairToken(
     signal?: AbortSignal;
     fetchFn?: typeof fetch;
     cloudApiBase?: string;
+    /**
+     * Origin the Cloud-minted token was bound to. Native HTTP does not receive
+     * the browser's automatic Origin header, so the in-process Capacitor path
+     * passes the authenticated redirect origin explicitly.
+     */
+    pairingOrigin?: string;
   } = {},
 ): Promise<string> {
   const fetchFn = options.fetchFn ?? fetch;
+  let pairingOrigin: string | undefined;
+  if (options.pairingOrigin) {
+    try {
+      const parsedOrigin = new URL(options.pairingOrigin);
+      if (
+        (parsedOrigin.protocol !== "https:" &&
+          parsedOrigin.protocol !== "http:") ||
+        parsedOrigin.origin !== options.pairingOrigin.replace(/\/$/, "")
+      ) {
+        throw new Error("origin must be an absolute http(s) origin");
+      }
+      pairingOrigin = parsedOrigin.origin;
+    } catch {
+      // error-policy:J3 the authenticated redirect origin is still treated as
+      // untrusted input; malformed values produce an explicit failed exchange.
+      throw new CloudPairExchangeError("Invalid Cloud pairing origin.", 400);
+    }
+  }
   const response = await fetchFn(
     resolveCloudPairExchangeUrl(options.cloudApiBase),
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(pairingOrigin ? { Origin: pairingOrigin } : {}),
+      },
       body: JSON.stringify({ token }),
       signal: options.signal,
     },
@@ -179,7 +206,7 @@ type CloudPairStatus =
 
 export type CloudPairExchangeFn = (
   token: string,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; pairingOrigin?: string },
 ) => Promise<string>;
 
 export interface CloudPairRelayProps {
@@ -219,8 +246,32 @@ function describePairFailure(error: unknown): Exclude<
   };
 }
 
-export function CloudHostedAgentAuthNotice() {
+export interface CloudHostedAgentAuthNoticeProps {
+  onReauthenticate?: () => Promise<void> | void;
+}
+
+export function CloudHostedAgentAuthNotice({
+  onReauthenticate,
+}: CloudHostedAgentAuthNoticeProps = {}) {
   const reopenUrl = resolveCloudHostedAgentUrl();
+  const [reauthenticating, setReauthenticating] = useState(false);
+  const [reauthError, setReauthError] = useState<string | null>(null);
+  const reauthenticate = async (): Promise<void> => {
+    if (!onReauthenticate || reauthenticating) return;
+    setReauthenticating(true);
+    setReauthError(null);
+    try {
+      await onReauthenticate();
+    } catch (error) {
+      setReauthError(
+        error instanceof Error
+          ? error.message
+          : "Cloud sign-in could not be started.",
+      );
+    } finally {
+      setReauthenticating(false);
+    }
+  };
   return (
     <main className="flex min-h-[100dvh] flex-col items-center overflow-y-auto bg-[#08090b] px-6 text-center font-body text-white">
       <div className="my-auto w-full max-w-[25rem]">
@@ -233,14 +284,32 @@ export function CloudHostedAgentAuthNotice() {
           This Cloud agent uses your Eliza Cloud session. Open it from Eliza
           Cloud again to create a fresh secure sign-in link.
         </p>
-        <a
-          className="mt-7 inline-flex min-h-11 items-center justify-center rounded-md bg-[#f3a51f] px-5 text-sm font-semibold text-[#101010] transition hover:bg-[#c97710]"
-          href={reopenUrl}
-          rel="noopener"
-          target="_top"
-        >
-          Re-open from Eliza Cloud
-        </a>
+        {onReauthenticate ? (
+          <button
+            className="mt-7 inline-flex min-h-11 items-center justify-center rounded-md bg-[#f3a51f] px-5 text-sm font-semibold text-[#101010] transition hover:bg-[#c97710] disabled:cursor-wait disabled:opacity-70"
+            disabled={reauthenticating}
+            onClick={() => void reauthenticate()}
+            type="button"
+          >
+            {reauthenticating
+              ? "Opening Cloud sign-in…"
+              : "Sign in to Eliza Cloud"}
+          </button>
+        ) : (
+          <a
+            className="mt-7 inline-flex min-h-11 items-center justify-center rounded-md bg-[#f3a51f] px-5 text-sm font-semibold text-[#101010] transition hover:bg-[#c97710]"
+            href={reopenUrl}
+            rel="noopener"
+            target="_top"
+          >
+            Re-open from Eliza Cloud
+          </a>
+        )}
+        {reauthError ? (
+          <p className="mt-4 text-sm leading-6 text-[#ffb4a8]" role="alert">
+            {reauthError}
+          </p>
+        ) : null}
       </div>
     </main>
   );

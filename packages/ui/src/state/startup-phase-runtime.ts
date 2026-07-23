@@ -515,14 +515,30 @@ export async function runStartingRuntime(
         // On Capacitor native the bearer token is injected asynchronously.
         // The first /api/status poll can race the injection and return 401
         // before the token is available. Fall through to retry on native;
-        // dispatch BACKEND_AUTH_REQUIRED immediately on non-native runtimes
+        // classify the public auth status immediately on non-native runtimes
         // where there is no injection race.
         if (!isCapacitorNative()) {
           const auth = await client.getAuthStatus().catch(() => ({
             required: true,
+            authenticated: false,
+            loginRequired: false,
+            bootstrapRequired: false,
+            localAccess: false,
+            passwordConfigured: false,
             pairingEnabled: false,
             expiresAt: null,
           }));
+          // Password login is owned by App's top-level auth gate, not the
+          // pairing startup shell. Treat the protected runtime as paintable so
+          // `/api/auth/me` can resolve 401 and LoginView can accept the
+          // configured owner's credentials, including pairing-disabled
+          // self-hosted servers reached through a same-origin proxy.
+          if (auth.loginRequired && auth.passwordConfigured === true) {
+            deps.setAuthRequired(false);
+            deps.setFirstRunLoading(false);
+            dispatch({ type: "AGENT_RUNNING" });
+            return;
+          }
           deps.setAuthRequired(true);
           deps.setPairingEnabled(auth.pairingEnabled);
           deps.setPairingExpiresAt(auth.expiresAt);

@@ -15,25 +15,18 @@
 
 import { hasOwnerAccess } from "@elizaos/agent";
 import type { Evaluator, JSONSchema } from "@elizaos/core";
+import {
+  FTU_GOAL_CONFIDENCE_THRESHOLD,
+  FTU_GOAL_DISCOVERY_PROMPT,
+  type FtuGoalDiscoveryOutput,
+  parseFtuGoalDiscoveryOutput,
+} from "@elizaos/shared";
 import { createFirstRunStateStore } from "../first-run/state.js";
 import { createOwnerFactStore } from "../owner/fact-store.js";
 import { createFtuGoalStateStore } from "./state.js";
 
-/**
- * Minimum extraction confidence required to persist the goal and close
- * discovery. Below this the turn contributes nothing and discovery stays
- * open — a half-guessed goal written as fact is worse than another turn of
- * conversation.
- */
-export const FTU_GOAL_CONFIDENCE_THRESHOLD = 0.7;
-
-const MAX_GOAL_LENGTH = 240;
-
-export interface FtuGoalDiscoveryOutput {
-  goalFound: boolean;
-  goal: string;
-  confidence: number;
-}
+export type { FtuGoalDiscoveryOutput };
+export { FTU_GOAL_CONFIDENCE_THRESHOLD };
 
 const ftuGoalSchema: JSONSchema = {
   type: "object",
@@ -46,25 +39,10 @@ const ftuGoalSchema: JSONSchema = {
   additionalProperties: false,
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 export function parseFtuGoalOutput(
   output: unknown,
 ): FtuGoalDiscoveryOutput | null {
-  if (!isRecord(output)) return null;
-  if (typeof output.goalFound !== "boolean") return null;
-  const goal = typeof output.goal === "string" ? output.goal.trim() : "";
-  const confidence =
-    typeof output.confidence === "number" && Number.isFinite(output.confidence)
-      ? Math.min(1, Math.max(0, output.confidence))
-      : 0;
-  return {
-    goalFound: output.goalFound && goal.length > 0,
-    goal: goal.slice(0, MAX_GOAL_LENGTH),
-    confidence,
-  };
+  return parseFtuGoalDiscoveryOutput(output);
 }
 
 export const ftuGoalDiscoveryEvaluator: Evaluator<FtuGoalDiscoveryOutput> = {
@@ -90,13 +68,7 @@ export const ftuGoalDiscoveryEvaluator: Evaluator<FtuGoalDiscoveryOutput> = {
   },
 
   prompt() {
-    return `Decide whether this turn reveals the owner's PRIMARY goal: the thing they mainly value or want the assistant's ongoing help with (e.g. "ship my startup's iOS app", "stay on top of email and family follow-ups", "train for a marathon").
-Judge from the owner's latest message in the shared turn context, in light of the agent's response.
-Rules:
-- goalFound=true only when the owner expresses a durable want, priority, or area they need help with — in their own words, not the agent's suggestion.
-- goal: one compact sentence (max ~30 words) restating that want. Empty string when goalFound=false.
-- confidence: 0-1. Use >=${FTU_GOAL_CONFIDENCE_THRESHOLD} only when the owner stated it plainly; use lower values for hints or topic-of-the-moment chatter.
-- One-off tasks ("remind me at 3pm"), pleasantries, and questions about the assistant itself are NOT goals => goalFound=false, goal="", confidence=0.`;
+    return FTU_GOAL_DISCOVERY_PROMPT;
   },
 
   parse: parseFtuGoalOutput,
@@ -112,34 +84,34 @@ Rules:
         ) {
           return undefined;
         }
-        const stateStore = createFtuGoalStateStore(runtime);
-        // Idempotence backstop: shouldRun already gates on `pending`, but a
-        // concurrent turn may have completed discovery between the gate and
-        // this processor. Never overwrite an already-discovered goal.
-        const current = await stateStore.read();
-        if (current.status === "complete") {
-          return undefined;
-        }
-
         const discoveredAt = new Date().toISOString();
         const sourceMessageId =
           typeof message.id === "string" && message.id.length > 0
             ? message.id
             : undefined;
-        await createOwnerFactStore(runtime).update(
-          { primaryGoal: output.goal },
+        const completion = await createFtuGoalStateStore(
+          runtime,
+        ).completeIfPending(
           {
-            source: "agent_inferred",
-            recordedAt: discoveredAt,
-            note: `ftu goal discovery from message:${sourceMessageId ?? "(unknown)"}`,
+            goal: output.goal,
+            confidence: output.confidence,
+            discoveredAt,
+            ...(sourceMessageId ? { sourceMessageId } : {}),
+          },
+          async () => {
+            await createOwnerFactStore(runtime).update(
+              { primaryGoal: output.goal },
+              {
+                source: "agent_inferred",
+                recordedAt: discoveredAt,
+                note: `ftu goal discovery from message:${sourceMessageId ?? "(unknown)"}`,
+              },
+            );
           },
         );
-        await stateStore.complete({
-          goal: output.goal,
-          confidence: output.confidence,
-          discoveredAt,
-          ...(sourceMessageId ? { sourceMessageId } : {}),
-        });
+        if (!completion.didComplete) {
+          return undefined;
+        }
         return {
           success: true,
           values: {

@@ -20,6 +20,10 @@
  *  - route only shared-eligible agents here (see `agent-tier.ts`)
  */
 
+import {
+  acceptedFtuGoalContext,
+  FTU_GOAL_PENDING_RESPONSE_INSTRUCTION,
+} from "@elizaos/shared/contracts";
 import { generateText, streamText } from "ai";
 import { CEREBRAS_DEFAULT_TEXT_SMALL_MODEL } from "../../models/catalog";
 import {
@@ -33,6 +37,11 @@ export interface SharedTurnMessage {
   content: string;
   /** Epoch-ms timestamp used by REST chat clients to reconcile persisted turns. */
   createdAt?: number;
+  /** Stable metadata carried by deterministic, non-model greeting messages. */
+  id?: string;
+  source?: string;
+  greetingKind?: "conversation" | "post_sign_in_activation";
+  activationVersion?: string;
 }
 
 export interface SharedAgentCharacter {
@@ -52,6 +61,8 @@ export interface RunSharedAgentTurnInput {
   history: SharedTurnMessage[];
   /** The incoming user message or event text. */
   message: string;
+  /** Narrow owner-goal context supplied by the durable activation ledger. */
+  ownerGoalContext?: { status: "pending" } | { status: "accepted"; goal: string };
 }
 
 export interface RunSharedAgentTurnResult {
@@ -161,7 +172,10 @@ export function resolveSharedAgentTurnModel(preferred?: string): string | null {
   return hasLanguageModelProviderConfigured(DEFAULT_SHARED_MODEL) ? DEFAULT_SHARED_MODEL : null;
 }
 
-function buildSystemPrompt(character: SharedAgentCharacter): string {
+function buildSystemPrompt(
+  character: SharedAgentCharacter,
+  ownerGoalContext?: RunSharedAgentTurnInput["ownerGoalContext"],
+): string {
   const parts: string[] = [];
   const system = character.system?.trim();
   if (system) parts.push(system);
@@ -172,6 +186,11 @@ function buildSystemPrompt(character: SharedAgentCharacter): string {
         .filter(Boolean)
         .join("\n- ")}`,
     );
+  }
+  if (ownerGoalContext?.status === "pending") {
+    parts.push(FTU_GOAL_PENDING_RESPONSE_INSTRUCTION);
+  } else if (ownerGoalContext?.status === "accepted") {
+    parts.push(acceptedFtuGoalContext(ownerGoalContext.goal));
   }
   return parts.join("\n\n") || `You are ${character.name}, a helpful assistant.`;
 }
@@ -234,7 +253,7 @@ export async function runSharedAgentTurn(
       // the model wrapper fails over to a healthy provider INSTANTLY on a 5xx,
       // so the SDK's 2-6s sleeping retry is redundant and only adds latency.
       maxRetries: SHARED_TURN_MAX_RETRIES,
-      system: buildSystemPrompt(input.character),
+      system: buildSystemPrompt(input.character, input.ownerGoalContext),
       messages: [
         ...input.history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user" as const, content: message },
@@ -313,7 +332,7 @@ export async function runSharedAgentTurnStream(
       // the model wrapper fails over to a healthy provider INSTANTLY on a 5xx,
       // so the SDK's 2-6s sleeping retry is redundant and only adds latency.
       maxRetries: SHARED_TURN_MAX_RETRIES,
-      system: buildSystemPrompt(input.character),
+      system: buildSystemPrompt(input.character, input.ownerGoalContext),
       messages: [
         ...input.history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user" as const, content: message },

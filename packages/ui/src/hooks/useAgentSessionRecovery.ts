@@ -12,7 +12,8 @@
  *
  * SECURITY (auth-adjacent): this NEVER bypasses the wall. Recovery only fires
  * when a valid cloud session exists to re-pair from; the server still gates the
- * pairing-token mint, and any 401/403 from it hands control back to the wall.
+ * pairing-token mint. Managed-Cloud failures hand control to Cloud sign-in;
+ * only self-hosted agents can fall through to the local owner-password form.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -29,10 +30,12 @@ import { ensureCloudSessionForRepair } from "../state/cloud-session-refresh-for-
 import { loadPersistedActiveServer } from "../state/persistence";
 
 export type AgentSessionRecoveryStatus =
-  /** Not a recoverable state, the auth gate should render the wall. */
+  /** No managed-Cloud recovery is active; self-hosted agents render login. */
   | "idle"
   /** A re-pair is in flight, the auth gate should hold (no wall yet). */
-  | "recovering";
+  | "recovering"
+  /** Managed Cloud needs a fresh Cloud session; never render local password. */
+  | "cloud-sign-in-required";
 
 interface UseAgentSessionRecoveryOptions {
   /**
@@ -67,8 +70,8 @@ export function useAgentSessionRecovery(
 ): AgentSessionRecoveryStatus {
   const { active, reason, navigate = defaultNavigate } = options;
   const [status, setStatus] = useState<AgentSessionRecoveryStatus>("idle");
-  // One attempt per mount cycle: if re-pairing fails we must NOT retry into an
-  // infinite loop, fall through to the wall instead.
+  // One attempt per mount cycle prevents a stale credential from creating an
+  // infinite re-pair loop; a failed managed-Cloud attempt requires sign-in.
   const attemptedRef = useRef(false);
 
   useEffect(() => {
@@ -81,9 +84,19 @@ export function useAgentSessionRecovery(
     }
 
     if (attemptedRef.current) {
-      // One attempt per cycle: a prior failed attempt must fall through to the
-      // wall/notice, never loop.
-      setStatus("idle");
+      const exhaustedDecision = resolveAgentSessionRecovery({
+        reason,
+        activeServer: loadPersistedActiveServer(),
+        cloudToken: getCloudAuthToken(),
+        cloudApiBase:
+          getBootConfig().cloudApiBase?.trim() || "https://elizacloud.ai",
+        alreadyAttempted: true,
+      });
+      setStatus(
+        exhaustedDecision.action === "show-cloud-sign-in"
+          ? "cloud-sign-in-required"
+          : "idle",
+      );
       return;
     }
 
@@ -110,7 +123,11 @@ export function useAgentSessionRecovery(
       cloudToken: string,
     ) => {
       if (decision.action !== "re-pair") {
-        setStatus("idle");
+        setStatus(
+          decision.action === "show-cloud-sign-in"
+            ? "cloud-sign-in-required"
+            : "idle",
+        );
         return;
       }
       setStatus("recovering");
@@ -129,12 +146,12 @@ export function useAgentSessionRecovery(
       })
         .then((result) => {
           if (cancelled) return;
-          // On success the runner triggers a full-page navigation to `/pair`,
-          // so this component unmounts. On failure, drop to the wall.
-          if (!result.ok) setStatus("idle");
+          // Browser success navigates; native success adopts the token
+          // in-process. A managed Cloud failure always returns to Cloud sign-in.
+          if (!result.ok) setStatus("cloud-sign-in-required");
         })
         .catch(() => {
-          if (!cancelled) setStatus("idle");
+          if (!cancelled) setStatus("cloud-sign-in-required");
         });
     };
 
@@ -152,9 +169,13 @@ export function useAgentSessionRecovery(
     }
 
     if (!agentSessionRepairNeedsCloudToken(initialInput)) {
-      // Not a cookie-recoverable state (self-hosted, wrong 401 reason, no agent
-      // id, or genuinely nothing to re-pair). The wall/notice is honest.
-      setStatus("idle");
+      // Self-hosted targets use their password wall. Managed Cloud targets whose
+      // state cannot be silently repaired return to Cloud sign-in.
+      setStatus(
+        initialDecision.action === "show-cloud-sign-in"
+          ? "cloud-sign-in-required"
+          : "idle",
+      );
       return;
     }
 
@@ -170,8 +191,7 @@ export function useAgentSessionRecovery(
       .then((token) => {
         if (cancelled) return;
         if (!token) {
-          // No cookie / refresh failed / timed out: the notice is honest now.
-          setStatus("idle");
+          setStatus("cloud-sign-in-required");
           return;
         }
         const decision = resolveAgentSessionRecovery(
@@ -180,7 +200,7 @@ export function useAgentSessionRecovery(
         startRepair(decision, token);
       })
       .catch(() => {
-        if (!cancelled) setStatus("idle");
+        if (!cancelled) setStatus("cloud-sign-in-required");
       });
 
     return () => {

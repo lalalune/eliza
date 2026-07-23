@@ -46,6 +46,10 @@ export type AgentSessionRecoveryDecision =
   | {
       /** Show the agent's internal password wall (no recovery available). */
       action: "show-wall";
+    }
+  | {
+      /** Managed Cloud sessions reauthenticate through Cloud, never a local password. */
+      action: "show-cloud-sign-in";
     };
 
 export interface AgentSessionRecoveryInput {
@@ -69,6 +73,9 @@ export interface AgentSessionRecoveryInput {
 }
 
 const SHOW_WALL: AgentSessionRecoveryDecision = { action: "show-wall" };
+const SHOW_CLOUD_SIGN_IN: AgentSessionRecoveryDecision = {
+  action: "show-cloud-sign-in",
+};
 
 /**
  * Extract the dedicated agent id from an API base alone: the
@@ -129,20 +136,15 @@ export function resolveDedicatedAgentId(
  *   - a cloud session token exists to re-pair from, and
  *   - we have not already tried this cycle.
  *
- * Otherwise the password wall is the honest, actionable state.
+ * A managed Cloud target never falls through to the local owner-password wall:
+ * when transparent re-pairing is unavailable or already failed, Cloud sign-in
+ * is the recovery surface. Only local/self-hosted targets use the wall.
  */
 export function resolveAgentSessionRecovery(
   input: AgentSessionRecoveryInput,
 ): AgentSessionRecoveryDecision {
   const { reason, activeServer, cloudToken, cloudApiBase, alreadyAttempted } =
     input;
-
-  if (alreadyAttempted) return SHOW_WALL;
-
-  // Only a rejected session/bearer is recoverable by re-pairing. When the host
-  // never configured an owner password, re-pairing cannot manufacture one, so
-  // keep the actionable setup wall.
-  if (reason !== "remote_auth_required") return SHOW_WALL;
 
   if (!activeServer) return SHOW_WALL;
 
@@ -152,15 +154,20 @@ export function resolveAgentSessionRecovery(
     isDirectCloudSharedAgentBase(activeServer.apiBase);
   if (!isCloudManaged) return SHOW_WALL;
 
-  // No cloud session means nothing to re-pair with, so the wall is honest.
+  if (alreadyAttempted || reason !== "remote_auth_required") {
+    return SHOW_CLOUD_SIGN_IN;
+  }
+
+  // No Cloud session means transparent pairing cannot proceed; ask for Cloud
+  // reauthentication instead of a password the managed agent never issued.
   const token = cloudToken?.trim();
-  if (!token) return SHOW_WALL;
+  if (!token) return SHOW_CLOUD_SIGN_IN;
 
   const agentId = resolveDedicatedAgentId(activeServer);
-  if (!agentId) return SHOW_WALL;
+  if (!agentId) return SHOW_CLOUD_SIGN_IN;
 
   const base = cloudApiBase.trim();
-  if (!base) return SHOW_WALL;
+  if (!base) return SHOW_CLOUD_SIGN_IN;
 
   return { action: "re-pair", agentId, cloudApiBase: base };
 }

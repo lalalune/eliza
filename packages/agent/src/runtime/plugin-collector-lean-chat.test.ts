@@ -63,6 +63,7 @@ describe("collectPluginNames lean-chat plugin set (#8434)", () => {
     expect(names.has("@elizaos/plugin-simple-views")).toBe(true);
     expect(names.has("@elizaos/plugin-commands")).toBe(true);
     expect(names.has("@elizaos/plugin-agent-skills")).toBe(true);
+    expect(names.has("@elizaos/plugin-personal-assistant")).toBe(true);
 
     // ...and drops every heavy surface, including browser (off until ready).
     for (const heavy of HEAVY) {

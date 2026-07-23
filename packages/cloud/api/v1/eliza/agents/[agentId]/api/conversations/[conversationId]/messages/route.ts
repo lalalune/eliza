@@ -4,6 +4,7 @@ import { InsufficientCreditsError } from "@/lib/api/errors";
 import { applyCorsHeaders, handleCorsOptions } from "@/lib/services/proxy/cors";
 import { resolveSharedAgent } from "@/lib/services/shared-runtime/resolve-shared-agent";
 import {
+  isCanonicalSharedRestConversation,
   sharedRestMessageSend,
   sharedRestMessagesGet,
 } from "@/lib/services/shared-runtime/shared-rest-adapter";
@@ -38,12 +39,31 @@ app.get("/", async (c) => {
     );
   }
   const conversationId = c.req.param("conversationId") ?? r.agentId;
+  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: "Conversation not found",
+          code: "conversation_not_found",
+        },
+        { status: 404 },
+      ),
+      CORS_METHODS,
+      origin,
+    );
+  }
   const namespace = c.env?.SHARED_RUNTIME_CONVERSATIONS;
+  const activationOwnerUserId =
+    r.callerUserId === r.agent.user_id ? r.agent.user_id : undefined;
   let body: Awaited<ReturnType<typeof sharedRestMessagesGet>>;
   try {
-    body = namespace
-      ? await sharedRestMessagesGet(r.agentId, conversationId, namespace)
-      : await sharedRestMessagesGet(r.agentId, conversationId);
+    body = await sharedRestMessagesGet(
+      r.agentId,
+      conversationId,
+      namespace,
+      activationOwnerUserId,
+    );
   } catch (error) {
     // error-policy:J1 a cold/evicted conversation object is a retryable
     // warming state, not an unhandled 500 — the most common cold read is
@@ -86,6 +106,20 @@ app.post("/", async (c) => {
     );
   }
   const conversationId = c.req.param("conversationId") ?? r.agentId;
+  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: "Conversation not found",
+          code: "conversation_not_found",
+        },
+        { status: 404 },
+      ),
+      CORS_METHODS,
+      origin,
+    );
+  }
   const raw: unknown = await c.req.json().catch(() => ({}));
   const text =
     raw &&
@@ -93,6 +127,15 @@ app.post("/", async (c) => {
     typeof (raw as { text?: unknown }).text === "string"
       ? (raw as { text: string }).text
       : "";
+  const clientMessageId =
+    raw &&
+    typeof raw === "object" &&
+    typeof (raw as { clientMessageId?: unknown }).clientMessageId ===
+      "string" &&
+    (raw as { clientMessageId: string }).clientMessageId.trim().length > 0 &&
+    (raw as { clientMessageId: string }).clientMessageId.trim().length <= 256
+      ? (raw as { clientMessageId: string }).clientMessageId.trim()
+      : undefined;
   if (!text.trim()) {
     return applyCorsHeaders(
       Response.json(
@@ -110,25 +153,18 @@ app.post("/", async (c) => {
   let result: { text: string; agentName: string };
   try {
     const namespace = c.env?.SHARED_RUNTIME_CONVERSATIONS;
-    result = namespace
-      ? await sharedRestMessageSend(
-          r.agentId,
-          r.orgId,
-          conversationId,
-          text,
-          r.agentName,
-          executionCtx,
-          r.agent,
-          namespace,
-        )
-      : await sharedRestMessageSend(
-          r.agentId,
-          r.orgId,
-          conversationId,
-          text,
-          r.agentName,
-          executionCtx,
-        );
+    result = await sharedRestMessageSend(
+      r.agentId,
+      r.orgId,
+      conversationId,
+      text,
+      r.agentName,
+      r.callerUserId,
+      clientMessageId,
+      executionCtx,
+      namespace ? r.agent : undefined,
+      namespace,
+    );
   } catch (error) {
     // error-policy:J1 route boundary translates bridge/billing failures to HTTP responses.
     // Insufficient credits is a PERMANENT condition until the org tops up —

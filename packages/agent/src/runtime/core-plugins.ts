@@ -311,6 +311,7 @@ export const LEAN_CHAT_PLUGINS: readonly string[] = [
   "@elizaos/plugin-native-filesystem", // mobile-safe FILE target
   "@elizaos/plugin-agent-skills", // skill execution + enabled-skills provider
   "@elizaos/plugin-commands", // slash commands
+  "@elizaos/plugin-personal-assistant", // owner activation, goal discovery, and LifeOps persistence
 ];
 
 /**

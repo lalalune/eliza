@@ -8,6 +8,7 @@
 
 import type { IAgentRuntime } from "@elizaos/core";
 import { asCacheRuntime } from "../runtime-cache.js";
+import { withRuntimeTransitionLock } from "../runtime-transition-lock.js";
 
 // --- Public re-exports of the canonical OwnerFactStore --------------------
 
@@ -35,7 +36,9 @@ export {
 
 // --- First-run lifecycle state -------------------------------------------
 
-export type FirstRunPath = "defaults" | "customize" | "replay";
+export type FirstRunPath = "defaults" | "customize" | "replay" | "app_handoff";
+
+export type InteractiveFirstRunPath = Exclude<FirstRunPath, "app_handoff">;
 
 export type FirstRunStatus = "pending" | "in_progress" | "complete";
 
@@ -56,10 +59,16 @@ const FIRST_RUN_CACHE_KEY = "eliza:lifeops:first-run:v1";
 
 export interface FirstRunStateStore {
   read(): Promise<FirstRunRecord>;
-  begin(path: FirstRunPath): Promise<FirstRunRecord>;
+  begin(path: InteractiveFirstRunPath): Promise<FirstRunRecord>;
   recordAnswer(key: string, value: unknown): Promise<FirstRunRecord>;
   abandon(): Promise<FirstRunRecord>;
   complete(): Promise<FirstRunRecord>;
+  /**
+   * Adopt the app's persisted completion without replaying onboarding.
+   * Only a still-pending lifecycle transitions; active customization/replay
+   * and completed records remain authoritative.
+   */
+  adoptAppCompletion(): Promise<FirstRunRecord>;
   /** Reset the lifecycle entirely and replay re-entry. */
   reset(): Promise<void>;
 }
@@ -93,7 +102,10 @@ function normalizeRecord(value: unknown): FirstRunRecord {
       ? v.status
       : "pending";
   const path =
-    v.path === "defaults" || v.path === "customize" || v.path === "replay"
+    v.path === "defaults" ||
+    v.path === "customize" ||
+    v.path === "replay" ||
+    v.path === "app_handoff"
       ? v.path
       : undefined;
   const partialAnswers =
@@ -136,7 +148,7 @@ export function createFirstRunStateStore(
 
   return {
     read,
-    async begin(path: FirstRunPath): Promise<FirstRunRecord> {
+    async begin(path: InteractiveFirstRunPath): Promise<FirstRunRecord> {
       const current = await read();
       const startedAt = current.startedAt ?? new Date().toISOString();
       const next: FirstRunRecord = {
@@ -187,6 +199,27 @@ export function createFirstRunStateStore(
         completionCount: current.completionCount + 1,
       };
       return await persist(next);
+    },
+    async adoptAppCompletion(): Promise<FirstRunRecord> {
+      return await withRuntimeTransitionLock(
+        runtime,
+        FIRST_RUN_CACHE_KEY,
+        async () => {
+          const current = await read();
+          if (current.status !== "pending") {
+            return current;
+          }
+          const completedAt = new Date().toISOString();
+          return await persist({
+            ...current,
+            status: "complete",
+            path: "app_handoff",
+            startedAt: current.startedAt ?? completedAt,
+            completedAt,
+            completionCount: 1,
+          });
+        },
+      );
     },
     async reset(): Promise<void> {
       if (typeof cache.deleteCache === "function") {

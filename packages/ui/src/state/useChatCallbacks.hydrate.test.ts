@@ -31,7 +31,12 @@ function makeFakeClient(
     sendWsMessage: vi.fn(),
     createConversation: vi.fn(async () => ({
       conversation: { ...CONVERSATION },
-      greeting: { text: "hi there" },
+      greeting: {
+        text: "hi there",
+        messageId: "server-greeting-id",
+        timestamp: 42,
+        greetingKind: "conversation",
+      },
     })),
     ...overrides,
     // biome-ignore lint/suspicious/noExplicitAny: test fake satisfies the structural client at the boundary
@@ -94,19 +99,21 @@ describe("hydrateInitialConversation — chat always has a chat (#1)", () => {
     const result = await hydrateInitialConversation(deps);
 
     expect(client.createConversation).toHaveBeenCalledWith(undefined, {
-      bootstrapGreeting: true,
       lang: "en",
     });
     expect(setActiveConversationId).toHaveBeenCalledWith("c1");
     const seeded = setConversationMessages.mock.calls.at(-1)?.[0];
     expect(seeded).toHaveLength(1);
     expect(seeded[0]).toMatchObject({
+      id: "server-greeting-id",
       role: "assistant",
       text: "hi there",
+      timestamp: 42,
       source: MESSAGE_SOURCE_AGENT_GREETING,
+      greetingKind: "conversation",
     });
     expect(greetingFiredRef.current).toBe(true);
-    expect(result).toBeNull(); // greeting inlined → no backfill needed
+    expect(result).toBe("c1"); // startup still asks the durable activation seam
   });
 
   it("restores an existing conversation with its messages instead of creating one", async () => {
@@ -133,7 +140,7 @@ describe("hydrateInitialConversation — chat always has a chat (#1)", () => {
     // The thread holder is bound to the restored conversation so the
     // empty-draft cleanup may legitimately judge it by these messages.
     expect(loadedConversationIdRef.current).toBe("c1");
-    expect(result).toBeNull(); // already has messages
+    expect(result).toBe("c1"); // existing history does not replace activation
   });
 
   it("leaves the thread holder UNKNOWN when the restore fetch fails (placeholder [] must never feed draft cleanup)", async () => {
@@ -200,7 +207,7 @@ describe("hydrateInitialConversation — chat always has a chat (#1)", () => {
     expect(setConversationMessages.mock.calls.at(-1)?.[0]).toEqual([
       { id: "m1", role: "user", text: "hello", timestamp: 2 },
     ]);
-    expect(result).toBeNull();
+    expect(result).toBe("real");
   });
 
   it("restores the MOST-RECENT real conversation even when the server list is not recency-sorted", async () => {
@@ -241,7 +248,7 @@ describe("hydrateInitialConversation — chat always has a chat (#1)", () => {
     const result = await hydrateInitialConversation(deps);
 
     expect(setActiveConversationId).toHaveBeenCalledWith("newer");
-    expect(result).toBeNull();
+    expect(result).toBe("newer");
   });
 
   it("returns the new conversation id to backfill when created WITHOUT an inline greeting", async () => {

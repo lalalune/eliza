@@ -92,6 +92,7 @@ interface MockCloudState {
     string,
     { id: string; title: string; messages: MockMessage[] }
   >;
+  handoffFences: Map<string, string>;
   requests: Array<{ method: string; path: string; auth: string | null }>;
   resumeCalls: string[];
 }
@@ -217,6 +218,44 @@ function createMockCloud(state: MockCloudState): Server {
         json(res, 200, { inserted: incoming.length });
         return;
       }
+      const handoffMatch =
+        /^\/api\/conversations\/([^/]+)\/messages\/handoff$/.exec(rest);
+      if (handoffMatch) {
+        const key = `${agent.id}:${handoffMatch[1]}`;
+        const conversation = state.conversations.get(key);
+        if (!conversation) {
+          json(res, 404, { error: "conversation not found" });
+          return;
+        }
+        const body = JSON.parse(await readBody(req)) as {
+          fenceToken?: unknown;
+        };
+        const fenceToken =
+          typeof body.fenceToken === "string" ? body.fenceToken.trim() : "";
+        if (!fenceToken) {
+          json(res, 400, { error: "fenceToken is required" });
+          return;
+        }
+        const activeFence = state.handoffFences.get(key);
+        if (method === "POST") {
+          if (activeFence && activeFence !== fenceToken) {
+            json(res, 409, { error: "handoff already in progress" });
+            return;
+          }
+          state.handoffFences.set(key, fenceToken);
+          json(res, 200, { messages: conversation.messages });
+          return;
+        }
+        if (method === "DELETE") {
+          if (activeFence && activeFence !== fenceToken) {
+            json(res, 409, { error: "handoff fence token mismatch" });
+            return;
+          }
+          state.handoffFences.delete(key);
+          json(res, 200, { released: true });
+          return;
+        }
+      }
       const messagesMatch = /^\/api\/conversations\/([^/]+)\/messages$/.exec(
         rest,
       );
@@ -229,6 +268,10 @@ function createMockCloud(state: MockCloudState): Server {
           return;
         }
         if (method === "POST") {
+          if (state.handoffFences.has(`${agent.id}:${messagesMatch[1]}`)) {
+            json(res, 409, { error: "conversation handoff in progress" });
+            return;
+          }
           const body = JSON.parse(await readBody(req)) as { text?: string };
           const userText = body.text ?? "";
           const replyText = `echo from ${agent.id}: ${userText}`;
@@ -381,6 +424,7 @@ describe("mock-cloud connect e2e — dedicated cold boot + shared chat bridge", 
   const state: MockCloudState = {
     agents: new Map(),
     conversations: new Map(),
+    handoffFences: new Map(),
     requests: [],
     resumeCalls: [],
   };
@@ -401,6 +445,7 @@ describe("mock-cloud connect e2e — dedicated cold boot + shared chat bridge", 
   beforeEach(() => {
     state.agents.clear();
     state.conversations.clear();
+    state.handoffFences.clear();
     state.requests.length = 0;
     state.resumeCalls.length = 0;
     // Make the mock origin the recognized direct-cloud base for both

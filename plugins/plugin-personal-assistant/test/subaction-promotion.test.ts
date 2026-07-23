@@ -1,10 +1,6 @@
 /**
- * Verifies the `promoteSubactionsToActions` helper from `@elizaos/core`.
- *
- * Phase-2 work: each umbrella's subactions are promoted to virtual top-level
- * Actions named `<UMBRELLA>_<SUBACTION>`. Virtuals delegate to the parent's
- * handler with the parent's discriminator injected into `options.parameters`
- * before dispatch. The parent stays registered alongside its virtuals.
+ * Verifies LifeOps umbrellas honor the core promoted-subaction dispatch
+ * contract, including pinned discriminators and legacy aliases.
  */
 
 import type {
@@ -195,26 +191,27 @@ describe("promoteSubactionsToActions", () => {
     });
   });
 
-  it("does not overwrite nested action params when a legacy discriminator is declared", async () => {
+  it("rejects a conflicting canonical discriminator when the parent declares a legacy alias", async () => {
     const stub = makeStubAction();
     const handlerSpy = vi.spyOn(stub, "handler");
     const [, virtualList] = promoteSubactionsToActions(stub);
-    await virtualList?.handler(
+    const result = await virtualList?.handler(
       STATIC_RUNTIME,
       STATIC_MESSAGE,
       NOOP_STATE,
       { parameters: { action: "pause" } },
       NOOP_CALLBACK,
     );
-    const passedOptions = handlerSpy.mock.calls[0][3] as HandlerOptions;
-    expect(passedOptions.parameters).toMatchObject({
-      action: "pause",
-      subaction: "list",
+    expect(result).toMatchObject({
+      success: false,
+      text: expect.stringContaining("Call STUB_PAUSE"),
     });
+    expect(handlerSpy).not.toHaveBeenCalled();
   });
 
-  it("virtual handler caller-supplied subaction is overridden by virtual's name", async () => {
+  it("rejects a caller-supplied subaction that conflicts with the virtual name", async () => {
     const stub = makeStubAction();
+    const handlerSpy = vi.spyOn(stub, "handler");
     const [, , virtualCreate] = promoteSubactionsToActions(stub);
     const result = await virtualCreate?.handler(
       STATIC_RUNTIME,
@@ -223,7 +220,11 @@ describe("promoteSubactionsToActions", () => {
       { parameters: { subaction: "list" } },
       NOOP_CALLBACK,
     );
-    expect(result?.text).toBe("dispatched create");
+    expect(result).toMatchObject({
+      success: false,
+      text: expect.stringContaining("Call STUB_LIST"),
+    });
+    expect(handlerSpy).not.toHaveBeenCalled();
   });
 
   it("is idempotent: calling twice returns structurally identical virtuals", () => {

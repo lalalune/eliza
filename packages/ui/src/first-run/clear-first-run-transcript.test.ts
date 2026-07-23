@@ -60,6 +60,20 @@ describe("isFirstRunTranscriptMessage", () => {
       false,
     );
   });
+
+  it("never treats the durable post-sign-in activation as setup transcript", () => {
+    expect(
+      isFirstRunTranscriptMessage({
+        id: "3de836f2-e9fd-036f-950e-9708ea14b898",
+        role: "assistant",
+        text: "You're signed in and I'm ready.",
+        timestamp: 4,
+        source: "agent_greeting",
+        greetingKind: "post_sign_in_activation",
+        activationVersion: "1",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("clearFirstRunTranscriptMessages", () => {
@@ -105,5 +119,24 @@ describe("clearFirstRunTranscriptMessages", () => {
       firstRunTurn("first-run:cloud-done"),
     ];
     expect(clearFirstRunTranscriptMessages(onlyOnboarding)).toEqual([]);
+  });
+
+  it("drops setup turns while preserving the durable activation invitation", () => {
+    const activation: ConversationMessage = {
+      id: "3de836f2-e9fd-036f-950e-9708ea14b898",
+      role: "assistant",
+      text: "You're signed in and I'm ready.",
+      timestamp: 4,
+      source: "agent_greeting",
+      greetingKind: "post_sign_in_activation",
+      activationVersion: "1",
+    };
+
+    expect(
+      clearFirstRunTranscriptMessages([
+        firstRunTurn("first-run:cloud-done"),
+        activation,
+      ]),
+    ).toEqual([activation]);
   });
 });

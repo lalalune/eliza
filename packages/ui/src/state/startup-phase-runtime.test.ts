@@ -285,6 +285,39 @@ describe("runStartingRuntime", () => {
     expect(deps.setStartupError).not.toHaveBeenCalled();
   });
 
+  it("advances tokenless owner-password 401s to the top-level login gate", async () => {
+    clientMock.getStatus.mockRejectedValue({ status: 401 });
+    clientMock.getAuthStatus.mockResolvedValue({
+      required: true,
+      authenticated: false,
+      loginRequired: true,
+      passwordConfigured: true,
+      pairingEnabled: false,
+      expiresAt: null,
+    });
+    clientMock.hasToken.mockReturnValue(false);
+
+    const dispatch = vi.fn();
+    const deps = createDeps();
+
+    await runStartingRuntime(
+      deps,
+      dispatch,
+      1,
+      { current: 1 },
+      { current: false },
+      { current: null },
+    );
+
+    expect(deps.setAuthRequired).toHaveBeenCalledWith(false);
+    expect(deps.setFirstRunLoading).toHaveBeenCalledWith(false);
+    expect(dispatch).toHaveBeenCalledWith({ type: "AGENT_RUNNING" });
+    expect(dispatch).not.toHaveBeenCalledWith({
+      type: "BACKEND_AUTH_REQUIRED",
+    });
+    expect(deps.setStartupError).not.toHaveBeenCalled();
+  });
+
   it("advances paired bearer sessions to the auth gate after endpoint 401s", async () => {
     clientMock.getStatus.mockRejectedValue({ status: 401 });
     clientMock.getAuthStatus.mockResolvedValue({

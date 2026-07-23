@@ -13,11 +13,17 @@
  * `POST /api/conversations/:id/import` (no inference, idempotent).
  */
 
+import type { ActivationGoalHandoffEnvelope } from "@elizaos/shared";
+
 export interface HandoffMessage {
+  id?: string;
   role: "user" | "assistant";
   text: string;
   /** Original send time (ms). Preserved so order survives the import. */
   timestamp?: number;
+  source?: string;
+  greetingKind?: "conversation" | "post_sign_in_activation";
+  activationVersion?: string;
 }
 
 export type ConversationHandoffStatus =
@@ -87,6 +93,11 @@ export interface ConversationHandoffDeps {
   checkPersonalReady: () => Promise<PersonalReadiness>;
   /** Read the conversation the user built on the shared agent. */
   readSharedMessages: () => Promise<HandoffMessage[]>;
+  /** Typed shared-runtime goal state read with the same transcript snapshot. */
+  readSharedActivationGoal?: () =>
+    | Promise<ActivationGoalHandoffEnvelope | undefined>
+    | ActivationGoalHandoffEnvelope
+    | undefined;
   /**
    * Import the messages into the personal container WITHOUT re-running
    * inference. Returns how many were inserted; `alreadyPopulated` when the
@@ -95,7 +106,10 @@ export interface ConversationHandoffDeps {
   importToPersonal: (
     messages: HandoffMessage[],
     personal: PersonalReadiness,
+    activationGoal?: ActivationGoalHandoffEnvelope,
   ) => Promise<{ inserted: number; alreadyPopulated?: boolean }>;
+  /** Release a snapshot fence when import or switching does not complete. */
+  releaseSharedHandoff?: () => Promise<void>;
   /** Switch the live client to the personal container. Seamless to the user. */
   switchToPersonal: (personal: PersonalReadiness) => void | Promise<void>;
   /** Readiness-poll cadence + budget. */
@@ -190,9 +204,12 @@ export async function runConversationHandoff(
 
     try {
       const messages = await deps.readSharedMessages();
+      const activationGoal = await deps.readSharedActivationGoal?.();
       let imported = 0;
-      if (messages.length > 0) {
-        const result = await deps.importToPersonal(messages, personal);
+      if (messages.length > 0 || activationGoal) {
+        const result = activationGoal
+          ? await deps.importToPersonal(messages, personal, activationGoal)
+          : await deps.importToPersonal(messages, personal);
         imported = result.inserted;
         deps.log?.(
           `[handoff] imported ${imported}/${messages.length} message(s)` +
@@ -206,6 +223,21 @@ export async function runConversationHandoff(
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (deps.releaseSharedHandoff) {
+        try {
+          await deps.releaseSharedHandoff();
+        } catch (releaseError) {
+          // error-policy:J6 the server-side fence has a bounded lease, so a
+          // failed cleanup cannot trap the user indefinitely.
+          deps.log?.(
+            `[handoff] fence release failed: ${
+              releaseError instanceof Error
+                ? releaseError.message
+                : String(releaseError)
+            }`,
+          );
+        }
+      }
       if (isTransientHandoffError(err) && now() < deadline) {
         lastTransientError = message;
         deps.log?.(
@@ -223,9 +255,13 @@ export async function runConversationHandoff(
 /** Normalize the shared agent's `/messages` payload into handoff messages. */
 export function toHandoffMessages(
   raw: ReadonlyArray<{
+    id?: unknown;
     role?: unknown;
     text?: unknown;
     timestamp?: unknown;
+    source?: unknown;
+    greetingKind?: unknown;
+    activationVersion?: unknown;
   }>,
 ): HandoffMessage[] {
   const out: HandoffMessage[] = [];
@@ -235,10 +271,21 @@ export function toHandoffMessages(
     const text = typeof m.text === "string" ? m.text.trim() : "";
     if (!role || !text) continue;
     out.push({
+      ...(typeof m.id === "string" && m.id.trim() ? { id: m.id.trim() } : {}),
       role,
       text,
       ...(typeof m.timestamp === "number" && Number.isFinite(m.timestamp)
         ? { timestamp: m.timestamp }
+        : {}),
+      ...(typeof m.source === "string" && m.source.trim()
+        ? { source: m.source.trim() }
+        : {}),
+      ...(m.greetingKind === "conversation" ||
+      m.greetingKind === "post_sign_in_activation"
+        ? { greetingKind: m.greetingKind }
+        : {}),
+      ...(typeof m.activationVersion === "string" && m.activationVersion.trim()
+        ? { activationVersion: m.activationVersion.trim() }
         : {}),
     });
   }

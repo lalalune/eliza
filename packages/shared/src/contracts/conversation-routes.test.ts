@@ -23,11 +23,22 @@ describe("PostConversationRequestSchema", () => {
     const parsed = PostConversationRequestSchema.parse({
       title: "Hello",
       includeGreeting: true,
+      greetingKind: "post_sign_in_activation",
       lang: "en",
       metadata: { scope: "general", taskId: "t1" },
     });
     expect(parsed.title).toBe("Hello");
+    expect(parsed.greetingKind).toBe("post_sign_in_activation");
     expect(parsed.metadata?.scope).toBe("general");
+  });
+
+  it("rejects an unknown greeting kind", () => {
+    expect(() =>
+      PostConversationRequestSchema.parse({
+        includeGreeting: true,
+        greetingKind: "marketing_nudge",
+      }),
+    ).toThrow();
   });
 
   it("rejects unknown metadata field", () => {

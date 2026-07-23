@@ -5,6 +5,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleIosLocalAgentRequest } from "./ios-local-agent-kernel";
 
+const POST_SIGN_IN_ACTIVATION_TEXT =
+  "You’re signed in — I’m ready. What would you like to work on first? If you’ve got a problem you want to solve, tell me what’s going on.";
+const POST_SIGN_IN_ACTIVATION_MESSAGE_ID =
+  "3de836f2-e9fd-036f-950e-9708ea14b898";
+const POST_SIGN_IN_ACTIVATION_LEDGER_KEY =
+  "eliza:ios-local-agent:post-sign-in-activation:v1";
+
 async function getJson(pathname: string): Promise<unknown> {
   const response = await handleIosLocalAgentRequest(
     new Request(`http://127.0.0.1:31337${pathname}`),
@@ -57,6 +64,7 @@ function stubLocalStorage(): Storage {
 
 describe("handleIosLocalAgentRequest", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -128,6 +136,174 @@ describe("handleIosLocalAgentRequest", () => {
     });
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+
+  it("persists signed-in activation exactly once across concurrent requests, reload, and conversation deletion", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T16:30:00.000Z"));
+    const localStorage = stubLocalStorage();
+    vi.stubGlobal("window", { localStorage });
+
+    const created = (await postJson("/api/conversations", {
+      title: "Activation",
+    })) as { conversation: { id: string } };
+    const activationPath = `/api/conversations/${created.conversation.id}/greeting?lang=en&greetingKind=post_sign_in_activation`;
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, async () => {
+        const response = await post(activationPath, {});
+        expect(response.status).toBe(200);
+        return response.json() as Promise<Record<string, unknown>>;
+      }),
+    );
+
+    expect(
+      responses.filter((response) => response.persisted === true),
+    ).toHaveLength(1);
+    for (const response of responses) {
+      expect(response).toEqual({
+        text: response.persisted === true ? POST_SIGN_IN_ACTIVATION_TEXT : "",
+        agentName: "Eliza",
+        generated: response.persisted === true,
+        persisted: response.persisted,
+        messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+        source: "agent_greeting",
+        timestamp: 1_784_824_200_000,
+        greetingKind: "post_sign_in_activation",
+        activationVersion: "1",
+        conversationId: created.conversation.id,
+      });
+    }
+
+    await expect(
+      getJson(`/api/conversations/${created.conversation.id}/messages`),
+    ).resolves.toEqual({
+      messages: [
+        {
+          id: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+          role: "assistant",
+          text: POST_SIGN_IN_ACTIVATION_TEXT,
+          timestamp: 1_784_824_200_000,
+          source: "agent_greeting",
+          greetingKind: "post_sign_in_activation",
+          activationVersion: "1",
+        },
+      ],
+    });
+
+    localStorage.removeItem(POST_SIGN_IN_ACTIVATION_LEDGER_KEY);
+    const repairedResponse = await post(activationPath, {});
+    expect(repairedResponse.status).toBe(200);
+    await expect(repairedResponse.json()).resolves.toMatchObject({
+      text: "",
+      generated: false,
+      persisted: false,
+      messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+      timestamp: 1_784_824_200_000,
+      conversationId: created.conversation.id,
+    });
+
+    const deleteResponse = await handleIosLocalAgentRequest(
+      new Request(
+        `http://127.0.0.1:31337/api/conversations/${created.conversation.id}`,
+        { method: "DELETE" },
+      ),
+    );
+    expect(deleteResponse.status).toBe(200);
+
+    vi.setSystemTime(new Date("2026-07-24T16:30:00.000Z"));
+    vi.resetModules();
+    const reloaded = await import("./ios-local-agent-kernel");
+    const reloadedCreateResponse = await reloaded.handleIosLocalAgentRequest(
+      new Request("http://127.0.0.1:31337/api/conversations", {
+        method: "POST",
+        body: JSON.stringify({ title: "After reload" }),
+      }),
+    );
+    const reloadedCreated = (await reloadedCreateResponse.json()) as {
+      conversation: { id: string };
+    };
+    const replayResponse = await reloaded.handleIosLocalAgentRequest(
+      new Request(
+        `http://127.0.0.1:31337/api/conversations/${reloadedCreated.conversation.id}/greeting?greetingKind=post_sign_in_activation`,
+        { method: "POST" },
+      ),
+    );
+    await expect(replayResponse.json()).resolves.toEqual({
+      text: "",
+      agentName: "Eliza",
+      generated: false,
+      persisted: false,
+      messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+      source: "agent_greeting",
+      timestamp: 1_784_824_200_000,
+      greetingKind: "post_sign_in_activation",
+      activationVersion: "1",
+      conversationId: created.conversation.id,
+    });
+
+    const messagesAfterReload = await reloaded.handleIosLocalAgentRequest(
+      new Request(
+        `http://127.0.0.1:31337/api/conversations/${reloadedCreated.conversation.id}/messages`,
+      ),
+    );
+    await expect(messagesAfterReload.json()).resolves.toEqual({ messages: [] });
+    expect(
+      JSON.parse(
+        localStorage.getItem(POST_SIGN_IN_ACTIVATION_LEDGER_KEY) ?? "null",
+      ),
+    ).toMatchObject({
+      activationVersion: "1",
+      messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+      timestamp: 1_784_824_200_000,
+    });
+  });
+
+  it("rejects unsupported activation requests without changing a conversation", async () => {
+    const localStorage = stubLocalStorage();
+    vi.stubGlobal("window", { localStorage });
+    const created = (await postJson("/api/conversations", {
+      title: "Unsupported activation",
+    })) as { conversation: { id: string } };
+
+    const unsupported = await post(
+      `/api/conversations/${created.conversation.id}/greeting?greetingKind=surprise`,
+      {},
+    );
+    expect(unsupported.status).toBe(400);
+    await expect(unsupported.json()).resolves.toEqual({
+      error: "Invalid greetingKind",
+    });
+    await expect(
+      getJson(`/api/conversations/${created.conversation.id}/messages`),
+    ).resolves.toEqual({ messages: [] });
+
+    const missing = await post(
+      "/api/conversations/missing/greeting?greetingKind=post_sign_in_activation",
+      {},
+    );
+    expect(missing.status).toBe(404);
+  });
+
+  it("surfaces a corrupt activation ledger instead of replaying onboarding", async () => {
+    const localStorage = stubLocalStorage();
+    vi.stubGlobal("window", { localStorage });
+    const created = (await postJson("/api/conversations", {
+      title: "Corrupt ledger",
+    })) as { conversation: { id: string } };
+    localStorage.setItem(POST_SIGN_IN_ACTIVATION_LEDGER_KEY, "{not-json");
+
+    const response = await post(
+      `/api/conversations/${created.conversation.id}/greeting?greetingKind=post_sign_in_activation`,
+      {},
+    );
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: "Post-sign-in activation ledger is malformed",
+    });
+    await expect(
+      getJson(`/api/conversations/${created.conversation.id}/messages`),
+    ).resolves.toEqual({ messages: [] });
   });
 
   it("reports paired Cloud state and forwards chat through the Cloud bridge", async () => {

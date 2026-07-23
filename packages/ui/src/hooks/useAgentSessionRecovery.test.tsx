@@ -159,7 +159,7 @@ describe("useAgentSessionRecovery", () => {
     );
   });
 
-  it("stays idle (wall) when there is no cloud session AND no recoverable cookie", async () => {
+  it("requires Cloud sign-in when a managed agent has no cloud session or recoverable cookie", async () => {
     mockCloudToken.mockReturnValue(null);
     mockActiveServer.mockReturnValue(cloudServer("agent-1"));
     // No shared cookie -> ensureCloudSessionForRepair resolves null (default).
@@ -174,9 +174,9 @@ describe("useAgentSessionRecovery", () => {
     );
 
     await waitFor(() => {
-      // Ends on idle so the notice/wall renders honestly.
-      expect(statuses[statuses.length - 1]).toBe("idle");
+      expect(statuses[statuses.length - 1]).toBe("cloud-sign-in-required");
     });
+    expect(mockEnsureCloudSession).toHaveBeenCalledTimes(1);
     expect(mockRunRecovery).not.toHaveBeenCalled();
   });
 
@@ -243,7 +243,7 @@ describe("useAgentSessionRecovery", () => {
     expect(mockRunRecovery).not.toHaveBeenCalled();
   });
 
-  it("drops back to idle (wall) when recovery fails", async () => {
+  it("drops to Cloud sign-in when recovery fails", async () => {
     mockCloudToken.mockReturnValue("steward.jwt.token");
     mockActiveServer.mockReturnValue(cloudServer("agent-1"));
     mockRunRecovery.mockResolvedValue({
@@ -262,12 +262,11 @@ describe("useAgentSessionRecovery", () => {
     );
 
     await waitFor(() => {
-      // Ended back on idle so the wall renders.
-      expect(statuses[statuses.length - 1]).toBe("idle");
+      expect(statuses[statuses.length - 1]).toBe("cloud-sign-in-required");
     });
   });
 
-  it("does not attempt recovery for the password-not-configured wall", async () => {
+  it("routes a managed password-not-configured response to Cloud sign-in", async () => {
     mockCloudToken.mockReturnValue("steward.jwt.token");
     mockActiveServer.mockReturnValue(cloudServer("agent-1"));
 
@@ -283,7 +282,7 @@ describe("useAgentSessionRecovery", () => {
     await waitFor(() => {
       expect(statuses.length).toBeGreaterThan(0);
     });
-    expect(statuses).not.toContain("recovering");
+    expect(statuses[statuses.length - 1]).toBe("cloud-sign-in-required");
     expect(mockRunRecovery).not.toHaveBeenCalled();
   });
 });

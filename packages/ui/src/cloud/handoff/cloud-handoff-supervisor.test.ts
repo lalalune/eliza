@@ -20,8 +20,12 @@ describe("startCloudConversationHandoff", () => {
       return readyCalls >= 2 ? CONTAINER : null;
     });
 
-    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path) => {
-      if (base === SHARED && path.endsWith("/messages")) {
+    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path, init) => {
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "POST"
+      ) {
         return {
           status: 200,
           json: {
@@ -31,6 +35,13 @@ describe("startCloudConversationHandoff", () => {
             ],
           },
         };
+      }
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "DELETE"
+      ) {
+        return { status: 200, json: { success: true, released: true } };
       }
       if (base === CONTAINER && path.endsWith("/import")) {
         return { status: 200, json: { inserted: 2 } };
@@ -55,7 +66,11 @@ describe("startCloudConversationHandoff", () => {
     // read from shared, import to container, switch to container
     expect(authedFetch).toHaveBeenCalledWith(
       SHARED,
-      `/api/conversations/${CONV}/messages`,
+      `/api/conversations/${CONV}/messages/handoff`,
+      {
+        method: "POST",
+        body: { fenceToken: expect.any(String) },
+      },
     );
     expect(authedFetch).toHaveBeenCalledWith(
       CONTAINER,
@@ -65,13 +80,130 @@ describe("startCloudConversationHandoff", () => {
     expect(onSwitch).toHaveBeenCalledWith(CONTAINER);
   });
 
+  it("waits for an admitted shared turn, releases the failed fence attempt, then snapshots", async () => {
+    let snapshots = 0;
+    let releases = 0;
+    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path, init) => {
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "POST"
+      ) {
+        snapshots += 1;
+        if (snapshots === 1) {
+          return {
+            status: 425,
+            json: { code: "handoff_not_quiescent", retryable: true },
+          };
+        }
+        return {
+          status: 200,
+          json: {
+            messages: [{ role: "user", text: "latest turn", timestamp: 1 }],
+          },
+        };
+      }
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "DELETE"
+      ) {
+        releases += 1;
+        return { status: 200, json: { success: true, released: false } };
+      }
+      if (base === CONTAINER && path.endsWith("/import")) {
+        return { status: 200, json: { inserted: 1 } };
+      }
+      throw new Error(`unexpected fetch ${base}${path}`);
+    });
+
+    const result = await startCloudConversationHandoff({
+      sharedApiBase: SHARED,
+      conversationId: CONV,
+      readiness: { resolveReadyBase: async () => CONTAINER },
+      authedFetch,
+      onSwitch: vi.fn(),
+      intervalMs: 1,
+      timeoutMs: 1_000,
+    });
+
+    expect(result).toEqual({ status: "switched", imported: 1 });
+    expect(snapshots).toBe(2);
+    expect(releases).toBe(1);
+  });
+
+  it("carries a verified accepted activation goal in the fenced import", async () => {
+    const activationGoal = {
+      activationVersion: "1",
+      status: "accepted" as const,
+      response: {
+        messageId: "owner-turn-1",
+        text: "Help me ship iOS by September",
+        createdAt: 1_785_000_000_000,
+      },
+      goal: {
+        text: "Ship iOS by September",
+        confidence: 0.96,
+        model: "live-model",
+        recordedAt: 1_785_000_000_001,
+      },
+    };
+    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path, init) => {
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "POST"
+      ) {
+        return {
+          status: 200,
+          json: {
+            messages: [
+              {
+                id: "owner-turn-1",
+                role: "user",
+                text: activationGoal.response.text,
+                timestamp: activationGoal.response.createdAt,
+              },
+            ],
+            activationGoal,
+          },
+        };
+      }
+      if (base === CONTAINER && path.endsWith("/import")) {
+        expect(init?.body).toMatchObject({ activationGoal });
+        return {
+          status: 200,
+          json: { inserted: 1, activationGoalVerified: true },
+        };
+      }
+      throw new Error(`unexpected fetch ${base}${path}`);
+    });
+    const onSwitch = vi.fn();
+
+    const result = await startCloudConversationHandoff({
+      sharedApiBase: SHARED,
+      conversationId: CONV,
+      readiness: { resolveReadyBase: async () => CONTAINER },
+      authedFetch,
+      onSwitch,
+      intervalMs: 1,
+      timeoutMs: 1_000,
+    });
+
+    expect(result).toEqual({ status: "switched", imported: 1 });
+    expect(onSwitch).toHaveBeenCalledWith(CONTAINER);
+  });
+
   it("fails closed immediately (no switch) on a NON-retryable import error", async () => {
-    const authedFetch: AuthedAgentFetch = vi.fn(async (_base, path) => {
-      if (path.endsWith("/messages")) {
+    const authedFetch: AuthedAgentFetch = vi.fn(async (_base, path, init) => {
+      if (path.endsWith("/messages/handoff") && init?.method === "POST") {
         return {
           status: 200,
           json: { messages: [{ role: "user", text: "x" }] },
         };
+      }
+      if (path.endsWith("/messages/handoff") && init?.method === "DELETE") {
+        return { status: 200, json: { success: true, released: true } };
       }
       return { status: 401, json: { error: "bad token" } };
     });
@@ -102,12 +234,23 @@ describe("startCloudConversationHandoff", () => {
   // transient so the orchestrator retries within its budget and still lands.
   it("survives the proxy-readiness 404 window: import 404s, then succeeds, then switches", async () => {
     let importCalls = 0;
-    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path) => {
-      if (base === SHARED && path.endsWith("/messages")) {
+    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path, init) => {
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "POST"
+      ) {
         return {
           status: 200,
           json: { messages: [{ role: "user", text: "hi", timestamp: 1 }] },
         };
+      }
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "DELETE"
+      ) {
+        return { status: 200, json: { success: true, released: true } };
       }
       if (base === CONTAINER && path.endsWith("/import")) {
         importCalls += 1;
@@ -135,11 +278,22 @@ describe("startCloudConversationHandoff", () => {
 
   it("treats a network-layer fetch throw as transient (container still coming up)", async () => {
     let sharedReads = 0;
-    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path) => {
-      if (base === SHARED && path.endsWith("/messages")) {
+    const authedFetch: AuthedAgentFetch = vi.fn(async (base, path, init) => {
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "POST"
+      ) {
         sharedReads += 1;
         if (sharedReads === 1) throw new TypeError("Failed to fetch");
         return { status: 200, json: { messages: [] } };
+      }
+      if (
+        base === SHARED &&
+        path.endsWith("/messages/handoff") &&
+        init?.method === "DELETE"
+      ) {
+        return { status: 200, json: { success: true, released: true } };
       }
       throw new Error(`unexpected fetch ${base}${path}`);
     });
@@ -161,9 +315,11 @@ describe("startCloudConversationHandoff", () => {
   });
 
   it("switches without importing when the shared conversation is empty", async () => {
-    const authedFetch: AuthedAgentFetch = vi.fn(async (_base, path) => {
-      if (path.endsWith("/messages"))
+    const authedFetch: AuthedAgentFetch = vi.fn(async (_base, path, init) => {
+      if (path.endsWith("/messages/handoff") && init?.method === "POST")
         return { status: 200, json: { messages: [] } };
+      if (path.endsWith("/messages/handoff") && init?.method === "DELETE")
+        return { status: 200, json: { success: true, released: true } };
       throw new Error("import should not be called");
     });
     const onSwitch = vi.fn();

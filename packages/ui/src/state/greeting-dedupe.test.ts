@@ -17,6 +17,14 @@ function greeting(text: string, id = `greeting-${text}`): ConversationMessage {
   };
 }
 
+function activation(text: string, id = "activation"): ConversationMessage {
+  return {
+    ...greeting(text, id),
+    greetingKind: "post_sign_in_activation",
+    activationVersion: "1",
+  };
+}
+
 function userMsg(text: string): ConversationMessage {
   return { id: `u-${text}`, role: "user", text, timestamp: Date.now() };
 }
@@ -71,6 +79,15 @@ describe("dedupeGreetings", () => {
     const out = dedupeGreetings(thread);
     expect(out.map((m) => m.id)).toEqual(["g1", "u-q", "a-a"]);
   });
+
+  it("keeps one ordinary greeting and one signed-in activation", () => {
+    const out = dedupeGreetings([
+      greeting("hello", "g1"),
+      activation("what should we solve?", "a1"),
+      activation("duplicate activation", "a2"),
+    ]);
+    expect(out.map((message) => message.id)).toEqual(["g1", "a1"]);
+  });
 });
 
 describe("appendGreetingOnce", () => {
@@ -88,5 +105,11 @@ describe("appendGreetingOnce", () => {
       greeting("late random greeting", "g2"),
     );
     expect(out).toBe(thread);
+  });
+
+  it("appends activation after an ordinary greeting", () => {
+    const thread = [greeting("existing", "g1")];
+    const out = appendGreetingOnce(thread, activation("what should we solve?"));
+    expect(out.map((message) => message.id)).toEqual(["g1", "activation"]);
   });
 });

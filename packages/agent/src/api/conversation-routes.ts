@@ -26,6 +26,7 @@ import {
   ChannelType,
   type Content,
   createMessageMemory,
+  ElizaError,
   logger,
   MESSAGE_SOURCE_AGENT_GREETING,
   MESSAGE_SOURCE_CLIENT_CHAT,
@@ -37,8 +38,12 @@ import {
   type UUID,
   validateUuid,
 } from "@elizaos/core";
-import type { ChatFailureKind } from "@elizaos/shared";
 import {
+  ACTIVATION_GOAL_HANDOFF_SERVICE_TYPE,
+  ActivationGoalHandoffEnvelopeSchema,
+  type ActivationGoalHandoffService,
+  type ChatFailureKind,
+  ConversationGreetingKindSchema,
   PatchConversationRequestSchema,
   PostConversationCleanupEmptyRequestSchema,
   PostConversationRequestSchema,
@@ -72,6 +77,7 @@ import {
   normalizeChatResponseText,
   persistAssistantConversationMemory,
   persistConversationMemory,
+  persistConversationMemoryOnce,
   readChatRequestPayload,
   releaseChatMessageId,
   resolveNoResponseFallback,
@@ -82,6 +88,10 @@ import {
   writeSseJson,
 } from "./chat-routes.ts";
 import { resolveClientChatAdminEntityId } from "./client-chat-admin.ts";
+import {
+  ensurePostSignInActivation,
+  type StoredConversationGreeting,
+} from "./conversation-activation.ts";
 import {
   buildConversationRoomMetadata,
   sanitizeConversationMetadata,
@@ -1224,6 +1234,8 @@ type ConversationRouteMessageRecord = {
   timestamp: number;
   attachments?: SerializedMessageAttachment[];
   source?: string;
+  greetingKind?: "conversation" | "post_sign_in_activation";
+  activationVersion?: string;
   actionName?: string;
   actionCallbackHistory?: string[];
   from?: string;
@@ -1267,24 +1279,14 @@ type ConversationRouteMessageRecord = {
 // create-then-fetch is unaffected: the entry is deleted before any later call.
 const greetingEnsureInFlight = new Map<
   string,
-  Promise<{
-    text: string;
-    agentName: string;
-    generated: boolean;
-    persisted: boolean;
-  }>
+  Promise<StoredConversationGreeting>
 >();
 
 async function ensureConversationGreetingStored(
   state: ConversationRouteState,
   conv: ConversationMeta,
   lang: string,
-): Promise<{
-  text: string;
-  agentName: string;
-  generated: boolean;
-  persisted: boolean;
-}> {
+): Promise<StoredConversationGreeting> {
   const inFlight = greetingEnsureInFlight.get(conv.id);
   if (inFlight) return inFlight;
   const run = ensureConversationGreetingStoredUnlocked(state, conv, lang);
@@ -1300,12 +1302,7 @@ async function ensureConversationGreetingStoredUnlocked(
   state: ConversationRouteState,
   conv: ConversationMeta,
   lang: string,
-): Promise<{
-  text: string;
-  agentName: string;
-  generated: boolean;
-  persisted: boolean;
-}> {
+): Promise<StoredConversationGreeting> {
   const runtime = state.runtime;
   const agentName = runtime?.character.name ?? state.agentName;
   if (!runtime) {
@@ -1314,6 +1311,7 @@ async function ensureConversationGreetingStoredUnlocked(
       agentName,
       generated: false,
       persisted: false,
+      greetingKind: "conversation",
     };
   }
 
@@ -1349,6 +1347,10 @@ async function ensureConversationGreetingStoredUnlocked(
       agentName,
       generated: true,
       persisted: false,
+      messageId: existingGreeting.id,
+      source: MESSAGE_SOURCE_AGENT_GREETING,
+      timestamp: existingGreeting.createdAt,
+      greetingKind: "conversation",
     };
   }
 
@@ -1358,6 +1360,7 @@ async function ensureConversationGreetingStoredUnlocked(
       agentName,
       generated: false,
       persisted: false,
+      greetingKind: "conversation",
     };
   }
 
@@ -1372,23 +1375,23 @@ async function ensureConversationGreetingStoredUnlocked(
       agentName,
       generated: false,
       persisted: false,
+      greetingKind: "conversation",
     };
   }
 
+  const greetingMemory = createMessageMemory({
+    id: crypto.randomUUID() as UUID,
+    entityId: runtime.agentId,
+    roomId: conv.roomId,
+    content: {
+      text: greeting,
+      source: MESSAGE_SOURCE_AGENT_GREETING,
+      channelType: ChannelType.DM,
+      greetingKind: "conversation",
+    },
+  });
   try {
-    await persistConversationMemory(
-      runtime,
-      createMessageMemory({
-        id: crypto.randomUUID() as UUID,
-        entityId: runtime.agentId,
-        roomId: conv.roomId,
-        content: {
-          text: greeting,
-          source: MESSAGE_SOURCE_AGENT_GREETING,
-          channelType: ChannelType.DM,
-        },
-      }),
-    );
+    await persistConversationMemory(runtime, greetingMemory);
   } catch (err) {
     throw new Error(
       `Failed to store greeting message: ${getErrorMessage(err)}`,
@@ -1401,6 +1404,10 @@ async function ensureConversationGreetingStoredUnlocked(
     agentName,
     generated: true,
     persisted: true,
+    messageId: greetingMemory.id,
+    source: MESSAGE_SOURCE_AGENT_GREETING,
+    timestamp: greetingMemory.createdAt,
+    greetingKind: "conversation",
   };
 }
 
@@ -1809,14 +1816,7 @@ export async function handleConversationRoutes(
       updatedAt: now,
     };
     state.conversations.set(id, conv);
-    let greeting:
-      | {
-          text: string;
-          agentName: string;
-          generated: boolean;
-          persisted: boolean;
-        }
-      | undefined;
+    let greeting: StoredConversationGreeting | undefined;
 
     // Soft cap: evict the oldest conversation when the map exceeds 500
     evictOldestConversation(state.conversations, 500);
@@ -1830,18 +1830,36 @@ export async function handleConversationRoutes(
         );
         await syncConversationRoomState(state, conv);
         if (body.includeGreeting === true) {
-          const storedGreeting = await ensureConversationGreetingStored(
-            state,
-            conv,
-            typeof body.lang === "string" ? body.lang : "en",
-          );
-          if (storedGreeting.text.trim()) {
-            greeting = {
-              text: storedGreeting.text,
-              agentName: storedGreeting.agentName,
-              generated: storedGreeting.generated,
-              persisted: storedGreeting.persisted,
-            };
+          const caller = resolveConversationCaller(req, state);
+          const greetingKind = body.greetingKind ?? "conversation";
+          if (
+            greetingKind === "post_sign_in_activation" &&
+            caller.entityId !== ensureAdminEntityId(state)
+          ) {
+            error(res, "Only the owner can request account activation", 403);
+            return true;
+          }
+          const storedGreeting =
+            greetingKind === "post_sign_in_activation"
+              ? await ensurePostSignInActivation({
+                  runtime: state.runtime,
+                  ownerId: caller.entityId,
+                  conversationId: conv.id,
+                  roomId: conv.roomId,
+                })
+              : await ensureConversationGreetingStored(
+                  state,
+                  conv,
+                  typeof body.lang === "string" ? body.lang : "en",
+                );
+          if (storedGreeting.persisted) {
+            conv.updatedAt = new Date().toISOString();
+          }
+          if (
+            storedGreeting.text.trim() ||
+            greetingKind === "post_sign_in_activation"
+          ) {
+            greeting = storedGreeting;
           }
         }
       } catch (err) {
@@ -1940,6 +1958,15 @@ export async function handleConversationRoutes(
             contentSource !== MESSAGE_SOURCE_CLIENT_CHAT
               ? contentSource
               : undefined;
+          const greetingKind =
+            content.greetingKind === "conversation" ||
+            content.greetingKind === "post_sign_in_activation"
+              ? content.greetingKind
+              : undefined;
+          const activationVersion =
+            typeof content.activationVersion === "string"
+              ? content.activationVersion
+              : undefined;
           const actionName =
             typeof content.action === "string" && content.action.length > 0
               ? content.action
@@ -2000,6 +2027,8 @@ export async function handleConversationRoutes(
             ...(attachments ? { attachments } : {}),
             ...(topics && topics.length > 0 ? { topics } : {}),
             source: normalizedSource,
+            greetingKind,
+            activationVersion,
             actionName,
             actionCallbackHistory:
               actionCallbackHistory.length > 0
@@ -2188,7 +2217,8 @@ export async function handleConversationRoutes(
   // on the shared agent so the switch is seamless. Keyed by the provided
   // conversation id (so the client re-opens the same conversation after the
   // switch) and idempotent per conversation — re-import onto an already
-  // populated room is a no-op, never a duplicate.
+  // populated room resumes per message, never duplicating or masking a
+  // conflicting stable id.
   if (
     method === "POST" &&
     /^\/api\/conversations\/[^/]+\/import$/.test(pathname)
@@ -2201,8 +2231,17 @@ export async function handleConversationRoutes(
       error(res, "Body must include a `messages` array", 400);
       return true;
     }
+    const rawActivationGoal = rawImport.activationGoal;
+    const activationGoal =
+      rawActivationGoal === undefined
+        ? undefined
+        : ActivationGoalHandoffEnvelopeSchema.safeParse(rawActivationGoal);
+    if (activationGoal && !activationGoal.success) {
+      error(res, "Body includes an invalid `activationGoal` envelope", 400);
+      return true;
+    }
     const importMessages = rawMessages
-      .map((entry) => {
+      .map((entry, index) => {
         if (!entry || typeof entry !== "object") return null;
         const rec = entry as Record<string, unknown>;
         const role =
@@ -2223,7 +2262,39 @@ export async function handleConversationRoutes(
           typeof rec.timestamp === "number" && Number.isFinite(rec.timestamp)
             ? rec.timestamp
             : undefined;
-        return { role, text, timestamp } as const;
+        const originalId =
+          typeof rec.id === "string" &&
+          rec.id.trim().length > 0 &&
+          rec.id.trim().length <= 256
+            ? rec.id.trim()
+            : undefined;
+        const source =
+          typeof rec.source === "string" &&
+          rec.source.trim().length > 0 &&
+          rec.source.trim().length <= 64
+            ? rec.source.trim()
+            : undefined;
+        const greetingKind =
+          rec.greetingKind === "conversation" ||
+          rec.greetingKind === "post_sign_in_activation"
+            ? rec.greetingKind
+            : undefined;
+        const activationVersion =
+          typeof rec.activationVersion === "string" &&
+          rec.activationVersion.trim().length > 0 &&
+          rec.activationVersion.trim().length <= 64
+            ? rec.activationVersion.trim()
+            : undefined;
+        return {
+          role,
+          text,
+          timestamp,
+          originalId,
+          source,
+          greetingKind,
+          activationVersion,
+          index,
+        } as const;
       })
       .filter(
         (
@@ -2232,12 +2303,25 @@ export async function handleConversationRoutes(
           readonly role: "user" | "assistant";
           readonly text: string;
           readonly timestamp: number | undefined;
+          readonly originalId: string | undefined;
+          readonly source: string | undefined;
+          readonly greetingKind:
+            | "conversation"
+            | "post_sign_in_activation"
+            | undefined;
+          readonly activationVersion: string | undefined;
+          readonly index: number;
         } => m !== null,
       );
 
     const runtime = await resolveRuntimeForChatTurn(state);
     if (!runtime) {
       error(res, "Agent is not running", 503);
+      return true;
+    }
+    const caller = resolveConversationCaller(req, state);
+    if (caller.entityId !== ensureAdminEntityId(state)) {
+      error(res, "Only the owner can import a handoff conversation", 403);
       return true;
     }
     await waitForConversationRestore(state);
@@ -2259,7 +2343,6 @@ export async function handleConversationRoutes(
       evictOldestConversation(state.conversations, 500);
     }
 
-    const caller = resolveConversationCaller(req, state);
     try {
       await ensureConversationRoom(state, conv, caller);
     } catch (err) {
@@ -2271,41 +2354,38 @@ export async function handleConversationRoutes(
       return true;
     }
 
-    // Idempotency: a populated room means the handoff already ran (or the user
-    // chatted here). Never double-import.
-    const existing = await runtime.getMemories({
-      roomId: conv.roomId,
-      tableName: "messages",
-      limit: 1,
-    });
-    if (existing.length > 0) {
-      json(res, {
-        conversationId: convId,
-        inserted: 0,
-        skipped: importMessages.length,
-        alreadyPopulated: true,
-      });
-      return true;
-    }
-
     // Preserve original ordering: assign strictly increasing timestamps,
-    // anchored to the provided ones when present.
+    // anchored to the provided ones when present. Every row has a stable import
+    // id, so a retry after any failed write resumes the missing suffix instead
+    // of treating a partially populated room as complete.
     let inserted = 0;
     const anchor = Date.now() - importMessages.length;
-    for (let i = 0; i < importMessages.length; i += 1) {
-      const m = importMessages[i];
-      const entityId =
-        m.role === "assistant" ? runtime.agentId : caller.entityId;
-      const createdAt = m.timestamp ?? anchor + i;
-      try {
+    try {
+      for (let i = 0; i < importMessages.length; i += 1) {
+        const m = importMessages[i];
+        const entityId =
+          m.role === "assistant" ? runtime.agentId : caller.entityId;
+        const createdAt = m.timestamp ?? anchor + i;
+        const importIdentity = m.originalId
+          ? `source:${m.originalId}`
+          : `legacy:${m.index}:${m.role}:${m.text}`;
+        const memoryId = stringToUuid(
+          `handoff-import:${convId}:${importIdentity}`,
+        );
         const memory = createMessageMemory({
-          id: crypto.randomUUID() as UUID,
+          id: memoryId,
           entityId,
           roomId: conv.roomId,
           content: {
             text: m.text,
             channelType: ChannelType.DM,
-            source: "handoff_import",
+            source: m.source ?? "handoff_import",
+            ...(m.greetingKind ? { greetingKind: m.greetingKind } : {}),
+            ...(m.activationVersion
+              ? { activationVersion: m.activationVersion }
+              : {}),
+            handoffImport: true,
+            ...(m.originalId ? { handoffOriginalMessageId: m.originalId } : {}),
           },
         }) as ReturnType<typeof createMessageMemory> & {
           createdAt?: number;
@@ -2315,12 +2395,85 @@ export async function handleConversationRoutes(
         if (memory.metadata && typeof memory.metadata === "object") {
           memory.metadata.timestamp = createdAt;
         }
-        await persistConversationMemory(runtime, memory);
-        inserted += 1;
-      } catch (err) {
-        logger.warn(
-          `[conversations] import: failed to persist message ${i}: ${getErrorMessage(err)}`,
+        if (await persistConversationMemoryOnce(runtime, memory)) {
+          inserted += 1;
+        } else {
+          const existing = await runtime.getMemoryById(memoryId);
+          const expectedContent = memory.content as Record<string, unknown>;
+          const actualContent =
+            existing?.content && typeof existing.content === "object"
+              ? (existing.content as Record<string, unknown>)
+              : null;
+          const matches =
+            existing?.roomId === memory.roomId &&
+            existing.entityId === memory.entityId &&
+            actualContent?.text === expectedContent.text &&
+            actualContent?.source === expectedContent.source &&
+            actualContent?.handoffImport === true &&
+            actualContent?.handoffOriginalMessageId ===
+              expectedContent.handoffOriginalMessageId &&
+            actualContent?.greetingKind === expectedContent.greetingKind &&
+            actualContent?.activationVersion ===
+              expectedContent.activationVersion;
+          if (!matches) {
+            throw new ElizaError(
+              "A handoff import id already belongs to different message content",
+              {
+                code: "HANDOFF_IMPORT_MEMORY_CONFLICT",
+                context: {
+                  conversationId: convId,
+                  memoryId,
+                  originalMessageId: m.originalId,
+                  messageIndex: m.index,
+                },
+                severity: "fatal",
+              },
+            );
+          }
+        }
+      }
+    } catch (err) {
+      error(
+        res,
+        `Conversation import stopped on a durable write failure: ${getErrorMessage(err)}`,
+        500,
+      );
+      return true;
+    }
+
+    let activationGoalAdopted = false;
+    let activationGoalVerified = false;
+    if (activationGoal?.success && activationGoal.data.status === "accepted") {
+      const service = runtime.getService(
+        ACTIVATION_GOAL_HANDOFF_SERVICE_TYPE,
+      ) as unknown as ActivationGoalHandoffService | null;
+      if (!service || typeof service.adoptActivationGoal !== "function") {
+        error(
+          res,
+          "Personal Assistant activation-goal handoff service is unavailable",
+          503,
         );
+        return true;
+      }
+      try {
+        const adopted = await service.adoptActivationGoal(activationGoal.data);
+        activationGoalAdopted = adopted.adopted;
+        activationGoalVerified = adopted.verified;
+      } catch (err) {
+        error(
+          res,
+          `Activation goal adoption failed: ${getErrorMessage(err)}`,
+          500,
+        );
+        return true;
+      }
+      if (!activationGoalVerified) {
+        error(
+          res,
+          "Activation goal adoption did not pass durable readback",
+          500,
+        );
+        return true;
       }
     }
     conv.updatedAt = new Date().toISOString();
@@ -2329,6 +2482,9 @@ export async function handleConversationRoutes(
       conversationId: convId,
       inserted,
       skipped: importMessages.length - inserted,
+      alreadyPopulated: importMessages.length > 0 && inserted === 0,
+      activationGoalAdopted,
+      activationGoalVerified,
     });
     return true;
   }
@@ -3193,13 +3349,25 @@ export async function handleConversationRoutes(
     }
     const url = new URL(req.url ?? "", `http://${req.headers.host}`);
     const lang = url.searchParams.get("lang") ?? "en";
+    const parsedGreetingKind = ConversationGreetingKindSchema.safeParse(
+      url.searchParams.get("greetingKind") ?? "conversation",
+    );
+    if (!parsedGreetingKind.success) {
+      error(res, "Invalid greetingKind", 400);
+      return true;
+    }
+    const greetingKind = parsedGreetingKind.data;
+    const caller = resolveConversationCaller(req, state);
+    if (
+      greetingKind === "post_sign_in_activation" &&
+      caller.entityId !== ensureAdminEntityId(state)
+    ) {
+      error(res, "Only the owner can request account activation", 403);
+      return true;
+    }
 
     try {
-      await ensureConversationRoom(
-        state,
-        conv,
-        resolveConversationCaller(req, state),
-      );
+      await ensureConversationRoom(state, conv, caller);
     } catch (err) {
       error(
         res,
@@ -3210,16 +3378,20 @@ export async function handleConversationRoutes(
     }
 
     try {
-      const greeting = await ensureConversationGreetingStored(
-        state,
-        conv,
-        lang,
-      );
+      const greeting =
+        greetingKind === "post_sign_in_activation"
+          ? await ensurePostSignInActivation({
+              runtime,
+              ownerId: caller.entityId,
+              conversationId: conv.id,
+              roomId: conv.roomId,
+            })
+          : await ensureConversationGreetingStored(state, conv, lang);
+      if (greeting.persisted) {
+        conv.updatedAt = new Date().toISOString();
+      }
       json(res, {
-        text: greeting.text,
-        agentName: greeting.agentName,
-        generated: greeting.generated,
-        persisted: greeting.persisted,
+        ...greeting,
       });
     } catch (err) {
       error(res, getErrorMessage(err), 500);

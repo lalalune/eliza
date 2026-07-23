@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { applyCorsHeaders, handleCorsOptions } from "@/lib/services/proxy/cors";
 import { resolveSharedAgent } from "@/lib/services/shared-runtime/resolve-shared-agent";
 import {
+  isCanonicalSharedRestConversation,
   sharedRestConversationDelete,
   sharedRestConversationUpdate,
 } from "@/lib/services/shared-runtime/shared-rest-adapter";
@@ -35,6 +36,21 @@ app.patch("/", async (c) => {
       origin,
     );
   }
+  const conversationId = c.req.param("conversationId") ?? r.agentId;
+  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: "Conversation not found",
+          code: "conversation_not_found",
+        },
+        { status: 404 },
+      ),
+      CORS_METHODS,
+      origin,
+    );
+  }
 
   const raw = await c.req.json().catch(() => null);
   const body =
@@ -59,6 +75,21 @@ app.delete("/", async (c) => {
   if ("error" in r) {
     return applyCorsHeaders(
       Response.json({ success: false, error: r.error }, { status: r.status }),
+      CORS_METHODS,
+      origin,
+    );
+  }
+  const conversationId = c.req.param("conversationId") ?? r.agentId;
+  if (!isCanonicalSharedRestConversation(r.agentId, conversationId)) {
+    return applyCorsHeaders(
+      Response.json(
+        {
+          success: false,
+          error: "Conversation not found",
+          code: "conversation_not_found",
+        },
+        { status: 404 },
+      ),
       CORS_METHODS,
       origin,
     );

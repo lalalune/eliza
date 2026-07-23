@@ -777,6 +777,18 @@ export async function runPollingBackend(
           dispatch({ type: "BACKEND_REACHED", firstRunComplete: false });
           return;
         }
+        // A configured owner password is a complete tokenless authentication
+        // path even when pairing is disabled. Advance far enough for
+        // `/api/auth/me` to resolve unauthenticated and let the top-level auth
+        // gate mount LoginView; pairing-required would hide that form, while
+        // remote fallback would discard the server the owner intends to use.
+        if (auth.loginRequired && auth.passwordConfigured === true) {
+          deps.setAuthRequired(false);
+          deps.setFirstRunComplete(true);
+          deps.setFirstRunLoading(false);
+          dispatch({ type: "BACKEND_REACHED", firstRunComplete: true });
+          return;
+        }
         // A stale remote that requires auth but has pairing DISABLED is a hard
         // dead end: this is the "Pairing is not enabled on this server" screen,
         // which offers no token field and no in-app way forward — the user can

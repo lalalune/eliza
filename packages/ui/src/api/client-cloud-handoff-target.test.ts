@@ -151,7 +151,7 @@ describe("startCloudAgentHandoff — proxy-readiness gate (#15901)", () => {
           json: async () => ({}),
         };
       }
-      if (url.endsWith("/messages")) {
+      if (url.endsWith("/messages/handoff")) {
         return { status: 200, json: async () => ({ messages: [] }) };
       }
       throw new Error(`unexpected fetch ${url}`);

@@ -3,6 +3,8 @@
  * (market data, steward session) directly in the webview when the full-bun agent
  * is not reachable, using the shared market-provider helpers.
  */
+
+import { MESSAGE_SOURCE_AGENT_GREETING, stringToUuid } from "@elizaos/core";
 import {
   asRecord,
   buildCoinGeckoMarketsUrl,
@@ -10,6 +12,8 @@ import {
   buildMarketPriceSnapshots,
   COINGECKO_MARKET_PROVIDER,
   POLYMARKET_MARKET_PROVIDER,
+  POST_SIGN_IN_ACTIVATION_GREETING,
+  POST_SIGN_IN_ACTIVATION_VERSION,
   type ProviderStatus,
   parseCoinGeckoMarkets,
 } from "@elizaos/shared";
@@ -55,6 +59,7 @@ import type { IttpAgentRequestContext } from "./ittp-agent-transport";
 
 const STORAGE_PREFIX = "eliza:ios-local-agent";
 const CONVERSATIONS_KEY = `${STORAGE_PREFIX}:conversations:v1`;
+const POST_SIGN_IN_ACTIVATION_LEDGER_KEY = `${STORAGE_PREFIX}:post-sign-in-activation:v1`;
 const TRANSCRIPTS_KEY = `${STORAGE_PREFIX}:transcripts:v1`;
 const ACTIVE_MODEL_KEY = `${STORAGE_PREFIX}:active-model:v1`;
 const ASSIGNMENTS_KEY = `${STORAGE_PREFIX}:assignments:v1`;
@@ -71,6 +76,12 @@ const DEFAULT_CLOUD_MARKET_PREVIEW_BASE_URL = "https://elizacloud.ai";
 const CLOUD_WALLET_MARKET_OVERVIEW_PATH = "/market/preview/wallet-overview";
 const WALLET_MARKET_OVERVIEW_CACHE_TTL_MS = 120_000;
 const WALLET_MARKET_OVERVIEW_FETCH_TIMEOUT_MS = 8_000;
+const POST_SIGN_IN_ACTIVATION_KIND = "post_sign_in_activation";
+const IOS_LOCAL_AGENT_IDENTITY = "ios-local-agent";
+const IOS_LOCAL_OWNER_IDENTITY = "local-owner";
+const POST_SIGN_IN_ACTIVATION_MESSAGE_ID = stringToUuid(
+  `post-sign-in-activation:${IOS_LOCAL_AGENT_IDENTITY}:${IOS_LOCAL_OWNER_IDENTITY}:${POST_SIGN_IN_ACTIVATION_VERSION}`,
+);
 const EMPTY_ROUTING_PREFERENCES: RoutingPreferences = {
   preferredProvider: {},
   policy: {},
@@ -96,11 +107,24 @@ interface LocalMessage {
   role: Role;
   text: string;
   timestamp: number;
+  source?: string;
+  greetingKind?: typeof POST_SIGN_IN_ACTIVATION_KIND;
+  activationVersion?: typeof POST_SIGN_IN_ACTIVATION_VERSION;
   localInference?: LocalReply["localInference"];
 }
 
 interface ConversationStore {
   conversations: LocalConversation[];
+}
+
+interface PostSignInActivationLedger {
+  activationVersion: typeof POST_SIGN_IN_ACTIVATION_VERSION;
+  conversationId: string;
+  messageId: string;
+  source: typeof MESSAGE_SOURCE_AGENT_GREETING;
+  timestamp: number;
+  greetingKind: typeof POST_SIGN_IN_ACTIVATION_KIND;
+  text: typeof POST_SIGN_IN_ACTIVATION_GREETING;
 }
 
 interface IosBundleFileEntry {
@@ -298,6 +322,7 @@ function removeStorageItem(key: string): void {
 function resetIosLocalAgentState(): void {
   for (const key of [
     CONVERSATIONS_KEY,
+    POST_SIGN_IN_ACTIVATION_LEDGER_KEY,
     TRANSCRIPTS_KEY,
     ACTIVE_MODEL_KEY,
     ASSIGNMENTS_KEY,
@@ -502,6 +527,141 @@ function readStore(): ConversationStore {
 
 function writeStore(store: ConversationStore): void {
   writeJson(CONVERSATIONS_KEY, store);
+}
+
+function isPostSignInActivationLedger(
+  value: unknown,
+): value is PostSignInActivationLedger {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.activationVersion === POST_SIGN_IN_ACTIVATION_VERSION &&
+    typeof record.conversationId === "string" &&
+    record.conversationId.length > 0 &&
+    record.messageId === POST_SIGN_IN_ACTIVATION_MESSAGE_ID &&
+    record.source === MESSAGE_SOURCE_AGENT_GREETING &&
+    typeof record.timestamp === "number" &&
+    Number.isFinite(record.timestamp) &&
+    record.greetingKind === POST_SIGN_IN_ACTIVATION_KIND &&
+    record.text === POST_SIGN_IN_ACTIVATION_GREETING
+  );
+}
+
+function readPostSignInActivationLedger(): PostSignInActivationLedger | null {
+  let raw: string | null | undefined;
+  try {
+    raw = storage()?.getItem(POST_SIGN_IN_ACTIVATION_LEDGER_KEY);
+  } catch (cause) {
+    throw new Error("Failed to read post-sign-in activation ledger", {
+      cause,
+    });
+  }
+  if (!raw) return null;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (cause) {
+    throw new Error("Post-sign-in activation ledger is malformed", { cause });
+  }
+  if (!isPostSignInActivationLedger(value)) {
+    throw new Error("Post-sign-in activation ledger is inconsistent");
+  }
+  return value;
+}
+
+function findPersistedPostSignInActivation(
+  store: ConversationStore,
+): PostSignInActivationLedger | null {
+  for (const conversation of store.conversations) {
+    const message = conversation.messages.find(
+      (candidate) =>
+        candidate.id === POST_SIGN_IN_ACTIVATION_MESSAGE_ID &&
+        candidate.role === "assistant" &&
+        candidate.source === MESSAGE_SOURCE_AGENT_GREETING &&
+        candidate.greetingKind === POST_SIGN_IN_ACTIVATION_KIND &&
+        candidate.activationVersion === POST_SIGN_IN_ACTIVATION_VERSION &&
+        candidate.text === POST_SIGN_IN_ACTIVATION_GREETING &&
+        Number.isFinite(candidate.timestamp),
+    );
+    if (message) {
+      return {
+        activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+        conversationId: conversation.id,
+        messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+        source: MESSAGE_SOURCE_AGENT_GREETING,
+        timestamp: message.timestamp,
+        greetingKind: POST_SIGN_IN_ACTIVATION_KIND,
+        text: POST_SIGN_IN_ACTIVATION_GREETING,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * The local kernel has one owner and one agent, so activation is global to the
+ * kernel rather than scoped to a browser session or conversation. The separate
+ * ledger survives conversation deletion; the deterministic message id also
+ * repairs a write interrupted between the conversation and ledger commits.
+ */
+function ensurePostSignInActivationStored(
+  store: ConversationStore,
+  conversation: LocalConversation,
+): {
+  activation: PostSignInActivationLedger;
+  persisted: boolean;
+} {
+  const ledger = readPostSignInActivationLedger();
+  if (ledger) return { activation: ledger, persisted: false };
+
+  const existing = findPersistedPostSignInActivation(store);
+  if (existing) {
+    writeJson(POST_SIGN_IN_ACTIVATION_LEDGER_KEY, existing);
+    if (!readPostSignInActivationLedger()) {
+      throw new Error("Post-sign-in activation ledger was not persisted");
+    }
+    return { activation: existing, persisted: false };
+  }
+
+  const timestamp = Date.now();
+  const activation: PostSignInActivationLedger = {
+    activationVersion: POST_SIGN_IN_ACTIVATION_VERSION,
+    conversationId: conversation.id,
+    messageId: POST_SIGN_IN_ACTIVATION_MESSAGE_ID,
+    source: MESSAGE_SOURCE_AGENT_GREETING,
+    timestamp,
+    greetingKind: POST_SIGN_IN_ACTIVATION_KIND,
+    text: POST_SIGN_IN_ACTIVATION_GREETING,
+  };
+  conversation.messages.push({
+    id: activation.messageId,
+    role: "assistant",
+    text: activation.text,
+    timestamp: activation.timestamp,
+    source: activation.source,
+    greetingKind: activation.greetingKind,
+    activationVersion: activation.activationVersion,
+  });
+  conversation.updatedAt = new Date(timestamp).toISOString();
+
+  // Conversation first, ledger second: if execution stops between the two
+  // synchronous writes, the stable message id lets the next request repair the
+  // ledger without creating a second message.
+  writeStore(store);
+  const durableMessage = findPersistedPostSignInActivation(readStore());
+  if (!durableMessage) {
+    throw new Error("Post-sign-in activation message was not persisted");
+  }
+  writeJson(POST_SIGN_IN_ACTIVATION_LEDGER_KEY, activation);
+  const durableLedger = readPostSignInActivationLedger();
+  if (!durableLedger) {
+    throw new Error("Post-sign-in activation ledger was not persisted");
+  }
+  return {
+    activation,
+    persisted: true,
+  };
 }
 
 // ── Transcripts (local persistence — mirrors plugin-local-inference's
@@ -731,7 +891,7 @@ function localMemoryFeedItems(): MemoryBrowseItem[] {
         agentId: null,
         createdAt: message.timestamp,
         metadata: { role: message.role, conversationId: conversation.id },
-        source: null,
+        source: message.source ?? null,
       });
     }
   }
@@ -3924,6 +4084,59 @@ export async function handleIosLocalAgentRequest(
     /^\/api\/conversations\/([^/]+)\/greeting$/,
   );
   if (greetingMatch && method === "POST") {
+    const greetingKind = url.searchParams.get("greetingKind");
+    if (
+      greetingKind !== null &&
+      greetingKind !== "conversation" &&
+      greetingKind !== POST_SIGN_IN_ACTIVATION_KIND
+    ) {
+      return json({ error: "Invalid greetingKind" }, 400);
+    }
+    if (greetingKind === POST_SIGN_IN_ACTIVATION_KIND) {
+      const conversationId = decodeURIComponent(greetingMatch[1]);
+      const store = readStore();
+      const conversation = store.conversations.find(
+        (entry) => entry.id === conversationId,
+      );
+      if (!conversation) {
+        return json({ error: "Conversation not found" }, 404);
+      }
+      let ensured: ReturnType<typeof ensurePostSignInActivationStored>;
+      try {
+        ensured = ensurePostSignInActivationStored(store, conversation);
+      } catch (error) {
+        // error-policy:J1 route boundary translates corrupt or unavailable
+        // durable state into an observable failure instead of replaying setup.
+        return json(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Post-sign-in activation failed",
+          },
+          500,
+        );
+      }
+      const { activation, persisted } = ensured;
+      const isWinningConversation =
+        activation.conversationId === conversationId &&
+        conversation.messages.some(
+          (message) => message.id === activation.messageId,
+        );
+      const shouldDeliver = isWinningConversation && persisted;
+      return json({
+        text: shouldDeliver ? activation.text : "",
+        agentName: AGENT_NAME,
+        generated: shouldDeliver,
+        persisted: shouldDeliver,
+        messageId: activation.messageId,
+        source: activation.source,
+        timestamp: activation.timestamp,
+        greetingKind: activation.greetingKind,
+        activationVersion: activation.activationVersion,
+        conversationId: activation.conversationId,
+      });
+    }
     const greeting = await generateLocalGreeting();
     return json({
       text: greeting.text,

@@ -811,6 +811,8 @@ const PROSE_ONLY_LLM_SCENARIOS: Record<string, string> = {
     "live-only real-LLM missing-input planner-loop regression; the live model routes OWNER_REMINDERS without a deterministic ACTION_PLANNER fixture, while the keyless planner-loop suite forces the erroneous evaluator-CONTINUE branch.",
   "live-plugin-enable-toggle-verb":
     "live-only real-LLM plugin enable/toggle verb routing; no deterministic ACTION_PLANNER fixture. Keyless gating proof: plugin-manager action unit suites in core.",
+  "live-post-sign-in-activation-goal":
+    "live-only real-LLM onboarding acknowledgement and merged evaluator proof; both model calls produce prose/structured extraction without routing an agent action. Keyless gating proof: the activation, FTU-goal, and handoff suites.",
   "live-workflow-action-executions":
     "live-only real-LLM counterpart of deterministic-workflow-actions-routes; the live model routes WORKFLOW with no deterministic ACTION_PLANNER fixture. The deterministic twin gates the keyless lane.",
 };

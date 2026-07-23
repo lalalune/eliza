@@ -221,7 +221,7 @@ export interface FirstRunRouteContext {
   ) => Promise<T | null>;
   // Server.ts helpers
   isCloudProvisionedContainer: () => boolean;
-  hasPersistedFirstRunState: (config: ElizaConfig) => boolean;
+  isAppFirstRunComplete: (config: ElizaConfig) => boolean;
   ensureWalletKeysInEnvAndConfig: (config: ElizaConfig) => boolean;
   getWalletAddresses: () => {
     evmAddress?: string;
@@ -282,12 +282,12 @@ export async function handleFirstRunRoutes(
     }
 
     let config = state.config;
-    let complete = configFileExists() && ctx.hasPersistedFirstRunState(config);
+    let complete = ctx.isAppFirstRunComplete(config);
 
     if (!complete && configFileExists()) {
       try {
         config = loadElizaConfig();
-        complete = ctx.hasPersistedFirstRunState(config);
+        complete = ctx.isAppFirstRunComplete(config);
         if (complete) {
           state.config = config;
         }
@@ -303,7 +303,7 @@ export async function handleFirstRunRoutes(
 
   // ── GET /api/wallet/keys (first-run only) ─────────────────────────
   if (method === "GET" && pathname === "/api/wallet/keys") {
-    if (ctx.hasPersistedFirstRunState(state.config)) {
+    if (ctx.isAppFirstRunComplete(state.config)) {
       json(
         res,
         { error: "Wallet keys are only available during first-run" },
