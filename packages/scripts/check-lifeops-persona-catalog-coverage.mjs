@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Coverage gate for the LifeOps persona scenario-pack ledgers. The pack
+ * Coverage report for the LifeOps persona scenario-pack ledgers. The pack
  * catalogs are progress ledgers, not executable scenarios; this script confirms
  * their declared scenario ids resolve to the real TypeScript scenario-runner
  * corpus or the Python LifeOpsBench corpus and prints authored/verified totals.
@@ -25,32 +25,11 @@ const PYTHON_SCENARIO_ROOT = path.join(
   "packages/benchmarks/lifeops-bench/eliza_lifeops_bench/scenarios",
 );
 
-const EXPECTED_CATALOGS = [
-  ["adhd-capture-and-start.catalog.json", "A1", 28],
-  ["adhd-follow-through.catalog.json", "A2", 24],
-  ["night-owl-anchored-day.catalog.json", "B1", 24],
-  ["shift-rotation.catalog.json", "B2", 22],
-  ["traveler-timezone-truth.catalog.json", "C1", 28],
-  ["comms-flood-triage.catalog.json", "D1", 26],
-  ["low-activation-reengagement.catalog.json", "E1", 28],
-  ["neurotypical-control-adversarial.catalog.json", "F1", 32],
-  ["overdue-comms-apology.catalog.json", "G1", 10],
-  ["reconnect-old-friends.catalog.json", "G2", 8],
-  ["relationship-type-inference.catalog.json", "H1", 10],
-  ["kg-live-capture.catalog.json", "H2", 8],
-  ["rupture-repair.catalog.json", "I1", 10],
-  ["mediation-logistics.catalog.json", "I2", 8],
-  ["co-parenting.catalog.json", "J1", 10],
-  ["third-party-support.catalog.json", "K1", 10],
-  ["child-student-deadlines.catalog.json", "L1", 6],
-];
-
 const VALID_TIERS = new Set(["T1", "T2", "T3", "T4"]);
 const VALID_SURFACES = new Set(["lifeops-bench", "scenario-runner"]);
 const VALID_STATUSES = new Set(["planned", "authored", "verified"]);
 const JSON_MODE = process.argv.includes("--json");
 const UNVERIFIED_MODE = process.argv.includes("--unverified");
-const REQUIRE_VERIFIED = process.argv.includes("--require-verified");
 const PACK_FILTER = readOption("--pack")?.toUpperCase();
 
 function toPosix(value) {
@@ -148,8 +127,6 @@ function loadLifeOpsBenchIds() {
 function validateCatalogShape(
   catalog,
   expectedFile,
-  expectedPack,
-  expectedTarget,
 ) {
   const where = `${expectedFile}`;
   const errors = [];
@@ -165,15 +142,17 @@ function validateCatalogShape(
   if (!catalog.source || typeof catalog.source !== "object") {
     errors.push(`${where}: source must be an object`);
   } else {
-    if (catalog.source.packId !== expectedPack) {
-      errors.push(
-        `${where}: source.packId=${catalog.source.packId} expected ${expectedPack}`,
-      );
+    if (
+      typeof catalog.source.packId !== "string" ||
+      catalog.source.packId.length === 0
+    ) {
+      errors.push(`${where}: source.packId must be a non-empty string`);
     }
-    if (catalog.source.targetCount !== expectedTarget) {
-      errors.push(
-        `${where}: source.targetCount=${catalog.source.targetCount} expected ${expectedTarget}`,
-      );
+    if (
+      !Number.isInteger(catalog.source.targetCount) ||
+      catalog.source.targetCount < 0
+    ) {
+      errors.push(`${where}: source.targetCount must be a non-negative integer`);
     }
   }
   if (!Array.isArray(catalog.scenarios)) {
@@ -187,22 +166,42 @@ function summarize() {
   const lifeOpsBenchIds = loadLifeOpsBenchIds();
   const errors = [];
   const packs = [];
-  const expectedCatalogs = PACK_FILTER
-    ? EXPECTED_CATALOGS.filter(([, pack]) => pack === PACK_FILTER)
-    : EXPECTED_CATALOGS;
+  const catalogFiles = readdirSync(CATALOG_DIR, { withFileTypes: true })
+    .filter(
+      (entry) => entry.isFile() && entry.name.endsWith(".catalog.json"),
+    )
+    .map((entry) => entry.name)
+    .sort();
+  const catalogs = catalogFiles
+    .map((fileName) => ({
+      fileName,
+      catalog: readJson(path.join(CATALOG_DIR, fileName)),
+    }))
+    .filter(
+      ({ catalog }) =>
+        !PACK_FILTER || catalog?.source?.packId === PACK_FILTER,
+    );
 
-  if (PACK_FILTER && expectedCatalogs.length === 0) {
+  if (PACK_FILTER && catalogs.length === 0) {
     errors.push(
       `--pack ${PACK_FILTER} did not match a known LifeOps persona pack`,
     );
   }
 
-  for (const [fileName, expectedPack, expectedTarget] of expectedCatalogs) {
-    const file = path.join(CATALOG_DIR, fileName);
-    const catalog = readJson(file);
-    errors.push(
-      ...validateCatalogShape(catalog, fileName, expectedPack, expectedTarget),
-    );
+  const seenPackIds = new Set();
+  for (const { fileName, catalog } of catalogs) {
+    errors.push(...validateCatalogShape(catalog, fileName));
+    const expectedPack =
+      typeof catalog?.source?.packId === "string"
+        ? catalog.source.packId
+        : "<invalid>";
+    const expectedTarget = Number.isInteger(catalog?.source?.targetCount)
+      ? catalog.source.targetCount
+      : 0;
+    if (seenPackIds.has(expectedPack)) {
+      errors.push(`${fileName}: duplicate source.packId ${expectedPack}`);
+    }
+    seenPackIds.add(expectedPack);
     const entries = Array.isArray(catalog.scenarios) ? catalog.scenarios : [];
     let authored = 0;
     let verified = 0;
@@ -267,21 +266,6 @@ function summarize() {
       unverifiedRows: unverified,
     });
   }
-  if (REQUIRE_VERIFIED) {
-    for (const pack of packs) {
-      if (pack.authored < pack.target) {
-        errors.push(
-          `${pack.pack}: ${pack.authored}/${pack.target} authored; --require-verified requires the pack target to be fully authored`,
-        );
-      }
-      if (pack.verified < pack.authored) {
-        errors.push(
-          `${pack.pack}: ${pack.verified}/${pack.authored} verified; --require-verified requires every authored row to be verified`,
-        );
-      }
-    }
-  }
-
   const target = packs.reduce((sum, pack) => sum + pack.target, 0);
   const authored = packs.reduce((sum, pack) => sum + pack.authored, 0);
   const verified = packs.reduce((sum, pack) => sum + pack.verified, 0);

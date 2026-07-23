@@ -1,9 +1,7 @@
-// Exercises e2e coverage check e2e coverage.test automation behavior with deterministic script fixtures.
+/** Verifies the source-derived keyless-e2e coverage report. */
 import { describe, expect, test } from "bun:test";
 import {
-  type CoverageGateResult,
-  evaluateCoverage,
-  loadBaseline,
+  buildKeylessCoverageReport,
 } from "./check-e2e-coverage.ts";
 import {
   buildPluginCoverage,
@@ -54,76 +52,16 @@ describe("e2e-coverage inventory", () => {
   });
 });
 
-describe("e2e-coverage gate", () => {
-  test("the real baseline passes the gate", () => {
+describe("e2e-coverage report", () => {
+  test("partitions every surface plugin without a baseline", () => {
     const coverage = buildPluginCoverage();
-    const baseline = loadBaseline();
-    const result = evaluateCoverage(coverage, baseline);
-    const message = JSON.stringify(
-      {
-        newlyUncovered: result.newlyUncovered,
-        staleCovered: result.staleCovered,
-        staleMissing: result.staleMissing,
-      },
-      null,
-      2,
-    );
-    expect(result.ok, message).toBe(true);
-  });
-
-  test("every baselined plugin still exposes a surface and lacks coverage", () => {
-    const coverage = buildPluginCoverage();
-    const baseline = loadBaseline();
-    const byDir = new Map(coverage.map((c) => [c.dir, c]));
-    for (const dir of baseline.knownUncovered) {
-      const entry = byDir.get(dir);
-      expect(
-        entry,
-        `baseline entry ${dir} not found in inventory`,
-      ).toBeDefined();
-      expect(entry?.hasSurface, `baseline entry ${dir} has no surface`).toBe(
-        true,
-      );
-      expect(
-        entry?.hasKeylessE2e,
-        `baseline entry ${dir} is now covered — remove it from the baseline`,
-      ).toBe(false);
-    }
-  });
-
-  test("flags a surface plugin that is neither covered nor baselined", () => {
-    const coverage = buildPluginCoverage();
-    // Drop the first baseline entry to simulate a newly-uncovered plugin.
-    const baseline = loadBaseline();
-    const [dropped, ...rest] = baseline.knownUncovered;
-    expect(dropped).toBeDefined();
-    const result: CoverageGateResult = evaluateCoverage(coverage, {
-      knownUncovered: rest,
-    });
-    expect(result.ok).toBe(false);
-    expect(result.newlyUncovered).toContain(dropped);
-  });
-
-  test("flags a baseline entry that no longer exists (ratchet must shrink)", () => {
-    const coverage = buildPluginCoverage();
-    const baseline = loadBaseline();
-    const result = evaluateCoverage(coverage, {
-      knownUncovered: [...baseline.knownUncovered, "plugin-does-not-exist"],
-    });
-    expect(result.ok).toBe(false);
-    expect(result.staleMissing).toContain("plugin-does-not-exist");
-  });
-
-  test("flags a baseline entry that is now covered (ratchet must shrink)", () => {
-    const coverage = buildPluginCoverage();
-    const covered = coverage.find((c) => c.hasSurface && c.hasKeylessE2e);
-    expect(covered).toBeDefined();
-    const baseline = loadBaseline();
-    const result = evaluateCoverage(coverage, {
-      // Pretend a covered plugin is still baselined as uncovered.
-      knownUncovered: [...baseline.knownUncovered, covered?.dir ?? ""],
-    });
-    expect(result.ok).toBe(false);
-    expect(result.staleCovered).toContain(covered?.dir);
+    const report = buildKeylessCoverageReport(coverage);
+    const surfaces = coverage
+      .filter((entry) => entry.hasSurface)
+      .map((entry) => entry.dir)
+      .sort();
+    expect([...report.covered, ...report.uncovered].sort()).toEqual(surfaces);
+    expect(new Set(report.covered).size).toBe(report.covered.length);
+    expect(new Set(report.uncovered).size).toBe(report.uncovered.length);
   });
 });

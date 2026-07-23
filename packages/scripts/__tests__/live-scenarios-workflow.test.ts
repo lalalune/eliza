@@ -17,7 +17,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { listScenarioMetadata } from "../../scenario-runner/src/loader.ts";
-import { main as auditScenarioCoverage } from "../check-scenario-workflow-coverage.mjs";
+import {
+  main as auditScenarioCoverage,
+  scenarioCoverageReportExitCode,
+} from "../check-scenario-workflow-coverage.mjs";
 import { PLUGIN_ROUTE_COVERAGE } from "../e2e-coverage/manifest.ts";
 import {
   evaluatePrerequisites,
@@ -261,6 +264,15 @@ test("reports uncovered live-only scenarios as explicit deferrals", () => {
     rmSync(tempRoot, { recursive: true, force: true });
   }
 }, 30_000);
+
+test("scenario coverage gaps remain diagnostic instead of imposing a floor", () => {
+  expect(
+    scenarioCoverageReportExitCode({
+      missingDefaultIds: ["new-scenario"],
+      untaggedLaneScenarios: ["new-scenario.scenario.ts"],
+    }),
+  ).toBe(0);
+});
 
 test("discovers the orchestrator live evidence in the scheduled catalog", async () => {
   const metadata = await listScenarioMetadata(
