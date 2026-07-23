@@ -60,6 +60,7 @@ function parseArgs(argv) {
     shard: null,
     section: null,
     grep: null,
+    tag: null,
     limit: null,
     updateBaseline: false,
     screenshots: true,
@@ -75,6 +76,7 @@ function parseArgs(argv) {
     else if (arg === "--shard") a.shard = next();
     else if (arg === "--section") a.section = next();
     else if (arg === "--grep") a.grep = next();
+    else if (arg === "--tag") a.tag = next();
     else if (arg === "--limit") a.limit = Number(next());
     else if (arg === "--update-baseline") a.updateBaseline = true;
     else if (arg === "--no-screenshots") a.screenshots = false;
@@ -197,6 +199,9 @@ async function loadStories() {
       (e) =>
         `${e.title}/${e.name}`.toLowerCase().includes(g) || e.id.includes(g),
     );
+  }
+  if (args.tag) {
+    stories = stories.filter((entry) => entry.tags?.includes(args.tag));
   }
   stories.sort((x, y) => x.id.localeCompare(y.id));
   if (args.shard) {
@@ -456,7 +461,7 @@ async function renderStory(context, baseUrl, story, axeSource, opts) {
     logCapture: null,
     a11y: [],
     play: {
-      expected: Boolean(story.tags?.includes("play-fn")),
+      expected: Boolean(story.tags?.includes("interaction-required")),
       prepared: false,
       phase: null,
     },
@@ -540,7 +545,13 @@ async function renderStory(context, baseUrl, story, axeSource, opts) {
     if (result.play.expected && !result.play.prepared) {
       result.verdict = "broken";
       result.issues.push(
-        "play-missing: story index is tagged play-fn but runtime playFunction was not prepared",
+        "play-missing: story is tagged interaction-required but runtime playFunction was not prepared",
+      );
+    }
+    if (!result.play.expected && result.play.prepared) {
+      result.verdict = "broken";
+      result.issues.push(
+        "play-unclassified: runtime playFunction exists without the interaction-required tag",
       );
     }
 
@@ -698,7 +709,8 @@ async function main() {
   console.log(
     `story-gate: ${stories.length} stories | concurrency=${args.concurrency}` +
       `${args.shard ? ` | shard ${args.shard}` : ""}` +
-      `${args.section ? ` | section ${args.section}` : ""}`,
+      `${args.section ? ` | section ${args.section}` : ""}` +
+      `${args.tag ? ` | tag ${args.tag}` : ""}`,
   );
 
   const axeSource = args.a11y ? await readAxe(resolveAxeSource()) : null;
@@ -833,7 +845,8 @@ async function main() {
   // pass silently while testing nothing. Hard-fail with a distinct exit code so
   // this can never regress unnoticed again. Guarded on a non-trivial,
   // unfiltered run so a legitimately all-runtime filtered slice doesn't trip it.
-  const unfiltered = !args.section && !args.grep && !args.limit && !args.shard;
+  const unfiltered =
+    !args.section && !args.grep && !args.tag && !args.limit && !args.shard;
   if (
     unfiltered &&
     results.length > 5 &&
@@ -1016,7 +1029,8 @@ async function writeManualReview(dir, results, failures) {
 // Only auto-run as a CLI; importing this module (e.g. from the classifier unit
 // test) must NOT launch a browser run.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
+  // error-policy:J1 CLI boundary reports a fatal gate failure and exits nonzero.
+  await main().catch((err) => {
     console.error("story-gate: fatal", err);
     process.exit(1);
   });

@@ -33,6 +33,7 @@ export const Closed: Story = {};
 
 /** The cheat sheet open: shortcuts grouped by scope with formatted key caps. */
 export const Open: Story = {
+  tags: ["interaction-required"],
   play: () => {
     openOverlay();
   },

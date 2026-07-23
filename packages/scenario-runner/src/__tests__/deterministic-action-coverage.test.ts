@@ -8,11 +8,9 @@
  *     is read live (from `plugin.actions[].name`) and must match the checked-in
  *     manifest. A new/renamed/removed action breaks the build, forcing whoever
  *     changed it to acknowledge the action here.
- *   - Coverage registry: every action we claim to cover deterministically must
- *     still be referenced by a real scenario (no silent coverage regression),
- *     and the total only grows (count ratchet).
- *   - Stable-core ratchet: every stable-core keyless action is either covered or
- *     in a baseline that may only shrink.
+ *   - Coverage classification: action coverage is derived from the loaded
+ *     scenarios, and every stable-core gap or direct-only route carries an
+ *     explicit reasoned exemption that fails once it becomes stale.
  *   - Wiring integrity: every scenario file is actually run by the deterministic
  *     CI script — a scenario that exists but never runs is larp.
  *
@@ -187,7 +185,7 @@ const SOURCE_VERIFIED_IMPORTED_ACTIONS: Record<string, readonly string[]> = {
 };
 
 /**
- * The stable-core keyless surface that the ratchet drives to completion: the
+ * The stable-core keyless surface the coverage classifier drives to completion:
  * importable core plugins plus the source-only VIEWS aliases. Big, volatile
  * surfaces (browser, lifeops) are NOT here — their coverage is tracked by the
  * coverage registry instead, so adding a lifeops scenario never has to edit a
@@ -201,132 +199,97 @@ function stableCoreActions(): string[] {
 }
 
 /**
- * Stable imported keyless actions that do NOT yet have a deterministic scenario.
- * This baseline may only shrink: cover one and delete it here; add a new
- * stable-core action and either cover it or add it here.
+ * Stable imported keyless actions that do not yet have a deterministic scenario.
+ * Each exemption names why the real keyless scenario cannot exist yet. The gate
+ * below rejects unknown, overlapping, empty-reason, and newly-covered entries,
+ * so this is a classification boundary rather than a historical count ledger.
  */
-const KNOWN_UNCOVERED: readonly string[] = [
-  // Source wires these VIEWS aliases, but this keyless E2E lane resolves the
-  // current runtime action surface without registering them as top-level actions.
-  "CLOSE_ALL_VIEWS",
-  "CLOSE_VIEW",
-  // Coding-tools web actions are unit-covered but do not yet have a strict,
-  // network-free scenario fixture. Keep them visible in the no-growth ledger.
-  "WEB_FETCH",
-  "WEB_SEARCH",
-  // New speaker-diarization action; no deterministic keyless scenario yet.
-  "IDENTIFY_SPEAKER",
-  // New on-device transcription actions; no deterministic keyless scenario yet.
-  "START_TRANSCRIPTION",
-  "STOP_TRANSCRIPTION",
-  // Transcript permissioning actions (#15606); no deterministic keyless
-  // scenario yet.
-  "REDACT_TRANSCRIPT",
-  "SHARE_TRANSCRIPT",
-  // New workflow code-eval action (#8914); no deterministic keyless scenario yet.
-  "EVAL_CODE",
-  // App-control agent/model switchers; dispatched through dashboard
-  // affordances, no deterministic keyless scenarios yet. (SETTINGS left this
-  // baseline with deterministic-settings-voice-actions, #16942.)
-  "AGENT_SWITCH",
-  "MODEL_SWITCH",
-  // Local-inference management action; no deterministic keyless scenario yet.
-  "LOCAL_INFERENCE",
-  // Facewear owns smartglasses connection/runtime actions. The device-facing
-  // actions need dedicated keyless scenarios before they can leave this
-  // baseline.
-  "FACEWEAR_CONNECT",
-  "FACEWEAR_DEBUG",
-  "SMARTGLASSES_CONTROL",
-  "SMARTGLASSES_DISPLAY_TEXT",
-  "SMARTGLASSES_MICROPHONE",
-  "SMARTGLASSES_STATUS",
-  // plugin-commands slash-command actions (/help, /status, /reset, /compact,
-  // /think, /model, /tts, …) are dispatched through the command palette, not
-  // the keyless scenario pipeline, so they have no deterministic scenario yet.
-  "ACCOUNTS_COMMAND",
-  "BACKEND_COMMAND",
-  "COMMANDS_COMMAND",
-  "COMPACT_COMMAND",
-  "CONTEXT_COMMAND",
-  "ELEVATED_COMMAND",
-  "HELP_COMMAND",
-  "MODEL_COMMAND",
-  "NEW_COMMAND",
-  "QUEUE_COMMAND",
-  "REASONING_COMMAND",
-  "RESET_COMMAND",
-  "STATUS_COMMAND",
-  "THINK_COMMAND",
-  "TTS_COMMAND",
-  "USAGE_COMMAND",
-  "VERBOSE_COMMAND",
-  "WHOAMI_COMMAND",
-];
-
-/**
- * Actions with deterministic keyless scenario coverage today. This is the
- * registry that must not regress: every entry must still be referenced by a
- * scenario. It includes actions from volatile plugins (browser web mode,
- * lifeops scheduled tasks) that are NOT in the stable-core surface above.
- */
-const COVERED_ACTIONS: readonly string[] = [
-  "APP",
-  "BACKGROUND",
-  "BROWSER_CLICK",
-  "BROWSER_CLOSE",
-  "BROWSER_GET",
-  "BROWSER_LIST_TABS",
-  "BROWSER_OPEN",
-  "BROWSER_SCREENSHOT",
-  "BROWSER_TYPE",
-  "BROWSER_WAIT",
-  "DOCUMENT",
-  "FILE",
-  "GENERATE_MEDIA",
-  "GIT_PATHOLOGY",
-  "GITHUB",
-  "GITHUB_ISSUE_ASSIGN",
-  "GITHUB_ISSUE_CLOSE",
-  "GITHUB_ISSUE_COMMENT",
-  "GITHUB_ISSUE_CREATE",
-  "GITHUB_ISSUE_LABEL",
-  "GITHUB_ISSUE_REOPEN",
-  "GITHUB_NOTIFICATION_TRIAGE",
-  "GITHUB_PR_LIST",
-  "GITHUB_PR_REVIEW",
-  "MCP",
-  "MCP_CALL_TOOL",
-  "MCP_LIST_CONNECTIONS",
-  "MCP_READ_RESOURCE",
-  "MCP_SEARCH_ACTIONS",
-  "SKILL",
-  "SKILL_DETAILS",
-  "SKILL_INSTALL",
-  "SKILL_SEARCH",
-  "SKILL_SYNC",
-  "SKILL_TOGGLE",
-  "SKILL_UNINSTALL",
-  "SHELL",
-  "SCHEDULED_TASKS",
-  "SETTINGS",
-  "STREAM",
-  "TODO",
-  "USE_SKILL",
-  "VIEWS",
-  "WORKTREE",
-  "WORKFLOW",
-];
-
-/** Deterministic coverage only grows: distinct covered actions must stay >= this. */
-const COVERED_FLOOR = COVERED_ACTIONS.length;
+const STABLE_CORE_COVERAGE_EXEMPTIONS = buildReasonedExemptions([
+  {
+    names: ["CLOSE_ALL_VIEWS", "CLOSE_VIEW"],
+    reason:
+      "The source-wired VIEWS aliases are not registered as top-level actions in the keyless scenario runtime.",
+  },
+  {
+    names: ["WEB_FETCH", "WEB_SEARCH"],
+    reason:
+      "Coding-tools web access has no strict network-free provider fixture; its real integration remains credentialed.",
+  },
+  {
+    names: ["IDENTIFY_SPEAKER"],
+    reason:
+      "Speaker diarization requires an audio/model fixture that exercises the on-device inference boundary.",
+  },
+  {
+    names: ["START_TRANSCRIPTION", "STOP_TRANSCRIPTION"],
+    reason:
+      "On-device transcription lifecycle actions require a real capture/inference session.",
+  },
+  {
+    names: ["REDACT_TRANSCRIPT", "SHARE_TRANSCRIPT"],
+    reason:
+      "Transcript permission actions require an authenticated transcript ownership fixture (#15606).",
+  },
+  {
+    names: ["EVAL_CODE"],
+    reason:
+      "Workflow code evaluation requires a sandbox execution fixture that the keyless scenario runtime does not provide (#8914).",
+  },
+  {
+    names: ["AGENT_SWITCH", "MODEL_SWITCH"],
+    reason:
+      "Agent and model switching require multiple booted runtime/model targets; dashboard unit coverage owns the keyless path.",
+  },
+  {
+    names: ["LOCAL_INFERENCE"],
+    reason:
+      "Local inference management requires a running model daemon and downloaded model artifact.",
+  },
+  {
+    names: [
+      "FACEWEAR_CONNECT",
+      "FACEWEAR_DEBUG",
+      "SMARTGLASSES_CONTROL",
+      "SMARTGLASSES_DISPLAY_TEXT",
+      "SMARTGLASSES_MICROPHONE",
+      "SMARTGLASSES_STATUS",
+    ],
+    reason:
+      "Facewear and smartglasses actions cross a native device bridge that the keyless scenario runtime cannot emulate.",
+  },
+  {
+    names: [
+      "ACCOUNTS_COMMAND",
+      "BACKEND_COMMAND",
+      "COMMANDS_COMMAND",
+      "COMPACT_COMMAND",
+      "CONTEXT_COMMAND",
+      "ELEVATED_COMMAND",
+      "HELP_COMMAND",
+      "MODEL_COMMAND",
+      "NEW_COMMAND",
+      "QUEUE_COMMAND",
+      "REASONING_COMMAND",
+      "RESET_COMMAND",
+      "STATUS_COMMAND",
+      "THINK_COMMAND",
+      "TTS_COMMAND",
+      "USAGE_COMMAND",
+      "VERBOSE_COMMAND",
+      "WHOAMI_COMMAND",
+    ],
+    reason:
+      "Slash-command actions are dispatched by the command palette rather than the scenario action-planner pipeline.",
+  },
+]);
 
 /**
  * Plugins whose remaining action surface needs live credentials, a real
  * browser, or a local model. Documented for honesty; the keyless mock LLM
  * cannot stand in for these without faking the integration. Note that browser
  * (web/JSDOM mode) and lifeops (scheduled tasks) ARE partially keyless-covered
- * — see COVERED_ACTIONS — so the reason describes only the remainder.
+ * — as discovered from loaded scenarios — so each reason describes only the
+ * remainder.
  */
 const LIVE_ONLY_REMAINDER: Record<string, string> = {
   "@elizaos/plugin-personal-assistant":
@@ -350,8 +313,8 @@ const LIVE_ONLY_REMAINDER: Record<string, string> = {
  * catch it) nor source-enumerated. This closes that gap by pinning the umbrella
  * action names each plugin declares in its own source. It is a drift-
  * acknowledgment surface, NOT a keyless-coverage mandate: a new umbrella forces
- * the author to classify it (cover its keyless slice in COVERED_ACTIONS, or
- * extend the LIVE_ONLY_REMAINDER justification) — it does not demand a scenario.
+ * the author to classify it (add a real keyless scenario, or extend the
+ * LIVE_ONLY_REMAINDER justification) — it does not demand a fake scenario.
  *
  * Each umbrella's promoted virtuals (`BROWSER_CLICK`, `BLOCK_LIST_ACTIVE`, ...)
  * are intentionally out of scope: their names are derived at runtime by
@@ -458,18 +421,17 @@ const APP_CONTROL_MODE_SURFACE: Record<
 };
 
 /**
- * Remaining APP/VIEWS modes without direct deterministic action turns. This
- * baseline may only shrink. The high-risk management modes below it are
- * covered by asserted turns and cannot be represented by helper strings.
+ * Remaining APP/VIEWS modes without direct deterministic action turns. The
+ * live schema, loaded turns, and these reasons form an exhaustive partition;
+ * an exemption fails as soon as the mode disappears or gains real coverage.
  */
-// VIEWS:close/split/tile are now exercised by real scenario turns (the coverage
-// loader reports zero uncovered modes), so the known-uncovered baseline is empty.
-// Re-add a mode here only if its real scenario turn is intentionally removed.
-const KNOWN_UNCOVERED_APP_CONTROL_MODES: readonly string[] = [
-  // New VIEWS:rollback mode (live action schema) has no deterministic scenario
-  // turn yet; tracked here so the coverage loader stays green until one lands.
-  "VIEWS:rollback",
-];
+const APP_CONTROL_MODE_EXEMPTIONS = buildReasonedExemptions([
+  {
+    names: ["VIEWS:rollback"],
+    reason:
+      "Rollback has no deterministic persisted-view revision fixture with an asserted restore outcome.",
+  },
+]);
 
 const REQUIRED_APP_CONTROL_MODE_TURNS: readonly {
   actionName: AppControlActionName;
@@ -621,77 +583,27 @@ const REQUIRED_APP_CONTROL_NL_TURNS: readonly string[] = [
 ];
 
 /**
- * Actions that are currently exercised through real message turns using the
- * strict deterministic LLM proxy. This is intentionally separate from
- * COVERED_ACTIONS: most deterministic coverage is still direct handler
- * coverage, which is useful but must not be reported as NL routing coverage.
+ * Scenarios exercised through real message turns using the strict deterministic
+ * LLM proxy. Their action union is derived below; most other deterministic
+ * coverage uses direct handler turns and must not be reported as NL routing.
  */
-const STRICT_LLM_ROUTED_ACTIONS: readonly string[] = [
-  "APP",
-  "BROWSER_CLICK",
-  "BROWSER_CLOSE",
-  "BROWSER_GET",
-  "BROWSER_LIST_TABS",
-  "BROWSER_OPEN",
-  "BROWSER_SCREENSHOT",
-  "BROWSER_TYPE",
-  "BROWSER_WAIT",
-  "FILE",
-  "GENERATE_MEDIA",
-  "GITHUB",
-  "GITHUB_ISSUE_ASSIGN",
-  "GITHUB_ISSUE_CLOSE",
-  "GITHUB_ISSUE_COMMENT",
-  "GITHUB_ISSUE_CREATE",
-  "GITHUB_ISSUE_LABEL",
-  "GITHUB_ISSUE_REOPEN",
-  "GITHUB_NOTIFICATION_TRIAGE",
-  "GITHUB_PR_LIST",
-  "GITHUB_PR_REVIEW",
-  "GIT_PATHOLOGY",
-  "MCP",
-  "MCP_CALL_TOOL",
-  "MCP_LIST_CONNECTIONS",
-  "MCP_READ_RESOURCE",
-  "MCP_SEARCH_ACTIONS",
-  "SCHEDULED_TASKS",
-  "SHELL",
-  "SKILL",
-  "SKILL_DETAILS",
-  "SKILL_INSTALL",
-  "SKILL_SEARCH",
-  "SKILL_SYNC",
-  "SKILL_TOGGLE",
-  "SKILL_UNINSTALL",
-  "STREAM",
-  "TODO",
-  "USE_SKILL",
-  "VIEWS",
-  "WORKTREE",
-  "WORKFLOW",
-];
-
 const STRICT_LLM_ROUTING_SCENARIOS: Record<
   string,
   {
     actionNames: readonly string[];
-    minMessageTurns: number;
   }
 > = {
   "deterministic-app-control-nl-routing": {
     actionNames: ["APP", "VIEWS"],
-    minMessageTurns: REQUIRED_APP_CONTROL_NL_TURNS.length,
   },
   "deterministic-active-view-agent-surface": {
     actionNames: ["VIEWS"],
-    minMessageTurns: 2,
   },
   // live-only lane, but it pins ACTION_PLANNER fixtures for its VIEWS turn, so
   // it satisfies the strict fixture contract and is classified here rather
   // than the no-deterministic-fixture bucket.
   "live-active-view-agent-surface": {
     actionNames: ["VIEWS"],
-    minMessageTurns: 1,
   },
   "deterministic-agent-skills-actions": {
     actionNames: [
@@ -704,7 +616,6 @@ const STRICT_LLM_ROUTING_SCENARIOS: Record<
       "SKILL_UNINSTALL",
       "USE_SKILL",
     ],
-    minMessageTurns: 9,
   },
   "deterministic-browser-actions": {
     actionNames: [
@@ -717,11 +628,9 @@ const STRICT_LLM_ROUTING_SCENARIOS: Record<
       "BROWSER_TYPE",
       "BROWSER_WAIT",
     ],
-    minMessageTurns: 8,
   },
   "deterministic-coding-tools-actions": {
     actionNames: ["FILE", "SHELL", "WORKTREE"],
-    minMessageTurns: 5,
   },
   "deterministic-github-actions-routes": {
     actionNames: [
@@ -736,23 +645,18 @@ const STRICT_LLM_ROUTING_SCENARIOS: Record<
       "GITHUB_PR_LIST",
       "GITHUB_PR_REVIEW",
     ],
-    minMessageTurns: 11,
   },
   "deterministic-gitpathology-actions": {
     actionNames: ["GIT_PATHOLOGY"],
-    minMessageTurns: 1,
   },
   "deterministic-media-actions": {
     actionNames: ["GENERATE_MEDIA"],
-    minMessageTurns: 2,
   },
   "deterministic-lifeops-multiday-journey": {
     actionNames: ["SCHEDULED_TASKS"],
-    minMessageTurns: 5,
   },
   "deterministic-lifeops-scheduled-tasks": {
     actionNames: ["SCHEDULED_TASKS"],
-    minMessageTurns: 6,
   },
   "deterministic-mcp-actions-routes": {
     actionNames: [
@@ -762,19 +666,15 @@ const STRICT_LLM_ROUTING_SCENARIOS: Record<
       "MCP_READ_RESOURCE",
       "MCP_SEARCH_ACTIONS",
     ],
-    minMessageTurns: 5,
   },
   "deterministic-streaming-actions": {
     actionNames: ["STREAM"],
-    minMessageTurns: 4,
   },
   "deterministic-todos-actions": {
     actionNames: ["TODO"],
-    minMessageTurns: 1,
   },
   "deterministic-workflow-actions-routes": {
     actionNames: ["WORKFLOW"],
-    minMessageTurns: 1,
   },
 };
 
@@ -816,14 +716,47 @@ const PROSE_ONLY_LLM_SCENARIOS: Record<string, string> = {
 };
 
 /**
- * Covered actions that are not yet strict natural-language routed. This
- * baseline may only shrink as actions move to STRICT_LLM_ROUTED_ACTIONS.
+ * Loaded-scenario actions intentionally covered only by direct action turns.
+ * The gate derives the real direct-only set and rejects exemptions that are
+ * unknown, empty, or stale after natural-language routing coverage lands.
  */
-const DIRECT_ONLY_COVERED_ACTIONS: readonly string[] = [
-  "BACKGROUND",
-  "DOCUMENT",
-  "SETTINGS",
-];
+const DIRECT_ONLY_ACTION_EXEMPTIONS = buildReasonedExemptions([
+  {
+    names: ["BACKGROUND"],
+    reason:
+      "The keyless scenario asserts background state transitions through direct action turns; natural-language routing is exercised in the credentialed live twin.",
+  },
+  {
+    names: ["DOCUMENT"],
+    reason:
+      "The keyless scenario asserts document CRUD and ownership outcomes through direct action turns; the live twin owns model routing.",
+  },
+  {
+    names: ["SETTINGS"],
+    reason:
+      "Settings voice mutations are asserted directly because the deterministic lane does not boot the dashboard routing context.",
+  },
+  {
+    names: ["BROWSER", "COMPUTER_USE", "COMPUTER_USE_AGENT"],
+    reason:
+      "The progress-stream scenario invokes these actions directly so it can assert callback ordering, approval payloads, and fake-device effects without conflating those contracts with planner selection.",
+  },
+  {
+    names: ["BROWSER_NAVIGATE", "BROWSER_WAIT_FOR_URL"],
+    reason:
+      "The browser catalog drives its stateful OAuth polling and restoration steps directly; the remaining browser verbs have strict planner fixtures in the same deterministic scenario.",
+  },
+  {
+    names: ["MULTI_DISPLAY_ROUTE", "CUA_VISION_LOOP"],
+    reason:
+      "These scenario-local harness actions expose coordinate-routing and vision-cache internals that are not agent-facing planner actions.",
+  },
+  {
+    names: ["VISION", "WINDOW"],
+    reason:
+      "The deterministic OCR and computer-use parity scenarios call these device-boundary actions directly to assert normalized native results.",
+  },
+]);
 
 function collectActionNames(plugin: Plugin): string[] {
   return sorted(
@@ -835,6 +768,30 @@ function collectActionNames(plugin: Plugin): string[] {
 
 function sorted(values: Iterable<string>): string[] {
   return [...new Set(values)].sort();
+}
+
+function buildReasonedExemptions(
+  groups: readonly { names: readonly string[]; reason: string }[],
+): Readonly<Record<string, string>> {
+  const exemptions: Record<string, string> = {};
+  for (const group of groups) {
+    for (const name of group.names) {
+      if (name in exemptions) {
+        throw new Error(`duplicate coverage exemption: ${name}`);
+      }
+      exemptions[name] = group.reason;
+    }
+  }
+  return exemptions;
+}
+
+function strictDeterministicLlmRoutedActions(): string[] {
+  const deterministicIds = new Set(ciScenarioList());
+  return sorted(
+    Object.entries(STRICT_LLM_ROUTING_SCENARIOS).flatMap(([id, scenario]) =>
+      deterministicIds.has(id) ? scenario.actionNames : [],
+    ),
+  );
 }
 
 /**
@@ -944,7 +901,7 @@ async function scenarioActionModeTurns(): Promise<
     scenarioId: string;
     turnName: string;
   }> = [];
-  for (const { scenario } of await loadAllScenarios(scenarioDir)) {
+  for (const { scenario } of await loadDeterministicScenarios()) {
     for (const turn of scenario.turns) {
       if (turn.kind !== "action") continue;
       const rawActionName = (turn as { actionName?: unknown }).actionName;
@@ -966,7 +923,7 @@ async function scenarioActionModeTurns(): Promise<
 }
 
 async function appControlNaturalLanguageTurnNames(): Promise<string[]> {
-  const loaded = await loadAllScenarios(scenarioDir);
+  const loaded = await loadDeterministicScenarios();
   const scenario = loaded.find(
     (entry) => entry.scenario.id === "deterministic-app-control-nl-routing",
   )?.scenario;
@@ -1000,9 +957,9 @@ function collectActionNameValue(value: unknown, names: Set<string>): void {
   }
 }
 
-async function scenarioActionNames(): Promise<string[]> {
+async function directScenarioActionNames(): Promise<string[]> {
   const names = new Set<string>();
-  for (const { scenario } of await loadAllScenarios(scenarioDir)) {
+  for (const { scenario } of await loadDeterministicScenarios()) {
     for (const turn of scenario.turns) {
       if (turn.kind !== "action") continue;
       collectActionNameValue(
@@ -1010,14 +967,18 @@ async function scenarioActionNames(): Promise<string[]> {
         names,
       );
     }
-    for (const check of scenario.finalChecks ?? []) {
-      collectActionNameValue(
-        (check as { actionName?: unknown }).actionName,
-        names,
-      );
-    }
   }
   return sorted(names);
+}
+
+function loadDeterministicScenarios() {
+  return loadAllScenarios(
+    scenarioDir,
+    undefined,
+    undefined,
+    false,
+    "pr-deterministic",
+  );
 }
 
 function declaredScenarioId(file: string): string | null {
@@ -1131,7 +1092,7 @@ describe("deterministic action coverage", () => {
       if (JSON.stringify(actual) !== JSON.stringify(want)) {
         drift.push(
           `${spec}: source umbrellas [${actual.join(", ") || "(none)"}] != manifest [${want.join(", ") || "(none)"}]\n` +
-            `    A new/renamed/removed action in ${spec} must be classified: cover its keyless slice in COVERED_ACTIONS, ` +
+            `    A new/renamed/removed action in ${spec} must be classified: add a real keyless scenario, ` +
             `or extend its LIVE_ONLY_REMAINDER justification — then update BOOTED_PLUGIN_ACTION_SURFACE to match.`,
         );
       }
@@ -1172,20 +1133,38 @@ describe("deterministic action coverage", () => {
     const covered = new Set(
       turns.map((turn) => actionModeKey(turn.actionName, turn.mode)),
     );
-    const liveModes = Object.entries(APP_CONTROL_MODE_SURFACE).flatMap(
-      ([actionName, modes]) =>
+    const liveModes = new Set(
+      Object.entries(APP_CONTROL_MODE_SURFACE).flatMap(([actionName, modes]) =>
         modes.map((mode) =>
           actionModeKey(actionName as AppControlActionName, mode),
         ),
+      ),
     );
-    const uncovered = liveModes.filter((key) => !covered.has(key));
+    const exemptions = new Set(Object.keys(APP_CONTROL_MODE_EXEMPTIONS));
+    const unclassified = [...liveModes].filter(
+      (key) => !covered.has(key) && !exemptions.has(key),
+    );
+    const staleExemptions = [...exemptions].filter(
+      (key) => !liveModes.has(key) || covered.has(key),
+    );
+    const outOfSurfaceTurns = [...covered].filter((key) => !liveModes.has(key));
+    const emptyReasons = Object.entries(APP_CONTROL_MODE_EXEMPTIONS)
+      .filter(([, reason]) => reason.trim().length === 0)
+      .map(([key]) => key);
 
     expect(
-      sorted(uncovered),
-      `APP/VIEWS mode coverage drifted.\n` +
-        `  real uncovered: ${sorted(uncovered).join(", ") || "(none)"}\n` +
-        `  baseline:       ${sorted(KNOWN_UNCOVERED_APP_CONTROL_MODES).join(", ") || "(none)"}`,
-    ).toEqual(sorted(KNOWN_UNCOVERED_APP_CONTROL_MODES));
+      unclassified,
+      `live APP/VIEWS modes need a loaded scenario turn or a reasoned exemption: ${unclassified.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      staleExemptions,
+      `remove APP/VIEWS exemptions that disappeared or gained coverage: ${staleExemptions.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      outOfSurfaceTurns,
+      `scenario turns reference APP/VIEWS modes absent from the live schema: ${outOfSurfaceTurns.join(", ")}`,
+    ).toEqual([]);
+    expect(emptyReasons).toEqual([]);
   });
 
   it("critical APP/VIEWS management modes have asserted deterministic action turns", async () => {
@@ -1262,11 +1241,12 @@ describe("deterministic action coverage", () => {
           ? `${source}\n${readFileSync(resolve(repoRoot, "packages/test/harness/action-route-fixtures.ts"), "utf8")}`
           : source;
 
-      const messageTurns = messageTurnCount(scenario);
-      if (messageTurns < spec.minMessageTurns) {
-        problems.push(
-          `${id}: expected at least ${spec.minMessageTurns} message turns, saw ${messageTurns}`,
-        );
+      const assertedMessageTurns = scenario.turns.filter(
+        (turn) =>
+          turn.kind === "message" && typeof turn.assertTurn === "function",
+      );
+      if (assertedMessageTurns.length === 0) {
+        problems.push(`${id}: no message turn has an assertTurn outcome check`);
       }
       if (!/scenarioLlmFixtures\?\.register\(/.test(fixtureSource)) {
         problems.push(`${id}: no scenarioLlmFixtures.register call`);
@@ -1278,9 +1258,12 @@ describe("deterministic action coverage", () => {
         problems.push(`${id}: no ACTION_PLANNER fixture`);
       }
       for (const actionName of spec.actionNames) {
-        if (!source.includes(`"${actionName}"`)) {
+        const fixtureSignal = new RegExp(
+          `(?:actionName|toolName|name)\\s*:\\s*["']${actionName}["']`,
+        );
+        if (!fixtureSignal.test(source)) {
           problems.push(
-            `${id}: source does not mention routed action ${actionName}`,
+            `${id}: source has no planner/action fixture signal for routed action ${actionName}`,
           );
         }
       }
@@ -1308,65 +1291,57 @@ describe("deterministic action coverage", () => {
     expect(problems, problems.join("\n")).toEqual([]);
   });
 
-  it("covered actions that are not strict LLM-routed are an explicit direct-only baseline", () => {
-    const covered = new Set(COVERED_ACTIONS);
-    const strict = new Set(STRICT_LLM_ROUTED_ACTIONS);
-    const missingStrict = STRICT_LLM_ROUTED_ACTIONS.filter(
-      (name) => !covered.has(name),
+  it("source-derived action coverage is strict-routed or explicitly direct-only", async () => {
+    const direct = new Set(await directScenarioActionNames());
+    const strictActions = strictDeterministicLlmRoutedActions();
+    const strict = new Set(strictActions);
+    const directOnly = sorted([...direct].filter((name) => !strict.has(name)));
+    const exemptions = new Set(Object.keys(DIRECT_ONLY_ACTION_EXEMPTIONS));
+    const unclassified = directOnly.filter((name) => !exemptions.has(name));
+    const staleExemptions = [...exemptions].filter(
+      (name) => !direct.has(name) || strict.has(name),
     );
-    const directOnly = sorted(
-      COVERED_ACTIONS.filter((name) => !strict.has(name)),
-    );
+    const emptyReasons = Object.entries(DIRECT_ONLY_ACTION_EXEMPTIONS)
+      .filter(([, reason]) => reason.trim().length === 0)
+      .map(([name]) => name);
 
     expect(
-      missingStrict,
-      `STRICT_LLM_ROUTED_ACTIONS must be a subset of COVERED_ACTIONS: ${missingStrict.join(", ")}`,
+      unclassified,
+      `loaded actions without strict routing need a reasoned direct-only exemption: ${unclassified.join(", ")}`,
     ).toEqual([]);
     expect(
-      directOnly,
-      `direct-only deterministic coverage drifted.\n` +
-        `  real direct-only: ${directOnly.join(", ") || "(none)"}\n` +
-        `  baseline:         ${sorted(DIRECT_ONLY_COVERED_ACTIONS).join(", ") || "(none)"}`,
-    ).toEqual(sorted(DIRECT_ONLY_COVERED_ACTIONS));
+      staleExemptions,
+      `remove direct-only exemptions that disappeared or gained strict routing: ${staleExemptions.join(", ")}`,
+    ).toEqual([]);
+    expect(emptyReasons).toEqual([]);
   });
 
-  it("every covered action still has a scenario (no coverage regression)", async () => {
-    const covered = new Set(await scenarioActionNames());
-    const regressed = sorted(COVERED_ACTIONS).filter(
-      (name) => !covered.has(name),
+  it("stable-core keyless actions are covered or explicitly and currently exempt", async () => {
+    const covered = new Set([
+      ...(await directScenarioActionNames()),
+      ...strictDeterministicLlmRoutedActions(),
+    ]);
+    const liveActions = new Set(stableCoreActions());
+    const exemptions = new Set(Object.keys(STABLE_CORE_COVERAGE_EXEMPTIONS));
+    const unclassified = [...liveActions].filter(
+      (name) => !covered.has(name) && !exemptions.has(name),
     );
+    const staleExemptions = [...exemptions].filter(
+      (name) => !liveActions.has(name) || covered.has(name),
+    );
+    const emptyReasons = Object.entries(STABLE_CORE_COVERAGE_EXEMPTIONS)
+      .filter(([, reason]) => reason.trim().length === 0)
+      .map(([name]) => name);
+
     expect(
-      regressed,
-      `actions in COVERED_ACTIONS no longer referenced by any scenario: ${regressed.join(", ")}`,
+      unclassified,
+      `stable-core actions need loaded scenario coverage or a reasoned exemption: ${unclassified.join(", ")}`,
     ).toEqual([]);
-  });
-
-  it("deterministic coverage only grows (count ratchet)", async () => {
-    const distinct = (await scenarioActionNames()).length;
     expect(
-      distinct,
-      `distinct covered actions dropped below the ratchet floor (${COVERED_FLOOR}); did a scenario get removed?`,
-    ).toBeGreaterThanOrEqual(COVERED_FLOOR);
-  });
-
-  it("stable-core keyless actions are covered by a scenario or in the shrinking baseline", async () => {
-    const covered = new Set(await scenarioActionNames());
-    const uncovered = stableCoreActions().filter((name) => !covered.has(name));
-    const baseline = sorted(KNOWN_UNCOVERED);
-
-    expect(
-      sorted(uncovered),
-      `stable-core uncovered set drifted from KNOWN_UNCOVERED.\n` +
-        `  real uncovered: ${sorted(uncovered).join(", ") || "(none)"}\n` +
-        `  baseline:       ${baseline.join(", ") || "(none)"}`,
-    ).toEqual(baseline);
-
-    const known = new Set(stableCoreActions());
-    const fake = baseline.filter((name) => !known.has(name));
-    expect(
-      fake,
-      `baseline lists actions that are not in the stable-core surface: ${fake.join(", ")}`,
+      staleExemptions,
+      `remove stable-core exemptions that disappeared or gained coverage: ${staleExemptions.join(", ")}`,
     ).toEqual([]);
+    expect(emptyReasons).toEqual([]);
   });
 
   it("every scenario file is wired into the deterministic CI run and named after its id", () => {

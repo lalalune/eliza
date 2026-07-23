@@ -1,6 +1,6 @@
 /**
- * Unit tests for the View Interaction Coverage app shell contract and coverage
- * guardrail.
+ * Maps every shipped plugin view to executable interaction evidence or a
+ * reasoned, current exemption.
  */
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -14,6 +14,7 @@ const KEYLESS_WORKFLOW = path.join(
   REPO_ROOT,
   ".github/workflows/scenario-pr.yml",
 );
+const UI_SMOKE_DENY_LIST = path.join(HERE, "ui-smoke", ".pr-deny-list.json");
 
 type ViewType = "gui" | "tui";
 
@@ -323,22 +324,6 @@ const GUI_INTERACTION_OWNERS: Readonly<
       signals: ["fine-tuning route selects trajectories", "start training job"],
     },
   ],
-  facewear: [
-    {
-      spec: "packages/app/test/ui-smoke/apps-comms-device-interactions.spec.ts",
-      proves:
-        "Exercises device status refresh and deterministic manage bridge behavior.",
-      signals: ["facewear device controls", "facewearStatusRequests"],
-    },
-  ],
-  smartglasses: [
-    {
-      spec: "packages/app/test/ui-smoke/apps-comms-device-interactions.spec.ts",
-      proves:
-        "Exercises connect headset, display writes, microphone toggles, and Wi-Fi setup bridge calls.",
-      signals: ["smartglasses bridge controls", "Connect"],
-    },
-  ],
   cockpit: [
     {
       spec: "plugins/plugin-task-coordinator/src/CockpitRoute.test.tsx",
@@ -365,12 +350,6 @@ const INTERACTION_DEBT: Readonly<Record<string, string>> = {
     "registered in the ui-smoke stub without hijacking that route. Needs a " +
     "disambiguated view path before a keyless interaction spec can drive it.",
 };
-
-const MAX_INTERACTION_DEBT = 1;
-
-const KEYLESS_INTERACTION_OWNER_DEBT = new Set([
-  "packages/app/test/ui-smoke/apps-personal-assistant-feed-interactions.spec.ts",
-]);
 
 function viewKey(view: Pick<VisualViewCase, "id" | "viewType">) {
   return `${view.id}:${view.viewType}`;
@@ -417,44 +396,56 @@ function uiSmokeSpecName(spec: string): string | null {
 }
 
 describe("plugin view interaction coverage", () => {
-  it("classifies every visual-matrix view as interaction-covered or explicit debt", () => {
+  it("classifies every live visual-matrix view exactly once", () => {
     const visualCases = readVisualMatrixCases();
-    const unclassified = visualCases.filter((view) => {
-      const owners = interactionOwners(view);
-      const hasInteractionOwner = owners.some(
-        (owner) => owner !== VISUAL_BASELINE_OWNER,
-      );
-      return !hasInteractionOwner && !(viewKey(view) in INTERACTION_DEBT);
-    });
+    const visualKeys = visualCases.map(viewKey);
+    const liveViewIds = new Set(visualCases.map((view) => view.id));
+    const ownerIds = Object.keys(GUI_INTERACTION_OWNERS);
+    const debtKeys = Object.keys(INTERACTION_DEBT);
+    const ownerKeys = visualCases
+      .filter((view) => (GUI_INTERACTION_OWNERS[view.id]?.length ?? 0) > 0)
+      .map(viewKey);
+    const duplicateVisualKeys = visualKeys.filter(
+      (key, index) => visualKeys.indexOf(key) !== index,
+    );
+    const staleOwners = ownerIds.filter((id) => !liveViewIds.has(id));
+    const staleDebt = debtKeys.filter((key) => !visualKeys.includes(key));
+    const blankDebtReasons = debtKeys.filter(
+      (key) => INTERACTION_DEBT[key]?.trim().length === 0,
+    );
+    const multiplyClassified = ownerKeys.filter((key) =>
+      debtKeys.includes(key),
+    );
+    const classifiedKeys = new Set([...ownerKeys, ...debtKeys]);
+    const unclassified = visualCases.filter(
+      (view) => !classifiedKeys.has(viewKey(view)),
+    );
 
-    expect(visualCases.length).toBe(30);
+    expect(duplicateVisualKeys, "Visual view keys must be unique.").toEqual([]);
+    expect(
+      staleOwners,
+      "Remove interaction-owner entries for views no longer in the live matrix.",
+    ).toEqual([]);
+    expect(
+      staleDebt,
+      "Remove exemptions for deleted or renamed views.",
+    ).toEqual([]);
+    expect(
+      blankDebtReasons,
+      "Every interaction exemption must explain its current blocker.",
+    ).toEqual([]);
+    expect(
+      multiplyClassified,
+      "A view with executable interaction evidence cannot remain exempt.",
+    ).toEqual([]);
     expect(
       unclassified.map((view) => `${viewKey(view)} ${view.path}`),
       "Add an interaction owner or an explicit debt reason for each view case.",
     ).toEqual([]);
-  });
-
-  it("keeps the explicit interaction-debt bucket from growing", () => {
-    const visualKeys = new Set(readVisualMatrixCases().map(viewKey));
-    const debtKeys = Object.keys(INTERACTION_DEBT);
-    const staleDebt = debtKeys.filter((key) => !visualKeys.has(key));
-    const coveredDebt = readVisualMatrixCases()
-      .filter((view) => viewKey(view) in INTERACTION_DEBT)
-      .filter((view) =>
-        interactionOwners(view).some(
-          (owner) => owner !== VISUAL_BASELINE_OWNER,
-        ),
-      )
-      .map(viewKey);
-
-    expect(debtKeys.length).toBeLessThanOrEqual(MAX_INTERACTION_DEBT);
-    expect(staleDebt, "Remove debt entries for deleted/renamed views.").toEqual(
-      [],
-    );
     expect(
-      coveredDebt,
-      "These views now have interaction owners; remove them from INTERACTION_DEBT and lower MAX_INTERACTION_DEBT.",
-    ).toEqual([]);
+      [...classifiedKeys].sort(),
+      "The interaction authority must exactly partition the live visual matrix.",
+    ).toEqual([...visualKeys].sort());
   });
 
   it("references real owner specs with the declared coverage signals", () => {
@@ -467,7 +458,11 @@ describe("plugin view interaction coverage", () => {
 
     const missingSpecs: string[] = [];
     const missingSignals: string[] = [];
+    const invalidMetadata: string[] = [];
     for (const owner of owners.values()) {
+      if (owner.proves.trim().length === 0 || owner.signals.length === 0) {
+        invalidMetadata.push(owner.spec);
+      }
       const absolutePath = path.join(REPO_ROOT, owner.spec);
       if (!existsSync(absolutePath)) {
         missingSpecs.push(owner.spec);
@@ -482,6 +477,10 @@ describe("plugin view interaction coverage", () => {
 
     expect(missingSpecs).toEqual([]);
     expect(missingSignals).toEqual([]);
+    expect(
+      invalidMetadata,
+      "Every interaction owner must state what it proves and name source signals.",
+    ).toEqual([]);
   });
 
   it("keeps ui-smoke interaction-owner specs wired into keyless CI", () => {
@@ -492,8 +491,19 @@ describe("plugin view interaction coverage", () => {
       }
     }
 
-    const workflow = readFileSync(KEYLESS_WORKFLOW, "utf8");
-    const unwired = [...owners.keys()]
+    const denyList = JSON.parse(readFileSync(UI_SMOKE_DENY_LIST, "utf8")) as {
+      specs?: Array<{ spec?: string }>;
+    };
+    expect(
+      Array.isArray(denyList.specs),
+      "The UI-smoke deny-list must expose a specs array.",
+    ).toBe(true);
+    const denied = new Set(
+      (denyList.specs ?? []).flatMap((entry) =>
+        typeof entry.spec === "string" ? [entry.spec] : [],
+      ),
+    );
+    const excludedOwners = [...owners.keys()]
       .map((spec) => ({
         spec,
         uiSmokeName: uiSmokeSpecName(spec),
@@ -502,15 +512,18 @@ describe("plugin view interaction coverage", () => {
         (owner): owner is { spec: string; uiSmokeName: string } =>
           owner.uiSmokeName !== null,
       )
-      .filter((owner) => !KEYLESS_INTERACTION_OWNER_DEBT.has(owner.spec))
-      .filter(
-        (owner) => !workflow.includes(`test/ui-smoke/${owner.uiSmokeName}`),
-      )
+      .filter((owner) => denied.has(owner.uiSmokeName))
       .map((owner) => owner.spec);
 
     expect(
-      unwired,
+      excludedOwners,
       "Every Playwright ui-smoke interaction owner must run in keyless scenario-pr CI.",
     ).toEqual([]);
+
+    const workflow = readFileSync(KEYLESS_WORKFLOW, "utf8");
+    expect(
+      workflow.includes("ui-smoke-pr-specs.mjs --list-auto"),
+      "Keyless CI must retain the directory-driven job that runs non-denied owner specs.",
+    ).toBe(true);
   });
 });

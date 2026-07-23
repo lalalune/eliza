@@ -134,6 +134,7 @@ export const ActivatesOnClick: Story = {
       activateCount += 1;
     },
   },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     activateCount = 0;
     const card = canvasElement.querySelector(

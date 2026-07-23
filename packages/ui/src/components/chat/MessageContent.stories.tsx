@@ -64,6 +64,7 @@ export const SubmittedInlineForm: Story = {
       text: '[form:submit reminder] {"title":"Quarterly report","time":"5pm"}',
     }),
   },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const text = canvasElement.textContent ?? "";
     assert(

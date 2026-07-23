@@ -84,6 +84,7 @@ export const TileLaunch: Story = {
       launchedId = e.id;
     },
   },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     launchedId = null;
     const tile = canvasElement.querySelector(
