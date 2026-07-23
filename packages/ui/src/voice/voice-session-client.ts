@@ -61,6 +61,7 @@ import {
   applyServerEvent,
   beginListening,
   INITIAL_VOICE_SESSION_STATE,
+  isEmptyFinal,
   loopToListening,
   toContinuousStatus,
   type VoiceSessionMachineState,
@@ -460,8 +461,9 @@ export function createVoiceSessionClient(
         // speaking_end will follow — the machine parked at 'complete' and the
         // loop must happen HERE or the turn never returns to listening
         // (#16662). Nothing was queued for playback, so there is no drain to
-        // wait for.
-        if (event.text === "") setState(loopToListening(state));
+        // wait for. `isEmptyFinal` mirrors the server's trimmed-empty
+        // predicate; the frame carries the raw untrimmed text.
+        if (isEmptyFinal(event.text)) setState(loopToListening(state));
         break;
       case "llm_first_text":
         mark("llm_first_text", event.traceId);

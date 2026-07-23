@@ -383,6 +383,38 @@ describe("voice-session client (real framing/state/barge-in/reconnect)", () => {
     await client.stop();
   });
 
+  it("a whitespace-only stt_final loops back to listening — server trims, wire text is raw (#16662)", async () => {
+    const mint = makeMintFetch();
+    const ws = makeWsFactory();
+    const client = createVoiceSessionClient({
+      agentId: "11111111-1111-1111-1111-111111111111",
+      conversationId: "22222222-2222-2222-2222-222222222222",
+      getConsentNonce: async () => "n",
+      fetch: mint.fetch,
+      webSocketFactory: ws.factory,
+      getUserMedia: fakeGetUserMedia(),
+      createMicAudioContext: () => new FakeMicAudioContext(16_000),
+      createPlaybackAudioContext: () => new FakePlaybackAudioContext(16_000),
+    });
+    await client.start();
+    await flush();
+    const sock = ws.last();
+    sock.emitOpen();
+    sock.emitControl({ t: "ready", sessionId: "sess-noise", traceId: "TA" });
+    await flush();
+    expect(client.state.phase).toBe("listening");
+
+    // The server decides the no-LLM path with transcript.trim() === "" but
+    // sends the RAW text, so "   " arrives on the wire for a silence turn.
+    // No speaking_end will follow; the client must not park in 'thinking'.
+    sock.emitControl({ t: "stt_partial", text: "uh", traceId: "TA" });
+    sock.emitControl({ t: "stt_final", text: "   ", traceId: "TA" });
+    expect(client.state.phase).toBe("listening");
+    expect(client.state.interimTranscript).toBe("");
+    expect(client.state.finalTranscript).toBe("");
+    await client.stop();
+  });
+
   it("barge-in flushes local playback BEFORE the server interrupted ack, then reconciles", async () => {
     const mint = makeMintFetch();
     const ws = makeWsFactory();

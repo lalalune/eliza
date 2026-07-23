@@ -101,6 +101,18 @@ export function applyClientAction(
 }
 
 /**
+ * The server decides "no LLM leg for this turn" with `transcript.trim() === ""`
+ * but sends the RAW untrimmed text in the `stt_final` frame
+ * (packages/cloud/api/v1/voice/session/lib/session.ts, commitTurn). The client
+ * must apply the SAME predicate — a strict `=== ""` check would treat a
+ * whitespace-only final as a real turn and strand the machine in 'thinking'
+ * waiting for a speaking_end that never comes (#16662).
+ */
+export function isEmptyFinal(text: string): boolean {
+  return text.trim() === "";
+}
+
+/**
  * Fold a server control event into the state. Server events are authoritative
  * for transcribing/thinking/speaking/interrupted; the mapping is:
  *   ready            → ready (client then starts capture → listening)
@@ -145,7 +157,7 @@ export function applyServerEvent(
       // eot_timeout with no speech). No speaking_end will ever follow, so
       // parking in 'thinking' would strand the client there forever (#16662).
       // Treat it as terminal-of-turn; the caller loops back to listening.
-      if (event.text === "") {
+      if (isEmptyFinal(event.text)) {
         return {
           ...state,
           phase: "complete",

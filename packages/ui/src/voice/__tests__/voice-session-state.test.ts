@@ -72,6 +72,24 @@ describe("voice-session-state machine (§7.4)", () => {
     expect(loopToListening(s).phase).toBe("listening");
   });
 
+  it("a whitespace-only final matches the server's trimmed-empty predicate (#16662)", () => {
+    // The server decides no-LLM-leg with transcript.trim() === "" but sends
+    // the RAW text — so "   " is an empty final on the wire. A strict === ""
+    // check on the client would park this turn in 'thinking' forever.
+    let s = applyClientAction(fresh(), { type: "client/connect" });
+    s = applyServerEvent(s, {
+      t: "ready",
+      sessionId: "sess-noise",
+      traceId: "T6",
+    });
+    s = applyServerEvent(s, { t: "stt_partial", text: "uh", traceId: "T6" });
+    s = applyServerEvent(s, { t: "stt_final", text: "   ", traceId: "T6" });
+    expect(s.phase).toBe("complete");
+    expect(s.finalTranscript).toBe("");
+    expect(s.interimTranscript).toBe("");
+    expect(loopToListening(s).phase).toBe("listening");
+  });
+
   it("server is authoritative for interrupted; local barge-in is optimistic", () => {
     let s = applyServerEvent(fresh(), { t: "speaking_start", traceId: "T2" });
     expect(s.phase).toBe("speaking");
