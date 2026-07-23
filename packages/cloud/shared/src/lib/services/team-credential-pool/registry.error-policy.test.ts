@@ -14,7 +14,11 @@ const mockSelect = mock();
 const mockRefresh = mock(async () => undefined);
 const mockSecretIdFor = mock();
 const mockGetDecryptedValue = mock();
+const mockMarkNeedsReauth = mock(async () => undefined);
+const mockMarkRateLimited = mock(async () => undefined);
 const mockWarn = mock();
+const mockRecordDailyUsage = mock(async () => undefined);
+const mockUpdatePoolState = mock(async () => undefined);
 
 mock.module("../../utils/logger", () => ({
   logger: { warn: mockWarn, info: mock(), error: mock(), debug: mock() },
@@ -25,7 +29,11 @@ mock.module("../secrets/secrets", () => ({
 }));
 
 mock.module("./account-pool", () => ({
-  TeamCredentialAccountPool: mock(() => ({ select: mockSelect })),
+  TeamCredentialAccountPool: mock(() => ({
+    select: mockSelect,
+    markNeedsReauth: mockMarkNeedsReauth,
+    markRateLimited: mockMarkRateLimited,
+  })),
 }));
 
 mock.module("./pool-deps", () => ({
@@ -38,7 +46,8 @@ mock.module("./pool-deps", () => ({
 
 mock.module("../../../db/repositories/pooled-credentials", () => ({
   pooledCredentialsRepository: {
-    recordInferenceUse: mock(),
+    recordDailyUsage: mockRecordDailyUsage,
+    updatePoolStateForOrganization: mockUpdatePoolState,
   },
 }));
 
@@ -53,7 +62,11 @@ async function freshRegistry(): Promise<TeamPoolRegistry> {
   mockSelect.mockReset();
   mockSecretIdFor.mockReset();
   mockGetDecryptedValue.mockReset();
+  mockMarkNeedsReauth.mockClear();
+  mockMarkRateLimited.mockClear();
   mockWarn.mockReset();
+  mockRecordDailyUsage.mockClear();
+  mockUpdatePoolState.mockClear();
   mockRefresh.mockClear();
   mockRefresh.mockResolvedValue(undefined);
   const { TeamPoolRegistry } = await import("./registry");
@@ -129,18 +142,151 @@ describe("TeamPoolRegistry.selectCredential error policy", () => {
     });
     expect(mockWarn).not.toHaveBeenCalled();
   });
+});
 
-  it("reuses the decrypted key and forwards Worker background persistence", async () => {
+describe("TeamPoolRegistry.selectCredentialCacheOnly", () => {
+  it("returns warming on a cold isolate and serves the hydrated secret from memory", async () => {
     const registry = await freshRegistry();
-    const defer = mock((_task: Promise<void>) => undefined);
     mockSelect.mockResolvedValue({ id: "cred-1", label: "team-key" });
     mockSecretIdFor.mockReturnValue("secret-1");
     mockGetDecryptedValue.mockResolvedValue("sk-real-key");
+    const background: Promise<unknown>[] = [];
 
-    await registry.selectCredential({ ...PARAMS, defer });
-    await registry.selectCredential({ ...PARAMS, defer });
+    expect(
+      await registry.selectCredentialCacheOnly(PARAMS, {
+        executionCtx: { waitUntil: (promise) => background.push(promise) },
+      }),
+    ).toEqual({ kind: "warming" });
+    expect(background).toHaveLength(1);
+    await background[0];
 
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "ready",
+      credential: {
+        credentialId: "cred-1",
+        providerId: "anthropic-api",
+        envKey: "ANTHROPIC_API_KEY",
+        apiKey: "sk-real-key",
+        label: "team-key",
+      },
+    });
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
     expect(mockGetDecryptedValue).toHaveBeenCalledTimes(1);
-    expect(mockGetDecryptedValue.mock.calls[0]?.[3]).toEqual({ defer });
+  });
+
+  it("does not query pool metadata or the secret store without waitUntil", async () => {
+    const registry = await freshRegistry();
+
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "unavailable",
+    });
+    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(mockSelect).not.toHaveBeenCalled();
+    expect(mockGetDecryptedValue).not.toHaveBeenCalled();
+  });
+
+  it("negative-caches a legitimately empty pool and coalesces cold hydration", async () => {
+    const registry = await freshRegistry();
+    mockSelect.mockResolvedValue(null);
+    const background: Promise<unknown>[] = [];
+    const executionCtx = {
+      waitUntil: (promise: Promise<unknown>) => background.push(promise),
+    };
+
+    expect(
+      await Promise.all([
+        registry.selectCredentialCacheOnly(PARAMS, { executionCtx }),
+        registry.selectCredentialCacheOnly(PARAMS, { executionCtx }),
+      ]),
+    ).toEqual([{ kind: "warming" }, { kind: "warming" }]);
+    expect(background).toHaveLength(2);
+    expect(background[0]).toBe(background[1]);
+    await background[0];
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "ready",
+      credential: null,
+    });
+  });
+
+  it("does not let an in-flight hydration repopulate a mutated organization", async () => {
+    const registry = await freshRegistry();
+    mockSelect.mockResolvedValue({ id: "cred-1", label: "team-key" });
+    mockSecretIdFor.mockReturnValue("secret-1");
+    const secret = Promise.withResolvers<string>();
+    mockGetDecryptedValue.mockReturnValue(secret.promise);
+    const background: Promise<unknown>[] = [];
+
+    expect(
+      await registry.selectCredentialCacheOnly(PARAMS, {
+        executionCtx: {
+          waitUntil: (promise) => background.push(promise),
+        },
+      }),
+    ).toEqual({ kind: "warming" });
+
+    registry.invalidate(PARAMS.organizationId);
+    secret.resolve("sk-stale-key");
+    await Promise.all(background);
+
+    expect(await registry.selectCredentialCacheOnly(PARAMS)).toEqual({
+      kind: "unavailable",
+    });
+  });
+
+  it("evicts every cached session selection after a provider auth failure", async () => {
+    const registry = await freshRegistry();
+    mockSelect.mockResolvedValue({ id: "cred-1", label: "team-key" });
+    mockSecretIdFor.mockReturnValue("secret-1");
+    mockGetDecryptedValue.mockResolvedValue("sk-real-key");
+    const background: Promise<unknown>[] = [];
+    const executionCtx = {
+      waitUntil: (promise: Promise<unknown>) => background.push(promise),
+    };
+    const firstSession = { ...PARAMS, sessionKey: "session-1" };
+    const secondSession = { ...PARAMS, sessionKey: "session-2" };
+
+    await registry.selectCredentialCacheOnly(firstSession, { executionCtx });
+    await registry.selectCredentialCacheOnly(secondSession, { executionCtx });
+    await Promise.all(background);
+
+    expect(await registry.selectCredentialCacheOnly(firstSession)).toMatchObject({ kind: "ready" });
+    expect(await registry.selectCredentialCacheOnly(secondSession)).toMatchObject({
+      kind: "ready",
+    });
+
+    await registry.recordProviderFailure({
+      organizationId: PARAMS.organizationId,
+      credentialId: "cred-1",
+      providerId: PARAMS.providerId,
+      status: 401,
+    });
+
+    expect(mockMarkNeedsReauth).toHaveBeenCalledTimes(1);
+    expect(await registry.selectCredentialCacheOnly(firstSession)).toEqual({
+      kind: "unavailable",
+    });
+    expect(await registry.selectCredentialCacheOnly(secondSession)).toEqual({
+      kind: "unavailable",
+    });
+  });
+
+  it("retains usage attribution under waitUntil instead of joining it to output", async () => {
+    const registry = await freshRegistry();
+    const background: Promise<unknown>[] = [];
+
+    registry.recordUseOffPath(
+      {
+        organizationId: "org-1",
+        credentialId: "cred-1",
+        userId: "user-1",
+      },
+      { waitUntil: (promise) => background.push(promise) },
+    );
+
+    expect(background).toHaveLength(1);
+    await background[0];
+    expect(mockRecordDailyUsage).toHaveBeenCalledTimes(1);
+    expect(mockUpdatePoolState).toHaveBeenCalledTimes(1);
   });
 });
