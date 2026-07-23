@@ -1112,8 +1112,7 @@ async function selectPooledInferenceCredential(params: {
     sessionKey: params.sessionKey,
     ...(params.executionCtx
       ? {
-          defer: (task: Promise<void>) =>
-            params.executionCtx?.waitUntil(task),
+          defer: (task: Promise<void>) => params.executionCtx?.waitUntil(task),
         }
       : {}),
   };
