@@ -235,6 +235,48 @@ describe("conversation connection readiness", () => {
     expect(hasReadyConversationConnection(recreatedDescriptor)).toBe(true);
   });
 
+  it("keeps a stale descriptor invalid after its blocked room is evicted", async () => {
+    const runtime = createRuntime();
+    const staleDescriptor = captureDescriptor(runtime);
+    await scheduleConversationConnectionEnsure(staleDescriptor, async () => {});
+
+    await serializeConversationConnectionRoomDeletion(
+      runtime,
+      staleDescriptor.roomId,
+      async () => {},
+    );
+
+    // Mirrors MAX_BLOCKED_CONVERSATION_ROOMS in the module under test:
+    // overflowing the block list evicts the deleted room's block entry first.
+    const blockedRoomCapacity = 5_000;
+    for (let index = 0; index < blockedRoomCapacity; index += 1) {
+      await serializeConversationConnectionRoomDeletion(
+        runtime,
+        stringToUuid(`readiness-evicted-room-${index}`) as UUID,
+        async () => {},
+      );
+    }
+
+    // The block is gone, so the room's surviving generation entry is the only
+    // thing keeping the pre-deletion descriptor from reviving the room.
+    const staleEnsure = vi.fn(async () => {});
+    await expect(
+      scheduleConversationConnectionEnsure(staleDescriptor, staleEnsure),
+    ).rejects.toMatchObject({
+      code: "CONVERSATION_CONNECTION_INVALIDATED",
+    });
+    expect(staleEnsure).not.toHaveBeenCalled();
+    expect(hasReadyConversationConnection(staleDescriptor)).toBe(false);
+
+    prepareConversationConnectionRoom(runtime, staleDescriptor.roomId);
+    const recreatedDescriptor = captureDescriptor(runtime);
+    await scheduleConversationConnectionEnsure(
+      recreatedDescriptor,
+      async () => {},
+    );
+    expect(hasReadyConversationConnection(recreatedDescriptor)).toBe(true);
+  });
+
   it("rejects old-name completion after an in-place topology change", async () => {
     const runtime = createRuntime("Old Name");
     const oldDescriptor = captureDescriptor(runtime);

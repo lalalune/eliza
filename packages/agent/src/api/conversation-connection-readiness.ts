@@ -41,7 +41,6 @@ export interface ConversationConnectionDescriptor {
 
 interface ReadyConnectionProof {
   readonly roomId: UUID;
-  readonly ownerId: UUID;
   readonly callerEntityId: UUID;
   readonly callerRole: BoundaryWorldRole;
   readonly callerUserName: string;
@@ -159,16 +158,20 @@ function pruneReadyProofs(registry: ConversationConnectionRegistry): void {
   }
 }
 
+/**
+ * Drops this caller's proofs captured under a different role or name. Cross-
+ * owner conflicts cannot reach here: ownerId is part of topologyIdentity, so a
+ * differing owner already invalidated the whole topology at capture time.
+ */
 function deleteConflictingCallerProofs(
   registry: ConversationConnectionRegistry,
   descriptor: ConversationConnectionDescriptor,
 ): void {
   for (const [identity, proof] of registry.readyProofs) {
     if (
-      proof.ownerId !== descriptor.ownerId ||
-      (proof.callerEntityId === descriptor.callerEntityId &&
-        (proof.callerRole !== descriptor.callerRole ||
-          proof.callerUserName !== descriptor.callerUserName))
+      proof.callerEntityId === descriptor.callerEntityId &&
+      (proof.callerRole !== descriptor.callerRole ||
+        proof.callerUserName !== descriptor.callerUserName)
     ) {
       registry.readyProofs.delete(identity);
     }
@@ -193,8 +196,10 @@ function pruneBlockedRooms(registry: ConversationConnectionRegistry): void {
       registry.blockedRooms.add(oldestRoomId);
       continue;
     }
+    // Evict only the block. The room's generation entry must outlive the
+    // eviction: deleting it would reset the room to generation 0, letting a
+    // stale pre-deletion descriptor pass the generation check again.
     registry.blockedRooms.delete(oldestRoomId);
-    registry.roomGenerations.delete(oldestRoomId);
   }
 }
 
@@ -384,7 +389,6 @@ export function scheduleConversationConnectionEnsure(
       registry.readyProofs.delete(descriptor.proofIdentity);
       registry.readyProofs.set(descriptor.proofIdentity, {
         roomId: descriptor.roomId,
-        ownerId: descriptor.ownerId,
         callerEntityId: descriptor.callerEntityId,
         callerRole: descriptor.callerRole,
         callerUserName: descriptor.callerUserName,
