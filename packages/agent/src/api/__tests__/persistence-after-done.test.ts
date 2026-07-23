@@ -1,9 +1,8 @@
 /**
- * Verifies that the streaming chat handler emits the SSE `done` frame and
- * closes the response BEFORE assistant-memory persistence resolves, so the
- * user-perceived end-of-turn excludes the persistence write. Also verifies
- * that persistence rejections still surface via the structured logger
- * instead of being silently swallowed.
+ * Verifies that the streaming chat handler treats `done` as a durable commit
+ * boundary: assistant persistence resolves before the terminal frame and both
+ * ids in that frame already exist. Persistence failures become terminal SSE
+ * errors rather than a false successful completion.
  */
 
 import { EventEmitter } from "node:events";
@@ -11,9 +10,9 @@ import http from "node:http";
 import { ChannelType, logger, stringToUuid, type UUID } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Capture the deferred persistence promise the handler kicks off so the test
-// can resolve it on demand and assert ordering against the SSE writes.
-let persistResolve: ((value?: unknown) => void) | null = null;
+// Capture the persistence promise so the test can resolve it on demand and
+// assert ordering against the SSE writes.
+let persistResolve: (() => void) | null = null;
 let persistReject: ((err: unknown) => void) | null = null;
 let persistCalledAt: number | null = null;
 let persistResolvedAt: number | null = null;
@@ -22,6 +21,28 @@ let generateWaitsForAbort = false;
 let generateThrowsTurnAbort = false;
 let generateThrowsTimeout = false;
 let assistantMemoryAlreadyPersisted = false;
+
+// Connection readiness has its own integration suite. This fixture isolates
+// the later assistant commit boundary and therefore supplies an already-valid
+// descriptor without running world/room topology writes.
+vi.mock("../conversation-connection-readiness.ts", async () => {
+  const actual = await vi.importActual<
+    typeof import("../conversation-connection-readiness.ts")
+  >("../conversation-connection-readiness.ts");
+  return {
+    ...actual,
+    captureConversationConnectionDescriptor: vi.fn((input) => ({
+      ...input,
+      runtimeAgentId: input.runtime.agentId,
+      topologyIdentity: "test-topology",
+      proofIdentity: "test-proof",
+      topologyGeneration: 1,
+      roomGeneration: 1,
+    })),
+    scheduleConversationConnectionEnsure: vi.fn(async () => undefined),
+    assertConversationConnectionRuntime: vi.fn(),
+  };
+});
 
 vi.mock("../chat-routes.ts", async () => {
   const actual =
@@ -57,10 +78,10 @@ vi.mock("../chat-routes.ts", async () => {
     persistConversationMemory: vi.fn(async () => undefined),
     persistAssistantConversationMemory: vi.fn(async () => {
       persistCalledAt = Date.now();
-      return new Promise<void>((resolve, reject) => {
-        persistResolve = (_value) => {
+      return new Promise<{ id: UUID }>((resolve, reject) => {
+        persistResolve = () => {
           persistResolvedAt = Date.now();
-          resolve();
+          resolve({ id: stringToUuid("assistant-msg-store") as UUID });
         };
         persistReject = (err) => {
           persistResolvedAt = Date.now();
@@ -291,63 +312,50 @@ describe("conversation-routes streaming persistence ordering", () => {
     vi.clearAllMocks();
   });
 
-  it("emits `done` frame and ends the response BEFORE persistence resolves", async () => {
+  it("emits `done` and ends only AFTER persistence resolves", async () => {
     const { ctx, record } = createCtx();
 
     // Kick the handler off; do NOT await — persistence is hanging.
     const handlerDone = handleConversationRoutes(ctx);
 
-    // Yield repeatedly so the handler reaches the `done` write + res.end().
+    // Yield repeatedly so the handler reaches the pending persistence write.
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
-    const doneAt = (() => {
-      const ts = record.writes.findIndex((w) => w.includes('"type":"done"'));
-      return ts >= 0 ? ts : -1;
-    })();
-    expect(doneAt).toBeGreaterThanOrEqual(0);
-    expect(record.ended).toBe(true);
+    expect(record.writes.some((w) => w.includes('"type":"done"'))).toBe(false);
+    expect(record.ended).toBe(false);
     expect(persistCalledAt).not.toBeNull();
     expect(persistResolvedAt).toBeNull();
 
-    // Now resolve persistence and let the handler clean up.
+    // Once persistence commits, the route can truthfully emit the terminal ids.
     persistResolve?.();
     await handlerDone;
     expect(persistResolvedAt).not.toBeNull();
-    // res.end() ran before persistence finished.
-    expect(record.endedAt).not.toBeNull();
-    expect(record.endedAt ?? 0).toBeLessThanOrEqual(
-      persistResolvedAt ?? Infinity,
+    const doneFrame = record.writes.find((w) => w.includes('"type":"done"'));
+    expect(doneFrame).toContain(
+      `"messageId":"${stringToUuid("assistant-msg-store")}"`,
     );
+    expect(doneFrame).toContain(
+      `"userMessageId":"${stringToUuid("user-msg-store")}"`,
+    );
+    expect(record.ended).toBe(true);
+    expect(record.endedAt).not.toBeNull();
+    expect(record.endedAt ?? 0).toBeGreaterThanOrEqual(persistResolvedAt ?? 0);
   });
 
-  it("logs persistence failures via Logger.error and still ends the response cleanly", async () => {
-    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+  it("turns persistence failures into a terminal SSE error", async () => {
     const { ctx, record } = createCtx();
 
     const handlerDone = handleConversationRoutes(ctx);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
-    expect(record.ended).toBe(true);
+    expect(record.ended).toBe(false);
     const persistErr = new Error("simulated db failure");
     persistReject?.(persistErr);
     await handlerDone;
-    // Detached catch handler runs after handlerDone resolves; flush microtasks.
-    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-
-    expect(errorSpy).toHaveBeenCalled();
-    const call = errorSpy.mock.calls.find((c) => {
-      const ctxArg = c[0] as { roomId?: unknown; err?: unknown } | undefined;
-      const msg = c[1];
-      return (
-        typeof msg === "string" &&
-        msg.includes("[ConversationStream] persistence failed") &&
-        ctxArg !== undefined &&
-        typeof ctxArg.err === "string" &&
-        ctxArg.err.includes("simulated db failure")
-      );
-    });
-    expect(call).toBeDefined();
-    errorSpy.mockRestore();
+    expect(record.writes.some((w) => w.includes('"type":"done"'))).toBe(false);
+    expect(record.writes.join("")).toContain('"type":"error"');
+    expect(record.writes.join("")).toContain("simulated db failure");
+    expect(record.ended).toBe(true);
   });
 
   it("aborts generation when the client socket closes after request body parsing", async () => {
