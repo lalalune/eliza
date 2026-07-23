@@ -155,7 +155,7 @@ async function rollbackCreatedUserSafely(
   originalError: unknown,
 ): Promise<void> {
   try {
-    await usersRepository.delete(userId);
+    await usersService.delete(userId);
   } catch (rollbackError) {
     logger.error("[StewardSync] Failed to roll back newly created user", {
       context,

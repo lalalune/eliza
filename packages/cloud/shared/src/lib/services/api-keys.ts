@@ -1,14 +1,18 @@
 /**
- * API key management service for generating, validating, and managing API keys.
+ * API-key issuance, validation, and lifecycle authorization.
  *
- * Includes Redis caching for validation to reduce database load on high-traffic APIs.
+ * Postgres owns credential state, while the organization's inference admission
+ * Durable Object is the synchronous revocation boundary for cache-authorized
+ * provider dispatch. Cache eviction is cleanup after that boundary is updated.
  */
 
+import { ElizaError } from "@elizaos/core";
 import crypto from "crypto";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, like, lt, sql } from "drizzle-orm";
 import { dbWrite } from "../../db/client";
 import { encryptApiKey } from "../../db/crypto/api-keys";
 import { type ApiKey, apiKeysRepository, type NewApiKey } from "../../db/repositories";
+import { agentSandboxes } from "../../db/schemas/agent-sandboxes";
 import { apiKeys } from "../../db/schemas/api-keys";
 import { cache } from "../cache/client";
 import { CacheKeys, CacheTTL } from "../cache/keys";
@@ -18,8 +22,15 @@ import {
   invalidateInferenceAuthContextByKeyHash,
   invalidateInferenceAuthContextsByKeyHashes,
 } from "./inference-auth-cache";
+import {
+  applyInferenceAuthorizationState,
+  applyInferenceAuthorizationStates,
+  type InferenceAuthorizationTargetState,
+} from "./inference-authorization-boundary";
+import { apiKeyAuthorizationState } from "./inference-authorization-lifecycle";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGENT_API_KEY_PREFIX = "agent-sandbox:";
 
 function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_RE.test(value);
@@ -65,6 +76,143 @@ function isNegativeApiKeySentinel(value: unknown): boolean {
  */
 const USAGE_INCREMENT_DEBOUNCE_MS = 60_000;
 const lastUsageIncrement = new Map<string, number>();
+
+type ApiKeyCreateInput = Omit<
+  NewApiKey,
+  | "key_hash"
+  | "key_prefix"
+  | "key_ciphertext"
+  | "key_nonce"
+  | "key_auth_tag"
+  | "key_kms_key_id"
+  | "key_kms_key_version"
+  | "inference_auth_revision"
+>;
+
+interface OrganizationAuthorizationState {
+  organizationId: string;
+  state: InferenceAuthorizationTargetState;
+}
+
+const AUTHORIZATION_FIELDS = [
+  "id",
+  "organization_id",
+  "user_id",
+  "key_hash",
+  "is_active",
+  "deleted_at",
+  "expires_at",
+] as const satisfies readonly (keyof NewApiKey)[];
+
+function apiKeyAuthorizationRequested(data: Partial<NewApiKey>): boolean {
+  return AUTHORIZATION_FIELDS.some((field) => Object.hasOwn(data, field));
+}
+
+function dateValue(value: Date | null): number | null {
+  return value?.getTime() ?? null;
+}
+
+function apiKeyAuthorizationChanged(existing: ApiKey, updated: ApiKey): boolean {
+  return (
+    existing.id !== updated.id ||
+    existing.organization_id !== updated.organization_id ||
+    existing.user_id !== updated.user_id ||
+    existing.key_hash !== updated.key_hash ||
+    existing.is_active !== updated.is_active ||
+    dateValue(existing.deleted_at) !== dateValue(updated.deleted_at) ||
+    dateValue(existing.expires_at) !== dateValue(updated.expires_at)
+  );
+}
+
+function apiKeyIdentityChanged(existing: ApiKey, updated: ApiKey): boolean {
+  return (
+    existing.id !== updated.id ||
+    existing.organization_id !== updated.organization_id ||
+    existing.user_id !== updated.user_id ||
+    existing.key_hash !== updated.key_hash
+  );
+}
+
+function apiKeyDenied(apiKey: ApiKey): boolean {
+  const expiresAt = dateValue(apiKey.expires_at);
+  return (
+    !apiKey.is_active ||
+    apiKey.deleted_at !== null ||
+    (expiresAt !== null && expiresAt <= Date.now())
+  );
+}
+
+function expiryContracted(existing: ApiKey, updated: ApiKey): boolean {
+  const existingExpiry = dateValue(existing.expires_at) ?? Number.POSITIVE_INFINITY;
+  const updatedExpiry = dateValue(updated.expires_at) ?? Number.POSITIVE_INFINITY;
+  return updatedExpiry < existingExpiry;
+}
+
+function deniedCredentialState(
+  apiKey: ApiKey,
+  revision: ApiKey["inference_auth_revision"],
+): InferenceAuthorizationTargetState {
+  return apiKeyAuthorizationState({
+    ...apiKey,
+    inference_auth_revision: revision,
+    is_active: false,
+  });
+}
+
+function authorizationUpdatePlan(
+  existing: ApiKey,
+  updated: ApiKey,
+): {
+  restrictive: OrganizationAuthorizationState[];
+  permissive: OrganizationAuthorizationState | null;
+} {
+  if (!apiKeyAuthorizationChanged(existing, updated)) {
+    return { restrictive: [], permissive: null };
+  }
+
+  const current = {
+    organizationId: updated.organization_id,
+    state: apiKeyAuthorizationState(updated),
+  };
+  if (!apiKeyIdentityChanged(existing, updated)) {
+    if (apiKeyDenied(updated) || expiryContracted(existing, updated)) {
+      return { restrictive: [current], permissive: null };
+    }
+    return { restrictive: [], permissive: current };
+  }
+
+  const previous = {
+    organizationId: existing.organization_id,
+    state: deniedCredentialState(existing, updated.inference_auth_revision),
+  };
+  if (!apiKeyDenied(updated)) {
+    return { restrictive: [previous], permissive: current };
+  }
+
+  if (
+    previous.organizationId === current.organizationId &&
+    previous.state.id === current.state.id
+  ) {
+    return { restrictive: [current], permissive: null };
+  }
+  return { restrictive: [previous, current], permissive: null };
+}
+
+async function applyAuthorizationStateGroups(
+  updates: readonly OrganizationAuthorizationState[],
+): Promise<void> {
+  const statesByOrganization = new Map<string, InferenceAuthorizationTargetState[]>();
+  for (const update of updates) {
+    const states = statesByOrganization.get(update.organizationId) ?? [];
+    states.push(update.state);
+    statesByOrganization.set(update.organizationId, states);
+  }
+  for (const [organizationId, states] of statesByOrganization) {
+    for (let offset = 0; offset < states.length; offset += 512) {
+      await applyInferenceAuthorizationStates(organizationId, states.slice(offset, offset + 512));
+    }
+  }
+}
 
 /**
  * Generated API key with hash and prefix.
@@ -161,25 +309,15 @@ export class ApiKeysService {
   }
 
   /**
-   * Invalidate cache for a specific API key (call on update/delete). Fails
-   * closed.
+   * Delete validation and inference cache entries for one credential.
    *
-   * Clears BOTH the validation cache (16-char-prefix key) AND the inference
-   * hot-path auth-context entry (full-hash key, #9899). Every api-key mutation
-   * site routes through here, so a revoked/updated key stops fast-pathing
-   * inference immediately rather than waiting out the IAC TTL.
-   *
-   * @throws when either backend delete is not confirmed. A revoked key whose
-   *   cache entry was NOT removed keeps authenticating until its TTL lapses, so
-   *   the mutation path must surface an unconfirmed invalidation (error-policy:J1)
-   *   rather than silently discard `cache.del`'s failure (#13417).
+   * Lifecycle methods invoke this after the Durable Object observes the
+   * authoritative transition, so a cleanup failure cannot reopen inference.
+   * The explicit throw keeps incomplete cache maintenance observable to direct
+   * callers and to the lifecycle wrapper's structured warning.
    */
   async invalidateCache(keyHash: string): Promise<void> {
     const shortHash = keyHash.substring(0, 16);
-    // Invalidate every auth cache a key participates in, or a revoked/updated
-    // key would keep authenticating until each TTL expires. All revoke/update/
-    // deactivate paths funnel through here: the per-key validation cache and the
-    // #9899 inference hot-path auth-context entry (keyed by full hash).
     const [validationDeleted, inferenceDeleted] = await Promise.all([
       cache.delConfirmed(CacheKeys.apiKey.validation(shortHash)),
       invalidateInferenceAuthContextByKeyHash(keyHash),
@@ -194,9 +332,11 @@ export class ApiKeysService {
         shortHash,
         unconfirmed,
       });
-      throw new Error(
-        `API key cache invalidation not confirmed (${unconfirmed.join(", ")}); revoked key may still authenticate until TTL`,
-      );
+      throw new ElizaError("API key cache invalidation was not confirmed", {
+        code: "API_KEY_CACHE_INVALIDATION_UNCONFIRMED",
+        context: { shortHash, unconfirmed },
+        severity: "ephemeral",
+      });
     }
 
     logger.debug("[ApiKeys] Invalidated API key + inference auth-context cache");
@@ -225,23 +365,16 @@ export class ApiKeysService {
     await invalidateInferenceAuthContextsByKeyHashes(keys.map((k) => k.key_hash));
   }
 
-  async create(
-    data: Omit<
-      NewApiKey,
-      | "key_hash"
-      | "key_prefix"
-      | "key_ciphertext"
-      | "key_nonce"
-      | "key_auth_tag"
-      | "key_kms_key_id"
-      | "key_kms_key_version"
-    >,
-  ): Promise<{
+  async create(data: ApiKeyCreateInput): Promise<{
     apiKey: ApiKey;
     plainKey: string;
   }> {
     const { apiKey, plainKey } = await this.buildApiKeyInsert(data);
     const created = await apiKeysRepository.create(apiKey);
+    await applyInferenceAuthorizationState(
+      created.organization_id,
+      apiKeyAuthorizationState(created),
+    );
 
     return {
       apiKey: created,
@@ -250,16 +383,7 @@ export class ApiKeysService {
   }
 
   private async buildApiKeyInsert(
-    data: Omit<
-      NewApiKey,
-      | "key_hash"
-      | "key_prefix"
-      | "key_ciphertext"
-      | "key_nonce"
-      | "key_auth_tag"
-      | "key_kms_key_id"
-      | "key_kms_key_version"
-    >,
+    data: ApiKeyCreateInput,
   ): Promise<{ apiKey: NewApiKey; plainKey: string }> {
     const { key, hash, prefix } = this.generateApiKey();
 
@@ -295,7 +419,7 @@ export class ApiKeysService {
       throw new Error("Invalid userId or organizationId for default API key provisioning");
     }
 
-    await dbWrite.transaction(async (tx) => {
+    const key = await dbWrite.transaction(async (tx) => {
       await tx.execute(
         sql`SELECT pg_advisory_xact_lock(hashtext(${`default_api_key:${userId}:${organizationId}`}))`,
       );
@@ -312,9 +436,13 @@ export class ApiKeysService {
             eq(apiKeys.is_active, true),
             isNull(apiKeys.deleted_at),
           ),
-        );
-      if (existingKeys.some((key) => !key.expires_at || key.expires_at > now)) {
-        return;
+        )
+        .for("update");
+      const existing = existingKeys.find((candidate) => {
+        return !candidate.expires_at || candidate.expires_at > now;
+      });
+      if (existing) {
+        return existing;
       }
 
       const { apiKey } = await this.buildApiKeyInsert({
@@ -323,8 +451,16 @@ export class ApiKeysService {
         name: "Default API Key",
         is_active: true,
       });
-      await tx.insert(apiKeys).values(apiKey);
+      const [created] = await tx.insert(apiKeys).values(apiKey).returning();
+      if (!created) {
+        throw new ElizaError("Default API key insert did not return its row", {
+          code: "API_KEY_DEFAULT_INSERT_FAILED",
+          context: { userId, organizationId },
+        });
+      }
+      return created;
     });
+    await applyInferenceAuthorizationState(key.organization_id, apiKeyAuthorizationState(key));
   }
 
   /**
@@ -356,13 +492,93 @@ export class ApiKeysService {
   }
 
   async update(id: string, data: Partial<NewApiKey>): Promise<ApiKey | undefined> {
-    // Get the key first to invalidate cache
-    const existing = await apiKeysRepository.findById(id);
-    if (existing) {
-      await this.invalidateCache(existing.key_hash);
-    }
+    const updateData = { ...data };
+    delete updateData.inference_auth_revision;
+    const authorizationRequested = apiKeyAuthorizationRequested(updateData);
+    const result = await dbWrite.transaction(async (tx) => {
+      const [existing] = await tx.select().from(apiKeys).where(eq(apiKeys.id, id)).for("update");
+      if (!existing) return undefined;
 
-    return await apiKeysRepository.update(id, data);
+      const candidate = { ...existing, ...updateData };
+      const authorizationChanged = apiKeyAuthorizationChanged(existing, candidate);
+      let [updated] = await tx
+        .update(apiKeys)
+        .set({
+          ...updateData,
+          ...(authorizationChanged
+            ? {
+                inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+              }
+            : {}),
+          updated_at: new Date(),
+        })
+        .where(eq(apiKeys.id, id))
+        .returning();
+      if (!updated) {
+        throw new ElizaError("API key disappeared during update", {
+          code: "API_KEY_UPDATE_LOST",
+          context: { apiKeyId: id },
+        });
+      }
+      const plan = authorizationUpdatePlan(existing, updated);
+      if (authorizationRequested && plan.restrictive.length === 0 && plan.permissive === null) {
+        const current = {
+          organizationId: updated.organization_id,
+          state: apiKeyAuthorizationState(updated),
+        };
+        if (apiKeyDenied(updated)) {
+          plan.restrictive.push(current);
+        } else {
+          plan.permissive = current;
+        }
+      }
+      await applyAuthorizationStateGroups(plan.restrictive);
+      if (
+        plan.permissive &&
+        plan.restrictive.some((restriction) => {
+          return (
+            restriction.organizationId === plan.permissive?.organizationId &&
+            restriction.state.kind === "credential" &&
+            plan.permissive.state.kind === "credential" &&
+            restriction.state.id === plan.permissive.state.id &&
+            restriction.state.credentialKind === plan.permissive.state.credentialKind
+          );
+        })
+      ) {
+        const [advanced] = await tx
+          .update(apiKeys)
+          .set({
+            inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+            updated_at: new Date(),
+          })
+          .where(eq(apiKeys.id, updated.id))
+          .returning();
+        if (!advanced) {
+          throw new ElizaError("API key disappeared while advancing authorization", {
+            code: "API_KEY_AUTH_REVISION_ADVANCE_LOST",
+            context: { apiKeyId: updated.id },
+          });
+        }
+        updated = advanced;
+        plan.permissive = {
+          organizationId: advanced.organization_id,
+          state: apiKeyAuthorizationState(advanced),
+        };
+      }
+      return { existing, updated, permissive: plan.permissive };
+    });
+    if (!result) return undefined;
+    if (result.permissive) {
+      await applyInferenceAuthorizationState(
+        result.permissive.organizationId,
+        result.permissive.state,
+      );
+    }
+    await this.invalidateCachesAfterAuthorization([
+      result.existing.key_hash,
+      result.updated.key_hash,
+    ]);
+    return result.updated;
   }
 
   async incrementUsage(id: string): Promise<void> {
@@ -370,42 +586,113 @@ export class ApiKeysService {
   }
 
   async delete(id: string): Promise<void> {
-    // Get the key first to invalidate cache
-    const existing = await apiKeysRepository.findById(id);
-    if (existing) {
-      await this.invalidateCache(existing.key_hash);
+    const deleted = await dbWrite.transaction(async (tx) => {
+      const [existing] = await tx.select().from(apiKeys).where(eq(apiKeys.id, id)).for("update");
+      if (!existing) return undefined;
+      const [restricted] = await tx
+        .update(apiKeys)
+        .set({
+          is_active: false,
+          deleted_at: existing.deleted_at ?? new Date(),
+          inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(eq(apiKeys.id, id))
+        .returning();
+      if (!restricted) {
+        throw new ElizaError("API key disappeared during deletion", {
+          code: "API_KEY_DELETE_LOST",
+          context: { apiKeyId: id },
+        });
+      }
+      await applyInferenceAuthorizationState(
+        restricted.organization_id,
+        apiKeyAuthorizationState(restricted),
+      );
+      await tx.delete(apiKeys).where(eq(apiKeys.id, restricted.id));
+      return restricted;
+    });
+    if (deleted) {
+      await this.invalidateCachesAfterAuthorization([deleted.key_hash]);
     }
-
-    await apiKeysRepository.delete(id);
   }
 
   async deactivateUserKeysByName(userId: string, name: string): Promise<void> {
-    const existingKeys = await apiKeysRepository.findByUserAndName(userId, name);
-
-    for (const key of existingKeys) {
-      await this.invalidateCache(key.key_hash);
-    }
-
-    await apiKeysRepository.deactivateUserKeysByName(userId, name);
+    const restricted = await dbWrite.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(apiKeys)
+        .where(
+          and(eq(apiKeys.user_id, userId), eq(apiKeys.name, name), eq(apiKeys.is_active, true)),
+        )
+        .for("update");
+      if (existing.length === 0) return [];
+      const updated = await tx
+        .update(apiKeys)
+        .set({
+          is_active: false,
+          inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(
+          inArray(
+            apiKeys.id,
+            existing.map((key) => key.id),
+          ),
+        )
+        .returning();
+      await applyAuthorizationStateGroups(
+        updated.map((key) => ({
+          organizationId: key.organization_id,
+          state: apiKeyAuthorizationState(key),
+        })),
+      );
+      return updated;
+    });
+    await this.invalidateCachesAfterAuthorization(restricted.map((key) => key.key_hash));
   }
 
   async deactivateByUserAndOrganization(userId: string, organizationId: string): Promise<void> {
-    const existingKeys = await apiKeysRepository.listByUser(userId);
-    const keysInOrganization = existingKeys.filter(
-      (key) => key.organization_id === organizationId && key.is_active,
-    );
-
-    for (const key of keysInOrganization) {
-      await this.invalidateCache(key.key_hash);
-    }
-
-    await apiKeysRepository.deactivateByUserAndOrganization(userId, organizationId);
+    const restricted = await dbWrite.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(apiKeys)
+        .where(
+          and(
+            eq(apiKeys.user_id, userId),
+            eq(apiKeys.organization_id, organizationId),
+            eq(apiKeys.is_active, true),
+          ),
+        )
+        .for("update");
+      if (existing.length === 0) return [];
+      const updated = await tx
+        .update(apiKeys)
+        .set({
+          is_active: false,
+          inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(
+          inArray(
+            apiKeys.id,
+            existing.map((key) => key.id),
+          ),
+        )
+        .returning();
+      await applyInferenceAuthorizationStates(
+        organizationId,
+        updated.map((key) => apiKeyAuthorizationState(key)),
+      );
+      return updated;
+    });
+    await this.invalidateCachesAfterAuthorization(restricted.map((key) => key.key_hash));
   }
 
   // Sandbox-scoped keys are named "agent-sandbox:<id>". Listing/revoking by that
   // canonical name is enough — no need for a separate metadata column today.
   private static agentApiKeyName(agentSandboxId: string): string {
-    return `agent-sandbox:${agentSandboxId}`;
+    return `${AGENT_API_KEY_PREFIX}${agentSandboxId}`;
   }
 
   async createForAgent(params: {
@@ -433,24 +720,105 @@ export class ApiKeysService {
 
   async revokeForAgent(agentSandboxId: string): Promise<void> {
     const name = ApiKeysService.agentApiKeyName(agentSandboxId);
-    // Unlike update/delete (which invalidate BEFORE the DB mutation and so can
-    // safely fail closed by throwing), this path deletes the rows FIRST — the
-    // credential is already DB-revoked. A cache-invalidation failure here must
-    // NOT abort agent (re)provisioning: the stale entry is TTL-bounded and the
-    // authoritative row is gone. So invalidation is best-effort — but the
-    // failure is surfaced observably (error-policy:J5), never swallowed silently.
-    for (const key of await apiKeysRepository.deleteByName(name)) {
+    const deleted = await dbWrite.transaction(async (tx) => {
+      const existing = await tx.select().from(apiKeys).where(eq(apiKeys.name, name)).for("update");
+      if (existing.length === 0) return [];
+      const restricted = await tx
+        .update(apiKeys)
+        .set({
+          is_active: false,
+          deleted_at: new Date(),
+          inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(
+          inArray(
+            apiKeys.id,
+            existing.map((key) => key.id),
+          ),
+        )
+        .returning();
+      await applyAuthorizationStateGroups(
+        restricted.map((key) => ({
+          organizationId: key.organization_id,
+          state: apiKeyAuthorizationState(key),
+        })),
+      );
+      await tx.delete(apiKeys).where(
+        inArray(
+          apiKeys.id,
+          restricted.map((key) => key.id),
+        ),
+      );
+      return restricted;
+    });
+    await this.invalidateCachesAfterAuthorization(deleted.map((key) => key.key_hash));
+  }
+
+  async revokeStrandedAgentKeys(olderThan: Date): Promise<ApiKey[]> {
+    const deleted = await dbWrite.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(apiKeys)
+        .where(
+          and(
+            eq(apiKeys.is_active, true),
+            like(apiKeys.name, `${AGENT_API_KEY_PREFIX}%`),
+            lt(apiKeys.created_at, olderThan),
+            sql`NOT EXISTS (
+              SELECT 1 FROM ${agentSandboxes}
+              WHERE ${agentSandboxes.id}::text = substring(
+                ${apiKeys.name} from ${sql.raw(String(AGENT_API_KEY_PREFIX.length + 1))}
+              )
+            )`,
+          ),
+        )
+        .for("update");
+      if (existing.length === 0) return [];
+      const restricted = await tx
+        .update(apiKeys)
+        .set({
+          is_active: false,
+          deleted_at: new Date(),
+          inference_auth_revision: sql`${apiKeys.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(
+          inArray(
+            apiKeys.id,
+            existing.map((key) => key.id),
+          ),
+        )
+        .returning();
+      await applyAuthorizationStateGroups(
+        restricted.map((key) => ({
+          organizationId: key.organization_id,
+          state: apiKeyAuthorizationState(key),
+        })),
+      );
+      await tx.delete(apiKeys).where(
+        inArray(
+          apiKeys.id,
+          restricted.map((key) => key.id),
+        ),
+      );
+      return restricted;
+    });
+    await this.invalidateCachesAfterAuthorization(deleted.map((key) => key.key_hash));
+    return deleted;
+  }
+
+  private async invalidateCachesAfterAuthorization(keyHashes: readonly string[]): Promise<void> {
+    for (const keyHash of new Set(keyHashes)) {
       try {
-        await this.invalidateCache(key.key_hash);
+        await this.invalidateCache(keyHash);
       } catch (error) {
-        logger.error(
-          "[ApiKeys] revokeForAgent: cache invalidation not confirmed for a DB-revoked key; " +
-            "stale entry bounded by TTL, provisioning continues",
-          {
-            agentSandboxId,
-            error: error instanceof Error ? error.message : String(error),
-          },
-        );
+        // error-policy:J7 the admission Durable Object already observes this
+        // credential transition; eviction only shortens stale-cache residency.
+        logger.warn("[ApiKeys] Post-authorization cache cleanup was not confirmed", {
+          keyHashPrefix: keyHash.substring(0, 16),
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
   }

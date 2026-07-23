@@ -32,6 +32,32 @@ import { usersService } from "../users";
 // Cache key for character data (longer TTL since characters rarely change)
 const characterCacheKey = (id: string) => `character:data:${id}`;
 const CHARACTER_CACHE_TTL = CacheTTL.agent.characterData; // 1 hour
+const characterHydrations = new Map<string, Promise<void>>();
+const characterHydrationGeneration = new Map<string, number>();
+
+export interface CharacterCacheExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+export type InferenceCharacterCacheResolution =
+  | { kind: "ready"; character: UserCharacter }
+  | {
+      kind: "warming" | "unavailable";
+      cacheRead: "miss" | "invalid" | "unavailable" | "error";
+    };
+
+function isCachedCharacter(value: unknown, expectedId: string): value is UserCharacter {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<UserCharacter>;
+  return (
+    candidate.id === expectedId &&
+    typeof candidate.user_id === "string" &&
+    typeof candidate.organization_id === "string" &&
+    typeof candidate.is_public === "boolean" &&
+    typeof candidate.mcp_enabled === "boolean" &&
+    typeof candidate.a2a_enabled === "boolean"
+  );
+}
 
 /**
  * PERF: In-memory cache for character data (60s TTL).
@@ -66,18 +92,75 @@ export class CharactersService {
       return structuredClone(cached);
     }
 
-    // Fetch from database
-    const character = await userCharactersRepository.findById(id);
+    return await this.loadAndCacheById(id);
+  }
 
-    // Cache for future requests (Redis: 1 hour, in-memory: 60s)
-    if (character) {
-      await cache.set(cacheKey, character, CHARACTER_CACHE_TTL);
-      inMemoryCharCache.set(id, character);
-      logger.debug(`[Characters] Cache MISS, cached: ${id}`);
-      return structuredClone(character);
+  private async loadAndCacheById(id: string): Promise<UserCharacter | undefined> {
+    const generation = characterHydrationGeneration.get(id) ?? 0;
+    const character = await userCharactersRepository.findById(id);
+    if ((characterHydrationGeneration.get(id) ?? 0) !== generation) {
+      return character ? structuredClone(character) : undefined;
+    }
+    if (!character) return undefined;
+
+    await cache.set(characterCacheKey(id), character, CHARACTER_CACHE_TTL);
+    inMemoryCharCache.set(id, character);
+    logger.debug(`[Characters] Cache MISS, cached: ${id}`);
+    return structuredClone(character);
+  }
+
+  private scheduleInferenceHydration(
+    id: string,
+    executionCtx: CharacterCacheExecutionContext,
+  ): void {
+    let hydration = characterHydrations.get(id);
+    if (!hydration) {
+      hydration = this.loadAndCacheById(id)
+        .then(() => undefined)
+        .catch((error) => {
+          // error-policy:J7 the inference request already returned a retryable
+          // warming response; retain the authoritative fill and expose failures.
+          logger.warn("[Characters] Background inference character hydration failed", {
+            characterId: id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .finally(() => {
+          characterHydrations.delete(id);
+        });
+      characterHydrations.set(id, hydration);
+    }
+    executionCtx.waitUntil(hydration);
+  }
+
+  /**
+   * Resolve public-agent metadata without allowing a cache miss to join the
+   * inference request promise. The authoritative database fill is retained by
+   * the Worker and the caller receives a retryable warming outcome.
+   */
+  async getByIdCacheOnly(
+    id: string,
+    options: { executionCtx?: CharacterCacheExecutionContext } = {},
+  ): Promise<InferenceCharacterCacheResolution> {
+    const local = inMemoryCharCache.get(id);
+    if (local && isCachedCharacter(local, id)) {
+      return { kind: "ready", character: structuredClone(local) };
     }
 
-    return character;
+    const outcome = await cache.getWithOutcome<unknown>(characterCacheKey(id));
+    if (outcome.kind === "hit" && isCachedCharacter(outcome.value, id)) {
+      inMemoryCharCache.set(id, outcome.value);
+      return { kind: "ready", character: structuredClone(outcome.value) };
+    }
+
+    const cacheRead = outcome.kind === "hit" ? ("invalid" as const) : outcome.kind;
+    if (options.executionCtx) {
+      this.scheduleInferenceHydration(id, options.executionCtx);
+    }
+    return {
+      kind: cacheRead === "unavailable" || cacheRead === "error" ? "unavailable" : "warming",
+      cacheRead,
+    };
   }
 
   /**
@@ -85,6 +168,7 @@ export class CharactersService {
    * CRITICAL: This now also invalidates the in-memory runtime cache
    */
   async invalidateCache(id: string): Promise<void> {
+    characterHydrationGeneration.set(id, (characterHydrationGeneration.get(id) ?? 0) + 1);
     inMemoryCharCache.delete(id);
     // Import dynamically to avoid circular dependency
     const { invalidateCharacterCache } = await import("../../cache/character-cache");

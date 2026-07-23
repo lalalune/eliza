@@ -70,7 +70,7 @@ let closeDb:
   | typeof import("../../../../shared/src/db/client").closeDatabaseConnectionsForTests
   | undefined;
 let cliAuthSessionsRepository: typeof import("../../../../shared/src/db/repositories/cli-auth-sessions").cliAuthSessionsRepository;
-let apiKeysRepository: typeof import("../../../../shared/src/db/repositories/api-keys").apiKeysRepository;
+let apiKeysService: typeof import("../../../../shared/src/lib/services/api-keys").apiKeysService;
 let cliAuthSessionsService: typeof import("../../../../shared/src/lib/services/cli-auth-sessions").cliAuthSessionsService;
 let pollApp: Hono;
 let legacyPollApp: Hono;
@@ -98,9 +98,7 @@ beforeAll(async () => {
   ({ cliAuthSessionsRepository } = await import(
     "../../../../shared/src/db/repositories/cli-auth-sessions"
   ));
-  ({ apiKeysRepository } = await import(
-    "../../../../shared/src/db/repositories/api-keys"
-  ));
+  ({ apiKeysService } = await import("../../../../shared/src/lib/services/api-keys"));
   ({ cliAuthSessionsService } = await import(
     "../../../../shared/src/lib/services/cli-auth-sessions"
   ));
@@ -362,7 +360,7 @@ describe("CLI session single-use plaintext retrieval with real persistence", () 
       `/api/auth/cli-session/${sessionId}`,
     );
     await within(decryptStarted, "regeneration rendezvous");
-    await apiKeysRepository.update(API_KEY_ID, {
+    await apiKeysService.update(API_KEY_ID, {
       key_hash: "regenerated-hash",
       key_prefix: "eliza_regenerated",
       key_ciphertext: "regenerated-ciphertext",

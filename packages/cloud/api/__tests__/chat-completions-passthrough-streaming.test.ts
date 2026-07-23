@@ -291,9 +291,9 @@ function callStreaming(
     "cerebras" as never,
     (options.pooledCredential ?? null) as never,
     false,
+    options.markProviderDispatched ?? (async () => undefined),
     options.executionCtx,
     options.providerDispatchTelemetry,
-    options.markProviderDispatched,
   );
 }
 
@@ -334,6 +334,7 @@ function callNonStreaming(
     "cerebras" as never,
     null,
     false,
+    async () => undefined,
     undefined,
   );
 }

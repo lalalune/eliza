@@ -63,13 +63,14 @@ export const CacheKeys = {
    * cache uses) so revoke/ban invalidation by `key_hash` is exact.
    */
   inference: {
-    authContext: (fullKeyHash: string) => `iac:auth:${fullKeyHash}:v1`,
+    authContext: (fullKeyHash: string) => `iac:auth:${fullKeyHash}:v2`,
     /**
      * Fully-authorized Steward session identity, keyed by a one-way hash of the
-     * verified Steward subject. The subject—not the token—is stable across
-     * refreshes and gives account/org lifecycle mutations one exact key to evict.
+     * complete signed token. Each refreshed credential has an immutable cache
+     * identity; bounded per-user not-before state provides exact revocation.
      */
-    sessionAuthContext: (stewardSubjectHash: string) => `iac:session-auth:${stewardSubjectHash}:v1`,
+    sessionAuthContext: (credentialFingerprint: string) =>
+      `iac:session-auth:${credentialFingerprint}:v2`,
     /** Org credit-balance snapshot used only as the optimistic fast-path gate hint. */
     orgBalance: (orgId: string) => `iac:org-balance:${orgId}:v1`,
     /** Durable pending-charge for Tier-2 optimistic billing; swept by cron backstop. */
@@ -302,18 +303,13 @@ export const CacheTTL = {
   },
   /**
    * Inference hot-path TTLs (#9899). The IAC entry caches a fully-authorized
-   * auth+moderation decision. Its PRIMARY freshness mechanism is explicit
-   * confirmed-delete invalidation on every credential mutation — revoke/update
-   * (api-keys), ban (users), org deactivate (organizations) — all fail-closed
-   * (#13417), so the TTL is only the backstop for an invalidation that was
-   * never issued. At 60s every chat pause longer than a minute paid the full
-   * cold auth rebuild (~1.7s measured on prod, the dominant term of the
-   * 3-5.5s first-message-after-idle spike); 300s keeps active conversations
-   * warm across natural gaps while bounding a lost-invalidation window to the
-   * same 5 minutes org.data already accepts.
+   * auth+moderation decision. Revocation is enforced by monotonic state in the
+   * per-organization admission object at provider dispatch; deletion only
+   * reduces stale-cache retries. Five minutes keeps active conversations warm
+   * across natural gaps while limiting obsolete projection storage.
    */
   inference: {
-    authContext: 300, // 5 min - backstop only; revoke paths invalidate explicitly (fail-closed)
+    authContext: 300, // 5 min - projection lifetime; the dispatch boundary owns revocation
     orgBalance: 15, // 15 seconds - FRESHNESS window: getGateBalanceUsd serves a hint older than this stale-while-revalidate (background refresh) instead of blocking on an authoritative read
     orgBalanceStale: 300, // 5 min - PHYSICAL KV lifetime so a stale hint can be served + background-refreshed; over-admit stays bounded by the debit settler's lowerOrgBalanceHint + top-up invalidate, exactly as before
     pendingCharge: 3600, // 60 min - sweep window = TTL - grace(20m) = 40m, survives cron hiccups

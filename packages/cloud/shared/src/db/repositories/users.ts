@@ -80,7 +80,8 @@ export class UsersRepository {
       return undefined;
     }
 
-    return await this.findUserWithOrganizationById(dbWrite, identityUserId);
+    const projected = await this.findUserWithOrganizationById(dbWrite, identityUserId);
+    return projected?.steward_user_id === stewardUserId ? projected : undefined;
   }
 
   /**
@@ -88,6 +89,14 @@ export class UsersRepository {
    */
   async findWithOrganization(userId: string): Promise<UserWithOrganization | undefined> {
     return await this.findUserWithOrganizationById(dbRead, userId);
+  }
+
+  /**
+   * Reads authorization state from the primary before publishing a positive
+   * cache entry. Replica lag must never resurrect a revoked identity.
+   */
+  async findWithOrganizationForWrite(userId: string): Promise<UserWithOrganization | undefined> {
+    return await this.findUserWithOrganizationById(dbWrite, userId);
   }
 
   /**
@@ -335,6 +344,20 @@ export class UsersRepository {
    * Updates an existing user.
    */
   async update(id: string, data: Partial<NewUser>): Promise<User | undefined> {
+    for (const field of [
+      "is_active",
+      "organization_id",
+      "deleted_at",
+      "steward_user_id",
+      "inference_auth_revision",
+      "inference_session_not_before",
+    ] as const) {
+      if (Object.hasOwn(data, field)) {
+        throw new Error(
+          `Authorization-sensitive user field ${field} must be updated through UsersService`,
+        );
+      }
+    }
     const [updated] = await dbWrite
       .update(users)
       .set({
@@ -342,21 +365,6 @@ export class UsersRepository {
         updated_at: new Date(),
       })
       .where(eq(users.id, id))
-      .returning();
-    return updated;
-  }
-
-  /**
-   * Links a Steward user ID to an existing user.
-   */
-  async linkStewardId(userId: string, stewardUserId: string): Promise<User | undefined> {
-    const [updated] = await dbWrite
-      .update(users)
-      .set({
-        steward_user_id: stewardUserId,
-        updated_at: new Date(),
-      })
-      .where(eq(users.id, userId))
       .returning();
     return updated;
   }
@@ -430,7 +438,10 @@ export class UsersRepository {
     const identityUserId = await this.findIdentityUserIdByStewardId(database, stewardUserId);
 
     if (identityUserId) {
-      return await this.findUserWithOrganizationById(database, identityUserId);
+      const projected = await this.findUserWithOrganizationById(database, identityUserId);
+      if (projected?.steward_user_id === stewardUserId) {
+        return projected;
+      }
     }
 
     return await this.findUserWithOrganizationByStewardId(database, stewardUserId);
@@ -654,12 +665,6 @@ export class UsersRepository {
     return identity;
   }
 
-  /**
-   * Deletes a user by ID.
-   */
-  async delete(id: string): Promise<void> {
-    await dbWrite.delete(users).where(eq(users.id, id));
-  }
 }
 
 /**

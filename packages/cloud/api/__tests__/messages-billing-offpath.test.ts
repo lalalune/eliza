@@ -54,6 +54,21 @@ import { createCreditReservationSettler } from "@/lib/utils/credit-reservation";
 const ORG = "00000000-0000-4000-8000-0000000000aa";
 const USER = "00000000-0000-4000-8000-0000000000bb";
 const API_KEY_ID = "00000000-0000-4000-8000-0000000000cc";
+const KEY_HASH = "a".repeat(64);
+const INFERENCE_AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: ORG,
+  organizationRevision: "1",
+  userId: USER,
+  userRevision: "1",
+  credential: {
+    kind: "api_key" as const,
+    id: API_KEY_ID,
+    fingerprint: KEY_HASH,
+    revision: "1",
+    expiresAt: null,
+  },
+};
 
 // --- mock the AI SDK boundary we drive ---------------------------------------
 let streamTextImpl: ((config: Record<string, unknown>) => unknown) | null =
@@ -86,12 +101,13 @@ const resolveInferenceAuthContext = mock(
   async (): Promise<InferenceAuthResolution> => ({
     kind: "authorized",
     ctx: {
-      v: 1,
+      v: 2,
       cachedAt: 0,
       userId: USER,
       orgId: ORG,
       apiKeyId: API_KEY_ID,
-      keyHash: "messages-billing-test-key",
+      keyHash: KEY_HASH,
+      authorization: INFERENCE_AUTHORIZATION,
     },
     source: "cache",
   }),
@@ -280,6 +296,7 @@ function callStreaming(
     undefined,
     "gateway" as never,
     "req-test-offpath",
+    async () => undefined,
     options.executionCtx,
     options.providerDispatchTelemetry,
   );
@@ -317,6 +334,7 @@ function callNonStreaming(
     "gateway" as never,
     "req-test-offpath",
     options.executionCtx,
+    async () => undefined,
     options.providerDispatchTelemetry,
   );
 }
@@ -336,12 +354,13 @@ beforeEach(() => {
   resolveInferenceAuthContext.mockResolvedValue({
     kind: "authorized",
     ctx: {
-      v: 1,
+      v: 2,
       cachedAt: 0,
       userId: USER,
       orgId: ORG,
       apiKeyId: API_KEY_ID,
-      keyHash: "messages-billing-test-key",
+      keyHash: KEY_HASH,
+      authorization: INFERENCE_AUTHORIZATION,
     },
     source: "cache",
   });

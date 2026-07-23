@@ -87,6 +87,7 @@ import type {
   CreditReservation,
 } from "@/lib/services/credits";
 import { resolveInferenceAuthContext } from "@/lib/services/inference-auth-context";
+import type { InferenceAuthorizationProof } from "@/lib/services/inference-authorization-boundary";
 import { InferenceBalanceCacheWarmingError } from "@/lib/services/inference-billing-fast-path";
 import {
   isKnownPreDispatchProviderConfigurationError,
@@ -593,11 +594,14 @@ app.post("/", async (c) => {
   let settleUnknownReservation:
     | (() => Promise<CreditReconciliationResult | null>)
     | null = null;
-  let markProviderDispatched: (() => Promise<void>) | undefined;
+  // Non-Worker compatibility reserves synchronously and has no DO transition;
+  // Worker admission always replaces this before provider code is reachable.
+  let markProviderDispatched: () => Promise<void> = () => Promise.resolve();
   let billingReservation: CreditReservation | undefined;
 
   let user: { id: string; organization_id: string };
   let apiKey: { id: string } | null = null;
+  let inferenceAuthorization: InferenceAuthorizationProof | undefined;
   // Collapse auth + org + suspension into one cache decision for API-key and
   // Steward-session inference. Cold Workers schedule authoritative hydration
   // and return a retryable response; wallet proofs stay on the non-Worker path
@@ -638,6 +642,7 @@ app.post("/", async (c) => {
         organization_id: resolution.ctx.orgId,
       };
       apiKey = resolution.ctx.apiKeyId ? { id: resolution.ctx.apiKeyId } : null;
+      inferenceAuthorization = resolution.ctx.authorization;
       // The resolver already verified not-suspended (cache hit = at populate;
       // origin miss = just now), so the synchronous moderation read is skipped.
       moderationAlreadyChecked = true;
@@ -888,6 +893,7 @@ app.post("/", async (c) => {
           provider,
           billingSource,
           affiliateCode,
+          authorization: inferenceAuthorization,
           executionCtx,
         });
         settleReservation = admission.settle;
@@ -953,6 +959,7 @@ app.post("/", async (c) => {
         estimatedOutputTokens,
         apiKeyId: apiKey?.id,
         affiliateCode,
+        authorization: inferenceAuthorization,
         executionCtx,
       });
       settleReservation = admission.settle;
@@ -1052,9 +1059,9 @@ app.post("/", async (c) => {
           billingReservation,
           billingSource,
           requestId,
+          markProviderDispatched,
           executionCtx,
           gatewayHandoffTelemetry,
-          markProviderDispatched,
         )
       : await handleNonStream(
           model,
@@ -1076,8 +1083,8 @@ app.post("/", async (c) => {
           billingSource,
           requestId,
           executionCtx,
-          gatewayHandoffTelemetry,
           markProviderDispatched,
+          gatewayHandoffTelemetry,
         );
     if (!preforwardTiming) {
       throw new Error("[Messages API] gateway handoff timing was not captured");
@@ -1164,8 +1171,8 @@ async function handleNonStream(
   // affiliate earnings. Mirrors chat/completions (#11588).
   requestId: string,
   executionCtx: { waitUntil(promise: Promise<unknown>): void } | undefined,
+  markProviderDispatched: () => Promise<void>,
   gatewayHandoffTelemetry?: GatewayHandoffTelemetry,
-  markProviderDispatched?: () => Promise<void>,
 ) {
   const provider = getProviderFromModel(model);
   let providerInvocationStarted = false;
@@ -1187,7 +1194,7 @@ async function handleNonStream(
       gatewayHandoffTelemetry,
       (options: Parameters<typeof generateText>[0]) => generateText(options),
     );
-    await markProviderDispatched?.();
+    await markProviderDispatched();
     providerInvocationStarted = true;
     const result = await invokeGenerateText({
       model: languageModel,
@@ -1554,9 +1561,9 @@ async function handleStream(
   // it billUsage falls back to legacy_<uuid> and a retry double-accrues cashable
   // affiliate earnings. Mirrors chat/completions (#11588).
   requestId: string,
+  markProviderDispatched: () => Promise<void>,
   executionCtx?: { waitUntil(promise: Promise<unknown>): void },
   gatewayHandoffTelemetry?: GatewayHandoffTelemetry,
-  markProviderDispatched?: () => Promise<void>,
 ) {
   const provider = getProviderFromModel(model);
   const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
@@ -1631,7 +1638,7 @@ async function handleStream(
     gatewayHandoffTelemetry,
     (options: Parameters<typeof streamText>[0]) => streamText(options),
   );
-  await markProviderDispatched?.();
+  await markProviderDispatched();
   const result = invokeStreamText({
     model: languageModel,
     system: systemPrompt,

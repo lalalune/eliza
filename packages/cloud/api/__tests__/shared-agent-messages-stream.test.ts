@@ -77,6 +77,20 @@ const AGENT = "de42b5ff-72d3-4a1a-8a16-19aee293bfea";
 const ORG = "org-1";
 const VOICE_USER = "user-voice";
 const VOICE_CONVERSATION = "conv-voice-service";
+const VOICE_AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: ORG,
+  organizationRevision: "0",
+  userId: VOICE_USER,
+  userRevision: "0",
+  credential: {
+    kind: "api_key" as const,
+    id: "voice-key",
+    fingerprint: "a".repeat(64),
+    revision: "0",
+    expiresAt: null,
+  },
+};
 const voiceServiceApp = new Hono();
 voiceServiceApp.route(
   "/api/v1/eliza/agents/:agentId/api/conversations/:conversationId/messages/stream",
@@ -140,10 +154,6 @@ function postVoiceServiceStream(body: unknown) {
     headers: {
       Authorization: "Bearer voice-service",
       "Content-Type": "application/json",
-      "X-Eliza-Agent-Id": AGENT,
-      "X-Eliza-Conversation-Id": VOICE_CONVERSATION,
-      "X-Eliza-Organization-Id": ORG,
-      "X-Eliza-User-Id": "user-voice",
     },
     body: JSON.stringify(body),
   });
@@ -186,6 +196,7 @@ describe("shared agent messages/stream", () => {
       agentId: AGENT,
       orgId: ORG,
       agentName: "Eliza",
+      authorization: VOICE_AUTHORIZATION,
     });
   });
 
@@ -223,10 +234,6 @@ describe("shared agent messages/stream", () => {
       headers: {
         Authorization: "Bearer voice-service",
         "Content-Type": "application/json",
-        "X-Eliza-Agent-Id": AGENT,
-        "X-Eliza-Conversation-Id": VOICE_CONVERSATION,
-        "X-Eliza-Organization-Id": ORG,
-        "X-Eliza-User-Id": VOICE_USER,
       },
       body: JSON.stringify({ text }),
     } satisfies RequestInit;
@@ -332,37 +339,22 @@ describe("shared agent messages/stream", () => {
     expect(bridgeStream).not.toHaveBeenCalled();
   });
 
-  test("voice service credential uses cached identity and the requested conversation", async () => {
-    await seedVoiceScope();
-    coordinatorFetch.mockResolvedValue(
-      new Response('event: chunk\ndata: {"chunk":"voice ok"}\n\n', {
-        headers: { "Content-Type": "text/event-stream" },
-      }),
-    );
+  test("static voice service credential cannot bypass the shared authorization resolver", async () => {
+    resolveSharedAgent.mockResolvedValue({
+      error: "Unauthorized",
+      status: 401,
+    });
 
     const res = await postVoiceServiceStream({ text: "voice transcript" });
 
-    expect(res.status).toBe(200);
-    await expect(res.text()).resolves.toContain("voice ok");
-    expect(resolveSharedAgent).not.toHaveBeenCalled();
-    expect(findByIdAndOrg).not.toHaveBeenCalled();
-    expect(bridgeStream).not.toHaveBeenCalled();
-    const envelope = JSON.parse(
-      String(coordinatorFetch.mock.calls[0]?.[1]?.body),
-    ) as Record<string, unknown>;
-    expect(envelope).toMatchObject({
-      operation: "stream",
-      rpc: {
-        jsonrpc: "2.0",
-        method: "message.send",
-        params: {
-          text: "voice transcript",
-          roomId: "conv-voice-service",
-          userId: "user-voice",
-          source: "voice",
-        },
-      },
+    expect(res.status).toBe(401);
+    expect(resolveSharedAgent).toHaveBeenCalledTimes(1);
+    expect(resolveSharedAgent.mock.calls[0]?.[1]).toMatchObject({
+      cacheOnly: true,
     });
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
+    expect(coordinatorFetch).not.toHaveBeenCalled();
+    expect(bridgeStream).not.toHaveBeenCalled();
   });
 
   test("internal voice fetch adapter dispatches cached scope through the conversation Durable Object", async () => {
@@ -381,6 +373,7 @@ describe("shared agent messages/stream", () => {
         conversationId: VOICE_CONVERSATION,
         organizationId: ORG,
         userId: VOICE_USER,
+        authorization: VOICE_AUTHORIZATION,
       },
       runtime.executionCtx,
     );
@@ -404,6 +397,7 @@ describe("shared agent messages/stream", () => {
     expect(operation).toMatchObject({
       operation: "stream",
       agent: cachedVoiceAgent(),
+      authorization: VOICE_AUTHORIZATION,
       rpc: {
         method: "message.send",
         params: {
@@ -461,6 +455,7 @@ describe("shared agent messages/stream", () => {
       conversationId: VOICE_CONVERSATION,
       organizationId: ORG,
       userId: VOICE_USER,
+      authorization: VOICE_AUTHORIZATION,
     });
     await fetchImpl.prewarm();
     expect(findByIdAndOrg).not.toHaveBeenCalled();
@@ -508,6 +503,7 @@ describe("shared agent messages/stream", () => {
       conversationId: VOICE_CONVERSATION,
       organizationId: ORG,
       userId: VOICE_USER,
+      authorization: VOICE_AUTHORIZATION,
     });
     await fetchImpl.prewarm();
     expect(runtime.background).toHaveLength(1);
@@ -541,152 +537,68 @@ describe("shared agent messages/stream", () => {
   });
 
   test("internal voice fetch adapter rejects mismatched verified scope before persistence", async () => {
-    findByIdAndOrg.mockResolvedValue({
-      id: AGENT,
-      organization_id: ORG,
-      user_id: "user-voice",
-      agent_name: "Voice Agent",
-    });
-
-    const fetchImpl = createInternalElizaConversationFetch(
-      {
-        VOICE_REALTIME_ELIZA_AUTHORIZATION: "Bearer voice-service",
-      } as Parameters<typeof createInternalElizaConversationFetch>[0],
-      {
-        agentId: AGENT,
-        conversationId: VOICE_CONVERSATION,
-        organizationId: ORG,
-        userId: "user-voice",
-      },
-    );
-
-    const res = await fetchImpl(
-      `https://api-staging.elizacloud.ai/api/v1/eliza/agents/${AGENT}/api/conversations/${VOICE_CONVERSATION}/messages/stream`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer voice-service",
-          "Content-Type": "application/json",
-          "X-Service-Key": "Bearer voice-service",
-          "X-Eliza-Agent-Id": AGENT,
-          "X-Eliza-Conversation-Id": VOICE_CONVERSATION,
-          "X-Eliza-Organization-Id": ORG,
-          "X-Eliza-User-Id": "different-user",
+    expect(() =>
+      createInternalElizaConversationFetch(
+        {
+          VOICE_REALTIME_ELIZA_AUTHORIZATION: "Bearer voice-service",
+        } as Parameters<typeof createInternalElizaConversationFetch>[0],
+        {
+          agentId: AGENT,
+          conversationId: VOICE_CONVERSATION,
+          organizationId: ORG,
+          userId: VOICE_USER,
+          authorization: {
+            ...VOICE_AUTHORIZATION,
+            userId: "different-user",
+          },
         },
-        body: JSON.stringify({ text: "do not persist" }),
-      },
+      ),
+    ).toThrow(
+      "internal voice authorization proof does not match the verified session scope",
     );
-
-    expect(res.status).toBe(404);
-    expect(bridgeStream).not.toHaveBeenCalled();
-    await expect(res.json()).resolves.toEqual({
-      success: false,
-      error: "Agent not found",
-      code: "agent_not_found",
-    });
-  });
-
-  test("voice service credential rejects missing structural voice identity", async () => {
-    findByIdAndOrg.mockResolvedValue({
-      id: AGENT,
-      organization_id: ORG,
-      user_id: "user-voice",
-      agent_name: "Voice Agent",
-    });
-
-    const res = await requestVoiceServiceRoute({
-      method: "POST",
-      headers: {
-        Authorization: "Bearer voice-service",
-        "Content-Type": "application/json",
-        "X-Eliza-Organization-Id": ORG,
-        "X-Eliza-User-Id": "user-voice",
-      },
-      body: JSON.stringify({ text: "do not persist" }),
-    });
-
-    expect(res.status).toBe(404);
-    expect(resolveSharedAgent).not.toHaveBeenCalled();
-    expect(findByIdAndOrg).not.toHaveBeenCalled();
-    expect(bridgeStream).not.toHaveBeenCalled();
-  });
-
-  test("voice service credential rejects mismatched conversation identity", async () => {
-    findByIdAndOrg.mockResolvedValue({
-      id: AGENT,
-      organization_id: ORG,
-      user_id: "user-voice",
-      agent_name: "Voice Agent",
-    });
-
-    const res = await requestVoiceServiceRoute({
-      method: "POST",
-      headers: {
-        Authorization: "Bearer voice-service",
-        "Content-Type": "application/json",
-        "X-Eliza-Agent-Id": AGENT,
-        "X-Eliza-Conversation-Id": "wrong-conversation",
-        "X-Eliza-Organization-Id": ORG,
-        "X-Eliza-User-Id": "user-voice",
-      },
-      body: JSON.stringify({ text: "do not persist" }),
-    });
-
-    expect(res.status).toBe(404);
-    expect(resolveSharedAgent).not.toHaveBeenCalled();
-    expect(findByIdAndOrg).not.toHaveBeenCalled();
-    expect(bridgeStream).not.toHaveBeenCalled();
-  });
-
-  test("voice service credential rejects mismatched agent identity", async () => {
-    findByIdAndOrg.mockResolvedValue({
-      id: AGENT,
-      organization_id: ORG,
-      user_id: "user-voice",
-      agent_name: "Voice Agent",
-    });
-
-    const res = await requestVoiceServiceRoute({
-      method: "POST",
-      headers: {
-        Authorization: "Bearer voice-service",
-        "Content-Type": "application/json",
-        "X-Eliza-Agent-Id": "wrong-agent",
-        "X-Eliza-Conversation-Id": VOICE_CONVERSATION,
-        "X-Eliza-Organization-Id": ORG,
-        "X-Eliza-User-Id": "user-voice",
-      },
-      body: JSON.stringify({ text: "do not persist" }),
-    });
-
-    expect(res.status).toBe(404);
-    expect(resolveSharedAgent).not.toHaveBeenCalled();
-    expect(findByIdAndOrg).not.toHaveBeenCalled();
-    expect(bridgeStream).not.toHaveBeenCalled();
-  });
-
-  test("voice service credential rejects an agent outside the scoped user or org before persistence", async () => {
-    await cache.set(
-      CacheKeys.sharedAgentScope.voice(ORG, VOICE_USER, AGENT),
-      {
-        ...cachedVoiceAgent(),
-        user_id: "different-user",
-        agent_name: "Wrong Agent",
-      },
-      60,
-    );
-
-    const res = await postVoiceServiceStream({ text: "do not persist" });
-
-    expect(res.status).toBe(404);
-    expect(resolveSharedAgent).not.toHaveBeenCalled();
     expect(findByIdAndOrg).not.toHaveBeenCalled();
     expect(coordinatorFetch).not.toHaveBeenCalled();
     expect(bridgeStream).not.toHaveBeenCalled();
-    await expect(res.json()).resolves.toMatchObject({
-      success: false,
-      error: "Agent not found",
+  });
+
+  test("spoofed voice identity headers cannot override the cache-authorized resolver scope", async () => {
+    coordinatorFetch.mockResolvedValue(
+      new Response('event: chunk\ndata: {"chunk":"resolver scope"}\n\n', {
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+
+    const res = await requestVoiceServiceRoute({
+      method: "POST",
+      headers: {
+        Authorization: "Bearer voice-service",
+        "Content-Type": "application/json",
+        "X-Eliza-Agent-Id": "spoofed-agent",
+        "X-Eliza-Conversation-Id": "spoofed-conversation",
+        "X-Eliza-Organization-Id": "spoofed-org",
+        "X-Eliza-User-Id": "spoofed-user",
+      },
+      body: JSON.stringify({ text: "use resolver scope" }),
     });
+
+    expect(res.status).toBe(200);
+    await expect(res.text()).resolves.toContain("resolver scope");
+    expect(resolveSharedAgent).toHaveBeenCalledTimes(1);
+    const envelope = JSON.parse(
+      String(coordinatorFetch.mock.calls[0]?.[1]?.body),
+    ) as {
+      authorization?: unknown;
+      rpc: { params: Record<string, unknown> };
+    };
+    expect(envelope.authorization).toEqual(VOICE_AUTHORIZATION);
+    expect(envelope.rpc.params).toMatchObject({
+      text: "use resolver scope",
+      roomId: VOICE_CONVERSATION,
+    });
+    expect(envelope.rpc.params.userId).toBeUndefined();
+    expect(envelope.rpc.params.source).toBeUndefined();
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
+    expect(bridgeStream).not.toHaveBeenCalled();
   });
 
   test("forwards a multi-chunk body incrementally — the route never awaits/buffers res.body", async () => {

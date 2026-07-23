@@ -103,6 +103,10 @@ import {
   type InferenceAuthTelemetry,
   resolveInferenceAuthContext,
 } from "@/lib/services/inference-auth-context";
+import {
+  authorizeInferenceProviderDispatch,
+  type InferenceAuthorizationProof,
+} from "@/lib/services/inference-authorization-boundary";
 import { InferenceBalanceCacheWarmingError } from "@/lib/services/inference-billing-fast-path";
 import {
   isPassthroughStreamingEnabled,
@@ -1254,7 +1258,7 @@ export async function handleChatCompletionsPOST(
     | null = null;
   let settleUnknown: (() => Promise<CreditReconciliationResult | null>) | null =
     null;
-  let markProviderDispatched: (() => Promise<void>) | undefined;
+  let markProviderDispatched: () => Promise<void> = () => Promise.resolve();
   let billingReservation: CreditReservation | undefined;
   let providerDispatched = false;
   // Hoisted so the catch below can echo the requested model in the sanitized
@@ -1269,6 +1273,7 @@ export async function handleChatCompletionsPOST(
     // only non-Worker callers may join that hydration inline.
     let user: { id: string; organization_id: string };
     let apiKey: { id: string } | null;
+    let inferenceAuthorization: InferenceAuthorizationProof | undefined;
     let moderationAlreadyChecked = false;
 
     const resolution = await resolveInferenceAuthContext(req, {
@@ -1343,6 +1348,7 @@ export async function handleChatCompletionsPOST(
         organization_id: resolution.ctx.orgId,
       };
       apiKey = resolution.ctx.apiKeyId ? { id: resolution.ctx.apiKeyId } : null;
+      inferenceAuthorization = resolution.ctx.authorization;
       // The resolver already verified not-suspended (cache hit = at populate;
       // origin miss = just now), so the synchronous moderation read is skipped.
       moderationAlreadyChecked = true;
@@ -1712,6 +1718,11 @@ export async function handleChatCompletionsPOST(
       ) {
         settleReservation = async () => null;
         settleUnknown = async () => null;
+        markProviderDispatched = () =>
+          authorizeInferenceProviderDispatch({
+            organizationId: user.organization_id,
+            authorization: inferenceAuthorization,
+          });
       } else if (useAppCredits && appId && monetizedApp) {
         assertInferenceAppAffiliateSupported(appId, affiliateCode);
         const { totalCost } = await calculateCost(
@@ -1749,6 +1760,7 @@ export async function handleChatCompletionsPOST(
             provider,
             billingSource,
             affiliateCode,
+            authorization: inferenceAuthorization,
             executionCtx: options.executionCtx,
           });
           settleReservation = admission.settle;
@@ -1784,6 +1796,7 @@ export async function handleChatCompletionsPOST(
           estimatedOutputTokens,
           apiKeyId: apiKey?.id ?? null,
           affiliateCode,
+          authorization: inferenceAuthorization,
           executionCtx: options.executionCtx,
         });
         settleReservation = admission.settle;
@@ -1925,9 +1938,9 @@ export async function handleChatCompletionsPOST(
           billingSource,
           pooledCredential,
           useMonetizedAppBilling,
+          markProviderDispatched,
           options.executionCtx,
           gatewayHandoffTelemetry,
-          markProviderDispatched,
         )
       : await handleNonStreamingRequest(
           model,
@@ -1952,9 +1965,9 @@ export async function handleChatCompletionsPOST(
           billingSource,
           pooledCredential,
           useMonetizedAppBilling,
+          markProviderDispatched,
           options.executionCtx,
           gatewayHandoffTelemetry,
-          markProviderDispatched,
         );
     if (!preforwardTiming) {
       throw new Error(
@@ -2350,7 +2363,7 @@ async function tryPassthroughStreamingRequest(params: {
     actualCost: number,
   ) => Promise<CreditReconciliationResult | null>;
   settleUnknown: () => Promise<CreditReconciliationResult | null>;
-  markProviderDispatched?: () => Promise<void>;
+  markProviderDispatched: () => Promise<void>;
   billingReservation?: CreditReservation;
   effectiveMaxTokens: number | undefined;
   billingSource: PricingBillingSource;
@@ -2430,7 +2443,7 @@ async function tryPassthroughStreamingRequest(params: {
     ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
   };
   try {
-    await params.markProviderDispatched?.();
+    await params.markProviderDispatched();
     upstreamResponse = await invokeAtGatewayHandoff(
       params.gatewayHandoffTelemetry,
       () => fetch(upstream.url, upstreamInit),
@@ -2698,9 +2711,9 @@ async function handleStreamingRequest(
   billingSource: PricingBillingSource,
   pooledCredential: PooledInferenceCredential | null,
   useMonetizedAppBilling: boolean,
+  markProviderDispatched: () => Promise<void>,
   executionCtx?: { waitUntil(promise: Promise<unknown>): void },
   gatewayHandoffTelemetry?: GatewayHandoffTelemetry,
-  markProviderDispatched?: () => Promise<void>,
 ) {
   // #15428 pass-through fast path: qualifying plain streamed chat against a
   // direct OpenAI-compatible upstream pipes the provider bytes straight
@@ -2829,7 +2842,7 @@ async function handleStreamingRequest(
     gatewayHandoffTelemetry,
     (options: Parameters<typeof streamText>[0]) => streamText(options),
   );
-  await markProviderDispatched?.();
+  await markProviderDispatched();
   const result = invokeStreamText({
     model: languageModel,
     system: systemPrompt,
@@ -3354,9 +3367,9 @@ async function handleNonStreamingRequest(
   billingSource: PricingBillingSource,
   pooledCredential: PooledInferenceCredential | null,
   useMonetizedAppBilling: boolean,
+  markProviderDispatched: () => Promise<void>,
   executionCtx: { waitUntil(promise: Promise<unknown>): void } | undefined,
   gatewayHandoffTelemetry?: GatewayHandoffTelemetry,
-  markProviderDispatched?: () => Promise<void>,
 ) {
   const provider = getProviderFromModel(model);
   const tools = convertTools(request.tools);
@@ -3400,7 +3413,7 @@ async function handleNonStreamingRequest(
       gatewayHandoffTelemetry,
       (options: Parameters<typeof generateText>[0]) => generateText(options),
     );
-    await markProviderDispatched?.();
+    await markProviderDispatched();
     providerInvocationStarted = true;
     const result = await invokeGenerateText({
       model: languageModel,

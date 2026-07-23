@@ -1,10 +1,16 @@
-// Coordinates cloud service agent gateway router behavior behind route handlers.
+/**
+ * Resolves connector identities to one owned Eliza runtime and dispatches the
+ * resulting message. Strong-auth Worker requests serve target decisions from a
+ * bounded shared cache; cold authoritative lookups run under waitUntil so a
+ * connector turn never reaches Postgres before paid-provider dispatch.
+ */
 import { createHash, randomUUID } from "crypto";
 import { and, desc, eq } from "drizzle-orm";
 import { dbWrite } from "../../db/client";
 import { type AgentSandbox, agentSandboxesRepository } from "../../db/repositories/agent-sandboxes";
 import { usersRepository } from "../../db/repositories/users";
 import { agentPhoneContacts, agentPhoneNumbers, phoneMessageLog } from "../../db/schemas";
+import { cache } from "../cache/client";
 import { logger } from "../utils/logger";
 import { normalizePhoneNumber } from "../utils/phone-normalization";
 import { type AgentGatewayRelaySession, agentGatewayRelayService } from "./agent-gateway-relay";
@@ -13,8 +19,13 @@ import {
   readManagedAgentDiscordGateway,
 } from "./eliza-agent-config";
 import { runOnboardingChat } from "./eliza-app/onboarding-chat";
-import type { BridgeRequest, BridgeResponse } from "./eliza-sandbox";
-import { elizaSandboxService } from "./eliza-sandbox";
+import type { BridgeExecutionContext, BridgeRequest, BridgeResponse } from "./eliza-sandbox";
+import { BRIDGE_CACHE_WARMING_CODE, elizaSandboxService } from "./eliza-sandbox";
+import { isInferenceAuthCacheEnabled } from "./inference-hot-path-caches";
+import {
+  type CachedAgentSandbox,
+  rehydrateCachedAgentDates,
+} from "./shared-runtime/cached-agent-dates";
 
 export type AgentGatewayRouteReason =
   | "not_linked"
@@ -23,6 +34,7 @@ export type AgentGatewayRouteReason =
   | "sender_not_guild_owner"
   | "owner_agent_not_running"
   | "ambiguous_target"
+  | "target_cache_warming"
   | "bridge_failed";
 
 export interface AgentGatewaySender {
@@ -40,6 +52,7 @@ export interface AgentGatewayRouteResult {
   organizationId?: string;
   userId?: string;
   roomId?: string;
+  retryable?: boolean;
 }
 
 interface ResolvedAgentTarget {
@@ -56,9 +69,94 @@ type PhoneTargetResolution = {
   userId?: string;
   organizationId?: string;
   source?: "owner" | "contact";
+  retryable?: boolean;
 };
 
 const PHONE_TARGET_CACHE_TTL_MS = 5_000;
+const CONNECTOR_TARGET_FRESH_MS = 30_000;
+const CONNECTOR_TARGET_PHYSICAL_TTL_SECONDS = 5 * 60;
+const CONNECTOR_TARGET_REFRESH_TTL_SECONDS = 60;
+
+interface CachedResolvedAgentTarget {
+  kind: ResolvedAgentTarget["kind"];
+  sandbox?: CachedAgentSandbox;
+  session?: AgentGatewayRelaySession;
+  sessions?: AgentGatewayRelaySession[];
+}
+
+interface CachedConnectorTargetResolution extends Omit<PhoneTargetResolution, "target"> {
+  target?: CachedResolvedAgentTarget;
+  hydratedAtMs: number;
+}
+
+function connectorTargetCacheKey(parts: readonly string[]): string {
+  const fingerprint = createHash("sha256").update(parts.join("\u0000")).digest("hex");
+  return `agent-gateway-target:${fingerprint}:v1`;
+}
+
+function cacheConnectorTargetResolution(
+  resolution: PhoneTargetResolution,
+): CachedConnectorTargetResolution {
+  return {
+    ...resolution,
+    ...(resolution.target
+      ? {
+          target: {
+            kind: resolution.target.kind,
+            ...(resolution.target.sandbox ? { sandbox: resolution.target.sandbox } : {}),
+            ...(resolution.target.session ? { session: resolution.target.session } : {}),
+            ...(resolution.target.sessions ? { sessions: resolution.target.sessions } : {}),
+          },
+        }
+      : {}),
+    hydratedAtMs: Date.now(),
+  };
+}
+
+function restoreConnectorTargetResolution(
+  cached: CachedConnectorTargetResolution,
+): PhoneTargetResolution | null {
+  if (
+    !cached ||
+    typeof cached !== "object" ||
+    typeof cached.hydratedAtMs !== "number" ||
+    !Number.isFinite(cached.hydratedAtMs)
+  ) {
+    return null;
+  }
+  try {
+    const { target, hydratedAtMs: _hydratedAtMs, ...resolution } = cached;
+    return {
+      ...resolution,
+      ...(target
+        ? {
+            target: {
+              kind: target.kind,
+              ...(target.sandbox
+                ? {
+                    sandbox: rehydrateCachedAgentDates(target.sandbox),
+                  }
+                : {}),
+              ...(target.session ? { session: target.session } : {}),
+              ...(target.sessions ? { sessions: target.sessions } : {}),
+            },
+          }
+        : {}),
+    };
+  } catch (error) {
+    logger.warn("[AgentGatewayRouter] Invalid cached connector target", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function targetCacheWarming(): PhoneTargetResolution {
+  return {
+    reason: "target_cache_warming",
+    retryable: true,
+  };
+}
 
 function isUndefinedAgentPhoneContactsTableError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -197,6 +295,103 @@ export class AgentGatewayRouterService {
 
   constructor(options: { runOnboardingChat?: typeof runOnboardingChat } = {}) {
     this.runOnboardingChat = options.runOnboardingChat ?? runOnboardingChat;
+  }
+
+  private scheduleConnectorTargetHydration(
+    cacheKey: string,
+    executionCtx: BridgeExecutionContext | undefined,
+    hydrate: () => Promise<PhoneTargetResolution>,
+  ): void {
+    if (!executionCtx) return;
+    const refreshWindow = Math.floor(Date.now() / CONNECTOR_TARGET_FRESH_MS);
+    const refreshKey = `${cacheKey}:refresh:${refreshWindow}`;
+    const hydration = cache
+      .getOrSet(
+        refreshKey,
+        CONNECTOR_TARGET_REFRESH_TTL_SECONDS,
+        async () => {
+          const resolved = cacheConnectorTargetResolution(await hydrate());
+          await cache.set(cacheKey, resolved, CONNECTOR_TARGET_PHYSICAL_TTL_SECONDS);
+          return { hydratedAtMs: resolved.hydratedAtMs };
+        },
+        { singleflight: true },
+      )
+      .then(() => undefined)
+      .catch((error) => {
+        // error-policy:J7 the cold request already returned an explicit
+        // retryable result; diagnostics record why its background fill failed.
+        logger.warn("[AgentGatewayRouter] Connector target hydration failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    executionCtx.waitUntil(hydration);
+  }
+
+  private async resolveConnectorTarget(
+    identity: readonly string[],
+    executionCtx: BridgeExecutionContext | undefined,
+    hydrate: () => Promise<PhoneTargetResolution>,
+  ): Promise<PhoneTargetResolution> {
+    if (!isInferenceAuthCacheEnabled()) {
+      return await hydrate();
+    }
+
+    const cacheKey = connectorTargetCacheKey(identity);
+    let cached: CachedConnectorTargetResolution | null = null;
+    try {
+      cached = await cache.get<CachedConnectorTargetResolution>(cacheKey);
+    } catch (error) {
+      // error-policy:J4 cache loss is a visible retryable connector result;
+      // it never falls through to response-path repository resolution.
+      logger.warn("[AgentGatewayRouter] Connector target cache read failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const restored = cached ? restoreConnectorTargetResolution(cached) : null;
+    if (restored && cached) {
+      if (Date.now() - cached.hydratedAtMs >= CONNECTOR_TARGET_FRESH_MS) {
+        this.scheduleConnectorTargetHydration(cacheKey, executionCtx, hydrate);
+      }
+      return restored;
+    }
+
+    this.scheduleConnectorTargetHydration(cacheKey, executionCtx, hydrate);
+    return targetCacheWarming();
+  }
+
+  async resolveServiceAgent(args: {
+    agentId: string;
+    executionCtx?: BridgeExecutionContext;
+  }): Promise<{
+    agent?: AgentSandbox;
+    retryable?: boolean;
+  }> {
+    const resolved = await this.resolveConnectorTarget(
+      ["service", args.agentId],
+      args.executionCtx,
+      async () => {
+        const agent = await elizaSandboxService.getAgentById(args.agentId);
+        return agent
+          ? {
+              target: {
+                kind: "sandbox",
+                sandbox: agent,
+              },
+              agentId: agent.id,
+              userId: agent.user_id,
+              organizationId: agent.organization_id,
+            }
+          : {
+              reason: "owner_agent_not_running",
+              agentId: args.agentId,
+            };
+      },
+    );
+    return {
+      ...(resolved.target?.sandbox ? { agent: resolved.target.sandbox } : {}),
+      ...(resolved.retryable ? { retryable: true } : {}),
+    };
   }
 
   private async listOwnedSandboxes(orgId: string, userId: string): Promise<AgentSandbox[]> {
@@ -540,6 +735,7 @@ export class AgentGatewayRouterService {
   private async routeToTarget(
     target: ResolvedAgentTarget,
     rpc: BridgeRequest,
+    executionCtx?: BridgeExecutionContext,
   ): Promise<AgentGatewayRouteResult> {
     if (target.kind === "local-session" && target.session) {
       const sessions = target.sessions ?? [target.session];
@@ -593,11 +789,15 @@ export class AgentGatewayRouterService {
       };
     }
 
-    const response = await elizaSandboxService.bridge(
-      target.sandbox.id,
-      target.sandbox.organization_id,
-      rpc,
-    );
+    const response =
+      target.sandbox.execution_tier === "shared"
+        ? await elizaSandboxService.bridgeResolvedShared(target.sandbox, rpc, executionCtx)
+        : await elizaSandboxService.bridge(
+            target.sandbox.id,
+            target.sandbox.organization_id,
+            rpc,
+            executionCtx,
+          );
 
     if (response.error) {
       logger.warn("[agent-gateway] Sandbox bridge rejected inbound message", {
@@ -612,6 +812,7 @@ export class AgentGatewayRouterService {
         agentId: target.sandbox.id,
         organizationId: target.sandbox.organization_id,
         roomId: extractRoomId(rpc),
+        ...(response.error.code === BRIDGE_CACHE_WARMING_CODE ? { retryable: true } : {}),
       };
     }
 
@@ -630,11 +831,17 @@ export class AgentGatewayRouterService {
     messageId: string;
     content: string;
     sender: AgentGatewaySender;
+    executionCtx?: BridgeExecutionContext;
   }): Promise<AgentGatewayRouteResult> {
-    const resolved = await this.resolveDiscordTarget({
-      guildId: args.guildId ?? null,
-      senderDiscordUserId: args.sender.id,
-    });
+    const resolved = await this.resolveConnectorTarget(
+      ["discord", args.guildId?.trim() || "dm", args.sender.id.trim()],
+      args.executionCtx,
+      () =>
+        this.resolveDiscordTarget({
+          guildId: args.guildId ?? null,
+          senderDiscordUserId: args.sender.id,
+        }),
+    );
 
     if (!resolved.target) {
       return {
@@ -642,6 +849,7 @@ export class AgentGatewayRouterService {
         reason: resolved.reason,
         agentId: resolved.agentId,
         userId: resolved.userId,
+        retryable: resolved.retryable,
       };
     }
 
@@ -679,7 +887,7 @@ export class AgentGatewayRouterService {
       },
     };
 
-    const routed = await this.routeToTarget(resolved.target, rpcRequest);
+    const routed = await this.routeToTarget(resolved.target, rpcRequest, args.executionCtx);
     return {
       ...routed,
       userId: resolved.userId,
@@ -695,14 +903,27 @@ export class AgentGatewayRouterService {
     providerMessageId?: string;
     mediaUrls?: string[];
     metadata?: Record<string, unknown>;
+    executionCtx?: BridgeExecutionContext;
   }): Promise<AgentGatewayRouteResult> {
     let resolved: Awaited<ReturnType<AgentGatewayRouterService["resolvePhoneTarget"]>>;
     try {
-      resolved = await this.resolvePhoneTarget({
-        organizationId: args.organizationId,
-        provider: args.provider,
-        senderId: args.from,
-      });
+      resolved = await this.resolveConnectorTarget(
+        [
+          "phone",
+          args.organizationId,
+          args.provider,
+          args.from.includes("@")
+            ? args.from.trim().toLowerCase()
+            : normalizePhoneNumber(args.from),
+        ],
+        args.executionCtx,
+        () =>
+          this.resolvePhoneTarget({
+            organizationId: args.organizationId,
+            provider: args.provider,
+            senderId: args.from,
+          }),
+      );
     } catch (error) {
       logger.error("[AgentGatewayRouter] Failed to resolve phone target", {
         provider: args.provider,
@@ -781,6 +1002,7 @@ export class AgentGatewayRouterService {
         agentId: resolved.agentId,
         userId: resolved.userId,
         organizationId: resolved.organizationId,
+        retryable: resolved.retryable,
       };
     }
 
@@ -828,7 +1050,7 @@ export class AgentGatewayRouterService {
 
     let routed: AgentGatewayRouteResult;
     try {
-      routed = await this.routeToTarget(resolved.target, rpcRequest);
+      routed = await this.routeToTarget(resolved.target, rpcRequest, args.executionCtx);
     } catch (error) {
       logger.error("[AgentGatewayRouter] Phone target route threw", {
         provider: args.provider,
@@ -852,6 +1074,7 @@ export class AgentGatewayRouterService {
     if (
       !routed.handled &&
       routed.reason === "bridge_failed" &&
+      !routed.retryable &&
       resolved.source === "owner" &&
       resolved.userId &&
       resolved.organizationId
@@ -891,38 +1114,48 @@ export class AgentGatewayRouterService {
     messageId: string;
     content: string;
     sender: AgentGatewaySender;
+    executionCtx?: BridgeExecutionContext;
   }): Promise<AgentGatewayRouteResult> {
     const senderTelegramId = args.sender.id.trim();
-    const owner = await usersRepository.findByTelegramIdWithOrganization(senderTelegramId);
-
-    if (!owner) {
-      return {
-        handled: false,
-        reason: "unknown_owner",
-      };
-    }
-
-    if (owner.organization_id !== args.organizationId) {
-      return {
-        handled: false,
-        reason: "owner_org_mismatch",
-      };
-    }
-
-    const resolved = await this.resolveOwnedRuntimeTarget(owner.organization_id, owner.id);
+    const resolved = await this.resolveConnectorTarget(
+      ["telegram", args.organizationId, senderTelegramId],
+      args.executionCtx,
+      async () => {
+        const owner = await usersRepository.findByTelegramIdWithOrganization(senderTelegramId);
+        if (!owner) {
+          return {
+            reason: "unknown_owner",
+          };
+        }
+        if (owner.organization_id !== args.organizationId) {
+          return {
+            reason: "owner_org_mismatch",
+            userId: owner.id,
+            organizationId: owner.organization_id ?? undefined,
+          };
+        }
+        const owned = await this.resolveOwnedRuntimeTarget(owner.organization_id, owner.id);
+        return {
+          ...owned,
+          organizationId: owner.organization_id,
+        };
+      },
+    );
     if (!resolved.target) {
       return {
         handled: false,
         reason: resolved.reason,
         agentId: resolved.agentId,
-        userId: owner.id,
+        userId: resolved.userId,
+        organizationId: resolved.organizationId,
+        retryable: resolved.retryable,
       };
     }
 
     const targetAgentId =
       resolved.target.kind === "local-session" && resolved.target.session
         ? resolved.target.session.runtimeAgentId
-        : (resolved.target.sandbox?.id ?? owner.id);
+        : (resolved.target.sandbox?.id ?? resolved.userId ?? senderTelegramId);
     const roomId = buildDirectConversationRoomIdFromIds(
       targetAgentId,
       "telegram",
@@ -959,10 +1192,10 @@ export class AgentGatewayRouterService {
       },
     };
 
-    const routed = await this.routeToTarget(resolved.target, rpcRequest);
+    const routed = await this.routeToTarget(resolved.target, rpcRequest, args.executionCtx);
     return {
       ...routed,
-      userId: owner.id,
+      userId: resolved.userId,
     };
   }
 
@@ -975,36 +1208,41 @@ export class AgentGatewayRouterService {
     mediaUrls?: string[];
     metadata?: Record<string, unknown>;
     senderName?: string;
+    executionCtx?: BridgeExecutionContext;
   }): Promise<AgentGatewayRouteResult> {
     const senderWhatsAppId = args.from.trim();
     const normalizedPhone = normalizePhoneNumber(senderWhatsAppId);
-    const owner =
-      (await usersRepository.findByWhatsAppIdWithOrganization(senderWhatsAppId)) ??
-      (normalizedPhone
-        ? await usersRepository.findByPhoneNumberWithOrganization(normalizedPhone)
-        : undefined);
+    const resolved = await this.resolveConnectorTarget(
+      ["whatsapp", args.organizationId, normalizedPhone || senderWhatsAppId],
+      args.executionCtx,
+      async () => {
+        const owner =
+          (await usersRepository.findByWhatsAppIdWithOrganization(senderWhatsAppId)) ??
+          (normalizedPhone
+            ? await usersRepository.findByPhoneNumberWithOrganization(normalizedPhone)
+            : undefined);
 
-    let resolved: PhoneTargetResolution;
-    if (owner?.organization_id) {
-      const owned = await this.resolveOwnedRuntimeTarget(owner.organization_id, owner.id);
-      resolved = owned.target
-        ? { ...owned, organizationId: owner.organization_id }
-        : await this.resolveLoggedPhoneContactTarget(
-            normalizedPhone || senderWhatsAppId,
-            "whatsapp",
-          );
-      if (!resolved.target) {
-        resolved = {
-          ...owned,
-          organizationId: owner.organization_id,
-        };
-      }
-    } else {
-      resolved = await this.resolveLoggedPhoneContactTarget(
-        normalizedPhone || senderWhatsAppId,
-        "whatsapp",
-      );
-    }
+        if (owner?.organization_id) {
+          const owned = await this.resolveOwnedRuntimeTarget(owner.organization_id, owner.id);
+          const target = owned.target
+            ? { ...owned, organizationId: owner.organization_id }
+            : await this.resolveLoggedPhoneContactTarget(
+                normalizedPhone || senderWhatsAppId,
+                "whatsapp",
+              );
+          return target.target
+            ? target
+            : {
+                ...owned,
+                organizationId: owner.organization_id,
+              };
+        }
+        return await this.resolveLoggedPhoneContactTarget(
+          normalizedPhone || senderWhatsAppId,
+          "whatsapp",
+        );
+      },
+    );
 
     if (!resolved.target) {
       return {
@@ -1013,6 +1251,7 @@ export class AgentGatewayRouterService {
         agentId: resolved.agentId,
         userId: resolved.userId,
         organizationId: resolved.organizationId,
+        retryable: resolved.retryable,
       };
     }
 
@@ -1058,7 +1297,7 @@ export class AgentGatewayRouterService {
       },
     };
 
-    const routed = await this.routeToTarget(resolved.target, rpcRequest);
+    const routed = await this.routeToTarget(resolved.target, rpcRequest, args.executionCtx);
     return {
       ...routed,
       userId: resolved.userId,

@@ -138,6 +138,21 @@ const baseEnv = {
   VOICE_REALTIME_ELIZA_AUTHORIZATION: "Bearer service",
 };
 
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: "org-1",
+  organizationRevision: "0",
+  userId: "user-1",
+  userRevision: "0",
+  credential: {
+    kind: "api_key" as const,
+    id: "key-1",
+    fingerprint: "a".repeat(64),
+    revision: "0",
+    expiresAt: null,
+  },
+};
+
 class FakeServerSocket {
   accepted = false;
   binaryType: "blob" | "arraybuffer" = "blob";
@@ -234,6 +249,7 @@ function buildCapturedSession(): { config: Record<string, unknown> } {
       userId: "user-1",
       agentId: "agent-1",
       conversationId: "conv-1",
+      authorization: AUTHORIZATION,
     },
     jti: "jti-upgrade-wire",
     tokenExpSeconds: Math.floor(Date.now() / 1000) + 60,
@@ -284,7 +300,7 @@ describe("voice-session ws upgrade (happy path)", () => {
     expect(afterUpgrade).toBeGreaterThan(beforeUpgrade);
     const deps = attachCalls[0].deps as unknown as {
       buildSession: (args: {
-        claims: Record<string, string>;
+        claims: Record<string, unknown>;
         jti: string;
         tokenExpSeconds: number;
         downlink: Record<string, unknown>;
@@ -297,6 +313,7 @@ describe("voice-session ws upgrade (happy path)", () => {
         userId: "user-1",
         agentId: "agent-1",
         conversationId: "conv-1",
+        authorization: AUTHORIZATION,
       },
       jti: "jti-16663-forwarding",
       tokenExpSeconds: Math.floor(Date.now() / 1000) + 60,

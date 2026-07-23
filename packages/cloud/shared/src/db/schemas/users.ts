@@ -1,7 +1,16 @@
 // Defines the users Drizzle table shape used by cloud repositories and services.
 import type { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import { sql } from "drizzle-orm";
-import { boolean, index, integer, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import {
+  bigint,
+  boolean,
+  index,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
 /**
@@ -64,6 +73,16 @@ export const users = pgTable(
     response_notifications: boolean("response_notifications").default(true),
 
     is_active: boolean("is_active").default(true).notNull(),
+    inference_auth_revision: bigint("inference_auth_revision", {
+      mode: "number",
+    })
+      .notNull()
+      .default(0),
+    inference_session_not_before: bigint("inference_session_not_before", {
+      mode: "number",
+    })
+      .notNull()
+      .default(0),
 
     // Field-level encryption columns (D-3). Each PII column has its own
     // ciphertext/nonce/auth_tag + key id/version. AAD = "users|<id>|<column>".

@@ -236,6 +236,7 @@ function callStreaming(
     "gateway" as never,
     options.pooledCredential ?? null,
     options.useMonetizedAppBilling ?? false,
+    async () => undefined,
     options.executionCtx,
   );
 }

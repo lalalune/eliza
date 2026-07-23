@@ -10,6 +10,7 @@ import type { RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-
 import { InsufficientCreditsError, RateLimitError } from "../../api/errors";
 import { logger } from "../../utils/logger";
 import type { BridgeRequest } from "../eliza-sandbox-bridge";
+import type { InferenceAuthorizationProof } from "../inference-authorization-boundary";
 import { applyCorsHeaders } from "../proxy/cors";
 import { coordinateSharedStream } from "./conversation-coordinator";
 import type { BridgeExecutionContext } from "./shared-runtime-chat";
@@ -33,6 +34,7 @@ export interface CanonicalScopedStreamRequest {
   orgId: string;
   conversationId: string;
   userId?: string;
+  authorization?: InferenceAuthorizationProof;
   namespace: RuntimeDurableObjectNamespace;
   executionCtx: BridgeExecutionContext;
   body: unknown;
@@ -102,6 +104,7 @@ export async function handleCanonicalScopedAgentStream(
   const bridgeStartedAt = nowMs();
   try {
     upstream = await coordinateSharedStream(request.agent, rpc, {
+      authorization: request.authorization,
       namespace: request.namespace,
       executionCtx: request.executionCtx,
     });

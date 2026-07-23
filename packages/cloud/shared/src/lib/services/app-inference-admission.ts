@@ -21,6 +21,7 @@ import {
 } from "./credits";
 import {
   acquireInferenceAdmissionLease,
+  assertInferenceAdmissionLeaseDispatched,
   InferenceAdmissionGateUnavailableError,
   type InferenceAdmissionLease,
   InferenceAdmissionLeaseRejectedError,
@@ -29,6 +30,7 @@ import {
   settleInferenceAdmissionLease,
 } from "./inference-admission-gate";
 import { invalidateOrgBalanceHint, writeOrgBalanceHint } from "./inference-auth-cache";
+import type { InferenceAuthorizationProof } from "./inference-authorization-boundary";
 import { clearOrgAdmissionRefused, markOrgAdmissionRefused } from "./inference-billing-deferred";
 import {
   getGateBalanceHint,
@@ -53,6 +55,7 @@ export interface AppInferenceAdmissionParams {
   provider: string;
   billingSource: string;
   affiliateCode?: string | null;
+  authorization?: InferenceAuthorizationProof;
   executionCtx: AppInferenceAdmissionExecutionContext;
 }
 
@@ -215,6 +218,7 @@ export async function admitAppInferenceCacheOnly(
           inferenceMarkupPercentage: params.app.inference_markup_percentage ?? null,
         },
       },
+      authorization: params.authorization,
       executionCtx: params.executionCtx,
     });
   } catch (error) {
@@ -282,7 +286,7 @@ export async function admitAppInferenceCacheOnly(
     if (settlement) return settlement;
     const current = (async () => {
       if ((firstActualBaseCostUsd ?? 0) > 0) {
-        await markInferenceAdmissionLeaseDispatched(inferenceLease);
+        assertInferenceAdmissionLeaseDispatched(inferenceLease);
       }
       const reconciliation = await settle(firstActualBaseCostUsd ?? 0);
       const actualTotalCostUsd =

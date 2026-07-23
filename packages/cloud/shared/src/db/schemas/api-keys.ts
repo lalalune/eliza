@@ -1,6 +1,7 @@
 // Defines the api keys Drizzle table shape used by cloud repositories and services.
 import type { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   index,
   integer,
@@ -46,6 +47,11 @@ export const apiKeys = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     rate_limit: integer("rate_limit").notNull().default(1000),
     is_active: boolean("is_active").notNull().default(true),
+    inference_auth_revision: bigint("inference_auth_revision", {
+      mode: "number",
+    })
+      .notNull()
+      .default(0),
     usage_count: integer("usage_count").default(0).notNull(),
     expires_at: timestamp("expires_at"),
     last_used_at: timestamp("last_used_at"),

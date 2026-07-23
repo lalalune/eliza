@@ -7,6 +7,8 @@ import { encryptApiKey } from "../../db/crypto/api-keys";
 import { type ApiKey, apiKeys, type NewApiKey } from "../../db/schemas/api-keys";
 import { type CliAuthSession, cliAuthSessions } from "../../db/schemas/cli-auth-sessions";
 import { apiKeysService } from "./api-keys";
+import { applyInferenceAuthorizationState } from "./inference-authorization-boundary";
+import { apiKeyAuthorizationState } from "./inference-authorization-lifecycle";
 
 interface CompletionState {
   session: CliAuthSession;
@@ -97,6 +99,10 @@ export class CliAuthSessionCompletionService {
 
       const [createdKey] = await tx.insert(apiKeys).values(apiKey).returning();
       if (!createdKey) throw new Error("Failed to create CLI API key");
+      await applyInferenceAuthorizationState(
+        createdKey.organization_id,
+        apiKeyAuthorizationState(createdKey),
+      );
 
       return {
         claimed: true,

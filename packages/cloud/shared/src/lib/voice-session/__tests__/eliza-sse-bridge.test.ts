@@ -108,10 +108,10 @@ describe("eliza sse bridge", () => {
     expect(seenBody).toEqual({ text: "hi" });
     expect(seenHeaders?.get("Authorization")).toBe("Bearer s");
     expect(seenHeaders?.get("X-Service-Key")).toBe("Bearer s");
-    expect(seenHeaders?.get("X-Eliza-Agent-Id")).toBe("agent-XYZ");
-    expect(seenHeaders?.get("X-Eliza-Conversation-Id")).toBe("conv-ABC");
-    expect(seenHeaders?.get("X-Eliza-Organization-Id")).toBe("org-123");
-    expect(seenHeaders?.get("X-Eliza-User-Id")).toBe("user-456");
+    expect(seenHeaders?.get("X-Eliza-Agent-Id")).toBeNull();
+    expect(seenHeaders?.get("X-Eliza-Conversation-Id")).toBeNull();
+    expect(seenHeaders?.get("X-Eliza-Organization-Id")).toBeNull();
+    expect(seenHeaders?.get("X-Eliza-User-Id")).toBeNull();
   });
 
   test("surfaces canonical agent stream errors instead of completing an empty turn", async () => {

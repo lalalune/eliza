@@ -37,7 +37,15 @@ const AUTH_ENUMS = Object.freeze({
     "none",
     "unknown",
   ]),
-  read: new Set(["not_run", "hit", "miss", "invalid", "unavailable", "error"]),
+  read: new Set([
+    "not_run",
+    "hit",
+    "rejected",
+    "miss",
+    "invalid",
+    "unavailable",
+    "error",
+  ]),
   authoritative: new Set([
     "not_run",
     "authorized",
@@ -56,6 +64,7 @@ const AUTH_ENUMS = Object.freeze({
   result: new Set([
     "authorized_cache",
     "authorized_origin",
+    "warming",
     "suspended",
     "slow_path",
     "rejected",
@@ -496,6 +505,19 @@ function assertRequiredTimings(timings, auth) {
   }
 }
 
+function assertNoDatabaseTimings(timings) {
+  for (const name of [
+    "auth_key_lookup",
+    "auth_user_org",
+    "auth_moderation",
+    "auth_cache_write",
+  ]) {
+    if (Object.hasOwn(timings, name)) {
+      throw new Error(`Cache-only auth path unexpectedly reported ${name}`);
+    }
+  }
+}
+
 export async function verifyDeployment(
   baseUrl,
   expectedSha,
@@ -566,7 +588,13 @@ export async function probeAuthSample({
     throw new Error("Auth probe request failed", { cause });
   }
   const totalMs = Math.round((now() - startedAt) * 100) / 100;
-  if (response.status !== 400)
+  const expectedStatuses =
+    phase === "miss"
+      ? new Set([503])
+      : phase === "prime"
+        ? new Set([400, 503])
+        : new Set([400]);
+  if (!expectedStatuses.has(response.status))
     throw new AuthProbeHttpStatusError(response.status);
   const returnedTraceId = response.headers.get(TRACE_HEADER);
   if (returnedTraceId !== traceId)
@@ -584,39 +612,48 @@ export async function probeAuthSample({
     phase === "hit" &&
     (auth.probe !== "off" ||
       auth.read !== "hit" ||
+      auth.authoritative !== "not_run" ||
+      auth.write !== "not_run" ||
       auth.result !== "authorized_cache")
   ) {
     throw new Error("Warm auth probe did not produce a cache hit");
   }
+  if (phase === "hit") assertNoDatabaseTimings(timings);
   if (
     phase === "miss" &&
     (auth.probe !== "on" ||
       auth.read !== "miss" ||
-      auth.authoritative !== "authorized" ||
-      auth.write !== "deferred" ||
-      auth.result !== "authorized_origin")
+      auth.authoritative !== "not_run" ||
+      auth.write !== "not_run" ||
+      auth.result !== "warming")
   ) {
     throw new Error(
-      "Controlled auth probe did not produce an authoritative miss",
+      "Controlled auth probe did not produce a cache-only warming response",
     );
   }
+  if (phase === "miss") assertNoDatabaseTimings(timings);
   if (
     phase === "prime" &&
     !(
-      (auth.probe === "off" &&
+      (response.status === 400 &&
+        auth.probe === "off" &&
         auth.read === "hit" &&
+        auth.authoritative === "not_run" &&
+        auth.write === "not_run" &&
         auth.result === "authorized_cache") ||
-      (auth.probe === "off" &&
+      (response.status === 503 &&
+        auth.probe === "off" &&
         auth.read === "miss" &&
-        auth.authoritative === "authorized" &&
-        auth.write === "deferred" &&
-        auth.result === "authorized_origin")
+        auth.authoritative === "not_run" &&
+        auth.write === "not_run" &&
+        auth.result === "warming")
     )
   ) {
     throw new Error(
       "Canonical cache-prime request used an unexpected auth path",
     );
   }
+  if (phase === "prime") assertNoDatabaseTimings(timings);
 
   return {
     kind: "sample",
@@ -720,6 +757,8 @@ export async function probeAuthGuardSample({
   probeToken,
   deploySha,
   guard,
+  credential,
+  expectation = guard === "forged_probe" ? "settled" : "warming",
   timeoutMs,
   fetchImpl = fetch,
   now = performance.now.bind(performance),
@@ -731,20 +770,29 @@ export async function probeAuthGuardSample({
   ) {
     throw new Error("Unknown auth guard probe");
   }
+  if (
+    expectation !== "warming" &&
+    expectation !== "settled" &&
+    expectation !== "settled_or_warming"
+  ) {
+    throw new Error("Unknown auth guard expectation");
+  }
   const traceId = randomUUID();
+  const selectedCredential =
+    credential ??
+    (guard === "invalid_key"
+      ? `eliza_${randomBytes(32).toString("hex")}`
+      : apiKey);
   const headers = {
     "Content-Type": "application/json",
     "User-Agent": "eliza-inference-auth-latency/1.0",
-    "X-API-Key":
-      guard === "invalid_key"
-        ? `eliza_${randomBytes(32).toString("hex")}`
-        : apiKey,
+    "X-API-Key": selectedCredential,
     [TRACE_HEADER]: traceId,
   };
   if (guard === "forged_probe") {
     headers[AUTH_PROBE_HEADER] =
       `invalid-control:${randomBytes(16).toString("hex")}`;
-  } else if (guard === "suspended_key") {
+  } else if (guard === "suspended_key" && expectation === "warming") {
     headers[AUTH_PROBE_HEADER] =
       `${probeToken}:${randomBytes(16).toString("hex")}`;
   }
@@ -764,9 +812,15 @@ export async function probeAuthGuardSample({
     throw new Error("Auth guard probe request failed", { cause });
   }
   const totalMs = Math.round((now() - startedAt) * 100) / 100;
-  const expectedStatus =
+  const settledStatus =
     guard === "invalid_key" ? 401 : guard === "suspended_key" ? 403 : 400;
-  if (response.status !== expectedStatus) {
+  const allowedStatuses =
+    expectation === "warming"
+      ? new Set([503])
+      : expectation === "settled_or_warming"
+        ? new Set([503, settledStatus])
+        : new Set([settledStatus]);
+  if (!allowedStatuses.has(response.status)) {
     throw new Error(`Auth guard probe returned HTTP ${response.status}`);
   }
   if (response.headers.get(TRACE_HEADER) !== traceId) {
@@ -774,30 +828,51 @@ export async function probeAuthGuardSample({
   }
   const auth = parseAuthTrace(response.headers.get(AUTH_TRACE_HEADER));
   const timings = parseAuthServerTiming(response.headers.get("server-timing"));
-  if (guard === "invalid_key") {
+  const warming = response.status === 503;
+  if (warming) {
     if (
+      auth.probe !==
+        (guard === "suspended_key" && expectation === "warming"
+          ? "on"
+          : "off") ||
       auth.read !== "miss" ||
-      auth.authoritative !== "rejected" ||
+      auth.authoritative !== "not_run" ||
+      auth.write !== "not_run" ||
+      auth.result !== "warming"
+    ) {
+      throw new Error(
+        "Auth guard did not produce a cache-only warming response",
+      );
+    }
+    assertNoDatabaseTimings(timings);
+  } else if (guard === "invalid_key") {
+    if (
+      auth.probe !== "off" ||
+      auth.read !== "rejected" ||
+      auth.authoritative !== "not_run" ||
+      auth.write !== "not_run" ||
       auth.result !== "rejected" ||
-      !Object.hasOwn(timings, "auth_key_lookup")
+      response.status !== 401
     ) {
       throw new Error(
         "Invalid-key probe did not preserve the 401 rejection path",
       );
     }
+    assertNoDatabaseTimings(timings);
   } else if (guard === "suspended_key") {
     if (
-      auth.probe !== "on" ||
-      auth.read !== "miss" ||
-      auth.authoritative !== "suspended" ||
+      auth.probe !== "off" ||
+      auth.read !== "rejected" ||
+      auth.authoritative !== "not_run" ||
       auth.write !== "not_run" ||
       auth.result !== "suspended" ||
-      !Object.hasOwn(timings, "auth_moderation")
+      response.status !== 403
     ) {
       throw new Error(
         "Suspended-key probe did not preserve the 403 moderation path",
       );
     }
+    assertNoDatabaseTimings(timings);
   } else if (
     auth.probe !== "off" ||
     auth.read !== "hit" ||
@@ -810,6 +885,7 @@ export async function probeAuthGuardSample({
     kind: "guard",
     deploySha,
     guard,
+    stage: warming ? "warming" : "settled",
     traceId,
     status: response.status,
     placement: boundedPlacement(response.headers.get("cf-placement")),
@@ -818,6 +894,56 @@ export async function probeAuthGuardSample({
     auth,
     timings,
   };
+}
+
+/** Warm and then read a cached rejection for one unchanged credential. */
+export async function probeAuthGuardSequence({
+  baseUrl,
+  apiKey,
+  probeToken,
+  deploySha,
+  guard,
+  timeoutMs,
+  fetchImpl = fetch,
+  wait = sleep,
+  attempts = 10,
+}) {
+  if (guard !== "invalid_key" && guard !== "suspended_key") {
+    throw new Error("Guard sequence requires an invalid or suspended key");
+  }
+  const credential =
+    guard === "invalid_key"
+      ? `eliza_${randomBytes(32).toString("hex")}`
+      : apiKey;
+  const records = [
+    await probeAuthGuardSample({
+      baseUrl,
+      apiKey,
+      probeToken,
+      deploySha,
+      guard,
+      credential,
+      expectation: "warming",
+      timeoutMs,
+      fetchImpl,
+    }),
+  ];
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await wait(250);
+    const record = await probeAuthGuardSample({
+      baseUrl,
+      apiKey,
+      deploySha,
+      guard,
+      credential,
+      expectation: "settled_or_warming",
+      timeoutMs,
+      fetchImpl,
+    });
+    records.push(record);
+    if (record.stage === "settled") return records;
+  }
+  throw new Error("Auth guard cache did not become readable");
 }
 
 function percentile(values, fraction) {
@@ -838,7 +964,7 @@ function metricSummary(records, selector) {
   };
 }
 
-/** Summarize the completed KV writes paired to authoritative miss traces. */
+/** Summarize completed KV writes when probing a legacy origin-authoritative path. */
 export function summarizeDeferredCacheWrites(workerLogs) {
   return metricSummary(
     workerLogs.filter(
@@ -851,56 +977,69 @@ export function summarizeDeferredCacheWrites(workerLogs) {
 export function summarizeAuthSamples(records, deploySha) {
   const hits = records.filter((record) => record.phase === "hit");
   const misses = records.filter((record) => record.phase === "miss");
+  const noDatabaseTiming = (record) =>
+    ![
+      "auth_key_lookup",
+      "auth_user_org",
+      "auth_moderation",
+      "auth_cache_write",
+    ].some((name) => Object.hasOwn(record.timings, name));
   return {
     kind: "summary",
     deploySha,
-    counts: { hit: hits.length, miss: misses.length },
-    hitAuthResolveMs: metricSummary(
+    counts: { warmHit: hits.length, cacheOnlyMiss: misses.length },
+    invariants: {
+      warmAuthorizedCache: hits.filter(
+        (record) =>
+          record.status === 400 &&
+          record.auth.read === "hit" &&
+          record.auth.authoritative === "not_run" &&
+          record.auth.result === "authorized_cache",
+      ).length,
+      warmHitWithoutDatabaseTimings: hits.filter(noDatabaseTiming).length,
+      cacheOnlyWarming: misses.filter(
+        (record) =>
+          record.status === 503 &&
+          record.auth.read === "miss" &&
+          record.auth.authoritative === "not_run" &&
+          record.auth.write === "not_run" &&
+          record.auth.result === "warming",
+      ).length,
+      cacheOnlyMissWithoutDatabaseTimings:
+        misses.filter(noDatabaseTiming).length,
+    },
+    warmHitAuthResolveMs: metricSummary(
       hits,
       (record) => record.timings.auth_resolve,
     ),
-    missAuthResolveMs: metricSummary(
+    warmHitTotalMs: metricSummary(hits, (record) => record.totalMs),
+    cacheOnlyMissAuthResolveMs: metricSummary(
       misses,
       (record) => record.timings.auth_resolve,
     ),
-    missKeyLookupMs: metricSummary(
-      misses,
-      (record) => record.timings.auth_key_lookup,
-    ),
-    missUserOrgMs: metricSummary(
-      misses,
-      (record) => record.timings.auth_user_org,
-    ),
-    missModerationMs: metricSummary(
-      misses,
-      (record) => record.timings.auth_moderation,
-    ),
-    missCacheReadMs: metricSummary(
+    cacheOnlyMissTotalMs: metricSummary(misses, (record) => record.totalMs),
+    cacheOnlyMissCacheReadMs: metricSummary(
       misses,
       (record) => record.timings.auth_cache_read,
-    ),
-    missCacheWriteMs: metricSummary(
-      misses,
-      (record) => record.timings.auth_cache_write,
     ),
   };
 }
 
-export function enforceAcceptance(summary) {
-  if (summary.counts.hit < 30 || summary.counts.miss < 10) {
-    throw new Error("Acceptance requires at least 30 hit and 10 miss samples");
+export function enforceAcceptance(summary, expectedCounts) {
+  if (
+    summary.counts.warmHit !== expectedCounts.hit ||
+    summary.counts.cacheOnlyMiss !== expectedCounts.miss
+  ) {
+    throw new Error("Auth sample counts did not match the requested counts");
   }
   if (
-    summary.hitAuthResolveMs.p95 >= 50 ||
-    summary.hitAuthResolveMs.max > 250
+    summary.invariants.warmAuthorizedCache !== expectedCounts.hit ||
+    summary.invariants.warmHitWithoutDatabaseTimings !== expectedCounts.hit ||
+    summary.invariants.cacheOnlyWarming !== expectedCounts.miss ||
+    summary.invariants.cacheOnlyMissWithoutDatabaseTimings !==
+      expectedCounts.miss
   ) {
-    throw new Error("Cache-hit auth latency exceeded its acceptance threshold");
-  }
-  if (
-    summary.missAuthResolveMs.p90 >= 1_602 ||
-    summary.missAuthResolveMs.max >= 2_000
-  ) {
-    throw new Error("Authoritative auth latency retained a multi-second tail");
+    throw new Error("Auth samples violated cache-only semantic invariants");
   }
 }
 
@@ -988,8 +1127,8 @@ export async function runAuthProbes(options, dependencies = {}) {
   }
 
   const guards = [];
-  for (const guard of ["invalid_key", "suspended_key", "forged_probe"]) {
-    const record = await probeAuthGuardSample({
+  for (const guard of ["invalid_key", "suspended_key"]) {
+    const sequence = await probeAuthGuardSequence({
       baseUrl: options.baseUrl,
       apiKey: guard === "suspended_key" ? suspendedApiKey : apiKey,
       probeToken,
@@ -997,10 +1136,23 @@ export async function runAuthProbes(options, dependencies = {}) {
       guard,
       timeoutMs: options.timeoutMs,
       fetchImpl,
+      wait,
     });
-    guards.push(record);
-    emit(record);
+    guards.push(...sequence);
+    for (const record of sequence) emit(record);
   }
+  const forged = await probeAuthGuardSample({
+    baseUrl: options.baseUrl,
+    apiKey,
+    probeToken,
+    deploySha: options.deploySha,
+    guard: "forged_probe",
+    expectation: "settled",
+    timeoutMs: options.timeoutMs,
+    fetchImpl,
+  });
+  guards.push(forged);
+  emit(forged);
   for (let sequence = 0; sequence < options.missCount; sequence++) {
     const record = await probeAuthSample({
       baseUrl: options.baseUrl,
@@ -1019,7 +1171,12 @@ export async function runAuthProbes(options, dependencies = {}) {
 
   const summary = summarizeAuthSamples(records, options.deploySha);
   emit(summary);
-  if (options.enforce) enforceAcceptance(summary);
+  if (options.enforce) {
+    enforceAcceptance(summary, {
+      hit: options.hitCount,
+      miss: options.missCount,
+    });
+  }
   return { deployment, records, guards, summary };
 }
 

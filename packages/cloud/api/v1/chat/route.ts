@@ -63,6 +63,7 @@ import {
 } from "@/lib/services/credits";
 import { generationsService } from "@/lib/services/generations";
 import { resolveInferenceAuthContext } from "@/lib/services/inference-auth-context";
+import type { InferenceAuthorizationProof } from "@/lib/services/inference-authorization-boundary";
 import { InferenceBalanceCacheWarmingError } from "@/lib/services/inference-billing-fast-path";
 import { isKnownUnacceptedProviderError } from "@/lib/services/inference-provider-outcome";
 import { admitOrganizationInference } from "@/lib/services/organization-inference-admission";
@@ -192,16 +193,18 @@ app.post("/", async (c) => {
   let settleUnknownReservation:
     | (() => Promise<CreditReconciliationResult | null>)
     | null = null;
-  let markProviderDispatched: (() => Promise<void>) | undefined;
+  let markProviderDispatched: () => Promise<void> = () => Promise.resolve();
   let billingReservation: CreditReservation | undefined;
   let refundAnonymousMessageSlot: (() => Promise<void>) | null = null;
   let commitAnonymousMessageSlot: (() => Promise<void>) | null = null;
-  let markAnonymousMessageSlotDispatched: (() => Promise<void>) | null = null;
+  let markAnonymousMessageSlotDispatched: () => Promise<void> = () =>
+    Promise.resolve();
   let providerDispatchStarted = false;
 
   try {
     let user: ChatBillingUser;
     let apiKey: ApiKeyIdentity | undefined;
+    let inferenceAuthorization: InferenceAuthorizationProof | undefined;
     let isAnonymous = false;
     let anonymousSession: Pick<
       AnonymousSession,
@@ -246,6 +249,7 @@ app.post("/", async (c) => {
         apiKey = authResolution.ctx.apiKeyId
           ? { id: authResolution.ctx.apiKeyId }
           : undefined;
+        inferenceAuthorization = authResolution.ctx.authorization;
         moderationAlreadyChecked = true;
       } else {
         const anonymousResolution = await resolveAnonymousChatContext(
@@ -582,6 +586,7 @@ app.post("/", async (c) => {
           estimatedOutputTokens,
           apiKeyId: apiKey?.id,
           affiliateCode,
+          authorization: inferenceAuthorization,
           executionCtx,
         });
         settleReservation = admission.settle;
@@ -619,8 +624,8 @@ app.post("/", async (c) => {
     const routeTimeoutMs = getRouteTimeoutMs(ROUTE_MAX_DURATION);
     const languageModel = getLanguageModel(selectedModel);
     const modelMessages = await convertToModelMessages(messages);
-    await markProviderDispatched?.();
-    await markAnonymousMessageSlotDispatched?.();
+    await markProviderDispatched();
+    await markAnonymousMessageSlotDispatched();
     providerDispatchStarted = true;
     const result = streamText({
       model: languageModel,

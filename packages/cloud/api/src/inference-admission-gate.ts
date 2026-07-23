@@ -16,6 +16,12 @@ import {
   type InferenceAdmissionRecoveryResult,
   recoverExpiredInferenceAdmissionLease,
 } from "@/lib/services/inference-admission-recovery";
+import {
+  INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+  type InferenceAuthorizationProof,
+  type InferenceAuthorizationTargetState,
+  isInferenceAuthorizationProof,
+} from "@/lib/services/inference-authorization-boundary";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
@@ -35,6 +41,7 @@ interface ActiveLease extends ActiveLeaseTiming {
    */
   preProviderCancellationToken?: string;
   recovery: InferenceAdmissionRecoveryContext;
+  authorization?: InferenceAuthorizationProof;
 }
 
 interface GateLedger {
@@ -61,6 +68,7 @@ interface LeaseRequest {
   balanceRevision: string;
   estimatedCostUsd: number;
   recovery: InferenceAdmissionRecoveryContext;
+  authorization?: InferenceAuthorizationProof;
 }
 
 interface HydrateRequest {
@@ -94,6 +102,34 @@ interface RateLimitWindow {
   count: number;
 }
 
+interface AuthorizationBoundaryRecord {
+  version: typeof INFERENCE_AUTHORIZATION_BOUNDARY_VERSION;
+  initializedAt: number;
+}
+
+interface AuthorizationStateRecord {
+  version: typeof INFERENCE_AUTHORIZATION_BOUNDARY_VERSION;
+  organizationId: string;
+  state: InferenceAuthorizationTargetState;
+  updatedAt: number;
+}
+
+interface AuthorizationBoundaryRequest {
+  organizationId: string;
+}
+
+interface AuthorizationStateRequest extends AuthorizationBoundaryRequest {
+  state: InferenceAuthorizationTargetState;
+}
+
+interface AuthorizationStatesRequest extends AuthorizationBoundaryRequest {
+  states: InferenceAuthorizationTargetState[];
+}
+
+interface AuthorizationDispatchRequest extends AuthorizationBoundaryRequest {
+  authorization: InferenceAuthorizationProof;
+}
+
 type RateLimitWindows = Record<string, RateLimitWindow>;
 
 const LEDGER_KEY = "ledger";
@@ -101,6 +137,8 @@ const LEASE_KEY_PREFIX = "lease:";
 const LEASE_ACTIVE_KEY_PREFIX = "lease-active:";
 const LEASE_EXPIRY_KEY_PREFIX = "lease-expiry:";
 const RATE_LIMITS_KEY = "rate-limits";
+const AUTHORIZATION_BOUNDARY_KEY = "authorization-boundary:v1";
+const AUTHORIZATION_STATE_KEY_PREFIX = "authorization-state:v1:";
 const MAX_LEASE_AGE_MS = 20 * 60_000;
 const RECOVERY_RETRY_MS = 60_000;
 const MAX_ACTIVE_LEASES = 2_048;
@@ -122,6 +160,7 @@ const APP_REVIEW_STATUSES = new Set([
   "approved",
   "rejected",
 ]);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function nonNegativeFinite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -142,6 +181,106 @@ function validRequestId(value: unknown): value is string {
 
 function validTrimmedId(value: unknown): value is string {
   return validId(value) && value.trim() === value;
+}
+
+function validAuthorizationRevision(value: unknown): value is string {
+  return typeof value === "string" && /^(0|[1-9]\d*)$/.test(value);
+}
+
+function authorizationRevision(value: string): bigint {
+  return BigInt(value);
+}
+
+function validAuthorizationState(
+  value: unknown,
+  organizationId: string,
+): value is InferenceAuthorizationTargetState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Record<string, unknown>;
+  if (
+    !validTrimmedId(state.id) ||
+    !validAuthorizationRevision(state.revision) ||
+    typeof state.denied !== "boolean"
+  ) {
+    return false;
+  }
+  if (state.kind === "organization") {
+    return state.id === organizationId;
+  }
+  if (
+    state.kind === "user" ||
+    state.kind === "moderation" ||
+    state.kind === "session"
+  ) {
+    return true;
+  }
+  return (
+    state.kind === "credential" &&
+    (state.credentialKind === "api_key" ||
+      state.credentialKind === "steward_session") &&
+    typeof state.fingerprint === "string" &&
+    SHA256_HEX.test(state.fingerprint) &&
+    validTrimmedId(state.userId) &&
+    (state.expiresAt === null ||
+      (Number.isSafeInteger(state.expiresAt) &&
+        (state.expiresAt as number) > 0))
+  );
+}
+
+function authorizationStateStorageKey(
+  state:
+    | InferenceAuthorizationTargetState
+    | {
+        kind:
+          | "organization"
+          | "user"
+          | "moderation"
+          | "session"
+          | "credential";
+        id: string;
+        credentialKind?: "api_key" | "steward_session";
+      },
+): string {
+  if (state.kind === "organization") {
+    return `${AUTHORIZATION_STATE_KEY_PREFIX}organization`;
+  }
+  if (state.kind === "user") {
+    return `${AUTHORIZATION_STATE_KEY_PREFIX}user:${encodeURIComponent(state.id)}`;
+  }
+  if (state.kind === "moderation") {
+    return `${AUTHORIZATION_STATE_KEY_PREFIX}moderation:${encodeURIComponent(state.id)}`;
+  }
+  if (state.kind === "session") {
+    return `${AUTHORIZATION_STATE_KEY_PREFIX}session:${encodeURIComponent(state.id)}`;
+  }
+  return `${AUTHORIZATION_STATE_KEY_PREFIX}credential:${state.credentialKind}:${encodeURIComponent(state.id)}`;
+}
+
+function validAuthorizationBoundaryRecord(
+  value: unknown,
+): value is AuthorizationBoundaryRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.version === INFERENCE_AUTHORIZATION_BOUNDARY_VERSION &&
+    Number.isSafeInteger(record.initializedAt) &&
+    (record.initializedAt as number) > 0
+  );
+}
+
+function validAuthorizationStateRecord(
+  value: unknown,
+  organizationId: string,
+): value is AuthorizationStateRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.version === INFERENCE_AUTHORIZATION_BOUNDARY_VERSION &&
+    record.organizationId === organizationId &&
+    validAuthorizationState(record.state, organizationId) &&
+    Number.isSafeInteger(record.updatedAt) &&
+    (record.updatedAt as number) > 0
+  );
 }
 
 function validRecoveryContext(
@@ -233,6 +372,10 @@ function canonicalJson(value: unknown): string {
     throw new Error("Inference admission recovery must contain JSON values");
   }
   return serialized;
+}
+
+function canonicalOptionalJson(value: unknown): string {
+  return value === undefined ? "undefined" : canonicalJson(value);
 }
 
 function balanceRevision(value: unknown): bigint | null {
@@ -459,6 +602,9 @@ export class InferenceAdmissionGate {
         requestId,
         recoveryOrganizationId,
       ) ||
+      (lease.authorization !== undefined &&
+        (!isInferenceAuthorizationProof(lease.authorization) ||
+          lease.authorization.organizationId !== recoveryOrganizationId)) ||
       activeIndex.requestId !== requestId ||
       activeIndex.createdAt !== lease.createdAt ||
       activeIndex.dueAt !== leaseDueAt(lease) ||
@@ -559,6 +705,414 @@ export class InferenceAdmissionGate {
     }
   }
 
+  private authorizationRequired(): boolean {
+    return this.env.INFERENCE_AUTH_CACHE_ENABLED === "true";
+  }
+
+  private async initializeAuthorizationBoundary(
+    request: AuthorizationBoundaryRequest,
+  ): Promise<Response> {
+    if (!validTrimmedId(request.organizationId)) {
+      return jsonError("Invalid inference authorization boundary", 400);
+    }
+    const existing = await this.state.storage.get<unknown>(
+      AUTHORIZATION_BOUNDARY_KEY,
+    );
+    if (existing !== undefined) {
+      if (!validAuthorizationBoundaryRecord(existing)) {
+        throw new Error("Inference authorization boundary is corrupt");
+      }
+      return Response.json({
+        applied: true,
+        duplicate: true,
+        authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+      });
+    }
+    await this.state.storage.put(AUTHORIZATION_BOUNDARY_KEY, {
+      version: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+      initializedAt: Date.now(),
+    } satisfies AuthorizationBoundaryRecord);
+    return Response.json({
+      applied: true,
+      duplicate: false,
+      authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+  }
+
+  private async applyAuthorizationState(
+    request: AuthorizationStateRequest,
+  ): Promise<Response> {
+    if (
+      !validTrimmedId(request.organizationId) ||
+      !validAuthorizationState(request.state, request.organizationId)
+    ) {
+      return jsonError("Invalid inference authorization state", 400);
+    }
+    const storageKey = authorizationStateStorageKey(request.state);
+    const existing = await this.state.storage.get<unknown>(storageKey);
+    if (
+      existing !== undefined &&
+      !validAuthorizationStateRecord(existing, request.organizationId)
+    ) {
+      throw new Error("Inference authorization state is corrupt");
+    }
+    if (existing) {
+      const incomingRevision = authorizationRevision(request.state.revision);
+      const currentRevision = authorizationRevision(existing.state.revision);
+      if (incomingRevision < currentRevision) {
+        return Response.json({
+          applied: true,
+          stale: true,
+          authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        });
+      }
+      if (incomingRevision === currentRevision) {
+        if (canonicalJson(existing.state) !== canonicalJson(request.state)) {
+          return jsonError(
+            "Inference authorization revision conflicts with stored state",
+            409,
+          );
+        }
+        return Response.json({
+          applied: true,
+          duplicate: true,
+          authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        });
+      }
+    }
+
+    const now = Date.now();
+    await this.state.storage.transaction(async (transaction) => {
+      const boundary = (await transaction.get<AuthorizationBoundaryRecord>(
+        AUTHORIZATION_BOUNDARY_KEY,
+      )) ?? {
+        version: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        initializedAt: now,
+      };
+      if (!validAuthorizationBoundaryRecord(boundary)) {
+        throw new Error("Inference authorization boundary is corrupt");
+      }
+      await transaction.put(AUTHORIZATION_BOUNDARY_KEY, boundary);
+      await transaction.put(storageKey, {
+        version: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        organizationId: request.organizationId,
+        state: structuredClone(request.state),
+        updatedAt: now,
+      } satisfies AuthorizationStateRecord);
+    });
+    return Response.json({
+      applied: true,
+      duplicate: false,
+      authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+  }
+
+  private async applyAuthorizationStates(
+    request: AuthorizationStatesRequest,
+  ): Promise<Response> {
+    if (
+      !validTrimmedId(request.organizationId) ||
+      !Array.isArray(request.states) ||
+      request.states.length === 0 ||
+      request.states.length > 512 ||
+      request.states.some(
+        (state) => !validAuthorizationState(state, request.organizationId),
+      )
+    ) {
+      return jsonError("Invalid inference authorization state batch", 400);
+    }
+    const uniqueKeys = new Set(
+      request.states.map((state) => authorizationStateStorageKey(state)),
+    );
+    if (uniqueKeys.size !== request.states.length) {
+      return jsonError("Duplicate inference authorization state target", 400);
+    }
+
+    const updates: Array<{
+      storageKey: string;
+      state: InferenceAuthorizationTargetState;
+    }> = [];
+    for (const state of request.states) {
+      const storageKey = authorizationStateStorageKey(state);
+      const existing = await this.state.storage.get<unknown>(storageKey);
+      if (
+        existing !== undefined &&
+        !validAuthorizationStateRecord(existing, request.organizationId)
+      ) {
+        throw new Error("Inference authorization state is corrupt");
+      }
+      if (existing) {
+        const incomingRevision = authorizationRevision(state.revision);
+        const currentRevision = authorizationRevision(existing.state.revision);
+        if (incomingRevision < currentRevision) continue;
+        if (incomingRevision === currentRevision) {
+          if (canonicalJson(existing.state) !== canonicalJson(state)) {
+            return jsonError(
+              "Inference authorization revision conflicts with stored state",
+              409,
+            );
+          }
+          continue;
+        }
+      }
+      updates.push({ storageKey, state });
+    }
+
+    const now = Date.now();
+    await this.state.storage.transaction(async (transaction) => {
+      const boundary = (await transaction.get<AuthorizationBoundaryRecord>(
+        AUTHORIZATION_BOUNDARY_KEY,
+      )) ?? {
+        version: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        initializedAt: now,
+      };
+      if (!validAuthorizationBoundaryRecord(boundary)) {
+        throw new Error("Inference authorization boundary is corrupt");
+      }
+      await transaction.put(AUTHORIZATION_BOUNDARY_KEY, boundary);
+      for (const update of updates) {
+        await transaction.put(update.storageKey, {
+          version: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+          organizationId: request.organizationId,
+          state: structuredClone(update.state),
+          updatedAt: now,
+        } satisfies AuthorizationStateRecord);
+      }
+    });
+    return Response.json({
+      applied: true,
+      updated: updates.length,
+      authBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+  }
+
+  private authorizationDeniedResponse(
+    code:
+      | "inference_authorization_boundary_uninitialized"
+      | "inference_authorization_revoked",
+    status: 403 | 503,
+  ): Response {
+    return Response.json(
+      {
+        success: false,
+        code,
+        error:
+          status === 403
+            ? "Inference authorization was revoked"
+            : "Inference authorization boundary is warming",
+      },
+      { status },
+    );
+  }
+
+  private async assertAuthorization(
+    proof: InferenceAuthorizationProof,
+  ): Promise<Response | null> {
+    const boundary = await this.state.storage.get<unknown>(
+      AUTHORIZATION_BOUNDARY_KEY,
+    );
+    if (boundary === undefined) {
+      return this.authorizationDeniedResponse(
+        "inference_authorization_boundary_uninitialized",
+        503,
+      );
+    }
+    if (!validAuthorizationBoundaryRecord(boundary)) {
+      throw new Error("Inference authorization boundary is corrupt");
+    }
+    if (
+      proof.credential.expiresAt !== null &&
+      proof.credential.expiresAt <= Date.now()
+    ) {
+      return this.authorizationDeniedResponse(
+        "inference_authorization_revoked",
+        403,
+      );
+    }
+
+    const [
+      moderationState,
+      organizationState,
+      userState,
+      sessionState,
+      credentialState,
+    ] =
+      await Promise.all([
+        this.state.storage.get<unknown>(
+          authorizationStateStorageKey({
+            kind: "moderation",
+            id: proof.userId,
+          }),
+        ),
+        this.state.storage.get<unknown>(
+          authorizationStateStorageKey({
+            kind: "organization",
+            id: proof.organizationId,
+          }),
+        ),
+        this.state.storage.get<unknown>(
+          authorizationStateStorageKey({
+            kind: "user",
+            id: proof.userId,
+          }),
+        ),
+        proof.credential.kind === "steward_session"
+          ? this.state.storage.get<unknown>(
+              authorizationStateStorageKey({
+                kind: "session",
+                id: proof.userId,
+              }),
+            )
+          : Promise.resolve(undefined),
+        proof.credential.kind === "api_key"
+          ? this.state.storage.get<unknown>(
+              authorizationStateStorageKey({
+                kind: "credential",
+                id: proof.credential.id,
+                credentialKind: proof.credential.kind,
+              }),
+            )
+          : Promise.resolve(undefined),
+      ]);
+    for (const state of [
+      organizationState,
+      userState,
+      moderationState,
+      sessionState,
+      credentialState,
+    ]) {
+      if (
+        state !== undefined &&
+        !validAuthorizationStateRecord(state, proof.organizationId)
+      ) {
+        throw new Error("Inference authorization state is corrupt");
+      }
+    }
+    const organizationAuthorizationState = organizationState as
+      | AuthorizationStateRecord
+      | undefined;
+    const userAuthorizationState = userState as
+      | AuthorizationStateRecord
+      | undefined;
+    const moderationAuthorizationState = moderationState as
+      | AuthorizationStateRecord
+      | undefined;
+    const sessionAuthorizationState = sessionState as
+      | AuthorizationStateRecord
+      | undefined;
+    const credentialAuthorizationState = credentialState as
+      | AuthorizationStateRecord
+      | undefined;
+
+    const requiredStates =
+      proof.credential.kind === "api_key"
+        ? [
+            organizationAuthorizationState,
+            userAuthorizationState,
+            moderationAuthorizationState,
+            credentialAuthorizationState,
+          ]
+        : [
+            organizationAuthorizationState,
+            userAuthorizationState,
+            moderationAuthorizationState,
+            sessionAuthorizationState,
+          ];
+    if (requiredStates.some((state) => state === undefined)) {
+      return this.authorizationDeniedResponse(
+        "inference_authorization_boundary_uninitialized",
+        503,
+      );
+    }
+
+    if (
+      organizationAuthorizationState?.state.kind !== "organization" ||
+      organizationAuthorizationState.state.id !== proof.organizationId ||
+      userAuthorizationState?.state.kind !== "user" ||
+      userAuthorizationState.state.id !== proof.userId ||
+      moderationAuthorizationState?.state.kind !== "moderation" ||
+      moderationAuthorizationState.state.id !== proof.userId ||
+      (proof.credential.kind === "api_key" &&
+        (credentialAuthorizationState?.state.kind !== "credential" ||
+          credentialAuthorizationState.state.credentialKind !== "api_key" ||
+          credentialAuthorizationState.state.id !== proof.credential.id)) ||
+      (proof.credential.kind === "steward_session" &&
+        (sessionAuthorizationState?.state.kind !== "session" ||
+          sessionAuthorizationState.state.id !== proof.userId))
+    ) {
+      throw new Error("Inference authorization state is stored under the wrong target");
+    }
+
+    if (
+      organizationAuthorizationState?.state.denied ||
+      userAuthorizationState?.state.denied ||
+      moderationAuthorizationState?.state.denied ||
+      sessionAuthorizationState?.state.denied ||
+      credentialAuthorizationState?.state.denied
+    ) {
+      return this.authorizationDeniedResponse(
+        "inference_authorization_revoked",
+        403,
+      );
+    }
+    if (
+      authorizationRevision(organizationAuthorizationState.state.revision) !==
+        authorizationRevision(proof.organizationRevision) ||
+      authorizationRevision(userAuthorizationState.state.revision) !==
+        authorizationRevision(proof.userRevision) ||
+      authorizationRevision(moderationAuthorizationState.state.revision) !==
+        authorizationRevision(proof.userRevision) ||
+      (sessionAuthorizationState &&
+        authorizationRevision(sessionAuthorizationState.state.revision) >
+          authorizationRevision(proof.credential.revision)) ||
+      (credentialAuthorizationState &&
+        authorizationRevision(credentialAuthorizationState.state.revision) !==
+          authorizationRevision(proof.credential.revision))
+    ) {
+      return this.authorizationDeniedResponse(
+        "inference_authorization_revoked",
+        403,
+      );
+    }
+    if (credentialAuthorizationState) {
+      const state = credentialAuthorizationState.state;
+      if (
+        state.kind !== "credential" ||
+        state.credentialKind !== proof.credential.kind ||
+        state.id !== proof.credential.id ||
+        state.fingerprint !== proof.credential.fingerprint ||
+        state.userId !== proof.userId ||
+        state.expiresAt !== proof.credential.expiresAt ||
+        (state.expiresAt !== null && state.expiresAt <= Date.now())
+      ) {
+        return this.authorizationDeniedResponse(
+          "inference_authorization_revoked",
+          403,
+        );
+      }
+    }
+    return null;
+  }
+
+  private async authorizeProviderDispatch(
+    request: AuthorizationDispatchRequest,
+  ): Promise<Response> {
+    if (
+      !this.authorizationRequired() ||
+      !validTrimmedId(request.organizationId) ||
+      !isInferenceAuthorizationProof(request.authorization) ||
+      request.authorization.organizationId !== request.organizationId
+    ) {
+      return jsonError("Invalid inference authorization dispatch", 400);
+    }
+    const denied = await this.assertAuthorization(request.authorization);
+    if (denied) return denied;
+    return Response.json({
+      authorized: true,
+      authCheckedVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+  }
+
   private async lease(request: LeaseRequest): Promise<Response> {
     if (
       !validRequestId(request.requestId) ||
@@ -571,9 +1125,19 @@ export class InferenceAdmissionGate {
         request.recovery,
         request.requestId,
         request.organizationId,
-      )
+      ) ||
+      (request.authorization !== undefined &&
+        (!isInferenceAuthorizationProof(request.authorization) ||
+          request.authorization.organizationId !== request.organizationId ||
+          request.authorization.userId !== request.recovery.userId)) ||
+      (this.authorizationRequired() &&
+        !isInferenceAuthorizationProof(request.authorization))
     ) {
       return jsonError("Invalid inference admission lease", 400);
+    }
+    if (this.authorizationRequired() && request.authorization) {
+      const denied = await this.assertAuthorization(request.authorization);
+      if (denied) return denied;
     }
 
     const existing = await this.load();
@@ -602,7 +1166,9 @@ export class InferenceAdmissionGate {
       }
       if (
         prior.estimatedCostUsd !== request.estimatedCostUsd ||
-        canonicalJson(prior.recovery) !== canonicalJson(request.recovery)
+        canonicalJson(prior.recovery) !== canonicalJson(request.recovery) ||
+        canonicalOptionalJson(prior.authorization) !==
+          canonicalOptionalJson(request.authorization)
       ) {
         await this.save(ledger);
         return jsonError(
@@ -646,6 +1212,9 @@ export class InferenceAdmissionGate {
       expiresAt: now + MAX_LEASE_AGE_MS,
       phase: "leased",
       recovery: structuredClone(request.recovery),
+      ...(request.authorization && {
+        authorization: structuredClone(request.authorization),
+      }),
     };
     ledger.activeLeaseCount++;
     ledger.activeEstimateUsd += request.estimatedCostUsd;
@@ -754,6 +1323,16 @@ export class InferenceAdmissionGate {
     if (!lease) {
       return jsonError("Inference admission lease was not found", 409);
     }
+    if (this.authorizationRequired()) {
+      if (!lease.authorization) {
+        return this.authorizationDeniedResponse(
+          "inference_authorization_boundary_uninitialized",
+          503,
+        );
+      }
+      const denied = await this.assertAuthorization(lease.authorization);
+      if (denied) return denied;
+    }
     if (lease.phase === "recovering") {
       return jsonError(
         "Inference admission lease recovery is in progress",
@@ -780,7 +1359,13 @@ export class InferenceAdmissionGate {
         delete: [{ requestId: request.requestId, lease }],
         put: [{ requestId: request.requestId, lease: refreshed }],
       });
-      return Response.json({ dispatched: true, duplicate: true });
+      return Response.json({
+        dispatched: true,
+        duplicate: true,
+        ...(this.authorizationRequired() && {
+          authCheckedVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        }),
+      });
     }
     const dispatched: ActiveLease = {
       ...lease,
@@ -792,7 +1377,13 @@ export class InferenceAdmissionGate {
       delete: [{ requestId: request.requestId, lease }],
       put: [{ requestId: request.requestId, lease: dispatched }],
     });
-    return Response.json({ dispatched: true, duplicate: false });
+    return Response.json({
+      dispatched: true,
+      duplicate: false,
+      ...(this.authorizationRequired() && {
+        authCheckedVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+      }),
+    });
   }
 
   private async release(request: LeaseIdentityRequest): Promise<Response> {
@@ -896,20 +1487,50 @@ export class InferenceAdmissionGate {
       | HydrateRequest
       | SettleRequest
       | LeaseIdentityRequest
-      | RateLimitRequest;
+      | RateLimitRequest
+      | AuthorizationBoundaryRequest
+      | AuthorizationStateRequest
+      | AuthorizationStatesRequest
+      | AuthorizationDispatchRequest;
     try {
       body = (await request.json()) as
         | LeaseRequest
         | HydrateRequest
         | SettleRequest
         | LeaseIdentityRequest
-        | RateLimitRequest;
+        | RateLimitRequest
+        | AuthorizationBoundaryRequest
+        | AuthorizationStateRequest
+        | AuthorizationStatesRequest
+        | AuthorizationDispatchRequest;
     } catch {
       // error-policy:J3 malformed request bodies are rejected explicitly.
       return jsonError("Invalid JSON body", 400);
     }
     if (!body) return jsonError("Invalid JSON body", 400);
     const path = new URL(request.url).pathname;
+    if (path === "/authorization/initialize") {
+      return await this.serialize(() =>
+        this.initializeAuthorizationBoundary(
+          body as AuthorizationBoundaryRequest,
+        ),
+      );
+    }
+    if (path === "/authorization/apply") {
+      return await this.serialize(() =>
+        this.applyAuthorizationState(body as AuthorizationStateRequest),
+      );
+    }
+    if (path === "/authorization/apply-batch") {
+      return await this.serialize(() =>
+        this.applyAuthorizationStates(body as AuthorizationStatesRequest),
+      );
+    }
+    if (path === "/authorization/dispatch") {
+      return await this.serialize(() =>
+        this.authorizeProviderDispatch(body as AuthorizationDispatchRequest),
+      );
+    }
     if (path === "/lease") {
       return await this.serialize(() => this.lease(body as LeaseRequest));
     }

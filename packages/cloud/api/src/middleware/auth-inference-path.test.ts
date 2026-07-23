@@ -8,6 +8,8 @@ import { isRouteAuthenticatedInferencePath } from "./auth";
 
 describe("isRouteAuthenticatedInferencePath", () => {
   test.each([
+    "/api/v1/generate-prompts",
+    "/api/v1/apps/app-1/chat",
     "/api/v1/eliza/agents/agent-1/stream",
     "/api/v1/eliza/agents/agent-1/bridge",
     "/api/v1/eliza/agents/agent-1/api/conversations/conversation-1/messages",
@@ -18,6 +20,9 @@ describe("isRouteAuthenticatedInferencePath", () => {
   });
 
   test.each([
+    "/api/v1/apps/app-1",
+    "/api/v1/apps/app-1/chat/history",
+    "/api/v1/generate-prompts/history",
     "/api/v1/eliza/agents/agent-1",
     "/api/v1/eliza/agents/agent-1/api/conversations",
     "/api/v1/eliza/agents/agent-1/api/conversations/conversation-1/messages/extra",

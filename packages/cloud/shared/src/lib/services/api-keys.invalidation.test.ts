@@ -1,20 +1,9 @@
 /**
- * API-key revocation cache-invalidation fails closed (#13417).
+ * Cache cleanup reports incomplete API-key eviction.
  *
- * `apiKeysService.invalidateCache()` is on every revoke / delete / deactivate
- * path. It clears BOTH the validation cache (16-char prefix) and the #9899
- * inference hot-path auth-context entry. Previously it fired both `cache.del`
- * calls inside a `Promise.all` and discarded their result, and `cache.del`
- * itself swallowed a backend failure — so a Redis `del` that never landed left
- * a REVOKED key authenticating from cache until its TTL lapsed, while the
- * revoke path reported success.
- *
- * These tests pin the corrected contract: an unconfirmed delete of either cache
- * surfaces as a throw, so the caller (route) can fail closed and retry rather
- * than believe the key is gone. Ordering matters too: `delete()` invalidates
- * BEFORE the DB delete, so a failed invalidation aborts before the row is
- * removed — the key stays consistently active-and-cached, never
- * DB-revoked-but-cache-live.
+ * Lifecycle mutations use the inference admission Durable Object as their
+ * authorization boundary, while this lower-level helper keeps validation and
+ * positive-auth caches from retaining stale data for their full TTL.
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
@@ -78,25 +67,6 @@ describe("apiKeysService.invalidateCache fails closed (#13417)", () => {
     await expect(apiKeysService.invalidateCache(KEY_HASH)).rejects.toThrow(/not confirmed/i);
   });
 
-  test("delete(): failed invalidation aborts BEFORE the DB row is removed", async () => {
-    track(spyOn(apiKeysRepository, "findById").mockResolvedValue(fakeKey()));
-    const repoDelete = track(spyOn(apiKeysRepository, "delete").mockResolvedValue(undefined));
-    track(spyOn(cache, "delConfirmed").mockResolvedValue(false));
-
-    await expect(apiKeysService.delete("key-1")).rejects.toThrow(/not confirmed/i);
-    // fail-closed ordering: the DB delete must NOT run once invalidation failed
-    expect(repoDelete).not.toHaveBeenCalled();
-  });
-
-  test("delete(): confirmed invalidation lets the DB delete proceed", async () => {
-    track(spyOn(apiKeysRepository, "findById").mockResolvedValue(fakeKey()));
-    const repoDelete = track(spyOn(apiKeysRepository, "delete").mockResolvedValue(undefined));
-    track(spyOn(cache, "delConfirmed").mockResolvedValue(true));
-
-    await expect(apiKeysService.delete("key-1")).resolves.toBeUndefined();
-    expect(repoDelete).toHaveBeenCalledWith("key-1");
-  });
-
   test("invalidateInferenceContextForUser: unconfirmed fan-out throws (ban fails closed)", async () => {
     track(
       spyOn(apiKeysRepository, "listByUser").mockResolvedValue([
@@ -121,13 +91,5 @@ describe("apiKeysService.invalidateCache fails closed (#13417)", () => {
     await expect(
       apiKeysService.invalidateInferenceContextForUser("user-1"),
     ).resolves.toBeUndefined();
-  });
-
-  test("revokeForAgent: unconfirmed invalidation does NOT abort (row already deleted, best-effort)", async () => {
-    // rows deleted FIRST -> credential already DB-revoked; a cache brownout must
-    // not abort agent reprovisioning (codex round-2 P2).
-    track(spyOn(apiKeysRepository, "deleteByName").mockResolvedValue([fakeKey()]));
-    track(spyOn(cache, "delConfirmed").mockResolvedValue(false));
-    await expect(apiKeysService.revokeForAgent("sandbox-1")).resolves.toBeUndefined();
   });
 });

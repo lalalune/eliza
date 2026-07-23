@@ -8,12 +8,19 @@ An admitted Cloudflare Worker token/model request must not query or mutate
 Postgres, connect to Railway Redis, or wait for an accounting write before
 dispatching the provider request. This contract covers `/v1/chat`,
 `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings`,
-shared-agent model turns, and the internal Eliza model turn used by a voice
-session.
+`/v1/generate-prompts`, app chat, public A2A/MCP chat, shared-agent model turns,
+and the internal Eliza model turn used by a voice session.
 
 Direct TTS, STT, and voice-clone requests are outside this contract. They are
 metered media or stateful job endpoints with their own reservation and job-state
 requirements; they are not token/model LLM dispatches.
+
+Eliza onboarding/provisioning chat and promotion/SEO/social content generation
+are separate control-plane workflows. They combine model calls with provisioning,
+ownership, connector, or publication state and do not expose the public
+text/embedding inference contract. They remain visible in the provider-dispatch
+inventory as synchronous control-plane work; adding one of those call sites to a
+covered inference route requires migrating it to this cache/lease boundary first.
 
 The synchronous Worker path is:
 
@@ -59,6 +66,11 @@ and exact organization limits use the same per-organization Durable Object that
 owns monetary leases. General API and excluded media/job routes can continue
 using Railway Redis without making it a prerequisite for an LLM request.
 
+Routes that own this cache-only credential check also bypass the global Steward
+session resolver. Otherwise a cookie-authenticated app-chat or prompt request
+could query the authoritative session store before reaching the route's warming
+decision even though its route implementation was cache-only.
+
 Moving the entire inference control plane into Railway would change this
 tradeoff. In that topology, Redis with atomic scripts could own exact counters
 and short-lived leases. Mixing a Cloudflare Worker with Railway Redis is not the
@@ -68,8 +80,8 @@ selected production architecture.
 
 | State | Synchronous owner | Durable/source-of-truth owner | Consistency |
 | --- | --- | --- | --- |
-| API-key and Steward-session authorization | Postgres/Steward | Postgres/Steward | Authoritative while `INFERENCE_AUTH_CACHE_ENABLED` is false |
-| Moderation decision | Cloudflare KV auth context | Postgres | Invalidated on lifecycle changes; bounded staleness |
+| API-key and Steward-session authorization | Cloudflare KV proof plus per-org Durable Object | Postgres/Steward | Eventual positive projection; strongly ordered revision/revocation check at dispatch |
+| Moderation decision | Cloudflare KV proof plus per-org Durable Object | Postgres | Eventual positive projection; strongly ordered deny/revision check at dispatch |
 | Model pricing | Cloudflare KV | Pricing tables | Revisioned cache; cold requests warm and retry |
 | Affiliate attribution | Cloudflare KV | Postgres | Immutable snapshot per admitted request |
 | App policy | Cloudflare KV | Postgres | Immutable snapshot per admitted request |
@@ -88,18 +100,28 @@ remain transactional in Postgres and publish monotonic cache revisions.
 
 ## Authorization and cold-cache behavior
 
-Authorization remains authoritative by default. `INFERENCE_AUTH_CACHE_ENABLED`
-is a separate, fail-closed rollout control and stays false in every checked-in
-environment until revocation has a strongly consistent boundary. A successful
-KV deletion is not proof that every point of presence has stopped serving an
-older positive value.
+`INFERENCE_AUTH_CACHE_ENABLED` selects a fail-closed authorization path for
+covered Worker inference routes. A positive KV value is a versioned proof, not
+the revocation authority. It contains the organization, user, and credential
+identity plus their monotonic revisions. The per-organization Durable Object
+compares that proof with its current authorization state in the final dispatch
+transition. A stale KV grant therefore cannot invoke a provider after an
+organization, user, moderation, API-key, or Steward-session revocation reaches
+the object.
 
-The gated implementation accepts positive cache entries only for fully
-authorized credentials. API-key entries are keyed by the full credential hash.
-Steward-session entries currently use the verified subject, so the gate must
-also remain disabled until they use an immutable session identity. Wallet
-signatures remain outside the cache-only Worker path because their timestamped
-proof cannot safely be replayed as an asynchronous hydration.
+Lifecycle writers use fail-closed ordering. Restrictive transitions reach the
+Durable Object before their database transaction commits; if the object is
+unavailable, the database mutation rolls back. Permissive transitions publish
+only after commit. KV deletion is cache hygiene and reduces retries, but is not
+relied upon for revocation correctness.
+
+API-key entries are keyed by the full SHA-256 credential hash. Steward JWTs are
+signature, expiry, issuer, and tenant checked locally on every request and their
+cache entries are keyed by the full signed-token fingerprint. A monotonic
+per-user `inference_session_not_before` revision revokes all JWTs issued before
+that boundary without an unbounded token-tombstone set. Wallet signatures remain
+outside the cache-only Worker path because their timestamped proof cannot safely
+be replayed as asynchronous hydration.
 
 On a Worker cache miss:
 
@@ -109,9 +131,10 @@ On a Worker cache miss:
 - no provider request starts until a later request observes the populated
   cache.
 
-When the gate is enabled, cache errors never fabricate authorization and never
-join a Postgres fallback to the request promise. Invalidation is only a cache
-hygiene mechanism; it is not the authorization revocation boundary.
+Cache errors never fabricate authorization and never join a Postgres fallback
+to the request promise. The final provider-dispatch transition must acknowledge
+the current authorization-boundary protocol version; an older or mixed-version
+Durable Object response fails closed before the provider call.
 
 Pricing, affiliate attribution, app policy, balance, and uninitialized Durable
 Objects follow the same fail-closed warming pattern. The first request may warm
@@ -200,17 +223,22 @@ These rules prefer an explicit retry over hidden latency or free inference.
 Staging and production require:
 
 - `CACHE_KV`;
+- `CACHE_BACKEND="kv"`;
 - `GLOBAL_RATE_LIMITER`, `CHAT_ROUTE_RATE_LIMITER`, and
   `DASHBOARD_CHAT_ROUTE_RATE_LIMITER`;
 - `INFERENCE_ADMISSION_GATES`;
 - `ANONYMOUS_CHAT_GATES`;
 - `INFERENCE_OPTIMISTIC_BILLING="true"`;
 - `INFERENCE_DEFERRED_ADMISSION="true"`; and
-- `INFERENCE_HOT_PATH_CACHES="true"`.
+- `INFERENCE_HOT_PATH_CACHES="true"`;
+- `INFERENCE_AUTH_CACHE_ENABLED="true"`.
 
-`INFERENCE_AUTH_CACHE_ENABLED` remains `"false"` in staging and production.
-Enabling it requires the strong revocation and immutable-session contract
-described above plus deployed rollback evidence.
+The deploy workflow applies database migrations before publishing the Worker.
+That ordering is required because the authorization proof reads monotonic
+revision columns installed by the same release. If migration fails, the Worker
+deploy is skipped. Rolling the authorization flag back to `"false"` restores
+the authoritative compatibility path, but covered inference routes must not be
+left in a mixed mode that silently falls through from KV to Railway Redis.
 
 `INFERENCE_BILLING_LEDGER` still selects the compatibility ledger for
 non-Worker callers and sweep migration support. It does not add a ledger write
@@ -224,16 +252,20 @@ token/model routes use Cloudflare-native bindings and do not require
 
 The production contract is protected at three layers:
 
-1. Route tripwire tests install database seams that throw if chat,
-   completions, messages, responses, embeddings, shared-agent, or the
+1. A source inventory discovers provider dispatch sites and requires every
+   covered user-triggered LLM path to declare its admission contract. Route
+   tripwire tests install database seams that throw if chat, completions,
+   messages, responses, embeddings, prompt generation, app/A2A/MCP chat,
+   shared-agent, the covered connector shared-model dispatch segment, or the
    voice-session internal Eliza turn touches them before provider dispatch.
 2. Admission tests assert the only warm pre-dispatch write is the Durable
    Object lease, including organization, affiliate, app, anonymous, cold-cache,
    concurrency, and crash-recovery cases.
-3. An in-process benchmark measures the serial rate, lease, and dispatch
-   transitions and asserts zero pre-provider Postgres, Redis, ledger,
-   reservation, or payout operations. Deployed Worker-to-Durable-Object latency
-   must be measured separately in the target Cloudflare topology.
+3. An in-process benchmark measures the serial rate, lease, authorization
+   re-check, and dispatch transitions and asserts zero pre-provider Postgres,
+   Redis, ledger, reservation, or payout operations. It reports latency without
+   imposing host-speed floors. Deployed Worker-to-Durable-Object latency must be
+   measured separately in the target Cloudflare topology.
 
 Migration tests apply the accounting schema to PGlite. Money tests exercise
 idempotent direct debits, app reconciliation, affiliate payout outbox replay,

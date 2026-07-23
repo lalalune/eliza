@@ -91,6 +91,8 @@ export interface StewardVerifyEnv {
 
 export interface StewardVerifyOptions {
   executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+  /** Keep inference verification on local crypto + isolate memory only. */
+  localOnly?: boolean;
 }
 
 export const STEWARD_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
@@ -126,11 +128,16 @@ export async function mintStewardTokenFromClaims(
   env: StewardVerifyEnv,
   claims: StewardTokenClaims,
   ttlSeconds = STEWARD_ACCESS_TOKEN_TTL_SECONDS,
+  options: { minimumIssuedAt?: number } = {},
 ): Promise<{ token: string; expiresAt: number; expiresIn: number } | null> {
   const secret = resolveJwtSecret(env);
   if (!secret) return null;
 
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.max(
+    Math.floor(Date.now() / 1000),
+    claims.issuedAt,
+    options.minimumIssuedAt ?? 0,
+  );
   const expiresIn = Math.max(1, Math.floor(ttlSeconds));
   const expiresAt = now + expiresIn;
   const payload: Record<string, unknown> = {
@@ -233,8 +240,9 @@ export async function verifyStewardTokenCached(
       return inMemoryCached;
     }
 
-    // 1. Check Redis cache
-    const cached = await cache.get<CachedStewardClaims>(cacheKey);
+    // Inference requests deliberately skip the remote cache: local signature
+    // verification is cheaper than adding a cross-region network dependency.
+    const cached = options.localOnly ? null : await cache.get<CachedStewardClaims>(cacheKey);
     if (cached && cached.expiration > now) {
       logger.debug("[StewardClient] ✓ Redis cache hit", {
         tokenHash: tokenHash.substring(0, 8),
@@ -303,7 +311,7 @@ export async function verifyStewardTokenCached(
     const tokenRemainingSeconds = claims.expiration - now;
     const effectiveTtl = Math.min(CacheTTL.session.steward, tokenRemainingSeconds);
 
-    if (effectiveTtl > 0) {
+    if (effectiveTtl > 0 && !options.localOnly) {
       const cachedClaims: CachedStewardClaims = {
         ...claims,
         cachedAt: Date.now(),

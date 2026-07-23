@@ -209,6 +209,7 @@ app.get("/", (c) => {
         conversationId: claims.conversationId,
         organizationId: claims.organizationId,
         userId: claims.userId,
+        authorization: claims.authorization,
       });
       return new VoiceSession({
         sessionId: claims.sessionId,

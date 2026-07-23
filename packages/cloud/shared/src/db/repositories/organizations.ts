@@ -112,6 +112,14 @@ export class OrganizationsRepository {
    * Updates an existing organization.
    */
   async update(id: string, data: Partial<NewOrganization>): Promise<Organization | undefined> {
+    if (
+      Object.hasOwn(data, "is_active") ||
+      Object.hasOwn(data, "inference_auth_revision")
+    ) {
+      throw new Error(
+        "Authorization-sensitive organization fields must be updated through OrganizationsService",
+      );
+    }
     const [updated] = await dbWrite
       .update(organizations)
       .set({
@@ -163,13 +171,6 @@ export class OrganizationsRepository {
     });
 
     return result;
-  }
-
-  /**
-   * Deletes an organization by ID.
-   */
-  async delete(id: string): Promise<void> {
-    await dbWrite.delete(organizations).where(eq(organizations.id, id));
   }
 
   /**

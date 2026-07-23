@@ -3,6 +3,8 @@
  *
  * Production chat callers use the cache-only mode: misses schedule
  * authoritative hydration under waitUntil and return retryable unavailability.
+ * When strong inference auth is enabled, the resolver also carries the
+ * server-minted proof that the admission Durable Object rechecks at dispatch.
  */
 
 import { createHash } from "node:crypto";
@@ -20,6 +22,15 @@ import {
 import { cache } from "../../cache/client";
 import { CacheKeys, CacheTTL } from "../../cache/keys";
 import { logger } from "../../utils/logger";
+import {
+  type ResolvedInferenceAuthContext,
+  resolveInferenceAuthContext,
+} from "../inference-auth-context";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "../inference-authorization-boundary";
+import { isInferenceAuthCacheEnabled } from "../inference-hot-path-caches";
 import { type CachedAgentSandbox, rehydrateCachedAgentDates } from "./cached-agent-dates";
 import { isDedicatedBootstrapWindow } from "./dedicated-bootstrap";
 
@@ -27,7 +38,17 @@ export { type CachedAgentSandbox, rehydrateCachedAgentDates } from "./cached-age
 
 export type ResolvedSharedAgent =
   | { error: string; status: 400 | 401 | 403 | 404 | 503 }
-  | { agent: AgentSandbox; agentId: string; orgId: string; agentName: string };
+  | {
+      agent: AgentSandbox;
+      agentId: string;
+      orgId: string;
+      agentName: string;
+      /**
+       * Server-minted proof for cache-authorized inference. It is rechecked by
+       * the organization admission Durable Object at provider dispatch.
+       */
+      authorization?: InferenceAuthorizationProof;
+    };
 
 export interface SharedRuntimeExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
@@ -100,11 +121,9 @@ interface CachedSharedAgentScope {
   orgId: string;
   agent: CachedAgentSandbox;
   /**
-   * Steward user id the entry was written for, present ONLY on session-keyed
-   * entries (#SHADOW-ACCOUNT-DEBUG). A session-path hit re-verifies the JWT and
-   * confirms it still maps to THIS user before serving, so a rotated/re-issued
-   * token for a different user can't read a stale entry. Absent on API-key
-   * entries (those revalidate via the key's org instead).
+   * Steward user id used by the flag-off compatibility lane. Strong-auth
+   * requests revalidate from the combined IAC decision and carry its immutable
+   * proof instead of trusting this scope-cache field.
    */
   stewardUserId?: string;
   /**
@@ -145,6 +164,15 @@ function isCacheableScopeFailureStatus(
   status: number,
 ): status is NonNullable<NegativeSharedAgentScope["status"]> {
   return status === 400 || status === 401 || status === 403 || status === 404;
+}
+
+function immutableAuthorizationProof(
+  proof: InferenceAuthorizationProof,
+): InferenceAuthorizationProof {
+  return Object.freeze({
+    ...proof,
+    credential: Object.freeze({ ...proof.credential }),
+  });
 }
 
 /**
@@ -215,19 +243,96 @@ export async function resolveSharedAgent(
     };
   }
 
+  let inferenceAuth: ResolvedInferenceAuthContext | undefined;
+  if (options.cacheOnly && isInferenceAuthCacheEnabled()) {
+    let resolution: Awaited<ReturnType<typeof resolveInferenceAuthContext>>;
+    try {
+      resolution = await resolveInferenceAuthContext(c.req.raw, {
+        cacheOnly: true,
+        executionCtx,
+      });
+    } catch (error) {
+      // error-policy:J4 a failed cache-local authorization dependency cannot
+      // fall through to the legacy scope resolver or an inline database read.
+      logger.warn("[resolveSharedAgent] inference authorization failed", {
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        error: "Agent authorization is unavailable. Retry shortly.",
+        status: 503,
+      };
+    }
+    if (resolution.kind === "warming") {
+      return {
+        error: "Agent authorization cache is warming. Retry shortly.",
+        status: 503,
+      };
+    }
+    if (resolution.kind === "suspended") {
+      return { error: "User account is suspended", status: 403 };
+    }
+    if (resolution.kind === "rejected") {
+      return {
+        error: "Credential is not authorized for inference",
+        status: resolution.status,
+      };
+    }
+    if (resolution.kind === "slow_path") {
+      return {
+        error: "A supported API key or session credential is required.",
+        status: 401,
+      };
+    }
+    if (
+      !isInferenceAuthorizationProof(resolution.ctx.authorization) ||
+      resolution.ctx.authorization.organizationId !== resolution.ctx.orgId ||
+      resolution.ctx.authorization.userId !== resolution.ctx.userId
+    ) {
+      return {
+        error: "Agent authorization cache is unavailable. Retry shortly.",
+        status: 503,
+      };
+    }
+    inferenceAuth = resolution.ctx;
+  }
+  const authorization = inferenceAuth
+    ? immutableAuthorizationProof(inferenceAuth.authorization)
+    : undefined;
+  const resolvedAgent = (
+    agent: AgentSandbox,
+    orgId: string,
+  ): Exclude<ResolvedSharedAgent, { error: string }> => ({
+    agent,
+    agentId,
+    orgId,
+    agentName: agent.agent_name ?? "Eliza",
+    ...(authorization && { authorization }),
+  });
+
   // COLD-PATH fast lane (COLDPATH-FIX-2026-07-21): on the API-key path, a fresh
   // browser session pays 2 serial cold Hyperdrive waves here (key validation +
   // user/org hydration + agent lookup) = the measured 1–4.4s pre-inference
   // stall. A short-TTL scope cache keyed by (key-hash, agentId) lets the second
   // cold-session hit (or a composer-mount prewarm) skip both waves. Miss → the
   // authoritative gate below runs unchanged, so this only removes latency.
-  // API-key path uses the key-hash prefix; SESSION path (Shadow's own account:
-  // steward JWT / cookie) uses the session-token hash under a distinct `s:`
-  // namespace so a session hash can never collide with an API-key hash
-  // (#SHADOW-ACCOUNT-DEBUG). Whichever credential the request carries wins;
-  // requests carrying neither skip the cache and hit the authoritative gate.
-  const apiKeyPrefix = await apiKeyScopeHashPrefix(c);
-  const sessionPrefix = apiKeyPrefix ? null : await sessionScopeHashPrefix(c);
+  // Strong auth uses the full credential fingerprint from the validated IAC
+  // proof. The flag-off compatibility lane retains its prior hash prefixes;
+  // session entries stay under a distinct `s:` namespace so credential kinds
+  // cannot collide. Requests carrying neither credential fail closed.
+  const strongCredential = authorization?.credential;
+  const apiKeyPrefix =
+    strongCredential?.kind === "api_key"
+      ? strongCredential.fingerprint
+      : strongCredential
+        ? null
+        : await apiKeyScopeHashPrefix(c);
+  const sessionPrefix =
+    strongCredential?.kind === "steward_session"
+      ? strongCredential.fingerprint
+      : apiKeyPrefix
+        ? null
+        : await sessionScopeHashPrefix(c);
   const isSessionScope = apiKeyPrefix == null && sessionPrefix != null;
   const scopeKeyPrefix = apiKeyPrefix ?? (sessionPrefix ? `s:${sessionPrefix}` : null);
   const scopeCacheKey = scopeKeyPrefix
@@ -253,18 +358,18 @@ export async function resolveSharedAgent(
     ) {
       return null;
     }
-    // SECURITY: a hit skips the expensive user/org+agent DB hydration, but it
-    // must NOT skip the credential gate. API-key path: re-run the (already-
-    // cached, revoke-invalidated) key validation + org match. SESSION path:
-    // re-run the warm-cached steward JWT verify + confirm it still maps to the
-    // SAME steward user the entry was written for. Either way a
-    // revoked/expired/re-scoped credential falls back to the authoritative
-    // gate inside the 30s TTL window; we only skip the cold DB waves.
+    // A strong-auth hit is joined only to the already-validated IAC identity;
+    // the admission object remains authoritative for revocation at dispatch.
+    // The flag-off compatibility lane retains its cached API-key/session
+    // revalidation. Neither lane trusts agent scope without an org match.
     let stillAuthorized: boolean;
     try {
-      stillAuthorized = isSessionScope
-        ? cached.stewardUserId != null && (await revalidateSessionScope(c, cached.stewardUserId))
-        : await revalidateCachedScope(c, cached.orgId, options.cacheOnly === true);
+      stillAuthorized = inferenceAuth
+        ? cached.orgId === inferenceAuth.orgId &&
+          cached.agent.organization_id === inferenceAuth.orgId
+        : isSessionScope
+          ? cached.stewardUserId != null && (await revalidateSessionScope(c, cached.stewardUserId))
+          : await revalidateCachedScope(c, cached.orgId, options.cacheOnly === true);
     } catch (error) {
       // error-policy:J4 a cache credential dependency failure cannot authorize
       // the request; cache-only callers receive the explicit warming response.
@@ -280,12 +385,7 @@ export async function resolveSharedAgent(
     // `agent.created_at.toISOString()`). Without this a cache hit 500s the read
     // (CONVERSATIONS-500-2026-07-22).
     const agent = rehydrateCachedAgentDates(cached.agent);
-    return {
-      agent,
-      agentId,
-      orgId: cached.orgId,
-      agentName: agent.agent_name ?? "Eliza",
-    };
+    return resolvedAgent(agent, cached.orgId);
   };
 
   // SLIDING-TTL refresh on a VALIDATED hit (COLDPATH-FIX-2026-07-22). The
@@ -375,9 +475,26 @@ export async function resolveSharedAgent(
   const hydrateScopeEntry = async (): Promise<SharedAgentScopeCacheEntry> => {
     try {
       const { agentSandboxesRepository } = await import("../../../db/repositories/agent-sandboxes");
-      const { user, orgLookupResult: agent } = await requireUserOrApiKeyWithOrgLookup(c, (orgId) =>
-        agentSandboxesRepository.findByIdAndOrg(agentId, orgId),
-      );
+      let orgId: string;
+      let agent: AgentSandbox | null | undefined;
+      let stewardUserId: string | undefined;
+      if (inferenceAuth) {
+        orgId = inferenceAuth.orgId;
+        agent = await agentSandboxesRepository.findByIdAndOrg(agentId, orgId);
+        if (inferenceAuth.apiKeyId === null) {
+          stewardUserId = inferenceAuth.stewardUserId;
+        }
+      } else {
+        const resolved = await requireUserOrApiKeyWithOrgLookup(c, (organizationId) =>
+          agentSandboxesRepository.findByIdAndOrg(agentId, organizationId),
+        );
+        orgId = resolved.user.organization_id;
+        agent = resolved.orgLookupResult;
+        stewardUserId =
+          isSessionScope && typeof resolved.user.steward_id === "string"
+            ? resolved.user.steward_id
+            : undefined;
+      }
       if (!agent) {
         return {
           unresolvable: true,
@@ -398,14 +515,13 @@ export async function resolveSharedAgent(
         const { charactersService } = await import("../characters/characters");
         await charactersService.getById(agent.character_id);
       }
-      const base =
-        isSessionScope && typeof user.steward_id === "string"
-          ? {
-              orgId: user.organization_id,
-              agent,
-              stewardUserId: user.steward_id,
-            }
-          : { orgId: user.organization_id, agent };
+      const base = stewardUserId
+        ? {
+            orgId,
+            agent,
+            stewardUserId,
+          }
+        : { orgId, agent };
       return { ...base, firstWrittenAtMs: Date.now() };
     } catch (error) {
       if (error instanceof ApiError && isCacheableScopeFailureStatus(error.status)) {
@@ -514,5 +630,5 @@ export async function resolveSharedAgent(
     else void write;
   }
 
-  return { agent, agentId, orgId: user.organization_id, agentName: agent.agent_name ?? "Eliza" };
+  return resolvedAgent(agent, user.organization_id);
 }

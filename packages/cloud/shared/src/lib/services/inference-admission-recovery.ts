@@ -13,6 +13,10 @@ import {
   isAffiliateBillingAttribution,
 } from "./affiliate-billing-attribution";
 import { AFFILIATE_PAYOUT_CONTRACT_VERSION } from "./affiliate-payout-outbox";
+import {
+  readAgentInferenceRecoveryPolicy,
+  recordAgentInferenceCreatorEarnings,
+} from "./agent-monetization";
 import { type AppCreditReservationAccountingApp, appCreditsService } from "./app-credits";
 import { type CreditReconciliationResult, creditsService, MIN_RESERVATION } from "./credits";
 import { debitInferenceCost } from "./inference-billing-fast-path";
@@ -255,6 +259,16 @@ async function recoverOrganizationCharge(
   }
   const partiallyCollected =
     collectedUsd + 0.0000001 < Math.max(estimatedCostUsd, outcome.attemptedAmountUsd);
+  const agentPolicy = readAgentInferenceRecoveryPolicy(context.metadata);
+  if (agentPolicy && outcome.status === "collected" && !partiallyCollected) {
+    await recordAgentInferenceCreatorEarnings({
+      policy: agentPolicy,
+      requestId: context.requestId,
+      totalCostUsd: estimatedCostUsd,
+      consumerOrgId: context.organizationId,
+      model: context.model,
+    });
+  }
   return {
     collectedUsd,
     gateConsumedUsd:

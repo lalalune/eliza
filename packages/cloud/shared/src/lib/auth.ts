@@ -20,6 +20,10 @@ import { getCookieValueFromHeader } from "./http/cookie-header";
 import { getCloudAwareEnv } from "./runtime/cloud-bindings";
 import { adminService } from "./services/admin";
 import { apiKeysService } from "./services/api-keys";
+import {
+  hashInferenceSessionCredential,
+  invalidateInferenceSessionAuthContext,
+} from "./services/inference-auth-cache";
 import { userSessionsService } from "./services/user-sessions";
 import { usersService } from "./services/users";
 import { ensureDefaultCharacter, syncUserFromSteward } from "./steward-sync";
@@ -59,7 +63,17 @@ export async function invalidateUserSessionCache(sessionToken: string): Promise<
  * Invalidate all caches for a session token. Call this on logout.
  */
 export async function invalidateSessionCaches(sessionToken: string): Promise<void> {
-  await invalidateStewardTokenCache(sessionToken);
+  const credentialFingerprint = hashInferenceSessionCredential(sessionToken);
+  const [, inferenceDeleted] = await Promise.all([
+    invalidateStewardTokenCache(sessionToken),
+    invalidateInferenceSessionAuthContext(credentialFingerprint),
+  ]);
+  if (!inferenceDeleted) {
+    logger.warn(
+      "[AUTH] Inference session cache deletion was not confirmed; the durable revocation boundary remains authoritative",
+      { credentialFingerprintPrefix: credentialFingerprint.substring(0, 16) },
+    );
+  }
   logger.debug("[AUTH] Invalidated all session caches (Steward + user)");
 }
 

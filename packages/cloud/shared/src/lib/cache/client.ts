@@ -304,12 +304,25 @@ export class CacheClient {
         logger.info("[Cache] ✓ Cache client initialized with Cloudflare KV");
         return;
       }
+      if (backendPreference === "kv") {
+        // An explicit Worker KV selection is a latency and topology contract.
+        // Falling through to Railway Redis when the binding is absent would
+        // silently put cross-region TCP back onto inference requests.
+        this.enabled = false;
+        logger.error("[Cache] CACHE_BACKEND=kv requires the CACHE_KV Worker binding");
+        return;
+      }
     }
 
     // Workers can't speak raw TCP via the `redis` package, but `cloudflare:sockets`
     // works for RESP2. Use the SocketRedis adapter whenever we're in a Worker and
     // a real REDIS_URL is set.
-    if (inWorker && socketRedisConfigured && redisUrl && backendPreference !== "redis-rest") {
+    if (
+      inWorker &&
+      socketRedisConfigured &&
+      redisUrl &&
+      (backendPreference === "auto" || backendPreference === "redis")
+    ) {
       this.backendConfigured = true;
       this.redis = new SocketRedisAdapter(new SocketRedis({ url: redisUrl }));
       this.nativeRedisConnectPromise = null;

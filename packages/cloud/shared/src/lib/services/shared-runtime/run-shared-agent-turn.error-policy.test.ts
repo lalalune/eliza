@@ -61,6 +61,8 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
+const PROVIDER_DISPATCH = async () => undefined;
+
 describe("runSharedAgentTurn — internal failure propagates vs designed-empty degrades", () => {
   test("marks dispatch only at the final model handoff", async () => {
     let dispatches = 0;
@@ -115,6 +117,7 @@ describe("runSharedAgentTurn — internal failure propagates vs designed-empty d
       character: { name: "Nova", system: "You are Nova.", model: "gpt-oss-120b" },
       history: [],
       message: "hello",
+      onProviderDispatch: PROVIDER_DISPATCH,
     }).then(
       () => {
         throw new Error("expected runSharedAgentTurn to throw on inference failure");
@@ -145,6 +148,7 @@ describe("runSharedAgentTurn — internal failure propagates vs designed-empty d
       character: { name: "Nova", system: "You are Nova." },
       history: [],
       message: "  hello there  ",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
 
     expect(result.degraded).toBe(true);
@@ -171,6 +175,7 @@ describe("runSharedAgentTurn — internal failure propagates vs designed-empty d
         { role: "assistant", content: "prev-a" },
       ],
       message: "hi",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
 
     expect(result.degraded).toBe(false);
@@ -195,6 +200,7 @@ describe("runSharedAgentTurnStream — incremental provider policy", () => {
       character: { name: "Nova", system: "You are Nova.", model: "gpt-oss-120b" },
       history: [],
       message: " hello ",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
 
     expect(result.degraded).toBe(false);
@@ -219,6 +225,7 @@ describe("runSharedAgentTurnStream — incremental provider policy", () => {
       character: { name: "Nova" },
       history: [],
       message: " hello ",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
 
     expect(result).toMatchObject({
@@ -245,6 +252,7 @@ describe("runSharedAgentTurnStream — incremental provider policy", () => {
       character: { name: "Nova", model: "gpt-oss-120b" },
       history: [],
       message: "hello",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
     if (!("parts" in result)) throw new Error("expected streaming result");
 

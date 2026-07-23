@@ -20,6 +20,20 @@ const AGENT_ID = "de42b5ff-72d3-4a1a-8a16-19aee293bfea";
 const ORGANIZATION_ID = "org-voice-hotpath";
 const USER_ID = "user-voice-hotpath";
 const CONVERSATION_ID = "conversation-voice-hotpath";
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: ORGANIZATION_ID,
+  organizationRevision: "0",
+  userId: USER_ID,
+  userRevision: "0",
+  credential: {
+    kind: "api_key" as const,
+    id: "voice-key",
+    fingerprint: "a".repeat(64),
+    revision: "0",
+    expiresAt: null,
+  },
+};
 const CACHE_KEY = CacheKeys.sharedAgentScope.voice(
   ORGANIZATION_ID,
   USER_ID,
@@ -80,6 +94,7 @@ test("real cache + canonical coordinator dispatch performs no response-path DB w
       conversationId: CONVERSATION_ID,
       organizationId: ORGANIZATION_ID,
       userId: USER_ID,
+      authorization: AUTHORIZATION,
     },
     executionCtx,
   );
@@ -90,10 +105,6 @@ test("real cache + canonical coordinator dispatch performs no response-path DB w
       headers: {
         Authorization: "Bearer voice-service",
         "Content-Type": "application/json",
-        "X-Eliza-Agent-Id": AGENT_ID,
-        "X-Eliza-Conversation-Id": CONVERSATION_ID,
-        "X-Eliza-Organization-Id": ORGANIZATION_ID,
-        "X-Eliza-User-Id": USER_ID,
       },
       body: JSON.stringify({ text: "prove the hot path" }),
     },
@@ -107,6 +118,7 @@ test("real cache + canonical coordinator dispatch performs no response-path DB w
   expect(JSON.parse(String(coordinatorCalls[0]?.init?.body))).toMatchObject({
     operation: "stream",
     agent: cachedAgent,
+    authorization: AUTHORIZATION,
     rpc: {
       method: "message.send",
       params: {
@@ -131,6 +143,7 @@ test("missing Worker coordinator fails closed without selecting a legacy bridge"
       conversationId: CONVERSATION_ID,
       organizationId: ORGANIZATION_ID,
       userId: USER_ID,
+      authorization: AUTHORIZATION,
     },
   );
 
@@ -141,10 +154,6 @@ test("missing Worker coordinator fails closed without selecting a legacy bridge"
       headers: {
         Authorization: "Bearer voice-service",
         "Content-Type": "application/json",
-        "X-Eliza-Agent-Id": AGENT_ID,
-        "X-Eliza-Conversation-Id": CONVERSATION_ID,
-        "X-Eliza-Organization-Id": ORGANIZATION_ID,
-        "X-Eliza-User-Id": USER_ID,
       },
       body: JSON.stringify({ text: "never use legacy" }),
     },

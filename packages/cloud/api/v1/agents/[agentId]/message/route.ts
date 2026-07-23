@@ -24,8 +24,13 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { failureResponse } from "@/lib/api/cloud-worker-errors";
 import { requireServiceKey } from "@/lib/auth/service-key-hono-worker";
-import { elizaSandboxService } from "@/lib/services/eliza-sandbox";
+import { agentGatewayRouterService } from "@/lib/services/agent-gateway-router";
+import {
+  BRIDGE_CACHE_WARMING_CODE,
+  elizaSandboxService,
+} from "@/lib/services/eliza-sandbox";
 import { provisioningJobService } from "@/lib/services/provisioning-jobs";
+import { isDedicatedBootstrapWindow } from "@/lib/services/shared-runtime/dedicated-bootstrap";
 import { logger } from "@/lib/utils/logger";
 import { notifyAgentReply } from "@/lib/web-push";
 import type { AppContext, AppEnv } from "@/types/cloud-worker-env";
@@ -79,10 +84,90 @@ async function __hono_POST(c: AppContext) {
 
     const { text, userId, sessionId, roomId } = parsed.data;
 
-    // Resolve by id, then attribute the daemon job to the actual agent owner.
-    const agent = await elizaSandboxService.getAgentById(agentId);
+    // The target decision is cache-only under strong auth. A cold entry is
+    // hydrated under waitUntil and returned as retryable instead of querying
+    // Postgres or enqueueing provider work on this request.
+    const resolved = await agentGatewayRouterService.resolveServiceAgent({
+      agentId,
+      executionCtx: c.executionCtx,
+    });
+    if (resolved.retryable) {
+      return c.json(
+        {
+          success: false,
+          error: "Agent target cache is warming. Retry shortly.",
+          code: "agent_target_cache_warming",
+          retryable: true,
+        },
+        503,
+      );
+    }
+    const agent = resolved.agent;
     if (!agent) {
       return c.json({ success: false, error: "Agent not found" }, 404);
+    }
+
+    // Shared agents run in the Worker and must never detour through the
+    // provisioning daemon's repository-backed bridge. The sandbox service
+    // resolves the agent's managed API-key IAC snapshot cache-only and sends
+    // the turn through the conversation/admission Durable Objects.
+    if (
+      agent.execution_tier === "shared" ||
+      isDedicatedBootstrapWindow(agent)
+    ) {
+      const response = await elizaSandboxService.bridgeResolvedShared(
+        agent,
+        {
+          jsonrpc: "2.0",
+          method: "message.send",
+          params: {
+            text,
+            ...(userId ? { userId } : {}),
+            ...(sessionId ? { sessionId } : {}),
+            ...(roomId ? { roomId } : {}),
+          },
+        },
+        c.executionCtx,
+      );
+      if (response.error) {
+        return c.json(
+          {
+            success: false,
+            error: response.error.message,
+            ...(response.error.code === BRIDGE_CACHE_WARMING_CODE
+              ? {
+                  code: "shared_runtime_cache_warming",
+                  retryable: true,
+                }
+              : {}),
+          },
+          503,
+        );
+      }
+      const result = (response.result ?? {}) as Record<string, unknown>;
+      const replyText = typeof result.text === "string" ? result.text : "";
+      if (userId && replyText) {
+        const pushWork = notifyAgentReply(
+          {
+            userId,
+            agentId,
+            replyText,
+            title: agent.agent_name ?? "New message",
+            ...(sessionId ? { conversationId: sessionId } : {}),
+          },
+          { env: c.env },
+        ).catch(() => {
+          // error-policy:J5 non-fatal; notify-service already logs internally.
+        });
+        const waitUntil = getWaitUntil(c);
+        if (waitUntil) waitUntil(pushWork);
+        else void pushWork;
+      }
+      return c.json({
+        success: true,
+        text: replyText,
+        ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
+      });
     }
 
     const { job } = await provisioningJobService.enqueueAgentMessage({

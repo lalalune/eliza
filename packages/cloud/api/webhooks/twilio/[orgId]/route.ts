@@ -15,6 +15,7 @@ import {
   RateLimitPresets,
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
+import { SharedRuntimeCacheWarmingError } from "@/lib/services/shared-runtime/shared-runtime-errors";
 import { twilioAutomationService } from "@/lib/services/twilio-automation";
 import { usageService } from "@/lib/services/usage";
 import { isAlreadyProcessed, markAsProcessed } from "@/lib/utils/idempotency";
@@ -249,7 +250,12 @@ async function handleIncomingMessage(
     providerMessageId: event.MessageSid,
     mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
     metadata: messageContext.metadata,
+    executionCtx: c.executionCtx,
   });
+
+  if (routed.retryable) {
+    throw new SharedRuntimeCacheWarmingError("Agent target cache is warming");
+  }
 
   if (!routed.handled) {
     logger.warn("[TwilioWebhook] Failed to route message to owned Agent", {

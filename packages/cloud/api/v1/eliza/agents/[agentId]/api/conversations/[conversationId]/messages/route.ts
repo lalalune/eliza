@@ -166,6 +166,7 @@ app.post("/", async (c) => {
       r.agentName,
       worker.executionCtx,
       worker.namespace,
+      r.authorization,
     );
   } catch (error) {
     // error-policy:J1 route boundary translates bridge/billing failures to HTTP responses.

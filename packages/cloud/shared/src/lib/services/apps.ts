@@ -19,6 +19,7 @@ import { managedDomainsService } from "./managed-domains";
 const DEFAULT_MAX_APPS_PER_ORG = 25;
 const appByIdHydrations = new Map<string, Promise<void>>();
 const appByIdHydrationGeneration = new Map<string, number>();
+const appByApiKeyHydrations = new Map<string, Promise<void>>();
 
 export interface AppCacheExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
@@ -26,6 +27,13 @@ export interface AppCacheExecutionContext {
 
 export type InferenceAppCacheResolution =
   | { kind: "ready"; app: App | null }
+  | {
+      kind: "warming" | "unavailable";
+      cacheRead: "miss" | "invalid" | "unavailable" | "error";
+    };
+
+export type InferenceAppApiKeyScopeResolution =
+  | { kind: "ready"; owningAppId: string | null }
   | {
       kind: "warming" | "unavailable";
       cacheRead: "miss" | "invalid" | "unavailable" | "error";
@@ -294,28 +302,94 @@ export class AppsService {
   async getByApiKeyId(apiKeyId: string): Promise<App | undefined> {
     const cacheKey = CacheKeys.app.byApiKeyId(apiKeyId);
 
-    // Check cache first
-    const cached = await cache.get<App>(cacheKey);
-    if (cached) {
+    const cached = await cache.get<unknown>(cacheKey);
+    if (isNoneMarker(cached)) {
+      return undefined;
+    }
+    if (
+      cached &&
+      typeof cached === "object" &&
+      typeof (cached as Partial<App>).id === "string" &&
+      isCachedApp(cached, (cached as App).id)
+    ) {
       logger.debug("[Apps] Cache hit for app by API key", {
         apiKeyId: apiKeyId.substring(0, 8),
       });
       return cached;
     }
 
-    // Cache miss - query DB directly
-    const app = await appsRepository.findByApiKeyId(apiKeyId);
+    return await this.loadAndCacheAppByApiKeyId(apiKeyId);
+  }
 
-    // Cache result (including null to prevent repeated lookups for invalid keys)
+  private async loadAndCacheAppByApiKeyId(apiKeyId: string): Promise<App | undefined> {
+    const cacheKey = CacheKeys.app.byApiKeyId(apiKeyId);
+    const app = await appsRepository.findByApiKeyId(apiKeyId);
     if (app) {
       await cache.set(cacheKey, app, CacheTTL.app.byApiKeyId);
       logger.debug("[Apps] Cached app by API key", {
         apiKeyId: apiKeyId.substring(0, 8),
         appId: app.id,
       });
+    } else {
+      await cache.set(cacheKey, { __none: true }, CacheTTL.app.none);
+    }
+    return app;
+  }
+
+  private scheduleAppByApiKeyHydration(
+    apiKeyId: string,
+    executionCtx: AppCacheExecutionContext,
+  ): void {
+    let hydration = appByApiKeyHydrations.get(apiKeyId);
+    if (!hydration) {
+      hydration = this.loadAndCacheAppByApiKeyId(apiKeyId)
+        .then(() => undefined)
+        .catch((error) => {
+          // error-policy:J7 the request remains denied while the app-key scope
+          // cache warms; log the authoritative hydration failure for retry.
+          logger.warn("[Apps] Background app-key scope hydration failed", {
+            apiKeyId: apiKeyId.substring(0, 8),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .finally(() => {
+          appByApiKeyHydrations.delete(apiKeyId);
+        });
+      appByApiKeyHydrations.set(apiKeyId, hydration);
+    }
+    executionCtx.waitUntil(hydration);
+  }
+
+  /**
+   * Resolve an API key's owning app without a database fallback. A null owner
+   * is a cached proof that the credential is an ordinary organization key.
+   */
+  async getApiKeyOwningAppIdCacheOnly(
+    apiKeyId: string,
+    options: { executionCtx?: AppCacheExecutionContext } = {},
+  ): Promise<InferenceAppApiKeyScopeResolution> {
+    const outcome = await cache.getWithOutcome<unknown>(CacheKeys.app.byApiKeyId(apiKeyId));
+    if (outcome.kind === "hit") {
+      if (isNoneMarker(outcome.value)) {
+        return { kind: "ready", owningAppId: null };
+      }
+      if (
+        outcome.value &&
+        typeof outcome.value === "object" &&
+        isCachedApp(outcome.value, (outcome.value as Partial<App>).id ?? "")
+      ) {
+        return { kind: "ready", owningAppId: outcome.value.id };
+      }
     }
 
-    return app;
+    const cacheRead = outcome.kind === "hit" ? ("invalid" as const) : outcome.kind;
+    if (options.executionCtx) {
+      this.scheduleAppByApiKeyHydration(apiKeyId, options.executionCtx);
+    }
+    return {
+      kind: cacheRead === "unavailable" || cacheRead === "error" ? "unavailable" : "warming",
+      cacheRead,
+    };
   }
 
   /**
@@ -333,6 +407,7 @@ export class AppsService {
     ];
 
     if (apiKeyId) {
+      appByApiKeyHydrations.delete(apiKeyId);
       promises.push(cache.del(CacheKeys.app.byApiKeyId(apiKeyId)));
     }
 

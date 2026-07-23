@@ -22,6 +22,32 @@ mock.module("@/lib/auth/workers-hono-auth", () => ({
     organization_id: "org-1",
   }),
 }));
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: "org-1",
+  organizationRevision: "0",
+  userId: "user-1",
+  userRevision: "0",
+  credential: {
+    kind: "api_key" as const,
+    id: "key-1",
+    fingerprint: "a".repeat(64),
+    revision: "0",
+    expiresAt: null,
+  },
+};
+mock.module("@/lib/services/inference-auth-context", () => ({
+  resolveInferenceAuthContext: async () => ({
+    kind: "authorized",
+    source: "cache",
+    ctx: {
+      userId: "user-1",
+      orgId: "org-1",
+      apiKeyId: "key-1",
+      authorization: AUTHORIZATION,
+    },
+  }),
+}));
 // Tenancy repos: the caller owns agent-1; conversation is new (not found).
 mock.module("@/db/repositories/characters", () => ({
   userCharactersRepository: {

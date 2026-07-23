@@ -35,6 +35,7 @@ import {
 import { billUsage, InsufficientCreditsError } from "@/lib/services/ai-billing";
 import type { CreditReservation } from "@/lib/services/credits";
 import { resolveInferenceAuthContext } from "@/lib/services/inference-auth-context";
+import type { InferenceAuthorizationProof } from "@/lib/services/inference-authorization-boundary";
 import { InferenceBalanceCacheWarmingError } from "@/lib/services/inference-billing-fast-path";
 import { isPassthroughEmbeddingsEnabled } from "@/lib/services/inference-passthrough";
 import { isKnownUnacceptedProviderError } from "@/lib/services/inference-provider-outcome";
@@ -73,9 +74,8 @@ app.post("/", async (c) => {
   let settleUnknown:
     | OrganizationInferenceAdmission["settleUnknown"]
     | undefined;
-  let markProviderDispatched:
-    | OrganizationInferenceAdmission["markProviderDispatched"]
-    | undefined;
+  let markProviderDispatched: OrganizationInferenceAdmission["markProviderDispatched"] =
+    () => Promise.resolve();
   let billingReservation: CreditReservation | undefined;
   let executionCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
   try {
@@ -117,6 +117,7 @@ app.post("/", async (c) => {
     // authoritative compatibility path is available only outside Workers.
     let user: { id: string; organization_id: string };
     let apiKeyId: string | null;
+    let inferenceAuthorization: InferenceAuthorizationProof | undefined;
     const resolution = await resolveInferenceAuthContext(c.req.raw, {
       executionCtx,
       cacheOnly: Boolean(executionCtx),
@@ -173,6 +174,7 @@ app.post("/", async (c) => {
         organization_id: resolution.ctx.orgId,
       };
       apiKeyId = resolution.ctx.apiKeyId;
+      inferenceAuthorization = resolution.ctx.authorization;
     } else {
       if (executionCtx) {
         return c.json(
@@ -322,6 +324,7 @@ app.post("/", async (c) => {
         estimatedInputTokens,
         estimatedOutputTokens: 0,
         affiliateCode,
+        authorization: inferenceAuthorization,
         executionCtx,
       });
       settleReservation = admission.settle;
@@ -400,7 +403,7 @@ app.post("/", async (c) => {
         : null;
 
     if (passthroughUpstream) {
-      await markProviderDispatched?.();
+      await markProviderDispatched();
       providerDispatched = true;
       const upstreamResponse = await fetch(passthroughUpstream.url, {
         method: "POST",
@@ -432,7 +435,7 @@ app.post("/", async (c) => {
       actualTokens = parsed.usage?.prompt_tokens || estimatedInputTokens;
     } else if (Array.isArray(request.input)) {
       const embeddingModel = getTextEmbeddingModel(model);
-      await markProviderDispatched?.();
+      await markProviderDispatched();
       providerDispatched = true;
       const result = await embedMany({
         model: embeddingModel,
@@ -442,7 +445,7 @@ app.post("/", async (c) => {
       actualTokens = result.usage?.tokens || estimatedInputTokens;
     } else {
       const embeddingModel = getTextEmbeddingModel(model);
-      await markProviderDispatched?.();
+      await markProviderDispatched();
       providerDispatched = true;
       const result = await embed({
         model: embeddingModel,

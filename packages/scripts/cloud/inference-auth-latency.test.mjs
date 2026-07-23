@@ -9,11 +9,11 @@ import {
   parseAuthServerTiming,
   parseAuthTrace,
   probeAuthGuardSample,
+  probeAuthGuardSequence,
   probeAuthSample,
   sanitizeInferenceAuthTail,
   sanitizeInferenceAuthTelemetry,
   summarizeAuthSamples,
-  summarizeDeferredCacheWrites,
   waitForInferenceAuthTail,
 } from "./inference-auth-latency.mjs";
 
@@ -22,14 +22,12 @@ const SHA = "a".repeat(40);
 function authHeader(phase) {
   return phase === "hit"
     ? "v=1;credential=x_api_key;probe=off;available=available;backend=cloudflare_kv;read=hit;authoritative=not_run;write=not_run;result=authorized_cache"
-    : "v=1;credential=x_api_key;probe=on;available=available;backend=cloudflare_kv;read=miss;authoritative=authorized;write=deferred;result=authorized_origin";
+    : "v=1;credential=x_api_key;probe=on;available=available;backend=cloudflare_kv;read=miss;authoritative=not_run;write=not_run;result=warming";
 }
 
-function timingHeader(phase, resolveMs = 10) {
+function timingHeader(resolveMs = 10) {
   const shared = `auth_extract;dur=0.1, auth_cache_available;dur=0.2, auth_cache_read;dur=1, auth_resolve;dur=${resolveMs}`;
-  return phase === "hit"
-    ? shared
-    : `${shared}, auth_key_lookup;dur=3, auth_user_org;dur=2, auth_moderation;dur=1`;
+  return shared;
 }
 
 test("parseArgs requires exact HTTPS deployment provenance and sample counts", () => {
@@ -90,9 +88,9 @@ test("auth parsers accept only bounded enums and finite auth durations", () => {
     available: "available",
     backend: "cloudflare_kv",
     read: "miss",
-    authoritative: "authorized",
-    write: "deferred",
-    result: "authorized_origin",
+    authoritative: "not_run",
+    write: "not_run",
+    result: "warming",
   });
   assert.throws(
     () => parseAuthTrace(`${authHeader("miss")};identity=customer@example.com`),
@@ -117,27 +115,19 @@ test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
     cacheAvailability: "available",
     cacheBackend: "cloudflare_kv",
     cacheRead: "miss",
-    authoritative: "authorized",
-    cacheWrite: "deferred",
-    result: "authorized_origin",
+    authoritative: "not_run",
+    cacheWrite: "not_run",
+    result: "warming",
     timings: {
       extractMs: 0.1,
       cacheAvailabilityMs: 0.1,
       cacheReadMs: 1,
-      keyLookupMs: 4,
-      userOrgLookupMs: 3,
-      moderationMs: 2,
+      keyLookupMs: null,
+      userOrgLookupMs: null,
+      moderationMs: null,
       cacheWriteMs: null,
       totalMs: 10.2,
     },
-  };
-  const deferredCacheWriteTelemetry = {
-    v: 1,
-    kind: "cache_write",
-    traceId,
-    cacheBackend: "cloudflare_kv",
-    cacheWrite: "written",
-    durationMs: 12,
   };
   const raw = [
     "wrangler banner that is not JSON",
@@ -158,10 +148,6 @@ test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
             ],
           },
           { level: "info", message: ["[InferenceAuth] trace", telemetry] },
-          {
-            level: "info",
-            message: ["[InferenceAuth] trace", deferredCacheWriteTelemetry],
-          },
         ],
         event: {
           request: {
@@ -183,23 +169,13 @@ test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
       traceId,
       outcome: "ok",
       telemetry,
-      deferredCacheWrite: {
-        outcome: "ok",
-        telemetry: deferredCacheWriteTelemetry,
-      },
+      deferredCacheWrite: null,
     },
   ]);
   const retained = JSON.stringify(records);
   assert.equal(retained.includes("eliza_private_api_key_material"), false);
   assert.equal(retained.includes("preview.example"), false);
   assert.equal(retained.includes("private=value"), false);
-  assert.deepEqual(summarizeDeferredCacheWrites(records), {
-    p50: 12,
-    p90: 12,
-    p95: 12,
-    max: 12,
-  });
-
   assert.throws(
     () =>
       sanitizeInferenceAuthTelemetry({ ...telemetry, userId: "private-user" }),
@@ -237,11 +213,11 @@ test("live sample retains timings and correlation but no credential, probe token
       sentProbeHeader = init.headers["X-Eliza-Auth-Probe"];
       sentBody = init.body;
       return new Response(null, {
-        status: 400,
+        status: 503,
         headers: {
           "X-Eliza-Trace-Id": init.headers["X-Eliza-Trace-Id"],
           "X-Eliza-Auth-Trace": authHeader("miss"),
-          "Server-Timing": timingHeader("miss"),
+          "Server-Timing": timingHeader(),
           "cf-placement": "remote-EWR",
           "cf-ray": "abc123-EWR",
         },
@@ -288,7 +264,7 @@ test("Tail readiness waits for an observed authenticated trace", async () => {
         headers: {
           "X-Eliza-Trace-Id": init.headers["X-Eliza-Trace-Id"],
           "X-Eliza-Auth-Trace": authHeader("hit"),
-          "Server-Timing": timingHeader("hit"),
+          "Server-Timing": timingHeader(),
         },
       });
     },
@@ -322,7 +298,7 @@ test("Tail readiness retries a transient workers.dev propagation response", asyn
         headers: {
           "X-Eliza-Trace-Id": observedTraceId,
           "X-Eliza-Auth-Trace": authHeader("hit"),
-          "Server-Timing": timingHeader("hit"),
+          "Server-Timing": timingHeader(),
         },
       });
     },
@@ -408,7 +384,7 @@ test("Tail readiness fails after bounded attempts without exposing credentials",
         headers: {
           "X-Eliza-Trace-Id": init.headers["X-Eliza-Trace-Id"],
           "X-Eliza-Auth-Trace": authHeader("hit"),
-          "Server-Timing": timingHeader("hit"),
+          "Server-Timing": timingHeader(),
         },
       }),
   }).then(
@@ -421,42 +397,54 @@ test("Tail readiness fails after bounded attempts without exposing credentials",
   assert.equal(failure.message.includes(probeToken), false);
 });
 
-test("guard probes retain 401 taxonomy and reject forged probe controls", async () => {
+test("guard probes warm asynchronously, reuse credentials, and read cached decisions", async () => {
+  const requestsByKey = new Map();
+  const requestKeys = [];
   const fetchImpl = async (_url, init) => {
     const key = init.headers["X-API-Key"];
+    requestKeys.push(key);
     const invalid = key !== "eliza_valid" && key !== "eliza_suspended";
     const suspended = key === "eliza_suspended";
-    const phase = invalid ? "invalid" : suspended ? "suspended" : "hit";
+    const requests = (requestsByKey.get(key) ?? 0) + 1;
+    requestsByKey.set(key, requests);
+    const warming = (invalid || suspended) && requests === 1;
+    const probe = init.headers["X-Eliza-Auth-Probe"] ? "on" : "off";
     return new Response(null, {
-      status: invalid ? 401 : suspended ? 403 : 400,
+      status: warming ? 503 : invalid ? 401 : suspended ? 403 : 400,
       headers: {
         "X-Eliza-Trace-Id": init.headers["X-Eliza-Trace-Id"],
-        "X-Eliza-Auth-Trace": invalid
-          ? "v=1;credential=x_api_key;probe=off;available=available;backend=cloudflare_kv;read=miss;authoritative=rejected;write=not_run;result=rejected"
-          : suspended
-            ? "v=1;credential=x_api_key;probe=on;available=available;backend=cloudflare_kv;read=miss;authoritative=suspended;write=not_run;result=suspended"
-            : authHeader(phase),
-        "Server-Timing": invalid
-          ? "auth_extract;dur=0.1, auth_cache_available;dur=0.1, auth_cache_read;dur=1, auth_key_lookup;dur=3, auth_resolve;dur=5"
-          : suspended
-            ? "auth_extract;dur=0.1, auth_cache_available;dur=0.1, auth_cache_read;dur=1, auth_key_lookup;dur=3, auth_user_org;dur=2, auth_moderation;dur=1, auth_resolve;dur=8"
-            : timingHeader(phase),
+        "X-Eliza-Auth-Trace": warming
+          ? `v=1;credential=x_api_key;probe=${probe};available=available;backend=cloudflare_kv;read=miss;authoritative=not_run;write=not_run;result=warming`
+          : invalid
+            ? "v=1;credential=x_api_key;probe=off;available=available;backend=cloudflare_kv;read=rejected;authoritative=not_run;write=not_run;result=rejected"
+            : suspended
+              ? "v=1;credential=x_api_key;probe=off;available=available;backend=cloudflare_kv;read=rejected;authoritative=not_run;write=not_run;result=suspended"
+              : authHeader("hit"),
+        "Server-Timing": timingHeader(),
       },
     });
   };
 
-  const invalid = await probeAuthGuardSample({
+  const invalid = await probeAuthGuardSequence({
     baseUrl: "https://preview.example",
     apiKey: "eliza_valid",
+    probeToken: "private_probe_control_token",
     deploySha: SHA,
     guard: "invalid_key",
     timeoutMs: 1_000,
     fetchImpl,
+    wait: async () => {},
   });
-  assert.equal(invalid.status, 401);
-  assert.equal(invalid.auth.result, "rejected");
+  assert.deepEqual(
+    invalid.map((record) => [record.stage, record.status, record.auth.result]),
+    [
+      ["warming", 503, "warming"],
+      ["settled", 401, "rejected"],
+    ],
+  );
+  assert.equal(requestKeys[0], requestKeys[1]);
 
-  const suspended = await probeAuthGuardSample({
+  const suspended = await probeAuthGuardSequence({
     baseUrl: "https://preview.example",
     apiKey: "eliza_suspended",
     probeToken: "private_probe_control_token",
@@ -464,13 +452,25 @@ test("guard probes retain 401 taxonomy and reject forged probe controls", async 
     guard: "suspended_key",
     timeoutMs: 1_000,
     fetchImpl,
+    wait: async () => {},
   });
-  assert.equal(suspended.status, 403);
-  assert.equal(suspended.auth.result, "suspended");
+  assert.deepEqual(
+    suspended.map((record) => [
+      record.stage,
+      record.status,
+      record.auth.result,
+    ]),
+    [
+      ["warming", 503, "warming"],
+      ["settled", 403, "suspended"],
+    ],
+  );
+  assert.equal(requestKeys[2], requestKeys[3]);
   assert.equal(
     JSON.stringify(suspended).includes("private_probe_control_token"),
     false,
   );
+  assert.equal(JSON.stringify(suspended).includes("eliza_suspended"), false);
 
   const forged = await probeAuthGuardSample({
     baseUrl: "https://preview.example",
@@ -488,32 +488,57 @@ test("guard probes retain 401 taxonomy and reject forged probe controls", async 
 function sample(phase, resolveMs) {
   return {
     phase,
+    status: phase === "hit" ? 400 : 503,
+    totalMs: resolveMs + 1,
+    auth: {
+      read: phase === "hit" ? "hit" : "miss",
+      authoritative: "not_run",
+      write: "not_run",
+      result: phase === "hit" ? "authorized_cache" : "warming",
+    },
     timings: {
       auth_resolve: resolveMs,
-      auth_key_lookup: phase === "miss" ? resolveMs / 2 : undefined,
-      auth_user_org: phase === "miss" ? 1 : undefined,
-      auth_moderation: phase === "miss" ? 1 : undefined,
       auth_cache_read: 1,
-      auth_cache_write: phase === "miss" ? 1 : undefined,
     },
   };
 }
 
-test("summary and acceptance enforce sample volume, hit tails, and 50% cold improvement", () => {
+test("summary reports distributions and acceptance enforces exact semantic counts", () => {
   const passing = [
-    ...Array.from({ length: 30 }, () => sample("hit", 10)),
-    ...Array.from({ length: 10 }, () => sample("miss", 1_000)),
+    ...Array.from({ length: 3 }, () => sample("hit", 10)),
+    ...Array.from({ length: 2 }, () => sample("miss", 1_000)),
   ];
   const summary = summarizeAuthSamples(passing, SHA);
-  assert.deepEqual(summary.counts, { hit: 30, miss: 10 });
-  assert.doesNotThrow(() => enforceAcceptance(summary));
-
-  const slow = summarizeAuthSamples(
-    [
-      ...Array.from({ length: 30 }, () => sample("hit", 10)),
-      ...Array.from({ length: 10 }, () => sample("miss", 2_100)),
-    ],
+  assert.deepEqual(summary.counts, { warmHit: 3, cacheOnlyMiss: 2 });
+  assert.deepEqual(summary.invariants, {
+    warmAuthorizedCache: 3,
+    warmHitWithoutDatabaseTimings: 3,
+    cacheOnlyWarming: 2,
+    cacheOnlyMissWithoutDatabaseTimings: 2,
+  });
+  assert.deepEqual(summary.warmHitAuthResolveMs, {
+    p50: 10,
+    p90: 10,
+    p95: 10,
+    max: 10,
+  });
+  assert.doesNotThrow(() => enforceAcceptance(summary, { hit: 3, miss: 2 }));
+  const slowHostSummary = summarizeAuthSamples(
+    [sample("hit", 600), sample("miss", 5_000)],
     SHA,
   );
-  assert.throws(() => enforceAcceptance(slow), /multi-second tail/);
+  assert.doesNotThrow(() =>
+    enforceAcceptance(slowHostSummary, { hit: 1, miss: 1 }),
+  );
+  assert.throws(
+    () => enforceAcceptance(summary, { hit: 4, miss: 2 }),
+    /requested counts/,
+  );
+
+  const invalid = structuredClone(summary);
+  invalid.invariants.cacheOnlyMissWithoutDatabaseTimings = 1;
+  assert.throws(
+    () => enforceAcceptance(invalid, { hit: 3, miss: 2 }),
+    /semantic invariants/,
+  );
 });
