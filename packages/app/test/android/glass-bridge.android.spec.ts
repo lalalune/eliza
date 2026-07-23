@@ -5,11 +5,11 @@
  * rejection at the untrusted boundary, and pixel captures proving the tinted
  * native material renders through a real transparency hole.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { PNG } from "pngjs";
-import { expect, test, waitForShellReady } from "./android-harness";
+import { expect, test } from "./android-harness";
 
 type RegionState = {
   exists: boolean;
@@ -20,6 +20,7 @@ type RegionState = {
 
 type GlassPlugin = {
   isAvailable(): Promise<{ available: boolean }>;
+  reset(): Promise<void>;
   setBackdrop(o: unknown): Promise<{ applied: boolean }>;
   clearBackdrop(): Promise<void>;
   attachGlass(o: unknown): Promise<{ attached: boolean }>;
@@ -35,11 +36,72 @@ const ARTIFACT_DIR = path.join(
 );
 
 function adb(args: string[], serial: string): Buffer {
-  const adbBin = process.env.ANDROID_HOME
+  return execFileSync(adbBin(), ["-s", serial, ...args], {
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+function adbBin(): string {
+  return process.env.ANDROID_HOME
     ? `${process.env.ANDROID_HOME}/platform-tools/adb`
     : "adb";
-  return execFileSync(adbBin, ["-s", serial, ...args], {
-    maxBuffer: 64 * 1024 * 1024,
+}
+
+async function selectorDevicePoint(page: import("@playwright/test").Page) {
+  // Start on the painted bar itself. The button's broad pseudo-element hit
+  // target extends above the visible handle and its DOM box can fall outside
+  // the active native-touch strip on tall Android viewports.
+  const grabber = page.getByTestId("chat-sheet-grabber");
+  const box =
+    (await grabber.locator("span").boundingBox()) ??
+    (await grabber.boundingBox());
+  if (!box) throw new Error("chat sheet grabber has no device geometry");
+  const metrics = await page.evaluate(() => ({
+    dpr: window.devicePixelRatio,
+    offsetLeft: window.visualViewport?.offsetLeft ?? 0,
+    offsetTop: window.visualViewport?.offsetTop ?? 0,
+  }));
+  return {
+    x: Math.round((box.x + box.width / 2 + metrics.offsetLeft) * metrics.dpr),
+    // The broad handle intentionally accepts a swipe that begins just below
+    // the painted bar as well. This keeps the device coordinate inside the
+    // WebView's active hit strip when Android's status-bar inset is not
+    // reflected in visualViewport.offsetTop.
+    y: Math.round(
+      (box.y + box.height / 2 + metrics.offsetTop + 50) * metrics.dpr,
+    ),
+    dpr: metrics.dpr,
+  };
+}
+
+function swipeInFlight(
+  serial: string,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  durationMs: number,
+): Promise<void> {
+  const child = spawn(
+    adbBin(),
+    [
+      "-s",
+      serial,
+      "shell",
+      "input",
+      "swipe",
+      String(from.x),
+      String(from.y),
+      String(to.x),
+      String(to.y),
+      String(durationMs),
+    ],
+    { stdio: "ignore" },
+  );
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`adb swipe exited ${String(code)}`));
+    });
   });
 }
 
@@ -68,12 +130,141 @@ function meanRgb(
   return { r: r / n, g: g / n, b: b / n };
 }
 
+test("product chat surface uses native Material at rest and CSS while moving", async ({
+  device,
+  page,
+}, testInfo) => {
+  test.setTimeout(180_000);
+  const serial = device.serial();
+
+  // This visual/material leg needs the offline shell, not an agent. A
+  // backendless debug APK intentionally offers an explicit "Open App" route.
+  const openApp = page.getByText("Open App", { exact: true });
+  if (await openApp.isVisible().catch(() => false)) await openApp.click();
+  const skipSetup = page.getByText("Skip for now", { exact: true });
+  if (await skipSetup.isVisible().catch(() => false)) await skipSetup.click();
+
+  const detent = page.getByTestId("chat-detent-probe");
+  const tier = page.getByTestId("chat-glass-tier-probe");
+  await expect(detent).toContainText("chat-detent:", { timeout: 60_000 });
+
+  // A real device swipe opens the product sheet from its settled input state.
+  const collapsedPoint = await selectorDevicePoint(page);
+  adb(
+    [
+      "shell",
+      "input",
+      "swipe",
+      String(collapsedPoint.x),
+      String(collapsedPoint.y),
+      String(collapsedPoint.x),
+      String(collapsedPoint.y - Math.round(300 * collapsedPoint.dpr)),
+      "100",
+    ],
+    serial,
+  );
+  await expect(detent).not.toContainText("chat-detent:collapsed", {
+    timeout: 15_000,
+  });
+  await expect(detent).toContainText("chat-detent:full", {
+    timeout: 15_000,
+  });
+  await expect(tier).toContainText("chat-glass-tier:native", {
+    timeout: 15_000,
+  });
+  await testInfo.attach("android-chat-native-rest.png", {
+    body: adb(["exec-out", "screencap", "-p"], serial),
+    contentType: "image/png",
+  });
+
+  // Hold a second REAL touch drag in flight. The React gate must switch to CSS
+  // before the gesture is released; querying only after `adb input swipe`
+  // returns would miss the transient state this contract is about.
+  const restPoint = await selectorDevicePoint(page);
+  const fullToHalfCss = await page.evaluate(() => {
+    const thread = document.querySelector("#continuous-thread");
+    if (!(thread instanceof HTMLElement)) {
+      throw new Error("open chat thread has no device geometry");
+    }
+    return Math.max(
+      1,
+      thread.getBoundingClientRect().height - window.innerHeight * 0.46,
+    );
+  });
+  await testInfo.attach("android-chat-drag-coordinates.json", {
+    body: Buffer.from(
+      JSON.stringify({ collapsedPoint, restPoint, fullToHalfCss }, null, 2),
+    ),
+    contentType: "application/json",
+  });
+  await page.evaluate(() => {
+    const probe = document.querySelector(
+      '[data-testid="chat-glass-tier-probe"]',
+    );
+    if (!probe) throw new Error("chat glass tier probe disappeared");
+    const state = window as unknown as { __glassTierHistory: string[] };
+    state.__glassTierHistory = [probe.textContent ?? ""];
+    new MutationObserver(() => {
+      state.__glassTierHistory.push(probe.textContent ?? "");
+    }).observe(probe, { childList: true, characterData: true, subtree: true });
+  });
+  const moving = swipeInFlight(
+    serial,
+    restPoint,
+    {
+      x: restPoint.x,
+      y: restPoint.y + Math.round(fullToHalfCss * restPoint.dpr),
+    },
+    4_000,
+  );
+  const midDragCapture = new Promise<Buffer>((resolve, reject) => {
+    setTimeout(() => {
+      try {
+        resolve(adb(["exec-out", "screencap", "-p"], serial));
+      } catch (error) {
+        reject(error);
+      }
+    }, 2_000);
+  });
+  await moving;
+  const tierHistory = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __glassTierHistory?: string[];
+        }
+      ).__glassTierHistory ?? [],
+  );
+  expect(
+    tierHistory.some((value) => value.includes("chat-glass-tier:css-")),
+  ).toBe(true);
+  expect(
+    tierHistory.some((value) => value.includes("chat-glass-gate:o1s0d1")),
+  ).toBe(true);
+  await testInfo.attach("android-chat-css-mid-drag.png", {
+    body: await midDragCapture,
+    contentType: "image/png",
+  });
+  // Release onto HALF rather than an arbitrary free-rest height: the native
+  // contract is specifically for settled detents, and the long in-flight hold
+  // above is independently what proves the moving CSS tier.
+  await expect(detent).toContainText("chat-detent:half", {
+    timeout: 15_000,
+  });
+  await expect(tier).toContainText("chat-glass-tier:native", {
+    timeout: 15_000,
+  });
+  await testInfo.attach("android-chat-native-resettled.png", {
+    body: adb(["exec-out", "screencap", "-p"], serial),
+    contentType: "image/png",
+  });
+});
+
 test("GlassBridge native-view lifecycle, boundary validation, and rendered pixels", async ({
   device,
   page,
 }, testInfo) => {
   test.setTimeout(180_000);
-  await waitForShellReady(page);
 
   const serial = device.serial();
   const sdk = Number.parseInt(
@@ -103,6 +294,10 @@ test("GlassBridge native-view lifecycle, boundary validation, and rendered pixel
     if (!plugin) return { error: "GlassBridge plugin not registered" } as const;
     (window as unknown as { __glass: GlassPlugin }).__glass = plugin;
     const availability = await plugin.isAvailable();
+    // The product may already have anchored its chat surface before this
+    // low-level probe attaches. Reset establishes a deterministic native-host
+    // baseline and directly exercises the renderer-reload teardown contract.
+    await plugin.reset();
     // Host a wallpaper below the WebView BEFORE the panel: bytes generated in
     // the page (canvas) and piped across the bridge — the contract has no
     // native network/cookie machinery, so no URL can exercise this path.

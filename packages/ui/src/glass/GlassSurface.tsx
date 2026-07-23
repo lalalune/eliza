@@ -7,12 +7,13 @@
  *
  *   css tiers      — translucent fill + backdrop-filter on this element
  *                    (refraction upgrade on Chromium via `@supports`).
- *   native   — the element goes transparent and a real UIGlassEffect
- *                    view is anchored to its rect through the GlassBridge
- *                    plugin. Rect syncs on mount and on resize (ResizeObserver
- *                    + window resize) — NOT per scroll frame, which is why the
- *                    primitive is for stable chrome (sheets at rest, pills,
- *                    menus, headers), never for elements inside a scroller.
+ *   native   — a real UIGlassEffect view is anchored below the WebView and the
+ *                    element keeps its translucent fill as a foreground scrim.
+ *                    A single WebView is one native compositing layer, so the
+ *                    scrim prevents sibling DOM behind the surface from being
+ *                    painted sharply above the native material. Rect syncs on
+ *                    mount and resize — NOT per scroll frame, so this is for
+ *                    stable chrome, never elements inside a scroller.
  *
  * `GlassStyles` mounts the shared stylesheet (rim pseudo-element + the
  * Chromium refraction upgrade) once per document, alongside
@@ -60,7 +61,6 @@ export function GlassStyles(): React.JSX.Element {
   border-radius: ${r.radius};
 }
 .eliza-glass-${variant}[data-glass-tier="native"] {
-  background-color: transparent;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }`;
@@ -113,16 +113,17 @@ export interface NativeGlassAnchorOptions {
  *      reason.
  *   3. Only after BOTH acks: `activateNativeBackdrop()` + local state flip in
  *      one React commit — the DOM wallpaper hides exactly when this element
- *      goes transparent and the native stack shows through, whole.
+ *      drops its CSS blur and the native stack shows through its fill.
  *
  * Disabling (`enabled: false` — e.g. a drag starting) reports a CSS tier on
  * the very same render; the caller repaints its CSS material instantly while
  * the native teardown trails harmlessly behind an opaque element.
  *
- * iOS only by design: Android's bridge panel is near-opaque, so anchoring it
- * per-surface is pure native-view churn with a worse look than the CSS tier
- * over a DOM wallpaper (measured in the #16200 investigation). Android and
- * every non-native platform always report a CSS tier here.
+ * Both native implementations use this acknowledgement-ordered path. iOS
+ * supplies UIGlassEffect and Android supplies its API-31+ dynamic-palette
+ * Material panel; older OS versions and non-native platforms stay on CSS.
+ * Android's material is intentionally near-opaque, but it still has to be the
+ * native panel promised by the bridge contract rather than a CSS imitation.
  */
 export function useNativeGlassAnchor(
   ref: React.RefObject<HTMLElement | null>,
@@ -143,13 +144,14 @@ export function useNativeGlassAnchor(
     };
   }, []);
 
-  const wantNative = enabled && available && nativeGlassPlatform() === "ios";
+  const platform = nativeGlassPlatform();
+  const wantNative = enabled && available && platform !== null;
 
   useEffect(() => {
     if (!wantNative) {
       // Disambiguate exactly which gate is holding the anchor on CSS —
-      // e=caller-enabled, p=platform-is-ios, a=plugin-available.
-      const platformOk = nativeGlassPlatform() === "ios";
+      // e=caller-enabled, p=supported-native-platform, a=plugin-available.
+      const platformOk = platform !== null;
       setNativeGlassDiag(
         `anchor-idle:e${enabled ? 1 : 0}p${platformOk ? 1 : 0}a${available ? 1 : 0}`,
       );
@@ -244,7 +246,7 @@ export function useNativeGlassAnchor(
       unsubscribe?.();
       teardown();
     };
-  }, [wantNative, enabled, available, interactive, ref, regionId]);
+  }, [wantNative, enabled, available, interactive, platform, ref, regionId]);
 
   return nativeLive && backdropActive ? "native" : cssGlassTier();
 }

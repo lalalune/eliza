@@ -75,6 +75,7 @@ import {
 } from "../../glass/native-backdrop";
 import { resetGlassBridgeForTests } from "../../glass/native-bridge";
 import {
+  GLASS_NATIVE_SHEET_SCRIM,
   GLASS_SHEET_BACKDROP_FILTER,
   GLASS_SHEET_FILL,
 } from "../../glass/tokens";
@@ -503,9 +504,10 @@ describe("ChatOverlay", () => {
     const attachOrder = bridge.attachGlass.mock.invocationCallOrder[0] ?? 0;
     expect(backdropOrder).toBeGreaterThan(0);
     expect(backdropOrder).toBeLessThan(attachOrder);
-    // Native material: fill + blur drop (the OS paints them); border, bevel,
-    // and sheen stay — the branded edge survives on every tier.
-    expect(surface.style.backgroundColor).toBe("transparent");
+    // Native material replaces the expensive CSS blur, while the translucent
+    // fill occludes DOM siblings that share the WebView layer and therefore
+    // cannot sit natively behind the anchored panel.
+    expect(surface.style.backgroundColor).toBe(GLASS_NATIVE_SHEET_SCRIM);
     expect(surface.style.backdropFilter).toBe("");
     expect(screen.getByTestId("chat-glass-tier-probe").textContent).toContain(
       "chat-glass-tier:native",

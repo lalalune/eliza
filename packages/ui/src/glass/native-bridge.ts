@@ -16,9 +16,11 @@
  *
  * True glass can never render INSIDE the DOM — WKWebView composites its own
  * pixels. The pattern here is a native effect view positioned to a web-reported
- * rect, layered under a transparent region of the page. Position sync is
- * per-call, not per-frame, so callers must anchor glass to STABLE chrome (the
- * composer pill, a sheet at rest, a header) — never to scrolling content.
+ * rect, layered under a translucent, blur-free region of the page. The fill
+ * prevents DOM siblings behind that region from painting sharply above the
+ * native material; a WebView cannot interleave native views between DOM
+ * layers. Position sync is per-call, not per-frame, so callers must anchor
+ * glass to STABLE chrome — never to scrolling content.
  */
 
 /** Mirrors the Swift plugin's attach options. */
@@ -136,11 +138,8 @@ export function glassBridge(): GlassBridgePlugin | null {
 
 /**
  * Which native platform the bridge would run on, independent of plugin
- * availability. The anchor layer branches on this: iOS's translucent
- * UIGlassEffect is the only material that needs (and rewards) an
- * under-WebView wallpaper; Android's panel is near-opaque, so anchoring it
- * per-sheet is pure view churn (measured in the #16200 investigation) and the
- * sheet stays on the CSS tier there.
+ * availability. Both returned platforms own a native material implementation;
+ * callers use null to keep web, desktop, and unsupported shells on CSS.
  */
 export function nativeGlassPlatform(): "ios" | "android" | null {
   const cap = capacitorGlobal();
@@ -208,14 +207,17 @@ export async function clearNativeBackdrop(): Promise<void> {
  * reach them across a reload/crash/HMR boundary; the shell root calls this
  * once per renderer boot.
  */
-export async function resetNativeGlassHost(): Promise<void> {
+export async function resetNativeGlassHost(): Promise<boolean> {
   const bridge = glassBridge();
-  if (!bridge) return;
+  if (!bridge) return true;
   try {
     await bridge.reset();
+    return true;
   } catch {
-    // error-policy:J4 capability write — a shell predating reset() has no
-    // cross-document state contract to clean; callers proceed on CSS.
+    // error-policy:J4 capability write — without a reset acknowledgement the
+    // renderer cannot prove that regions from the previous document are gone,
+    // so its boot gate keeps this session on CSS.
+    return false;
   }
 }
 

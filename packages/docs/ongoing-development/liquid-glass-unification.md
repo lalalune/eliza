@@ -40,9 +40,9 @@ chat sheet and notification cards used it, each with hand-tuned numbers.
   screen-downsampled BYTES the page already loaded (never a URL — the #16656
   review found URL fetching forwarded the iOS cookie jar to arbitrary
   wallpaper origins). The handoff is acknowledgement-ordered: wallpaper ack →
-  region ack → one-commit flip, so no frame ever lacks a material. Anchoring
-  is iOS-only: Android's panel is near-opaque, so per-surface anchoring there
-  is pure native-view churn (#16200 finding).
+  region ack → one-commit flip, so no frame ever lacks a material. Both native
+  platforms use this path: translucent `UIGlassEffect` on iOS and the
+  near-opaque dynamic-palette Material panel on Android.
 - **`native-bridge.ts` + `GlassBridge.swift` + `GlassBridgePlugin.java`** —
   real native material on both mobile platforms, one JS API. The Swift plugin
   (`packages/app-core/platforms/ios/App/App/GlassBridge.swift`, same
@@ -69,6 +69,13 @@ from web rects on mount/resize (not per scroll frame). So the native tier is
 for **stable chrome only**: the composer pill, a sheet at rest, menus, headers.
 Content inside scrollers keeps CSS glass on every platform.
 
+The native sheet also retains a theme-aware foreground scrim. Native material
+under the WebView can sample the native wallpaper, but it cannot blur launcher
+controls that are sibling DOM pixels in the WebView's indivisible layer. The
+scrim keeps that content from remaining readable through chat while leaving a
+small transparent contribution for the system material. CSS tiers use the
+lighter sheet fill because their backdrop filter can sample DOM pixels.
+
 Findings that shaped this (2026-07 research):
 
 - **Capacitor 9.0.0-alpha.5 ships nothing glass-related** (its notes: a merge
@@ -91,13 +98,13 @@ Findings that shaped this (2026-07 research):
 | Surface | State |
 | --- | --- |
 | Notification cards | already on the liquid-glass optical stack (shade v4) |
-| Chat sheet | sheet-tier tokens canonical in `glass/tokens.ts`; on iOS 26 the SETTLED open sheet adopts real `UIGlassEffect` over the temporally-hosted wallpaper (`useNativeGlassAnchor` in `ChatOverlay`), CSS during every drag/settle; Android stays CSS by design |
+| Chat sheet | sheet-tier tokens canonical in `glass/tokens.ts`; on iOS 26 and Android 12+ the SETTLED open sheet adopts the platform-native material over the temporally-hosted wallpaper (`useNativeGlassAnchor` in `ChatOverlay`), CSS during every drag/settle |
 | + menu (chat composer) | migrated — `DropdownMenuContent glass` → `menu` variant |
 | Other dropdowns/popovers (slash menu, config selects) | pending — same `glass` prop |
 | ViewHeader back button / pills | pending — `pill` variant |
 | NotificationBanners (toasts) | pending — `banner` variant |
 | `HOME_GLASS_CLASS` / `WALLPAPER_GLASS` family | pending consolidation into tokens |
-| Native tier wiring (wallpaper + sheet region) | `setBackdrop`/`clearBackdrop` (byte-piped) + settle-anchored chat sheet shipped for iOS; Android device e2e covers the bridge contract (`packages/app/test/android/glass-bridge.android.spec.ts`); attended iOS 26 captures + GPU/battery traces remain the release-verification gate for #15891 |
+| Native tier wiring (wallpaper + sheet region) | `setBackdrop`/`clearBackdrop` (byte-piped) + settle-anchored chat sheet implemented on iOS and Android; device E2E covers the bridge contract (`packages/app/test/android/glass-bridge.android.spec.ts`); attended platform captures + GPU/battery traces are the release-verification gate for #15891 |
 
 Each pending row is a small mechanical PR: swap the hand-rolled recipe for a
 variant, delete the local numbers, screenshot before/after.

@@ -57,6 +57,13 @@ let encoded: { key: string; promise: Promise<string | null> } | null = null;
  *  re-acquire (drag → settle) skip re-sending the same bytes. */
 let installed: string | null = null;
 let pendingClear: number | null = null;
+/**
+ * Orders the intent of native writes without serializing image decodes. Both
+ * plugins already use a native generation to cancel older decodes; this token
+ * lets the renderer recognize that a successful acknowledgement was
+ * superseded by a newer set/clear before it promotes a lease.
+ */
+let nativeMutation = 0;
 
 const listeners = new Set<() => void>();
 
@@ -169,6 +176,7 @@ async function pipe(
     setNativeGlassDiag("stale-encode");
     return false;
   }
+  const mutation = ++nativeMutation;
   const applied = await setNativeBackdrop({
     imageBase64,
     color: target.color,
@@ -177,8 +185,22 @@ async function pipe(
     setNativeGlassDiag("native-refused-backdrop");
     return false;
   }
+  if (mutation !== nativeMutation) {
+    setNativeGlassDiag("superseded-backdrop");
+    return false;
+  }
   if (targetEpoch !== epoch) {
     setNativeGlassDiag("stale-backdrop");
+    // A source can change while the native decoder is in flight. If no newer
+    // native write or live anchor now owns the layer, remove the stale pixels
+    // and restore WebView opacity. Incrementing first makes a later acquire's
+    // setBackdrop the newer native generation, so this cleanup can never erase
+    // pixels that an activation has acknowledged.
+    if (!active && holders === 0 && mutation === nativeMutation) {
+      nativeMutation += 1;
+      installed = null;
+      await clearNativeBackdrop();
+    }
     return false;
   }
   installed = key;
@@ -269,6 +291,7 @@ function deactivate(): void {
       if (pendingClear !== clearEpoch) return;
       pendingClear = null;
       installed = null;
+      nativeMutation += 1;
       void clearNativeBackdrop();
     }),
   );
@@ -376,5 +399,6 @@ export function resetNativeBackdropForTests(): void {
   encoded = null;
   installed = null;
   pendingClear = null;
+  nativeMutation += 1;
   listeners.clear();
 }

@@ -25,10 +25,10 @@
  *   banner  — transient toast/banner: card fill at higher opacity, no rim (it
  *             lives for seconds; the ring reads as noise at toast scale).
  *
- * `backdropFilter` values are the CSS tier; native tiers replace the fill +
- * blur with a real system material behind a transparent element (see
- * `useNativeGlass`), keeping ONLY the rim/sheen overlays so the branded edge
- * survives on top of the OS material.
+ * `backdropFilter` values are the CSS tier; native tiers replace the blur with
+ * real system material behind the same translucent fill (see `useNativeGlass`).
+ * The fill also occludes sibling DOM that shares the WebView's indivisible
+ * native layer; the rim/sheen overlays preserve the branded edge.
  */
 
 import {
@@ -67,6 +67,15 @@ export interface GlassRecipe {
  */
 export const GLASS_SHEET_FILL =
   "color-mix(in srgb, var(--card) 62%, transparent)";
+/**
+ * Foreground scrim for native-hosted sheet material. A WKWebView is one
+ * composited native layer, so system material beneath it cannot blur sibling
+ * DOM pixels. Keeping a small transparent contribution lets the native
+ * wallpaper material tint the sheet while preventing launcher controls from
+ * remaining readable through the chat content.
+ */
+export const GLASS_NATIVE_SHEET_SCRIM =
+  "color-mix(in srgb, var(--card) 96%, transparent)";
 /**
  * Backdrop filter for the chat sheet: a heavy neutral blur with NO saturate.
  * The blur keeps text legible while letting the backdrop's color and light

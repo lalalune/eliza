@@ -282,9 +282,6 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
                 true,
               );
             }
-            for (const [key, value] of Object.entries(args.seed)) {
-              localStorage.setItem(key, value);
-            }
             const preferences = (
               window as Window & {
                 Capacitor?: {
@@ -306,6 +303,10 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
                 ),
               );
             }
+            // The live route may be executing in a restricted surface realm,
+            // where raw writes to shell-owned keys correctly throw. Native
+            // Preferences seeds the durable store here; the init script above
+            // mirrors those keys before the realm broker installs on reload.
           },
           { seed: storageSeed, allowFirstRun: ALLOW_FIRST_RUN },
         );

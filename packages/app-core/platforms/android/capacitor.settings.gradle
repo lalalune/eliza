@@ -27,7 +27,7 @@ include ':capacitor-keyboard'
 project(':capacitor-keyboard').projectDir = new File('../../../../node_modules/.bun/@capacitor+keyboard@8.0.3+1b808583819c2ac6/node_modules/@capacitor/keyboard/android')
 
 include ':capacitor-local-notifications'
-project(':capacitor-local-notifications').projectDir = new File('../../../../node_modules/.bun/@capacitor+local-notifications@8.2.0+1b808583819c2ac6/node_modules/@capacitor/local-notifications/android')
+project(':capacitor-local-notifications').projectDir = new File('../../../../node_modules/.bun/@capacitor+local-notifications@8.2.1+f721df64a7724b94/node_modules/@capacitor/local-notifications/android')
 
 include ':capacitor-network'
 project(':capacitor-network').projectDir = new File('../../../../node_modules/.bun/@capacitor+network@8.0.1+1b808583819c2ac6/node_modules/@capacitor/network/android')
