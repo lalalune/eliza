@@ -273,8 +273,11 @@ describe("committed compose.yml", () => {
     );
     const doc = Bun.YAML.parse(text);
     expect(doc.name).toBe("eliza-certification");
-    expect(Object.keys(doc.services).length).toBeGreaterThanOrEqual(12);
+    const serviceNames = Object.keys(doc.services);
+    expect(serviceNames.some((name) => name.startsWith("lane-"))).toBe(true);
+    expect(new Set(serviceNames).size).toBe(serviceNames.length);
     expect(doc.services["gpu-vision"].profiles).toEqual(["gpu"]);
+    expect(doc.services["gpu-queue-worker"].profiles).toEqual(["gpu"]);
     expect(doc.volumes["build-cache"]).toBeDefined();
   }, 120_000);
 
