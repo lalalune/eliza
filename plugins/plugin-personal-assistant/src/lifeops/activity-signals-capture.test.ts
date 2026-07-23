@@ -22,13 +22,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => {
   const mobile = {
     listenerCb: null as null | ((signal: unknown) => void),
+    listenerRemoves: [] as Array<ReturnType<typeof vi.fn>>,
     checkPermissions: vi.fn(async () => ({ status: "granted" })),
     addListener: vi.fn(
       async (_event: string, cb: (signal: unknown) => void) => {
         mobile.listenerCb = cb;
-        return { remove: vi.fn(async () => {}) };
+        const remove = vi.fn(async () => {});
+        mobile.listenerRemoves.push(remove);
+        return { remove };
       },
     ),
+    releaseSignalListeners: vi.fn(async () => ({ removed: true })),
     startMonitoring: vi.fn(async () => ({
       enabled: true,
       supported: true,
@@ -218,7 +222,9 @@ describe("startLifeOpsActivitySignalCapture", () => {
     h.mobile.addListener.mockImplementation(
       async (_event: string, cb: (signal: unknown) => void) => {
         h.mobile.listenerCb = cb;
-        return { remove: vi.fn(async () => {}) };
+        const remove = vi.fn(async () => {});
+        h.mobile.listenerRemoves.push(remove);
+        return { remove };
       },
     );
     h.mobile.getSnapshot.mockResolvedValue({
@@ -234,9 +240,11 @@ describe("startLifeOpsActivitySignalCapture", () => {
       healthSnapshot: null,
     });
     h.mobile.stopMonitoring.mockResolvedValue({ stopped: true });
+    h.mobile.releaseSignalListeners.mockResolvedValue({ removed: true });
     h.mobile.scheduleBackgroundRefresh.mockResolvedValue({ scheduled: true });
     h.mobile.cancelBackgroundRefresh.mockResolvedValue({ cancelled: true });
     h.mobile.listenerCb = null;
+    h.mobile.listenerRemoves.length = 0;
   });
 
   afterEach(async () => {
@@ -472,11 +480,9 @@ describe("startLifeOpsActivitySignalCapture", () => {
 
   it("rolls back a rejected native start and retries cleanly on resume", async () => {
     mockNativeMobile();
-    const firstRemove = vi.fn(async () => {});
-    const secondRemove = vi.fn(async () => {});
     h.mobile.addListener
-      .mockResolvedValueOnce({ remove: firstRemove })
-      .mockResolvedValueOnce({ remove: secondRemove });
+      .mockResolvedValueOnce({ remove: vi.fn(async () => {}) })
+      .mockResolvedValueOnce({ remove: vi.fn(async () => {}) });
     h.mobile.startMonitoring
       .mockRejectedValueOnce(new Error("native start rejected"))
       .mockResolvedValueOnce({
@@ -490,7 +496,7 @@ describe("startLifeOpsActivitySignalCapture", () => {
     stop = startLifeOpsActivitySignalCapture(true);
     await settle();
 
-    expect(firstRemove).toHaveBeenCalledTimes(1);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(1);
     expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
     expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalledTimes(1);
 
@@ -499,14 +505,13 @@ describe("startLifeOpsActivitySignalCapture", () => {
 
     expect(h.mobile.addListener).toHaveBeenCalledTimes(2);
     expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(2);
-    expect(secondRemove).not.toHaveBeenCalled();
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(1);
   });
 
   it("rolls back a disabled native start instead of wedging future retries", async () => {
     mockNativeMobile();
-    const firstRemove = vi.fn(async () => {});
     h.mobile.addListener
-      .mockResolvedValueOnce({ remove: firstRemove })
+      .mockResolvedValueOnce({ remove: vi.fn(async () => {}) })
       .mockResolvedValueOnce({ remove: vi.fn(async () => {}) });
     h.mobile.startMonitoring
       .mockResolvedValueOnce({
@@ -527,7 +532,7 @@ describe("startLifeOpsActivitySignalCapture", () => {
     stop = startLifeOpsActivitySignalCapture(true);
     await settle();
 
-    expect(firstRemove).toHaveBeenCalledTimes(1);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(1);
     document.dispatchEvent(new Event("eliza:app-resume"));
     await settle();
 
@@ -556,6 +561,129 @@ describe("startLifeOpsActivitySignalCapture", () => {
     await stopping;
     stop = undefined;
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
+  });
+
+  it("queues native release immediately while an owned snapshot read is pending", async () => {
+    mockNativeMobile();
+    const finishSnapshots: Array<
+      (result: {
+        supported: boolean;
+        snapshot: null;
+        healthSnapshot: null;
+      }) => void
+    > = [];
+    h.mobile.getSnapshot.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishSnapshots.push(resolve);
+        }),
+    );
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() => expect(finishSnapshots.length).toBeGreaterThan(0));
+
+    const stopping = stop();
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
+    expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalledTimes(1);
+
+    for (const finishSnapshot of finishSnapshots) {
+      finishSnapshot({
+        supported: false,
+        snapshot: null,
+        healthSnapshot: null,
+      });
+    }
+    await stopping;
+    stop = undefined;
+  });
+
+  it("does not start deferred native reads or scheduling after teardown begins during initial persistence", async () => {
+    mockNativeMobile();
+    h.mobile.startMonitoring.mockResolvedValue({
+      enabled: true,
+      supported: true,
+      platform: "ios",
+      snapshot: DEVICE_SNAPSHOT,
+      healthSnapshot: null,
+    });
+
+    let stopping: Promise<void> | undefined;
+    h.captureLifeOpsActivitySignal.mockImplementation(
+      (
+        signal: { source: string },
+        options?: {
+          signal?: AbortSignal;
+        },
+      ) => {
+        if (signal.source !== "mobile_device") {
+          return Promise.resolve({ signal: { id: "sig-1" } });
+        }
+        return new Promise((_resolve, reject) => {
+          const uploadSignal = options?.signal;
+          if (!uploadSignal) {
+            reject(new Error("missing capture AbortSignal"));
+            return;
+          }
+          uploadSignal.addEventListener(
+            "abort",
+            () => reject(new DOMException("stopped", "AbortError")),
+            { once: true },
+          );
+          const cleanup = stop;
+          if (!cleanup) {
+            reject(new Error("capture teardown was not installed"));
+            return;
+          }
+          stopping = cleanup();
+          stop = undefined;
+        });
+      },
+    );
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() => expect(stopping).toBeDefined());
+    await stopping;
+
+    // Native snapshots are consent-gated and the startup enrichment observes
+    // the synchronous teardown before it can create fresh bridge work.
+    expect(h.mobile.getSnapshot).not.toHaveBeenCalled();
+    expect(h.mobile.scheduleBackgroundRefresh).not.toHaveBeenCalled();
+    expect(h.mobile.stopMonitoring).toHaveBeenCalled();
+    expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalled();
+  });
+
+  it("keeps scheduling and health retries alive when initial persistence fails", async () => {
+    mockNativeMobile();
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    h.isApiError.mockImplementation(
+      (error) => typeof error === "object" && error !== null && "kind" in error,
+    );
+    h.captureLifeOpsActivitySignal.mockRejectedValue({ kind: "network" });
+    h.mobile.startMonitoring.mockResolvedValue({
+      enabled: true,
+      supported: true,
+      platform: "ios",
+      snapshot: DEVICE_SNAPSHOT,
+      healthSnapshot: HEALTH_SNAPSHOT,
+    });
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+
+    expect(h.mobile.scheduleBackgroundRefresh).toHaveBeenCalledTimes(1);
+    expect(
+      setIntervalSpy.mock.calls.some(([, delay]) => delay === 5 * 60_000),
+    ).toBe(true);
+    expect(h.mobile.listenerCb).toBeTypeOf("function");
+    expect(h.dispatchStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "capture_error" }),
+    );
+    expect(consoleError).not.toHaveBeenCalled();
+    setIntervalSpy.mockRestore();
+    consoleError.mockRestore();
   });
 
   it("aborts and settles owned signal uploads before teardown completes", async () => {
@@ -619,21 +747,25 @@ describe("startLifeOpsActivitySignalCapture", () => {
     stop = startLifeOpsActivitySignalCapture(true);
     await vi.waitFor(() => expect(finishSchedule).toBeTypeOf("function"));
     const stopping = stop();
-    expect(events).toEqual(["schedule:start"]);
+    expect(events).toEqual(["schedule:start", "cancel"]);
 
     finishSchedule?.({ scheduled: true });
     await stopping;
     stop = undefined;
 
-    expect(events).toEqual(["schedule:start", "schedule:end", "cancel"]);
+    expect(events).toEqual([
+      "schedule:start",
+      "cancel",
+      "schedule:end",
+      "cancel",
+    ]);
   });
 
   it("retains failed native ownership and retries every incomplete release", async () => {
     mockNativeMobile();
-    const remove = vi.fn(async () => {
-      throw new Error("listener remove failed");
-    });
-    h.mobile.addListener.mockResolvedValue({ remove });
+    h.mobile.releaseSignalListeners.mockRejectedValue(
+      new Error("listener registry release failed"),
+    );
     h.mobile.stopMonitoring.mockRejectedValue(new Error("monitor stop failed"));
 
     stop = startLifeOpsActivitySignalCapture(true);
@@ -642,21 +774,47 @@ describe("startLifeOpsActivitySignalCapture", () => {
     const cleanup = stop;
     stop = undefined;
     await expect(cleanup()).rejects.toThrow(
-      "Failed to fully release mobile activity monitoring ownership",
+      "Failed to stop LifeOps native activity capture after the late-acquisition sweep",
     );
 
-    expect(remove).toHaveBeenCalledTimes(1);
-    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(2);
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(2);
     expect(h.mobile.cancelBackgroundRefresh).toHaveBeenCalledTimes(1);
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(true);
     expect(startLifeOpsActivitySignalCapture(true)).toBe(cleanup);
 
-    remove.mockResolvedValue(undefined);
+    h.mobile.releaseSignalListeners.mockResolvedValue({ removed: true });
     h.mobile.stopMonitoring.mockResolvedValue({ stopped: true });
     await cleanup();
 
-    expect(remove).toHaveBeenCalledTimes(2);
-    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(2);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(3);
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(3);
+    expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
+  });
+
+  it("treats fulfilled false release results as retained ownership", async () => {
+    mockNativeMobile();
+    h.mobile.releaseSignalListeners.mockResolvedValue({ removed: false });
+    h.mobile.stopMonitoring.mockResolvedValue({ stopped: false });
+    h.mobile.cancelBackgroundRefresh.mockResolvedValue({
+      cancelled: false,
+      reason: "native owner still active",
+    });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+
+    const cleanup = stop;
+    stop = undefined;
+    await expect(cleanup()).rejects.toThrow(
+      "Failed to stop LifeOps native activity capture after the late-acquisition sweep",
+    );
+    expect(isLifeOpsActivitySignalCaptureActive()).toBe(true);
+
+    h.mobile.releaseSignalListeners.mockResolvedValue({ removed: true });
+    h.mobile.stopMonitoring.mockResolvedValue({ stopped: true });
+    h.mobile.cancelBackgroundRefresh.mockResolvedValue({ cancelled: true });
+    await cleanup();
     expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
   });
 
@@ -670,12 +828,17 @@ describe("startLifeOpsActivitySignalCapture", () => {
     expect(h.mobile.checkPermissions).toHaveBeenCalled();
     expect(h.mobile.addListener).not.toHaveBeenCalled();
     expect(h.mobile.startMonitoring).not.toHaveBeenCalled();
+    expect(h.mobile.getSnapshot).not.toHaveBeenCalled();
     expect(h.dispatchStatus).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "permission_unavailable",
         reason: "denied",
       }),
     );
+
+    document.dispatchEvent(new Event("eliza:app-pause"));
+    await settle();
+    expect(h.mobile.getSnapshot).not.toHaveBeenCalled();
   });
 
   it("does not prompt for permission when consent is not yet determined", async () => {
@@ -686,12 +849,27 @@ describe("startLifeOpsActivitySignalCapture", () => {
     await settle();
 
     expect(h.mobile.startMonitoring).not.toHaveBeenCalled();
+    expect(h.mobile.getSnapshot).not.toHaveBeenCalled();
     expect(h.dispatchStatus).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "permission_unavailable",
         reason: "not-determined",
       }),
     );
+  });
+
+  it("starts on iOS once the privacy-preserving HealthKit decision is determined", async () => {
+    mockNativeMobile();
+    h.mobile.checkPermissions.mockResolvedValue({
+      status: "determined",
+      permissions: { sleep: false, biometrics: false },
+    });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+
+    expect(h.mobile.addListener).toHaveBeenCalledTimes(1);
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
   });
 
   it("picks up a permission granted later on app resume", async () => {
@@ -709,7 +887,371 @@ describe("startLifeOpsActivitySignalCapture", () => {
     expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
   });
 
-  it("stopping during an awaited listener registration removes the late handle", async () => {
+  it("stops committed monitoring when consent is revoked before a resume read", async () => {
+    mockNativeMobile();
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+    const snapshotsBeforeResume = h.mobile.getSnapshot.mock.calls.length;
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "denied" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
+    expect(h.mobile.getSnapshot).toHaveBeenCalledTimes(snapshotsBeforeResume);
+    expect(h.dispatchStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "permission_unavailable",
+        reason: "denied",
+      }),
+    );
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "granted" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the health poller across revocation and installs only one replacement after re-grant", async () => {
+    mockNativeMobile();
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+
+    const healthIntervalIndexes = (): number[] =>
+      setIntervalSpy.mock.calls.flatMap(([, delay], index) =>
+        delay === 5 * 60_000 ? [index] : [],
+      );
+    expect(healthIntervalIndexes()).toHaveLength(1);
+    const firstHealthInterval =
+      setIntervalSpy.mock.results[healthIntervalIndexes()[0]]?.value;
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "denied" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+
+    expect(clearIntervalSpy).toHaveBeenCalledWith(firstHealthInterval);
+    const readsAfterRevocation = h.mobile.getSnapshot.mock.calls.length;
+    document.dispatchEvent(new Event("eliza:app-pause"));
+    await settle();
+    expect(h.mobile.getSnapshot).toHaveBeenCalledTimes(readsAfterRevocation);
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "granted" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+
+    expect(healthIntervalIndexes()).toHaveLength(2);
+    const secondHealthInterval =
+      setIntervalSpy.mock.results[healthIntervalIndexes()[1]]?.value;
+    expect(secondHealthInterval).not.toBe(firstHealthInterval);
+
+    await stop();
+    stop = undefined;
+    expect(clearIntervalSpy).toHaveBeenCalledWith(secondHealthInterval);
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
+  });
+
+  it("releases residual ownership and starts a fresh listener after partial revocation teardown", async () => {
+    mockNativeMobile();
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    expect(h.mobile.addListener).toHaveBeenCalledTimes(1);
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+
+    h.mobile.stopMonitoring.mockResolvedValueOnce({ stopped: false });
+    h.mobile.checkPermissions.mockResolvedValue({ status: "denied" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(1);
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1);
+    expect(h.dispatchStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "capture_error" }),
+    );
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "granted" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await settle();
+
+    // The failed stop is retried before a successor acquires a fresh listener.
+    expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(2);
+    expect(h.mobile.addListener).toHaveBeenCalledTimes(2);
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(2);
+  });
+
+  it("fences delayed reads and callbacks from a released consent generation", async () => {
+    mockNativeMobile();
+    let finishOldRead:
+      | ((result: {
+          supported: boolean;
+          snapshot: typeof DEVICE_SNAPSHOT;
+          healthSnapshot: typeof HEALTH_SNAPSHOT;
+        }) => void)
+      | undefined;
+    h.mobile.getSnapshot
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishOldRead = resolve;
+          }),
+      )
+      .mockResolvedValue({
+        supported: false,
+        snapshot: null,
+        healthSnapshot: null,
+      });
+    h.mobile.checkPermissions
+      .mockResolvedValueOnce({ status: "granted" })
+      .mockResolvedValueOnce({ status: "denied" })
+      .mockResolvedValue({ status: "granted" });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() => expect(finishOldRead).toBeTypeOf("function"));
+    await vi.waitFor(() => expect(h.mobile.listenerCb).toBeTypeOf("function"));
+    const releasedGenerationCallback = h.mobile.listenerCb;
+    h.captureLifeOpsActivitySignal.mockClear();
+
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await vi.waitFor(() =>
+      expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1),
+    );
+    releasedGenerationCallback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { generation: "released-before-settle" },
+    });
+    finishOldRead?.({
+      supported: true,
+      snapshot: {
+        ...DEVICE_SNAPSHOT,
+        metadata: { generation: "released-read" },
+      },
+      healthSnapshot: HEALTH_SNAPSHOT,
+    });
+    await settle();
+
+    const releasedGenerationSignals =
+      h.captureLifeOpsActivitySignal.mock.calls.filter(([signal]) =>
+        (signal as { source: string }).source.startsWith("mobile_"),
+      );
+    expect(releasedGenerationSignals).toHaveLength(0);
+
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await vi.waitFor(() =>
+      expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(2),
+    );
+    const currentGenerationCallback = h.mobile.listenerCb;
+    expect(currentGenerationCallback).not.toBe(releasedGenerationCallback);
+
+    releasedGenerationCallback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { generation: "released-after-restart" },
+    });
+    currentGenerationCallback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { generation: "current" },
+    });
+    await settle();
+
+    const callbackGenerations =
+      h.captureLifeOpsActivitySignal.mock.calls.flatMap(([signal]) => {
+        const metadata = (signal as { metadata?: { generation?: string } })
+          .metadata;
+        return metadata?.generation ? [metadata.generation] : [];
+      });
+    expect(callbackGenerations).toContain("current");
+    expect(callbackGenerations).not.toContain("released-read");
+    expect(callbackGenerations).not.toContain("released-before-settle");
+    expect(callbackGenerations).not.toContain("released-after-restart");
+  });
+
+  it("aborts and settles a released generation upload before allowing restart", async () => {
+    mockNativeMobile();
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    const releasedGenerationCallback = h.mobile.listenerCb;
+    expect(releasedGenerationCallback).toBeTypeOf("function");
+
+    let finishUpload:
+      | ((result: { signal: { id: string } }) => void)
+      | undefined;
+    let uploadSignal: AbortSignal | undefined;
+    h.captureLifeOpsActivitySignal.mockImplementation(
+      (
+        signal: { metadata?: { generation?: string } },
+        options?: { signal?: AbortSignal },
+      ) => {
+        if (signal.metadata?.generation !== "pending") {
+          return Promise.resolve({ signal: { id: "sig-1" } });
+        }
+        uploadSignal = options?.signal;
+        return new Promise((resolve) => {
+          finishUpload = resolve;
+        });
+      },
+    );
+
+    releasedGenerationCallback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { generation: "pending" },
+    });
+    await vi.waitFor(() => expect(finishUpload).toBeTypeOf("function"));
+
+    h.mobile.checkPermissions
+      .mockResolvedValueOnce({ status: "denied" })
+      .mockResolvedValue({ status: "granted" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await vi.waitFor(() => expect(uploadSignal?.aborted).toBe(true));
+
+    // A later resume records a stronger consent epoch, but cannot acquire its
+    // successor while the old transport still owns an unsettled operation.
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await Promise.resolve();
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+
+    finishUpload?.({ signal: { id: "late-old-generation" } });
+    await vi.waitFor(() =>
+      expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  it("does not let an older failed upload erase a newer dedupe entry", async () => {
+    mockNativeMobile();
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    const callback = h.mobile.listenerCb;
+    expect(callback).toBeTypeOf("function");
+
+    let failOlderUpload: ((reason?: unknown) => void) | undefined;
+    h.isApiError.mockImplementation(
+      (error) => typeof error === "object" && error !== null && "kind" in error,
+    );
+    h.captureLifeOpsActivitySignal.mockImplementation(
+      (signal: { metadata?: { sequence?: string } }) => {
+        if (signal.metadata?.sequence === "older") {
+          return new Promise((_resolve, reject) => {
+            failOlderUpload = reject;
+          });
+        }
+        return Promise.resolve({ signal: { id: "sig-newer" } });
+      },
+    );
+
+    callback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { sequence: "older" },
+    });
+    callback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { sequence: "newer" },
+    });
+    await vi.waitFor(() => expect(failOlderUpload).toBeTypeOf("function"));
+    await vi.waitFor(() =>
+      expect(
+        h.captureLifeOpsActivitySignal.mock.calls.filter(
+          ([signal]) =>
+            (signal as { metadata?: { sequence?: string } }).metadata
+              ?.sequence === "newer",
+        ),
+      ).toHaveLength(1),
+    );
+
+    failOlderUpload?.({ kind: "network" });
+    await settle();
+    callback?.({
+      ...DEVICE_SNAPSHOT,
+      metadata: { sequence: "newer" },
+    });
+    await settle();
+
+    expect(
+      h.captureLifeOpsActivitySignal.mock.calls.filter(
+        ([signal]) =>
+          (signal as { metadata?: { sequence?: string } }).metadata
+            ?.sequence === "newer",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("revalidates denied consent even while post-commit enrichment is hung", async () => {
+    mockNativeMobile();
+    let finishSnapshot:
+      | ((result: {
+          supported: boolean;
+          snapshot: null;
+          healthSnapshot: null;
+        }) => void)
+      | undefined;
+    h.mobile.getSnapshot.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishSnapshot = resolve;
+        }),
+    );
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() => expect(finishSnapshot).toBeTypeOf("function"));
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+
+    h.mobile.checkPermissions.mockResolvedValue({ status: "denied" });
+    document.dispatchEvent(new Event("eliza:app-resume"));
+
+    await vi.waitFor(() =>
+      expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(2),
+    );
+    await vi.waitFor(() => expect(h.mobile.stopMonitoring).toHaveBeenCalled());
+
+    finishSnapshot?.({
+      supported: false,
+      snapshot: null,
+      healthSnapshot: null,
+    });
+    await settle();
+  });
+
+  it("queues resume consent revalidation while initial native acquisition is pending", async () => {
+    mockNativeMobile();
+    let resolveInitialPermission:
+      | ((result: { status: string }) => void)
+      | undefined;
+    h.mobile.checkPermissions
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveInitialPermission = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ status: "denied" });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await vi.waitFor(() =>
+      expect(resolveInitialPermission).toBeTypeOf("function"),
+    );
+
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    resolveInitialPermission?.({ status: "granted" });
+
+    await vi.waitFor(() =>
+      expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(2),
+    );
+    await vi.waitFor(() =>
+      expect(h.mobile.stopMonitoring).toHaveBeenCalledTimes(1),
+    );
+    expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+    expect(h.dispatchStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "permission_unavailable",
+        reason: "denied",
+      }),
+    );
+  });
+
+  it("stopping during an awaited listener registration clears the native registry", async () => {
     mockNativeMobile();
     const remove = vi.fn(async () => {});
     let releaseAddListener:
@@ -732,10 +1274,46 @@ describe("startLifeOpsActivitySignalCapture", () => {
     await stopping;
     await settle();
 
-    // The handle resolved after stop: it must be removed, and monitoring must
-    // never have started.
+    // The resolved handle queues Capacitor's ordinary removeListener call,
+    // while the package-owned release proves both native registries empty.
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(2);
     expect(remove).toHaveBeenCalledTimes(1);
     expect(h.mobile.startMonitoring).not.toHaveBeenCalled();
+  });
+
+  it("releases every saved listener callback across repeated generations", async () => {
+    mockNativeMobile();
+
+    for (let generation = 0; generation < 3; generation += 1) {
+      stop = startLifeOpsActivitySignalCapture(true);
+      await settle();
+      const cleanup = stop;
+      stop = undefined;
+      await cleanup();
+    }
+
+    expect(h.mobile.addListener).toHaveBeenCalledTimes(3);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(3);
+    expect(h.mobile.listenerRemoves).toHaveLength(3);
+    for (const remove of h.mobile.listenerRemoves) {
+      expect(remove).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("does not let a stale generic listener handle block authoritative release", async () => {
+    mockNativeMobile();
+    const remove = vi.fn(() => new Promise<void>(() => {}));
+    h.mobile.addListener.mockResolvedValue({ remove });
+
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    const cleanup = stop;
+    stop = undefined;
+
+    await expect(cleanup()).resolves.toBeUndefined();
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(h.mobile.releaseSignalListeners).toHaveBeenCalledTimes(1);
+    expect(isLifeOpsActivitySignalCaptureActive()).toBe(false);
   });
 
   it("stopping during an awaited startMonitoring stops the monitor and installs no late interval", async () => {
@@ -780,31 +1358,66 @@ describe("startLifeOpsActivitySignalCapture", () => {
     setIntervalSpy.mockRestore();
   });
 
-  it("does not double-start native monitoring from concurrent triggers", async () => {
+  it("coalesces concurrent resumes into one revalidation without double-starting", async () => {
     mockNativeMobile();
-    let releasePermissions: ((status: { status: string }) => void) | undefined;
+    const permissionResolvers: Array<(status: { status: string }) => void> = [];
     h.mobile.checkPermissions.mockImplementation(
       () =>
         new Promise((resolve) => {
-          releasePermissions = resolve;
+          permissionResolvers.push(resolve);
         }),
     );
 
     stop = startLifeOpsActivitySignalCapture(true);
-    await settle();
+    await vi.waitFor(() => expect(permissionResolvers).toHaveLength(1));
     expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(1);
 
-    // While the first start is parked on checkPermissions, app resumes retry
-    // the start; the in-flight guard must absorb them.
+    // Resume requires a fresh consent read, but simultaneous resume events
+    // coalesce behind one stronger follow-up check.
     document.dispatchEvent(new Event("eliza:app-resume"));
     document.dispatchEvent(new Event("eliza:app-resume"));
-    await settle();
-    releasePermissions?.({ status: "granted" });
-    await settle();
+    permissionResolvers.shift()?.({ status: "granted" });
+    await vi.waitFor(() => expect(permissionResolvers).toHaveLength(1));
+    permissionResolvers.shift()?.({ status: "granted" });
+    await vi.waitFor(() =>
+      expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(2),
+    );
 
-    expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(1);
+    expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(2);
     expect(h.mobile.addListener).toHaveBeenCalledTimes(1);
     expect(h.mobile.startMonitoring).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces concurrent resume health refreshes into one native read", async () => {
+    mockNativeMobile();
+    stop = startLifeOpsActivitySignalCapture(true);
+    await settle();
+    h.mobile.checkPermissions.mockClear();
+    h.mobile.getSnapshot.mockClear();
+
+    const finishPermissions: Array<(status: { status: string }) => void> = [];
+    h.mobile.checkPermissions.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishPermissions.push(resolve);
+        }),
+    );
+
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    document.dispatchEvent(new Event("eliza:app-resume"));
+    await vi.waitFor(() => expect(finishPermissions).toHaveLength(1));
+    finishPermissions.shift()?.({ status: "granted" });
+    await vi.waitFor(() => expect(finishPermissions).toHaveLength(1));
+    finishPermissions.shift()?.({ status: "granted" });
+    await vi.waitFor(() =>
+      expect(h.mobile.getSnapshot).toHaveBeenCalledTimes(1),
+    );
+    await settle();
+
+    // Both resume epochs are revalidated, but their shared completion schedules
+    // one health read rather than one read per caller.
+    expect(h.mobile.checkPermissions).toHaveBeenCalledTimes(2);
+    expect(h.mobile.getSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it("surfaces unexpected capture failures as a capture_error status event", async () => {

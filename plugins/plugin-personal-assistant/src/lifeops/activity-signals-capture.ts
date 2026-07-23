@@ -1,42 +1,29 @@
 /**
- * Imperative renderer-side controller that captures presence/health/screen-time
- * activity signals and posts them to the LifeOps activity-signals endpoint:
- * browser lifecycle listeners on every platform, the Capacitor MobileSignals
- * plugin on native mobile, and the Electrobun power/workspace bridge on
- * desktop. Signals are deduped by per-source fingerprint and re-captured on app
- * resume.
+ * Captures browser, native-mobile, and desktop activity signals for the LifeOps
+ * activity-signals endpoint. The renderer-service host installs one controller
+ * in each main app window; popouts, companion surfaces, and model tools do not
+ * participate.
  *
- * The renderer-service host starts this via `../register.ts`
- * (`registerRendererService`), scoped to main app windows only — never
- * popouts, detached shells, the phone companion, app windows, or the model
- * tester. The controller upholds three hard guarantees (#16504):
+ * Native ownership is generation-scoped. A generation owns its callbacks,
+ * reads, uploads, poller, and background-scheduling request, and teardown aborts
+ * and settles that work before a successor can start. Monitoring never prompts:
+ * it begins only after the OS records an authorization decision and revalidates
+ * that decision on resume. iOS can expose only that HealthKit authorization was
+ * determined, not which read types were granted.
  *
- * - **Idempotent start.** One capture per renderer: a second start while one
- *   is active returns the active capture's stop function instead of installing
- *   duplicate listeners/pollers. Stop fully releases the singleton so a later
- *   start re-initializes cleanly (host replacement, HMR).
- * - **Race-safe stop.** Native startup awaits (permission check, listener
- *   registration, monitor start) re-check the stop flag after every await:
- *   stopping mid-start removes the late listener handle, stops monitoring if
- *   it already engaged, and never installs a late poller interval.
- * - **No capture before consent.** Native monitoring starts only when the OS
- *   permission status is already "granted". This background service never
- *   prompts — requesting permission is the settings UI's job — and a denial
- *   is surfaced as a `permission_unavailable` status event, then re-checked on
- *   each app resume so a grant made in Settings activates without a restart.
- *
- * Expected unavailability (runtime not yet running, transient network/timeout,
- * endpoint 503) quietly stands the capture down until the ready-poll recovers.
- * Anything else is an unexpected failure and is surfaced observably: a
- * `capture_error` status event plus a prefixed console.error.
+ * Runtime startup, transport loss, timeouts, and an endpoint 503 are designed
+ * stand-down states. Other failures emit a `capture_error` status and remain
+ * visible in renderer diagnostics.
  */
 import { Capacitor } from "@capacitor/core";
 import {
   MobileSignals,
   type MobileSignalsHealthSnapshot,
+  type MobileSignalsPermissionStatus,
   type MobileSignalsSignal,
   type MobileSignalsSnapshot,
 } from "@elizaos/capacitor-mobile-signals";
+import { ElizaError } from "@elizaos/core";
 // The LifeOps client methods this controller calls are installed onto
 // ElizaClient.prototype by the client-lifeops side-effect module. Import it
 // here, not just in the root facade: the register entry can evaluate before
@@ -80,6 +67,12 @@ const MOBILE_HEALTH_POLL_MS = 5 * 60_000;
 type SignalFingerprint = {
   fingerprint: string;
   sentAtMs: number;
+};
+
+type MobileSignalsGeneration = {
+  controller: AbortController;
+  operations: Set<Promise<unknown>>;
+  refreshTask: Promise<void> | null;
 };
 
 interface CapacitorRuntime {
@@ -132,6 +125,18 @@ function errorMessage(error: unknown): string {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function combinedLifecycleError(
+  message: string,
+  code: string,
+  causes: unknown[],
+): ElizaError {
+  return new ElizaError(message, {
+    code,
+    cause: new AggregateError(causes, message),
+    severity: "ephemeral",
+  });
 }
 
 function fingerprintSignal(
@@ -225,6 +230,8 @@ export function startLifeOpsActivitySignalCapture(
   const inFlight = new Set<Promise<unknown>>();
   let runtimeReady = false;
   let mounted = true;
+  let mobileSignalsGeneration: MobileSignalsGeneration | null = null;
+  let mobileSignalsCommitted = false;
 
   const track = <T>(operation: Promise<T>): Promise<T> => {
     const tracked = operation.finally(() => {
@@ -240,6 +247,49 @@ export function startLifeOpsActivitySignalCapture(
     }
   };
 
+  const trackMobileSignalsOperation = <T>(
+    generation: MobileSignalsGeneration,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    // Install the lease before invoking the boundary: a native/client shim may
+    // synchronously trigger pagehide or consent teardown from inside `run`.
+    let releaseOwnership!: () => void;
+    const ownership = new Promise<void>((resolve) => {
+      releaseOwnership = resolve;
+    });
+    generation.operations.add(ownership);
+
+    let operation: Promise<T>;
+    try {
+      operation = run();
+    } catch (error) {
+      // error-policy:J1 normalize a synchronous native boundary throw into the
+      // same generation-owned operation and observable rejection.
+      operation = Promise.reject(error);
+    }
+    const tracked = operation.finally(() => {
+      generation.operations.delete(ownership);
+      releaseOwnership();
+    });
+    return tracked;
+  };
+
+  const settleMobileSignalsOperations = async (
+    generation: MobileSignalsGeneration,
+  ): Promise<void> => {
+    while (generation.operations.size > 0) {
+      await Promise.allSettled([...generation.operations]);
+    }
+  };
+
+  const isCurrentMobileSignalsGeneration = (
+    generation: MobileSignalsGeneration,
+  ): boolean =>
+    mounted &&
+    mobileSignalsCommitted &&
+    mobileSignalsGeneration === generation &&
+    !generation.controller.signal.aborted;
+
   const isRuntimeUnavailableError = (error: unknown): boolean =>
     isApiError(error) &&
     error.kind === "http" &&
@@ -249,25 +299,56 @@ export function startLifeOpsActivitySignalCapture(
   const isExpectedTransientError = (error: unknown): boolean =>
     isApiError(error) && (error.kind === "network" || error.kind === "timeout");
 
+  const captureErrorLeaves = (error: unknown): unknown[] =>
+    error instanceof AggregateError
+      ? [...error.errors].flatMap(captureErrorLeaves)
+      : error instanceof ElizaError && error.cause !== undefined
+        ? captureErrorLeaves(error.cause)
+        : [error];
+
   const reportCaptureError = (error: unknown): void => {
-    if (!mounted || isAbortError(error)) {
-      return;
+    if (!mounted) return;
+
+    const unexpected: unknown[] = [];
+    for (const cause of captureErrorLeaves(error)) {
+      if (isAbortError(cause)) continue;
+      if (isRuntimeUnavailableError(cause)) {
+        runtimeReady = false;
+        continue;
+      }
+      if (isExpectedTransientError(cause)) continue;
+      unexpected.push(cause);
     }
-    if (isRuntimeUnavailableError(error)) {
-      runtimeReady = false;
-      return;
-    }
-    if (isExpectedTransientError(error)) {
-      return;
-    }
+    if (unexpected.length === 0) return;
+
+    const reported =
+      unexpected.length === 1
+        ? unexpected[0]
+        : new AggregateError(
+            unexpected,
+            "Multiple LifeOps activity capture operations failed",
+          );
     // Unexpected failure: surface it observably — status event for in-app
     // listeners plus a prefixed console line for log capture — instead of
     // letting the capture silently rot.
-    console.error(`${LOG_PREFIX} unexpected capture failure:`, error);
+    console.error(`${LOG_PREFIX} unexpected capture failure:`, reported);
     dispatchLifeOpsActivitySignalsStatus({
       status: "capture_error",
-      message: errorMessage(error),
+      message: errorMessage(reported),
     });
+  };
+
+  const observeCaptureOperation = <T>(operation: Promise<T>): void => {
+    // error-policy:J7 renderer capture diagnostics must not kill the controller;
+    // unexpected failures still surface through reportCaptureError.
+    void track(operation).catch(reportCaptureError);
+  };
+
+  const observeMobileSignalsOperation = <T>(
+    generation: MobileSignalsGeneration,
+    operation: () => Promise<T>,
+  ): void => {
+    observeCaptureOperation(trackMobileSignalsOperation(generation, operation));
   };
 
   // Runtime not up yet (boot, restart) is the designed stand-down state; only
@@ -299,8 +380,14 @@ export function startLifeOpsActivitySignalCapture(
 
   const sendSignal = async (
     signal: CaptureLifeOpsActivitySignalRequest,
+    generation?: MobileSignalsGeneration,
   ): Promise<LifeOpsActivitySignal | null> => {
-    if (!mounted || !runtimeReady) {
+    if (
+      !mounted ||
+      !runtimeReady ||
+      (generation !== undefined &&
+        !isCurrentMobileSignalsGeneration(generation))
+    ) {
       return null;
     }
     const normalized: CaptureLifeOpsActivitySignalRequest = {
@@ -318,20 +405,29 @@ export function startLifeOpsActivitySignalCapture(
     ) {
       return null;
     }
-    lastSent.set(dedupeKey, { fingerprint, sentAtMs: nowMs });
+    const sentFingerprint = { fingerprint, sentAtMs: nowMs };
+    lastSent.set(dedupeKey, sentFingerprint);
     try {
       const { signal: persisted } = await client.captureLifeOpsActivitySignal(
         normalized,
         {
-          signal: captureController.signal,
+          signal: generation?.controller.signal ?? captureController.signal,
         },
       );
-      if (!mounted) {
+      if (
+        !mounted ||
+        (generation !== undefined &&
+          !isCurrentMobileSignalsGeneration(generation))
+      ) {
         return null;
       }
       return persisted;
     } catch (error) {
-      lastSent.delete(dedupeKey);
+      // error-policy:J4 abort and runtime-starting failures are explicit
+      // stand-down states; every other transport failure is rethrown.
+      if (lastSent.get(dedupeKey) === sentFingerprint) {
+        lastSent.delete(dedupeKey);
+      }
       if (!mounted || isAbortError(error)) {
         return null;
       }
@@ -343,20 +439,37 @@ export function startLifeOpsActivitySignalCapture(
     }
   };
 
-  const sendSnapshotResult = async (result: {
-    snapshot: MobileSignalsSnapshot | null;
-    healthSnapshot: MobileSignalsHealthSnapshot | null;
-  }): Promise<void> => {
+  const sendSnapshotResult = async (
+    result: {
+      snapshot: MobileSignalsSnapshot | null;
+      healthSnapshot: MobileSignalsHealthSnapshot | null;
+    },
+    generation: MobileSignalsGeneration,
+  ): Promise<void> => {
+    const sends: Promise<LifeOpsActivitySignal | null>[] = [];
     if (result.snapshot) {
-      await sendSignal(mapMobileSignal(result.snapshot));
+      sends.push(sendSignal(mapMobileSignal(result.snapshot), generation));
     }
     if (result.healthSnapshot) {
-      await sendSignal(mapMobileSignal(result.healthSnapshot));
+      sends.push(
+        sendSignal(mapMobileSignal(result.healthSnapshot), generation),
+      );
+    }
+    const outcomes = await Promise.allSettled(sends);
+    const failures = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw combinedLifecycleError(
+        "Failed to persist one or more mobile activity snapshots",
+        "MOBILE_SIGNAL_SNAPSHOT_PERSIST_FAILED",
+        failures,
+      );
     }
   };
 
   const fireAndForget = (signal: CaptureLifeOpsActivitySignalRequest): void => {
-    void track(sendSignal(signal)).catch(reportCaptureError);
+    observeCaptureOperation(sendSignal(signal));
   };
 
   const emitPageState = (reason: string): void => {
@@ -434,17 +547,16 @@ export function startLifeOpsActivitySignalCapture(
   const handleResume = (): void => {
     emitLifecycleState("active");
     emitPageState("resume");
-    void track(refreshMobileHealthSnapshot("resume")).catch(reportCaptureError);
     void track(emitDesktopSnapshot("resume"));
     // A permission granted in OS Settings while the app was backgrounded
-    // becomes effective here: startMobileSignals re-checks consent and is a
-    // cheap no-op when monitoring is already running.
-    void requestMobileSignalsStart().catch(reportCaptureError);
+    // becomes effective here, while a revoked grant stops existing native
+    // ownership before any fresh health read can begin.
+    requestMobileSignalsResume();
   };
   const handlePause = (): void => {
     emitLifecycleState("background");
     emitPageState("pause");
-    void track(refreshMobileHealthSnapshot("pause")).catch(reportCaptureError);
+    requestMobileHealthSnapshot("pause");
     void track(emitDesktopSnapshot("pause"));
   };
 
@@ -453,109 +565,362 @@ export function startLifeOpsActivitySignalCapture(
   let pendingMobileSignalsHandle: { remove: () => Promise<void> } | null = null;
   let mobileSignalsHandle: { remove: () => Promise<void> } | null = null;
   let mobileSignalsStarted = false;
-  let mobileSignalsCommitted = false;
   let mobileSignalsStartTask: Promise<void> | null = null;
+  let mobileSignalsResumeTask: Promise<void> | null = null;
+  let requestedConsentRevalidation = 0;
+  let attemptedConsentRevalidation = 0;
   let mobileSignalsStartupAttempted = false;
+  let mobileSignalListenersNeedRelease = false;
   let mobileBackgroundRefreshNeedsCancel = false;
+  let mobileBackgroundRefreshScheduleTask: Promise<void> | null = null;
+  let nativeReleaseTask: Promise<void> | null = null;
   let mobileHealthPoller: number | null = null;
 
-  const refreshMobileHealthSnapshot = async (reason: string): Promise<void> => {
-    if (!mobileSignals || typeof mobileSignals.getSnapshot !== "function") {
+  const clearMobileHealthPoller = (): void => {
+    if (mobileHealthPoller === null) return;
+    window.clearInterval(mobileHealthPoller);
+    mobileHealthPoller = null;
+  };
+
+  const requestMobileHealthSnapshot = (
+    reason: string,
+    requestedGeneration: MobileSignalsGeneration | null = mobileSignalsGeneration,
+  ): void => {
+    if (
+      !requestedGeneration ||
+      !isCurrentMobileSignalsGeneration(requestedGeneration) ||
+      !mobileSignals ||
+      typeof mobileSignals.getSnapshot !== "function"
+    ) {
       return;
     }
-    const snapshot = await mobileSignals.getSnapshot();
-    if (snapshot.supported) {
-      await sendSnapshotResult(snapshot);
-    } else {
-      dispatchLifeOpsActivitySignalsStatus({
-        status: "snapshot_unavailable",
-        reason,
-      });
-    }
+    if (requestedGeneration.refreshTask) return;
+
+    let tracked: Promise<void>;
+    const reading = trackMobileSignalsOperation(
+      requestedGeneration,
+      async () => {
+        const snapshot = await mobileSignals.getSnapshot();
+        if (!isCurrentMobileSignalsGeneration(requestedGeneration)) {
+          return;
+        }
+        if (snapshot.supported) {
+          await sendSnapshotResult(snapshot, requestedGeneration);
+        } else {
+          dispatchLifeOpsActivitySignalsStatus({
+            status: "snapshot_unavailable",
+            reason,
+          });
+        }
+      },
+    );
+    const finalized = reading.finally(() => {
+      if (requestedGeneration.refreshTask === tracked) {
+        requestedGeneration.refreshTask = null;
+      }
+    });
+    tracked = finalized;
+    requestedGeneration.refreshTask = tracked;
+    observeCaptureOperation(tracked);
   };
 
   const hasNativeOwnership = (): boolean =>
+    mobileSignalsGeneration !== null ||
     pendingMobileSignalsHandle !== null ||
     mobileSignalsHandle !== null ||
+    mobileSignalListenersNeedRelease ||
+    mobileSignalsStarted ||
+    mobileSignalsCommitted ||
     mobileSignalsStartupAttempted ||
-    mobileBackgroundRefreshNeedsCancel;
+    mobileBackgroundRefreshNeedsCancel ||
+    mobileBackgroundRefreshScheduleTask !== null;
 
   const releaseNativeOwnership = async (): Promise<void> => {
     if (!mobileSignals) return;
-    const failures: unknown[] = [];
-    const handles = new Set(
-      [pendingMobileSignalsHandle, mobileSignalsHandle].filter(
-        (handle): handle is { remove: () => Promise<void> } => handle !== null,
-      ),
-    );
-    for (const handle of handles) {
-      try {
-        await handle.remove();
-        if (pendingMobileSignalsHandle === handle) {
-          pendingMobileSignalsHandle = null;
+    // Suspending the commit bit before the first native await prevents a
+    // poller or already-queued callback from reading/sending while consent or
+    // ownership is uncertain. Granular obligations below remain set until
+    // their native postconditions are individually proved.
+    mobileSignalsCommitted = false;
+    clearMobileHealthPoller();
+    if (nativeReleaseTask) return nativeReleaseTask;
+
+    const generationAtRelease = mobileSignalsGeneration;
+    if (generationAtRelease) {
+      mobileSignalsGeneration = null;
+      generationAtRelease.controller.abort();
+    }
+    const settlingGeneration = generationAtRelease
+      ? settleMobileSignalsOperations(generationAtRelease)
+      : Promise.resolve();
+    const scheduleTaskAtRelease = mobileBackgroundRefreshScheduleTask;
+    const shouldReleaseListeners =
+      mobileSignalListenersNeedRelease ||
+      pendingMobileSignalsHandle !== null ||
+      mobileSignalsHandle !== null;
+    const releasingListeners = shouldReleaseListeners
+      ? typeof mobileSignals.releaseSignalListeners === "function"
+        ? (async () => {
+            const listenerHandles = [
+              ...new Set(
+                [pendingMobileSignalsHandle, mobileSignalsHandle].filter(
+                  (handle): handle is { remove: () => Promise<void> } =>
+                    handle !== null,
+                ),
+              ),
+            ];
+            const pendingHandleAtRelease = pendingMobileSignalsHandle;
+            const committedHandleAtRelease = mobileSignalsHandle;
+            const handleRemovals = listenerHandles.map((handle) => {
+              try {
+                return Promise.resolve(handle.remove());
+              } catch (error) {
+                // error-policy:J6 preserve synchronous handle failures as
+                // teardown outcomes while the authoritative native release is
+                // still invoked in this same pagehide turn.
+                return Promise.reject(error);
+              }
+            });
+            for (const handleRemoval of handleRemovals) {
+              void handleRemoval.catch((error) => {
+                // error-policy:J6 the package-owned native release below is
+                // the authoritative event-registry and bridge-callback
+                // postcondition; a stale generic wrapper cannot retain native
+                // ownership or block teardown once that fence succeeds.
+                console.warn(
+                  `${LOG_PREFIX} generic mobile signal listener removal failed; the package-owned native release remains authoritative:`,
+                  error,
+                );
+              });
+            }
+            // The package call is authoritative and releases both native
+            // ownership tables. Generic handles are advisory because Capacitor
+            // does not acknowledge their nested removeListener call.
+            const result = await mobileSignals.releaseSignalListeners();
+            if (!result.removed) {
+              throw new ElizaError(
+                "MobileSignals.releaseSignalListeners() did not establish the removed postcondition",
+                {
+                  code: "MOBILE_SIGNAL_LISTENER_RELEASE_INCOMPLETE",
+                  severity: "ephemeral",
+                },
+              );
+            }
+            mobileSignalListenersNeedRelease = false;
+            if (pendingMobileSignalsHandle === pendingHandleAtRelease) {
+              pendingMobileSignalsHandle = null;
+            }
+            if (mobileSignalsHandle === committedHandleAtRelease) {
+              mobileSignalsHandle = null;
+            }
+          })()
+        : Promise.reject(
+            new ElizaError(
+              "MobileSignals.releaseSignalListeners() disappeared while listener ownership was recorded",
+              {
+                code: "MOBILE_SIGNAL_LISTENER_RELEASE_UNAVAILABLE",
+                severity: "fatal",
+              },
+            ),
+          )
+      : Promise.resolve();
+    const shouldStop = mobileSignalsStarted || mobileSignalsStartupAttempted;
+    const stopping = shouldStop
+      ? (async () => {
+          const result = await mobileSignals.stopMonitoring();
+          if (!result.stopped) {
+            throw new ElizaError(
+              "MobileSignals.stopMonitoring() did not establish the stopped postcondition",
+              {
+                code: "MOBILE_SIGNAL_MONITOR_STOP_INCOMPLETE",
+                severity: "ephemeral",
+              },
+            );
+          }
+          mobileSignalsStarted = false;
+          mobileSignalsCommitted = false;
+          mobileSignalsStartupAttempted = false;
+        })()
+      : Promise.resolve();
+    const shouldCancel = mobileBackgroundRefreshNeedsCancel;
+    const cancelling = shouldCancel
+      ? typeof mobileSignals.cancelBackgroundRefresh === "function"
+        ? (async () => {
+            const result = await mobileSignals.cancelBackgroundRefresh();
+            if (!result.cancelled) {
+              throw new ElizaError(
+                `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
+                  result.reason ? `: ${result.reason}` : ""
+                }`,
+                {
+                  code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
+                  context: { reason: result.reason },
+                  severity: "ephemeral",
+                },
+              );
+            }
+            if (!scheduleTaskAtRelease) {
+              mobileBackgroundRefreshNeedsCancel = false;
+            }
+          })()
+        : Promise.reject(
+            new ElizaError(
+              "MobileSignals.cancelBackgroundRefresh() disappeared while a cancellation was owned",
+              {
+                code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_UNAVAILABLE",
+                severity: "fatal",
+              },
+            ),
+          )
+      : Promise.resolve();
+
+    // Invoke every native release before the first await. A persisted pagehide
+    // can freeze JavaScript immediately after this task, so listener removal,
+    // monitor stop, and job cancellation must already be in the bridge queue.
+    const attempt = (async () => {
+      const [outcomes] = await Promise.all([
+        Promise.allSettled([releasingListeners, stopping, cancelling]),
+        settlingGeneration,
+      ]);
+      const failures = outcomes
+        .slice(0, 2)
+        .flatMap((outcome) =>
+          outcome.status === "rejected" ? [outcome.reason] : [],
+        );
+      let cancellationFailure =
+        outcomes[2]?.status === "rejected" ? outcomes[2].reason : null;
+
+      // A schedule request may accept work after the first cancellation. Wait
+      // only for that package-owned bridge call, then prove the job absent at
+      // the later boundary. A hung call keeps this service safely uncommitted.
+      if (scheduleTaskAtRelease) {
+        await Promise.allSettled([scheduleTaskAtRelease]);
+      }
+      if (mobileBackgroundRefreshNeedsCancel) {
+        if (typeof mobileSignals.cancelBackgroundRefresh !== "function") {
+          cancellationFailure = new ElizaError(
+            "MobileSignals.cancelBackgroundRefresh() disappeared while a cancellation was owned",
+            {
+              code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_UNAVAILABLE",
+              severity: "fatal",
+            },
+          );
+        } else {
+          try {
+            const result = await mobileSignals.cancelBackgroundRefresh();
+            if (!result.cancelled) {
+              throw new ElizaError(
+                `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
+                  result.reason ? `: ${result.reason}` : ""
+                }`,
+                {
+                  code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
+                  context: { reason: result.reason },
+                  severity: "ephemeral",
+                },
+              );
+            }
+            mobileBackgroundRefreshNeedsCancel = false;
+            cancellationFailure = null;
+          } catch (error) {
+            // error-policy:J6 a cancellation that raced scheduling is retried
+            // after that bridge call settles; the retained obligation blocks a
+            // successor if the postcondition is still not established.
+            cancellationFailure = error;
+          }
         }
-        if (mobileSignalsHandle === handle) {
-          mobileSignalsHandle = null;
-        }
-      } catch (error) {
-        failures.push(error);
       }
-    }
-    if (mobileSignalsStarted || mobileSignalsStartupAttempted) {
-      try {
-        await mobileSignals.stopMonitoring();
-        mobileSignalsStarted = false;
-        mobileSignalsCommitted = false;
-        mobileSignalsStartupAttempted = false;
-      } catch (error) {
-        failures.push(error);
+      if (mobileBackgroundRefreshNeedsCancel && cancellationFailure !== null) {
+        failures.push(cancellationFailure);
       }
-    }
-    if (
-      mobileBackgroundRefreshNeedsCancel &&
-      typeof mobileSignals.cancelBackgroundRefresh === "function"
-    ) {
-      try {
-        await mobileSignals.cancelBackgroundRefresh();
-        mobileBackgroundRefreshNeedsCancel = false;
-      } catch (error) {
-        failures.push(error);
+      if (failures.length > 0) {
+        throw combinedLifecycleError(
+          "Failed to fully release mobile activity monitoring ownership",
+          "MOBILE_SIGNAL_NATIVE_RELEASE_FAILED",
+          failures,
+        );
       }
-    }
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        "Failed to fully release mobile activity monitoring ownership",
-      );
-    }
+    })();
+    const tracked = attempt.finally(() => {
+      if (nativeReleaseTask === tracked) {
+        nativeReleaseTask = null;
+      }
+    });
+    nativeReleaseTask = tracked;
+    return tracked;
   };
 
-  const startMobileSignals = async (): Promise<void> => {
+  const hasMonitoringConsent = (status: string): boolean =>
+    status === "granted" ||
+    status === "determined" ||
+    status === "not-applicable";
+
+  const startMobileSignals = async (
+    revalidateConsent = false,
+  ): Promise<void> => {
     if (
+      !mounted ||
       !mobileSignals ||
       typeof mobileSignals.addListener !== "function" ||
+      typeof mobileSignals.releaseSignalListeners !== "function" ||
       typeof mobileSignals.checkPermissions !== "function" ||
       typeof mobileSignals.startMonitoring !== "function" ||
       typeof mobileSignals.stopMonitoring !== "function"
     ) {
       return;
     }
-    if (mobileSignalsCommitted) return;
+    if (mobileSignalsCommitted) {
+      if (!revalidateConsent) return;
+      // Treat consent as unknown while the OS lookup is pending. The existing
+      // native generation stays owned, but its callbacks and poller cannot
+      // read or send until the lookup restores the commit bit.
+      mobileSignalsCommitted = false;
+      let permissions: MobileSignalsPermissionStatus;
+      try {
+        permissions = await mobileSignals.checkPermissions();
+      } catch (error) {
+        // error-policy:J6 a permission lookup failure fails closed: release the
+        // existing native generation before propagating the lookup failure.
+        try {
+          await releaseNativeOwnership();
+        } catch (cleanupError) {
+          // error-policy:J2 preserve both causal failures while adding the
+          // lifecycle boundary that could not be established.
+          throw combinedLifecycleError(
+            "Mobile activity permission revalidation and teardown failed",
+            "MOBILE_SIGNAL_PERMISSION_TEARDOWN_FAILED",
+            [error, cleanupError],
+          );
+        }
+        throw error;
+      }
+      if (!mounted) return;
+      if (!hasMonitoringConsent(permissions.status)) {
+        dispatchLifeOpsActivitySignalsStatus({
+          status: "permission_unavailable",
+          reason: permissions.status,
+        });
+        await releaseNativeOwnership();
+        return;
+      }
+      mobileSignalsCommitted = true;
+      return;
+    }
     if (hasNativeOwnership()) {
       await releaseNativeOwnership();
+      if (!mounted) return;
     }
 
     let committed = false;
     let rollbackStarted = false;
     try {
+      if (!mounted) return;
       const permissions = await mobileSignals.checkPermissions();
       if (!mounted) return;
-      if (
-        permissions.status !== "granted" &&
-        permissions.status !== "not-applicable"
-      ) {
-        // Consent gate: never begin monitoring (or prompt) without a grant.
-        // The settings UI owns requesting; resume re-checks pick up a grant.
+      if (!hasMonitoringConsent(permissions.status)) {
+        // Monitoring starts only after the OS records an authorization choice
+        // (or reports the capability inapplicable). The settings UI owns
+        // prompting; resume re-checks pick up a later choice.
         dispatchLifeOpsActivitySignalsStatus({
           status: "permission_unavailable",
           reason: permissions.status,
@@ -563,11 +928,23 @@ export function startLifeOpsActivitySignalCapture(
         return;
       }
 
+      if (!mounted) return;
+      const generation: MobileSignalsGeneration = {
+        controller: new AbortController(),
+        operations: new Set(),
+        refreshTask: null,
+      };
+      mobileSignalsGeneration = generation;
+      // The native callback may be installed before Capacitor resolves the
+      // registration promise. Record the package-owned release obligation
+      // first so a rejected or lost bridge response remains cleanable.
+      mobileSignalListenersNeedRelease = true;
       pendingMobileSignalsHandle = await mobileSignals.addListener(
         "signal",
         (signal: MobileSignalsSignal) => {
-          void track(sendSignal(mapMobileSignal(signal))).catch(
-            reportCaptureError,
+          if (!isCurrentMobileSignalsGeneration(generation)) return;
+          observeMobileSignalsOperation(generation, () =>
+            sendSignal(mapMobileSignal(signal), generation),
           );
         },
       );
@@ -582,6 +959,11 @@ export function startLifeOpsActivitySignalCapture(
       // a bridge rejection can occur after the OS accepted background work.
       mobileBackgroundRefreshNeedsCancel =
         typeof mobileSignals.cancelBackgroundRefresh === "function";
+      if (!mounted) {
+        rollbackStarted = true;
+        await releaseNativeOwnership();
+        return;
+      }
       const initial = await mobileSignals.startMonitoring({
         emitInitial: true,
       });
@@ -600,26 +982,45 @@ export function startLifeOpsActivitySignalCapture(
       mobileSignalsStarted = initial.enabled;
       mobileSignalsCommitted = true;
       committed = true;
-      await sendSnapshotResult(initial);
-      await refreshMobileHealthSnapshot("start");
-      if (!mounted) return;
+      clearMobileHealthPoller();
+      mobileHealthPoller = window.setInterval(() => {
+        if (isCurrentMobileSignalsGeneration(generation)) {
+          requestMobileHealthSnapshot("poll", generation);
+        }
+      }, MOBILE_HEALTH_POLL_MS);
+
+      // Monitoring ownership is already committed; enrichment is observed but
+      // cannot pin the acquisition task or suppress later consent checks.
+      observeMobileSignalsOperation(generation, () =>
+        sendSnapshotResult(initial, generation),
+      );
+      requestMobileHealthSnapshot("start", generation);
       if (
         typeof mobileSignals.scheduleBackgroundRefresh === "function" &&
         typeof mobileSignals.cancelBackgroundRefresh === "function"
       ) {
-        try {
+        const scheduling = Promise.resolve().then(async () => {
+          if (!isCurrentMobileSignalsGeneration(generation)) return;
           const result = await mobileSignals.scheduleBackgroundRefresh();
-          if (mounted && !result.scheduled && result.reason) {
+          if (!isCurrentMobileSignalsGeneration(generation)) return;
+          if (!result.scheduled && result.reason) {
             dispatchLifeOpsActivitySignalsStatus({
               status: "background_refresh_unavailable",
               reason: result.reason,
             });
           }
-        } catch (error) {
-          // error-policy:J7 background-refresh scheduling is an enhancement;
-          // its failure is reported without killing the started capture.
-          reportCaptureError(error);
-        }
+        });
+        const ownedScheduling = trackMobileSignalsOperation(
+          generation,
+          () => scheduling,
+        );
+        const trackedScheduling = ownedScheduling.finally(() => {
+          if (mobileBackgroundRefreshScheduleTask === trackedScheduling) {
+            mobileBackgroundRefreshScheduleTask = null;
+          }
+        });
+        mobileBackgroundRefreshScheduleTask = trackedScheduling;
+        observeCaptureOperation(trackedScheduling);
       } else if (
         mounted &&
         typeof mobileSignals.scheduleBackgroundRefresh === "function"
@@ -630,20 +1031,21 @@ export function startLifeOpsActivitySignalCapture(
           reason: "cancel_unavailable",
         });
       }
-      if (!mounted) return;
-      mobileHealthPoller = window.setInterval(() => {
-        void track(refreshMobileHealthSnapshot("poll")).catch(
-          reportCaptureError,
-        );
-      }, MOBILE_HEALTH_POLL_MS);
     } catch (error) {
+      // error-policy:J6 a failed partial acquisition is rolled back before the
+      // original failure is allowed to cross the controller boundary.
       if (!committed && !rollbackStarted && hasNativeOwnership()) {
+        // error-policy:J6 failed acquisition must release every granular
+        // obligation before another generation is allowed to start.
         try {
           await releaseNativeOwnership();
         } catch (cleanupError) {
-          throw new AggregateError(
-            [error, cleanupError],
+          // error-policy:J2 preserve acquisition and cleanup failures under one
+          // classified lifecycle error.
+          throw combinedLifecycleError(
             "Mobile activity monitoring startup and rollback failed",
+            "MOBILE_SIGNAL_START_ROLLBACK_FAILED",
+            [error, cleanupError],
           );
         }
       }
@@ -651,32 +1053,91 @@ export function startLifeOpsActivitySignalCapture(
     }
   };
 
-  const requestMobileSignalsStart = (): Promise<void> => {
+  const requestMobileSignalsStart = (
+    revalidateConsent = false,
+  ): Promise<void> => {
+    if (!mounted) return Promise.resolve();
+    if (revalidateConsent) {
+      requestedConsentRevalidation += 1;
+    }
     if (mobileSignalsStartTask) return mobileSignalsStartTask;
-    const task = track(startMobileSignals()).finally(() => {
-      if (mobileSignalsStartTask === task) {
-        mobileSignalsStartTask = null;
+
+    const runRequestedStarts = async (): Promise<void> => {
+      let firstAttempt = true;
+      const failures: unknown[] = [];
+      while (
+        mounted &&
+        (firstAttempt ||
+          attemptedConsentRevalidation < requestedConsentRevalidation)
+      ) {
+        const requestedAtStart = requestedConsentRevalidation;
+        const mustRevalidate =
+          revalidateConsent || attemptedConsentRevalidation < requestedAtStart;
+        try {
+          await startMobileSignals(mustRevalidate);
+        } catch (error) {
+          // Keep draining a stronger resume request even if an earlier
+          // acquisition failed; the returned task reports every failed attempt.
+          failures.push(error);
+        }
+        if (mustRevalidate) {
+          attemptedConsentRevalidation = requestedAtStart;
+        }
+        firstAttempt = false;
+        revalidateConsent = false;
       }
+      if (failures.length > 0) {
+        throw combinedLifecycleError(
+          "One or more mobile activity monitoring start attempts failed",
+          "MOBILE_SIGNAL_START_FAILED",
+          failures,
+        );
+      }
+    };
+
+    const task = track(runRequestedStarts()).finally(() => {
+      if (mobileSignalsStartTask === task) mobileSignalsStartTask = null;
     });
     mobileSignalsStartTask = task;
     return task;
   };
 
+  const requestMobileSignalsResume = (): void => {
+    if (!mounted) return;
+    const startTask = requestMobileSignalsStart(true);
+    if (mobileSignalsResumeTask) return;
+
+    const task = startTask
+      .then(() => {
+        if (mounted && mobileSignalsGeneration) {
+          requestMobileHealthSnapshot("resume", mobileSignalsGeneration);
+        }
+      })
+      .finally(() => {
+        if (mobileSignalsResumeTask === task) {
+          mobileSignalsResumeTask = null;
+        }
+      });
+    mobileSignalsResumeTask = task;
+    observeCaptureOperation(task);
+  };
+
   const emitCurrentState = (reason: string): void => {
+    if (!mounted) return;
     emitLifecycleState("active");
     emitPageState(reason);
     void track(emitDesktopSnapshot(reason));
-    void track(refreshMobileHealthSnapshot(reason)).catch(reportCaptureError);
+    requestMobileHealthSnapshot(reason);
   };
 
-  void track(
+  observeCaptureOperation(
     refreshRuntimeReady().then(async (ready) => {
       if (ready && mounted) {
         emitCurrentState("mount");
         await requestMobileSignalsStart();
       }
     }),
-  ).catch(reportCaptureError);
+  );
 
   document.addEventListener("visibilitychange", handleVisibilityChange);
   document.addEventListener(APP_RESUME_EVENT, handleResume);
@@ -686,7 +1147,7 @@ export function startLifeOpsActivitySignalCapture(
 
   const runtimePoller = window.setInterval(() => {
     const wasReady = runtimeReady;
-    void track(
+    observeCaptureOperation(
       refreshRuntimeReady().then(async (ready) => {
         if (!mounted || !ready || wasReady) {
           return;
@@ -694,7 +1155,7 @@ export function startLifeOpsActivitySignalCapture(
         emitCurrentState("runtime-ready");
         await requestMobileSignalsStart();
       }),
-    ).catch(reportCaptureError);
+    );
   }, RUNTIME_READY_POLL_MS);
   const pageHeartbeat = window.setInterval(() => {
     if (document.visibilityState === "visible") {
@@ -719,20 +1180,43 @@ export function startLifeOpsActivitySignalCapture(
     document.removeEventListener(APP_PAUSE_EVENT, handlePause);
     window.removeEventListener("focus", handleFocus);
     window.removeEventListener("blur", handleBlur);
-    if (mobileHealthPoller !== null) {
-      window.clearInterval(mobileHealthPoller);
-      mobileHealthPoller = null;
-    }
+    clearMobileHealthPoller();
     window.clearInterval(runtimePoller);
     window.clearInterval(pageHeartbeat);
     window.clearInterval(desktopPoller);
 
+    const initialNativeRelease = releaseNativeOwnership();
     stopPromise = (async () => {
-      await settleInFlight();
       // error-policy:J6 releaseNativeOwnership attempts every owned native
       // resource before rejecting. Failed resources remain recorded so the
       // same idempotent stop can retry instead of permitting duplicate owners.
-      await releaseNativeOwnership();
+      const [initialReleaseOutcome] = await Promise.allSettled([
+        initialNativeRelease,
+        settleInFlight(),
+      ]);
+      try {
+        // A start/getSnapshot task can acquire a handle after the first
+        // pagehide sweep. Run a second sweep after every owned task settles.
+        await releaseNativeOwnership();
+      } catch (finalError) {
+        // error-policy:J2 preserve both failed release boundaries so the host
+        // can quarantine and retry the same cleanup lease.
+        throw initialReleaseOutcome.status === "rejected"
+          ? combinedLifecycleError(
+              "Failed to stop LifeOps native activity capture after the late-acquisition sweep",
+              "MOBILE_SIGNAL_CAPTURE_STOP_FAILED",
+              [initialReleaseOutcome.reason, finalError],
+            )
+          : finalError;
+      }
+      if (initialReleaseOutcome.status === "rejected") {
+        // error-policy:J6 a later sweep established the release postcondition;
+        // retain the first failure as teardown diagnostics.
+        console.warn(
+          `${LOG_PREFIX} native teardown required a successful retry:`,
+          initialReleaseOutcome.reason,
+        );
+      }
     })().then(
       () => {
         if (activeCaptureStop === stop) {
@@ -750,13 +1234,17 @@ export function startLifeOpsActivitySignalCapture(
   activeCaptureStop = stop;
   if (serviceSignal) {
     const onServiceAbort = () => {
-      void stop();
+      const stopping = stop();
+      // error-policy:J5 the renderer-service host observes this same cleanup
+      // promise and quarantines a failed release; this branch only prevents the
+      // synchronous AbortSignal listener from creating an unhandled rejection.
+      void stopping.catch(() => {});
     };
     serviceSignal.addEventListener("abort", onServiceAbort, { once: true });
     detachServiceAbort = () =>
       serviceSignal.removeEventListener("abort", onServiceAbort);
     if (serviceSignal.aborted) {
-      void stop();
+      onServiceAbort();
     }
   }
   return stop;
