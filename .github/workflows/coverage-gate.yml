@@ -151,6 +151,11 @@ jobs:
         # Bun may not emit LCOV when it only ran tests, and there is no changed
         # source whose LCOV presence must be checked (#15849).
         if: steps.changed.outputs.bun_tests != '' || steps.changed.outputs.vitest_tests != '' || steps.changed.outputs.node_tests != ''
+        env:
+          # The awk gate exits non-zero only under enforcement. Percentage
+          # floors are gone; the surviving hard guarantee is that changed
+          # executable source appears in LCOV at all.
+          COVERAGE_GATE_ENFORCE: "1"
         run: |
           if [ -z "${{ steps.changed.outputs.files }}" ]; then
             if [ -n "${{ steps.changed.outputs.subprocess_files }}" ]; then
