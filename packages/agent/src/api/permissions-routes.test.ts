@@ -58,6 +58,7 @@ function makeContext(
     method?: string;
     state?: Partial<PermissionRouteState>;
     registry?: IPermissionsRegistry | null;
+    body?: Record<string, unknown>;
   } = {},
 ): PermissionRouteContext & { captured: { data?: unknown; status?: number } } {
   const captured: { data?: unknown; status?: number } = {};
@@ -72,6 +73,9 @@ function makeContext(
     config: {},
     ...options.state,
   };
+  const readJsonBody: PermissionRouteContext["readJsonBody"] = async <
+    T extends object,
+  >() => (options.body as T | undefined) ?? null;
 
   return {
     req: {} as PermissionRouteContext["req"],
@@ -81,7 +85,7 @@ function makeContext(
     state,
     saveConfig: vi.fn(),
     scheduleRuntimeRestart: vi.fn(),
-    readJsonBody: vi.fn(async () => null),
+    readJsonBody,
     json: vi.fn((_res, data, status) => {
       captured.data = data;
       captured.status = status;
@@ -224,6 +228,66 @@ describe("permission routes", () => {
       id: "website-blocking",
       permission: websiteBlocking,
     });
+  });
+
+  it("accepts a privacy-opaque permission state from the native client", async () => {
+    const ctx = makeContext("/api/permissions/state", {
+      method: "PUT",
+      body: {
+        permissions: {
+          health: {
+            id: "health",
+            status: "opaque",
+            canRequest: false,
+            lastChecked: 1,
+            platform: "ios",
+            reason:
+              "HealthKit read choices are private; data availability confirms access.",
+          },
+        },
+      },
+    });
+
+    await expect(handlePermissionRoutes(ctx)).resolves.toBe(true);
+
+    expect(ctx.captured.status).toBeUndefined();
+    expect(ctx.state.permissionStates?.health).toEqual({
+      id: "health",
+      status: "opaque",
+      canRequest: false,
+      lastChecked: 1,
+      platform: "ios",
+      reason:
+        "HealthKit read choices are private; data availability confirms access.",
+    });
+    expect(ctx.state.permissionStates?.health).not.toHaveProperty(
+      "restrictedReason",
+    );
+  });
+
+  it("rejects the native-only determined status at the API boundary", async () => {
+    const ctx = makeContext("/api/permissions/state", {
+      method: "PUT",
+      body: {
+        permissions: {
+          health: {
+            id: "health",
+            status: "determined",
+            canRequest: false,
+            lastChecked: 1,
+            platform: "ios",
+          },
+        },
+      },
+    });
+
+    await expect(handlePermissionRoutes(ctx)).resolves.toBe(true);
+
+    expect(ctx.captured.status).toBe(400);
+    expect(ctx.captured.data).toEqual({
+      error: 'Permission "health" has invalid status',
+    });
+    expect(ctx.state.permissionStates).toBeUndefined();
   });
 
   it("rejects unknown permission ids", async () => {

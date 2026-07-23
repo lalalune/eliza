@@ -40,11 +40,7 @@ function resolveRegistry(runtime: IAgentRuntime): IPermissionsRegistry | null {
     return svc as IPermissionsRegistry;
   }
   if (typeof svc.getRegistry === "function") {
-    try {
-      return svc.getRegistry();
-    } catch {
-      return null;
-    }
+    return svc.getRegistry();
   }
   return svc.registry ?? null;
 }
@@ -88,6 +84,10 @@ export function formatPendingPermissionLine(
     const why = state.restrictedReason ?? "restricted";
     return `- ${id}: restricted (${why})`;
   }
+  if (state.status === "opaque") {
+    const detail = state.reason ? ` (${state.reason})` : "";
+    return `- ${id}: opaque${detail}; authorization is resolved, so do not re-request`;
+  }
   return `- ${id}: ${state.status}`;
 }
 
@@ -105,8 +105,8 @@ export function buildPendingPermissionsContext(
 export const pendingPermissionsProvider: Provider = {
   name: "elizaPendingPermissions",
   description:
-    "Surfaces permissions blocked or not-yet-granted so the planner can decide whether to re-request.",
-  descriptionCompressed: "surface blocked permission for planner",
+    "Surfaces permissions relevant to a recent block so the planner can distinguish requestable, denied, restricted, and privacy-opaque states.",
+  descriptionCompressed: "surface blocked permission semantics for planner",
   dynamic: true,
   position: -5,
   cacheStable: false,

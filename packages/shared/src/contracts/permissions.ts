@@ -83,12 +83,29 @@ export function isPermissionId(value: unknown): value is PermissionId {
   );
 }
 
-export type PermissionStatus =
-  | "granted"
-  | "denied"
-  | "not-determined"
-  | "restricted"
-  | "not-applicable";
+/**
+ * Canonical permission states accepted at every API and renderer boundary.
+ * `opaque` means the OS has resolved authorization but intentionally withholds
+ * the per-capability grant result, so callers must not infer denial or prompt
+ * again.
+ */
+export const PERMISSION_STATUSES = [
+  "granted",
+  "denied",
+  "not-determined",
+  "restricted",
+  "opaque",
+  "not-applicable",
+] as const;
+
+export type PermissionStatus = (typeof PERMISSION_STATUSES)[number];
+
+export function isPermissionStatus(value: unknown): value is PermissionStatus {
+  return (
+    typeof value === "string" &&
+    (PERMISSION_STATUSES as readonly string[]).includes(value)
+  );
+}
 
 /**
  * Why a `restricted` permission cannot be requested. Surfaces in the chat

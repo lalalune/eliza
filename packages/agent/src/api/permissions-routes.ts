@@ -16,12 +16,12 @@ import type {
   PermissionId,
   PermissionRestrictedReason,
   PermissionState,
-  PermissionStatus,
   Platform,
 } from "@elizaos/shared";
 import {
   getMacPermissionDeepLink,
   isPermissionId,
+  isPermissionStatus,
   PERMISSION_IDS,
   PutPermissionsShellRequestSchema,
   PutPermissionsStateRequestSchema,
@@ -73,14 +73,6 @@ function unavailableSystemPermission(id: PermissionId): PermissionState {
     reason: "Native permission checks are unavailable in this runtime.",
   };
 }
-
-const PERMISSION_STATUSES: readonly PermissionStatus[] = [
-  "granted",
-  "denied",
-  "not-determined",
-  "restricted",
-  "not-applicable",
-];
 
 const PLATFORMS: readonly Platform[] = [
   "darwin",
@@ -140,10 +132,7 @@ function validatePermissionStates(
         reason: `Permission "${key}" has mismatched id field`,
       };
     }
-    if (
-      typeof entry.status !== "string" ||
-      !PERMISSION_STATUSES.includes(entry.status as PermissionStatus)
-    ) {
+    if (!isPermissionStatus(entry.status)) {
       return { ok: false, reason: `Permission "${key}" has invalid status` };
     }
     if (
@@ -167,7 +156,7 @@ function validatePermissionStates(
 
     const validated: PermissionState = {
       id: key,
-      status: entry.status as PermissionStatus,
+      status: entry.status,
       platform: entry.platform as Platform,
       lastChecked: entry.lastChecked,
       canRequest: entry.canRequest,

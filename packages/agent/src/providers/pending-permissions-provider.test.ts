@@ -1,7 +1,7 @@
 /**
  * Unit coverage for the pending-permissions provider and its formatters:
- * formatPendingPermissionLine (denied / not-determined / restricted states with
- * relative timing and last-blocked-feature attribution),
+ * formatPendingPermissionLine (denied / not-determined / restricted / opaque
+ * states with relative timing and last-blocked-feature attribution),
  * buildPendingPermissionsContext (the PENDING PERMISSIONS section, empty when
  * nothing is pending), and pendingPermissionsProvider itself (silent when the
  * permissions registry is absent or empty, populated otherwise, registered at
@@ -95,6 +95,25 @@ describe("formatPendingPermissionLine", () => {
       ),
     ).toBe("- health: restricted (entitlement_required)");
   });
+
+  it("marks privacy-opaque authorization as resolved and non-requestable", () => {
+    expect(
+      formatPendingPermissionLine(
+        {
+          id: "health",
+          status: "opaque",
+          lastChecked: NOW,
+          canRequest: false,
+          platform: "ios",
+          reason:
+            "HealthKit read choices are private; data availability confirms access.",
+        },
+        NOW,
+      ),
+    ).toBe(
+      "- health: opaque (HealthKit read choices are private; data availability confirms access.); authorization is resolved, so do not re-request",
+    );
+  });
 });
 
 describe("buildPendingPermissionsContext", () => {
@@ -145,6 +164,25 @@ describe("pendingPermissionsProvider", () => {
       {} as never,
     );
     expect(result.text).toBe("");
+  });
+
+  it("surfaces a broken registry service instead of fabricating an absent registry", async () => {
+    const failure = new Error("registry initialization failed");
+    const runtime = {
+      getService: vi.fn((id: string) =>
+        id === PERMISSIONS_REGISTRY_SERVICE_ID
+          ? {
+              getRegistry: () => {
+                throw failure;
+              },
+            }
+          : null,
+      ),
+    } as unknown as IAgentRuntime;
+
+    await expect(
+      pendingPermissionsProvider.get?.(runtime, {} as never, {} as never),
+    ).rejects.toBe(failure);
   });
 
   it("emits no text when registry has nothing pending", async () => {
