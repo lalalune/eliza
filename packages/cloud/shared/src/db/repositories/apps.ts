@@ -85,12 +85,12 @@ export class AppsRepository {
    * Reads an app from the primary for write/recovery decisions where replica
    * lag must not be mistaken for a durable deletion.
    */
-  async findByIdForWrite(id: string): Promise<App | undefined> {
-    if (!UUID_PATTERN.test(id)) {
+  async findByIdForWrite(id: string, organizationId: string): Promise<App | undefined> {
+    if (!UUID_PATTERN.test(id) || !UUID_PATTERN.test(organizationId)) {
       return undefined;
     }
     return await dbWrite.query.apps.findFirst({
-      where: eq(apps.id, id),
+      where: and(eq(apps.id, id), eq(apps.organization_id, organizationId)),
     });
   }
 

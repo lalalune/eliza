@@ -185,7 +185,7 @@ async function recoverAppReservation(
   ) {
     throw new Error("App inference recovery policy is invalid");
   }
-  const current = await appsRepository.findByIdForWrite(context.appId);
+  const current = await appsRepository.findByIdForWrite(context.appId, context.organizationId);
   const pinnedPolicy = {
     id: context.appId,
     name: context.appPolicy.name,
