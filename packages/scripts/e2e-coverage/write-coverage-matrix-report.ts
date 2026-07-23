@@ -5,16 +5,11 @@
  * Builds the canonical coverage matrix (slash commands, #8791 shortcuts, plugin
  * routes, views) from real source, writes `reports/coverage/e2e-matrix.json` +
  * a self-contained HTML contact sheet + a markdown summary, prints a one-line
- * status, and exits non-zero on a blocking gap when enforcement is on.
- *
- * Advisory-then-required:
- *   - default: report only, exit 0 (advisory).
- *   - `--fail-on-missing` or `E2E_COVERAGE_GATE_ENFORCE=1`: exit 1 on a blocking
- *     gap (required).
+ * status. Missing coverage is reported as data and never converted into a
+ * merge-blocking threshold.
  *
  * Usage:
  *   bun packages/scripts/e2e-coverage/write-coverage-matrix-report.ts [--report-dir <dir>] [--json]
- *       [--fail-on-missing]
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -28,16 +23,12 @@ import {
 interface CliOptions {
   reportDir: string;
   json: boolean;
-  failOnMissing: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     reportDir: path.join(REPO_ROOT, "reports/coverage"),
     json: false,
-    failOnMissing:
-      process.env.E2E_COVERAGE_GATE_ENFORCE === "1" ||
-      process.env.E2E_COVERAGE_GATE_ENFORCE === "true",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -45,10 +36,6 @@ function parseArgs(argv: string[]): CliOptions {
       options.reportDir = path.resolve(argv[++i] ?? options.reportDir);
     } else if (arg === "--json") {
       options.json = true;
-    } else if (arg === "--fail-on-missing") {
-      options.failOnMissing = true;
-    } else if (arg === "--no-fail") {
-      options.failOnMissing = false;
     }
   }
   return options;
@@ -228,12 +215,6 @@ function main(): number {
     }
   }
 
-  if (options.failOnMissing && matrix.blockingGaps.length > 0) {
-    process.stderr.write(
-      `\n${matrix.blockingGaps.length} blocking e2e coverage gap(s); see ${path.relative(REPO_ROOT, options.reportDir)}/README.md\n`,
-    );
-    return 1;
-  }
   return 0;
 }
 

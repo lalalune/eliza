@@ -288,8 +288,8 @@ a reviewer confirms each change works *without reading the code*, from artifacts
 attached inline to the PR. "Tests pass" is not proof; "CI is green" is not
 proof. Per workstream, done means:
 
-1. **Personas** — the coverage gate
-   (`check-lifeops-persona-catalog-coverage.mjs`) reads verified = target for
+1. **Personas** — the coverage report
+   (`check-lifeops-persona-catalog-coverage.mjs`) shows verified = target for
    A1/A2/B2/F1; child-voice, student-deadline, onboarding-journey, elderly
    week-1, and non-sleep-goal scenarios exist and pass with hand-read live-model
    trajectories and catalog `status` notes recording model + judge score.

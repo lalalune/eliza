@@ -257,13 +257,9 @@ This package mostly reads config injected by the host, not raw env vars:
   pick it up.
 - **Make a view agent-controllable:** use `useAgentElement` — see
   `src/agent-surface/README.md` for ids/roles/controlled-component rules.
-- **Add a mutating control to a builtin view:** every on-screen mutation in
-  `components/pages/`, `components/settings/`, or `components/character/` must
-  have a registered agent-action twin ("views display, chat controls" — voice
-  has no DOM to click). The per-view handler baseline in
-  `src/testing/builtin-view-action-ratchet.ts` covers local handler growth per
-  view. Prefer adding or extending the semantic action; the generic
-  `useAgentElement` bridge is for third-party plugin views only.
+- **Add a mutating control to a builtin view:** prefer adding or extending the
+  semantic action that owns the mutation; the generic `useAgentElement` bridge
+  is for third-party plugin views only.
 - **Add a cloud-frontend component:** add under `cloud-ui/components/` and export
   from `cloud-ui/index.ts`; it ships under the `@elizaos/ui/cloud-ui` subpath.
   Import primitives from `../../components/ui/*` — do not create re-export shims
@@ -298,15 +294,9 @@ This package mostly reads config injected by the host, not raw env vars:
   shimmer and spinner for thinking, tool work, and speaking so transport-phase
   changes do not flash the app accent. Preserve its `motion-reduce` fallback
   when changing the status treatment.
-- **Builtin view mutations need semantic action twins.** First-party shell views
-  are covered by `src/testing/builtin-view-action-ratchet.ts`: every local
-  mutation site in the baseline either maps to a semantic action (`SETTINGS`,
-  `SCHEDULED_TASKS`, `BACKGROUND`, etc.) or is explicitly exempt as a diagnostic
-  view. When adding a button/filter/toggle/form handler to a builtin view, add or
-  reuse the action first, then update the ratchet baseline with the reason. The
-  per-site twin mapping (typed-client writes → action ids) is enforced by the
-  repo-level gate — see "Add a mutating control to a builtin view" in the
-  how-to list above.
+- **Builtin view mutations need semantic action twins.** When adding a
+  button/filter/toggle/form handler to a builtin view, add or reuse the owning
+  semantic action so chat and direct manipulation stay equivalent.
 - Type root `src/types/index.ts` re-exports from `@elizaos/shared/types`; keep
   shared transport/domain types there rather than redefining them here.
 - **Files / attachments.** The "Files" tab (`components/pages/FilesView.tsx`,

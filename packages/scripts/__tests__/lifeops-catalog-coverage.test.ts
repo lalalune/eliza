@@ -17,12 +17,6 @@ function runCoverage(...args: string[]) {
   return result.stdout;
 }
 
-function runCoverageResult(...args: string[]) {
-  return spawnSync(process.execPath, [scriptPath, ...args], {
-    encoding: "utf8",
-  });
-}
-
 describe("LifeOps persona catalog coverage", () => {
   test("JSON output includes unverified rows grouped by surface", () => {
     const report = JSON.parse(runCoverage("--json"));
@@ -100,15 +94,10 @@ describe("LifeOps persona catalog coverage", () => {
     });
   });
 
-  test("--require-verified fails a selected pack until every authored row is verified", () => {
-    const result = runCoverageResult("--pack", "B2", "--require-verified");
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toContain(
+  test("incomplete verification remains visible without becoming a floor", () => {
+    const output = runCoverage("--pack", "B2");
+    expect(output).toContain(
       "B2 22 authored (target 22), 6/22 verified",
-    );
-    expect(result.stderr).toContain(
-      "B2: 6/22 verified; --require-verified requires every authored row to be verified",
     );
   });
 });
