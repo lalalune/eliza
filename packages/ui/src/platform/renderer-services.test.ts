@@ -102,21 +102,26 @@ describe("registration and host startup ordering", () => {
     ).toThrow(/declares no shells/);
   });
 
-  it("upgrades an active pre-queue HMR store without leaking its generation", async () => {
+  it("upgrades an active schema-v1 HMR host in place for bfcache events", async () => {
     await resetRendererServicesForTest();
-    const cleanup = vi.fn();
-    const detachPagehide = vi.fn();
+    const legacyCleanup = vi.fn();
+    const resumedCleanup = vi.fn();
+    const legacyPagehide = vi.fn();
+    window.addEventListener("pagehide", legacyPagehide);
+    const detachPagehide = vi.fn(() => {
+      window.removeEventListener("pagehide", legacyPagehide);
+    });
     const definition = {
       id: "a.legacy-hmr",
       shells: ["main"] as const,
-      start: vi.fn(() => () => {}),
+      start: vi.fn(() => resumedCleanup),
     };
     const controller = new AbortController();
     const legacyInstance = {
       definition,
       controller,
       status: "running",
-      cleanup,
+      cleanup: legacyCleanup,
       settled: Promise.resolve(),
     };
     const legacyHost = {
@@ -132,14 +137,152 @@ describe("registration and host startup ordering", () => {
       host: legacyHost,
     };
 
-    startRendererServiceHost({ shell: "main" });
+    expect(getRendererServiceStates().hostShell).toBe("main");
+    expect(detachPagehide).toHaveBeenCalledTimes(1);
+
+    const persistedPagehide = new Event("pagehide") as Event & {
+      persisted: boolean;
+    };
+    Object.defineProperty(persistedPagehide, "persisted", { value: true });
+    window.dispatchEvent(persistedPagehide);
     await settleRendererServices();
 
     expect(controller.signal.aborted).toBe(true);
-    expect(cleanup).toHaveBeenCalledTimes(1);
-    expect(detachPagehide).toHaveBeenCalledTimes(1);
+    expect(legacyCleanup).toHaveBeenCalledTimes(1);
+    expect(legacyPagehide).not.toHaveBeenCalled();
+
+    const persistedPageshow = new Event("pageshow") as Event & {
+      persisted: boolean;
+    };
+    Object.defineProperty(persistedPageshow, "persisted", { value: true });
+    window.dispatchEvent(persistedPageshow);
+    await settleRendererServices();
+
     expect(definition.start).toHaveBeenCalledTimes(1);
     expect(stateOf(definition.id)).toBe("running");
+  });
+
+  it("observes rejected schema-v1 promises without poisoning the upgraded queue", async () => {
+    await resetRendererServicesForTest();
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const reportError = vi.fn();
+    const legacyCleanup = vi.fn();
+    const definition = {
+      id: "a.legacy-rejection",
+      shells: ["main"] as const,
+      start: vi.fn(() => () => {}),
+    };
+    const holder = globalThis as unknown as Record<PropertyKey, unknown>;
+    holder[Symbol.for("elizaos.renderer-services.store")] = {
+      definitions: new Map([[definition.id, definition]]),
+      host: {
+        shell: "main",
+        reportError,
+        instances: new Map([
+          [
+            definition.id,
+            {
+              definition,
+              controller: new AbortController(),
+              status: "running",
+              cleanup: legacyCleanup,
+              settled: Promise.reject(new Error("legacy settled rejected")),
+            },
+          ],
+        ]),
+        detachPagehide: vi.fn(),
+        disposed: false,
+      },
+      transition: Promise.reject(new Error("legacy transition rejected")),
+    };
+
+    startRendererServiceHost({ shell: "main" });
+    await settleRendererServices();
+
+    expect(legacyCleanup).toHaveBeenCalledTimes(1);
+    expect(definition.start).toHaveBeenCalledTimes(1);
+    expect(stateOf(definition.id)).toBe("running");
+    expect(reportError).toHaveBeenCalledWith(
+      definition.id,
+      expect.objectContaining({ message: "legacy settled rejected" }),
+      "start",
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("renderer-service-registry"),
+      expect.objectContaining({ message: "legacy transition rejected" }),
+    );
+  });
+
+  it("quarantines a schema-v1 starting generation whose cleanup cannot be tracked", async () => {
+    vi.useFakeTimers();
+    try {
+      await resetRendererServicesForTest();
+      const cleanupGate = createGate();
+      const events: string[] = [];
+      const controller = new AbortController();
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          events.push("legacy-cleanup:start");
+          void cleanupGate.promise.then(() => {
+            events.push("legacy-cleanup:end");
+          });
+        },
+        { once: true },
+      );
+      const definition = {
+        id: "a.legacy-starting",
+        shells: ["main"] as const,
+        start: vi.fn(() => {
+          events.push("successor:start");
+          return () => {};
+        }),
+      };
+      const holder = globalThis as unknown as Record<PropertyKey, unknown>;
+      holder[Symbol.for("elizaos.renderer-services.store")] = {
+        definitions: new Map([[definition.id, definition]]),
+        host: {
+          shell: "main",
+          reportError: vi.fn(),
+          instances: new Map([
+            [
+              definition.id,
+              {
+                definition,
+                controller,
+                status: "starting",
+                cleanup: null,
+                settled: new Promise<void>(() => {}),
+              },
+            ],
+          ]),
+          detachPagehide: vi.fn(),
+          disposed: false,
+        },
+      };
+
+      startRendererServiceHost({ shell: "main" });
+      const independent = makeService("a.after-legacy-starting");
+      registerRendererService(independent.definition);
+      expect(controller.signal.aborted).toBe(true);
+      expect(events).toEqual(["legacy-cleanup:start"]);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+
+      expect(definition.start).not.toHaveBeenCalled();
+      expect(independent.start).toHaveBeenCalledTimes(1);
+      expect(stateOf(definition.id)).toBe("failed");
+
+      cleanupGate.release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(["legacy-cleanup:start", "legacy-cleanup:end"]);
+      expect(definition.start).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -312,6 +455,35 @@ describe("teardown", () => {
       "cleanup",
     );
   });
+
+  it("retries a rejected cleanup lease before starting its successor", async () => {
+    const reportError = vi.fn();
+    let attempt = 0;
+    const cleanup = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error("transient native release failure");
+    });
+    registerRendererService({
+      id: "a.cleanup-retry",
+      shells: ["main"],
+      start: () => cleanup,
+    });
+    startRendererServiceHost({ shell: "main", reportError });
+    await settleRendererServices();
+
+    const successorStart = vi.fn(() => () => {});
+    registerRendererService({
+      id: "a.cleanup-retry",
+      shells: ["main"],
+      start: successorStart,
+    });
+    await settleRendererServices();
+
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(successorStart).toHaveBeenCalledTimes(1);
+    expect(stateOf("a.cleanup-retry")).toBe("running");
+    expect(reportError).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("serialized ownership", () => {
@@ -446,6 +618,243 @@ describe("serialized ownership", () => {
       expect.any(AggregateError),
     );
   });
+
+  it("observes an async error reporter rejection outside the ownership queue", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    registerRendererService({
+      id: "a.async-reporter-failure",
+      shells: ["main"],
+      start: async () => {
+        throw new Error("start failed");
+      },
+    });
+    startRendererServiceHost({
+      shell: "main",
+      reportError: async () => {
+        throw new Error("async reporter failed");
+      },
+    });
+    await settleRendererServices();
+    await vi.waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining("a.async-reporter-failure"),
+        expect.any(AggregateError),
+      ),
+    );
+
+    const independent = makeService("a.after-async-reporter");
+    registerRendererService(independent.definition);
+    await settleRendererServices();
+    expect(independent.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds a hung cleanup without duplicating it or blocking other services", async () => {
+    vi.useFakeTimers();
+    try {
+      const cleanupGate = createGate();
+      const hangingCleanup = vi.fn(() => cleanupGate.promise);
+      registerRendererService({
+        id: "a.hung-cleanup",
+        shells: ["main"],
+        start: () => hangingCleanup,
+      });
+      startRendererServiceHost({
+        shell: "main",
+        reportError: vi.fn(),
+      });
+      await settleRendererServices();
+
+      const successorStart = vi.fn(() => () => {});
+      registerRendererService({
+        id: "a.hung-cleanup",
+        shells: ["main"],
+        start: successorStart,
+      });
+      const independent = makeService("a.after-hung-cleanup");
+      registerRendererService(independent.definition);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hangingCleanup).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+      expect(successorStart).not.toHaveBeenCalled();
+      expect(independent.start).toHaveBeenCalledTimes(1);
+      expect(stateOf("a.hung-cleanup")).toBe("failed");
+
+      startRendererServiceHost({ shell: "main", reportError: vi.fn() });
+      await settleRendererServices();
+      expect(hangingCleanup).toHaveBeenCalledTimes(1);
+      expect(successorStart).not.toHaveBeenCalled();
+
+      cleanupGate.release();
+      await vi.advanceTimersByTimeAsync(0);
+      await settleRendererServices();
+      expect(successorStart).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries once when a timed-out cleanup later rejects", async () => {
+    vi.useFakeTimers();
+    try {
+      let rejectFirstCleanup: ((error: Error) => void) | undefined;
+      const firstCleanup = new Promise<void>((_, reject) => {
+        rejectFirstCleanup = reject;
+      });
+      const cleanup = vi
+        .fn<() => Promise<void>>()
+        .mockReturnValueOnce(firstCleanup)
+        .mockResolvedValue(undefined);
+      registerRendererService({
+        id: "a.late-cleanup-rejection",
+        shells: ["main"],
+        start: () => cleanup,
+      });
+      startRendererServiceHost({ shell: "main", reportError: vi.fn() });
+      await settleRendererServices();
+
+      const successorStart = vi.fn(() => () => {});
+      registerRendererService({
+        id: "a.late-cleanup-rejection",
+        shells: ["main"],
+        start: successorStart,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(successorStart).not.toHaveBeenCalled();
+
+      rejectFirstCleanup?.(new Error("late cleanup rejection"));
+      await vi.advanceTimersByTimeAsync(0);
+      await settleRendererServices();
+
+      expect(cleanup).toHaveBeenCalledTimes(2);
+      expect(successorStart).toHaveBeenCalledTimes(1);
+      expect(stateOf("a.late-cleanup-rejection")).toBe("running");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a start that never settles and keeps the queue usable", async () => {
+    vi.useFakeTimers();
+    try {
+      const never = new Promise<RendererServiceCleanup>(() => {});
+      const hangingStart = vi.fn(() => never);
+      registerRendererService({
+        id: "a.hung-start",
+        shells: ["main"],
+        start: hangingStart,
+      });
+      const independent = makeService("a.alongside-hung-start");
+      registerRendererService(independent.definition);
+      startRendererServiceHost({ shell: "main", reportError: vi.fn() });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hangingStart).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+
+      expect(stateOf("a.hung-start")).toBe("failed");
+      expect(independent.start).toHaveBeenCalledTimes(1);
+
+      const later = makeService("a.after-hung-start");
+      registerRendererService(later.definition);
+      await settleRendererServices();
+      expect(later.start).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs a late timed-out start cleanup once before automatic recovery", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveFirstStart:
+        | ((cleanup: RendererServiceCleanup) => void)
+        | undefined;
+      const firstStart = new Promise<RendererServiceCleanup>((resolve) => {
+        resolveFirstStart = resolve;
+      });
+      const lateCleanup = vi.fn();
+      const recoveredCleanup = vi.fn();
+      const start = vi
+        .fn<() => RendererServiceCleanup | Promise<RendererServiceCleanup>>()
+        .mockReturnValueOnce(firstStart)
+        .mockReturnValue(recoveredCleanup);
+      registerRendererService({
+        id: "a.late-timeout-recovery",
+        shells: ["main"],
+        start,
+      });
+      startRendererServiceHost({ shell: "main", reportError: vi.fn() });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+      expect(stateOf("a.late-timeout-recovery")).toBe("failed");
+
+      resolveFirstStart?.(lateCleanup);
+      await vi.advanceTimersByTimeAsync(0);
+      await settleRendererServices();
+
+      expect(lateCleanup).toHaveBeenCalledTimes(1);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(stateOf("a.late-timeout-recovery")).toBe("running");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("isolates a late timed-out start from a reset generation reusing its id", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveOldStart:
+        | ((cleanup: RendererServiceCleanup) => void)
+        | undefined;
+      const oldStart = new Promise<RendererServiceCleanup>((resolve) => {
+        resolveOldStart = resolve;
+      });
+      const oldCleanup = vi.fn(async () => {
+        throw new Error("old cleanup rejected");
+      });
+      registerRendererService({
+        id: "a.reset-epoch",
+        shells: ["main"],
+        start: () => oldStart,
+      });
+      startRendererServiceHost({ shell: "main", reportError: vi.fn() });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await settleRendererServices();
+      await resetRendererServicesForTest();
+
+      const newCleanup = vi.fn();
+      registerRendererService({
+        id: "a.reset-epoch",
+        shells: ["main"],
+        start: () => newCleanup,
+      });
+      const newHost = startRendererServiceHost({
+        shell: "main",
+        reportError: vi.fn(),
+      });
+      await settleRendererServices();
+      expect(stateOf("a.reset-epoch")).toBe("running");
+
+      resolveOldStart?.(oldCleanup);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(oldCleanup).toHaveBeenCalledTimes(1);
+      expect(stateOf("a.reset-epoch")).toBe("running");
+      expect(newCleanup).not.toHaveBeenCalled();
+
+      await newHost.dispose();
+      expect(newCleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("race-safe async start", () => {
@@ -476,13 +885,15 @@ describe("race-safe async start", () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores a rejection from a start that was already stopped", async () => {
+  it("quarantines a rejection from a start that was already stopped", async () => {
     const reportError = vi.fn();
+    const start = vi.fn();
     let rejectStart: ((error: Error) => void) | undefined;
     registerRendererService({
       id: "a.aborted-reject",
       shells: ["main"],
       start: async () => {
+        start();
         await new Promise<never>((_, reject) => {
           rejectStart = reject;
         });
@@ -494,7 +905,16 @@ describe("race-safe async start", () => {
     const disposal = host.dispose();
     rejectStart?.(new Error("torn down mid-start"));
     await disposal;
-    expect(reportError).not.toHaveBeenCalled();
+
+    startRendererServiceHost({ shell: "main", reportError });
+    await settleRendererServices();
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(stateOf("a.aborted-reject")).toBe("failed");
+    expect(reportError).toHaveBeenCalledWith(
+      "a.aborted-reject",
+      expect.any(Error),
+      "start",
+    );
   });
 });
 
@@ -521,11 +941,12 @@ describe("observable failures", () => {
 
   it("treats a start that returns no cleanup as a contract violation", async () => {
     const reportError = vi.fn();
+    const start = vi.fn(() => undefined);
     registerRendererService({
       id: "a.no-cleanup",
       shells: ["main"],
       // Deliberately violates the contract at runtime.
-      start: (() => undefined) as unknown as () => RendererServiceCleanup,
+      start: start as unknown as () => RendererServiceCleanup,
     });
     startRendererServiceHost({ shell: "main", reportError });
     await settleRendererServices();
@@ -538,6 +959,10 @@ describe("observable failures", () => {
       }),
       "start",
     );
+
+    startRendererServiceHost({ shell: "main", reportError });
+    await settleRendererServices();
+    expect(start).toHaveBeenCalledTimes(1);
   });
 
   it("a failed service does not block other services from running", async () => {

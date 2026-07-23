@@ -3,18 +3,20 @@
  * loops so plugins cannot orphan resources outside React.
  *
  * Plugin registration entries declare shell-scoped definitions; the app shell
- * installs one host per renderer window. The host retains and awaits every
- * cleanup on suspension, teardown, host replacement, and HMR re-registration.
- * One transition queue ensures a successor never starts before its predecessor
- * has completely released native resources. Registration order does not
- * matter, and rapid replacements coalesce to the latest generation.
+ * installs one host per renderer window. The host retains cleanup ownership on
+ * suspension, teardown, host replacement, and HMR re-registration. Cleanup
+ * waits are bounded so one broken service cannot deadlock unrelated work; a
+ * timed-out lease stays quarantined and blocks only that service's successor.
+ * Registration order does not matter, and rapid replacements coalesce to the
+ * latest generation.
  *
  * A `globalThis` store preserves single ownership across duplicated module
- * evaluations. Stops abort pending starts immediately and await late cleanup.
- * Persisted `pagehide` suspends external resources; `pageshow` starts a fresh
- * serialized generation. Missing cleanup is a contract failure (#16504,
- * #17110).
+ * evaluations. Stops abort pending starts immediately and observe late cleanup
+ * through the same bounded ownership policy. Persisted `pagehide` suspends
+ * external resources; `pageshow` starts a fresh serialized generation. Missing
+ * cleanup is a contract failure (#16504, #17110).
  */
+import { ElizaError } from "@elizaos/core";
 
 /**
  * Renderer window shells the app boots. Only the app shell assigns these; a
@@ -39,7 +41,11 @@ export interface RendererServiceContext {
   signal: AbortSignal;
 }
 
-/** Releases every resource acquired by a service; the host awaits completion. */
+/**
+ * Releases every resource acquired by a service. Cleanup must be idempotent
+ * and retry-safe: the host serializes attempts, but retries a rejected release
+ * because a successor cannot safely start until ownership is proved absent.
+ */
 export type RendererServiceCleanup = () => void | Promise<void>;
 
 export interface RendererServiceDefinition {
@@ -49,8 +55,9 @@ export interface RendererServiceDefinition {
   shells: readonly RendererShellKind[];
   /**
    * Start the service. Must return (or resolve to) the cleanup that undoes
-   * every listener/interval/native handle it installed. May be async; the host
-   * guarantees the cleanup still runs and settles if stopped mid-start.
+   * every listener/interval/native handle it installed. May be async; when a
+   * stopped start returns ownership late, the host invokes that cleanup and
+   * quarantines the id if release does not settle within the ownership bound.
    */
   start: (
     context: RendererServiceContext,
@@ -75,28 +82,35 @@ export type RendererServiceErrorReporter = (
   serviceId: string,
   error: unknown,
   phase: "start" | "cleanup",
-) => void;
+) => void | Promise<void>;
 
 export interface RendererServiceHostHandle {
   shell: RendererShellKind;
-  /** Stop every running/starting instance and await all owned cleanup. */
+  /**
+   * Stop every running/starting instance. Resolution means each release either
+   * settled or reached the ownership bound and remains visibly quarantined.
+   */
   dispose: () => Promise<void>;
 }
 
 interface ServiceInstance {
   definition: RendererServiceDefinition;
   definitionVersion: number;
+  /** Invalidates late continuations after the test-only registry reset. */
+  storeEpoch: number;
   controller: AbortController;
   status: "starting" | "running" | "failed" | "stopped";
   cleanup: RendererServiceCleanup | null;
-  /** Settles after start and any late cleanup caused by a concurrent stop. */
+  /** Settles after bounded start handling; a timed-out outcome stays observed. */
   startPromise: Promise<void>;
-  /** Shared by every stop request so cleanup is invoked and awaited once. */
+  /** Shared by concurrent stop callers for one serialized release attempt. */
   stopPromise: Promise<void> | null;
   /** A rejected cleanup leaves ownership uncertain and blocks successors. */
   cleanupFailed: boolean;
-  /** Pre-#17110 field retained only while an HMR store is upgraded in place. */
+  /** Schema-v1 completion promise consumed during an in-place HMR upgrade. */
   settled?: Promise<void>;
+  /** Legacy starting work could discard an async cleanup and cannot recover. */
+  legacyStartUntrackable?: boolean;
 }
 
 interface HostState {
@@ -104,19 +118,31 @@ interface HostState {
   reportError: RendererServiceErrorReporter;
   instances: Map<string, ServiceInstance>;
   detachPageEvents: (() => void) | null;
-  /** Pre-#17110 pagehide disposer retained for in-place HMR store upgrades. */
+  /** Schema-v1 pagehide disposer consumed during an in-place HMR upgrade. */
   detachPagehide?: (() => void) | null;
   disposed: boolean;
   suspended: boolean;
   disposePromise: Promise<void> | null;
 }
 
+interface CleanupRetryState {
+  cleanup: RendererServiceCleanup;
+  activeAttempt: Promise<void> | null;
+  /** A timed-out attempt remains the sole owner until it eventually settles. */
+  timedOutAttempt: Promise<void> | null;
+  /** Prevents repeated diagnostics when several reconciles see one hung call. */
+  reportedAttempt: Promise<void> | null;
+}
+
 interface RendererServiceStore {
+  epoch: number;
   definitions: Map<string, RendererServiceDefinition>;
   definitionVersions: Map<string, number>;
   nextDefinitionVersion: number;
   /** Services whose prior generation could not prove complete release. */
   blockedServiceIds: Set<string>;
+  /** Retryable cleanup leases retained after rejection or timeout. */
+  cleanupRetries: Map<string, CleanupRetryState>;
   host: HostState | null;
   /** The tail of the ownership queue; every successor is chained here. */
   transition: Promise<void>;
@@ -141,10 +167,12 @@ function getStore(): RendererServiceStore {
   const holder = globalThis as { [STORE_KEY]?: RendererServiceStore };
   if (!holder[STORE_KEY]) {
     holder[STORE_KEY] = {
+      epoch: 0,
       definitions: new Map(),
       definitionVersions: new Map(),
       nextDefinitionVersion: 0,
       blockedServiceIds: new Set(),
+      cleanupRetries: new Map(),
       host: null,
       transition: Promise.resolve(),
     };
@@ -152,12 +180,13 @@ function getStore(): RendererServiceStore {
   const store = holder[STORE_KEY];
 
   // HMR deliberately preserves this global store across module evaluations.
-  // Upgrade the pre-#17110 shape in place so the lifecycle fix can take
-  // ownership of already-running services instead of crashing on missing queue
-  // fields or leaking the old pagehide listener.
+  // Cached schema-v1 hosts may own live services, so migration preserves their
+  // instances while installing serialized lifecycle ownership.
+  store.epoch ??= 0;
   store.definitionVersions ??= new Map();
   store.nextDefinitionVersion ??= 0;
   store.blockedServiceIds ??= new Set();
+  store.cleanupRetries ??= new Map();
   store.transition ??= Promise.resolve();
   for (const id of store.definitions.keys()) {
     if (!store.definitionVersions.has(id)) {
@@ -169,20 +198,86 @@ function getStore(): RendererServiceStore {
   if (host) {
     host.suspended ??= false;
     host.disposePromise ??= null;
-    if (!host.detachPageEvents && host.detachPagehide) {
-      host.detachPageEvents = host.detachPagehide;
+    if (host.detachPagehide) {
+      const detachLegacyPagehide = host.detachPagehide;
+      const detachCurrentPageEvents = host.detachPageEvents;
+      detachLegacyPagehide();
+      if (
+        detachCurrentPageEvents &&
+        detachCurrentPageEvents !== detachLegacyPagehide
+      ) {
+        detachCurrentPageEvents();
+      }
+      host.detachPagehide = null;
+      host.detachPageEvents = null;
+      attachPageEvents(host);
     }
     for (const [id, instance] of host.instances) {
       instance.definitionVersion ??= store.definitionVersions.get(id) ?? 0;
-      instance.startPromise ??= instance.settled ?? Promise.resolve();
+      instance.storeEpoch ??= store.epoch;
+      if (!instance.startPromise) {
+        const legacySettled = instance.settled ?? Promise.resolve();
+        if (instance.status === "starting") {
+          // Schema-v1 did not retain the Promise returned by a cleanup acquired
+          // after abort. Migration cannot recover that lease, so this id stays
+          // quarantined until a document reload establishes a new boundary.
+          instance.controller.abort();
+          instance.status = "failed";
+          instance.legacyStartUntrackable = true;
+          store.blockedServiceIds.add(id);
+          reportServiceError(
+            host,
+            id,
+            new ElizaError(
+              `renderer service "${id}" was starting under an untrackable legacy lifecycle`,
+              {
+                code: "RENDERER_SERVICE_LEGACY_OWNERSHIP_UNTRACKABLE",
+                context: { serviceId: id },
+                severity: "fatal",
+              },
+            ),
+            "start",
+          );
+        }
+        instance.startPromise = awaitOwnershipSettlement(
+          Promise.resolve(legacySettled),
+          id,
+          "start",
+        ).catch((error) => {
+          // error-policy:J1 the HMR upgrade boundary translates an old
+          // lifecycle rejection into the current failed/quarantined state.
+          instance.status = "failed";
+          store.blockedServiceIds.add(id);
+          reportServiceError(host, id, error, "start");
+        });
+      }
       instance.stopPromise ??= null;
       instance.cleanupFailed ??= false;
+      instance.legacyStartUntrackable ??= false;
     }
   }
   return store;
 }
 
 const LOG_PREFIX = "[RendererServices]";
+const OWNERSHIP_SETTLE_TIMEOUT_MS = 10_000;
+
+class OwnershipSettlementTimeoutError extends ElizaError {
+  constructor(serviceId: string, phase: "start" | "cleanup") {
+    super(
+      `renderer service "${serviceId}" ${phase} did not settle within ${OWNERSHIP_SETTLE_TIMEOUT_MS}ms`,
+      {
+        code: "RENDERER_SERVICE_OWNERSHIP_TIMEOUT",
+        context: {
+          serviceId,
+          phase,
+          timeoutMs: OWNERSHIP_SETTLE_TIMEOUT_MS,
+        },
+        severity: "ephemeral",
+      },
+    );
+  }
+}
 
 const defaultReportError: RendererServiceErrorReporter = (
   serviceId,
@@ -199,8 +294,23 @@ function reportServiceError(
   phase: "start" | "cleanup",
 ): void {
   try {
-    host.reportError(serviceId, error, phase);
+    const reporting = host.reportError(serviceId, error, phase);
+    if (reporting) {
+      // error-policy:J7 reporter diagnostics must never create an unhandled
+      // rejection or become part of the resource-ownership queue.
+      void reporting.catch((reporterError) => {
+        defaultReportError(
+          serviceId,
+          new AggregateError(
+            [error, reporterError],
+            `renderer service error reporter failed during ${phase}`,
+          ),
+          phase,
+        );
+      });
+    }
   } catch (reporterError) {
+    // error-policy:J7 reporter diagnostics must not kill lifecycle progress.
     // The reporter is an observability boundary, not part of resource
     // ownership. Its own failure must stay visible without poisoning the
     // serialized lifecycle queue and stranding every later transition.
@@ -219,9 +329,150 @@ function enqueueTransition(
   store: RendererServiceStore,
   transition: () => Promise<void>,
 ): Promise<void> {
-  const scheduled = store.transition.then(transition);
-  store.transition = scheduled;
+  // The second arm also handles a rejected transition imported from a cached
+  // schema-v1 store. The returned promise preserves failure for its direct
+  // caller, while the stored tail observes it and stays usable.
+  const scheduled = store.transition.then(transition, (error) => {
+    defaultReportError("renderer-service-registry", error, "cleanup");
+    return transition();
+  });
+  // error-policy:J5 direct callers observe `scheduled`; this second observer
+  // reports the same failure and keeps the shared queue tail usable.
+  store.transition = scheduled.catch((error) => {
+    defaultReportError("renderer-service-registry", error, "cleanup");
+  });
   return scheduled;
+}
+
+function ownershipTimeout(
+  serviceId: string,
+  phase: "start" | "cleanup",
+): OwnershipSettlementTimeoutError {
+  return new OwnershipSettlementTimeoutError(serviceId, phase);
+}
+
+async function awaitOwnershipSettlement<T>(
+  promise: Promise<T>,
+  serviceId: string,
+  phase: "start" | "cleanup",
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(ownershipTimeout(serviceId, phase)),
+          OWNERSHIP_SETTLE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function getOrStartCleanupAttempt(
+  store: RendererServiceStore,
+  serviceId: string,
+  retry: CleanupRetryState,
+): Promise<void> {
+  if (retry.activeAttempt) return retry.activeAttempt;
+
+  let result: void | Promise<void>;
+  try {
+    // Invoke synchronously so pagehide queues native release before the
+    // browser is allowed to freeze the document.
+    result = retry.cleanup();
+  } catch (error) {
+    // error-policy:J1 normalize a synchronous service-boundary throw into the
+    // same observed attempt used for asynchronous cleanup rejection.
+    result = Promise.reject(error);
+  }
+  const attempt = Promise.resolve(result);
+  retry.activeAttempt = attempt;
+  retry.timedOutAttempt = null;
+  void attempt.then(
+    () => {
+      if (
+        store.cleanupRetries.get(serviceId) === retry &&
+        retry.activeAttempt === attempt
+      ) {
+        retry.activeAttempt = null;
+        retry.timedOutAttempt = null;
+        store.cleanupRetries.delete(serviceId);
+        store.blockedServiceIds.delete(serviceId);
+        queueReconcileAfterCleanupSettlement(store, serviceId);
+      }
+    },
+    () => {
+      if (
+        store.cleanupRetries.get(serviceId) === retry &&
+        retry.activeAttempt === attempt
+      ) {
+        const settledAfterTimeout = retry.timedOutAttempt === attempt;
+        retry.activeAttempt = null;
+        retry.timedOutAttempt = null;
+        if (settledAfterTimeout) {
+          // A late rejection makes this lease retryable again. Queue exactly
+          // one retry; an immediate second rejection does not recursively
+          // spin because that attempt was never marked timed out.
+          queueReconcileAfterCleanupSettlement(store, serviceId);
+        }
+      }
+    },
+  );
+  return attempt;
+}
+
+function queueReconcileAfterCleanupSettlement(
+  store: RendererServiceStore,
+  serviceId: string,
+): void {
+  const host = store.host;
+  if (!host || host.disposed || host.suspended) return;
+  // A release may settle after its bounded waiter returned. Queue the latest
+  // definition now; requiring another HMR/pageshow event would turn a
+  // transient slow teardown into a permanent stopped state.
+  void enqueueTransition(store, () => reconcileService(host, serviceId));
+}
+
+async function settleCleanupRetry(
+  host: HostState,
+  serviceId: string,
+  retry: CleanupRetryState,
+): Promise<boolean> {
+  const store = getStore();
+  if (
+    store.cleanupRetries.get(serviceId) !== retry ||
+    !store.blockedServiceIds.has(serviceId)
+  ) {
+    return true;
+  }
+  if (retry.activeAttempt && retry.timedOutAttempt === retry.activeAttempt) {
+    return false;
+  }
+
+  const attempt = getOrStartCleanupAttempt(store, serviceId, retry);
+  try {
+    await awaitOwnershipSettlement(attempt, serviceId, "cleanup");
+    return true;
+  } catch (error) {
+    if (
+      retry.activeAttempt === attempt &&
+      error instanceof OwnershipSettlementTimeoutError
+    ) {
+      retry.timedOutAttempt = attempt;
+    }
+    if (retry.reportedAttempt !== attempt) {
+      retry.reportedAttempt = attempt;
+      // error-policy:J6 best-effort teardown — every other service still
+      // tears down. This id stays quarantined until the same release lease
+      // succeeds, so uncertain ownership cannot overlap a successor.
+      reportServiceError(host, serviceId, error, "cleanup");
+    }
+    return false;
+  }
 }
 
 async function runCleanup(
@@ -229,17 +480,57 @@ async function runCleanup(
   instance: ServiceInstance,
 ): Promise<void> {
   const cleanup = instance.cleanup;
-  instance.cleanup = null;
   if (!cleanup) return;
-  try {
-    await cleanup();
-  } catch (error) {
+
+  const store = getStore();
+  const serviceId = instance.definition.id;
+  if (instance.storeEpoch !== store.epoch) {
+    // A reset invalidates old continuations but cannot cancel arbitrary
+    // service code. Release a late lease locally without letting it mutate
+    // the fresh registry's block/retry state for a reused id.
+    instance.cleanup = null;
+    let result: void | Promise<void>;
+    try {
+      result = cleanup();
+    } catch (error) {
+      // error-policy:J1 normalize a synchronous service-boundary throw into
+      // the stale generation's bounded asynchronous cleanup path.
+      result = Promise.reject(error);
+    }
+    try {
+      await awaitOwnershipSettlement(
+        Promise.resolve(result),
+        serviceId,
+        "cleanup",
+      );
+    } catch (error) {
+      // error-policy:J6 stale test-epoch teardown is observed but cannot
+      // quarantine an unrelated generation in the replacement registry.
+      reportServiceError(host, serviceId, error, "cleanup");
+    }
+    return;
+  }
+
+  let retry = store.cleanupRetries.get(serviceId);
+  if (!retry) {
+    retry = {
+      cleanup,
+      activeAttempt: null,
+      timedOutAttempt: null,
+      reportedAttempt: null,
+    };
+    store.cleanupRetries.set(serviceId, retry);
+  }
+  // The retry state, not the stopped instance, owns this lease from here.
+  // Clearing before invocation prevents a successful attempt's recovery
+  // reconcile from seeing and executing the same cleanup a second time.
+  instance.cleanup = null;
+  store.blockedServiceIds.add(serviceId);
+  const released = await settleCleanupRetry(host, serviceId, retry);
+  if (released) {
+    instance.cleanupFailed = false;
+  } else {
     instance.cleanupFailed = true;
-    getStore().blockedServiceIds.add(instance.definition.id);
-    // error-policy:J6 best-effort teardown — a throwing cleanup must not block
-    // the remaining services' teardown. The failed service is quarantined so
-    // uncertain old ownership cannot overlap a claimed-running successor.
-    reportServiceError(host, instance.definition.id, error, "cleanup");
   }
 }
 
@@ -261,6 +552,7 @@ function stopInstance(
   const id = instance.definition.id;
   instance.status = "stopped";
   instance.controller.abort();
+  const hadRetainedCleanup = instance.cleanup !== null;
   // If acquisition already completed, invoke cleanup before returning from
   // the stop request so pagehide initiates native teardown in the same task.
   const eagerCleanup = instance.cleanup
@@ -271,7 +563,25 @@ function stopInstance(
     // A pending start owns acquisition until it settles. Its abort branch
     // releases any cleanup returned after the stop request.
     await instance.startPromise;
-    await runCleanup(host, instance);
+    // A failed release stays recorded for the next serialized reconcile.
+    // Re-invoking it twice inside one stop would turn a retry policy into a
+    // hot loop and offers no new boundary at which ownership could change.
+    if (!instance.cleanupFailed) {
+      await runCleanup(host, instance);
+    }
+    const store = getStore();
+    if (
+      instance.storeEpoch === store.epoch &&
+      instance.settled &&
+      hadRetainedCleanup &&
+      !instance.legacyStartUntrackable &&
+      !instance.cleanupFailed &&
+      !store.cleanupRetries.has(id)
+    ) {
+      // A rejected schema-v1 `settled` may only reflect its reporter path.
+      // Successful release of the cleanup it retained proves ownership absent.
+      store.blockedServiceIds.delete(id);
+    }
     // Identity, not just id, prevents an old generation from deleting a
     // successor if future callers evolve independently of the host queue.
     if (host.instances.get(id) === instance) {
@@ -280,6 +590,71 @@ function stopInstance(
   })();
   void stopping.then(resolveStop, rejectStop);
   return completion;
+}
+
+type StartOutcome =
+  | { status: "fulfilled"; cleanup: RendererServiceCleanup }
+  | { status: "rejected"; error: unknown }
+  | { status: "skipped" };
+
+async function applyStartOutcome(
+  host: HostState,
+  instance: ServiceInstance,
+  outcome: StartOutcome,
+): Promise<void> {
+  const { definition, controller } = instance;
+  const store = getStore();
+  const isCurrentEpoch = instance.storeEpoch === store.epoch;
+  if (outcome.status === "skipped") return;
+  if (outcome.status === "rejected") {
+    instance.status = "failed";
+    if (isCurrentEpoch) {
+      store.blockedServiceIds.add(definition.id);
+    }
+    // error-policy:J1 host boundary — a service failing to start must not take
+    // down renderer boot; uncertain partial acquisition stays quarantined.
+    reportServiceError(host, definition.id, outcome.error, "start");
+    return;
+  }
+
+  const cleanup = outcome.cleanup;
+  if (typeof cleanup !== "function") {
+    instance.status = "failed";
+    if (isCurrentEpoch) {
+      store.blockedServiceIds.add(definition.id);
+    }
+    reportServiceError(
+      host,
+      definition.id,
+      new ElizaError(
+        `renderer service "${definition.id}" start() returned ${String(
+          cleanup,
+        )} instead of a cleanup function`,
+        {
+          code: "RENDERER_SERVICE_INVALID_CLEANUP",
+          context: { serviceId: definition.id },
+          severity: "fatal",
+        },
+      ),
+      "start",
+    );
+    return;
+  }
+
+  if (
+    !isCurrentEpoch ||
+    controller.signal.aborted ||
+    instance.status === "failed"
+  ) {
+    // Stopped or timed out while start was awaited: release a cleanup returned
+    // late. The id remains quarantined unless that release proves success.
+    instance.cleanup = cleanup;
+    await runCleanup(host, instance);
+    return;
+  }
+
+  instance.cleanup = cleanup;
+  instance.status = "running";
 }
 
 function startInstance(
@@ -291,66 +666,56 @@ function startInstance(
   const instance: ServiceInstance = {
     definition,
     definitionVersion,
+    storeEpoch: getStore().epoch,
     controller,
     status: "starting",
     cleanup: null,
     startPromise: Promise.resolve(),
     stopPromise: null,
     cleanupFailed: false,
+    legacyStartUntrackable: false,
   };
   host.instances.set(definition.id, instance);
 
   // Defer the call one microtask so startPromise is installed before service
   // code can synchronously trigger a replacement or stop through callbacks.
-  instance.startPromise = Promise.resolve().then(async () => {
-    if (controller.signal.aborted) return;
-    let cleanup: RendererServiceCleanup;
+  const outcome = Promise.resolve().then<StartOutcome>(async () => {
+    if (controller.signal.aborted) {
+      return { status: "skipped" };
+    }
     try {
-      cleanup = await definition.start({
+      const cleanup = await definition.start({
         shell: host.shell,
         signal: controller.signal,
       });
+      return { status: "fulfilled", cleanup };
     } catch (error) {
-      if (controller.signal.aborted) {
-        // error-policy:J6 the instance was stopped while starting; a rejection
-        // from the torn-down start is expected teardown noise, not a failure.
-        return;
-      }
-      // The failed instance stays in the map so its state reads "failed", not
-      // a healthy-looking absence (three-state rule: failure must be visible).
-      instance.status = "failed";
-      // error-policy:J1 host boundary — a service failing to start must not
-      // take down the renderer boot path; it is surfaced via the reporter.
-      reportServiceError(host, definition.id, error, "start");
-      return;
+      // error-policy:J1 the service start boundary translates arbitrary plugin
+      // failures into an explicit lifecycle outcome for quarantine/reporting.
+      return { status: "rejected", error };
     }
+  });
 
-    if (typeof cleanup !== "function") {
-      if (!controller.signal.aborted) instance.status = "failed";
-      reportServiceError(
-        host,
-        definition.id,
-        new Error(
-          `renderer service "${definition.id}" start() returned ${String(
-            cleanup,
-          )} instead of a cleanup function`,
-        ),
-        "start",
+  instance.startPromise = (async () => {
+    let settled: StartOutcome;
+    try {
+      settled = await awaitOwnershipSettlement(outcome, definition.id, "start");
+    } catch (error) {
+      // error-policy:J1 the host boundary quarantines timed-out acquisition
+      // while observing the underlying start for any late-owned cleanup.
+      instance.status = "failed";
+      getStore().blockedServiceIds.add(definition.id);
+      controller.abort();
+      reportServiceError(host, definition.id, error, "start");
+      // The underlying call remains observed. If it returns ownership after
+      // the bound, release it without letting the global queue wait forever.
+      void outcome.then((lateOutcome) =>
+        applyStartOutcome(host, instance, lateOutcome),
       );
       return;
     }
-
-    if (controller.signal.aborted) {
-      // Stopped while start was awaited: run the late cleanup now so no
-      // listener/interval installed by the finished start survives the stop.
-      instance.cleanup = cleanup;
-      await runCleanup(host, instance);
-      return;
-    }
-
-    instance.cleanup = cleanup;
-    instance.status = "running";
-  });
+    await applyStartOutcome(host, instance, settled);
+  })();
   return instance;
 }
 
@@ -367,19 +732,28 @@ async function reconcileService(
   expectedVersion?: number,
 ): Promise<void> {
   const store = getStore();
+  if (store.blockedServiceIds.has(serviceId)) {
+    const retry = store.cleanupRetries.get(serviceId);
+    if (!retry || !(await settleCleanupRetry(host, serviceId, retry))) {
+      return;
+    }
+  }
+
   const definition = store.definitions.get(serviceId);
   const definitionVersion = store.definitionVersions.get(serviceId);
   if (
     !definition ||
     definitionVersion === undefined ||
-    store.blockedServiceIds.has(serviceId) ||
     (expectedVersion !== undefined && definitionVersion !== expectedVersion)
   ) {
     return;
   }
 
   const existing = host.instances.get(serviceId);
-  if (existing?.definitionVersion === definitionVersion) {
+  if (
+    existing?.definitionVersion === definitionVersion &&
+    (existing.status === "starting" || existing.status === "running")
+  ) {
     await existing.startPromise;
     return;
   }
@@ -425,11 +799,23 @@ export function registerRendererService(
   definition: RendererServiceDefinition,
 ): void {
   if (!definition.id || definition.id.trim().length === 0) {
-    throw new Error(`${LOG_PREFIX} a renderer service needs a non-empty id`);
+    throw new ElizaError(
+      `${LOG_PREFIX} a renderer service needs a non-empty id`,
+      {
+        code: "RENDERER_SERVICE_INVALID_DEFINITION",
+        context: { reason: "empty_id" },
+        severity: "fatal",
+      },
+    );
   }
   if (definition.shells.length === 0) {
-    throw new Error(
+    throw new ElizaError(
       `${LOG_PREFIX} service "${definition.id}" declares no shells; declare where it runs instead of registering it nowhere`,
+      {
+        code: "RENDERER_SERVICE_INVALID_DEFINITION",
+        context: { serviceId: definition.id, reason: "empty_shells" },
+        severity: "fatal",
+      },
     );
   }
   const store = getStore();
@@ -448,6 +834,27 @@ export function registerRendererService(
   });
 }
 
+function attachPageEvents(host: HostState): void {
+  if (typeof window === "undefined") return;
+
+  const onPagehide = (event: PageTransitionEvent) => {
+    if (event.persisted) {
+      void suspendHost(host);
+    } else {
+      void disposeHost(host);
+    }
+  };
+  const onPageshow = (event: PageTransitionEvent) => {
+    if (event.persisted) resumeHost(host);
+  };
+  window.addEventListener("pagehide", onPagehide);
+  window.addEventListener("pageshow", onPageshow);
+  host.detachPageEvents = () => {
+    window.removeEventListener("pagehide", onPagehide);
+    window.removeEventListener("pageshow", onPageshow);
+  };
+}
+
 /**
  * Install the per-window service host. The app shell calls this once per
  * renderer window with the window's resolved shell kind; every already
@@ -455,7 +862,8 @@ export function registerRendererService(
  * and `pagehide` stops external resources. A persisted bfcache transition keeps
  * the logical host but resumes services through a fresh generation on
  * `pageshow`; a real teardown disposes the host. Calling again aborts the
- * previous host immediately and queues the successor after all cleanup.
+ * previous host immediately. Each successor waits for proved release of its
+ * own id; a timed-out id remains quarantined without blocking unrelated work.
  */
 export function startRendererServiceHost(options: {
   shell: RendererShellKind;
@@ -474,25 +882,7 @@ export function startRendererServiceHost(options: {
     disposePromise: null,
   };
   store.host = host;
-
-  if (typeof window !== "undefined") {
-    const onPagehide = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        void suspendHost(host);
-      } else {
-        void disposeHost(host);
-      }
-    };
-    const onPageshow = (event: PageTransitionEvent) => {
-      if (event.persisted) resumeHost(host);
-    };
-    window.addEventListener("pagehide", onPagehide);
-    window.addEventListener("pageshow", onPageshow);
-    host.detachPageEvents = () => {
-      window.removeEventListener("pagehide", onPagehide);
-      window.removeEventListener("pageshow", onPageshow);
-    };
-  }
+  attachPageEvents(host);
 
   void enqueueTransition(store, () => startEligibleServices(host));
 
@@ -583,8 +973,9 @@ export function getRendererServiceStates(): {
 }
 
 /**
- * Wait for the ownership queue, including starts and asynchronous cleanup.
- * Diagnostics/tests only; production callers use the returned host handle.
+ * Wait for the ownership queue, including bounded waits for starts and cleanup.
+ * A resolved wait may leave a timed-out service quarantined; diagnostics/tests
+ * can inspect that state without letting one broken lease deadlock the queue.
  */
 export async function settleRendererServices(): Promise<void> {
   const store = getStore();
@@ -605,12 +996,16 @@ export async function resetRendererServicesForTest(): Promise<void> {
   store.definitions.clear();
   store.definitionVersions.clear();
   store.blockedServiceIds.clear();
+  store.cleanupRetries.clear();
   if (store.host) await disposeHost(store.host);
   await settleRendererServices();
+  store.epoch += 1;
   // Cleanup code is arbitrary service code and may register definitions.
-  // Clear again only after teardown has fully settled for strict test isolation.
+  // Clear again after the bounded teardown queue drains; the epoch keeps any
+  // still-late test continuation from mutating the replacement registry.
   store.definitions.clear();
   store.definitionVersions.clear();
   store.blockedServiceIds.clear();
+  store.cleanupRetries.clear();
   store.nextDefinitionVersion = 0;
 }
