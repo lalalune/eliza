@@ -87,10 +87,7 @@ export class TeamPoolRegistry {
   }>(4096, HOT_PATH_SELECTION_TTL_MS);
   private readonly hotPathHydrations = new Map<string, Promise<void>>();
   private hotPathInvalidationGeneration = 0;
-  private readonly decryptedCredentials = new Map<
-    string,
-    { apiKey: string; expiresAt: number }
-  >();
+  private readonly decryptedCredentials = new Map<string, { apiKey: string; expiresAt: number }>();
   private readonly maxOrgPools: number;
   private keepAlive: ReturnType<typeof setInterval> | null = null;
 
@@ -113,10 +110,7 @@ export class TeamPoolRegistry {
     }
   }
 
-  private invalidateDecryptedCredential(
-    organizationId: string,
-    credentialId: string,
-  ): void {
+  private invalidateDecryptedCredential(organizationId: string, credentialId: string): void {
     const prefix = `${organizationId}\u0000${credentialId}\u0000`;
     for (const key of this.decryptedCredentials.keys()) {
       if (key.startsWith(prefix)) this.decryptedCredentials.delete(key);
@@ -372,10 +366,7 @@ export class TeamPoolRegistry {
       // A cached raw key must not survive the health transition that removed
       // it from pool eligibility. The prefix covers every session-affinity key
       // for this organization/provider.
-      this.invalidateDecryptedCredential(
-        params.organizationId,
-        params.credentialId,
-      );
+      this.invalidateDecryptedCredential(params.organizationId, params.credentialId);
       this.invalidateProviderSelections(params.organizationId, params.providerId);
     } catch (err) {
       logger.warn("[TeamPoolRegistry] provider failure writeback failed", {
