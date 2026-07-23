@@ -34,6 +34,7 @@ import {
   type RolesWorldMetadata,
   recordOwnerGrant,
   recordRoleGrant,
+  shouldSkipResponseMemoryPersistence,
   stringToUuid,
   type UUID,
   validateUuid,
@@ -242,16 +243,6 @@ function persistDeletedConversationIdsToState(ids: Set<string>): void {
 
 export interface ConversationRouteState {
   runtime: AgentRuntime | null;
-  /** Current agent lifecycle state (mirrors ServerState.agentState). */
-  agentState?: string;
-  /**
-   * Hold a chat turn through the warming window (early API bind → runtime ready)
-   * instead of 503-dropping it; resolves with the live runtime or null on
-   * timeout. Provided by the coerced ServerState; see ServerState.awaitRuntimeReady.
-   */
-  awaitRuntimeReady?:
-    | ((timeoutMs: number) => Promise<AgentRuntime | null>)
-    | null;
   config: ElizaConfig;
   agentName: string;
   adminEntityId: UUID | null;
@@ -268,35 +259,6 @@ export interface ConversationRouteState {
 
 export interface ConversationRouteContext extends RouteRequestContext {
   state: ConversationRouteState;
-}
-
-/**
- * How long a chat turn may HOLD waiting for first-turn capability during the
- * warming window (early API bind → runtime ready). Normal boots resolve in ~2s;
- * the cap bounds the hold so a genuinely-stuck boot still fails fast.
- */
-const WARMING_TURN_HOLD_MS = 30_000;
-
-/**
- * Resolve the runtime for a chat turn, HOLDING through the warming window
- * instead of 503-dropping. Returns the live runtime immediately if present;
- * otherwise, only while the agent is actively warming up (`starting`/
- * `restarting`), waits up to WARMING_TURN_HOLD_MS for capability to come online.
- * A genuinely stopped/errored agent (or one with no gate wired) returns null so
- * the caller fails fast with the usual 503.
- */
-async function resolveRuntimeForChatTurn(
-  state: ConversationRouteState,
-): Promise<AgentRuntime | null> {
-  if (state.runtime) {
-    return state.runtime;
-  }
-  const warming =
-    state.agentState === "starting" || state.agentState === "restarting";
-  if (!warming || !state.awaitRuntimeReady) {
-    return state.runtime ?? null;
-  }
-  return state.awaitRuntimeReady(WARMING_TURN_HOLD_MS);
 }
 
 function beginActiveChatTurn(state: ConversationRouteState): () => void {
@@ -715,20 +677,104 @@ async function ensureWorldOwnershipAndRoles(
   }
 }
 
-async function shouldPersistFinalAssistantTurn(
+function findPersistedGeneratedAssistantTurn(
+  result: ChatGenerationResult,
+  text: string,
+): { id: UUID; text: string } | null {
+  if (
+    !Array.isArray(result.persistedResponseMessageIds) ||
+    !Array.isArray(result.responseMessages)
+  ) {
+    return null;
+  }
+  const persistedIds = new Set(result.persistedResponseMessageIds);
+  const normalizedText = text.trim();
+  for (let index = result.responseMessages.length - 1; index >= 0; index -= 1) {
+    const candidate = result.responseMessages[index];
+    const candidateText =
+      typeof candidate?.content?.text === "string"
+        ? candidate.content.text.trim()
+        : "";
+    if (
+      typeof candidate?.id === "string" &&
+      candidate.id.length > 0 &&
+      persistedIds.has(candidate.id) &&
+      candidateText === normalizedText
+    ) {
+      return { id: candidate.id as UUID, text: candidateText };
+    }
+  }
+  return null;
+}
+
+class AssistantReplyPersistenceError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "AssistantReplyPersistenceError";
+  }
+}
+
+async function resolvePersistedAssistantTurn(
   runtime: AgentRuntime,
   roomId: UUID,
   turnStartedAt: number,
   result: ChatGenerationResult,
-): Promise<boolean> {
-  if (!result.usedActionCallbacks) {
-    return true;
+  text: string,
+  channelType: ChannelType,
+): Promise<
+  | { kind: "durable"; id: UUID; text: string }
+  | { kind: "ephemeral"; text: string }
+> {
+  const generatedTurn = findPersistedGeneratedAssistantTurn(result, text);
+  if (generatedTurn) {
+    return { kind: "durable", ...generatedTurn };
   }
 
-  const alreadyPersistedVisibleAssistantTurn =
-    await hasRecentVisibleAssistantMemorySince(runtime, roomId, turnStartedAt);
+  if (result.usedActionCallbacks) {
+    const callbackTurn = await getRecentVisibleAssistantMemorySince(
+      runtime,
+      roomId,
+      turnStartedAt,
+    );
+    if (callbackTurn) {
+      return { kind: "durable", ...callbackTurn };
+    }
+  }
 
-  return !alreadyPersistedVisibleAssistantTurn;
+  const content = buildPersistedAssistantContent(text, result);
+  if (
+    shouldSkipResponseMemoryPersistence({
+      content,
+      roomId,
+      entityId: runtime.agentId,
+    } as Memory)
+  ) {
+    return { kind: "ephemeral", text };
+  }
+
+  let persisted: Memory | null;
+  try {
+    persisted = await persistAssistantConversationMemory(
+      runtime,
+      roomId,
+      content,
+      channelType,
+      turnStartedAt,
+    );
+  } catch (cause) {
+    // error-policy:J2 attach the durable-turn boundary before the route
+    // translates this into a terminal SSE error.
+    throw new AssistantReplyPersistenceError(
+      "Failed to persist the assistant reply",
+      cause,
+    );
+  }
+  if (!persisted?.id) {
+    throw new AssistantReplyPersistenceError(
+      "Assistant reply persistence returned no durable message id",
+    );
+  }
+  return { kind: "durable", id: persisted.id as UUID, text };
 }
 
 function markConversationDeleted(
@@ -964,17 +1010,7 @@ async function waitForConversationRestore(
 ): Promise<void> {
   const pending = state.conversationRestorePromise;
   if (!pending) return;
-  try {
-    const timeout = new Promise<void>((_, reject) =>
-      setTimeout(
-        () => reject(new Error("Conversation restore timed out after 5000ms")),
-        5000,
-      ),
-    );
-    await Promise.race([pending, timeout]);
-  } catch {
-    // Restore failures are logged at the source.
-  }
+  await pending;
 }
 
 export function normalizeActionCallbackHistory(value: unknown): string[] {
@@ -2328,7 +2364,7 @@ export async function handleConversationRoutes(
         } => m !== null,
       );
 
-    const runtime = await resolveRuntimeForChatTurn(state);
+    const runtime = state.runtime;
     if (!runtime) {
       error(res, "Agent is not running", 503);
       return true;
@@ -2664,10 +2700,10 @@ export async function handleConversationRoutes(
       return true;
     };
 
-    // Hold the streaming turn through the warming window instead of dropping it
-    // — the client already shows the optimistic bubble + typing indicator, and
-    // the response streams the instant first-turn capability comes online.
-    const runtime = await resolveRuntimeForChatTurn(state);
+    // Runtime readiness is a lifecycle/API boundary. A chat request must fail
+    // immediately when capability is absent instead of occupying an SSE socket
+    // behind a hidden boot timer.
+    const runtime = state.runtime;
     if (!runtime) {
       return failStream("Agent is not running");
     }
@@ -2794,13 +2830,6 @@ export async function handleConversationRoutes(
     // the wire carries each phase transition once. Distinct consecutive phases
     // (thinking → running_action → thinking) still pass through.
     let lastStatusSignature = "thinking::";
-    // The client needs the persisted assistant id in the terminal `done` frame
-    // so it can replace its streamed `temp-resp-*` bubble in place. Create the
-    // memory before `done`, but defer only the DB insert until after the socket
-    // closes so the latency optimization stays intact and the id is still the
-    // same one the later WS proactive-message broadcast carries.
-    let deferredPersistence: Promise<void> | null = null;
-
     try {
       const result = await generateChatResponse(
         runtime,
@@ -2895,37 +2924,39 @@ export async function handleConversationRoutes(
               await new Promise((resolve) => setTimeout(resolve, 60));
             }
           }
-          // Resolve the durable assistant-memory id BEFORE emitting `done` so
-          // the client can swap its optimistic temp-resp-* bubble to the
-          // persisted id, and the proactive-message WS echo then reconciles by
-          // id instead of appending a duplicate bubble. Two topologies:
-          //  - action-callback turns may have ALREADY persisted (and WS-echoed)
-          //    the reply via the client_chat send handler — reuse that memory's
-          //    id and skip the route's own persist (same suppression
-          //    shouldPersistFinalAssistantTurn provided, but id-carrying);
-          //  - otherwise pre-mint the id here and defer only the DB insert.
-          let persistedAssistantId: UUID | null = null;
-          let shouldPersistAssistantTurn = false;
-          if (result.usedActionCallbacks) {
-            const existingAssistantTurn =
-              await getRecentVisibleAssistantMemorySince(
-                runtime,
-                conv.roomId,
-                turnStartedAt,
-              );
-            if (existingAssistantTurn) {
-              persistedAssistantId = existingAssistantTurn.id;
-            } else {
-              persistedAssistantId = crypto.randomUUID() as UUID;
-              shouldPersistAssistantTurn = true;
-            }
-          } else {
-            persistedAssistantId = crypto.randomUUID() as UUID;
-            shouldPersistAssistantTurn = true;
+          if (result.actionCallbackHistory?.length) {
+            assertConversationConnectionRuntime(
+              state.runtime,
+              connectionDescriptor,
+            );
+            await persistRecentAssistantActionCallbackHistory(
+              runtime,
+              conv.roomId,
+              result.actionCallbackHistory,
+              turnStartedAt,
+            );
+            assertConversationConnectionRuntime(
+              state.runtime,
+              connectionDescriptor,
+            );
           }
-          // Emit `done` before the DB insert so user-perceived end-of-turn
-          // latency excludes the memory write, but include the pre-minted
-          // persisted id so the client can reconcile its streamed temp bubble.
+          assertConversationConnectionRuntime(
+            state.runtime,
+            connectionDescriptor,
+          );
+          // `done` is a commit boundary: both ids it carries already exist in
+          // storage. The common direct-reply path reuses the message service's
+          // committed response id without a second read or write; action
+          // callbacks reuse their independently committed turn; only synthetic
+          // route fallbacks need a new assistant insert.
+          const persistedAssistant = await resolvePersistedAssistantTurn(
+            runtime,
+            conv.roomId,
+            turnStartedAt,
+            result,
+            resolvedText,
+            channelType,
+          );
           assertConversationConnectionRuntime(
             state.runtime,
             connectionDescriptor,
@@ -2934,8 +2965,12 @@ export async function handleConversationRoutes(
             type: "done",
             fullText: resolvedText,
             agentName: result.agentName,
-            ...(persistedAssistantId
-              ? { messageId: persistedAssistantId }
+            ...(persistedAssistant.kind === "durable"
+              ? { messageId: persistedAssistant.id }
+              : { assistantEphemeral: true }),
+            userMessageId: messageToStore.id,
+            ...(result.usedActionCallbacks
+              ? { historyRefreshRequired: true }
               : {}),
             ...(result.thought ? { thought: result.thought } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
@@ -2956,34 +2991,6 @@ export async function handleConversationRoutes(
               ? { localInference: result.localInference }
               : {}),
           });
-          deferredPersistence = (async () => {
-            if (result.actionCallbackHistory?.length) {
-              assertConversationConnectionRuntime(
-                state.runtime,
-                connectionDescriptor,
-              );
-              await persistRecentAssistantActionCallbackHistory(
-                runtime,
-                conv.roomId,
-                result.actionCallbackHistory,
-                turnStartedAt,
-              );
-            }
-            if (shouldPersistAssistantTurn && persistedAssistantId) {
-              assertConversationConnectionRuntime(
-                state.runtime,
-                connectionDescriptor,
-              );
-              await persistAssistantConversationMemory(
-                runtime,
-                conv.roomId,
-                buildPersistedAssistantContent(resolvedText, result),
-                channelType,
-                turnStartedAt,
-                persistedAssistantId,
-              );
-            }
-          })();
         } else {
           assertConversationConnectionRuntime(
             state.runtime,
@@ -3038,6 +3045,14 @@ export async function handleConversationRoutes(
         // instead of being suppressed into dead air (the iOS-suspend →
         // disconnect-abort → retry-eaten scenario).
         releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      } else if (
+        err instanceof AssistantReplyPersistenceError &&
+        !disconnectTracker.isAborted()
+      ) {
+        writeSse(res, {
+          type: "error",
+          message: getErrorMessage(err.cause ?? err),
+        });
       } else if (!disconnectTracker.isAborted()) {
         // If text was already streamed to the client (e.g. the initial
         // response succeeded but planner follow-up failed), use the
@@ -3183,19 +3198,6 @@ export async function handleConversationRoutes(
       clearInterval(heartbeatInterval);
       finishStreamResponse();
       endActiveChatTurn();
-      // Persistence runs after the client has already received `done` + the
-      // socket is closed. Failures must still be observable — never swallow.
-      if (deferredPersistence !== null) {
-        deferredPersistence.catch((persistErr: unknown) => {
-          logger.error(
-            {
-              roomId: conv.roomId,
-              err: getErrorMessage(persistErr),
-            },
-            "[ConversationStream] persistence failed",
-          );
-        });
-      }
     }
     return true;
   }
@@ -3264,9 +3266,7 @@ export async function handleConversationRoutes(
       }
       return true;
     }
-    // Hold the turn through the warming window (early API bind → runtime ready)
-    // instead of dropping it; the client already shows the optimistic bubble.
-    const runtime = await resolveRuntimeForChatTurn(state);
+    const runtime = state.runtime;
     if (!runtime) {
       error(res, "Agent is not running", 503);
       return true;
@@ -3384,26 +3384,18 @@ export async function handleConversationRoutes(
             turnStartedAt,
           );
         }
-        if (
-          await shouldPersistFinalAssistantTurn(
-            runtime,
-            conv.roomId,
-            turnStartedAt,
-            result,
-          )
-        ) {
-          assertConversationConnectionRuntime(
-            state.runtime,
-            connectionDescriptor,
-          );
-          await persistAssistantConversationMemory(
-            runtime,
-            conv.roomId,
-            buildPersistedAssistantContent(resolvedText, result),
-            channelType,
-            turnStartedAt,
-          );
-        }
+        assertConversationConnectionRuntime(
+          state.runtime,
+          connectionDescriptor,
+        );
+        await resolvePersistedAssistantTurn(
+          runtime,
+          conv.roomId,
+          turnStartedAt,
+          result,
+          resolvedText,
+          channelType,
+        );
         assertConversationConnectionRuntime(
           state.runtime,
           connectionDescriptor,
