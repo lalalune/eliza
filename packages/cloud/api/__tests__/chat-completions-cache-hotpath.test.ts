@@ -12,6 +12,7 @@ import * as languageModelActual from "@/lib/providers/language-model";
 import * as appsActual from "@/lib/services/apps";
 import * as contentModerationActual from "@/lib/services/content-moderation";
 import * as inferenceAuthActual from "@/lib/services/inference-auth-context";
+import * as inferenceAuthorizationActual from "@/lib/services/inference-authorization-boundary";
 import * as modelCatalogActual from "@/lib/services/model-catalog";
 import * as teamPoolActual from "@/lib/services/team-credential-pool";
 
@@ -21,6 +22,8 @@ const ORG = "00000000-0000-4000-8000-0000000000aa";
 const USER = "00000000-0000-4000-8000-0000000000bb";
 const API_KEY_ID = "00000000-0000-4000-8000-0000000000cc";
 const APP_ID = "00000000-0000-4000-8000-0000000000dd";
+const KEY_HASH = "a".repeat(64);
+const callOrder: string[] = [];
 
 let appCacheState: "ready" | "warming" = "ready";
 let coldHydration: Promise<void> | null = null;
@@ -29,6 +32,15 @@ let poolHydration: Promise<void> | null = null;
 let catalogCacheState: "ready" | "warming" = "ready";
 let catalogHydration: Promise<void> | null = null;
 let platformCredentialConfigured = true;
+let monetizedAppAvailable = true;
+let pooledCredential: {
+  credentialId: string;
+  providerId: "openai-api";
+  envKey: string;
+  apiKey: string;
+  label: string;
+} | null = null;
+let pooledAuthorizationError: Error | null = null;
 
 const resolveInferenceAuthContext = mock(
   async (
@@ -44,12 +56,26 @@ const resolveInferenceAuthContext = mock(
       kind: "authorized" as const,
       source: "cache" as const,
       ctx: {
-        v: 1 as const,
+        v: 2 as const,
         cachedAt: Date.now(),
         userId: USER,
         orgId: ORG,
         apiKeyId: API_KEY_ID,
-        keyHash: "a".repeat(64),
+        keyHash: KEY_HASH,
+        authorization: {
+          v: 1 as const,
+          organizationId: ORG,
+          organizationRevision: "1",
+          userId: USER,
+          userRevision: "1",
+          credential: {
+            kind: "api_key" as const,
+            id: API_KEY_ID,
+            fingerprint: KEY_HASH,
+            revision: "1",
+            expiresAt: null,
+          },
+        },
       },
     };
   },
@@ -105,15 +131,17 @@ const cacheOnlyAppLookup = mock(
     }
     return {
       kind: "ready" as const,
-      app: {
-        id: APP_ID,
-        organization_id: ORG,
-        created_by_user_id: USER,
-        monetization_enabled: true,
-        platform_offset_amount: "0",
-        purchase_share_percentage: "0",
-        inference_markup_percentage: "10",
-      },
+      app: monetizedAppAvailable
+        ? {
+            id: APP_ID,
+            organization_id: ORG,
+            created_by_user_id: USER,
+            monetization_enabled: true,
+            platform_offset_amount: "0",
+            purchase_share_percentage: "0",
+            inference_markup_percentage: "10",
+          }
+        : null,
     };
   },
 );
@@ -188,7 +216,7 @@ const cacheOnlyPoolSelection = mock(
     }
     return {
       kind: "ready" as const,
-      credential: null,
+      credential: pooledCredential,
     };
   },
 );
@@ -234,11 +262,15 @@ mock.module("@/lib/providers/language-model", () => ({
 
 const settle = mock(async () => null);
 const settleUnknown = mock(async () => null);
+const appMarkProviderDispatched = mock(async () => {
+  callOrder.push("dispatch");
+});
 const admitAppInferenceCacheOnly = mock(async () => ({
   mode: "deferred_app_reservation" as const,
   estimatedTotalCostUsd: 0.002,
   settle,
   settleUnknown,
+  markProviderDispatched: appMarkProviderDispatched,
 }));
 class TestInferenceAppAffiliateUnsupportedError extends Error {}
 const assertInferenceAppAffiliateSupported = mock(
@@ -255,15 +287,40 @@ mock.module("@/lib/services/app-inference-admission", () => ({
     TestInferenceAppAffiliateUnsupportedError,
 }));
 
+const authorizeInferenceProviderDispatch = mock(
+  async (params: {
+    organizationId: string;
+    authorization: {
+      organizationId: string;
+      userId: string;
+    };
+  }) => {
+    expect(params.organizationId).toBe(ORG);
+    expect(params.authorization).toMatchObject({
+      organizationId: ORG,
+      userId: USER,
+    });
+    callOrder.push("dispatch");
+    if (pooledAuthorizationError) throw pooledAuthorizationError;
+  },
+);
+mock.module("@/lib/services/inference-authorization-boundary", () => ({
+  ...inferenceAuthorizationActual,
+  authorizeInferenceProviderDispatch,
+}));
+
 const generateText = mock(() => {
+  callOrder.push("provider");
+  throw new Error("provider-handoff");
+});
+const streamText = mock(() => {
+  callOrder.push("provider");
   throw new Error("provider-handoff");
 });
 mock.module("ai", () => ({
   ...aiActual,
   generateText,
-  streamText: () => {
-    throw new Error("provider-handoff");
-  },
+  streamText,
 }));
 
 const { handleChatCompletionsPOST } = await import(
@@ -274,7 +331,10 @@ afterAll(() => {
   mock.restore();
 });
 
-function request(extraHeaders: Record<string, string> = {}): Request {
+function request(
+  extraHeaders: Record<string, string> = {},
+  stream = false,
+): Request {
   return new Request("https://api.example/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -286,7 +346,7 @@ function request(extraHeaders: Record<string, string> = {}): Request {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: "hello" }],
-      stream: false,
+      stream,
     }),
   });
 }
@@ -294,6 +354,17 @@ function request(extraHeaders: Record<string, string> = {}): Request {
 function executionCtx(background: Promise<unknown>[]) {
   return {
     waitUntil: (promise: Promise<unknown>) => background.push(promise),
+  };
+}
+
+function useZeroRatedPooledCredential(): void {
+  monetizedAppAvailable = false;
+  pooledCredential = {
+    credentialId: "pool-key-1",
+    providerId: "openai-api",
+    envKey: "OPENAI_API_KEY",
+    apiKey: "pooled-provider-key",
+    label: "Pooled OpenAI",
   };
 }
 
@@ -305,6 +376,10 @@ beforeEach(() => {
   catalogCacheState = "ready";
   catalogHydration = null;
   platformCredentialConfigured = true;
+  monetizedAppAvailable = true;
+  pooledCredential = null;
+  pooledAuthorizationError = null;
+  callOrder.length = 0;
   resolveInferenceAuthContext.mockClear();
   requireAuthOrApiKeyWithOrg.mockClear();
   enforceOrgRateLimit.mockClear();
@@ -320,7 +395,10 @@ beforeEach(() => {
   assertInferenceAppAffiliateSupported.mockClear();
   settle.mockClear();
   settleUnknown.mockClear();
+  appMarkProviderDispatched.mockClear();
+  authorizeInferenceProviderDispatch.mockClear();
   generateText.mockClear();
+  streamText.mockClear();
 });
 
 test("warm Worker request reaches provider with authoritative stores tripwired", async () => {
@@ -331,6 +409,7 @@ test("warm Worker request reaches provider with authoritative stores tripwired",
   });
 
   expect(response.status).toBe(500);
+  expect(callOrder).toEqual(["dispatch", "provider"]);
   expect(generateText).toHaveBeenCalledTimes(1);
   expect(resolveInferenceAuthContext).toHaveBeenCalledTimes(1);
   expect(enforceOrgRateLimit).toHaveBeenCalledTimes(1);
@@ -343,6 +422,61 @@ test("warm Worker request reaches provider with authoritative stores tripwired",
   expect(authoritativeCatalogLookup).not.toHaveBeenCalled();
   expect(authoritativePoolSelection).not.toHaveBeenCalled();
   expect(shouldBlockUser).not.toHaveBeenCalled();
+});
+
+test("zero-rated pooled streaming and non-streaming dispatch cross the exact auth boundary first", async () => {
+  useZeroRatedPooledCredential();
+
+  for (const stream of [false, true]) {
+    callOrder.length = 0;
+    authorizeInferenceProviderDispatch.mockClear();
+    generateText.mockClear();
+    streamText.mockClear();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleChatCompletionsPOST(request({}, stream), {
+      executionCtx: executionCtx(background),
+    });
+
+    expect({ stream, status: response.status }).toEqual({
+      stream,
+      status: 500,
+    });
+    expect(callOrder).toEqual(["dispatch", "provider"]);
+    expect(authorizeInferenceProviderDispatch).toHaveBeenCalledTimes(1);
+    expect(stream ? streamText : generateText).toHaveBeenCalledTimes(1);
+    expect(admitAppInferenceCacheOnly).not.toHaveBeenCalled();
+    await Promise.all(background);
+  }
+});
+
+test("zero-rated pooled authorization failure invokes no streaming or non-streaming provider", async () => {
+  useZeroRatedPooledCredential();
+  pooledAuthorizationError = new Error(
+    "Access denied: inference authorization was revoked",
+  );
+
+  for (const stream of [false, true]) {
+    callOrder.length = 0;
+    authorizeInferenceProviderDispatch.mockClear();
+    generateText.mockClear();
+    streamText.mockClear();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleChatCompletionsPOST(request({}, stream), {
+      executionCtx: executionCtx(background),
+    });
+
+    expect({ stream, status: response.status }).toEqual({
+      stream,
+      status: 403,
+    });
+    expect(callOrder).toEqual(["dispatch"]);
+    expect(authorizeInferenceProviderDispatch).toHaveBeenCalledTimes(1);
+    expect(generateText).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+    await Promise.all(background);
+  }
 });
 
 test("cold dependency returns 503 before held hydration completes", async () => {

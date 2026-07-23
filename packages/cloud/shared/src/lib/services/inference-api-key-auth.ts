@@ -48,8 +48,7 @@ async function findApiKey(rawKey: string, bypassCache: boolean): Promise<ApiKey 
   if (!bypassCache) return await apiKeysService.validateApiKey(rawKey);
 
   const keyHash = createHash("sha256").update(rawKey).digest("hex");
-  const replicaKey = await apiKeysRepository.findActiveByHash(keyHash);
-  return replicaKey ?? (await apiKeysRepository.findActiveByHashConsistent(keyHash)) ?? null;
+  return (await apiKeysRepository.findActiveByHashConsistent(keyHash)) ?? null;
 }
 
 async function findUser(
@@ -57,7 +56,7 @@ async function findUser(
   bypassCache: boolean,
 ): Promise<UserWithOrganization | undefined> {
   return bypassCache
-    ? await usersRepository.findWithOrganization(userId)
+    ? await usersRepository.findWithOrganizationForWrite(userId)
     : await usersService.getWithOrganization(userId);
 }
 

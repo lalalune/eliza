@@ -122,21 +122,6 @@ export class ApiKeysRepository {
   }
 
   /**
-   * Updates an existing API key.
-   */
-  async update(id: string, data: Partial<NewApiKey>): Promise<ApiKey | undefined> {
-    const [updated] = await dbWrite
-      .update(apiKeys)
-      .set({
-        ...data,
-        updated_at: new Date(),
-      })
-      .where(eq(apiKeys.id, id))
-      .returning();
-    return updated;
-  }
-
-  /**
    * Atomically increments the usage count for an API key.
    *
    * Uses SQL atomic increment to prevent race conditions.
@@ -150,49 +135,6 @@ export class ApiKeysRepository {
         updated_at: new Date(),
       })
       .where(eq(apiKeys.id, id));
-  }
-
-  /**
-   * Deletes an API key by ID.
-   */
-  async delete(id: string): Promise<void> {
-    await dbWrite.delete(apiKeys).where(eq(apiKeys.id, id));
-  }
-
-  async deactivateUserKeysByName(userId: string, name: string): Promise<void> {
-    await dbWrite
-      .update(apiKeys)
-      .set({
-        is_active: false,
-        updated_at: new Date(),
-      })
-      .where(and(eq(apiKeys.user_id, userId), eq(apiKeys.name, name), eq(apiKeys.is_active, true)));
-  }
-
-  async deleteByName(name: string): Promise<ApiKey[]> {
-    return await dbWrite.delete(apiKeys).where(eq(apiKeys.name, name)).returning();
-  }
-
-  /**
-   * Deactivates every active key a user holds in one organization. Used when a
-   * member is detached from an org (#11332): their keys authenticate AS that
-   * org (billing + access), and the plaintext is encrypted under the org's
-   * DEK, so the keys can be neither kept nor re-scoped — they are revoked.
-   */
-  async deactivateByUserAndOrganization(userId: string, organizationId: string): Promise<void> {
-    await dbWrite
-      .update(apiKeys)
-      .set({
-        is_active: false,
-        updated_at: new Date(),
-      })
-      .where(
-        and(
-          eq(apiKeys.user_id, userId),
-          eq(apiKeys.organization_id, organizationId),
-          eq(apiKeys.is_active, true),
-        ),
-      );
   }
 }
 

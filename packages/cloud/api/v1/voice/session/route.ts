@@ -6,6 +6,7 @@ import { agentSandboxesRepository } from "@/db/repositories/agent-sandboxes";
 import { userCharactersRepository } from "@/db/repositories/characters";
 import { conversationsRepository } from "@/db/repositories/conversations";
 import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
+import { resolveInferenceAuthContext } from "@/lib/services/inference-auth-context";
 import { logger } from "@/lib/utils/logger";
 import {
   isVoiceRealtimeWsEnabled,
@@ -64,6 +65,50 @@ app.post("/", async (c) => {
   }
 
   const auth = await requireUserOrApiKeyWithOrg(c);
+  const inferenceAuth = await resolveInferenceAuthContext(c.req.raw);
+  if (inferenceAuth.kind !== "authorized") {
+    if (inferenceAuth.kind === "suspended") {
+      return c.json(
+        { error: "account suspended", code: "account_suspended" },
+        403,
+      );
+    }
+    if (inferenceAuth.kind === "rejected") {
+      return c.json(
+        { error: "inference authorization rejected", code: "access_denied" },
+        inferenceAuth.status,
+      );
+    }
+    if (inferenceAuth.kind === "warming") {
+      return c.json(
+        {
+          error: "inference authorization is warming",
+          code: "authorization_warming",
+          retryable: true,
+        },
+        503,
+      );
+    }
+    return c.json(
+      {
+        error: "voice sessions require an API key or Steward session",
+        code: "authentication_required",
+      },
+      401,
+    );
+  }
+  if (
+    inferenceAuth.ctx.orgId !== auth.organization_id ||
+    inferenceAuth.ctx.userId !== auth.id
+  ) {
+    return c.json(
+      {
+        error: "inference authorization scope mismatch",
+        code: "access_denied",
+      },
+      403,
+    );
+  }
 
   let body: z.infer<typeof MintBody>;
   try {
@@ -141,6 +186,7 @@ app.post("/", async (c) => {
       userId: auth.id,
       agentId: sandboxAgent.id,
       conversationId: body.conversationId,
+      authorization: inferenceAuth.ctx.authorization,
     });
 
     // Persist sessionId->jti so a revoke landing on ANY worker can durably

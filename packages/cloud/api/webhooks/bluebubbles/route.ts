@@ -238,6 +238,7 @@ export async function handleBlueBubblesWebhookPayload(
       to: recipient,
       body,
       providerMessageId: data.guid ?? undefined,
+      executionCtx: c.executionCtx,
       metadata: {
         bluebubblesBridgeId: bridgeId,
         bluebubblesEventType: type,
@@ -252,6 +253,18 @@ export async function handleBlueBubblesWebhookPayload(
         phoneGatewayDeviceRegistered: gatewayDevice.registered,
       },
     });
+
+    if (routed.retryable) {
+      return c.json(
+        {
+          success: false,
+          handled: false,
+          reason: routed.reason,
+          retryable: true,
+        },
+        503,
+      );
+    }
 
     const replyText =
       routed.reason === "unknown_owner" && !hasPreferredNameSignal(body)

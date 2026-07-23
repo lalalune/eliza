@@ -24,11 +24,22 @@ const mintStewardTokenFromClaims = mock<
     _env: unknown,
     _claims: VerifiedStewardClaims,
     _ttlSeconds: number,
+    _options: { minimumIssuedAt?: number },
   ) => Promise<{ token: string; expiresAt: number; expiresIn: number } | null>
 >(async () => ({
   token: "fresh-steward-jwt",
   expiresAt: 1_800_000_000,
   expiresIn: 3600,
+}));
+const getByStewardIdForWrite = mock(async (_stewardUserId: string) => ({
+  id: "cloud-user-1",
+  organization_id: "org-1",
+  is_active: true,
+  inference_session_not_before: 0,
+  organization: {
+    id: "org-1",
+    is_active: true,
+  },
 }));
 
 mock.module("@/lib/auth/steward-client", () => ({
@@ -39,6 +50,10 @@ mock.module("@/lib/auth/steward-client", () => ({
 
 mock.module("@/lib/steward/sign", () => ({
   signStewardMutatingRequest: mock(async () => undefined),
+}));
+
+mock.module("@/lib/services/users", () => ({
+  usersService: { getByStewardIdForWrite },
 }));
 
 mock.module("@/lib/utils/logger", () => ({
@@ -78,6 +93,7 @@ describe("steward-refresh bearer rotation", () => {
   beforeEach(() => {
     verifyStewardTokenCached.mockClear();
     mintStewardTokenFromClaims.mockClear();
+    getByStewardIdForWrite.mockClear();
     verifyStewardTokenCached.mockResolvedValue({
       userId: "steward-user-1",
       email: "user@example.com",
@@ -89,6 +105,16 @@ describe("steward-refresh bearer rotation", () => {
       token: "fresh-steward-jwt",
       expiresAt: 1_800_000_000,
       expiresIn: 3600,
+    });
+    getByStewardIdForWrite.mockResolvedValue({
+      id: "cloud-user-1",
+      organization_id: "org-1",
+      is_active: true,
+      inference_session_not_before: 0,
+      organization: {
+        id: "org-1",
+        is_active: true,
+      },
     });
   });
 
@@ -112,6 +138,7 @@ describe("steward-refresh bearer rotation", () => {
       expect.objectContaining({ STEWARD_JWT_SECRET: "secret" }),
       expect.objectContaining({ userId: "steward-user-1" }),
       3600,
+      { minimumIssuedAt: 0 },
     );
   });
 
@@ -126,6 +153,55 @@ describe("steward-refresh bearer rotation", () => {
     await expect(response.json()).resolves.toEqual({
       error: "Invalid token",
       code: "invalid_token",
+    });
+    expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
+  });
+
+  test("rejects a bearer issued before the durable logout epoch", async () => {
+    const issuedAt = Math.floor(Date.now() / 1000) - 60;
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "steward-user-1",
+      email: "user@example.com",
+      tenantId: "elizacloud",
+      expiration: Math.floor(Date.now() / 1000) + 60,
+      issuedAt,
+    });
+    getByStewardIdForWrite.mockResolvedValue({
+      id: "cloud-user-1",
+      organization_id: "org-1",
+      is_active: true,
+      inference_session_not_before: issuedAt + 1,
+      organization: {
+        id: "org-1",
+        is_active: true,
+      },
+    });
+
+    const response = await post({
+      Authorization: "Bearer logged-out-steward-jwt",
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid token",
+      code: "invalid_token",
+    });
+    expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when authoritative bearer authorization is unavailable", async () => {
+    getByStewardIdForWrite.mockRejectedValueOnce(
+      new Error("primary unavailable"),
+    );
+
+    const response = await post({
+      Authorization: "Bearer near-expiry-steward-jwt",
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Session authorization unavailable",
+      code: "internal_error",
     });
     expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
   });

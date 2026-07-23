@@ -20,48 +20,82 @@ let getUser:
       id: string;
       is_active: boolean;
       organization_id: string;
-      organization: { is_active: boolean };
+      inference_auth_revision: number;
+      inference_session_not_before: number;
+      deleted_at: Date | null;
+      organization: {
+        id: string;
+        is_active: boolean;
+        inference_auth_revision: number;
+      };
     }>)
   | undefined;
 let userReads = 0;
 let moderationReads = 0;
 
+const actualStewardClient = await import("../auth/steward-client");
+const actualUsers = await import("./users");
+const actualAdmin = await import("./admin");
+const actualStewardSync = await import("../steward-sync");
+
 mock.module("../auth/steward-client", () => ({
+  ...actualStewardClient,
   verifyStewardTokenCached: async () => claims,
 }));
 
 mock.module("./users", () => ({
-  usersService: {
-    getByStewardId: async () => {
-      userReads++;
-      return await getUser?.();
+  ...actualUsers,
+  usersService: new Proxy(actualUsers.usersService, {
+    get(target, property, receiver) {
+      if (property !== "getByStewardIdForWrite") {
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async () => {
+        userReads++;
+        return await getUser?.();
+      };
     },
-  },
+  }),
 }));
 
 mock.module("./admin", () => ({
-  adminService: {
-    shouldBlockUser: async () => {
-      moderationReads++;
-      return false;
+  ...actualAdmin,
+  adminService: new Proxy(actualAdmin.adminService, {
+    get(target, property, receiver) {
+      if (property !== "shouldBlockUser") {
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async () => {
+        moderationReads++;
+        return false;
+      };
     },
-  },
+  }),
 }));
 
 mock.module("../steward-sync", () => ({
+  ...actualStewardSync,
   syncUserFromSteward: async () => undefined,
 }));
 
-const { __clearInferenceSessionAuthHydrations, resolveInferenceSessionAuthContext } = await import(
-  "./inference-session-auth-context"
-);
-const { invalidateInferenceSessionAuthContext, readInferenceSessionAuthDecision } = await import(
-  "./inference-auth-cache"
-);
+const {
+  __clearInferenceSessionAuthHydrations,
+  extractInferenceSessionCredential,
+  resolveInferenceSessionAuthContext,
+} = await import("./inference-session-auth-context");
+const {
+  hashInferenceSessionCredential,
+  invalidateInferenceSessionAuthContext,
+  readInferenceSessionAuthDecision,
+} = await import("./inference-auth-cache");
+
+const TOKEN = "header.payload.signature";
 
 function request(): Request {
   return new Request("https://api.example/api/v1/chat/completions", {
-    headers: { authorization: "Bearer header.payload.signature" },
+    headers: { authorization: `Bearer ${TOKEN}` },
   });
 }
 
@@ -79,9 +113,75 @@ beforeEach(async () => {
     id: "user-1",
     is_active: true,
     organization_id: "org-1",
-    organization: { is_active: true },
+    inference_auth_revision: 0,
+    inference_session_not_before: 0,
+    deleted_at: null,
+    organization: {
+      id: "org-1",
+      is_active: true,
+      inference_auth_revision: 0,
+    },
   });
-  await invalidateInferenceSessionAuthContext("steward-1");
+  await invalidateInferenceSessionAuthContext(hashInferenceSessionCredential(TOKEN));
+});
+
+describe("extractInferenceSessionCredential", () => {
+  test("JWT bearer takes precedence over the environment-owned cookie", () => {
+    const req = new Request("https://api.example/api/v1/chat/completions", {
+      headers: {
+        authorization: "Bearer bearer.payload.signature",
+        cookie: "steward-token=cookie.payload.signature",
+      },
+    });
+
+    expect(
+      extractInferenceSessionCredential(req, {
+        environment: "production",
+        environmentOwnedCookieOnly: true,
+      }),
+    ).toBe("bearer.payload.signature");
+  });
+
+  test("eliza API-key bearer does not fall through to a Steward cookie", () => {
+    const req = new Request("https://api.example/api/v1/chat/completions", {
+      headers: {
+        authorization: "Bearer eliza_test-api-key",
+        cookie: "steward-token=cookie.payload.signature",
+      },
+    });
+
+    expect(
+      extractInferenceSessionCredential(req, {
+        environment: "production",
+        environmentOwnedCookieOnly: true,
+      }),
+    ).toBeNull();
+  });
+
+  test("mutation mode rejects another environment's legacy cookie", () => {
+    const legacyOnly = new Request("https://api.example/api/v1/chat/completions", {
+      headers: { cookie: "steward-token=production.payload.signature" },
+    });
+    const stagingOwned = new Request("https://api.example/api/v1/chat/completions", {
+      headers: {
+        cookie:
+          "steward-token=production.payload.signature; steward-token-staging=staging.payload.signature",
+      },
+    });
+
+    expect(
+      extractInferenceSessionCredential(legacyOnly, {
+        environment: "staging",
+        environmentOwnedCookieOnly: true,
+      }),
+    ).toBeNull();
+    expect(
+      extractInferenceSessionCredential(stagingOwned, {
+        environment: "staging",
+        environmentOwnedCookieOnly: true,
+      }),
+    ).toBe("staging.payload.signature");
+  });
 });
 
 describe("resolveInferenceSessionAuthContext", () => {
@@ -94,7 +194,14 @@ describe("resolveInferenceSessionAuthContext", () => {
             id: "user-1",
             is_active: true,
             organization_id: "org-1",
-            organization: { is_active: true },
+            inference_auth_revision: 0,
+            inference_session_not_before: 0,
+            deleted_at: null,
+            organization: {
+              id: "org-1",
+              is_active: true,
+              inference_auth_revision: 0,
+            },
           });
       });
     const waited: Promise<unknown>[] = [];
@@ -153,7 +260,14 @@ describe("resolveInferenceSessionAuthContext", () => {
         id: "user-1",
         is_active: true,
         organization_id: "org-1",
-        organization: { is_active: true },
+        inference_auth_revision: 0,
+        inference_session_not_before: 0,
+        deleted_at: null,
+        organization: {
+          id: "org-1",
+          is_active: true,
+          inference_auth_revision: 0,
+        },
       };
     };
     const firstWaited: Promise<unknown>[] = [];
@@ -198,7 +312,9 @@ describe("resolveInferenceSessionAuthContext", () => {
     // The authoritative decision must NOT have been persisted: the real cache
     // stays cold for the subject, so nothing exists for a later flag flip to
     // trust and a cache-gated resolution still has to hydrate from origin.
-    await expect(readInferenceSessionAuthDecision("steward-1")).resolves.toBeNull();
+    await expect(
+      readInferenceSessionAuthDecision(hashInferenceSessionCredential(TOKEN)),
+    ).resolves.toBeNull();
   });
 
   test("flag-on origin resolution persists the decision (write stays gated, not removed)", async () => {
@@ -208,7 +324,9 @@ describe("resolveInferenceSessionAuthContext", () => {
     });
 
     expect(result).toMatchObject({ kind: "authorized", source: "origin" });
-    await expect(readInferenceSessionAuthDecision("steward-1")).resolves.toMatchObject({
+    await expect(
+      readInferenceSessionAuthDecision(hashInferenceSessionCredential(TOKEN)),
+    ).resolves.toMatchObject({
       userId: "user-1",
       orgId: "org-1",
       stewardUserId: "steward-1",
@@ -227,5 +345,40 @@ describe("resolveInferenceSessionAuthContext", () => {
     ).resolves.toEqual({ kind: "rejected", status: 401 });
     expect(userReads).toBe(0);
     expect(moderationReads).toBe(0);
+  });
+
+  test("does not republish a JWT issued before the user's revocation boundary", async () => {
+    if (!claims) throw new Error("test claims are missing");
+    const issuedAt = claims.issuedAt;
+    getUser = async () => ({
+      id: "user-1",
+      is_active: true,
+      organization_id: "org-1",
+      inference_auth_revision: 0,
+      inference_session_not_before: issuedAt + 1,
+      deleted_at: null,
+      organization: {
+        id: "org-1",
+        is_active: true,
+        inference_auth_revision: 0,
+      },
+    });
+    const waited: Promise<unknown>[] = [];
+
+    expect(
+      await resolveInferenceSessionAuthContext(request(), {
+        cacheOnly: true,
+        useAuthCache: true,
+        executionCtx: { waitUntil: (promise) => waited.push(promise) },
+      }),
+    ).toEqual({ kind: "warming" });
+    await Promise.all(waited);
+
+    await expect(
+      resolveInferenceSessionAuthContext(request(), {
+        cacheOnly: true,
+        useAuthCache: true,
+      }),
+    ).resolves.toEqual({ kind: "rejected", status: 401 });
   });
 });

@@ -34,7 +34,11 @@ app.post("/", async (c) => {
       messageId: body.messageId,
       content: body.content,
       sender: body.sender,
+      executionCtx: c.executionCtx,
     });
+    if (result.retryable) {
+      return c.json(result, 503);
+    }
     return c.json(result);
   } catch (err) {
     logger.error("[internal/discord/eliza-app/messages]", { error: err });

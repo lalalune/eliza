@@ -12,15 +12,18 @@ import { calculateCreditMarkup } from "@elizaos/cloud-shared/billing";
 import { streamText } from "ai";
 import { Hono } from "hono";
 import { z } from "zod";
-import { requireUserOrApiKeyWithOrg } from "@/lib/auth/workers-hono-auth";
 import { CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS } from "@/lib/cors-constants";
+import {
+  enforceOrgRateLimit,
+  OrgRateLimitCacheNotReadyError,
+} from "@/lib/middleware/rate-limit";
 import {
   RateLimitPresets,
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import {
   calculateCost,
-  estimateRequestCost,
+  estimateTokens,
   getProviderFromModel,
 } from "@/lib/pricing";
 import {
@@ -29,15 +32,26 @@ import {
   parseThinkingBudgetFromCharacterSettings,
   resolveAnthropicThinkingBudgetTokens,
 } from "@/lib/providers/anthropic-thinking";
-import { getLanguageModel } from "@/lib/providers/language-model";
-import { agentMonetizationService } from "@/lib/services/agent-monetization";
-import { charactersService } from "@/lib/services/characters/characters";
-import type { CreditReservation } from "@/lib/services/credits";
 import {
-  creditsService,
-  InsufficientCreditsError,
-} from "@/lib/services/credits";
+  getLanguageModel,
+  isProviderConfigurationError,
+  resolveAiProviderSource,
+} from "@/lib/providers/language-model";
+import {
+  AGENT_INFERENCE_RECOVERY_METADATA_KEY,
+  agentInferenceChargeMultiplier,
+  createAgentInferenceRecoveryPolicy,
+  parseAgentMonetizationNumber,
+  recordAgentInferenceCreatorEarnings,
+} from "@/lib/services/agent-monetization";
+import { charactersService } from "@/lib/services/characters/characters";
+import { InsufficientCreditsError } from "@/lib/services/credits";
+import { resolveInferenceAuthContext } from "@/lib/services/inference-auth-context";
+import { InferenceBalanceCacheWarmingError } from "@/lib/services/inference-billing-fast-path";
+import { isKnownUnacceptedProviderError } from "@/lib/services/inference-provider-outcome";
+import { admitOrganizationInference } from "@/lib/services/organization-inference-admission";
 import { logger } from "@/lib/utils/logger";
+import { settleOffResponsePath } from "@/lib/utils/settle-off-response-path";
 import type { AppContext, AppEnv } from "@/types/cloud-worker-env";
 
 const DEFAULT_MIN_OUTPUT_TOKENS = 4096;
@@ -139,33 +153,24 @@ app.get("/", rateLimit(RateLimitPresets.STANDARD), async (c) => {
   });
 });
 
-app.post("/", rateLimit(RateLimitPresets.STANDARD), async (c) => {
+app.post("/", async (c) => {
   const id = c.req.param("id");
   if (!id) return c.json({ error: "Missing id" }, 400);
 
-  const character = await charactersService.getById(id);
-  if (!character) {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    // error-policy:J3 malformed JSON is an explicit JSON-RPC parse failure.
     return c.json(
       {
         jsonrpc: "2.0",
-        error: { code: -32001, message: "Agent not found" },
+        error: { code: -32700, message: "Parse error" },
         id: null,
       },
-      404,
+      400,
     );
   }
-  if (!character.is_public || !character.mcp_enabled) {
-    return c.json(
-      {
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "MCP not accessible" },
-        id: null,
-      },
-      403,
-    );
-  }
-
-  const body = await c.req.json();
   const validation = MCPRequestSchema.safeParse(body);
   if (!validation.success) {
     return c.json(
@@ -180,19 +185,124 @@ app.post("/", rateLimit(RateLimitPresets.STANDARD), async (c) => {
 
   const { method, params, id: rpcId } = validation.data;
 
-  let user: Awaited<ReturnType<typeof requireUserOrApiKeyWithOrg>>;
+  let executionCtx: { waitUntil(promise: Promise<unknown>): void };
   try {
-    user = await requireUserOrApiKeyWithOrg(c);
+    executionCtx = c.executionCtx;
   } catch {
-    // error-policy:J1 the public JSON-RPC boundary translates authentication
-    // failures without exposing session or API-key internals.
     return c.json(
       {
         jsonrpc: "2.0",
-        error: { code: -32002, message: "Authentication required" },
+        error: {
+          code: -32005,
+          message: "Authorization cache is warming. Retry shortly.",
+        },
         id: rpcId,
       },
-      401,
+      503,
+    );
+  }
+
+  const auth = await resolveInferenceAuthContext(c.req.raw, {
+    executionCtx,
+    cacheOnly: true,
+    traceId: c.get("traceId"),
+  });
+  if (auth.kind !== "authorized") {
+    const status =
+      auth.kind === "suspended" ||
+      (auth.kind === "rejected" && auth.status === 403)
+        ? 403
+        : auth.kind === "warming"
+          ? 503
+          : 401;
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: {
+          code: status === 503 ? -32005 : -32002,
+          message:
+            status === 503
+              ? "Authorization cache is warming. Retry shortly."
+              : status === 403
+                ? "Account access is disabled"
+                : "Authentication required",
+        },
+        id: rpcId,
+      },
+      status,
+    );
+  }
+
+  let rateLimited: Response | null;
+  try {
+    rateLimited = await enforceOrgRateLimit(auth.ctx.orgId, "standard", {
+      cacheOnly: true,
+      executionCtx,
+    });
+  } catch (error) {
+    if (error instanceof OrgRateLimitCacheNotReadyError) {
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32005,
+            message:
+              "Rate-limit authorization cache is warming. Retry shortly.",
+          },
+          id: rpcId,
+        },
+        503,
+        { "Retry-After": "1" },
+      );
+    }
+    throw error;
+  }
+  if (rateLimited) {
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: {
+          code: rateLimited.status === 429 ? -32004 : -32005,
+          message:
+            rateLimited.status === 429
+              ? "Organization rate limit exceeded"
+              : "Rate-limit authorization is unavailable. Retry shortly.",
+        },
+        id: rpcId,
+      },
+      rateLimited.status === 429 ? 429 : 503,
+      rateLimited.status === 429
+        ? { "Retry-After": rateLimited.headers.get("Retry-After") ?? "60" }
+        : { "Retry-After": "1" },
+    );
+  }
+
+  const characterResolution = await charactersService.getByIdCacheOnly(id, {
+    executionCtx,
+  });
+  if (characterResolution.kind !== "ready") {
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: {
+          code: -32005,
+          message: "Agent authorization cache is warming. Retry shortly.",
+        },
+        id: rpcId,
+      },
+      503,
+      { "Retry-After": "1" },
+    );
+  }
+  const character = characterResolution.character;
+  if (!character.is_public || !character.mcp_enabled) {
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "MCP not accessible" },
+        id: rpcId,
+      },
+      403,
     );
   }
 
@@ -236,7 +346,13 @@ app.post("/", rateLimit(RateLimitPresets.STANDARD), async (c) => {
       });
 
     case "tools/call":
-      return handleToolCall(c, character, params ?? {}, rpcId, user);
+      return handleToolCall(c, character, params ?? {}, rpcId, {
+        id: auth.ctx.userId,
+        organization_id: auth.ctx.orgId,
+        apiKeyId: auth.ctx.apiKeyId,
+        authorization: auth.ctx.authorization,
+        executionCtx,
+      });
 
     case "ping":
       return c.json({ jsonrpc: "2.0", result: {}, id: rpcId });
@@ -268,7 +384,18 @@ export async function handleToolCall(
   },
   params: Record<string, unknown>,
   rpcId: string | number,
-  authUser: { id: string; organization_id: string },
+  authUser: {
+    id: string;
+    organization_id: string;
+    apiKeyId: string | null;
+    authorization: NonNullable<
+      Extract<
+        Awaited<ReturnType<typeof resolveInferenceAuthContext>>,
+        { kind: "authorized" }
+      >["ctx"]["authorization"]
+    >;
+    executionCtx: { waitUntil(promise: Promise<unknown>): void };
+  },
 ): Promise<Response> {
   const parsedParams = ToolCallParamsSchema.safeParse(params);
   if (!parsedParams.success) {
@@ -331,7 +458,15 @@ export async function handleToolCall(
     ];
 
     const provider = getProviderFromModel(model);
-    const markupPct = Number(character.inference_markup_percentage || 0);
+    const billingSource = resolveAiProviderSource(model) ?? "gateway";
+    const markupPct =
+      character.monetization_enabled &&
+      character.inference_markup_percentage != null
+        ? parseAgentMonetizationNumber(
+            character.inference_markup_percentage,
+            "inference_markup_percentage",
+          )
+        : 0;
     const envForThinking = getAnthropicCotEnv(c.env);
     const agentThinkingBudget = parseThinkingBudgetFromCharacterSettings(
       character.settings,
@@ -342,31 +477,72 @@ export async function handleToolCall(
       agentThinkingBudget,
     );
     const baseOutputTokens = DEFAULT_MIN_OUTPUT_TOKENS;
-    const estimatedOutputTokens =
+    const providerOutputTokens =
       effectiveThinkingBudget != null
         ? baseOutputTokens + effectiveThinkingBudget
         : baseOutputTokens;
-    const estimatedBaseCost = await estimateRequestCost(
-      model,
-      messages,
-      estimatedOutputTokens,
-    );
-    const { totalCredits: estimatedTotalCost } = calculateCreditMarkup({
-      baseCredits: estimatedBaseCost,
-      markupPercent: character.monetization_enabled ? markupPct : 0,
+    const creatorPolicy = createAgentInferenceRecoveryPolicy({
+      agentId: character.id,
+      agentName: character.name,
+      ownerId: character.user_id,
+      markupPercent: markupPct,
+      protocol: "mcp",
     });
+    const chargeMultiplier = agentInferenceChargeMultiplier(creatorPolicy);
+    const estimatedInputTokens = Math.max(
+      1,
+      Math.ceil(
+        estimateTokens(messages.map((entry) => entry.content).join(" ")) *
+          chargeMultiplier,
+      ),
+    );
+    const estimatedOutputTokens = Math.ceil(
+      providerOutputTokens * chargeMultiplier,
+    );
+    const requestId = crypto.randomUUID();
+    let providerUsage: z.infer<typeof ProviderUsageSchema> | null = null;
+    let admission: Awaited<ReturnType<typeof admitOrganizationInference>>;
 
-    let reservation: CreditReservation;
     try {
-      reservation = await creditsService.reserve({
-        organizationId: authUser.organization_id,
-        amount: estimatedTotalCost,
-        userId: authUser.id,
-        description: `Agent MCP: ${character.name} (${model})`,
+      admission = await admitOrganizationInference({
+        context: {
+          organizationId: authUser.organization_id,
+          userId: authUser.id,
+          apiKeyId: authUser.apiKeyId,
+          model,
+          provider,
+          billingSource,
+          requestId,
+          description: `Agent MCP: ${character.name} (${model})`,
+          metadata: {
+            [AGENT_INFERENCE_RECOVERY_METADATA_KEY]: creatorPolicy,
+            protocol: "mcp",
+            agentId: character.id,
+          },
+        },
+        apiKeyId: authUser.apiKeyId,
+        estimatedInputTokens,
+        estimatedOutputTokens,
+        authorization: authUser.authorization,
+        executionCtx: authUser.executionCtx,
+        afterDebitBeforeLeaseRelease: async (actualTotal, reconciliation) => {
+          if (
+            actualTotal <= 0 ||
+            reconciliation?.adjustmentType === "uncollected_overage"
+          ) {
+            return;
+          }
+          await recordAgentInferenceCreatorEarnings({
+            policy: creatorPolicy,
+            requestId,
+            totalCostUsd: actualTotal,
+            consumerOrgId: authUser.organization_id,
+            model,
+            tokens: providerUsage?.totalTokens,
+          });
+        },
       });
     } catch (error) {
-      // error-policy:J1 the route boundary translates the expected credit
-      // refusal and lets unexpected reservation failures reach the owner path.
       if (error instanceof InsufficientCreditsError) {
         return c.json({
           jsonrpc: "2.0",
@@ -377,24 +553,71 @@ export async function handleToolCall(
           id: rpcId,
         });
       }
+      if (error instanceof InferenceBalanceCacheWarmingError) {
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            error: {
+              code: -32005,
+              message: "Billing authorization cache is warming. Retry shortly.",
+            },
+            id: rpcId,
+          },
+          503,
+          { "Retry-After": "1" },
+        );
+      }
       throw error;
     }
 
+    const settle = (
+      kind: "zero" | "unknown" | "actual",
+      actualTotal?: number,
+    ): void => {
+      void settleOffResponsePath(authUser.executionCtx, async () => {
+        try {
+          const reconciliation =
+            kind === "zero"
+              ? await admission.settle(0)
+              : kind === "actual" && actualTotal !== undefined
+                ? await admission.settle(actualTotal)
+                : await admission.settleUnknown();
+          if (reconciliation?.adjustmentType === "uncollected_overage") {
+            logger.error("[Agent MCP] Final usage overage was not collected", {
+              agentId: character.id,
+              ownerId: character.user_id,
+              consumerOrgId: authUser.organization_id,
+              reserved: reconciliation.reservedAmount,
+              actual: reconciliation.actualCost,
+            });
+          }
+        } catch (error) {
+          // error-policy:J7 the DO alarm replays this pinned charge while the
+          // post-provider accounting failure remains visible to operators.
+          logger.error("[Agent MCP] Deferred settlement failed", {
+            agentId: character.id,
+            requestId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    };
+
+    let providerDispatchStarted = false;
     try {
       logger.info("[Agent MCP] Invoking configured provider", {
         agentId: character.id,
         model,
-        maxOutputTokens: estimatedOutputTokens,
+        maxOutputTokens: providerOutputTokens,
         thinkingBudgetTokens: effectiveThinkingBudget,
       });
+      const languageModel = getLanguageModel(model);
+      await admission.markProviderDispatched();
+      providerDispatchStarted = true;
       const result = await streamText({
-        model: getLanguageModel(model),
+        model: languageModel,
         messages,
-        // Cap the provider at the EXACT ceiling billing reserved above
-        // (`estimatedOutputTokens`), not a second, larger formula (#16148).
-        // Always sent — including the no-thinking 4096 floor — so final usage
-        // cannot outrun the admitted reservation.
-        maxOutputTokens: estimatedOutputTokens,
+        maxOutputTokens: providerOutputTokens,
         ...mergeAnthropicCotProviderOptions(
           model,
           envForThinking,
@@ -412,12 +635,15 @@ export async function handleToolCall(
       }
 
       const usage = ProviderUsageSchema.parse(await result.usage);
+      providerUsage = usage;
 
       const { totalCost: actualBaseCost } = await calculateCost(
         model,
         provider,
         usage.inputTokens,
         usage.outputTokens,
+        billingSource,
+        { cacheOnly: true, executionCtx: authUser.executionCtx },
       );
       const { markupCredits: actualCreatorMarkup, totalCredits: actualTotal } =
         calculateCreditMarkup({
@@ -425,80 +651,14 @@ export async function handleToolCall(
           markupPercent: character.monetization_enabled ? markupPct : 0,
         });
 
-      const reconciliation = await reservation.reconcile(actualTotal);
-      if (reconciliation?.adjustmentType === "uncollected_overage") {
-        logger.error("[Agent MCP] Final usage overage was not collected", {
-          agentId: character.id,
-          ownerId: character.user_id,
-          consumerOrgId: authUser.organization_id,
-          reserved: reconciliation.reservedAmount,
-          actual: reconciliation.actualCost,
-        });
-        return c.json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32003,
-            message: "Insufficient credits for final usage cost",
-          },
-          id: rpcId,
-        });
-      }
-
-      let creatorEarningsWarning:
-        | { code: "CREATOR_EARNINGS_UNAVAILABLE"; message: string }
-        | undefined;
-      if (character.monetization_enabled && actualCreatorMarkup > 0) {
-        // Settlement is non-idempotent: a secondary accounting failure cannot
-        // reach the outer refund boundary after reconcile(actualTotal), because
-        // reconcile(0) would issue a second adjustment. The warning below keeps
-        // that degraded outcome visible without corrupting consumer billing.
-        try {
-          await agentMonetizationService.recordCreatorEarnings({
-            agentId: character.id,
-            agentName: character.name,
-            ownerId: character.user_id,
-            earnings: actualCreatorMarkup,
-            consumerOrgId: authUser.organization_id,
-            model,
-            tokens: usage.totalTokens,
-            protocol: "mcp",
-          });
-          logger.info(
-            "[Agent MCP] Creator earnings credited to redeemable balance",
-            {
-              agentId: character.id,
-              ownerId: character.user_id,
-              earnings: actualCreatorMarkup,
-            },
-          );
-        } catch (earningsError) {
-          // error-policy:J4 inference is already purchased and settled, so the
-          // response degrades explicitly with a machine-readable warning while
-          // the structured error log raises the accounting failure to operators.
-          logger.error(
-            "[Agent MCP] Failed to record creator earnings (settlement already applied — not rolling back)",
-            {
-              agentId: character.id,
-              ownerId: character.user_id,
-              error:
-                earningsError instanceof Error
-                  ? earningsError.message
-                  : String(earningsError),
-            },
-          );
-          creatorEarningsWarning = {
-            code: "CREATOR_EARNINGS_UNAVAILABLE",
-            message: "Creator earnings could not be recorded",
-          };
-        }
-      }
+      settle("actual", actualTotal);
 
       return c.json({
         jsonrpc: "2.0",
         result: {
           content: [{ type: "text", text: fullText }],
           _meta: {
-            admittedOutputTokens: estimatedOutputTokens,
+            admittedOutputTokens: providerOutputTokens,
             cost: {
               base: actualBaseCost,
               markup: actualCreatorMarkup,
@@ -508,17 +668,20 @@ export async function handleToolCall(
               inputTokens: usage.inputTokens,
               outputTokens: usage.outputTokens,
             },
-            ...(creatorEarningsWarning
-              ? { warnings: [creatorEarningsWarning] }
-              : {}),
           },
         },
         id: rpcId,
       });
     } catch (error) {
-      // error-policy:J1 the JSON-RPC boundary refunds a failed generation and
-      // returns a structured failure instead of partial model output.
-      await reservation.reconcile(0);
+      if (
+        !providerDispatchStarted ||
+        isProviderConfigurationError(error) ||
+        isKnownUnacceptedProviderError(error)
+      ) {
+        settle("zero");
+      } else {
+        settle("unknown");
+      }
       logger.error("[Agent MCP] Error generating response", {
         error: error instanceof Error ? error.message : "Unknown error",
         agentId: character.id,

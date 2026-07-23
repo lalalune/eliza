@@ -2,6 +2,8 @@
  * Users service for managing user accounts and organization relationships.
  */
 
+import { eq, sql } from "drizzle-orm";
+import { dbWrite } from "../../db/client";
 import {
   apiKeysRepository,
   type NewUser,
@@ -11,13 +13,16 @@ import {
   usersRepository,
 } from "../../db/repositories";
 import { retryOnTransientDbError } from "../../db/retry-transient";
+import { users } from "../../db/schemas/users";
 import { cache } from "../cache/client";
 import { CacheKeys, CacheTTL } from "../cache/keys";
 import { logger } from "../utils/logger";
+import { invalidateInferenceAuthContextsByKeyHashes } from "./inference-auth-cache";
+import { applyInferenceAuthorizationState } from "./inference-authorization-boundary";
 import {
-  invalidateInferenceAuthContextsByKeyHashes,
-  invalidateInferenceSessionAuthContexts,
-} from "./inference-auth-cache";
+  stewardSessionAuthorizationState,
+  userAuthorizationState,
+} from "./inference-authorization-lifecycle";
 
 function getErrorDetails(error: unknown): Record<string, unknown> {
   if (!(error instanceof Error)) {
@@ -53,6 +58,52 @@ function generatePersonalOrgSlug(user: User): string {
  * Service for user operations including organization lookups.
  */
 export class UsersService {
+  /**
+   * Move the earliest accepted Steward JWT issue time beyond every token
+   * minted so far. The Durable Object transition happens before the database
+   * commit, so a rollback can only leave inference more restrictive.
+   */
+  async revokeInferenceSessions(userId: string, credentialIssuedAt?: number): Promise<User> {
+    if (
+      credentialIssuedAt !== undefined &&
+      (!Number.isSafeInteger(credentialIssuedAt) ||
+        credentialIssuedAt < 0 ||
+        credentialIssuedAt >= Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new Error("Steward credential issue time is invalid");
+    }
+    const credentialNotBefore = credentialIssuedAt === undefined ? 0 : credentialIssuedAt + 1;
+    const updated = await dbWrite.transaction(async (tx) => {
+      const [locked] = await tx.select().from(users).where(eq(users.id, userId)).for("update");
+      if (!locked?.organization_id) {
+        throw new Error(`User ${userId} has no inference authorization identity`);
+      }
+      const nextNotBefore = Math.max(
+        locked.inference_session_not_before,
+        Math.floor(Date.now() / 1_000) + 1,
+        credentialNotBefore,
+      );
+      const [revisioned] = await tx
+        .update(users)
+        .set({
+          inference_session_not_before: nextNotBefore,
+          updated_at: new Date(),
+        })
+        .where(eq(users.id, userId))
+        .returning();
+      if (!revisioned) {
+        throw new Error(`User ${userId} disappeared during session revocation`);
+      }
+      await applyInferenceAuthorizationState(
+        locked.organization_id,
+        stewardSessionAuthorizationState(revisioned),
+      );
+      return revisioned;
+    });
+    await this.invalidateCache(updated);
+    return updated;
+  }
+
   async invalidateCache(user: User | UserWithOrganization): Promise<void> {
     const promises: Promise<void>[] = [
       cache.del(CacheKeys.user.byId(user.id)),
@@ -66,7 +117,6 @@ export class UsersService {
     if (typeof stewardUserId === "string") {
       promises.push(cache.del(CacheKeys.user.byStewardId(stewardUserId)));
       promises.push(cache.del(CacheKeys.user.byStewardIdWithOrg(stewardUserId)));
-      promises.push(invalidateInferenceSessionAuthContexts([stewardUserId]));
     }
     const walletAddress = user.wallet_address;
     if (typeof walletAddress === "string") {
@@ -253,11 +303,9 @@ export class UsersService {
 
   /**
    * Inference hot path (#9981 review gap): drop every cached IAC identity for a
-   * user's API keys so a deactivated/deleted user stops fast-pathing inference
-   * immediately rather than authorizing until the authContext TTL expires. The
-   * slow path enforces `user.is_active`, but the IAC cache short-circuits it.
-   * Best-effort: a cache failure must never break the lifecycle write. Mirrors
-   * the ban/suspend wiring already in admin.ts (reuses listByUser, no new reader).
+   * user's API keys after the strongly ordered lifecycle transition. This is
+   * retry hygiene: the admission object rejects stale grants even if replicated
+   * cache deletion fails. Mirrors the ban/suspend wiring already in admin.ts.
    */
   private async invalidateInferenceAuthForUser(userId: string): Promise<void> {
     try {
@@ -274,16 +322,71 @@ export class UsersService {
   }
 
   async update(id: string, data: Partial<NewUser>): Promise<User | undefined> {
-    const existing = await usersRepository.findById(id);
-    const result = await usersRepository.update(id, data);
+    const changesAuthorization =
+      Object.hasOwn(data, "is_active") ||
+      Object.hasOwn(data, "organization_id") ||
+      Object.hasOwn(data, "deleted_at") ||
+      Object.hasOwn(data, "steward_user_id");
+    let existing: User | undefined;
+    let result: User | undefined;
+    let authorizationAppliedBeforeCommit = false;
+    let movedOrganization = false;
+    if (!changesAuthorization) {
+      existing = await usersRepository.findById(id);
+      result = await usersRepository.update(id, data);
+    } else {
+      const transition = await dbWrite.transaction(async (tx) => {
+        const [locked] = await tx.select().from(users).where(eq(users.id, id)).for("update");
+        if (!locked) {
+          return {
+            existing: undefined,
+            updated: undefined,
+            authorizationApplied: false,
+            moved: false,
+          };
+        }
+        const [updated] = await tx
+          .update(users)
+          .set({
+            ...data,
+            inference_auth_revision: sql`${users.inference_auth_revision} + 1`,
+            updated_at: new Date(),
+          })
+          .where(eq(users.id, id))
+          .returning();
+        if (!updated) {
+          throw new Error(`User ${id} disappeared during update`);
+        }
+        const moved = locked.organization_id !== updated.organization_id;
+        const denied = !updated.is_active || updated.deleted_at !== null;
+        const identityChanged = locked.steward_user_id !== updated.steward_user_id;
+        const authorizationApplied = moved || denied || identityChanged;
+        if (authorizationApplied && locked.organization_id) {
+          await applyInferenceAuthorizationState(
+            locked.organization_id,
+            userAuthorizationState(updated, moved || denied),
+          );
+        }
+        return { existing: locked, updated, authorizationApplied, moved };
+      });
+      existing = transition.existing;
+      result = transition.updated;
+      authorizationAppliedBeforeCommit = transition.authorizationApplied;
+      movedOrganization = transition.moved;
+      if (result?.organization_id && (!authorizationAppliedBeforeCommit || movedOrganization)) {
+        await applyInferenceAuthorizationState(
+          result.organization_id,
+          userAuthorizationState(result),
+        );
+      }
+    }
     if (existing) {
       await this.invalidateCache(existing);
     }
     if (result) {
       await this.invalidateCache(result);
     }
-    // Deactivation: when is_active flips to false, evict the user's warm IAC
-    // entries so the now-inactive account can no longer fast-path inference.
+    // Eviction keeps later requests from carrying a stale proof to the boundary.
     if (data.is_active === false) {
       await this.invalidateInferenceAuthForUser(id);
     }
@@ -292,8 +395,15 @@ export class UsersService {
 
   async upsertStewardIdentity(userId: string, stewardUserId: string): Promise<void> {
     const existingIdentity = await usersRepository.findIdentityByUserIdForWrite(userId);
+    const existingUser = await usersRepository.findWithOrganizationForWrite(userId);
+    if (!existingUser) {
+      throw new Error(`User ${userId} not found while upserting Steward identity`);
+    }
 
-    if (existingIdentity?.steward_user_id === stewardUserId) {
+    if (
+      existingIdentity?.steward_user_id === stewardUserId &&
+      existingUser.steward_user_id === stewardUserId
+    ) {
       await Promise.all([
         cache.del(CacheKeys.user.byStewardId(stewardUserId)),
         cache.del(CacheKeys.user.byStewardIdWithOrg(stewardUserId)),
@@ -301,19 +411,23 @@ export class UsersService {
       return;
     }
 
+    if (existingUser.steward_user_id !== stewardUserId) {
+      const updated = await this.update(userId, { steward_user_id: stewardUserId });
+      if (!updated) {
+        throw new Error(`User ${userId} disappeared while upserting Steward identity`);
+      }
+    }
     await usersRepository.upsertStewardIdentity(userId, stewardUserId);
 
     const cacheDeletes = [
       cache.del(CacheKeys.user.byStewardId(stewardUserId)),
       cache.del(CacheKeys.user.byStewardIdWithOrg(stewardUserId)),
-      invalidateInferenceSessionAuthContexts([stewardUserId]),
     ];
 
     if (existingIdentity?.steward_user_id && existingIdentity.steward_user_id !== stewardUserId) {
       cacheDeletes.push(
         cache.del(CacheKeys.user.byStewardId(existingIdentity.steward_user_id)),
         cache.del(CacheKeys.user.byStewardIdWithOrg(existingIdentity.steward_user_id)),
-        invalidateInferenceSessionAuthContexts([existingIdentity.steward_user_id]),
       );
     }
 
@@ -322,7 +436,11 @@ export class UsersService {
 
   async linkStewardId(userId: string, stewardUserId: string): Promise<void> {
     const existing = await usersRepository.findById(userId);
-    const updated = await usersRepository.linkStewardId(userId, stewardUserId);
+    const updated = await this.update(userId, { steward_user_id: stewardUserId });
+    if (!updated) {
+      throw new Error(`User ${userId} not found while linking Steward identity`);
+    }
+    await usersRepository.upsertStewardIdentity(userId, stewardUserId);
 
     if (existing) {
       await this.invalidateCache(existing);
@@ -371,7 +489,7 @@ export class UsersService {
 
     let updated: User | undefined;
     try {
-      updated = await usersRepository.update(id, {
+      updated = await this.update(id, {
         organization_id: organization.id,
         role: "owner",
       });
@@ -381,7 +499,8 @@ export class UsersService {
     } catch (error) {
       // Don't strand an empty org when the move fails.
       try {
-        await organizationsRepository.delete(organization.id);
+        const { organizationsService } = await import("./organizations");
+        await organizationsService.delete(organization.id);
       } catch (rollbackError) {
         // error-policy:J6 best-effort rollback of the just-created empty org; log and
         // fall through to rethrow the original move failure (never masks it).
@@ -395,13 +514,13 @@ export class UsersService {
     }
 
     if (user.organization_id) {
-      await apiKeysRepository.deactivateByUserAndOrganization(id, user.organization_id);
+      const { apiKeysService } = await import("./api-keys");
+      await apiKeysService.deactivateByUserAndOrganization(id, user.organization_id);
     }
 
     await this.invalidateCache(user);
     await this.invalidateCache(updated);
-    // The revoked keys may still be warm in the inference-auth cache under the
-    // old org's identity — evict them so they stop fast-pathing immediately.
+    // Evict projections for the revoked old-organization credentials.
     await this.invalidateInferenceAuthForUser(id);
 
     return updated;
@@ -414,14 +533,38 @@ export class UsersService {
       throw new Error(`User ${id} not found`);
     }
 
-    const organizationId = user.organization_id;
-
     await this.invalidateCache(user);
     // Resolve + evict the user's cached IAC identities BEFORE the row is deleted:
     // at delete time the user is still active, so an is_active gate can't fire and
     // the key_hash set must be read while the keys still exist.
     await this.invalidateInferenceAuthForUser(id);
-    await usersRepository.delete(id);
+    const organizationId = await dbWrite.transaction(async (tx) => {
+      const [locked] = await tx.select().from(users).where(eq(users.id, id)).for("update");
+      if (!locked) {
+        throw new Error(`User ${id} not found`);
+      }
+      const [restricted] = await tx
+        .update(users)
+        .set({
+          is_active: false,
+          deleted_at: new Date(),
+          inference_auth_revision: sql`${users.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(eq(users.id, id))
+        .returning();
+      if (!restricted) {
+        throw new Error(`User ${id} disappeared during deletion`);
+      }
+      if (restricted.organization_id) {
+        await applyInferenceAuthorizationState(
+          restricted.organization_id,
+          userAuthorizationState(restricted, true),
+        );
+      }
+      await tx.delete(users).where(eq(users.id, id));
+      return locked.organization_id;
+    });
 
     // Check if this was the last user in the organization
     if (organizationId) {
@@ -429,7 +572,8 @@ export class UsersService {
 
       // If no users remain, delete the organization
       if (remainingUsers.length === 0) {
-        await organizationsRepository.delete(organizationId);
+        const { organizationsService } = await import("./organizations");
+        await organizationsService.delete(organizationId);
       }
     }
   }

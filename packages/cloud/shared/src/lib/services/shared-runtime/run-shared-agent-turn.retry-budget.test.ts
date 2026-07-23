@@ -58,6 +58,7 @@ function clampExpectation(raw: string | undefined): number {
 }
 
 const originalFetch = globalThis.fetch;
+const PROVIDER_DISPATCH = async () => undefined;
 
 beforeEach(() => {
   providerConfigured = true;
@@ -87,6 +88,7 @@ describe("shared-runtime turn retry budget", () => {
       character: { name: "Nova", system: "You are Nova.", model: "gpt-oss-120b" },
       history: [],
       message: "hello",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
     expect(lastGenerateOptions).not.toBeNull();
     expect(lastGenerateOptions?.maxRetries).toBe(SHARED_TURN_MAX_RETRIES);
@@ -101,6 +103,7 @@ describe("shared-runtime turn retry budget", () => {
       character: { name: "Nova", system: "You are Nova.", model: "gpt-oss-120b" },
       history: [],
       message: "hello",
+      onProviderDispatch: PROVIDER_DISPATCH,
     });
     // Drain so the stream generator runs, matching real caller behavior.
     if ("parts" in result && result.parts) {
@@ -112,6 +115,44 @@ describe("shared-runtime turn retry budget", () => {
     expect(lastStreamOptions?.maxRetries).toBe(SHARED_TURN_MAX_RETRIES);
     expect(lastStreamOptions?.maxRetries).toBeLessThanOrEqual(1);
     expect(lastStreamOptions?.maxRetries).toBe(0);
+  });
+
+  test("dispatch denial prevents both generate and stream provider invocation", async () => {
+    const revoked = async () => {
+      throw new Error("authorization revoked");
+    };
+
+    await expect(
+      runSharedAgentTurn({
+        character: {
+          name: "Nova",
+          system: "You are Nova.",
+          model: "gpt-oss-120b",
+        },
+        history: [],
+        message: "hello",
+        onProviderDispatch: revoked,
+      }),
+    ).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: "authorization revoked" }),
+    });
+    expect(lastGenerateOptions).toBeNull();
+
+    await expect(
+      runSharedAgentTurnStream({
+        character: {
+          name: "Nova",
+          system: "You are Nova.",
+          model: "gpt-oss-120b",
+        },
+        history: [],
+        message: "hello",
+        onProviderDispatch: revoked,
+      }),
+    ).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: "authorization revoked" }),
+    });
+    expect(lastStreamOptions).toBeNull();
   });
 });
 

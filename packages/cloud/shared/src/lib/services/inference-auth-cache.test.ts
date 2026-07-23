@@ -15,7 +15,6 @@ const { CacheKeys } = await import("../cache/keys");
 const {
   INFERENCE_AUTH_CONTEXT_VERSION,
   hashApiKey,
-  hashStewardUserId,
   invalidateInferenceAuthContextByKeyHash,
   invalidateInferenceSessionAuthContext,
   readInferenceAuthContextWithOutcome,
@@ -27,10 +26,39 @@ const {
 
 const KEY_HASH = hashApiKey("eliza_validator_test_key");
 const STEWARD_USER_ID = "steward-validator-1";
+const SESSION_FINGERPRINT = hashApiKey("steward-validator-session");
+const API_KEY_AUTHORIZATION = {
+  v: 1,
+  organizationId: "org-1",
+  organizationRevision: "0",
+  userId: "user-1",
+  userRevision: "0",
+  credential: {
+    kind: "api_key",
+    id: "key-1",
+    fingerprint: KEY_HASH,
+    revision: "0",
+    expiresAt: null,
+  },
+} as const;
+const SESSION_AUTHORIZATION = {
+  v: 1,
+  organizationId: "org-1",
+  organizationRevision: "0",
+  userId: "user-1",
+  userRevision: "0",
+  credential: {
+    kind: "steward_session",
+    id: SESSION_FINGERPRINT,
+    fingerprint: SESSION_FINGERPRINT,
+    revision: "0",
+    expiresAt: Date.now() + 60_000,
+  },
+} as const;
 
 beforeEach(async () => {
   await invalidateInferenceAuthContextByKeyHash(KEY_HASH);
-  await invalidateInferenceSessionAuthContext(STEWARD_USER_ID);
+  await invalidateInferenceSessionAuthContext(SESSION_FINGERPRINT);
 });
 
 describe("session decision validators", () => {
@@ -42,8 +70,9 @@ describe("session decision validators", () => {
       orgId: "org-1",
       apiKeyId: null,
       stewardUserId: STEWARD_USER_ID,
+      authorization: SESSION_AUTHORIZATION,
     });
-    await expect(readInferenceSessionAuthDecision(STEWARD_USER_ID)).resolves.toMatchObject({
+    await expect(readInferenceSessionAuthDecision(SESSION_FINGERPRINT)).resolves.toMatchObject({
       userId: "user-1",
       orgId: "org-1",
       apiKeyId: null,
@@ -55,15 +84,16 @@ describe("session decision validators", () => {
       stewardUserId: STEWARD_USER_ID,
       decision: "rejected",
       status: 401,
+      credentialFingerprint: SESSION_FINGERPRINT,
     });
-    await expect(readInferenceSessionAuthDecision(STEWARD_USER_ID)).resolves.toMatchObject({
+    await expect(readInferenceSessionAuthDecision(SESSION_FINGERPRINT)).resolves.toMatchObject({
       decision: "rejected",
       status: 401,
     });
   });
 
   test("a hybrid entry (identity fields + rejection decision) is dropped, never authorized", async () => {
-    const key = CacheKeys.inference.sessionAuthContext(hashStewardUserId(STEWARD_USER_ID));
+    const key = CacheKeys.inference.sessionAuthContext(SESSION_FINGERPRINT);
     await cache.set(
       key,
       {
@@ -73,13 +103,15 @@ describe("session decision validators", () => {
         orgId: "org-1",
         apiKeyId: null,
         stewardUserId: STEWARD_USER_ID,
+        authorization: SESSION_AUTHORIZATION,
         decision: "rejected",
         status: 403,
+        credentialFingerprint: SESSION_FINGERPRINT,
       },
       60,
     );
 
-    await expect(readInferenceSessionAuthDecision(STEWARD_USER_ID)).resolves.toBeNull();
+    await expect(readInferenceSessionAuthDecision(SESSION_FINGERPRINT)).resolves.toBeNull();
     // The malformed entry was evicted, not left behind for a later read.
     await expect(cache.get(key)).resolves.toBeNull();
   });
@@ -94,6 +126,7 @@ describe("api-key IAC validators", () => {
       orgId: "org-1",
       apiKeyId: "key-1",
       keyHash: KEY_HASH,
+      authorization: API_KEY_AUTHORIZATION,
     });
     await expect(readInferenceAuthContextWithOutcome(KEY_HASH)).resolves.toMatchObject({
       kind: "hit",
@@ -119,6 +152,7 @@ describe("api-key IAC validators", () => {
         orgId: "org-1",
         apiKeyId: "key-1",
         keyHash: KEY_HASH,
+        authorization: API_KEY_AUTHORIZATION,
         decision: "rejected",
         status: 401,
       },

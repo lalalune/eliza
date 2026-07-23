@@ -9,6 +9,7 @@ import { z } from "zod";
 import type { AgentSandbox } from "@/db/repositories/agent-sandboxes";
 import { errorToResponse, ValidationError } from "@/lib/api/errors";
 import type { BridgeRequest } from "@/lib/services/eliza-sandbox-bridge";
+import type { InferenceAuthorizationProof } from "@/lib/services/inference-authorization-boundary";
 import { applyCorsHeaders, handleCorsOptions } from "@/lib/services/proxy/cors";
 import { coordinateSharedStream } from "@/lib/services/shared-runtime/conversation-coordinator";
 import {
@@ -59,6 +60,7 @@ async function __hono_POST(
   _route: { params: Promise<{ agentId: string }> },
   resolved: {
     agent: AgentSandbox;
+    authorization?: InferenceAuthorizationProof;
     namespace: RuntimeDurableObjectNamespace;
     executionCtx: BridgeExecutionContext;
   },
@@ -94,6 +96,7 @@ async function __hono_POST(
       resolved.agent,
       rpcRequest,
       {
+        authorization: resolved.authorization,
         executionCtx: resolved.executionCtx,
         namespace: resolved.namespace,
       },
@@ -197,6 +200,7 @@ __hono_app.post("/", async (c) => {
     { params: Promise.resolve({ agentId: c.req.param("agentId")! }) },
     {
       agent: scope.agent,
+      authorization: scope.authorization,
       namespace: worker.namespace,
       executionCtx: worker.executionCtx,
     },

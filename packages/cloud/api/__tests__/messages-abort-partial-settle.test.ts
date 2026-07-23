@@ -181,6 +181,7 @@ function callStreaming(
     undefined,
     "gateway" as never,
     "req-test-abort",
+    async () => undefined,
   );
 }
 

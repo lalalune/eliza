@@ -110,6 +110,86 @@ interface RecordEarningsParams {
   model?: string;
   tokens?: number;
   protocol: "http" | "a2a" | "mcp";
+  /** Stable server-generated inference identity used for crash-safe replay. */
+  requestId?: string;
+}
+
+export const AGENT_INFERENCE_RECOVERY_METADATA_KEY = "agentCreatorEarnings";
+export const AGENT_INFERENCE_RECOVERY_VERSION = 1 as const;
+
+export interface AgentInferenceRecoveryPolicy {
+  v: typeof AGENT_INFERENCE_RECOVERY_VERSION;
+  agentId: string;
+  agentName: string;
+  ownerId: string;
+  markupPercent: number;
+  protocol: "a2a" | "mcp";
+}
+
+export function createAgentInferenceRecoveryPolicy(params: {
+  agentId: string;
+  agentName: string;
+  ownerId: string;
+  markupPercent: number;
+  protocol: "a2a" | "mcp";
+}): AgentInferenceRecoveryPolicy {
+  if (
+    !params.agentId.trim() ||
+    !params.agentName.trim() ||
+    !params.ownerId.trim() ||
+    !Number.isFinite(params.markupPercent) ||
+    params.markupPercent < 0 ||
+    params.markupPercent > 1000
+  ) {
+    throw new Error("Agent inference creator policy is invalid");
+  }
+  return {
+    v: AGENT_INFERENCE_RECOVERY_VERSION,
+    ...params,
+  };
+}
+
+export function readAgentInferenceRecoveryPolicy(
+  metadata: Record<string, unknown> | undefined,
+): AgentInferenceRecoveryPolicy | null {
+  const value = metadata?.[AGENT_INFERENCE_RECOVERY_METADATA_KEY];
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object") {
+    throw new Error("Agent inference recovery metadata is invalid");
+  }
+  const policy = value as Record<string, unknown>;
+  if (
+    policy.v !== AGENT_INFERENCE_RECOVERY_VERSION ||
+    typeof policy.agentId !== "string" ||
+    !policy.agentId.trim() ||
+    typeof policy.agentName !== "string" ||
+    !policy.agentName.trim() ||
+    typeof policy.ownerId !== "string" ||
+    !policy.ownerId.trim() ||
+    typeof policy.markupPercent !== "number" ||
+    !Number.isFinite(policy.markupPercent) ||
+    policy.markupPercent < 0 ||
+    policy.markupPercent > 1000 ||
+    (policy.protocol !== "a2a" && policy.protocol !== "mcp")
+  ) {
+    throw new Error("Agent inference recovery metadata is invalid");
+  }
+  return policy as unknown as AgentInferenceRecoveryPolicy;
+}
+
+export function agentInferenceChargeMultiplier(policy: AgentInferenceRecoveryPolicy): number {
+  return 1 + policy.markupPercent / 100;
+}
+
+export function agentCreatorMarkupFromTotal(
+  totalCostUsd: number,
+  policy: AgentInferenceRecoveryPolicy,
+): number {
+  if (!Number.isFinite(totalCostUsd) || totalCostUsd < 0) {
+    throw new Error("Agent inference charge is invalid");
+  }
+  if (policy.markupPercent === 0) return 0;
+  return totalCostUsd * (policy.markupPercent / (100 + policy.markupPercent));
 }
 
 interface AgentUsageParams {
@@ -227,8 +307,17 @@ class AgentMonetizationService {
   async recordCreatorEarnings(
     params: RecordEarningsParams,
   ): Promise<{ success: boolean; error?: string }> {
-    const { agentId, agentName, ownerId, earnings, consumerOrgId, model, tokens, protocol } =
-      params;
+    const {
+      agentId,
+      agentName,
+      ownerId,
+      earnings,
+      consumerOrgId,
+      model,
+      tokens,
+      protocol,
+      requestId,
+    } = params;
 
     if (earnings <= 0) {
       return { success: true }; // No earnings to record
@@ -242,7 +331,7 @@ class AgentMonetizationService {
       userId: ownerId,
       amount: earnings,
       source: "agent",
-      sourceId: agentId,
+      sourceId: requestId ? `${agentId}:${protocol}:${requestId}` : agentId,
       description: `Agent earnings: ${agentName} via ${protocol}`,
       metadata: {
         agent_id: agentId,
@@ -251,7 +340,9 @@ class AgentMonetizationService {
         model,
         tokens,
         protocol,
+        ...(requestId ? { request_id: requestId } : {}),
       },
+      dedupeBySourceId: Boolean(requestId),
     });
 
     if (!result.success) {
@@ -264,15 +355,29 @@ class AgentMonetizationService {
       return { success: false, error: result.error };
     }
 
-    // 2. Update agent's earnings tracking
-    await dbWrite
-      .update(userCharacters)
-      .set({
-        total_creator_earnings: sql`${userCharacters.total_creator_earnings} + ${earningsDecimal}`,
-        total_inference_requests: sql`${userCharacters.total_inference_requests} + 1`,
-        updated_at: new Date(),
-      })
-      .where(eq(userCharacters.id, agentId));
+    if (!result.deduplicated) {
+      // The immutable redeemable ledger is authoritative. Character totals are
+      // a projection and never make a replayed payout non-idempotent.
+      try {
+        await dbWrite
+          .update(userCharacters)
+          .set({
+            total_creator_earnings: sql`${userCharacters.total_creator_earnings} + ${earningsDecimal}`,
+            total_inference_requests: sql`${userCharacters.total_inference_requests} + 1`,
+            updated_at: new Date(),
+          })
+          .where(eq(userCharacters.id, agentId));
+      } catch (error) {
+        if (!requestId) throw error;
+        // error-policy:J7 the payout ledger committed first and is replay-safe;
+        // this denormalized counter cannot hold the admission lease.
+        logger.warn("[AgentMonetization] Agent earnings projection update failed", {
+          agentId,
+          requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     logger.info("[AgentMonetization] Creator earnings recorded", {
       agentId,
@@ -502,3 +607,33 @@ class AgentMonetizationService {
 
 // Export singleton
 export const agentMonetizationService = new AgentMonetizationService();
+
+/**
+ * Materialize one replay-safe creator payout from a fully collected inference
+ * charge. Shares below ledger precision remain with the platform.
+ */
+export async function recordAgentInferenceCreatorEarnings(params: {
+  policy: AgentInferenceRecoveryPolicy;
+  requestId: string;
+  totalCostUsd: number;
+  consumerOrgId: string;
+  model: string;
+  tokens?: number;
+}): Promise<void> {
+  const earnings = agentCreatorMarkupFromTotal(params.totalCostUsd, params.policy);
+  if (earnings < 0.0001) return;
+  const result = await agentMonetizationService.recordCreatorEarnings({
+    agentId: params.policy.agentId,
+    agentName: params.policy.agentName,
+    ownerId: params.policy.ownerId,
+    earnings,
+    consumerOrgId: params.consumerOrgId,
+    model: params.model,
+    tokens: params.tokens,
+    protocol: params.policy.protocol,
+    requestId: params.requestId,
+  });
+  if (!result.success) {
+    throw new Error(result.error ?? "Agent inference creator earnings could not be recorded");
+  }
+}

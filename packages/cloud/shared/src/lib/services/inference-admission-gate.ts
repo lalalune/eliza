@@ -8,6 +8,7 @@
  * expired-lease alarm.
  */
 
+import { ElizaError } from "@elizaos/core";
 import { sql } from "drizzle-orm";
 import { sqlRows } from "../../db/execute-helpers";
 import { writeTransaction } from "../../db/helpers";
@@ -19,6 +20,11 @@ import { getCloudBinding } from "../runtime/cloud-bindings";
 import { logger } from "../utils/logger";
 import { type CreditReconciliationResult, creditsService } from "./credits";
 import type { InferenceAdmissionRecoveryContext } from "./inference-admission-recovery";
+import {
+  INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+  type InferenceAuthorizationProof,
+} from "./inference-authorization-boundary";
+import { isInferenceAuthCacheEnabled } from "./inference-hot-path-caches";
 import type { EndpointType } from "./org-rate-limits";
 
 const GATE_BINDING = "INFERENCE_ADMISSION_GATES";
@@ -40,6 +46,7 @@ interface SettleResponse {
 
 interface DispatchResponse {
   dispatched: boolean;
+  authCheckedVersion?: number;
 }
 
 interface ReleaseResponse {
@@ -63,6 +70,7 @@ export interface InferenceAdmissionLease {
   estimatedCostUsd: number;
   gate: RuntimeDurableObjectStub;
   providerDispatched: boolean;
+  authorizationBoundaryVersion?: typeof INFERENCE_AUTHORIZATION_BOUNDARY_VERSION;
   /**
    * Proves that a live Worker abandoned dispatch before invoking the provider.
    * It is destroyed as soon as dispatch acknowledgement is received.
@@ -112,6 +120,27 @@ export class InferenceAdmissionLeaseRejectedError extends Error {
       `Inference admission lease rejected. Required: $${requiredUsd.toFixed(4)}, Available: $${availableUsd.toFixed(4)}`,
     );
     this.name = "InferenceAdmissionLeaseRejectedError";
+  }
+}
+
+/** A settlement attempted to account provider work before its dispatch marker. */
+export class InferenceProviderDispatchNotMarkedError extends ElizaError {
+  constructor(lease: Pick<InferenceAdmissionLease, "organizationId" | "requestId">) {
+    super("Inference settlement requires an explicit pre-provider dispatch acknowledgement", {
+      code: "INFERENCE_PROVIDER_DISPATCH_NOT_MARKED",
+      context: {
+        organizationId: lease.organizationId,
+        requestId: lease.requestId,
+      },
+      severity: "fatal",
+    });
+  }
+}
+
+/** Enforce the provider-before-accounting ordering invariant. */
+export function assertInferenceAdmissionLeaseDispatched(lease: InferenceAdmissionLease): void {
+  if (!lease.providerDispatched) {
+    throw new InferenceProviderDispatchNotMarkedError(lease);
   }
 }
 
@@ -209,13 +238,17 @@ async function parseSettleResponse(response: Response): Promise<SettleResponse> 
 async function parseLeaseTransitionResponse<Field extends "dispatched" | "released">(
   response: Response,
   field: Field,
+  requiredAuthorizationVersion?: typeof INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
 ): Promise<Field extends "dispatched" ? DispatchResponse : ReleaseResponse> {
   try {
     const value = await response.json();
+    const record =
+      typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
     if (
-      typeof value !== "object" ||
-      value === null ||
-      (value as Record<string, unknown>)[field] !== true
+      record === null ||
+      record[field] !== true ||
+      (requiredAuthorizationVersion !== undefined &&
+        record.authCheckedVersion !== requiredAuthorizationVersion)
     ) {
       throw new TypeError(`response does not confirm ${field}`);
     }
@@ -423,15 +456,19 @@ export async function acquireInferenceAdmissionLease(params: {
   balanceRevision: string;
   estimatedCostUsd: number;
   recovery: InferenceAdmissionRecoveryContext;
+  authorization?: InferenceAuthorizationProof;
   executionCtx?: { waitUntil(promise: Promise<unknown>): void };
 }): Promise<InferenceAdmissionLease> {
   const balanceUsd = finiteNonNegative(params.balanceUsd, "balanceUsd");
   const estimatedCostUsd = finiteNonNegative(params.estimatedCostUsd, "estimatedCostUsd");
+  const authorizationRequired = isInferenceAuthCacheEnabled();
+  const authorization = authorizationRequired ? params.authorization : undefined;
   if (
     !params.organizationId ||
     !params.requestId ||
     !/^(0|[1-9]\d*)$/.test(params.balanceRevision) ||
-    estimatedCostUsd === 0
+    estimatedCostUsd === 0 ||
+    (authorizationRequired && !authorization)
   ) {
     throw new InferenceAdmissionGateUnavailableError(
       "Inference admission lease identity and positive cost are required",
@@ -449,6 +486,9 @@ export async function acquireInferenceAdmissionLease(params: {
       balanceRevision: params.balanceRevision,
       estimatedCostUsd,
       recovery: params.recovery,
+      ...(authorization && {
+        authorization,
+      }),
     },
     stub,
     AbortSignal.timeout(GATE_OPERATION_TIMEOUT_MS),
@@ -477,6 +517,9 @@ export async function acquireInferenceAdmissionLease(params: {
     estimatedCostUsd,
     gate: stub,
     providerDispatched: false,
+    ...(authorization && {
+      authorizationBoundaryVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    }),
     preProviderCancellationToken: crypto.randomUUID(),
   };
 }
@@ -561,7 +604,11 @@ export async function markInferenceAdmissionLeaseDispatched(
       break;
     }
     try {
-      await parseLeaseTransitionResponse(response, "dispatched");
+      await parseLeaseTransitionResponse(
+        response,
+        "dispatched",
+        lease.authorizationBoundaryVersion,
+      );
     } catch (error) {
       // A valid 2xx transport with an unreadable body can still follow a
       // committed dispatch. Replaying the same capability resolves ambiguity.
@@ -633,7 +680,7 @@ export async function settleInferenceAdmissionLease(
       await releaseInferenceAdmissionLease(lease);
       return;
     }
-    await markInferenceAdmissionLeaseDispatched(lease);
+    throw new InferenceProviderDispatchNotMarkedError(lease);
   }
   const snapshot = await creditsService.getOrganizationBalanceSnapshot(lease.organizationId);
   const response = await gateFetch(

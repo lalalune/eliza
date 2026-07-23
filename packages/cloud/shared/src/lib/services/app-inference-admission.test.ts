@@ -46,7 +46,21 @@ const acquireInferenceAdmissionLease = mock(
     requestId: params.requestId,
     estimatedCostUsd: params.estimatedCostUsd,
     gate: { fetch: async () => Response.json({ settled: true }) },
+    providerDispatched: false,
   }),
+);
+class TestInferenceProviderDispatchNotMarkedError extends Error {
+  readonly code = "INFERENCE_PROVIDER_DISPATCH_NOT_MARKED";
+
+  constructor() {
+    super("Inference settlement requires an explicit pre-provider dispatch acknowledgement");
+    this.name = "InferenceProviderDispatchNotMarkedError";
+  }
+}
+const markInferenceAdmissionLeaseDispatched = mock(
+  async (lease: { providerDispatched: boolean }) => {
+    lease.providerDispatched = true;
+  },
 );
 const settleInferenceAdmissionLease = mock(async () => undefined);
 
@@ -106,6 +120,11 @@ mock.module("./inference-billing-fast-path", () => ({
 }));
 mock.module("./inference-admission-gate", () => ({
   acquireInferenceAdmissionLease,
+  assertInferenceAdmissionLeaseDispatched: (lease: { providerDispatched: boolean }) => {
+    if (!lease.providerDispatched) {
+      throw new TestInferenceProviderDispatchNotMarkedError();
+    }
+  },
   inferenceSettlementAmounts: (_lease: unknown, actualCostUsd: number) => ({
     balanceBackedUsd: actualCostUsd,
     gateConsumedUsd: actualCostUsd,
@@ -115,7 +134,8 @@ mock.module("./inference-admission-gate", () => ({
     readonly requiredUsd = 1;
     readonly availableUsd = 0;
   },
-  markInferenceAdmissionLeaseDispatched: async () => undefined,
+  InferenceProviderDispatchNotMarkedError: TestInferenceProviderDispatchNotMarkedError,
+  markInferenceAdmissionLeaseDispatched,
   settleInferenceAdmissionLease,
 }));
 
@@ -197,6 +217,7 @@ beforeEach(() => {
   refusalClears = [];
   usageProjections = [];
   acquireInferenceAdmissionLease.mockClear();
+  markInferenceAdmissionLeaseDispatched.mockClear();
   settleInferenceAdmissionLease.mockClear();
   authoritativeBalanceUsd = 80;
   reserveImpl = async () => ({
@@ -253,6 +274,7 @@ describe("admitAppInferenceCacheOnly", () => {
     expect(background).toHaveLength(0);
     expect(reserveCalls).toBe(0);
 
+    await admission.markProviderDispatched();
     const settlement = admission.settle(0.4);
     await Promise.resolve();
     expect(reserveCalls).toBe(1);
@@ -289,6 +311,7 @@ describe("admitAppInferenceCacheOnly", () => {
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
     expect(reserveCalls).toBe(0);
 
+    await admission.markProviderDispatched();
     expect(await admission.settle(0.4)).toBeNull();
     expect(reconciled).toEqual([0.4]);
     expect(hintWrites).toEqual([80]);
@@ -324,6 +347,7 @@ describe("admitAppInferenceCacheOnly", () => {
     });
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
 
+    await admission.markProviderDispatched();
     const unknown = admission.settleUnknown();
     const laterActual = admission.settle(0);
 
@@ -355,6 +379,7 @@ describe("admitAppInferenceCacheOnly", () => {
     });
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
 
+    await admission.markProviderDispatched();
     await expect(admission.settle(0.4)).rejects.toThrow("settlement acknowledgement lost");
     await expect(admission.settle(9)).resolves.toMatchObject({ actualCost: 0.4 });
     expect(reconciled).toEqual([0.4, 0.4]);
@@ -383,6 +408,7 @@ describe("admitAppInferenceCacheOnly", () => {
     hintWriteError = new Error("cache write unconfirmed");
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
 
+    await admission.markProviderDispatched();
     await expect(admission.settle(0.4)).rejects.toThrow("cache write unconfirmed");
     expect(refusalMarks).toContain("org-1");
     expect(refusalClears).toHaveLength(0);
@@ -405,6 +431,8 @@ describe("admitAppInferenceCacheOnly", () => {
     });
     expect(reserveCalls).toBe(0);
 
+    await firstAdmission.markProviderDispatched();
+    await secondAdmission.markProviderDispatched();
     await firstAdmission.settle(0.5);
     await secondAdmission.settle(0.5);
 
@@ -466,6 +494,7 @@ describe("admitAppInferenceCacheOnly", () => {
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
     expect(reserveCalls).toBe(0);
 
+    await admission.markProviderDispatched();
     const first = admission.settle(0.5);
     const second = admission.settle(99);
     await expect(first).resolves.toMatchObject({
@@ -491,6 +520,7 @@ describe("admitAppInferenceCacheOnly", () => {
     };
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
 
+    await admission.markProviderDispatched();
     await expect(admission.settle(0.5)).resolves.toEqual({
       reservedAmount: 0,
       actualCost: 0.6,
@@ -511,11 +541,23 @@ describe("admitAppInferenceCacheOnly", () => {
     const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
     expect(reserveCalls).toBe(0);
 
+    await admission.markProviderDispatched();
     const first = admission.settle(0.5);
     const second = admission.settle(99);
     await expect(first).rejects.toBe(failure);
     await expect(second).rejects.toBe(failure);
     expect(reserveCalls).toBe(1);
+  });
+
+  test("positive settlement cannot repair a missing provider dispatch marker", async () => {
+    const admission = await admitAppInferenceCacheOnly(params({ waitUntil: () => undefined }));
+
+    await expect(admission.settle(0.4)).rejects.toMatchObject({
+      code: "INFERENCE_PROVIDER_DISPATCH_NOT_MARKED",
+    });
+    expect(markInferenceAdmissionLeaseDispatched).not.toHaveBeenCalled();
+    expect(reserveCalls).toBe(0);
+    expect(settleInferenceAdmissionLease).not.toHaveBeenCalled();
   });
 
   test("app plus affiliate is rejected before cache or authoritative money work", async () => {

@@ -9,7 +9,6 @@
  */
 
 import { organizationInvitesRepository } from "../db/repositories/organization-invites";
-import { usersRepository } from "../db/repositories/users";
 import { getClientIp } from "./runtime/request-context";
 import { apiKeysService } from "./services/api-keys";
 import { charactersService } from "./services/characters/characters";
@@ -155,7 +154,7 @@ async function rollbackCreatedUserSafely(
   originalError: unknown,
 ): Promise<void> {
   try {
-    await usersRepository.delete(userId);
+    await usersService.delete(userId);
   } catch (rollbackError) {
     logger.error("[StewardSync] Failed to roll back newly created user", {
       context,

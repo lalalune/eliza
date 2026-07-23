@@ -31,7 +31,12 @@ import { aiBillingRecordsService } from "../ai-billing-records";
 import type { CreditReconciliationResult, CreditReservation } from "../credits";
 import type { BridgeRequest, BridgeResponse } from "../eliza-sandbox-bridge";
 import { isInferenceAdmissionDispatchMarkError } from "../inference-admission-gate";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "../inference-authorization-boundary";
 import { InferenceBalanceCacheWarmingError } from "../inference-billing-fast-path";
+import { isInferenceAuthCacheEnabled } from "../inference-hot-path-caches";
 import {
   isKnownPreDispatchProviderConfigurationError,
   isKnownUnacceptedProviderError,
@@ -62,6 +67,8 @@ export interface SharedRuntimeHistoryStore {
 }
 
 export interface SharedRuntimeChatOptions {
+  /** Server-minted proof checked by the admission DO at provider dispatch. */
+  authorization?: InferenceAuthorizationProof;
   executionCtx?: BridgeExecutionContext;
   historyStore?: SharedRuntimeHistoryStore;
 }
@@ -268,22 +275,48 @@ interface BillingTurn {
   markProviderDispatched?(): Promise<void>;
 }
 
+function requiredProviderDispatch(billing: BillingTurn | null): () => Promise<void> {
+  if (billing && typeof billing.markProviderDispatched === "function") {
+    return billing.markProviderDispatched;
+  }
+  if (!isInferenceAuthCacheEnabled()) {
+    return async () => undefined;
+  }
+  return async () => {
+    throw new SharedRuntimeCacheWarmingError(
+      "Inference authorization acknowledgement is unavailable. Retry shortly.",
+    );
+  };
+}
+
 async function admitTurn(
   agent: AgentSandbox,
   character: SharedAgentCharacter,
   history: SharedTurnMessage[],
   text: string,
   roomId: string,
+  authorization?: InferenceAuthorizationProof,
   executionCtx?: BridgeExecutionContext,
 ): Promise<BillingTurn | null> {
   const model = resolveSharedAgentTurnModel(character.model);
   if (!model) return null;
+  const authorizationRequired = isInferenceAuthCacheEnabled();
+  if (
+    (authorization !== undefined &&
+      (!isInferenceAuthorizationProof(authorization) ||
+        authorization.organizationId !== agent.organization_id)) ||
+    (authorizationRequired && authorization === undefined)
+  ) {
+    throw new SharedRuntimeCacheWarmingError(
+      "Inference authorization proof is unavailable. Retry shortly.",
+    );
+  }
   const estimatedInputTokens = estimateInputTokens(billingPrompt(character, history, text));
   const requestId = `shared-runtime-${crypto.randomUUID()}`;
   const idempotencyKey = `shared-runtime:${agent.id}:${roomId}:${crypto.randomUUID()}`;
   const context = {
     organizationId: agent.organization_id,
-    userId: agent.user_id,
+    userId: authorization?.userId ?? agent.user_id,
     model,
     provider: getProviderFromModel(model),
     billingSource: "bitrouter" as const,
@@ -331,6 +364,7 @@ async function admitTurn(
       context,
       estimatedInputTokens,
       estimatedOutputTokens: 500,
+      authorization,
       executionCtx,
     });
   } catch (error) {
@@ -340,6 +374,22 @@ async function admitTurn(
       throw new SharedRuntimeCacheWarmingError("Billing authorization is warming. Retry shortly.");
     }
     throw error;
+  }
+  if (authorizationRequired && typeof admission.markProviderDispatched !== "function") {
+    try {
+      await admission.settle(0);
+    } catch (error) {
+      // error-policy:J7 the missing acknowledgement is already a hard deny;
+      // failed zero-settlement remains observable without permitting provider
+      // invocation or replacing the authorization failure.
+      logger.warn("[SharedRuntimeChatService] authorization deny settlement failed", {
+        agentId: agent.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    throw new SharedRuntimeCacheWarmingError(
+      "Inference authorization acknowledgement is unavailable. Retry shortly.",
+    );
   }
   return {
     context,
@@ -524,7 +574,15 @@ export class SharedRuntimeChatService {
     ]);
     let billing: BillingTurn | null;
     try {
-      billing = await admitTurn(agent, character, history, text, roomId, options.executionCtx);
+      billing = await admitTurn(
+        agent,
+        character,
+        history,
+        text,
+        roomId,
+        options.authorization,
+        options.executionCtx,
+      );
     } catch (error) {
       // error-policy:J1 translate the money boundary to the JSON-RPC protocol.
       if (error instanceof InsufficientCreditsError) {
@@ -546,7 +604,7 @@ export class SharedRuntimeChatService {
         character,
         history,
         message: text,
-        onProviderDispatch: billing?.markProviderDispatched,
+        onProviderDispatch: requiredProviderDispatch(billing),
       });
     } catch (error) {
       await settleFailedProviderWorkOffPath(
@@ -625,7 +683,15 @@ export class SharedRuntimeChatService {
     ]);
     let billing: BillingTurn | null;
     try {
-      billing = await admitTurn(agent, character, history, text, roomId, options.executionCtx);
+      billing = await admitTurn(
+        agent,
+        character,
+        history,
+        text,
+        roomId,
+        options.authorization,
+        options.executionCtx,
+      );
     } catch (error) {
       // error-policy:J1 translate the money boundary to the HTTP stream boundary.
       if (error instanceof InsufficientCreditsError) {
@@ -641,7 +707,7 @@ export class SharedRuntimeChatService {
         character,
         history,
         message: text,
-        onProviderDispatch: billing?.markProviderDispatched,
+        onProviderDispatch: requiredProviderDispatch(billing),
       });
     } catch (error) {
       await settleFailedProviderWorkOffPath(

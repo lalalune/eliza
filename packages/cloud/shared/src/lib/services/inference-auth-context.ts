@@ -7,12 +7,11 @@
  * hydrates the authoritative decision under `waitUntil`; non-Worker callers may
  * still await the same operation inline for deterministic tools and tests.
  *
- * API keys are keyed by their full hash and Steward sessions by a hash of the
- * verified subject. The cache-backed mode is independently default-off:
- * lifecycle invalidation of an eventually consistent cache is not a strong
- * revocation boundary. Wallet signatures remain on the general non-Worker path
- * because their timestamped proof cannot be replayed as asynchronous cache
- * hydration.
+ * API keys and Steward sessions are keyed by the full SHA-256 fingerprint of
+ * the presented credential. Positive entries carry monotonic authorization
+ * revisions that the per-organization Durable Object checks at provider
+ * dispatch. Wallet signatures remain on the general non-Worker path because
+ * their timestamped proof cannot be replayed as asynchronous cache hydration.
  *
  * Safety invariants:
  *   - A positive IAC entry is written ONLY for a fully-authorized credential.
@@ -22,7 +21,7 @@
  *     it never authorizes by joining a database fallback to model dispatch.
  */
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { getErrorStatusCode } from "../api/errors";
 import { type CacheBackendKind, cache } from "../cache/client";
 import { getCloudAwareEnv } from "../runtime/cloud-bindings";
@@ -40,6 +39,17 @@ import {
   writeInferenceApiKeyAuthRejection,
   writeInferenceAuthContext,
 } from "./inference-auth-cache";
+import {
+  applyInferenceAuthorizationStates,
+  INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+  initializeInferenceAuthorizationBoundary,
+} from "./inference-authorization-boundary";
+import {
+  apiKeyAuthorizationState,
+  moderationAuthorizationState,
+  organizationAuthorizationState,
+  userAuthorizationState,
+} from "./inference-authorization-lifecycle";
 import { isInferenceAuthCacheEnabled } from "./inference-hot-path-caches";
 import { resolveInferenceSessionAuthContext } from "./inference-session-auth-context";
 
@@ -443,7 +453,10 @@ export async function resolveInferenceAuthContext(
       trace.authoritative = "not_run";
       trace.result = "warming";
       if (cacheAvailable && options.executionCtx) {
-        const hydration = getOrCreateApiKeyHydration(req, keyHash, options.traceId);
+        // Background origin work gets its own trace identity. Reusing the
+        // request trace would make one warming response appear to have both a
+        // cache-only and an authoritative outcome in telemetry.
+        const hydration = getOrCreateApiKeyHydration(req, keyHash, randomUUID());
         options.executionCtx.waitUntil(hydration);
       }
       return { kind: "warming" };
@@ -492,6 +505,20 @@ export async function resolveInferenceAuthContext(
       orgId: user.organization_id,
       apiKeyId: apiKey.id,
       keyHash,
+      authorization: {
+        v: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+        organizationId: user.organization_id,
+        organizationRevision: String(user.organization.inference_auth_revision),
+        userId: user.id,
+        userRevision: String(user.inference_auth_revision),
+        credential: {
+          kind: "api_key",
+          id: apiKey.id,
+          fingerprint: keyHash,
+          revision: String(apiKey.inference_auth_revision),
+          expiresAt: apiKey.expires_at ? new Date(apiKey.expires_at).getTime() : null,
+        },
+      },
     };
     trace.authoritative = "authorized";
     trace.result = "authorized_origin";
@@ -499,6 +526,13 @@ export async function resolveInferenceAuthContext(
     if (!authCacheEnabled) {
       return { kind: "authorized", ctx, source: "origin" };
     }
+    await initializeInferenceAuthorizationBoundary(ctx.orgId);
+    await applyInferenceAuthorizationStates(ctx.orgId, [
+      organizationAuthorizationState(user.organization),
+      userAuthorizationState(user),
+      moderationAuthorizationState(user, false),
+      apiKeyAuthorizationState(apiKey),
+    ]);
     const cacheWrite = writeInferenceAuthContext(ctx);
     if (cacheAvailable && typeof options.executionCtx?.waitUntil === "function") {
       trace.cacheWrite = "deferred";

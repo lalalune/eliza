@@ -189,8 +189,7 @@ CRYPTO_DIRECT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 CRYPTO_DIRECT_SOLANA_TOKEN_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 CRYPTO_DIRECT_SOLANA_TOKEN_DECIMALS = "6"
 CACHE_ENABLED = "true"
-# auto: Workers prefer CACHE_KV; non-Worker services use REDIS_URL when set.
-# Explicit "redis" / "redis-rest" overrides remain compatibility options.
+# auto keeps local Wrangler/Node development compatible with Wadis or Redis.
 CACHE_BACKEND = "auto"
 REDIS_RATE_LIMITING = "false"
 # Enables post-provider billing for cache-only Worker admission. Worker cache
@@ -419,9 +418,9 @@ CRYPTO_DIRECT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 CRYPTO_DIRECT_SOLANA_TOKEN_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 CRYPTO_DIRECT_SOLANA_TOKEN_DECIMALS = "6"
 CACHE_ENABLED = "true"
-# auto: Workers prefer CACHE_KV; non-Worker services use REDIS_URL when set.
-# Explicit "redis" / "redis-rest" overrides remain compatibility options.
-CACHE_BACKEND = "auto"
+# Staging Workers fail closed if CACHE_KV is absent; inference must never
+# silently fall through to Railway Redis on a binding/configuration error.
+CACHE_BACKEND = "kv"
 REDIS_RATE_LIMITING = "true"
 # Enables post-provider billing for cache-only Worker admission. Worker cache
 # misses warm and retry instead of joining an authoritative database fallback.
@@ -438,8 +437,9 @@ INFERENCE_DEFERRED_ADMISSION = "true"
 # Enables local decision memos in front of shared revisioned caches. Exact
 # organization rate and spend decisions remain in the Durable Object.
 INFERENCE_HOT_PATH_CACHES = "true"
-# Staging retains authoritative auth while admission/cache foundations soak.
-INFERENCE_AUTH_CACHE_ENABLED = "false"
+# Covered inference routes fail closed on cache misses and re-check versioned
+# authorization in the per-organization Durable Object before provider work.
+INFERENCE_AUTH_CACHE_ENABLED = "true"
 # Pass-through streaming fast path (#15428): "true" pipes qualifying streamed
 # chat completions (OpenAI-compatible direct upstream, no tools/response_format/
 # web-search) byte-for-byte from the provider instead of decoding/re-encoding
@@ -617,9 +617,9 @@ CRYPTO_DIRECT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 CRYPTO_DIRECT_SOLANA_TOKEN_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 CRYPTO_DIRECT_SOLANA_TOKEN_DECIMALS = "6"
 CACHE_ENABLED = "true"
-# auto: Workers prefer CACHE_KV; non-Worker services use REDIS_URL when set.
-# Explicit "redis" / "redis-rest" overrides remain compatibility options.
-CACHE_BACKEND = "auto"
+# Production Workers fail closed if CACHE_KV is absent; inference must never
+# silently fall through to Railway Redis on a binding/configuration error.
+CACHE_BACKEND = "kv"
 REDIS_RATE_LIMITING = "true"
 # Enables post-provider billing for cache-only Worker admission. Worker cache
 # misses warm and retry instead of joining an authoritative database fallback.
@@ -636,8 +636,9 @@ INFERENCE_DEFERRED_ADMISSION = "true"
 # Enables local decision memos in front of shared revisioned caches. Exact
 # organization rate and spend decisions remain in the Durable Object.
 INFERENCE_HOT_PATH_CACHES = "true"
-# Production authorization remains authoritative until the revocation gate lands.
-INFERENCE_AUTH_CACHE_ENABLED = "false"
+# Covered inference routes fail closed on cache misses and re-check versioned
+# authorization in the per-organization Durable Object before provider work.
+INFERENCE_AUTH_CACHE_ENABLED = "true"
 # Pass-through streaming fast path (#15428): "true" pipes qualifying streamed
 # chat completions (OpenAI-compatible direct upstream, no tools/response_format/
 # web-search) byte-for-byte from the provider instead of decoding/re-encoding

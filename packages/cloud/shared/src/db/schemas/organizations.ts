@@ -47,6 +47,11 @@ export const organizations = pgTable(
     // is the per-organization initial revision; only mutations need a globally
     // monotonic sequence value.
     balance_revision: bigint("balance_revision", { mode: "number" }).notNull().default(0),
+    inference_auth_revision: bigint("inference_auth_revision", {
+      mode: "number",
+    })
+      .notNull()
+      .default(0),
 
     // Settings (kept for backward compatibility with container management)
     settings: jsonb("settings").$type<Record<string, unknown>>().default({}),

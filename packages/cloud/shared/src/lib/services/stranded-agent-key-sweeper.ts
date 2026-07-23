@@ -1,23 +1,10 @@
-/** Reaps unusable sandbox credentials and invalidates caches for rows actually removed. */
-import { strandedAgentKeyRepository } from "../../db/repositories/stranded-agent-keys";
+/** Reaps unusable sandbox credentials after durable inference revocation. */
 import { logger } from "../utils/logger";
 import { apiKeysService } from "./api-keys";
 
 /** Returns the number of database rows atomically revoked before the cutoff. */
 export async function sweepStrandedAgentKeys(olderThan: Date): Promise<number> {
-  const stranded = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
-
-  for (const key of stranded) {
-    try {
-      await apiKeysService.invalidateCache(key.key_hash);
-    } catch (error) {
-      // error-policy:J6 The database revocation is complete; cache TTL bounds stale access.
-      logger.error("[ApiKeys] Stranded-key cache invalidation was not confirmed", {
-        apiKeyId: key.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
+  const stranded = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
   if (stranded.length > 0) {
     logger.warn("[ApiKeys] Swept stranded agent-sandbox keys", {

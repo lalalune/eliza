@@ -18,11 +18,6 @@
  */
 
 export const VOICE_TRACE_HEADER = "X-Eliza-Voice-Trace-Id";
-/** Scope headers so the configured endpoint routes the turn to the right agent. */
-export const VOICE_AGENT_HEADER = "X-Eliza-Agent-Id";
-export const VOICE_CONVERSATION_HEADER = "X-Eliza-Conversation-Id";
-export const VOICE_ORGANIZATION_HEADER = "X-Eliza-Organization-Id";
-export const VOICE_USER_HEADER = "X-Eliza-User-Id";
 
 export interface ElizaSseBridgeRequest {
   /** API origin hosting the canonical agent conversation routes. */
@@ -37,7 +32,7 @@ export interface ElizaSseBridgeRequest {
   agentId: string;
   /** Conversation this session writes into (from the verified token claims). */
   conversationId: string;
-  /** Verified voice-token tenancy, accepted only with the server-held credential. */
+  /** Verified voice-token tenancy retained for session diagnostics. */
   organizationId?: string;
   userId?: string;
   /** Optional system prompt; the route applies its own default if omitted. */
@@ -102,10 +97,6 @@ export async function streamElizaConversation(
         "X-Service-Key": request.authorization,
         Accept: "text/event-stream",
         [VOICE_TRACE_HEADER]: request.traceId,
-        [VOICE_AGENT_HEADER]: request.agentId,
-        [VOICE_CONVERSATION_HEADER]: request.conversationId,
-        ...(request.organizationId ? { [VOICE_ORGANIZATION_HEADER]: request.organizationId } : {}),
-        ...(request.userId ? { [VOICE_USER_HEADER]: request.userId } : {}),
       },
       // This is the canonical message contract. Agent and conversation identity
       // are structural URL segments, so the route cannot silently discard them;

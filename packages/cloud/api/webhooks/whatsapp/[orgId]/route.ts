@@ -17,6 +17,7 @@ import {
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import { agentGatewayRouterService } from "@/lib/services/agent-gateway-router";
 import { messageRouterService } from "@/lib/services/message-router";
+import { SharedRuntimeCacheWarmingError } from "@/lib/services/shared-runtime/shared-runtime-errors";
 import { whatsappAutomationService } from "@/lib/services/whatsapp-automation";
 import {
   releaseProcessingClaim,
@@ -124,7 +125,7 @@ async function handleWhatsAppWebhook(c: AppContext): Promise<Response> {
       }
 
       try {
-        await handleIncomingMessage(orgId, msg);
+        await handleIncomingMessage(c, orgId, msg);
       } catch (error) {
         logger.error("[WhatsAppWebhook] Failed to process message", {
           orgId,
@@ -183,6 +184,7 @@ async function handleWhatsAppVerification(c: AppContext): Promise<Response> {
 // ============================================================================
 
 async function handleIncomingMessage(
+  c: AppContext,
   orgId: string,
   msg: WhatsAppIncomingMessage,
 ): Promise<void> {
@@ -287,7 +289,12 @@ async function handleIncomingMessage(
         phoneNumberId: msg.phoneNumberId,
       },
       senderName: msg.profileName,
+      executionCtx: c.executionCtx,
     });
+
+    if (routeResult.retryable) {
+      throw new SharedRuntimeCacheWarmingError("Agent target cache is warming");
+    }
 
     if (
       !routeResult.handled ||

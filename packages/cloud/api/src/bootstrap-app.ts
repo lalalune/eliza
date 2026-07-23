@@ -67,8 +67,11 @@ export function isRedisIndependentInferencePath(pathname: string): boolean {
     return true;
   }
   return (
-    /^\/api\/v1\/eliza\/agents\/[^/]+\/(?:bridge|stream)$/.test(pathname) ||
-    /^\/api\/v1\/eliza\/agents\/[^/]+\/api\/conversations\/[^/]+\/messages(?:\/stream)?$/.test(
+    /^\/api\/v1\/generate-prompts\/?$/.test(pathname) ||
+    /^\/api\/agents\/[^/]+\/(?:a2a|mcp)\/?$/.test(pathname) ||
+    /^\/api\/v1\/apps\/[^/]+\/chat\/?$/.test(pathname) ||
+    /^\/api\/v1\/eliza\/agents\/[^/]+\/(?:bridge|stream)\/?$/.test(pathname) ||
+    /^\/api\/v1\/eliza\/agents\/[^/]+\/api\/conversations\/[^/]+\/messages(?:\/stream)?\/?$/.test(
       pathname,
     )
   );

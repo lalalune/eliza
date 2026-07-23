@@ -7,6 +7,10 @@
  */
 
 import type { BridgeRequest } from "@/lib/services/eliza-sandbox";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "@/lib/services/inference-authorization-boundary";
 import type { CachedAgentSandbox } from "@/lib/services/shared-runtime/cached-agent-dates";
 import type { SharedTurnMessage } from "@/lib/services/shared-runtime/run-shared-agent-turn";
 import type { SharedRuntimeHistoryStore } from "@/lib/services/shared-runtime/shared-runtime-chat";
@@ -16,8 +20,18 @@ import type { AppEnv } from "@/types/cloud-worker-env";
 // `Date` columns arrive as ISO strings; `handle` rehydrates them before any
 // service consumes the row (the CONVERSATIONS-500 defect class).
 type ConversationRequest =
-  | { operation: "bridge"; agent: CachedAgentSandbox; rpc: BridgeRequest }
-  | { operation: "stream"; agent: CachedAgentSandbox; rpc: BridgeRequest }
+  | {
+      operation: "bridge";
+      agent: CachedAgentSandbox;
+      rpc: BridgeRequest;
+      authorization?: InferenceAuthorizationProof;
+    }
+  | {
+      operation: "stream";
+      agent: CachedAgentSandbox;
+      rpc: BridgeRequest;
+      authorization?: InferenceAuthorizationProof;
+    }
   | { operation: "history"; agentId: string; roomId: string };
 
 interface StoredConversation {
@@ -260,16 +274,27 @@ export class SharedRuntimeConversation {
           import("@/lib/services/shared-runtime/cached-agent-dates"),
         ]);
       const agent = rehydrateCachedAgentDates(payload.agent);
+      if (
+        payload.authorization !== undefined &&
+        (!isInferenceAuthorizationProof(payload.authorization) ||
+          payload.authorization.organizationId !== agent.organization_id)
+      ) {
+        throw new Error(
+          "[shared-runtime] invalid inference authorization proof",
+        );
+      }
       const executionCtx = {
         waitUntil: (promise: Promise<unknown>) => this.state.waitUntil(promise),
       };
       if (payload.operation === "stream") {
         return await sharedRuntimeChatService.stream(agent, payload.rpc, {
+          authorization: payload.authorization,
           executionCtx,
           historyStore,
         });
       }
       const result = await sharedRuntimeChatService.bridge(agent, payload.rpc, {
+        authorization: payload.authorization,
         executionCtx,
         historyStore,
       });

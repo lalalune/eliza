@@ -19,10 +19,9 @@ import {
 } from "../../db/schemas";
 import { shouldBlockDevnetBypass } from "../config/deployment-environment";
 import { logger } from "../utils/logger";
-import {
-  invalidateInferenceAuthContextsByKeyHashes,
-  invalidateInferenceSessionAuthContexts,
-} from "./inference-auth-cache";
+import { invalidateInferenceAuthContextsByKeyHashes } from "./inference-auth-cache";
+import { applyInferenceAuthorizationState } from "./inference-authorization-boundary";
+import { moderationAuthorizationState } from "./inference-authorization-lifecycle";
 
 /**
  * Clear the inference auth-context cache (#9899) for every API key a user owns.
@@ -30,17 +29,8 @@ import {
  * fast-pathing inference immediately (bounded otherwise by the IAC TTL).
  */
 async function invalidateUserInferenceContext(userId: string): Promise<void> {
-  const [keys, user] = await Promise.all([
-    apiKeysRepository.listByUser(userId),
-    dbRead.query.users.findFirst({
-      where: eq(users.id, userId),
-      columns: { steward_user_id: true },
-    }),
-  ]);
-  await Promise.all([
-    invalidateInferenceAuthContextsByKeyHashes(keys.map((k) => k.key_hash)),
-    invalidateInferenceSessionAuthContexts(user?.steward_user_id ? [user.steward_user_id] : []),
-  ]);
+  const keys = await apiKeysRepository.listByUser(userId);
+  await invalidateInferenceAuthContextsByKeyHashes(keys.map((k) => k.key_hash));
 }
 
 // Default anvil wallet - admin in devnet only
@@ -356,29 +346,37 @@ class AdminService {
     userId: string,
     action: ModerationAction,
   ): Promise<void> {
-    const existing = await dbRead.query.userModerationStatus.findFirst({
-      where: eq(userModerationStatus.userId, userId),
-    });
-
     const now = new Date();
+    const crossedBlockingBoundary = await dbWrite.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(userModerationStatus)
+        .where(eq(userModerationStatus.userId, userId))
+        .for("update");
+      if (!existing) {
+        await tx.insert(userModerationStatus).values({
+          userId,
+          status: "clean",
+          totalViolations: 1,
+          warningCount: action === "warned" || action === "flagged_for_ban" ? 1 : 0,
+          riskScore: 20,
+          lastViolationAt: now,
+          lastWarningAt: action === "warned" ? now : null,
+        });
+        return false;
+      }
 
-    if (existing) {
       const newTotalViolations = existing.totalViolations + 1;
       const newWarningCount =
         action === "warned" || action === "flagged_for_ban"
           ? existing.warningCount + 1
           : existing.warningCount;
-
-      // Calculate new risk score (capped at 100)
       const newRiskScore = Math.min(100, existing.riskScore + 20);
-
-      // Determine new status
       let newStatus: ModerationStatus = existing.status;
       if (newTotalViolations >= 5 && existing.status === "clean") {
         newStatus = "warned";
       }
-
-      await dbWrite
+      await tx
         .update(userModerationStatus)
         .set({
           totalViolations: newTotalViolations,
@@ -391,26 +389,29 @@ class AdminService {
         })
         .where(eq(userModerationStatus.userId, userId));
 
-      // #9899: if this violation crosses the user into a blocking state
-      // (banned or >=5 violations — see shouldBlockUser), drop their cached
-      // inference auth-context so they stop fast-pathing inference within the
-      // request, not after the IAC TTL. Wired into the authoritative mutation so
-      // every moderation entrypoint (chat, messages, A2A) is covered uniformly.
       const wasBlocking = existing.status === "banned" || existing.totalViolations >= 5;
       const isBlocking = newStatus === "banned" || newTotalViolations >= 5;
-      if (isBlocking && !wasBlocking) {
-        await invalidateUserInferenceContext(userId);
+      if (!isBlocking || wasBlocking) return false;
+
+      const [revisionedUser] = await tx
+        .update(users)
+        .set({
+          inference_auth_revision: sql`${users.inference_auth_revision} + 1`,
+          updated_at: now,
+        })
+        .where(eq(users.id, userId))
+        .returning();
+      if (!revisionedUser?.organization_id) {
+        throw new Error(`User ${userId} has no inference organization`);
       }
-    } else {
-      await dbWrite.insert(userModerationStatus).values({
-        userId,
-        status: "clean",
-        totalViolations: 1,
-        warningCount: action === "warned" || action === "flagged_for_ban" ? 1 : 0,
-        riskScore: 20,
-        lastViolationAt: now,
-        lastWarningAt: action === "warned" ? now : null,
-      });
+      await applyInferenceAuthorizationState(
+        revisionedUser.organization_id,
+        moderationAuthorizationState(revisionedUser, true),
+      );
+      return true;
+    });
+    if (crossedBlockingBoundary) {
+      await invalidateUserInferenceContext(userId);
     }
   }
 
@@ -487,33 +488,54 @@ class AdminService {
   async banUser(params: { userId: string; adminUserId: string; reason: string }): Promise<void> {
     const { userId, adminUserId, reason } = params;
     const now = new Date();
-
-    const existing = await this.getUserModerationStatus(userId);
-
-    if (existing) {
-      await dbWrite
-        .update(userModerationStatus)
-        .set({
+    await dbWrite.transaction(async (tx) => {
+      const [user] = await tx.select().from(users).where(eq(users.id, userId)).for("update");
+      if (!user?.organization_id) {
+        throw new Error(`User ${userId} has no inference organization`);
+      }
+      const existing = await tx.query.userModerationStatus.findFirst({
+        where: eq(userModerationStatus.userId, userId),
+      });
+      if (existing) {
+        await tx
+          .update(userModerationStatus)
+          .set({
+            status: "banned",
+            bannedBy: adminUserId,
+            bannedAt: now,
+            banReason: reason,
+            riskScore: 100,
+            updatedAt: now,
+          })
+          .where(eq(userModerationStatus.userId, userId));
+      } else {
+        await tx.insert(userModerationStatus).values({
+          userId,
           status: "banned",
+          totalViolations: 0,
+          warningCount: 0,
+          riskScore: 100,
           bannedBy: adminUserId,
           bannedAt: now,
           banReason: reason,
-          riskScore: 100,
-          updatedAt: now,
+        });
+      }
+      const [revisionedUser] = await tx
+        .update(users)
+        .set({
+          inference_auth_revision: sql`${users.inference_auth_revision} + 1`,
+          updated_at: now,
         })
-        .where(eq(userModerationStatus.userId, userId));
-    } else {
-      await dbWrite.insert(userModerationStatus).values({
-        userId,
-        status: "banned",
-        totalViolations: 0,
-        warningCount: 0,
-        riskScore: 100,
-        bannedBy: adminUserId,
-        bannedAt: now,
-        banReason: reason,
-      });
-    }
+        .where(eq(users.id, userId))
+        .returning();
+      if (!revisionedUser) {
+        throw new Error(`User ${userId} disappeared during ban`);
+      }
+      await applyInferenceAuthorizationState(
+        user.organization_id,
+        moderationAuthorizationState(revisionedUser, true),
+      );
+    });
 
     // Stop any warm inference fast path for this user immediately (#9899).
     await invalidateUserInferenceContext(userId);
@@ -525,19 +547,44 @@ class AdminService {
    * Unban a user
    */
   async unbanUser(userId: string, adminUserId: string): Promise<void> {
-    await dbWrite
-      .update(userModerationStatus)
-      .set({
-        status: "clean",
-        bannedBy: null,
-        bannedAt: null,
-        banReason: null,
-        riskScore: 0,
-        totalViolations: 0,
-        warningCount: 0,
-        updatedAt: new Date(),
-      })
-      .where(eq(userModerationStatus.userId, userId));
+    const revisionedUser = await dbWrite.transaction(async (tx) => {
+      const [user] = await tx.select().from(users).where(eq(users.id, userId)).for("update");
+      if (!user?.organization_id) {
+        throw new Error(`User ${userId} has no inference organization`);
+      }
+      await tx
+        .update(userModerationStatus)
+        .set({
+          status: "clean",
+          bannedBy: null,
+          bannedAt: null,
+          banReason: null,
+          riskScore: 0,
+          totalViolations: 0,
+          warningCount: 0,
+          updatedAt: new Date(),
+        })
+        .where(eq(userModerationStatus.userId, userId));
+      const [updated] = await tx
+        .update(users)
+        .set({
+          inference_auth_revision: sql`${users.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(eq(users.id, userId))
+        .returning();
+      if (!updated) {
+        throw new Error(`User ${userId} disappeared during unban`);
+      }
+      return updated;
+    });
+    if (!revisionedUser.organization_id) {
+      throw new Error(`User ${userId} has no inference organization`);
+    }
+    await applyInferenceAuthorizationState(
+      revisionedUser.organization_id,
+      moderationAuthorizationState(revisionedUser, false),
+    );
 
     logger.info("[Admin] User unbanned", { userId, adminUserId });
   }

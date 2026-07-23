@@ -18,6 +18,11 @@ let admissionError: Error | null;
 let billError: Error | null;
 let billingGate: Promise<void> | null;
 let releaseBilling = () => {};
+let authorizationRequired = false;
+let includeDispatchAcknowledgement = true;
+let dispatchError: Error | null;
+let providerInvocations = 0;
+let dispatchCalls = 0;
 const settleCalls: number[] = [];
 let settleUnknownCalls = 0;
 const billCalls: unknown[] = [];
@@ -50,6 +55,7 @@ mock.module("../../middleware/rate-limit", () => ({
 const admitOrganizationInference = mock(
   async (params: {
     context?: { metadata?: Record<string, unknown> };
+    authorization?: unknown;
     executionCtx?: { waitUntil(promise: Promise<unknown>): void };
   }) => {
     if (admissionError) throw admissionError;
@@ -64,6 +70,12 @@ const admitOrganizationInference = mock(
         settleUnknownCalls++;
         return null;
       },
+      ...(includeDispatchAcknowledgement && {
+        markProviderDispatched: async () => {
+          dispatchCalls++;
+          if (dispatchError) throw dispatchError;
+        },
+      }),
       reservation: payoutAwareReservation,
     };
   },
@@ -104,13 +116,20 @@ mock.module("../../../db/repositories/characters", () => ({
     },
   },
 }));
+mock.module("../inference-hot-path-caches", () => ({
+  isInferenceAuthCacheEnabled: () => authorizationRequired,
+}));
 mock.module("./run-shared-agent-turn", () => ({
   resolveSharedAgentTurnModel: () => "openai/gpt-oss-120b",
-  runSharedAgentTurn: async () => {
+  runSharedAgentTurn: async (input: { onProviderDispatch: () => Promise<void> }) => {
+    await input.onProviderDispatch();
+    providerInvocations++;
     if (turnError) throw turnError;
     return turn;
   },
-  runSharedAgentTurnStream: async () => {
+  runSharedAgentTurnStream: async (input: { onProviderDispatch: () => Promise<void> }) => {
+    await input.onProviderDispatch();
+    providerInvocations++;
     if (streamTurnError) throw streamTurnError;
     return streamTurn;
   },
@@ -173,6 +192,20 @@ const rpc = {
   method: "message.send",
   params: { text: "hello", roomId: "room-1" },
 };
+const authorization = {
+  v: 1 as const,
+  organizationId: agent.organization_id,
+  organizationRevision: "7",
+  userId: "00000000-0000-4000-8000-000000000004",
+  userRevision: "5",
+  credential: {
+    kind: "api_key" as const,
+    id: "00000000-0000-4000-8000-000000000005",
+    fingerprint: "a".repeat(64),
+    revision: "3",
+    expiresAt: null,
+  },
+};
 
 function harness() {
   let history = [{ role: "assistant" as const, content: "prior" }];
@@ -200,6 +233,11 @@ beforeEach(() => {
   billError = null;
   turnError = null;
   streamTurnError = null;
+  authorizationRequired = false;
+  includeDispatchAcknowledgement = true;
+  dispatchError = null;
+  providerInvocations = 0;
+  dispatchCalls = 0;
   characterReads = 0;
   enforceOrgRateLimit.mockClear();
   admitOrganizationInference.mockClear();
@@ -314,6 +352,51 @@ describe("SharedRuntimeChatService", () => {
       executionCtx: h.executionCtx,
     });
     expect(admitOrganizationInference).not.toHaveBeenCalled();
+  });
+
+  test("revoked proof is denied at the dispatch acknowledgement before any provider invocation", async () => {
+    authorizationRequired = true;
+    dispatchError = new InferenceAdmissionDispatchMarkError("Inference authorization was revoked");
+    const service = new SharedRuntimeChatService();
+    const h = harness();
+
+    await expect(service.bridge(agent, rpc, { ...h, authorization })).rejects.toThrow(
+      "Inference authorization was revoked",
+    );
+
+    expect(admitOrganizationInference).toHaveBeenCalledTimes(1);
+    expect(admitOrganizationInference.mock.calls[0]?.[0]).toMatchObject({
+      authorization,
+      context: {
+        organizationId: agent.organization_id,
+        userId: authorization.userId,
+      },
+    });
+    expect(dispatchCalls).toBe(1);
+    expect(providerInvocations).toBe(0);
+    expect(settleCalls).toEqual([0]);
+  });
+
+  test("missing proof or versioned dispatch acknowledgement fails closed before the model", async () => {
+    authorizationRequired = true;
+    const service = new SharedRuntimeChatService();
+    const h = harness();
+
+    await expect(service.bridge(agent, rpc, h)).rejects.toMatchObject({
+      name: "SharedRuntimeCacheWarmingError",
+      message: "Inference authorization proof is unavailable. Retry shortly.",
+    });
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(providerInvocations).toBe(0);
+
+    includeDispatchAcknowledgement = false;
+    await expect(service.stream(agent, rpc, { ...h, authorization })).rejects.toMatchObject({
+      name: "SharedRuntimeCacheWarmingError",
+      message: "Inference authorization acknowledgement is unavailable. Retry shortly.",
+    });
+    expect(admitOrganizationInference).toHaveBeenCalledTimes(1);
+    expect(settleCalls).toEqual([0]);
+    expect(providerInvocations).toBe(0);
   });
 
   test("cold linked character returns warming while hydration stays off path", async () => {

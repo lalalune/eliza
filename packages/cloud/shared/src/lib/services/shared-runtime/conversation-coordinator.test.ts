@@ -31,6 +31,21 @@ const { coordinateSharedBridge, coordinateSharedHistory, coordinateSharedStream 
   "./conversation-coordinator"
 );
 
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: "org-1",
+  organizationRevision: "7",
+  userId: "user-1",
+  userRevision: "5",
+  credential: {
+    kind: "api_key" as const,
+    id: "key-1",
+    fingerprint: "a".repeat(64),
+    revision: "3",
+    expiresAt: null,
+  },
+};
+
 describe("shared conversation coordinator", () => {
   test("routes bridge, stream, and history through one room object", async () => {
     const names: string[] = [];
@@ -76,10 +91,22 @@ describe("shared conversation coordinator", () => {
     const executionCtx = { waitUntil() {} };
 
     expect(
-      (await coordinateSharedBridge(agent, rpc, { namespace, executionCtx })).result?.text,
+      (
+        await coordinateSharedBridge(agent, rpc, {
+          authorization: AUTHORIZATION,
+          namespace,
+          executionCtx,
+        })
+      ).result?.text,
     ).toBe("coordinated");
     expect(
-      await (await coordinateSharedStream(agent, rpc, { namespace, executionCtx }))?.text(),
+      await (
+        await coordinateSharedStream(agent, rpc, {
+          authorization: AUTHORIZATION,
+          namespace,
+          executionCtx,
+        })
+      )?.text(),
     ).toContain("event: done");
     expect(await coordinateSharedHistory("agent-1", "room-1", { namespace })).toEqual([
       { role: "assistant", content: "cached" },
@@ -90,6 +117,10 @@ describe("shared conversation coordinator", () => {
       "bridge",
       "stream",
       "history",
+    ]);
+    expect(envelopes.slice(0, 2)).toEqual([
+      expect.objectContaining({ authorization: AUTHORIZATION }),
+      expect.objectContaining({ authorization: AUTHORIZATION }),
     ]);
     expect(directBridge).not.toHaveBeenCalled();
     expect(directStream).not.toHaveBeenCalled();

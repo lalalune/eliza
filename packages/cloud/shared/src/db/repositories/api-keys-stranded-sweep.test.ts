@@ -1,7 +1,7 @@
 /**
- * Real-DB (PGlite) coverage for the stranded agent-sandbox key GC query (#16071).
+ * Real-DB (PGlite) coverage for stranded agent-sandbox credential revocation.
  *
- * `deleteOlderThan(olderThan)` must delete only active
+ * `ApiKeysService.revokeStrandedAgentKeys(olderThan)` must revoke only active
  * `agent-sandbox:<uuid>` keys whose uuid has NO `agent_sandboxes` row and whose
  * `created_at` predates the grace window. The three acceptance cases from the
  * issue are proven against real SQL (no mocks): a stranded key is returned, an
@@ -16,7 +16,7 @@ process.env.DATABASE_URL ||= "pglite://memory";
 process.env.NODE_ENV ||= "test";
 
 let dbWrite: typeof import("../helpers").dbWrite;
-let strandedAgentKeyRepository: typeof import("./stranded-agent-keys").strandedAgentKeyRepository;
+let apiKeysService: typeof import("../../lib/services/api-keys").apiKeysService;
 let closeDatabaseConnectionsForTests: typeof import("../client").closeDatabaseConnectionsForTests;
 
 const ORG_ID = "00000000-0000-4000-8000-0000000000a1";
@@ -55,7 +55,7 @@ async function insertKey(params: {
 beforeAll(async () => {
   ({ dbWrite } = await import("../helpers"));
   ({ closeDatabaseConnectionsForTests } = await import("../client"));
-  ({ strandedAgentKeyRepository } = await import("./stranded-agent-keys"));
+  ({ apiKeysService } = await import("../../lib/services/api-keys"));
 
   // Minimal shapes: the query only touches api_keys columns + agent_sandboxes.id.
   await dbWrite.execute(sql`
@@ -76,6 +76,7 @@ beforeAll(async () => {
         user_id uuid NOT NULL,
         rate_limit integer NOT NULL DEFAULT 1000,
         is_active boolean NOT NULL DEFAULT true,
+        inference_auth_revision bigint NOT NULL DEFAULT 0,
         usage_count integer NOT NULL DEFAULT 0,
         expires_at timestamp,
         last_used_at timestamp,
@@ -84,22 +85,22 @@ beforeAll(async () => {
         deleted_at timestamp
       )
     `);
-});
+}, 60_000);
 
 beforeEach(async () => {
   await dbWrite.execute(sql`DELETE FROM api_keys`);
   await dbWrite.execute(sql`DELETE FROM agent_sandboxes`);
   // The LIVE sandbox row exists for the "never touch a bound key" case.
   await dbWrite.execute(sql`INSERT INTO agent_sandboxes (id) VALUES (${SANDBOX_LIVE})`);
-});
+}, 30_000);
 
 afterAll(async () => {
   await dbWrite.execute(sql`DROP TABLE IF EXISTS api_keys`);
   await dbWrite.execute(sql`DROP TABLE IF EXISTS agent_sandboxes`);
   await closeDatabaseConnectionsForTests();
-});
+}, 30_000);
 
-describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
+describe("ApiKeysService.revokeStrandedAgentKeys (#16071)", () => {
   test("returns a stranded key: no sandbox row + past the grace window", async () => {
     const strandedId = await insertKey({
       name: `agent-sandbox:${SANDBOX_STRANDED}`,
@@ -107,7 +108,7 @@ describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
     });
 
     const olderThan = new Date(Date.now() - 6 * 60 * 60 * 1000); // 6h grace
-    const found = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
+    const found = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
     expect(found.map((k) => k.id)).toEqual([strandedId]);
   });
@@ -121,7 +122,7 @@ describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
     });
 
     const olderThan = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const found = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
+    const found = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
     expect(found).toHaveLength(0);
   });
@@ -134,7 +135,7 @@ describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
     });
 
     const olderThan = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const found = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
+    const found = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
     expect(found).toHaveLength(0);
     const remaining = (await dbWrite.execute(sql`
@@ -154,7 +155,7 @@ describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
     });
 
     const olderThan = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const found = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
+    const found = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
     expect(found).toHaveLength(0);
   });
@@ -175,7 +176,7 @@ describe("strandedAgentKeyRepository.deleteOlderThan (#16071)", () => {
     await insertKey({ name: "eliza cloud key", createdAtSql: "now() - interval '1 day'" });
 
     const olderThan = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const found = await strandedAgentKeyRepository.deleteOlderThan(olderThan);
+    const found = await apiKeysService.revokeStrandedAgentKeys(olderThan);
 
     expect(found.map((k) => k.id)).toEqual([strandedId]);
   });

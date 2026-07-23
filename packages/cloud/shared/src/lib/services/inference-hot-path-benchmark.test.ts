@@ -13,10 +13,7 @@
 
 process.env.MOCK_REDIS = "1";
 process.env.CACHE_ENABLED = "true";
-// This benchmark measures the STAGED cache-on auth path. The flag is
-// default-off in every checked-in environment (wrangler.toml) until #17093
-// lands a strongly consistent revocation boundary; enabling it here exercises
-// the gated single-cache-read contract without changing any shipped default.
+// Preserve the caller's flag because Bun may share one process across files.
 const originalAuthCacheFlag = process.env.INFERENCE_AUTH_CACHE_ENABLED;
 process.env.INFERENCE_AUTH_CACHE_ENABLED = "true";
 
@@ -30,8 +27,28 @@ mock.module("./inference-api-key-auth", () => ({
   requireInferenceApiKeyWithOrg: async () => {
     authChainCalls++;
     return {
-      user: { id: "user-bench", organization_id: "org-bench" },
-      apiKey: { id: "key-bench" },
+      user: {
+        id: "user-bench",
+        organization_id: "org-bench",
+        inference_auth_revision: 1,
+        is_active: true,
+        deleted_at: null,
+        organization: {
+          id: "org-bench",
+          is_active: true,
+          inference_auth_revision: 1,
+        },
+      },
+      apiKey: {
+        id: "key-bench",
+        user_id: "user-bench",
+        organization_id: "org-bench",
+        key_hash: hashApiKey(KEY),
+        is_active: true,
+        deleted_at: null,
+        expires_at: null,
+        inference_auth_revision: 1,
+      },
     };
   },
 }));
@@ -57,6 +74,13 @@ mock.module("./api-keys", () => ({
       usageCalls++;
     },
   },
+}));
+
+const authorizationBoundaryActual = await import("./inference-authorization-boundary");
+mock.module("./inference-authorization-boundary", () => ({
+  ...authorizationBoundaryActual,
+  initializeInferenceAuthorizationBoundary: async () => undefined,
+  applyInferenceAuthorizationStates: async () => undefined,
 }));
 
 const { resolveInferenceAuthContext } = await import("./inference-auth-context");

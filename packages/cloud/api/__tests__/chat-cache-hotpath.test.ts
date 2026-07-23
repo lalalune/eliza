@@ -10,6 +10,8 @@ const languageModelActual = await import("@/lib/providers/language-model");
 
 const ORG = "00000000-0000-4000-8000-0000000000cc";
 const USER = "00000000-0000-4000-8000-0000000000dd";
+const API_KEY_ID = "00000000-0000-4000-8000-0000000000ee";
+const KEY_HASH = "a".repeat(64);
 const RESERVATION = {
   reservedAmount: 0.02,
   reservationTransactionId: "reservation-a",
@@ -129,7 +131,21 @@ let authResolutionImpl: () => Promise<unknown> = async () => ({
   ctx: {
     userId: USER,
     orgId: ORG,
-    apiKeyId: "api-key-a",
+    apiKeyId: API_KEY_ID,
+    authorization: {
+      v: 1,
+      organizationId: ORG,
+      organizationRevision: "1",
+      userId: USER,
+      userRevision: "1",
+      credential: {
+        kind: "api_key",
+        id: API_KEY_ID,
+        fingerprint: KEY_HASH,
+        revision: "1",
+        expiresAt: null,
+      },
+    },
   },
 });
 const resolveInferenceAuthContext = mock(() => authResolutionImpl());
@@ -139,6 +155,9 @@ mock.module("@/lib/services/inference-auth-context", () => ({
 
 const settle = mock(async () => null);
 const settleUnknown = mock(async () => null);
+const markProviderDispatched = mock(async () => {
+  callOrder.push("dispatch");
+});
 const admitOrganizationInference = mock(
   async (_params: Record<string, unknown>) => {
     callOrder.push("admission");
@@ -146,6 +165,7 @@ const admitOrganizationInference = mock(
       mode: "deferred_reservation",
       settle,
       settleUnknown,
+      markProviderDispatched,
       reservation: RESERVATION,
     };
   },
@@ -225,6 +245,7 @@ beforeEach(() => {
   billUsage.mockClear();
   settle.mockClear();
   settleUnknown.mockClear();
+  markProviderDispatched.mockClear();
   admitOrganizationInference.mockClear();
   getCurrentUser.mockClear();
   getAnonymousUser.mockClear();
@@ -244,7 +265,21 @@ beforeEach(() => {
     ctx: {
       userId: USER,
       orgId: ORG,
-      apiKeyId: "api-key-a",
+      apiKeyId: API_KEY_ID,
+      authorization: {
+        v: 1,
+        organizationId: ORG,
+        organizationRevision: "1",
+        userId: USER,
+        userRevision: "1",
+        credential: {
+          kind: "api_key",
+          id: API_KEY_ID,
+          fingerprint: KEY_HASH,
+          revision: "1",
+          expiresAt: null,
+        },
+      },
     },
   });
   anonymousResolutionImpl = async () => {
@@ -303,7 +338,12 @@ describe("/v1/chat Worker cache hot path", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(callOrder).toEqual(["rate-limit", "admission", "provider"]);
+    expect(callOrder).toEqual([
+      "rate-limit",
+      "admission",
+      "dispatch",
+      "provider",
+    ]);
     expect(getCurrentUser).not.toHaveBeenCalled();
     expect(getAnonymousUser).not.toHaveBeenCalled();
     expect(reserveAnonymousMessageSlot).not.toHaveBeenCalled();

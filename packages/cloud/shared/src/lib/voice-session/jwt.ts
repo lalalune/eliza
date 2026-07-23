@@ -36,6 +36,10 @@ import {
   isCloudflareWorkerRuntime,
 } from "../cache/redis-factory";
 import { getCloudAwareEnv } from "../runtime/cloud-bindings";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "../services/inference-authorization-boundary";
 import { logger } from "../utils/logger";
 
 /** Audience claim — a voice-session token is valid ONLY for the voice WS. */
@@ -67,6 +71,12 @@ export interface VoiceSessionTokenClaims {
   agentId: string;
   /** Single conversation this session may write turns into. */
   conversationId: string;
+  /**
+   * Strong inference grant captured at the authenticated mint boundary. The
+   * signed JWT binds this snapshot to the same org/user carried above, so
+   * realtime turns never reconstruct authorization from service headers.
+   */
+  authorization: InferenceAuthorizationProof;
 }
 
 export interface VoiceSessionTokenMintInput extends VoiceSessionTokenClaims {
@@ -124,7 +134,9 @@ function clampTtl(ttlSeconds: number | undefined): number {
   );
 }
 
-function assertNonEmpty(field: keyof VoiceSessionTokenClaims, value: string): void {
+type VoiceSessionStringClaim = Exclude<keyof VoiceSessionTokenClaims, "authorization">;
+
+function assertNonEmpty(field: VoiceSessionStringClaim, value: string): void {
   if (typeof value !== "string" || value.trim() === "") {
     throw new VoiceSessionTokenError(`voice-session ${field} is required`, "invalid_input");
   }
@@ -136,6 +148,16 @@ function assertClaims(claims: VoiceSessionTokenClaims): void {
   assertNonEmpty("userId", claims.userId);
   assertNonEmpty("agentId", claims.agentId);
   assertNonEmpty("conversationId", claims.conversationId);
+  if (
+    !isInferenceAuthorizationProof(claims.authorization) ||
+    claims.authorization.organizationId !== claims.organizationId ||
+    claims.authorization.userId !== claims.userId
+  ) {
+    throw new VoiceSessionTokenError(
+      "voice-session authorization proof is invalid",
+      "invalid_input",
+    );
+  }
 }
 
 /**
@@ -166,6 +188,7 @@ export async function mintVoiceSessionToken(
     userId: input.userId,
     agentId: input.agentId,
     conversationId: input.conversationId,
+    authorization: input.authorization,
   })
     .setProtectedHeader({ alg: getAlgorithm(), kid: getKeyId() })
     .setIssuer(VOICE_SESSION_JWT_ISSUER)
@@ -207,7 +230,7 @@ function readClaim(payload: Record<string, unknown>, key: string): string {
  */
 export async function verifyVoiceSessionToken(
   token: string,
-  expected?: Partial<VoiceSessionTokenClaims>,
+  expected?: Partial<Omit<VoiceSessionTokenClaims, "authorization">>,
   options?: { now?: () => number; store?: CompatibleRedis },
 ): Promise<VoiceSessionTokenVerifyResult> {
   if (!isVoiceSessionJwtConfigured()) {
@@ -252,16 +275,34 @@ export async function verifyVoiceSessionToken(
     );
   }
 
+  const authorization = payload.authorization;
   const claims: VoiceSessionTokenClaims = {
     sessionId: readClaim(payload, "sessionId"),
     organizationId: readClaim(payload, "organizationId"),
     userId: readClaim(payload, "userId"),
     agentId: readClaim(payload, "agentId"),
     conversationId: readClaim(payload, "conversationId"),
+    authorization: isInferenceAuthorizationProof(authorization)
+      ? authorization
+      : (() => {
+          throw new VoiceSessionTokenError(
+            "voice-session token is missing a valid authorization proof",
+            "invalid_token",
+          );
+        })(),
   };
+  if (
+    claims.authorization.organizationId !== claims.organizationId ||
+    claims.authorization.userId !== claims.userId
+  ) {
+    throw new VoiceSessionTokenError(
+      "voice-session authorization proof does not match the session scope",
+      "claim_mismatch",
+    );
+  }
 
   if (expected) {
-    for (const key of Object.keys(expected) as (keyof VoiceSessionTokenClaims)[]) {
+    for (const key of Object.keys(expected) as VoiceSessionStringClaim[]) {
       const want = expected[key];
       if (want !== undefined && claims[key] !== want) {
         throw new VoiceSessionTokenError(

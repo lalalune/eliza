@@ -20,6 +20,7 @@ import { normalizePhoneNumber } from "../../utils/phone-normalization";
 import { apiKeysService } from "../api-keys";
 import { creditsService } from "../credits";
 import { redeemSignupCode } from "../signup-code";
+import { usersService } from "../users";
 import type { TelegramAuthData } from "./telegram-auth";
 
 const ELIZA_APP_INITIAL_CREDITS = 5.0;
@@ -772,7 +773,7 @@ class ElizaAppUserService {
   }
 
   async updateUser(userId: string, data: Partial<NewUser>): Promise<User | undefined> {
-    return usersRepository.update(userId, {
+    return usersService.update(userId, {
       ...data,
       updated_at: new Date(),
     });

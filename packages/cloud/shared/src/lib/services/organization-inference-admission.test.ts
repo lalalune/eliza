@@ -149,6 +149,19 @@ const acquireInferenceAdmissionLease = mock(
     providerDispatched: false,
   }),
 );
+class TestInferenceProviderDispatchNotMarkedError extends Error {
+  readonly code = "INFERENCE_PROVIDER_DISPATCH_NOT_MARKED";
+
+  constructor() {
+    super("Inference settlement requires an explicit pre-provider dispatch acknowledgement");
+    this.name = "InferenceProviderDispatchNotMarkedError";
+  }
+}
+const markInferenceAdmissionLeaseDispatched = mock(
+  async (lease: { providerDispatched: boolean }) => {
+    lease.providerDispatched = true;
+  },
+);
 const settleInferenceAdmissionLease = mock(async () => undefined);
 
 mock.module("./ai-billing", () => ({
@@ -202,6 +215,11 @@ mock.module("./inference-billing-fast-path", () => ({
 }));
 mock.module("./inference-admission-gate", () => ({
   acquireInferenceAdmissionLease,
+  assertInferenceAdmissionLeaseDispatched: (lease: { providerDispatched: boolean }) => {
+    if (!lease.providerDispatched) {
+      throw new TestInferenceProviderDispatchNotMarkedError();
+    }
+  },
   inferenceSettlementAmounts: (_lease: unknown, actualCostUsd: number) => ({
     balanceBackedUsd: actualCostUsd,
     gateConsumedUsd: actualCostUsd,
@@ -211,7 +229,8 @@ mock.module("./inference-admission-gate", () => ({
     readonly requiredUsd = 1;
     readonly availableUsd = 0;
   },
-  markInferenceAdmissionLeaseDispatched: async () => undefined,
+  InferenceProviderDispatchNotMarkedError: TestInferenceProviderDispatchNotMarkedError,
+  markInferenceAdmissionLeaseDispatched,
   settleInferenceAdmissionLease,
 }));
 mock.module("./inference-billing-ledger", () => ({
@@ -299,6 +318,7 @@ beforeEach(() => {
   admitInferenceChargeViaLedger.mockClear();
   optimisticSettle.mockClear();
   acquireInferenceAdmissionLease.mockClear();
+  markInferenceAdmissionLeaseDispatched.mockClear();
   settleInferenceAdmissionLease.mockClear();
   isOptimisticEligible.mockClear();
   listActiveEntriesForProviderModelPairs.mockClear();
@@ -389,6 +409,7 @@ test("warm Worker admission writes only the Durable Object lease before provider
   expect(reserveCredits).not.toHaveBeenCalled();
   expect(isOptimisticEligible).not.toHaveBeenCalled();
 
+  await admission.markProviderDispatched();
   const first = admission.settle(0.01);
   const replay = admission.settle(99);
   await expect(first).resolves.toMatchObject({
@@ -424,6 +445,7 @@ test("unknown provider cost retains the admitted estimate and wins a later zero 
     | undefined;
   if (!leaseParams) throw new Error("expected inference admission lease");
 
+  await admission.markProviderDispatched();
   const unknown = admission.settleUnknown();
   const laterZero = admission.settle(0);
 
@@ -442,6 +464,19 @@ test("unknown provider cost retains the admitted estimate and wins a later zero 
   expect(settleInferenceAdmissionLease.mock.calls[0]?.[1]).toBeCloseTo(
     leaseParams.estimatedCostUsd,
   );
+});
+
+test("positive settlement cannot repair a missing provider dispatch marker", async () => {
+  const model = nextModel();
+  await hydratePricing(model);
+  const admission = await admitOrganizationInference(admissionParams(model, []));
+
+  await expect(admission.settle(0.01)).rejects.toMatchObject({
+    code: "INFERENCE_PROVIDER_DISPATCH_NOT_MARKED",
+  });
+  expect(markInferenceAdmissionLeaseDispatched).not.toHaveBeenCalled();
+  expect(debitInferenceCost).not.toHaveBeenCalled();
+  expect(settleInferenceAdmissionLease).not.toHaveBeenCalled();
 });
 
 test("stale pricing serves immediately and refreshes only under waitUntil", async () => {
@@ -650,6 +685,7 @@ test("warm Worker affiliate admission has zero pre-dispatch repository calls", a
     affiliateAttribution: admission.affiliateAttribution,
     affiliatePayoutSourceId: `ai_billing:affiliate:${leaseParams.requestId}`,
   });
+  await admission.markProviderDispatched();
   const first = admission.reservation?.reconcile(0.02);
   const replay = admission.reservation?.reconcile(99);
   await expect(first).resolves.toMatchObject({ actualCost: 0.02 });
@@ -693,6 +729,7 @@ test("affiliate settlement retries the same post-provider amount after infrastru
   expect(admission.mode).toBe("durable_object_affiliate_debit");
   expect(background).toHaveLength(0);
 
+  await admission.markProviderDispatched();
   await expect(admission.settle(0.02)).rejects.toBe(affiliateDebitError);
   expect(collectAffiliateInferenceFallback).toHaveBeenCalledTimes(1);
   expect(collectAffiliateInferenceFallback.mock.calls[0]?.[0].actualCost).toBe(0.02);

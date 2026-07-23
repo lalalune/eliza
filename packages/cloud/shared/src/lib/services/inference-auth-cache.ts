@@ -7,15 +7,15 @@
  * creating an import cycle with the resolver in `inference-auth-context.ts`.
  *
  * Inference auth-context entries collapse auth + org + moderation into a
- * single cache read for API-key or Steward-session inference. The feature is
- * default-off until a strongly consistent revocation boundary exists (see
- * `packages/cloud/api/docs/inference-hot-path.md`). Its data-shape rules are:
+ * single cache read for API-key or Steward-session inference. Each positive
+ * entry carries the versioned proof checked by the admission Durable Object
+ * immediately before provider dispatch. Its data-shape rules are:
  *   1. A positive entry is ONLY ever written for a FULLY-authorized credential
  *      (active user + active org + not suspended + org present). Explicit
  *      negative entries contain only a bounded 401/403 decision, never identity
  *      fields, so cold Worker retries converge without a database fallback.
- *   2. Entries are keyed by the FULL sha256(key) (== the stored `key_hash`), so
- *      revoke/ban invalidation by `key_hash` is exact.
+ *   2. Entries are keyed by a FULL credential SHA-256 fingerprint. Cache
+ *      invalidation reduces stale retries; the Durable Object owns revocation.
  */
 
 import { createHash } from "node:crypto";
@@ -27,9 +27,13 @@ import {
 } from "../cache/client";
 import { CacheKeys, CacheTTL } from "../cache/keys";
 import { logger } from "../utils/logger";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "./inference-authorization-boundary";
 
 /** Current IAC schema version. Bump the key suffix in CacheKeys on a breaking change. */
-export const INFERENCE_AUTH_CONTEXT_VERSION = 1 as const;
+export const INFERENCE_AUTH_CONTEXT_VERSION = 2 as const;
 
 /**
  * A cached, fully-authorized inference identity. Presence of this entry means
@@ -43,6 +47,7 @@ export interface InferenceAuthContext {
   apiKeyId: string;
   /** Full sha256(presented key) - equals the stored api_keys.key_hash. */
   keyHash: string;
+  authorization: InferenceAuthorizationProof;
 }
 
 export interface InferenceApiKeyAuthRejection {
@@ -65,6 +70,7 @@ export interface InferenceSessionAuthContext {
   orgId: string;
   apiKeyId: null;
   stewardUserId: string;
+  authorization: InferenceAuthorizationProof;
 }
 
 export interface InferenceSessionAuthRejection {
@@ -73,6 +79,7 @@ export interface InferenceSessionAuthRejection {
   stewardUserId: string;
   decision: "rejected" | "suspended";
   status: 401 | 403;
+  credentialFingerprint: string;
 }
 
 export type InferenceSessionAuthDecision =
@@ -109,9 +116,9 @@ export function hashApiKey(rawKey: string): string {
   return createHash("sha256").update(rawKey).digest("hex");
 }
 
-/** One-way cache-key material for a verified Steward subject. */
-export function hashStewardUserId(stewardUserId: string): string {
-  return createHash("sha256").update(stewardUserId).digest("hex");
+/** Immutable one-way identity for one Steward session credential. */
+export function hashInferenceSessionCredential(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
 }
 
 /**
@@ -137,7 +144,13 @@ export function isInferenceAuthContext(value: unknown): value is InferenceAuthCo
     typeof v.apiKeyId === "string" &&
     v.apiKeyId.length > 0 &&
     typeof v.keyHash === "string" &&
-    /^[0-9a-f]{64}$/.test(v.keyHash)
+    /^[0-9a-f]{64}$/.test(v.keyHash) &&
+    isInferenceAuthorizationProof(v.authorization) &&
+    v.authorization.organizationId === v.orgId &&
+    v.authorization.userId === v.userId &&
+    v.authorization.credential.kind === "api_key" &&
+    v.authorization.credential.id === v.apiKeyId &&
+    v.authorization.credential.fingerprint === v.keyHash
   );
 }
 
@@ -175,7 +188,12 @@ export function isInferenceSessionAuthContext(
     v.orgId.length > 0 &&
     v.apiKeyId === null &&
     typeof v.stewardUserId === "string" &&
-    v.stewardUserId.length > 0
+    v.stewardUserId.length > 0 &&
+    isInferenceAuthorizationProof(v.authorization) &&
+    v.authorization.organizationId === v.orgId &&
+    v.authorization.userId === v.userId &&
+    v.authorization.credential.kind === "steward_session" &&
+    v.authorization.credential.id === v.authorization.credential.fingerprint
   );
 }
 
@@ -190,6 +208,8 @@ function isInferenceSessionAuthRejection(value: unknown): value is InferenceSess
     v.cachedAt > 0 &&
     typeof v.stewardUserId === "string" &&
     v.stewardUserId.length > 0 &&
+    typeof v.credentialFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(v.credentialFingerprint) &&
     (v.decision === "rejected" || v.decision === "suspended") &&
     (v.status === 401 || v.status === 403)
   );
@@ -291,23 +311,25 @@ export async function writeInferenceApiKeyAuthRejection(
 
 /** Read a session IAC without consulting any authoritative store. */
 export async function readInferenceSessionAuthContext(
-  stewardUserId: string,
+  credentialFingerprint: string,
 ): Promise<InferenceSessionAuthContext | null> {
-  const decision = await readInferenceSessionAuthDecision(stewardUserId);
+  const decision = await readInferenceSessionAuthDecision(credentialFingerprint);
   return decision && "apiKeyId" in decision ? decision : null;
 }
 
 /** Read the cached positive or fail-closed session decision. */
 export async function readInferenceSessionAuthDecision(
-  stewardUserId: string,
+  credentialFingerprint: string,
 ): Promise<InferenceSessionAuthDecision | null> {
-  const key = CacheKeys.inference.sessionAuthContext(hashStewardUserId(stewardUserId));
+  const key = CacheKeys.inference.sessionAuthContext(credentialFingerprint);
   const outcome = await cache.getWithOutcome<unknown>(key, { keyClass: "inference_auth" });
   const cached = outcome.kind === "hit" ? outcome.value : null;
   if (cached === null) return null;
   if (
     (!isInferenceSessionAuthContext(cached) && !isInferenceSessionAuthRejection(cached)) ||
-    cached.stewardUserId !== stewardUserId
+    ("apiKeyId" in cached
+      ? cached.authorization.credential.fingerprint
+      : cached.credentialFingerprint) !== credentialFingerprint
   ) {
     logger.warn("[InferenceAuthCache] Dropping malformed session IAC entry");
     await cache.del(key, { keyClass: "inference_auth" });
@@ -327,55 +349,33 @@ export async function writeInferenceSessionAuthContext(
 export async function writeInferenceSessionAuthDecision(
   decision: InferenceSessionAuthDecision,
 ): Promise<CacheWriteOutcome> {
+  const credentialFingerprint =
+    "apiKeyId" in decision
+      ? decision.authorization.credential.fingerprint
+      : decision.credentialFingerprint;
   return await cache.setWithOutcome(
-    CacheKeys.inference.sessionAuthContext(hashStewardUserId(decision.stewardUserId)),
+    CacheKeys.inference.sessionAuthContext(credentialFingerprint),
     decision,
     CacheTTL.inference.authContext,
     { keyClass: "inference_auth" },
   );
 }
 
-/** Exact lifecycle invalidation for every active token belonging to a user. */
+/** Exact cache cleanup for one presented Steward credential fingerprint. */
 export async function invalidateInferenceSessionAuthContext(
-  stewardUserId: string,
+  credentialFingerprint: string,
 ): Promise<boolean> {
-  return await cache.delConfirmed(
-    CacheKeys.inference.sessionAuthContext(hashStewardUserId(stewardUserId)),
-    { keyClass: "inference_auth" },
-  );
+  return await cache.delConfirmed(CacheKeys.inference.sessionAuthContext(credentialFingerprint), {
+    keyClass: "inference_auth",
+  });
 }
 
-/**
- * Fail closed when any user in a lifecycle mutation cannot be evicted. The
- * authoritative mutation caller decides whether cache failure may abort or is
- * an explicitly logged teardown-style best effort.
- */
-export async function invalidateInferenceSessionAuthContexts(
-  stewardUserIds: readonly string[],
-): Promise<void> {
-  const unique = [...new Set(stewardUserIds.filter((id) => id.length > 0))];
-  const results = await Promise.all(unique.map((id) => invalidateInferenceSessionAuthContext(id)));
-  const unconfirmed = unique.filter((_id, index) => !results[index]);
-  if (unconfirmed.length > 0) {
-    throw new Error(
-      `Inference session auth-context invalidation not confirmed for ${unconfirmed.length}/${unique.length} user(s)`,
-    );
-  }
-}
-
-/**
- * Exact invalidation by the stored `key_hash`. Called from every api-key
- * mutation (revoke/update/delete/deactivate) so a revoked key stops fast-pathing
- * immediately rather than waiting out the TTL.
- */
 /**
  * Invalidate the inference auth-context entry for a single key hash.
  *
  * @returns `true` when the delete is confirmed, `false` when the backend
- *   rejected it. Callers on a credential-revocation path (see
- *   {@link ../api-keys}) must fail closed on `false` — a discarded failure here
- *   let a revoked key keep fast-pathing inference until the IAC TTL lapsed
- *   (#13417).
+ *   rejected it. The authorization boundary remains authoritative when a
+ *   replicated cache delete cannot be confirmed.
  */
 export async function invalidateInferenceAuthContextByKeyHash(keyHash: string): Promise<boolean> {
   return await cache.delConfirmed(CacheKeys.inference.authContext(keyHash), {
@@ -387,15 +387,9 @@ export async function invalidateInferenceAuthContextByKeyHash(keyHash: string): 
  * Fan-out invalidation for every supplied key hash (used at ban / deactivate,
  * where the caller resolves the user's key hashes from the DB).
  *
- * FAILS CLOSED: every hash is attempted, but if ANY per-key delete is
- * unconfirmed (backend rejected it or the cache is configured-but-unavailable)
- * this THROWS naming the still-warm hashes. Ban/deactivate callers simply
- * `await` this and do not inspect a return value, so a thrown error is what
- * makes them fail closed instead of completing the ban while warm IAC entries
- * keep authorizing until TTL. Callers that intentionally want best-effort
- * (e.g. a lifecycle write that must not be blocked by a cache brownout) wrap
- * this in their own try/catch — that stays a deliberate, visible choice rather
- * than a silently-swallowed one. (#13417)
+ * Every hash is attempted, but an unconfirmed delete still throws so cache
+ * maintenance failures stay observable. Authorization lifecycle callers may
+ * log that cleanup failure after their strongly ordered deny is durable.
  *
  * @throws when any key's invalidation is not confirmed.
  */

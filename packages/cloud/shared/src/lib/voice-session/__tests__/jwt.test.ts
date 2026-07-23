@@ -51,6 +51,20 @@ const CLAIMS = {
   userId: "user-1",
   agentId: "agent-1",
   conversationId: "conv-1",
+  authorization: {
+    v: 1 as const,
+    organizationId: "org-1",
+    organizationRevision: "0",
+    userId: "user-1",
+    userRevision: "0",
+    credential: {
+      kind: "api_key" as const,
+      id: "key-1",
+      fingerprint: "a".repeat(64),
+      revision: "0",
+      expiresAt: null,
+    },
+  },
 };
 
 const savedEnv: Record<string, string | undefined> = {};
@@ -93,6 +107,18 @@ describe("voice-session jwt", () => {
     });
     expect(verified.claims).toEqual(CLAIMS);
     expect(verified.jti).toBe(minted.jti);
+  });
+
+  test("refuses to sign an authorization proof outside the session scope", async () => {
+    await expect(
+      mintVoiceSessionToken({
+        ...CLAIMS,
+        authorization: {
+          ...CLAIMS.authorization,
+          userId: "different-user",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
   });
 
   test("clamps TTL to the <=120s ceiling", async () => {

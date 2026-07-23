@@ -365,6 +365,37 @@ describe("cloud-api worker entrypoint", () => {
     expect(embeddings).toContain('bindingName: "CHAT_ROUTE_RATE_LIMITER"');
   });
 
+  test("activates the fail-closed authorization boundary in deployed Workers", async () => {
+    type InferenceVars = {
+      CACHE_BACKEND?: string;
+      INFERENCE_AUTH_CACHE_ENABLED?: string;
+      INFERENCE_DEFERRED_ADMISSION?: string;
+      INFERENCE_HOT_PATH_CACHES?: string;
+    };
+    const config = Bun.TOML.parse(
+      await Bun.file(new URL("../wrangler.toml", import.meta.url)).text(),
+    ) as {
+      vars?: InferenceVars;
+      env?: {
+        staging?: { vars?: InferenceVars };
+        production?: { vars?: InferenceVars };
+      };
+    };
+
+    expect(config.vars?.INFERENCE_AUTH_CACHE_ENABLED).toBe("false");
+    for (const vars of [
+      config.env?.staging?.vars,
+      config.env?.production?.vars,
+    ]) {
+      expect(vars).toMatchObject({
+        CACHE_BACKEND: "kv",
+        INFERENCE_AUTH_CACHE_ENABLED: "true",
+        INFERENCE_DEFERRED_ADMISSION: "true",
+        INFERENCE_HOT_PATH_CACHES: "true",
+      });
+    }
+  });
+
   test("feed.elizacloud.ai is inert when FEED_ORIGIN_HOST is unset", () => {
     // No env / empty host => falls through to the cloud-api app (no regression).
     expect(

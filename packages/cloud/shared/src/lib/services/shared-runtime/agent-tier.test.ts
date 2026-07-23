@@ -82,6 +82,7 @@ describe("runSharedAgentTurn (degraded path — no model configured)", () => {
       character: { name: "Nova", system: "You are Nova, a concise helper." },
       history: [],
       message: "  hello there  ",
+      onProviderDispatch: async () => undefined,
     });
     expect(result.degraded).toBe(true);
     expect(result.reply).toContain("Nova");

@@ -20,6 +20,11 @@ const databaseUrl =
 process.env.DATABASE_URL = databaseUrl;
 process.env.TEST_DATABASE_URL = databaseUrl;
 process.env.NODE_ENV ||= "test";
+const originalInferenceAuthCacheFlag = process.env.INFERENCE_AUTH_CACHE_ENABLED;
+// Strong-boundary transition ordering has dedicated lifecycle coverage. This
+// suite isolates the database/KMS single-winner protocol and must not inherit a
+// production-only Worker binding requirement from another Bun test file.
+process.env.INFERENCE_AUTH_CACHE_ENABLED = "false";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_USER_ID = "44444444-4444-4444-8444-444444444444";
@@ -70,7 +75,7 @@ let closeDb:
   | typeof import("../../../../shared/src/db/client").closeDatabaseConnectionsForTests
   | undefined;
 let cliAuthSessionsRepository: typeof import("../../../../shared/src/db/repositories/cli-auth-sessions").cliAuthSessionsRepository;
-let apiKeysRepository: typeof import("../../../../shared/src/db/repositories/api-keys").apiKeysRepository;
+let apiKeysService: typeof import("../../../../shared/src/lib/services/api-keys").apiKeysService;
 let cliAuthSessionsService: typeof import("../../../../shared/src/lib/services/cli-auth-sessions").cliAuthSessionsService;
 let pollApp: Hono;
 let legacyPollApp: Hono;
@@ -85,6 +90,7 @@ beforeAll(async () => {
     key_kms_key_id text, key_kms_key_version integer, organization_id uuid NOT NULL,
     user_id uuid NOT NULL, rate_limit integer NOT NULL DEFAULT 1000,
     is_active boolean NOT NULL DEFAULT true, usage_count integer NOT NULL DEFAULT 0,
+    inference_auth_revision bigint NOT NULL DEFAULT 0,
     expires_at timestamp, last_used_at timestamp, created_at timestamp NOT NULL DEFAULT now(),
     updated_at timestamp NOT NULL DEFAULT now(), deleted_at timestamp
   )`);
@@ -98,8 +104,8 @@ beforeAll(async () => {
   ({ cliAuthSessionsRepository } = await import(
     "../../../../shared/src/db/repositories/cli-auth-sessions"
   ));
-  ({ apiKeysRepository } = await import(
-    "../../../../shared/src/db/repositories/api-keys"
+  ({ apiKeysService } = await import(
+    "../../../../shared/src/lib/services/api-keys"
   ));
   ({ cliAuthSessionsService } = await import(
     "../../../../shared/src/lib/services/cli-auth-sessions"
@@ -118,6 +124,11 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await closeDb?.();
+  if (originalInferenceAuthCacheFlag === undefined) {
+    delete process.env.INFERENCE_AUTH_CACHE_ENABLED;
+  } else {
+    process.env.INFERENCE_AUTH_CACHE_ENABLED = originalInferenceAuthCacheFlag;
+  }
 });
 
 beforeEach(async () => {
@@ -362,7 +373,7 @@ describe("CLI session single-use plaintext retrieval with real persistence", () 
       `/api/auth/cli-session/${sessionId}`,
     );
     await within(decryptStarted, "regeneration rendezvous");
-    await apiKeysRepository.update(API_KEY_ID, {
+    await apiKeysService.update(API_KEY_ID, {
       key_hash: "regenerated-hash",
       key_prefix: "eliza_regenerated",
       key_ciphertext: "regenerated-ciphertext",

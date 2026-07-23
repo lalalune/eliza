@@ -321,6 +321,8 @@ jobs:
       ELIZA_GATEWAY_DEPLOY_SHA: ${{ inputs.expected_gateway_sha }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      AUTH_HIT_COUNT: "30"
+      AUTH_MISS_COUNT: "10"
     steps:
       - name: Checkout exact requested ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -719,7 +721,7 @@ jobs:
           console.log("Verified exact isolated deployment and cache environment");
           NODE
 
-      - name: Capture 30 cache hits and 10 unique controlled KV misses
+      - name: Capture requested warm hits and cache-only KV misses
         id: auth-probe
         env:
           AUTH_PROBE_BASE_URL: ${{ steps.deployment.outputs.base-url }}
@@ -793,8 +795,8 @@ jobs:
             --suspended-api-key-env AUTH_PROBE_SUSPENDED_API_KEY \
             --probe-token-env INFERENCE_AUTH_PROBE_TOKEN \
             --deploy-sha "$GITHUB_SHA" \
-            --hit-count 30 \
-            --miss-count 10 \
+            --hit-count "$AUTH_HIT_COUNT" \
+            --miss-count "$AUTH_MISS_COUNT" \
             --timeout-ms 30000 \
             --interval-ms 250 \
             --enforce \
@@ -809,7 +811,6 @@ jobs:
           import { readFileSync, writeFileSync } from "node:fs";
           import {
             sanitizeInferenceAuthTail,
-            summarizeDeferredCacheWrites,
           } from "./packages/scripts/cloud/inference-auth-latency.mjs";
           const report = readFileSync(process.argv[3], "utf8")
             .split(/\r?\n/)
@@ -818,15 +819,39 @@ jobs:
           const traceIds = report
             .filter((record) => record.kind === "sample" || record.kind === "guard")
             .map((record) => record.traceId);
-          if (traceIds.length !== 43) throw new Error("Auth report did not retain exactly 43 probe traces");
+          const summary = report.findLast((record) => record.kind === "summary");
+          if (!summary) throw new Error("Auth report has no summary record");
+          const samples = report.filter((record) => record.kind === "sample");
+          const guards = report.filter((record) => record.kind === "guard");
+          const expectedSamples = summary.counts.warmHit + summary.counts.cacheOnlyMiss;
+          if (samples.length !== expectedSamples) {
+            throw new Error("Auth report sample traces do not match its summary");
+          }
+          if (guards.length === 0) {
+            throw new Error("Auth report has no guard traces");
+          }
+          for (const guard of ["invalid_key", "suspended_key"]) {
+            const sequence = guards.filter((record) => record.guard === guard);
+            if (
+              sequence.length < 2 ||
+              sequence[0].stage !== "warming" ||
+              sequence.at(-1).stage !== "settled"
+            ) {
+              throw new Error(`${guard} evidence did not warm and then settle`);
+            }
+          }
+          const forged = guards.filter((record) => record.guard === "forged_probe");
+          if (forged.length !== 1 || forged[0].stage !== "settled") {
+            throw new Error("Forged-probe evidence did not retain one settled control");
+          }
+          if (new Set(traceIds).size !== traceIds.length) {
+            throw new Error("Auth report retained duplicate probe trace ids");
+          }
           const logs = sanitizeInferenceAuthTail(
             readFileSync(process.argv[2], "utf8"),
             traceIds,
             process.env.GITHUB_SHA,
           );
-          const summary = report.findLast((record) => record.kind === "summary");
-          if (!summary) throw new Error("Auth report has no summary record");
-          summary.missCacheWriteMs = summarizeDeferredCacheWrites(logs);
           writeFileSync(
             process.argv[3],
             report.map((record) => JSON.stringify(record)).join("\n") + "\n",
@@ -894,16 +919,21 @@ jobs:
           console.log("| path | count | p50 | p90 | p95 | max |");
           console.log("| --- | ---: | ---: | ---: | ---: | ---: |");
           for (const [path, count, metric] of [
-            ["cache hit", summary.counts.hit, summary.hitAuthResolveMs],
-            ["authoritative miss", summary.counts.miss, summary.missAuthResolveMs],
-            ["miss: key lookup", summary.counts.miss, summary.missKeyLookupMs],
-            ["miss: user/org", summary.counts.miss, summary.missUserOrgMs],
-            ["miss: moderation", summary.counts.miss, summary.missModerationMs],
-            ["miss: KV read", summary.counts.miss, summary.missCacheReadMs],
-            ["miss: KV write", summary.counts.miss, summary.missCacheWriteMs],
+            ["warm cache hit: auth resolve", summary.counts.warmHit, summary.warmHitAuthResolveMs],
+            ["warm cache hit: request", summary.counts.warmHit, summary.warmHitTotalMs],
+            ["cache-only miss: auth resolve", summary.counts.cacheOnlyMiss, summary.cacheOnlyMissAuthResolveMs],
+            ["cache-only miss: request", summary.counts.cacheOnlyMiss, summary.cacheOnlyMissTotalMs],
+            ["cache-only miss: KV read", summary.counts.cacheOnlyMiss, summary.cacheOnlyMissCacheReadMs],
           ]) {
             console.log(`| ${path} | ${count} | ${metric.p50} | ${metric.p90} | ${metric.p95} | ${metric.max} |`);
           }
+          console.log("");
+          console.log(
+            `Cache-only invariants: ${summary.invariants.warmAuthorizedCache}/${summary.counts.warmHit} warm hits authorized from cache; ` +
+              `${summary.invariants.warmHitWithoutDatabaseTimings}/${summary.counts.warmHit} warm hits reported no database timings; ` +
+              `${summary.invariants.cacheOnlyWarming}/${summary.counts.cacheOnlyMiss} controlled misses returned warming; ` +
+              `${summary.invariants.cacheOnlyMissWithoutDatabaseTimings}/${summary.counts.cacheOnlyMiss} controlled misses reported no database timings.`,
+          );
           NODE
 
       - name: Upload exact-version auth evidence

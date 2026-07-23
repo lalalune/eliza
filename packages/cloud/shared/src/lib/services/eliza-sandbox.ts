@@ -34,11 +34,12 @@ import {
 import { dockerNodes } from "../../db/schemas/docker-nodes";
 import { jobs } from "../../db/schemas/jobs";
 import { imageRepo } from "../../db/utils/docker-image-ref";
+import type { RuntimeDurableObjectNamespace } from "../../types/cloud-worker-env";
 import { ApiError } from "../api/cloud-worker-errors";
 import { InsufficientCreditsError as InsufficientCreditsApiError } from "../api/errors";
 import { containersEnv } from "../config/containers-env";
 import { getElizaAgentPublicWebUiUrl } from "../eliza-agent-web-ui";
-import { getCloudAwareEnv } from "../runtime/cloud-bindings";
+import { getCloudAwareEnv, getCloudBinding } from "../runtime/cloud-bindings";
 import { assertSafeOutboundUrl } from "../security/outbound-url";
 import { createCreditReservationSettler } from "../utils/credit-reservation";
 import { logger } from "../utils/logger";
@@ -83,6 +84,9 @@ import {
   elizaCodingContainerImageAdvisoryLockSql,
   elizaProvisionAdvisoryLockSql,
 } from "./eliza-provision-lock";
+import { resolveInferenceAuthContext } from "./inference-auth-context";
+import type { InferenceAuthorizationProof } from "./inference-authorization-boundary";
+import { isInferenceAuthCacheEnabled } from "./inference-hot-path-caches";
 import {
   applyManagedAgentInferenceEnvDefaults,
   type ManagedElizaEnvironmentResult,
@@ -98,6 +102,10 @@ import {
   type SandboxProvider,
 } from "./sandbox-provider";
 import { SandboxReplacementCleanupUnresolvedError } from "./sandbox-provider-types";
+import {
+  coordinateSharedBridge,
+  coordinateSharedStream,
+} from "./shared-runtime/conversation-coordinator";
 import { isDedicatedBootstrapWindow } from "./shared-runtime/dedicated-bootstrap";
 import {
   type RunSharedAgentTurnResult,
@@ -109,6 +117,7 @@ import {
   type SharedTurnMessage,
 } from "./shared-runtime/run-shared-agent-turn";
 import { navIntentActionResult } from "./shared-runtime/shared-nav-intent";
+import { SharedRuntimeCacheWarmingError } from "./shared-runtime/shared-runtime-errors";
 import { applyPooledCredentialsToBootstrapEnv } from "./team-credential-pool/bootstrap-env";
 import {
   formatWakeRestoreIntegrityError,
@@ -409,6 +418,8 @@ export type BridgeExecutionContext = { waitUntil(promise: Promise<unknown>): voi
  * outage.
  */
 export const BRIDGE_INSUFFICIENT_CREDITS_CODE = -32002;
+/** Retryable cache/Worker-context denial before any shared provider dispatch. */
+export const BRIDGE_CACHE_WARMING_CODE = -32003;
 
 export interface BridgeResponse {
   jsonrpc: "2.0";
@@ -3184,6 +3195,111 @@ export class ElizaSandboxService {
     };
   }
 
+  /**
+   * Resolve the platform-managed per-agent API key from the persisted runtime
+   * environment. This credential is already lifecycle-coupled to the sandbox;
+   * using its IAC snapshot keeps connector/service turns on the same revocation
+   * boundary as direct user inference without inventing an unversioned service
+   * principal.
+   */
+  private managedSharedInferenceCredential(rec: AgentSandbox): string {
+    const environment = rec.environment_vars as Record<string, string> | null;
+    const credential = environment?.ELIZAOS_CLOUD_API_KEY?.trim();
+    if (!credential) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Managed agent inference authorization is unavailable. Retry shortly.",
+      );
+    }
+    return credential;
+  }
+
+  private async resolveManagedSharedAuthorization(
+    rec: AgentSandbox,
+    executionCtx: BridgeExecutionContext | undefined,
+  ): Promise<InferenceAuthorizationProof> {
+    if (!executionCtx) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Shared runtime authorization context is unavailable. Retry shortly.",
+      );
+    }
+    const credential = this.managedSharedInferenceCredential(rec);
+    const resolution = await resolveInferenceAuthContext(
+      new Request("https://shared-runtime.internal/authorize", {
+        headers: { "X-API-Key": credential },
+      }),
+      {
+        cacheOnly: true,
+        executionCtx,
+      },
+    );
+    if (
+      resolution.kind !== "authorized" ||
+      resolution.ctx.orgId !== rec.organization_id ||
+      resolution.ctx.userId !== rec.user_id
+    ) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Managed agent inference authorization is unavailable. Retry shortly.",
+      );
+    }
+    return resolution.ctx.authorization;
+  }
+
+  private sharedConversationCoordinator(): RuntimeDurableObjectNamespace {
+    const namespace = getCloudBinding<RuntimeDurableObjectNamespace>(
+      "SHARED_RUNTIME_CONVERSATIONS",
+    );
+    if (!namespace) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Shared runtime conversation coordinator is unavailable. Retry shortly.",
+      );
+    }
+    return namespace;
+  }
+
+  private async bridgeStrongSharedMessageSend(
+    rec: AgentSandbox,
+    rpc: BridgeRequest,
+    executionCtx: BridgeExecutionContext | undefined,
+  ): Promise<BridgeResponse> {
+    if (!executionCtx) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Shared runtime execution context is unavailable. Retry shortly.",
+      );
+    }
+    const authorization = await this.resolveManagedSharedAuthorization(rec, executionCtx);
+    return await coordinateSharedBridge(rec, rpc, {
+      authorization,
+      namespace: this.sharedConversationCoordinator(),
+      executionCtx,
+    });
+  }
+
+  private async bridgeStrongSharedMessageStream(
+    rec: AgentSandbox,
+    rpc: BridgeRequest,
+    executionCtx: BridgeExecutionContext | undefined,
+  ): Promise<Response> {
+    if (!executionCtx) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Shared runtime execution context is unavailable. Retry shortly.",
+      );
+    }
+    const authorization = await this.resolveManagedSharedAuthorization(rec, executionCtx);
+    return await coordinateSharedStream(rec, rpc, {
+      authorization,
+      namespace: this.sharedConversationCoordinator(),
+      executionCtx,
+    });
+  }
+
+  private async authorizeLegacySharedProviderDispatch(): Promise<void> {
+    if (isInferenceAuthCacheEnabled()) {
+      throw new SharedRuntimeCacheWarmingError(
+        "Versioned inference authorization is required before provider dispatch.",
+      );
+    }
+  }
+
   private async bridgeSharedMessageSend(
     rec: AgentSandbox,
     rpc: BridgeRequest,
@@ -3265,6 +3381,7 @@ export class ElizaSandboxService {
         character,
         history,
         message: text,
+        onProviderDispatch: () => this.authorizeLegacySharedProviderDispatch(),
       });
       if (turn.degraded) {
         // A failed/degraded turn isn't persisted or billed — just refund the hold.
@@ -3436,6 +3553,7 @@ export class ElizaSandboxService {
         character,
         history,
         message: text,
+        onProviderDispatch: () => this.authorizeLegacySharedProviderDispatch(),
       });
       if (turn.degraded) {
         await settleReservation(0);
@@ -4371,6 +4489,62 @@ export class ElizaSandboxService {
 
   // Bridge
 
+  /**
+   * Dispatch a shared target that was already resolved by the request's
+   * cache-only identity boundary. Keeping the row as an explicit argument
+   * prevents connector/service hot paths from repeating a repository lookup
+   * immediately before the inference coordinator.
+   */
+  async bridgeResolvedShared(
+    rec: AgentSandbox,
+    rpc: BridgeRequest,
+    executionCtx?: BridgeExecutionContext,
+  ): Promise<BridgeResponse> {
+    if (rec.execution_tier !== "shared" && !isDedicatedBootstrapWindow(rec)) {
+      return {
+        jsonrpc: "2.0",
+        id: rpc.id,
+        error: {
+          code: -32602,
+          message: "Resolved sandbox is not a shared-runtime agent",
+        },
+      };
+    }
+    try {
+      if (rpc.method === "status.get" || rpc.method === "heartbeat") {
+        return await this.bridgeSharedStatus(rec, rpc);
+      }
+      if (rpc.method === "message.send") {
+        if (isInferenceAuthCacheEnabled()) {
+          return await this.bridgeStrongSharedMessageSend(rec, rpc, executionCtx);
+        }
+        return await this.bridgeSharedMessageSend(rec, rpc, executionCtx);
+      }
+      return {
+        jsonrpc: "2.0",
+        id: rpc.id,
+        error: { code: -32601, message: `Method not found: ${rpc.method}` },
+      };
+    } catch (error) {
+      logger.warn("[agent-sandbox] Resolved shared bridge request failed", {
+        agentId: rec.id,
+        method: rpc.method,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        jsonrpc: "2.0",
+        id: rpc.id,
+        error:
+          error instanceof SharedRuntimeCacheWarmingError
+            ? {
+                code: BRIDGE_CACHE_WARMING_CODE,
+                message: error.message,
+              }
+            : { code: -32000, message: "Sandbox bridge is unreachable" },
+      };
+    }
+  }
+
   async bridge(
     agentId: string,
     orgId: string,
@@ -4401,17 +4575,7 @@ export class ElizaSandboxService {
 
     try {
       if (rec.execution_tier === "shared") {
-        if (rpc.method === "status.get" || rpc.method === "heartbeat") {
-          return await this.bridgeSharedStatus(rec, rpc);
-        }
-        if (rpc.method === "message.send") {
-          return await this.bridgeSharedMessageSend(rec, rpc, executionCtx);
-        }
-        return {
-          jsonrpc: "2.0",
-          id: rpc.id,
-          error: { code: -32601, message: `Method not found: ${rpc.method}` },
-        };
+        return await this.bridgeResolvedShared(rec, rpc, executionCtx);
       }
 
       if (!rec.bridge_url) {
@@ -4469,6 +4633,9 @@ export class ElizaSandboxService {
         return await this.bridgeSharedStatus(rec, rpc);
       }
       if (rpc.method === "message.send") {
+        if (isInferenceAuthCacheEnabled()) {
+          return await this.bridgeStrongSharedMessageSend(rec, rpc, executionCtx);
+        }
         return await this.bridgeSharedMessageSend(rec, rpc, executionCtx);
       }
       return {
@@ -5651,6 +5818,9 @@ export class ElizaSandboxService {
     const fallbackText = this.buildBridgeNoReplyFallbackText(params);
 
     if (rec.execution_tier === "shared") {
+      if (isInferenceAuthCacheEnabled()) {
+        return await this.bridgeStrongSharedMessageStream(rec, rpc, executionCtx);
+      }
       const response = await this.bridgeSharedMessageStream(rec, rpc, executionCtx);
       return response ?? (fallbackText ? this.createBridgeSseTextResponse(fallbackText) : null);
     }

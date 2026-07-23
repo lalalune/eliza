@@ -1,6 +1,9 @@
 /**
- * POST /api/auth/steward-session — set steward-token cookie from a steward JWT.
- * DELETE /api/auth/steward-session — clear steward cookies (logout).
+ * Exchanges verified Steward JWTs for environment-scoped browser sessions.
+ *
+ * Session deletion advances the exact inference revocation boundary before
+ * clearing cookies, preserving the credential when a retryable revocation
+ * failure prevents logout from completing.
  */
 
 import type {
@@ -9,8 +12,10 @@ import type {
   StewardSessionResponse,
 } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
-import { deleteCookie, setCookie } from "hono/cookie";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { revokeStewardRefreshToken } from "@/api/auth/steward-refresh-token-revocation";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
+import { invalidateSessionCaches } from "@/lib/auth";
 import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
 import {
   type StewardVerifyEnv,
@@ -26,6 +31,7 @@ import {
   RateLimitPresets,
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
+import { revokeInferenceStewardSession } from "@/lib/services/inference-session-revocation";
 import { describeSyncError, syncUserFromSteward } from "@/lib/steward-sync";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -327,7 +333,7 @@ app.post("/", async (c) => {
   }
 });
 
-app.delete("/", (c) => {
+app.delete("/", async (c) => {
   const isProduction = c.env.NODE_ENV === "production";
   const originCheck = checkOrigin(c, isProduction);
   if (!originCheck.ok) {
@@ -341,6 +347,59 @@ app.delete("/", (c) => {
   // still owns and clears them; non-production clears only its suffixed names
   // and lets the bounded legacy read fallback expire naturally (#13728).
   const names = stewardCookieNames(c.env.ENVIRONMENT);
+  const token =
+    getCookie(c, names.token) ??
+    (canMutateLegacyStewardCookies(c.env.ENVIRONMENT)
+      ? getCookie(c, LEGACY_STEWARD_COOKIES.token)
+      : undefined);
+  const refreshToken =
+    getCookie(c, names.refreshToken) ??
+    (canMutateLegacyStewardCookies(c.env.ENVIRONMENT)
+      ? getCookie(c, LEGACY_STEWARD_COOKIES.refreshToken)
+      : undefined);
+  if (token) {
+    if (!stewardSecretConfigured(c.env)) {
+      return c.json(
+        {
+          error: "Server-side session revocation is not configured",
+        },
+        503,
+      );
+    }
+    try {
+      await revokeInferenceStewardSession(token, c.env);
+    } catch (error) {
+      // error-policy:J1 exact revocation is the logout security boundary. A
+      // retryable failure keeps browser credentials intact for another attempt.
+      logger.error("[steward-auth] Durable session revocation failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        {
+          error:
+            "Server-side session revocation did not complete; retry logout",
+        },
+        503,
+      );
+    }
+  }
+  if (refreshToken) {
+    try {
+      await revokeStewardRefreshToken(refreshToken, c.env);
+    } catch (error) {
+      // error-policy:J1 local cookie deletion cannot stand in for authoritative
+      // refresh-token revocation because copied refresh credentials remain live.
+      logger.error("[steward-auth] Steward refresh revocation failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        {
+          error: "Refresh-session revocation did not complete; retry logout",
+        },
+        503,
+      );
+    }
+  }
   deleteCookie(c, names.token, opts);
   deleteCookie(c, names.refreshToken, opts);
   deleteCookie(c, names.authed, opts);
@@ -348,6 +407,20 @@ app.delete("/", (c) => {
     deleteCookie(c, LEGACY_STEWARD_COOKIES.token, opts);
     deleteCookie(c, LEGACY_STEWARD_COOKIES.refreshToken, opts);
     deleteCookie(c, LEGACY_STEWARD_COOKIES.authed, opts);
+  }
+  if (token) {
+    try {
+      await invalidateSessionCaches(token);
+    } catch (error) {
+      // error-policy:J6 the exact boundary already rejects replay; legacy cache
+      // deletion is teardown hygiene and expires independently.
+      logger.warn(
+        "[steward-auth] Session cache invalidation failed after revocation",
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
   }
   logStewardAuth("deleted", null);
   return c.json({ ok: true });

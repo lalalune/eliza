@@ -96,6 +96,44 @@ mock.module("../../services/api-keys", () => ({
   apiKeysService: { validateApiKey },
 }));
 
+const AUTHORIZATION_FINGERPRINT = createHash("sha256").update("eliza_testkey").digest("hex");
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: "org-1",
+  organizationRevision: "7",
+  userId: "user-1",
+  userRevision: "5",
+  credential: {
+    kind: "api_key" as const,
+    id: "key-1",
+    fingerprint: AUTHORIZATION_FINGERPRINT,
+    revision: "3",
+    expiresAt: null,
+  },
+};
+let strongAuthEnabled = false;
+const isInferenceAuthCacheEnabled = mock(() => strongAuthEnabled);
+let inferenceAuthResolution: Record<string, unknown> = {
+  kind: "authorized",
+  source: "cache",
+  ctx: {
+    v: 2,
+    cachedAt: Date.now(),
+    userId: "user-1",
+    orgId: "org-1",
+    apiKeyId: "key-1",
+    keyHash: AUTHORIZATION_FINGERPRINT,
+    authorization: AUTHORIZATION,
+  },
+};
+const resolveInferenceAuthContext = mock(async () => inferenceAuthResolution);
+mock.module("../inference-hot-path-caches", () => ({
+  isInferenceAuthCacheEnabled,
+}));
+mock.module("../inference-auth-context", () => ({
+  resolveInferenceAuthContext,
+}));
+
 mock.module("../../utils/logger", () => ({
   logger: { debug: () => {}, warn: () => {}, error: () => {}, info: () => {} },
 }));
@@ -106,8 +144,12 @@ const { CacheTTL, CacheKeys } = await import("../../cache/keys");
 function contextWithAgentId(agentId?: string, headers: Record<string, string> = {}) {
   const lower: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v;
+  const raw = new Request(`https://api.example.test/api/v1/eliza/agents/${agentId ?? ""}`, {
+    headers,
+  });
   return {
     req: {
+      raw,
       param: (name: string) => (name === "agentId" ? agentId : undefined),
       header: (name: string) => lower[name.toLowerCase()],
     },
@@ -158,6 +200,8 @@ beforeEach(() => {
   cacheGetOrSet.mockClear();
   inFlight.clear();
   validateApiKey.mockClear();
+  isInferenceAuthCacheEnabled.mockClear();
+  resolveInferenceAuthContext.mockClear();
   cacheStore.clear();
   sessionScopeHashPrefix.mockClear();
   revalidateSessionScope.mockClear();
@@ -165,6 +209,20 @@ beforeEach(() => {
   sessionHashPrefixBehavior = async () => null;
   sessionRevalidateBehavior = async () => true;
   validateBehavior = async () => ({ is_active: true, organization_id: "org-1", expires_at: null });
+  strongAuthEnabled = false;
+  inferenceAuthResolution = {
+    kind: "authorized",
+    source: "cache",
+    ctx: {
+      v: 2,
+      cachedAt: Date.now(),
+      userId: "user-1",
+      orgId: "org-1",
+      apiKeyId: "key-1",
+      keyHash: AUTHORIZATION_FINGERPRINT,
+      authorization: AUTHORIZATION,
+    },
+  };
 });
 
 describe("resolveSharedAgent", () => {
@@ -218,6 +276,56 @@ describe("resolveSharedAgent", () => {
     ).resolves.toMatchObject({ agentId: "agent-1", orgId: "org-1" });
     expect(findByIdAndOrg).toHaveBeenCalledTimes(1);
     expect(validateApiKey).not.toHaveBeenCalled();
+  });
+
+  test("strong-auth cache hit carries the immutable server proof without legacy auth or DB work", async () => {
+    strongAuthEnabled = true;
+    cacheStore.set(CacheKeys.sharedAgentScope.resolve(AUTHORIZATION_FINGERPRINT, "agent-1"), {
+      orgId: "org-1",
+      agent: agent(),
+      firstWrittenAtMs: Date.now(),
+    });
+    const background: Promise<unknown>[] = [];
+
+    const resolved = await resolveSharedAgent(apiKeyContext("agent-1") as never, {
+      cacheOnly: true,
+      executionCtx: { waitUntil: (promise) => background.push(promise) },
+    });
+
+    expect(resolved).toMatchObject({
+      agentId: "agent-1",
+      orgId: "org-1",
+      authorization: AUTHORIZATION,
+    });
+    expect("authorization" in resolved && Object.isFrozen(resolved.authorization)).toBe(true);
+    expect("authorization" in resolved && Object.isFrozen(resolved.authorization?.credential)).toBe(
+      true,
+    );
+    expect(resolveInferenceAuthContext).toHaveBeenCalledTimes(1);
+    expect(requireUserOrApiKeyWithOrgLookup).not.toHaveBeenCalled();
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
+    expect(validateApiKey).not.toHaveBeenCalled();
+  });
+
+  test("strong-auth cold decision remains retryable and never enters scope or database resolution", async () => {
+    strongAuthEnabled = true;
+    inferenceAuthResolution = { kind: "warming" };
+    const background: Promise<unknown>[] = [];
+
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => background.push(promise) },
+      }),
+    ).resolves.toEqual({
+      error: "Agent authorization cache is warming. Retry shortly.",
+      status: 503,
+    });
+
+    expect(cacheGet).not.toHaveBeenCalled();
+    expect(cacheGetOrSet).not.toHaveBeenCalled();
+    expect(requireUserOrApiKeyWithOrgLookup).not.toHaveBeenCalled();
+    expect(findByIdAndOrg).not.toHaveBeenCalled();
   });
 
   test("cache-only converges for a non-shared agent: negative entry routes retries to the authoritative 404", async () => {

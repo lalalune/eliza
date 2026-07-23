@@ -56,6 +56,20 @@ const DEFAULT_AGENT = {
   organization_id: ORG,
   execution_tier: "shared",
 };
+const AUTHORIZATION = {
+  v: 1 as const,
+  organizationId: ORG,
+  organizationRevision: "7",
+  userId: "user-1",
+  userRevision: "5",
+  credential: {
+    kind: "api_key" as const,
+    id: "key-1",
+    fingerprint: "a".repeat(64),
+    revision: "3",
+    expiresAt: null,
+  },
+};
 const DEFAULT_NAMESPACE = {
   getByName: mock(() => ({
     fetch: mock(async () => new Response()),
@@ -145,6 +159,7 @@ describe("shared agent messages route", () => {
       agentId: AGENT,
       orgId: ORG,
       agentName: "Eliza",
+      authorization: AUTHORIZATION,
     });
   });
 
@@ -168,6 +183,7 @@ describe("shared agent messages route", () => {
       "Eliza",
       expect.objectContaining({ waitUntil: expect.any(Function) }),
       DEFAULT_NAMESPACE,
+      AUTHORIZATION,
     );
   });
 
@@ -187,6 +203,7 @@ describe("shared agent messages route", () => {
       agentId: AGENT,
       orgId: ORG,
       agentName: "Eliza",
+      authorization: AUTHORIZATION,
     });
     sharedRestMessageSend.mockResolvedValue({
       text: "hello",
@@ -209,6 +226,7 @@ describe("shared agent messages route", () => {
       "Eliza",
       expect.objectContaining({ waitUntil: expect.any(Function) }),
       namespace,
+      AUTHORIZATION,
     );
   });
 

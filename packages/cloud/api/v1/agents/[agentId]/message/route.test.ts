@@ -10,15 +10,45 @@ const requireServiceKey = mock(async () => ({
   organizationId: "service-org",
   userId: "service-user",
 }));
+interface TestAgent {
+  id: string;
+  organization_id: string;
+  user_id: string;
+  execution_tier?: "shared" | "dedicated";
+  agent_name?: string;
+}
 const getAgentById = mock(
-  async (): Promise<{
-    id: string;
-    organization_id: string;
-    user_id: string;
-  } | null> => ({
+  async (_agentId: string): Promise<TestAgent | null> => ({
     id: "cloud-agent-1",
     organization_id: "agent-wallet-org",
     user_id: "agent-wallet-user",
+  }),
+);
+const resolveServiceAgent = mock(
+  async ({
+    agentId,
+  }: {
+    agentId: string;
+  }): Promise<{ agent?: TestAgent | null; retryable?: boolean }> => ({
+    agent: await getAgentById(agentId),
+  }),
+);
+type TestBridgeResponse =
+  | {
+      jsonrpc: "2.0";
+      result: { text: string; reason: string };
+    }
+  | {
+      jsonrpc: "2.0";
+      error: { code: number; message: string };
+    };
+const bridgeResolvedShared = mock(
+  async (): Promise<TestBridgeResponse> => ({
+    jsonrpc: "2.0" as const,
+    result: {
+      text: "shared reply",
+      reason: "ok",
+    },
   }),
 );
 const enqueueAgentMessage = mock(async () => ({
@@ -47,8 +77,16 @@ mock.module("@/lib/auth/service-key-hono-worker", () => ({
 }));
 
 mock.module("@/lib/services/eliza-sandbox", () => ({
+  BRIDGE_CACHE_WARMING_CODE: -32003,
   elizaSandboxService: {
     getAgentById,
+    bridgeResolvedShared,
+  },
+}));
+
+mock.module("@/lib/services/agent-gateway-router", () => ({
+  agentGatewayRouterService: {
+    resolveServiceAgent,
   },
 }));
 
@@ -87,6 +125,11 @@ describe("service agent message route", () => {
       organization_id: "agent-wallet-org",
       user_id: "agent-wallet-user",
     });
+    resolveServiceAgent.mockClear();
+    resolveServiceAgent.mockImplementation(async ({ agentId }) => ({
+      agent: await getAgentById(agentId),
+    }));
+    bridgeResolvedShared.mockClear();
     enqueueAgentMessage.mockClear();
     enqueueAgentMessage.mockResolvedValue({
       created: true,
@@ -130,6 +173,11 @@ describe("service agent message route", () => {
         WAIFU_SERVICE_KEY: "svc",
         ELIZA_WEB_PUSH_VAPID_PUBLIC_KEY: "PUBKEY",
         ELIZA_WEB_PUSH_VAPID_PRIVATE_KEY: "PRIVKEY",
+      },
+      {
+        waitUntil() {},
+        passThroughOnException() {},
+        props: {},
       },
     );
 
@@ -188,6 +236,11 @@ describe("service agent message route", () => {
         },
       ),
       { WAIFU_SERVICE_KEY: "svc" },
+      {
+        waitUntil() {},
+        passThroughOnException() {},
+        props: {},
+      },
     );
 
     expect(response.status).toBe(404);
@@ -197,5 +250,134 @@ describe("service agent message route", () => {
     });
     expect(enqueueAgentMessage).not.toHaveBeenCalled();
     expect(getJobForOrg).not.toHaveBeenCalled();
+  });
+
+  test("returns retryable 503 on a cold target without enqueueing or dispatching", async () => {
+    resolveServiceAgent.mockResolvedValueOnce({ retryable: true });
+
+    const response = await app.fetch(
+      new Request(
+        "https://api.example.test/api/v1/agents/cloud-agent-1/message",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Key": "svc",
+          },
+          body: JSON.stringify({ text: "hello" }),
+        },
+      ),
+      { WAIFU_SERVICE_KEY: "svc" },
+      {
+        waitUntil() {},
+        passThroughOnException() {},
+        props: {},
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "agent_target_cache_warming",
+      retryable: true,
+    });
+    expect(enqueueAgentMessage).not.toHaveBeenCalled();
+    expect(bridgeResolvedShared).not.toHaveBeenCalled();
+  });
+
+  test("dispatches a cache-resolved shared target without the daemon job", async () => {
+    resolveServiceAgent.mockResolvedValueOnce({
+      agent: {
+        id: "cloud-agent-1",
+        organization_id: "agent-wallet-org",
+        user_id: "agent-wallet-user",
+        execution_tier: "shared",
+        agent_name: "Shared agent",
+      },
+    });
+
+    const executionCtx = {
+      waitUntil() {},
+      passThroughOnException() {},
+      props: {},
+    };
+    const response = await app.fetch(
+      new Request(
+        "https://api.example.test/api/v1/agents/cloud-agent-1/message",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Key": "svc",
+          },
+          body: JSON.stringify({ text: "hello", userId: "patron-user" }),
+        },
+      ),
+      { WAIFU_SERVICE_KEY: "svc" },
+      executionCtx,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      text: "shared reply",
+    });
+    expect(bridgeResolvedShared).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "cloud-agent-1" }),
+      expect.objectContaining({
+        method: "message.send",
+        params: expect.objectContaining({
+          text: "hello",
+          userId: "patron-user",
+        }),
+      }),
+      executionCtx,
+    );
+    expect(enqueueAgentMessage).not.toHaveBeenCalled();
+  });
+
+  test("surfaces a cold shared authorization cache as retryable without enqueueing", async () => {
+    resolveServiceAgent.mockResolvedValueOnce({
+      agent: {
+        id: "cloud-agent-1",
+        organization_id: "agent-wallet-org",
+        user_id: "agent-wallet-user",
+        execution_tier: "shared",
+        agent_name: "Shared agent",
+      },
+    });
+    bridgeResolvedShared.mockResolvedValueOnce({
+      jsonrpc: "2.0",
+      error: {
+        code: -32003,
+        message: "Inference authorization cache is warming",
+      },
+    });
+
+    const response = await app.fetch(
+      new Request(
+        "https://api.example.test/api/v1/agents/cloud-agent-1/message",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Key": "svc",
+          },
+          body: JSON.stringify({ text: "hello" }),
+        },
+      ),
+      { WAIFU_SERVICE_KEY: "svc" },
+      {
+        waitUntil() {},
+        passThroughOnException() {},
+        props: {},
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "shared_runtime_cache_warming",
+      retryable: true,
+    });
+    expect(enqueueAgentMessage).not.toHaveBeenCalled();
   });
 });

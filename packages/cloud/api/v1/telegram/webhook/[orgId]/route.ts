@@ -22,6 +22,8 @@ import {
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import { agentGatewayRouterService } from "@/lib/services/agent-gateway-router";
+import type { BridgeExecutionContext } from "@/lib/services/eliza-sandbox";
+import { SharedRuntimeCacheWarmingError } from "@/lib/services/shared-runtime/shared-runtime-errors";
 import { telegramAutomationService } from "@/lib/services/telegram-automation";
 import { telegramAppAutomationService } from "@/lib/services/telegram-automation/app-automation";
 import { logger } from "@/lib/utils/logger";
@@ -38,6 +40,7 @@ function allowUnverifiedTelegramDevWebhook(): boolean {
 async function handleTelegramWebhook(
   request: Request,
   context?: RouteContext<{ orgId: string }>,
+  executionCtx?: BridgeExecutionContext,
 ): Promise<Response> {
   const { params } = context || { params: Promise.resolve({ orgId: "" }) };
   const { orgId } = await params;
@@ -154,7 +157,7 @@ async function handleTelegramWebhook(
     const activeApps =
       await telegramAppAutomationService.getAppsWithActiveAutomation(orgId);
 
-    setupBotHandlers(bot, orgId, activeApps);
+    setupBotHandlers(bot, orgId, activeApps, executionCtx);
 
     try {
       await bot.handleUpdate(update);
@@ -304,7 +307,12 @@ async function handleChatMemberUpdate(
   }
 }
 
-function setupBotHandlers(bot: Telegraf, orgId: string, activeApps: App[]) {
+function setupBotHandlers(
+  bot: Telegraf,
+  orgId: string,
+  activeApps: App[],
+  executionCtx?: BridgeExecutionContext,
+) {
   bot.start(async (ctx) => {
     const chatId = ctx.chat.id;
     const userName = ctx.from?.first_name || "there";
@@ -388,7 +396,14 @@ ${matchingApp.website_url ? `🌐 Website: ${matchingApp.website_url}` : ""}`;
           username: telegramUsername,
           ...(userName ? { displayName: userName } : {}),
         },
+        executionCtx,
       });
+
+      if (routed.retryable) {
+        throw new SharedRuntimeCacheWarmingError(
+          "Agent target cache is warming",
+        );
+      }
 
       if (routed.handled) {
         const replyText = routed.replyText?.trim();
@@ -459,6 +474,7 @@ honoRouter.post("/", rateLimit(RateLimitPresets.AGGRESSIVE), async (c) => {
     return await handleTelegramWebhook(
       c.req.raw,
       nextStyleParams(c, ROUTE_PARAM_SPEC),
+      c.executionCtx,
     );
   } catch (error) {
     return failureResponse(c, error);

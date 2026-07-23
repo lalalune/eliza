@@ -16,6 +16,10 @@ import {
   hasCloudBindingsContext,
   runWithCloudBindingsAsync,
 } from "@/lib/runtime/cloud-bindings";
+import {
+  type InferenceAuthorizationProof,
+  isInferenceAuthorizationProof,
+} from "@/lib/services/inference-authorization-boundary";
 import { handleCanonicalScopedAgentStream } from "@/lib/services/shared-runtime/canonical-scoped-stream";
 import type { BridgeExecutionContext } from "@/lib/services/shared-runtime/shared-runtime-chat";
 import { logger } from "@/lib/utils/logger";
@@ -29,6 +33,7 @@ export interface InternalElizaConversationFetchClaims {
   conversationId: string;
   organizationId: string;
   userId: string;
+  authorization: InferenceAuthorizationProof;
 }
 
 export type InternalElizaConversationFetch = typeof fetch & {
@@ -58,6 +63,20 @@ function isCachedVoiceAgent(
       agent.user_id === claims.userId &&
       agent.execution_tier === "shared",
   );
+}
+
+function assertBoundAuthorization(
+  claims: InternalElizaConversationFetchClaims,
+): void {
+  if (
+    !isInferenceAuthorizationProof(claims.authorization) ||
+    claims.authorization.organizationId !== claims.organizationId ||
+    claims.authorization.userId !== claims.userId
+  ) {
+    throw new TypeError(
+      "internal voice authorization proof does not match the verified session scope",
+    );
+  }
 }
 
 function unavailableResponse(
@@ -91,6 +110,7 @@ export function createInternalElizaConversationFetchFactory(
   });
 
   return (claims) => {
+    assertBoundAuthorization(claims);
     const cacheKey = CacheKeys.sharedAgentScope.voice(
       claims.organizationId,
       claims.userId,
@@ -220,18 +240,6 @@ async function dispatchInternalElizaConversationFetch(
       { status: 404 },
     );
   }
-  if (
-    headers.get("X-Eliza-Agent-Id") !== claims.agentId ||
-    headers.get("X-Eliza-Conversation-Id") !== claims.conversationId ||
-    headers.get("X-Eliza-Organization-Id") !== claims.organizationId ||
-    headers.get("X-Eliza-User-Id") !== claims.userId
-  ) {
-    return Response.json(
-      { success: false, error: "Agent not found", code: "agent_not_found" },
-      { status: 404 },
-    );
-  }
-
   if (!runtime?.namespace || !runtime.executionCtx) {
     return unavailableResponse(
       "shared_runtime_unavailable",
@@ -265,6 +273,7 @@ async function dispatchInternalElizaConversationFetch(
     orgId: claims.organizationId,
     conversationId: claims.conversationId,
     userId: claims.userId,
+    authorization: claims.authorization,
     body,
     origin: headers.get("origin"),
     namespace: runtime.namespace,

@@ -52,8 +52,12 @@ export interface RunSharedAgentTurnInput {
   history: SharedTurnMessage[];
   /** The incoming user message or event text. */
   message: string;
-  /** Durable accounting transition invoked at the final provider handoff. */
-  onProviderDispatch?: () => Promise<void>;
+  /**
+   * Durable authorization/accounting transition invoked at the final provider
+   * handoff. This is structurally required so a new caller cannot accidentally
+   * create a paid dispatch path by omitting the gate.
+   */
+  onProviderDispatch: () => Promise<void>;
 }
 
 export interface RunSharedAgentTurnResult {
@@ -238,7 +242,7 @@ export async function runSharedAgentTurn(
       ...input.history.map((m) => ({ role: m.role, content: m.content })),
       { role: "user" as const, content: message },
     ];
-    await input.onProviderDispatch?.();
+    await input.onProviderDispatch();
     const { text, usage } = await generateText({
       model,
       // Zero SDK backoff on the interactive turn (see SHARED_TURN_MAX_RETRIES):
@@ -322,7 +326,7 @@ export async function runSharedAgentTurnStream(
       ...input.history.map((m) => ({ role: m.role, content: m.content })),
       { role: "user" as const, content: message },
     ];
-    await input.onProviderDispatch?.();
+    await input.onProviderDispatch();
     const result = streamText({
       model,
       // Zero SDK backoff on the interactive turn (see SHARED_TURN_MAX_RETRIES):

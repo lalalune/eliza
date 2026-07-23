@@ -36,6 +36,7 @@ import {
   verifyStewardTokenCached,
 } from "@/lib/auth/steward-client";
 import { stewardCookieNames } from "@/lib/auth/steward-cookies";
+import { usersService } from "@/lib/services/users";
 import { signStewardMutatingRequest } from "@/lib/steward/sign";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -287,10 +288,38 @@ app.post("/", async (c) => {
       return c.json(errorBody("Invalid token", "invalid_token"), 401);
     }
 
+    let sessionNotBefore: number;
+    try {
+      const user = await usersService.getByStewardIdForWrite(claims.userId);
+      if (
+        !user?.organization_id ||
+        !user.organization ||
+        !user.is_active ||
+        !user.organization.is_active ||
+        claims.issuedAt < user.inference_session_not_before
+      ) {
+        logRefresh("bearer-revoked-token");
+        return c.json(errorBody("Invalid token", "invalid_token"), 401);
+      }
+      sessionNotBefore = user.inference_session_not_before;
+    } catch (error) {
+      // error-policy:J1 bearer refresh is a control-plane boundary. A primary
+      // lookup failure must not mint around the durable logout epoch.
+      logRefresh("bearer-authorization-unavailable");
+      logger.error("[steward-refresh] bearer authorization lookup failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        errorBody("Session authorization unavailable", "internal_error"),
+        503,
+      );
+    }
+
     const refreshed = await mintStewardTokenFromClaims(
       c.env,
       claims,
       BEARER_REFRESH_TTL_SECONDS,
+      { minimumIssuedAt: sessionNotBefore },
     );
     if (!refreshed) {
       logRefresh("bearer-mint-failed");

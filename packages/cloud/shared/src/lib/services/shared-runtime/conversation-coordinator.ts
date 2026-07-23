@@ -10,6 +10,7 @@ import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
 import type { RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-env";
 import { InsufficientCreditsError, RateLimitError } from "../../api/errors";
 import type { BridgeRequest, BridgeResponse } from "../eliza-sandbox-bridge";
+import type { InferenceAuthorizationProof } from "../inference-authorization-boundary";
 import type { SharedTurnMessage } from "./run-shared-agent-turn";
 import type { BridgeExecutionContext } from "./shared-runtime-chat";
 import { SharedRuntimeCacheWarmingError } from "./shared-runtime-errors";
@@ -17,6 +18,8 @@ import { SharedRuntimeCacheWarmingError } from "./shared-runtime-errors";
 export interface SharedConversationCoordinatorOptions {
   namespace: RuntimeDurableObjectNamespace;
   executionCtx: BridgeExecutionContext;
+  /** Server-minted authorization snapshot carried unchanged to admission. */
+  authorization?: InferenceAuthorizationProof;
 }
 
 export interface SharedConversationHistoryCoordinatorOptions {
@@ -119,7 +122,12 @@ export async function coordinateSharedBridge(
     .fetch("https://shared-runtime.internal/bridge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operation: "bridge", agent, rpc }),
+      body: JSON.stringify({
+        operation: "bridge",
+        agent,
+        rpc,
+        ...(options.authorization && { authorization: options.authorization }),
+      }),
     });
   await requireCoordinatorResponse(response, "conversation");
   return (await response.json()) as BridgeResponse;
@@ -136,7 +144,12 @@ export async function coordinateSharedStream(
     .fetch("https://shared-runtime.internal/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operation: "stream", agent, rpc }),
+      body: JSON.stringify({
+        operation: "stream",
+        agent,
+        rpc,
+        ...(options.authorization && { authorization: options.authorization }),
+      }),
     });
   return await requireCoordinatorResponse(response, "stream");
 }

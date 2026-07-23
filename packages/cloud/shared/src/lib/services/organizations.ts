@@ -2,19 +2,21 @@
  * Organizations service for managing organization data and credit balances.
  */
 
+import { eq, sql } from "drizzle-orm";
+import { dbWrite } from "../../db/client";
 import {
   apiKeysRepository,
   type NewOrganization,
   type Organization,
   organizationsRepository,
 } from "../../db/repositories";
+import { organizations } from "../../db/schemas/organizations";
 import { cache } from "../cache/client";
 import { CacheKeys, CacheTTL } from "../cache/keys";
 import { logger } from "../utils/logger";
-import {
-  invalidateInferenceAuthContextsByKeyHashes,
-  invalidateInferenceSessionAuthContexts,
-} from "./inference-auth-cache";
+import { invalidateInferenceAuthContextsByKeyHashes } from "./inference-auth-cache";
+import { applyInferenceAuthorizationState } from "./inference-authorization-boundary";
+import { organizationAuthorizationState } from "./inference-authorization-lifecycle";
 
 /**
  * Service for organization operations with caching support.
@@ -75,24 +77,14 @@ export class OrganizationsService {
 
   /**
    * Inference hot path (#9981 review gap): drop every cached IAC identity for an
-   * org's API keys so a deactivated/deleted org stops fast-pathing inference
-   * immediately rather than authorizing until the authContext TTL expires. The
-   * slow path enforces `org.is_active`, but the IAC cache short-circuits it.
-   * Best-effort: a cache failure must never break the lifecycle write. Reuses the
-   * existing listByOrganization reader (no new reader added).
+   * org's API keys after the strongly ordered lifecycle transition. This keeps
+   * stale projections from causing avoidable rejected retries; the admission
+   * object remains authoritative if cache deletion fails.
    */
   private async invalidateInferenceAuthForOrganization(organizationId: string): Promise<void> {
     try {
-      const [keys, organization] = await Promise.all([
-        apiKeysRepository.listByOrganization(organizationId),
-        organizationsRepository.findWithUsers(organizationId),
-      ]);
-      await Promise.all([
-        invalidateInferenceAuthContextsByKeyHashes(keys.map((k) => k.key_hash)),
-        invalidateInferenceSessionAuthContexts(
-          organization?.users.map((user) => user.steward_user_id) ?? [],
-        ),
-      ]);
+      const keys = await apiKeysRepository.listByOrganization(organizationId);
+      await invalidateInferenceAuthContextsByKeyHashes(keys.map((k) => k.key_hash));
     } catch (error) {
       logger.warn("[OrganizationsService] Failed to invalidate inference auth cache for org", {
         organizationId,
@@ -102,11 +94,42 @@ export class OrganizationsService {
   }
 
   async update(id: string, data: Partial<NewOrganization>): Promise<Organization | undefined> {
-    const result = await organizationsRepository.update(id, data);
+    let result: Organization | undefined;
+    if (data.is_active === undefined) {
+      result = await organizationsRepository.update(id, data);
+    } else {
+      result = await dbWrite.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(organizations)
+          .where(eq(organizations.id, id))
+          .for("update");
+        if (!existing) return undefined;
+        const [updated] = await tx
+          .update(organizations)
+          .set({
+            ...data,
+            inference_auth_revision: sql`${organizations.inference_auth_revision} + 1`,
+            updated_at: new Date(),
+          })
+          .where(eq(organizations.id, id))
+          .returning();
+        if (!updated) return undefined;
+        if (!updated.is_active) {
+          await applyInferenceAuthorizationState(
+            updated.id,
+            organizationAuthorizationState(updated),
+          );
+        }
+        return updated;
+      });
+      if (result?.is_active) {
+        await applyInferenceAuthorizationState(result.id, organizationAuthorizationState(result));
+      }
+    }
     // Invalidate cache after update
     await this.invalidateCache(id);
-    // Deactivation: when is_active flips to false, evict the org's warm IAC
-    // entries so credentials under the now-inactive org can no longer fast-path.
+    // Eviction keeps later requests from carrying stale proofs to the boundary.
     if (data.is_active === false) {
       await this.invalidateInferenceAuthForOrganization(id);
     }
@@ -127,7 +150,28 @@ export class OrganizationsService {
     // Resolve + evict the org's cached IAC identities BEFORE the delete cascade
     // removes the api_keys rows, so the key_hash set is read while it still exists.
     await this.invalidateInferenceAuthForOrganization(id);
-    await organizationsRepository.delete(id);
+    await dbWrite.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(organizations)
+        .where(eq(organizations.id, id))
+        .for("update");
+      if (!existing) return;
+      const [restricted] = await tx
+        .update(organizations)
+        .set({
+          is_active: false,
+          inference_auth_revision: sql`${organizations.inference_auth_revision} + 1`,
+          updated_at: new Date(),
+        })
+        .where(eq(organizations.id, id))
+        .returning();
+      if (!restricted) {
+        throw new Error(`Organization ${id} disappeared during deletion`);
+      }
+      await applyInferenceAuthorizationState(id, organizationAuthorizationState(restricted));
+      await tx.delete(organizations).where(eq(organizations.id, id));
+    });
     // Invalidate cache after delete
     await this.invalidateCache(id);
   }

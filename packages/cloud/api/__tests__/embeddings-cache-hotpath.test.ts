@@ -17,6 +17,7 @@ const aiActual = require("ai") as Record<string, unknown>;
 const ORG = "00000000-0000-4000-8000-0000000000aa";
 const USER = "00000000-0000-4000-8000-0000000000bb";
 const API_KEY_ID = "00000000-0000-4000-8000-0000000000cc";
+const KEY_HASH = "a".repeat(64);
 const EMBEDDING = [0.25, -0.5, 1];
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -49,6 +50,7 @@ mock.module("@/lib/providers/language-model", () => ({
 }));
 
 const settleAdmission = mock(async () => null);
+const markProviderDispatched = mock(async () => undefined);
 const admitOrganizationInference = mock();
 mock.module("@/lib/services/organization-inference-admission", () => ({
   ...admissionActual,
@@ -132,6 +134,7 @@ beforeEach(() => {
   resolveInferenceAuthContext.mockReset();
   admitOrganizationInference.mockReset();
   settleAdmission.mockClear();
+  markProviderDispatched.mockClear();
   billUsage.mockReset();
   usageCreate.mockReset();
   embed.mockReset();
@@ -141,12 +144,26 @@ beforeEach(() => {
     kind: "authorized",
     source: "cache",
     ctx: {
-      v: 1,
+      v: 2,
       cachedAt: Date.now(),
       userId: USER,
       orgId: ORG,
       apiKeyId: API_KEY_ID,
-      keyHash: "cached-key-hash",
+      keyHash: KEY_HASH,
+      authorization: {
+        v: 1,
+        organizationId: ORG,
+        organizationRevision: "1",
+        userId: USER,
+        userRevision: "1",
+        credential: {
+          kind: "api_key",
+          id: API_KEY_ID,
+          fingerprint: KEY_HASH,
+          revision: "1",
+          expiresAt: null,
+        },
+      },
     },
   });
   enforceOrgRateLimit.mockResolvedValue(null);
@@ -154,6 +171,7 @@ beforeEach(() => {
     mode: "deferred_kv_ledger",
     settle: settleAdmission,
     settleUnknown: settleAdmission,
+    markProviderDispatched,
   });
   billUsage.mockResolvedValue({
     inputCost: 0.001,
@@ -212,6 +230,7 @@ describe("POST /api/v1/embeddings Worker cache hot path", () => {
           mode: "deferred_kv_ledger",
           settle: settleAdmission,
           settleUnknown: settleAdmission,
+          markProviderDispatched,
         };
       },
     );
@@ -232,6 +251,7 @@ describe("POST /api/v1/embeddings Worker cache hot path", () => {
       throw new Error("provider dispatch joined authoritative admission");
     }
     expect(outcome.response.status).toBe(200);
+    expect(markProviderDispatched).toHaveBeenCalledTimes(1);
     expect(embed).toHaveBeenCalledTimes(1);
     expect(requireUserOrApiKeyWithOrg).not.toHaveBeenCalled();
     expect(enforceOrgRateLimit).toHaveBeenCalledWith(ORG, "embeddings", {
@@ -263,12 +283,26 @@ describe("POST /api/v1/embeddings Worker cache hot path", () => {
       kind: "authorized",
       source: "steward_session",
       ctx: {
-        v: 1,
+        v: 2,
         cachedAt: Date.now(),
         userId: USER,
         orgId: ORG,
         apiKeyId: null,
-        stewardUserIdHash: "session-subject-hash",
+        stewardUserId: "steward-user",
+        authorization: {
+          v: 1,
+          organizationId: ORG,
+          organizationRevision: "1",
+          userId: USER,
+          userRevision: "1",
+          credential: {
+            kind: "steward_session",
+            id: "b".repeat(64),
+            fingerprint: "b".repeat(64),
+            revision: "1",
+            expiresAt: Date.now() + 60_000,
+          },
+        },
       },
     });
     const { ctx, scheduled } = makeExecutionCtx();

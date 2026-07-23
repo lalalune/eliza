@@ -12,6 +12,7 @@ import {
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import { blooioAutomationService } from "@/lib/services/blooio-automation";
+import { SharedRuntimeCacheWarmingError } from "@/lib/services/shared-runtime/shared-runtime-errors";
 import {
   type BlooioWebhookEvent,
   extractBlooioMediaUrls,
@@ -161,7 +162,7 @@ async function handleBlooioWebhook(c: AppContext): Promise<Response> {
     // Handle different event types
     switch (payload.event) {
       case "message.received":
-        await handleIncomingMessage(orgId, payload);
+        await handleIncomingMessage(c, orgId, payload);
         break;
 
       case "message.sent":
@@ -236,6 +237,7 @@ app.post("/bluebubbles", (c) => handleBlueBubblesWebhook(c));
  * Handle incoming message from Blooio
  */
 async function handleIncomingMessage(
+  c: AppContext,
   orgId: string,
   event: BlooioWebhookEvent,
 ): Promise<void> {
@@ -341,7 +343,12 @@ async function handleIncomingMessage(
     providerMessageId: event.message_id ?? undefined,
     mediaUrls: extractedMediaUrls,
     metadata: messageContext.metadata,
+    executionCtx: c.executionCtx,
   });
+
+  if (routed.retryable) {
+    throw new SharedRuntimeCacheWarmingError("Agent target cache is warming");
+  }
 
   if (!routed.handled) {
     logger.info("[BlooioWebhook] Message did not resolve to an owned Agent", {

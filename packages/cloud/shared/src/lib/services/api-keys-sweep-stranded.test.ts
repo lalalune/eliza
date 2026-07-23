@@ -1,18 +1,13 @@
 /**
  * `sweepStrandedAgentKeys` behavior (#16071).
  *
- * The sweep revokes every stranded `agent-sandbox:<uuid>` key the repository
- * atomically deletes and best-effort invalidates each revoked key's auth
- * caches. Cache invalidation is best-effort by design
- * (the row is already DB-revoked): a brownout on one key must NOT abort the
- * sweep, but the failure is surfaced observably (logged), never swallowed.
- * These tests spy the repository + invalidateCache boundary so no DB or Redis
- * is needed.
+ * The cron adapter delegates stranded `agent-sandbox:<uuid>` credentials to
+ * the API-key lifecycle service, which owns durable authorization revocation,
+ * database deletion, and cache cleanup as one ordered operation.
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { ApiKey } from "../../db/repositories";
-import { strandedAgentKeyRepository } from "../../db/repositories/stranded-agent-keys";
 import { apiKeysService } from "./api-keys";
 import { sweepStrandedAgentKeys } from "./stranded-agent-key-sweeper";
 
@@ -40,55 +35,31 @@ describe("sweepStrandedAgentKeys (#16071)", () => {
   }
 
   test("no stranded keys -> revokes nothing, no deletes, no invalidations", async () => {
-    const del = track(spyOn(strandedAgentKeyRepository, "deleteOlderThan").mockResolvedValue([]));
-    const invalidate = track(spyOn(apiKeysService, "invalidateCache").mockResolvedValue());
+    const revoke = track(spyOn(apiKeysService, "revokeStrandedAgentKeys").mockResolvedValue([]));
 
     const revoked = await sweepStrandedAgentKeys(new Date());
 
     expect(revoked).toBe(0);
-    expect(del).toHaveBeenCalledOnce();
-    expect(invalidate).not.toHaveBeenCalled();
+    expect(revoke).toHaveBeenCalledOnce();
   });
 
-  test("invalidates each atomically deleted key and returns the count", async () => {
+  test("returns the number of credentials durably revoked by the lifecycle service", async () => {
     const keys = [strandedKey("k1"), strandedKey("k2"), strandedKey("k3")];
-    const del = track(spyOn(strandedAgentKeyRepository, "deleteOlderThan").mockResolvedValue(keys));
-    const invalidate = track(spyOn(apiKeysService, "invalidateCache").mockResolvedValue());
+    const revoke = track(spyOn(apiKeysService, "revokeStrandedAgentKeys").mockResolvedValue(keys));
 
     const revoked = await sweepStrandedAgentKeys(new Date());
 
     expect(revoked).toBe(3);
-    // Deleted by row id (not by name).
-    expect(del).toHaveBeenCalledOnce();
-    expect(invalidate.mock.calls.map((c) => c[0])).toEqual(["k1-hash", "k2-hash", "k3-hash"]);
+    expect(revoke).toHaveBeenCalledOnce();
   });
 
-  test("passes the grace cutoff straight through to the repository query", async () => {
-    const find = track(spyOn(strandedAgentKeyRepository, "deleteOlderThan").mockResolvedValue([]));
-    track(spyOn(apiKeysService, "invalidateCache").mockResolvedValue());
+  test("passes the grace cutoff straight through to the lifecycle service", async () => {
+    const revoke = track(spyOn(apiKeysService, "revokeStrandedAgentKeys").mockResolvedValue([]));
 
     const cutoff = new Date("2026-01-01T00:00:00.000Z");
     await sweepStrandedAgentKeys(cutoff);
 
-    expect(find).toHaveBeenCalledTimes(1);
-    expect(find).toHaveBeenCalledWith(cutoff);
-  });
-
-  test("a cache-invalidation failure does NOT abort the sweep; every row is still revoked", async () => {
-    const keys = [strandedKey("k1"), strandedKey("k2"), strandedKey("k3")];
-    const del = track(spyOn(strandedAgentKeyRepository, "deleteOlderThan").mockResolvedValue(keys));
-    // The MIDDLE key's invalidation throws (Redis brownout); the sweep must
-    // continue and still count it as revoked (its DB row is already gone).
-    const invalidate = track(
-      spyOn(apiKeysService, "invalidateCache").mockImplementation(async (hash: string) => {
-        if (hash === "k2-hash") throw new Error("cache down");
-      }),
-    );
-
-    const revoked = await sweepStrandedAgentKeys(new Date());
-
-    expect(revoked).toBe(3);
-    expect(del).toHaveBeenCalledOnce();
-    expect(invalidate.mock.calls.length).toBe(3);
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(revoke).toHaveBeenCalledWith(cutoff);
   });
 });

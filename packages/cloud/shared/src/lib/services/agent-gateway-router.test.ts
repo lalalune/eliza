@@ -3,7 +3,11 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 
 import { agentSandboxesRepository } from "../../db/repositories/agent-sandboxes";
 import * as realDbSchemas from "../../db/schemas";
-import { elizaSandboxService } from "./eliza-sandbox";
+import { cache } from "../cache/client";
+import { runWithCloudBindingsAsync } from "../runtime/cloud-bindings";
+import { BRIDGE_CACHE_WARMING_CODE, elizaSandboxService } from "./eliza-sandbox";
+
+process.env.MOCK_REDIS = "1";
 
 const findByPhoneNumberWithOrganization = mock();
 const listByOrganization = mock();
@@ -11,6 +15,7 @@ const findRunningSandbox = mock();
 const listOwnerSessions = mock();
 const routeToSession = mock();
 const bridge = mock();
+const bridgeResolvedShared = mock();
 const runOnboardingChat = mock();
 
 let selectResults: Array<Array<Record<string, unknown>>> = [];
@@ -139,6 +144,10 @@ mock.module("./agent-gateway-relay", () => ({
 const bridgeSpy = spyOn(elizaSandboxService, "bridge").mockImplementation(
   (...args) => bridge(...args) as never,
 );
+const bridgeResolvedSharedSpy = spyOn(
+  elizaSandboxService,
+  "bridgeResolvedShared",
+).mockImplementation((...args) => bridgeResolvedShared(...args) as never);
 
 mock.module("./eliza-agent-config", () => ({
   readManagedAgentDiscordBinding: mock(() => null),
@@ -149,6 +158,7 @@ afterAll(() => {
   listByOrganizationSpy.mockRestore();
   findRunningSandboxSpy.mockRestore();
   bridgeSpy.mockRestore();
+  bridgeResolvedSharedSpy.mockRestore();
 });
 
 const { AgentGatewayRouterService } = await import("./agent-gateway-router");
@@ -169,14 +179,64 @@ function routeArgs(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function sharedAgent() {
+  const now = new Date("2026-07-23T00:00:00.000Z");
+  return {
+    id: "sender-cloud-agent",
+    organization_id: "sender-org",
+    user_id: "sender-user",
+    character_id: null,
+    sandbox_id: null,
+    status: "running",
+    execution_tier: "shared" as const,
+    bridge_url: null,
+    health_url: null,
+    agent_name: "Shared sender",
+    agent_config: {},
+    database_uri: null,
+    database_status: null,
+    database_error: null,
+    snapshot_id: null,
+    last_backup_at: null,
+    last_heartbeat_at: null,
+    error_message: null,
+    error_count: 0,
+    environment_vars: {
+      ELIZAOS_CLOUD_API_KEY: "eliza_managed_sender_key",
+    },
+    node_id: null,
+    container_name: null,
+    bridge_port: null,
+    web_ui_port: null,
+    headscale_ip: null,
+    docker_image: null,
+    image_digest: null,
+    previous_image_digest: null,
+    previous_docker_image: null,
+    billing_status: "active",
+    last_billed_at: null,
+    hourly_rate: "0.0100",
+    total_billed: "0.00",
+    shutdown_warning_sent_at: null,
+    scheduled_shutdown_at: null,
+    pool_status: null,
+    pool_ready_at: null,
+    claimed_at: null,
+    created_at: now,
+    updated_at: now,
+    deleted_at: null,
+  };
+}
+
 describe("AgentGatewayRouterService phone routing", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     findByPhoneNumberWithOrganization.mockReset();
     listByOrganization.mockReset();
     findRunningSandbox.mockReset();
     listOwnerSessions.mockReset();
     routeToSession.mockReset();
     bridge.mockReset();
+    bridgeResolvedShared.mockReset();
     runOnboardingChat.mockReset();
     selectBuilder.from.mockClear();
     selectBuilder.innerJoin.mockClear();
@@ -190,6 +250,7 @@ describe("AgentGatewayRouterService phone routing", () => {
     selectResults = [];
     selectErrors = [];
     selectCalls = 0;
+    await cache.delPattern("agent-gateway-target:*");
   });
 
   test("routes to the sender's own active agent before checking friend contacts", async () => {
@@ -266,6 +327,7 @@ describe("AgentGatewayRouterService phone routing", () => {
       expect.objectContaining({
         method: "message.send",
       }),
+      undefined,
     );
     expect(findRunningSandbox).not.toHaveBeenCalled();
   });
@@ -597,6 +659,145 @@ describe("AgentGatewayRouterService phone routing", () => {
       agentId: "friend-agent",
       organizationId: "owner-org",
       userId: "owner-user",
+    });
+    expect(runOnboardingChat).not.toHaveBeenCalled();
+  });
+
+  test("strong-auth cold target returns retryable before DB hydration and invokes no provider", async () => {
+    let releaseOwner!: (owner: { id: string; organization_id: string }) => void;
+    let markHydrationStarted!: () => void;
+    const hydrationStarted = new Promise<void>((resolve) => {
+      markHydrationStarted = resolve;
+    });
+    findByPhoneNumberWithOrganization.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseOwner = resolve;
+          markHydrationStarted();
+        }),
+    );
+    listOwnerSessions.mockResolvedValue([]);
+    listByOrganization.mockResolvedValue([sharedAgent()]);
+    const background: Promise<unknown>[] = [];
+    const executionCtx = {
+      waitUntil(promise: Promise<unknown>) {
+        background.push(promise);
+      },
+    };
+    const router = newRouter();
+
+    const cold = await runWithCloudBindingsAsync({ INFERENCE_AUTH_CACHE_ENABLED: "true" }, () =>
+      router.routePhoneMessage(
+        routeArgs({
+          from: "+1 555 555 0199",
+          executionCtx,
+        }),
+      ),
+    );
+
+    expect(cold).toMatchObject({
+      handled: false,
+      reason: "target_cache_warming",
+      retryable: true,
+    });
+    expect(bridgeResolvedShared).not.toHaveBeenCalled();
+    expect(bridge).not.toHaveBeenCalled();
+    expect(runOnboardingChat).not.toHaveBeenCalled();
+    expect(background).toHaveLength(1);
+
+    await hydrationStarted;
+    expect(bridgeResolvedShared).not.toHaveBeenCalled();
+    releaseOwner({
+      id: "sender-user",
+      organization_id: "sender-org",
+    });
+    await background[0];
+  });
+
+  test("strong-auth warm shared target uses the resolved row without any response-path repository read", async () => {
+    findByPhoneNumberWithOrganization.mockResolvedValue({
+      id: "sender-user",
+      organization_id: "sender-org",
+    });
+    listOwnerSessions.mockResolvedValue([]);
+    listByOrganization.mockResolvedValue([sharedAgent()]);
+    bridgeResolvedShared.mockResolvedValue({
+      jsonrpc: "2.0",
+      result: { text: "cache-only reply" },
+    });
+    const background: Promise<unknown>[] = [];
+    const executionCtx = {
+      waitUntil(promise: Promise<unknown>) {
+        background.push(promise);
+      },
+    };
+    const router = newRouter();
+    const args = routeArgs({
+      from: "+1 555 555 0188",
+      executionCtx,
+    });
+
+    const cold = await runWithCloudBindingsAsync({ INFERENCE_AUTH_CACHE_ENABLED: "true" }, () =>
+      router.routePhoneMessage(args),
+    );
+    expect(cold.retryable).toBe(true);
+    await Promise.all(background);
+
+    findByPhoneNumberWithOrganization.mockClear();
+    listByOrganization.mockClear();
+    findRunningSandbox.mockClear();
+    selectCalls = 0;
+    const warmExecutionCtx = {
+      waitUntil(_promise: Promise<unknown>) {},
+    };
+    const warm = await runWithCloudBindingsAsync({ INFERENCE_AUTH_CACHE_ENABLED: "true" }, () =>
+      router.routePhoneMessage({
+        ...args,
+        executionCtx: warmExecutionCtx,
+      }),
+    );
+
+    expect(warm).toMatchObject({
+      handled: true,
+      replyText: "cache-only reply",
+      agentId: "sender-cloud-agent",
+      organizationId: "sender-org",
+      userId: "sender-user",
+    });
+    expect(findByPhoneNumberWithOrganization).not.toHaveBeenCalled();
+    expect(listByOrganization).not.toHaveBeenCalled();
+    expect(findRunningSandbox).not.toHaveBeenCalled();
+    expect(selectCalls).toBe(0);
+    expect(bridge).not.toHaveBeenCalled();
+    expect(bridgeResolvedShared).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "sender-cloud-agent",
+        execution_tier: "shared",
+      }),
+      expect.objectContaining({ method: "message.send" }),
+      warmExecutionCtx,
+    );
+
+    bridgeResolvedShared.mockResolvedValue({
+      jsonrpc: "2.0",
+      error: {
+        code: BRIDGE_CACHE_WARMING_CODE,
+        message: "Inference authorization cache is warming",
+      },
+    });
+    runOnboardingChat.mockClear();
+    const authorizationCold = await runWithCloudBindingsAsync(
+      { INFERENCE_AUTH_CACHE_ENABLED: "true" },
+      () =>
+        router.routePhoneMessage({
+          ...args,
+          executionCtx: warmExecutionCtx,
+        }),
+    );
+    expect(authorizationCold).toMatchObject({
+      handled: false,
+      reason: "bridge_failed",
+      retryable: true,
     });
     expect(runOnboardingChat).not.toHaveBeenCalled();
   });

@@ -1,11 +1,7 @@
 /**
- * Steward-session Redis-outage rate-limit behavior.
- *
- * The route must not repeat the staging outage from #13890: a Redis limiter
- * failure cannot block legitimate session minting before auth validation. It
- * also cannot become naked fail-open, so this drives the real route with a
- * throwing Redis client and proves the route-owned fallback bucket still bounds
- * invalid-token spray.
+ * Exercises the real Steward-session route with a failed Redis limiter.
+ * External identity and revocation services are isolated while route-owned
+ * fallback limiting and durable logout ordering remain under test.
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
@@ -30,6 +26,16 @@ const syncUserFromSteward = mock(async () => ({
   welcomeBonusWithheldReason: undefined,
   welcomeBonusWithheldMessage: undefined,
 }));
+const invalidateSessionCaches = mock(async (_token: string) => undefined);
+const revokeStewardRefreshToken = mock(
+  async (_refreshToken: string, _env: unknown) => undefined,
+);
+const revokeInferenceStewardSession = mock(
+  async (_token: string, _env: unknown) => ({
+    userId: "cloud-user-1",
+    organizationId: "org-1",
+  }),
+);
 
 const throwingRedis = {
   incr: async () => {
@@ -53,8 +59,24 @@ mock.module("@/api-app/services/audit-dispatcher-singleton", () => ({
   getAuditDispatcher: () => ({ emit: emitAudit }),
 }));
 
+mock.module("@/lib/auth", () => ({
+  invalidateSessionCaches,
+}));
+
+mock.module("@/api/auth/steward-refresh-token-revocation", () => ({
+  revokeStewardRefreshToken,
+}));
+
 mock.module("@/lib/auth/steward-client", () => ({
+  STEWARD_ACCESS_TOKEN_TTL_SECONDS: 60 * 60,
+  STEWARD_AUTH_UPSTREAM_TIMEOUT_MS: 25_000,
+  invalidateStewardTokenCache: mock(async () => undefined),
+  mintStewardTokenFromClaims: mock(async () => null),
   verifyStewardTokenCached,
+}));
+
+mock.module("@/lib/services/inference-session-revocation", () => ({
+  revokeInferenceStewardSession,
 }));
 
 mock.module("@/lib/steward-sync", () => ({
@@ -101,10 +123,42 @@ function postStewardSession(body: unknown, ip = "203.0.113.10") {
   );
 }
 
+function deleteStewardSession(cookie: string, ip = "203.0.113.11") {
+  const app = new Hono();
+  app.route("/api/auth/steward-session", stewardSessionRoute);
+  return app.fetch(
+    new Request("https://api-staging.elizacloud.ai/api/auth/steward-session", {
+      method: "DELETE",
+      headers: {
+        "cf-connecting-ip": ip,
+        cookie,
+        origin: "https://staging.elizacloud.ai",
+      },
+    }),
+    ENV,
+  );
+}
+
+function deletedCookieNames(res: Response): string[] {
+  return res.headers
+    .getSetCookie()
+    .filter((cookie) => /Max-Age=0/i.test(cookie))
+    .map((cookie) => cookie.split("=")[0]);
+}
+
 beforeEach(() => {
   emitAudit.mockClear();
   verifyStewardTokenCached.mockClear();
   syncUserFromSteward.mockClear();
+  invalidateSessionCaches.mockClear();
+  revokeStewardRefreshToken.mockClear();
+  revokeInferenceStewardSession.mockClear();
+  revokeInferenceStewardSession.mockImplementation(
+    async (_token: string, _env: unknown) => ({
+      userId: "cloud-user-1",
+      organizationId: "org-1",
+    }),
+  );
   _resetRedisUnavailableFallbackBuckets();
 });
 
@@ -160,5 +214,72 @@ describe("POST /api/auth/steward-session — Redis outage fallback limiter", () 
       "redis-unavailable-local",
     );
     expect(verifyStewardTokenCached).toHaveBeenCalledTimes(10);
+  });
+});
+
+describe("DELETE /api/auth/steward-session — durable revocation ordering", () => {
+  test("revokes an environment-owned session before deleting its cookies", async () => {
+    const res = await deleteStewardSession(
+      "steward-token-staging=cookie.payload.signature",
+    );
+
+    expect(res.status).toBe(200);
+    expect(revokeInferenceStewardSession).toHaveBeenCalledTimes(1);
+    expect(revokeInferenceStewardSession.mock.calls[0]?.[0]).toBe(
+      "cookie.payload.signature",
+    );
+    expect(invalidateSessionCaches).toHaveBeenCalledWith(
+      "cookie.payload.signature",
+    );
+    const cleared = deletedCookieNames(res);
+    expect(cleared).toContain("steward-token-staging");
+    expect(cleared).toContain("steward-refresh-token-staging");
+    expect(cleared).toContain("steward-authed-staging");
+    expect(cleared).not.toContain("steward-token");
+  });
+
+  test("revocation failure returns 503 without deleting the retry credential", async () => {
+    revokeInferenceStewardSession.mockRejectedValueOnce(
+      new Error("Durable Object unavailable"),
+    );
+    const res = await deleteStewardSession(
+      "steward-token-staging=cookie.payload.signature",
+    );
+
+    expect(res.status).toBe(503);
+    expect(deletedCookieNames(res)).toEqual([]);
+    await expect(res.json()).resolves.toEqual({
+      error: "Server-side session revocation did not complete; retry logout",
+    });
+    expect(invalidateSessionCaches).not.toHaveBeenCalled();
+  });
+
+  test("revokes the environment-owned refresh token before deleting cookies", async () => {
+    const res = await deleteStewardSession(
+      "steward-token-staging=cookie.payload.signature; steward-refresh-token-staging=refresh-token",
+    );
+
+    expect(res.status).toBe(200);
+    expect(revokeStewardRefreshToken).toHaveBeenCalledWith(
+      "refresh-token",
+      expect.anything(),
+    );
+    expect(deletedCookieNames(res)).toContain("steward-refresh-token-staging");
+  });
+
+  test("refresh revocation failure preserves the access and refresh cookies", async () => {
+    revokeStewardRefreshToken.mockRejectedValueOnce(
+      new Error("Steward unavailable"),
+    );
+    const res = await deleteStewardSession(
+      "steward-token-staging=cookie.payload.signature; steward-refresh-token-staging=refresh-token",
+    );
+
+    expect(res.status).toBe(503);
+    expect(deletedCookieNames(res)).toEqual([]);
+    await expect(res.json()).resolves.toEqual({
+      error: "Refresh-session revocation did not complete; retry logout",
+    });
+    expect(invalidateSessionCaches).not.toHaveBeenCalled();
   });
 });

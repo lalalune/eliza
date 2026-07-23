@@ -10,12 +10,19 @@ import { creditsService } from "@/lib/services/credits";
 import {
   acquireInferenceAdmissionLease,
   consumeInferenceRateLimit,
+  InferenceAdmissionDispatchMarkError,
   InferenceAdmissionGateUnavailableError,
   InferenceAdmissionLeaseRejectedError,
+  InferenceProviderDispatchNotMarkedError,
   markInferenceAdmissionLeaseDispatched,
   settleInferenceAdmissionLease,
 } from "@/lib/services/inference-admission-gate";
 import * as admissionRecovery from "@/lib/services/inference-admission-recovery";
+import {
+  authorizeInferenceProviderDispatch,
+  INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+  type InferenceAuthorizationProof,
+} from "@/lib/services/inference-authorization-boundary";
 import { InferenceAdmissionGate } from "../src/inference-admission-gate";
 
 const recoverExpiredLease = spyOn(
@@ -98,6 +105,7 @@ class TestStorage {
 
   async transaction<T>(
     closure: (transaction: {
+      get<T>(key: string): Promise<T | undefined>;
       put(key: string, value: unknown): Promise<void>;
       delete(key: string): Promise<boolean>;
       setAlarm(scheduledTime: number): Promise<void>;
@@ -108,6 +116,14 @@ class TestStorage {
     const deletedKeys = new Set<string>();
     let stagedAlarm = this.alarm;
     const result = await closure({
+      get: async <T>(key: string): Promise<T | undefined> => {
+        await Promise.resolve();
+        if (deletedKeys.has(key)) return undefined;
+        const value = stagedValues.has(key)
+          ? stagedValues.get(key)
+          : this.values.get(key);
+        return value === undefined ? undefined : (structuredClone(value) as T);
+      },
       put: async (key, value) => {
         await Promise.resolve();
         if (this.failNextPut) {
@@ -157,11 +173,16 @@ function storedLeaseKey(requestId: string): string {
   return `lease:${encodeURIComponent(requestId)}`;
 }
 
-function createGate(storage = new TestStorage()): InferenceAdmissionGate {
+function createGate(
+  storage = new TestStorage(),
+  authorizationRequired = false,
+): InferenceAdmissionGate {
   const state = {
     storage,
   } as unknown as DurableObjectState;
-  return new InferenceAdmissionGate(state, {} as never);
+  return new InferenceAdmissionGate(state, {
+    INFERENCE_AUTH_CACHE_ENABLED: authorizationRequired ? "true" : "false",
+  } as never);
 }
 
 function post(
@@ -172,7 +193,11 @@ function post(
     | "/dispatch"
     | "/release"
     | "/settle"
-    | "/rate-limit",
+    | "/rate-limit"
+    | "/authorization/initialize"
+    | "/authorization/apply"
+    | "/authorization/apply-batch"
+    | "/authorization/dispatch",
   body: Record<string, unknown>,
 ): Promise<Response> {
   const payload =
@@ -203,6 +228,86 @@ function post(
       body: JSON.stringify(payload),
     }),
   );
+}
+
+function authorizationProof(
+  overrides: Partial<InferenceAuthorizationProof> = {},
+): InferenceAuthorizationProof {
+  return {
+    v: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    organizationId: "org-a",
+    organizationRevision: "1",
+    userId: "user-a",
+    userRevision: "1",
+    credential: {
+      kind: "api_key",
+      id: "key-a",
+      fingerprint: "a".repeat(64),
+      revision: "1",
+      expiresAt: null,
+    },
+    ...overrides,
+  };
+}
+
+async function hydrateAuthorizationBoundary(
+  gate: InferenceAdmissionGate,
+  proof = authorizationProof(),
+  sessionNotBefore = "0",
+): Promise<void> {
+  expect(
+    (
+      await post(gate, "/authorization/initialize", {
+        organizationId: proof.organizationId,
+      })
+    ).status,
+  ).toBe(200);
+  const credentialState =
+    proof.credential.kind === "api_key"
+      ? {
+          kind: "credential" as const,
+          id: proof.credential.id,
+          credentialKind: "api_key" as const,
+          fingerprint: proof.credential.fingerprint,
+          revision: proof.credential.revision,
+          denied: false,
+          userId: proof.userId,
+          expiresAt: proof.credential.expiresAt,
+        }
+      : {
+          kind: "session" as const,
+          id: proof.userId,
+          revision: sessionNotBefore,
+          denied: false,
+        };
+  expect(
+    (
+      await post(gate, "/authorization/apply-batch", {
+        organizationId: proof.organizationId,
+        states: [
+          {
+            kind: "organization",
+            id: proof.organizationId,
+            revision: proof.organizationRevision,
+            denied: false,
+          },
+          {
+            kind: "user",
+            id: proof.userId,
+            revision: proof.userRevision,
+            denied: false,
+          },
+          {
+            kind: "moderation",
+            id: proof.userId,
+            revision: proof.userRevision,
+            denied: false,
+          },
+          credentialState,
+        ],
+      })
+    ).status,
+  ).toBe(200);
 }
 
 async function hydrateGate(
@@ -261,6 +366,561 @@ describe("InferenceAdmissionGate", () => {
   afterAll(() => {
     recoverExpiredLease.mockRestore();
     getOrganizationBalanceSnapshot.mockRestore();
+  });
+
+  test("fails closed until the authorization boundary is initialized", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+
+    const response = await post(gate, "/lease", {
+      requestId: "authorization-uninitialized",
+      balanceUsd: 5,
+      balanceRevision: "1",
+      estimatedCostUsd: 1,
+      authorization: authorizationProof(),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      code: "inference_authorization_boundary_uninitialized",
+    });
+  });
+
+  test("fails closed when an initialized boundary is missing any proof state", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+    await post(gate, "/authorization/initialize", {
+      organizationId: "org-a",
+    });
+    await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "organization",
+        id: "org-a",
+        revision: "1",
+        denied: false,
+      },
+    });
+
+    for (const [path, body] of [
+      [
+        "/lease",
+        {
+          requestId: "authorization-partial",
+          balanceUsd: 5,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: authorizationProof(),
+        },
+      ],
+      [
+        "/authorization/dispatch",
+        {
+          organizationId: "org-a",
+          authorization: authorizationProof(),
+        },
+      ],
+    ] as const) {
+      const response = await post(gate, path, body);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        code: "inference_authorization_boundary_uninitialized",
+      });
+    }
+  });
+
+  test("rechecks durable revocation immediately before provider dispatch", async () => {
+    const storage = new TestStorage();
+    const gate = createGate(storage, true);
+    await hydrateGate(gate, 5);
+    await hydrateAuthorizationBoundary(gate);
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "authorization-revoked",
+          balanceUsd: 5,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: authorizationProof(),
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await post(gate, "/authorization/apply", {
+          organizationId: "org-a",
+          state: {
+            kind: "user",
+            id: "user-a",
+            revision: "2",
+            denied: true,
+          },
+        })
+      ).status,
+    ).toBe(200);
+
+    const denied = await post(createGate(storage, true), "/dispatch", {
+      requestId: "authorization-revoked",
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({
+      code: "inference_authorization_revoked",
+    });
+    expect(
+      storage.read<{ phase: string }>(storedLeaseKey("authorization-revoked"))
+        ?.phase,
+    ).toBe("leased");
+  });
+
+  test("auth-only dispatch rejects a stale proof without creating a monetary lease", async () => {
+    const storage = new TestStorage();
+    const gate = createGate(storage, true);
+    await hydrateAuthorizationBoundary(gate);
+
+    const authorized = await post(gate, "/authorization/dispatch", {
+      organizationId: "org-a",
+      authorization: authorizationProof(),
+    });
+    expect(authorized.status).toBe(200);
+    const authorizedBody = (await authorized.json()) as Record<string, unknown>;
+    expect(authorizedBody).toEqual({
+      authorized: true,
+      authCheckedVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+    expect(storage.read("ledger")).toBeUndefined();
+
+    await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "user",
+        id: "user-a",
+        revision: "2",
+        denied: true,
+      },
+    });
+    const denied = await post(
+      createGate(storage, true),
+      "/authorization/dispatch",
+      {
+        organizationId: "org-a",
+        authorization: authorizationProof(),
+      },
+    );
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({
+      code: "inference_authorization_revoked",
+    });
+    expect(storage.read("ledger")).toBeUndefined();
+  });
+
+  test("requires a fresh proof after a reversible authorization transition", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 10);
+    await hydrateAuthorizationBoundary(gate);
+    await post(gate, "/lease", {
+      requestId: "authorization-stale",
+      balanceUsd: 10,
+      balanceRevision: "1",
+      estimatedCostUsd: 1,
+      authorization: authorizationProof(),
+    });
+    await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "user",
+        id: "user-a",
+        revision: "2",
+        denied: true,
+      },
+    });
+    const stale = await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "user",
+        id: "user-a",
+        revision: "1",
+        denied: false,
+      },
+    });
+    expect(await stale.json()).toMatchObject({ applied: true, stale: true });
+
+    expect(
+      (
+        await post(gate, "/dispatch", {
+          requestId: "authorization-stale",
+        })
+      ).status,
+    ).toBe(403);
+
+    expect(
+      (
+        await post(gate, "/authorization/apply", {
+          organizationId: "org-a",
+          state: {
+            kind: "user",
+            id: "user-a",
+            revision: "3",
+            denied: false,
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await post(gate, "/authorization/apply", {
+          organizationId: "org-a",
+          state: {
+            kind: "moderation",
+            id: "user-a",
+            revision: "3",
+            denied: false,
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const stillStale = await post(gate, "/dispatch", {
+      requestId: "authorization-stale",
+    });
+    expect(stillStale.status).toBe(403);
+
+    const freshProof = authorizationProof({ userRevision: "3" });
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "authorization-fresh",
+          balanceUsd: 10,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: freshProof,
+        })
+      ).status,
+    ).toBe(200);
+    const allowed = await post(gate, "/dispatch", {
+      requestId: "authorization-fresh",
+    });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toMatchObject({
+      dispatched: true,
+      authCheckedVersion: INFERENCE_AUTHORIZATION_BOUNDARY_VERSION,
+    });
+  });
+
+  test("matches each proof revision to the corresponding authorization lane", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 10);
+    await post(gate, "/authorization/initialize", {
+      organizationId: "org-a",
+    });
+    await post(gate, "/authorization/apply-batch", {
+      organizationId: "org-a",
+      states: [
+        {
+          kind: "organization",
+          id: "org-a",
+          revision: "4",
+          denied: false,
+        },
+        {
+          kind: "user",
+          id: "user-a",
+          revision: "6",
+          denied: false,
+        },
+        {
+          kind: "moderation",
+          id: "user-a",
+          revision: "6",
+          denied: false,
+        },
+        {
+          kind: "credential",
+          id: "key-a",
+          credentialKind: "api_key",
+          fingerprint: "a".repeat(64),
+          revision: "7",
+          denied: false,
+          userId: "user-a",
+          expiresAt: null,
+        },
+      ],
+    });
+
+    for (const [requestId, proof] of [
+      [
+        "stale-organization-revision",
+        authorizationProof({
+          organizationRevision: "3",
+          userRevision: "6",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "7",
+          },
+        }),
+      ],
+      [
+        "stale-user-revision",
+        authorizationProof({
+          organizationRevision: "4",
+          userRevision: "4",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "7",
+          },
+        }),
+      ],
+      [
+        "future-user-revision",
+        authorizationProof({
+          organizationRevision: "4",
+          userRevision: "7",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "7",
+          },
+        }),
+      ],
+      [
+        "future-organization-revision",
+        authorizationProof({
+          organizationRevision: "5",
+          userRevision: "6",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "7",
+          },
+        }),
+      ],
+      [
+        "future-credential-revision",
+        authorizationProof({
+          organizationRevision: "4",
+          userRevision: "6",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "8",
+          },
+        }),
+      ],
+      [
+        "stale-credential-revision",
+        authorizationProof({
+          organizationRevision: "4",
+          userRevision: "6",
+          credential: {
+            ...authorizationProof().credential,
+            revision: "6",
+          },
+        }),
+      ],
+    ] as const) {
+      const response = await post(gate, "/lease", {
+        requestId,
+        balanceUsd: 10,
+        balanceRevision: "1",
+        estimatedCostUsd: 1,
+        authorization: proof,
+      });
+      expect({ requestId, status: response.status }).toEqual({
+        requestId,
+        status: 403,
+      });
+    }
+
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "current-authorization-revisions",
+          balanceUsd: 10,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: authorizationProof({
+            organizationRevision: "4",
+            userRevision: "6",
+            credential: {
+              ...authorizationProof().credential,
+              revision: "7",
+            },
+          }),
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  test("rejects a stale credential fingerprint after rotation", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+    await hydrateAuthorizationBoundary(gate);
+    await post(gate, "/lease", {
+      requestId: "authorization-rotation",
+      balanceUsd: 5,
+      balanceRevision: "1",
+      estimatedCostUsd: 1,
+      authorization: authorizationProof(),
+    });
+    await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "credential",
+        id: "key-a",
+        credentialKind: "api_key",
+        fingerprint: "b".repeat(64),
+        revision: "2",
+        denied: false,
+        userId: "user-a",
+        expiresAt: null,
+      },
+    });
+
+    expect(
+      (
+        await post(gate, "/dispatch", {
+          requestId: "authorization-rotation",
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  test("rejects every Steward JWT issued before the session not-before revision", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+    const staleSession = authorizationProof({
+      credential: {
+        kind: "steward_session",
+        id: "c".repeat(64),
+        fingerprint: "c".repeat(64),
+        revision: "100",
+        expiresAt: Date.now() + 60_000,
+      },
+    });
+    await hydrateAuthorizationBoundary(gate, staleSession, "101");
+
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "stale-steward-session",
+          balanceUsd: 5,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: staleSession,
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "fresh-steward-session",
+          balanceUsd: 5,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: {
+            ...staleSession,
+            credential: {
+              ...staleSession.credential,
+              revision: "101",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  test("requires a versioned dispatch acknowledgement during mixed-version rollout", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+    await hydrateAuthorizationBoundary(gate);
+    const bindings = {
+      INFERENCE_AUTH_CACHE_ENABLED: "true",
+      INFERENCE_ADMISSION_GATES: {
+        getByName: (_name: string) => ({
+          fetch: async (request: RequestInfo | URL, init?: RequestInit) => {
+            const incoming = new Request(request, init);
+            const response = await gate.fetch(incoming);
+            if (
+              new URL(incoming.url).pathname !== "/dispatch" ||
+              !response.ok
+            ) {
+              return response;
+            }
+            const body = (await response.json()) as Record<string, unknown>;
+            delete body.authCheckedVersion;
+            return Response.json(body);
+          },
+        }),
+      },
+    };
+
+    await runWithCloudBindingsAsync(bindings, async () => {
+      const lease = await acquireInferenceAdmissionLease({
+        organizationId: "org-a",
+        requestId: "mixed-version",
+        balanceUsd: 5,
+        balanceRevision: "1",
+        estimatedCostUsd: 1,
+        recovery: organizationRecovery("mixed-version"),
+        authorization: authorizationProof(),
+      });
+      await expect(
+        markInferenceAdmissionLeaseDispatched(lease),
+      ).rejects.toBeInstanceOf(InferenceAdmissionDispatchMarkError);
+    });
+  });
+
+  test("auth-only dispatch client fails closed on missing proofs and mixed-version replies", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateAuthorizationBoundary(gate);
+    const bindings = {
+      INFERENCE_AUTH_CACHE_ENABLED: "true",
+      INFERENCE_ADMISSION_GATES: {
+        getByName: (_name: string) => ({
+          fetch: async (request: RequestInfo | URL, init?: RequestInit) => {
+            const incoming = new Request(request, init);
+            const response = await gate.fetch(incoming);
+            if (
+              new URL(incoming.url).pathname !== "/authorization/dispatch" ||
+              !response.ok
+            ) {
+              return response;
+            }
+            const body = (await response.json()) as Record<string, unknown>;
+            delete body.authCheckedVersion;
+            return Response.json(body);
+          },
+        }),
+      },
+    };
+
+    await runWithCloudBindingsAsync(bindings, async () => {
+      await expect(
+        authorizeInferenceProviderDispatch({
+          organizationId: "org-a",
+          authorization: undefined,
+        }),
+      ).rejects.toMatchObject({
+        code: "INFERENCE_AUTHORIZATION_PROOF_REQUIRED",
+      });
+      await expect(
+        authorizeInferenceProviderDispatch({
+          organizationId: "org-a",
+          authorization: authorizationProof(),
+        }),
+      ).rejects.toMatchObject({
+        code: "INFERENCE_AUTHORIZATION_BOUNDARY_UNCONFIRMED",
+      });
+    });
+
+    await runWithCloudBindingsAsync(
+      { INFERENCE_AUTH_CACHE_ENABLED: "true" },
+      async () => {
+        await expect(
+          authorizeInferenceProviderDispatch({
+            organizationId: "org-a",
+            authorization: authorizationProof(),
+          }),
+        ).rejects.toMatchObject({
+          code: "INFERENCE_AUTHORIZATION_BOUNDARY_MISSING",
+        });
+      },
+    );
   });
 
   test("serializes and persists an exact fixed endpoint window", async () => {
@@ -664,6 +1324,33 @@ describe("InferenceAdmissionGate", () => {
         recovery: organizationRecovery("request-c"),
       }),
     ).rejects.toBeInstanceOf(InferenceAdmissionGateUnavailableError);
+  });
+
+  test("positive settlement cannot create a missing provider dispatch marker", async () => {
+    const storage = new TestStorage();
+    const gate = createGate(storage);
+    await hydrateGate(gate, 2);
+    await runWithCloudBindingsAsync(gateBindings(gate), async () => {
+      const lease = await acquireInferenceAdmissionLease({
+        organizationId: "org-a",
+        requestId: "settlement-without-dispatch",
+        balanceUsd: 2,
+        balanceRevision: "1",
+        estimatedCostUsd: 1,
+        recovery: organizationRecovery("settlement-without-dispatch"),
+      });
+
+      await expect(
+        settleInferenceAdmissionLease(lease, 1),
+      ).rejects.toBeInstanceOf(InferenceProviderDispatchNotMarkedError);
+      expect(lease.providerDispatched).toBe(false);
+      expect(getOrganizationBalanceSnapshot).not.toHaveBeenCalled();
+      expect(
+        storage.read<{ phase: string }>(
+          storedLeaseKey("settlement-without-dispatch"),
+        )?.phase,
+      ).toBe("leased");
+    });
   });
 
   test("does not publish an unpersisted lease after a storage failure", async () => {

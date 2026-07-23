@@ -483,6 +483,20 @@ export async function startRealVoiceServer(
       userId: config.userId,
       agentId: config.agentId,
       conversationId: config.conversationId,
+      authorization: {
+        v: 1,
+        organizationId: config.organizationId,
+        organizationRevision: "0",
+        userId: config.userId,
+        userRevision: "0",
+        credential: {
+          kind: "api_key",
+          id: "voice-evidence-harness",
+          fingerprint: "a".repeat(64),
+          revision: "0",
+          expiresAt: null,
+        },
+      },
     });
     await recordVoiceSessionJti({
       organizationId: config.organizationId,

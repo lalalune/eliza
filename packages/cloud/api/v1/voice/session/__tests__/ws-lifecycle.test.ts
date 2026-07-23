@@ -27,6 +27,7 @@ import type { CartesiaWebSocketLike } from "../../../../../shared/src/lib/servic
 import { InMemoryVoiceUsageStore } from "../../../../../shared/src/lib/services/voice-usage-meter";
 import {
   mintVoiceSessionToken,
+  type VoiceSessionTokenClaims,
   VoiceSessionTokenError,
 } from "../../../../../shared/src/lib/voice-session/jwt";
 import type { ServerControlFrame } from "../../../../../shared/src/lib/voice-session/protocol";
@@ -277,12 +278,26 @@ function makeCanonicalChunkFetch(deltas: string[]): typeof fetch {
 
 // --- helpers --------------------------------------------------------------
 
-const CLAIMS = {
+const CLAIMS: VoiceSessionTokenClaims = {
   sessionId: "sess-lifecycle",
   organizationId: "org-1",
   userId: "user-1",
   agentId: "agent-1",
   conversationId: "conv-1",
+  authorization: {
+    v: 1 as const,
+    organizationId: "org-1",
+    organizationRevision: "0",
+    userId: "user-1",
+    userRevision: "0",
+    credential: {
+      kind: "api_key" as const,
+      id: "key-1",
+      fingerprint: "a".repeat(64),
+      revision: "0",
+      expiresAt: null,
+    },
+  },
 };
 
 async function connectSession(opts: {
@@ -397,10 +412,10 @@ describe("voice-session WS lifecycle", () => {
     expect(requests[0].body).toEqual({ text: "hello agent" });
     expect(requests[0].headers.authorization).toBe("Bearer eliza-server");
     expect(requests[0].headers["x-service-key"]).toBe("Bearer eliza-server");
-    expect(requests[0].headers["x-eliza-agent-id"]).toBe("agent-1");
-    expect(requests[0].headers["x-eliza-conversation-id"]).toBe("conv-1");
-    expect(requests[0].headers["x-eliza-organization-id"]).toBe("org-1");
-    expect(requests[0].headers["x-eliza-user-id"]).toBe("user-1");
+    expect(requests[0].headers["x-eliza-agent-id"]).toBeUndefined();
+    expect(requests[0].headers["x-eliza-conversation-id"]).toBeUndefined();
+    expect(requests[0].headers["x-eliza-organization-id"]).toBeUndefined();
+    expect(requests[0].headers["x-eliza-user-id"]).toBeUndefined();
     expect(requests[0].headers["x-eliza-voice-trace-id"]).toContain(
       "sess-lifecycle:turn:1:",
     );

@@ -15,6 +15,7 @@ let repositoryWrites = 0;
 let repositoryRow: unknown[] = [];
 const repositoryHistoryLengths: number[] = [];
 const repositoryHistories: unknown[][] = [];
+let observedAuthorization: unknown;
 
 mock.module("@/db/client", () => ({
   runWithDbCacheAsync: async <T>(fn: () => Promise<T>) => await fn(),
@@ -46,6 +47,7 @@ mock.module("@/lib/services/shared-runtime/shared-runtime-chat", () => ({
       agent: { id: string },
       rpc: { id?: string | number; params?: { roomId?: string } },
       options: {
+        authorization?: unknown;
         historyStore: {
           load(agentId: string, channelId: string): Promise<unknown[]>;
           save(
@@ -56,6 +58,7 @@ mock.module("@/lib/services/shared-runtime/shared-runtime-chat", () => ({
         };
       },
     ) => {
+      observedAuthorization = options.authorization;
       if (rpc.id === "rate-limited") {
         throw new RateLimitError("Organization rate limit exceeded.", 29);
       }
@@ -110,7 +113,10 @@ const AGENT_FIXTURE = {
   scheduled_shutdown_at: null,
 };
 
-function makeInvoke(object: SharedRuntimeConversation) {
+function makeInvoke(
+  object: SharedRuntimeConversation,
+  authorization?: Record<string, unknown>,
+) {
   return async (id: string) => {
     const response = await object.fetch(
       new Request("https://shared-runtime.internal/bridge", {
@@ -118,6 +124,7 @@ function makeInvoke(object: SharedRuntimeConversation) {
         body: JSON.stringify({
           operation: "bridge",
           agent: AGENT_FIXTURE,
+          ...(authorization && { authorization }),
           rpc: {
             jsonrpc: "2.0",
             id,
@@ -130,6 +137,40 @@ function makeInvoke(object: SharedRuntimeConversation) {
     return await response.json();
   };
 }
+
+const AUTHORIZATION_FIXTURE = {
+  v: 1,
+  organizationId: "org-1",
+  organizationRevision: "7",
+  userId: "user-1",
+  userRevision: "5",
+  credential: {
+    kind: "api_key",
+    id: "key-1",
+    fingerprint: "a".repeat(64),
+    revision: "3",
+    expiresAt: null,
+  },
+};
+
+test("forwards the validated authorization proof into the cache-local chat service", async () => {
+  repositoryReads = 0;
+  repositoryRow = [];
+  observedAuthorization = undefined;
+  const data = new Map<string, unknown>();
+  const background: Promise<unknown>[] = [];
+  const object = new SharedRuntimeConversation(
+    makeState(data, background) as never,
+    {} as never,
+  );
+  const invoke = makeInvoke(object, AUTHORIZATION_FIXTURE);
+
+  await invoke("cold");
+  await Promise.all(background.splice(0));
+  await invoke("authorized");
+
+  expect(observedAuthorization).toEqual(AUTHORIZATION_FIXTURE);
+});
 
 test("warm coordinated turns use local history and mirror asynchronously", async () => {
   repositoryReads = 0;

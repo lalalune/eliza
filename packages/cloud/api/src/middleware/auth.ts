@@ -195,7 +195,7 @@ export function isPublicPath(pathname: string): boolean {
 }
 
 /**
- * Shared-agent model endpoints perform their own cache-only credential and
+ * Model endpoints listed here perform their own cache-only credential and
  * organization-scope gate. Running the global session resolver first would
  * duplicate that gate and can hydrate a cold session from Postgres before the
  * route has a chance to return its explicit warming response.
@@ -206,6 +206,8 @@ export function isRouteAuthenticatedInferencePath(
 ): boolean {
   if (method !== "POST" && method !== "OPTIONS") return false;
   return (
+    pathname === "/api/v1/generate-prompts" ||
+    /^\/api\/v1\/apps\/[^/]+\/chat\/?$/.test(pathname) ||
     /^\/api\/v1\/eliza\/agents\/[^/]+\/(?:stream|bridge)\/?$/.test(pathname) ||
     /^\/api\/v1\/eliza\/agents\/[^/]+\/api\/conversations\/[^/]+\/messages(?:\/stream)?\/?$/.test(
       pathname,

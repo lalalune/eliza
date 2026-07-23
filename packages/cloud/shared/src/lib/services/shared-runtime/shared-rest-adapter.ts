@@ -20,6 +20,7 @@ import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
 import type { RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-env";
 import { InsufficientCreditsError } from "../../api/errors";
 import type { BridgeRequest } from "../eliza-sandbox-bridge";
+import type { InferenceAuthorizationProof } from "../inference-authorization-boundary";
 import { coordinateSharedBridge, coordinateSharedHistory } from "./conversation-coordinator";
 import type { SharedAgentCharacter } from "./run-shared-agent-turn";
 import { type BridgeExecutionContext, sharedRuntimeChatService } from "./shared-runtime-chat";
@@ -351,6 +352,7 @@ export async function sharedRestMessageSend(
   agentName: string,
   executionCtx: BridgeExecutionContext,
   namespace: RuntimeDurableObjectNamespace,
+  authorization?: InferenceAuthorizationProof,
 ): Promise<{ text: string; agentName: string }> {
   const rpc: BridgeRequest = {
     jsonrpc: "2.0",
@@ -360,7 +362,11 @@ export async function sharedRestMessageSend(
   };
   // The production coordinator and Worker lifetime are required together so a
   // missing binding cannot select an inline legacy bridge or billing path.
-  const response = await coordinateSharedBridge(agent, rpc, { executionCtx, namespace });
+  const response = await coordinateSharedBridge(agent, rpc, {
+    authorization,
+    executionCtx,
+    namespace,
+  });
   if (response.error) {
     // A credit-reserve rejection is a permanent add-credits condition, not a
     // transient bridge failure — surface it typed so the route boundary can

@@ -23,6 +23,7 @@ import {
 } from "./credits";
 import {
   acquireInferenceAdmissionLease,
+  assertInferenceAdmissionLeaseDispatched,
   InferenceAdmissionGateUnavailableError,
   type InferenceAdmissionLease,
   InferenceAdmissionLeaseRejectedError,
@@ -35,6 +36,7 @@ import {
   InferenceAffiliateCacheWarmingError as AffiliateCacheWarmingError,
   getCachedInferenceAffiliateAttribution,
 } from "./inference-affiliate-cache";
+import type { InferenceAuthorizationProof } from "./inference-authorization-boundary";
 import { isDeferredAdmissionEnabled, isOrgAdmissionRefused } from "./inference-billing-deferred";
 import {
   createOptimisticDebitSettler,
@@ -67,8 +69,12 @@ export interface OrganizationInferenceAdmission {
   settle(actualCostUsd: number): Promise<CreditReconciliationResult | null>;
   /** Conservatively settle provider work whose exact usage is unavailable. */
   settleUnknown(): Promise<CreditReconciliationResult | null>;
-  /** Durably record provider acceptance before streamed output is delivered. */
-  markProviderDispatched?(): Promise<void>;
+  /**
+   * Durably record provider acceptance before invoking provider code. The
+   * synchronous compatibility lane returns an explicit no-op so every caller
+   * must still cross this boundary in source.
+   */
+  markProviderDispatched(): Promise<void>;
   /**
    * Reservation-compatible view for accounting that must reconcile before a
    * payout. Affiliate billing passes this to `billUsage`, which then waits for
@@ -89,7 +95,16 @@ export interface OrganizationInferenceAdmissionParams {
   estimatedInputTokens: number;
   estimatedOutputTokens: number;
   affiliateCode?: string | null;
+  authorization?: InferenceAuthorizationProof;
   executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+  /**
+   * Durable side accounting that must complete after the debit but before the
+   * lease is released. Recovery inputs for this hook must also live in metadata.
+   */
+  afterDebitBeforeLeaseRelease?(
+    actualCostUsd: number,
+    reconciliation: CreditReconciliationResult | null,
+  ): Promise<void>;
 }
 
 /** Retryable signal preserving route compatibility while identifying pricing hydration. */
@@ -132,6 +147,12 @@ export class InferenceAdmissionUnavailableError extends InferenceBalanceCacheWar
   }
 }
 
+/**
+ * Non-Worker compatibility already reserves in Postgres before provider work,
+ * so it has no dispatch-time Durable Object transition to acknowledge.
+ */
+async function acknowledgeSynchronousProviderDispatch(): Promise<void> {}
+
 async function reserveSynchronously(
   params: OrganizationInferenceAdmissionParams,
 ): Promise<OrganizationInferenceAdmission> {
@@ -148,6 +169,7 @@ async function reserveSynchronously(
     mode: "synchronous_reservation",
     settle,
     settleUnknown: () => settle(reservation.reservedAmount),
+    markProviderDispatched: acknowledgeSynchronousProviderDispatch,
     affiliateAttribution: reservation.affiliateAttribution ?? null,
     reservation: {
       reservedAmount: reservation.reservedAmount,
@@ -160,8 +182,12 @@ async function reserveSynchronously(
 }
 
 function attachInferenceAdmissionLease(
-  admission: OrganizationInferenceAdmission,
+  admission: Omit<OrganizationInferenceAdmission, "markProviderDispatched">,
   lease: InferenceAdmissionLease,
+  afterDebitBeforeLeaseRelease?: (
+    actualCostUsd: number,
+    reconciliation: CreditReconciliationResult | null,
+  ) => Promise<void>,
 ): OrganizationInferenceAdmission {
   const settleAuthoritatively = admission.settle;
   const settleUnknownAuthoritatively = admission.settleUnknown;
@@ -175,7 +201,7 @@ function attachInferenceAdmissionLease(
     const selected = choice;
     const current = (async () => {
       if (selected.kind === "unknown" || selected.actualCostUsd > 0) {
-        await markProviderDispatched();
+        assertInferenceAdmissionLeaseDispatched(lease);
       }
       const reconciliation =
         selected.kind === "actual"
@@ -185,6 +211,7 @@ function attachInferenceAdmissionLease(
         selected.kind === "actual"
           ? selected.actualCostUsd
           : Math.max(lease.estimatedCostUsd, reconciliation?.actualCost ?? 0);
+      await afterDebitBeforeLeaseRelease?.(actualCostUsd, reconciliation);
       const amounts = inferenceSettlementAmounts(lease, actualCostUsd, reconciliation);
       await settleInferenceAdmissionLease(lease, amounts.balanceBackedUsd, amounts.gateConsumedUsd);
       return reconciliation;
@@ -360,6 +387,7 @@ export async function admitOrganizationInference(
               }
             : { kind: "direct_debit" },
         },
+        authorization: params.authorization,
         executionCtx: params.executionCtx,
       });
     } catch (error) {
@@ -421,7 +449,7 @@ export async function admitOrganizationInference(
           actualCost: actualCostUsd,
           reservationMetadata,
         });
-      const result: OrganizationInferenceAdmission = {
+      const result: Omit<OrganizationInferenceAdmission, "markProviderDispatched"> = {
         mode: "durable_object_affiliate_debit",
         settle,
         settleUnknown: () => settle(estimatedCostUsd),
@@ -434,7 +462,11 @@ export async function admitOrganizationInference(
         },
         affiliateAttribution,
       };
-      return attachInferenceAdmissionLease(result, inferenceLease);
+      return attachInferenceAdmissionLease(
+        result,
+        inferenceLease,
+        params.afterDebitBeforeLeaseRelease,
+      );
     }
 
     const settle = async (actualCostUsd: number): Promise<CreditReconciliationResult> => {
@@ -473,6 +505,7 @@ export async function admitOrganizationInference(
         affiliateAttribution: null,
       },
       inferenceLease,
+      params.afterDebitBeforeLeaseRelease,
     );
   }
 
@@ -488,6 +521,7 @@ export async function admitOrganizationInference(
         mode: "synchronous_db_ledger",
         settle,
         settleUnknown: () => settle(estimatedCostUsd),
+        markProviderDispatched: acknowledgeSynchronousProviderDispatch,
       };
     }
     return await reserveSynchronously(params);
@@ -501,6 +535,7 @@ export async function admitOrganizationInference(
         mode: "synchronous_kv_ledger",
         settle,
         settleUnknown: () => settle(estimatedCostUsd),
+        markProviderDispatched: acknowledgeSynchronousProviderDispatch,
       };
     }
   }

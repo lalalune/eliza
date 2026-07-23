@@ -1,11 +1,15 @@
 /**
- * POST /api/auth/logout
- * Logs out the current user by ending all sessions and clearing auth cookies.
- * Also invalidates Redis caches to ensure immediate token invalidation.
+ * Ends the current Steward session at both the browser and inference boundary.
+ *
+ * Strong inference revocation commits before browser cookies are deleted. A
+ * retryable failure therefore leaves the credential available for another
+ * logout attempt instead of destroying the only copy while a replay remains
+ * authorized.
  */
 
 import { Hono } from "hono";
 import { deleteCookie, getCookie } from "hono/cookie";
+import { revokeStewardRefreshToken } from "@/api/auth/steward-refresh-token-revocation";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import { invalidateSessionCaches } from "@/lib/auth";
 import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
@@ -19,6 +23,7 @@ import {
   RateLimitPresets,
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
+import { revokeInferenceStewardSession } from "@/lib/services/inference-session-revocation";
 import { userSessionsService } from "@/lib/services/user-sessions";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
@@ -30,21 +35,102 @@ app.use("*", rateLimit(RateLimitPresets.STANDARD));
 app.post("/", async (c) => {
   const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
   const canMutateLegacy = canMutateLegacyStewardCookies(c.env.ENVIRONMENT);
-  const stewardToken =
+  const authorization = c.req.header("authorization");
+  const bearer = authorization?.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length).trim() || null
+    : null;
+  const isApiKeyRequest = bearer?.startsWith("eliza_") === true;
+
+  // API-key auth owns the request and cannot authorize mutation of an unrelated
+  // browser session. Leaving cookies untouched also preserves their credential
+  // for a subsequent Steward-authenticated logout.
+  if (isApiKeyRequest) {
+    return c.json({ success: true, message: "Logged out successfully" });
+  }
+
+  const cookieToken =
     getCookie(c, cookieNames.token) ??
     (canMutateLegacy ? getCookie(c, LEGACY_STEWARD_COOKIES.token) : undefined);
+  const refreshToken =
+    getCookie(c, cookieNames.refreshToken) ??
+    (canMutateLegacy
+      ? getCookie(c, LEGACY_STEWARD_COOKIES.refreshToken)
+      : undefined);
+  const accessTokens = [
+    ...new Set(
+      [bearer, cookieToken].filter(
+        (token): token is string =>
+          typeof token === "string" && token.length > 0,
+      ),
+    ),
+  ];
+  if (
+    accessTokens.length > 0 &&
+    !c.env.STEWARD_SESSION_SECRET &&
+    !c.env.STEWARD_JWT_SECRET
+  ) {
+    return c.json(
+      {
+        success: false,
+        error: "Server-side session revocation is not configured",
+      },
+      503,
+    );
+  }
 
-  // Clear cookies FIRST. Clearing them is what actually logs the user out, and
-  // it must happen even if the server-side teardown below fails (a transient DB
-  // error during logout must not leave the session cookies in place — that was
-  // the prior behavior, which left users "still logged in" after a failed
-  // logout). The session-record teardown + cache invalidation are best-effort
-  // hygiene (caches expire on their own TTL).
+  for (const token of accessTokens) {
+    try {
+      const revoked = await revokeInferenceStewardSession(token, {
+        STEWARD_SESSION_SECRET: c.env.STEWARD_SESSION_SECRET,
+        STEWARD_JWT_SECRET: c.env.STEWARD_JWT_SECRET,
+        STEWARD_TENANT_ID: c.env.STEWARD_TENANT_ID,
+      });
+      if (!revoked && token === bearer) {
+        return c.json(
+          { success: false, error: "Invalid Steward bearer token" },
+          401,
+        );
+      }
+    } catch (error) {
+      // error-policy:J1 exact revocation is the logout security boundary. A
+      // retryable failure keeps browser credentials intact for another attempt.
+      logger.error("[Logout] Durable session revocation failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        {
+          success: false,
+          error:
+            "Server-side session revocation did not complete; retry logout",
+        },
+        503,
+      );
+    }
+  }
+
+  if (refreshToken) {
+    try {
+      await revokeStewardRefreshToken(refreshToken, c.env);
+    } catch (error) {
+      // error-policy:J1 a copied refresh token can mint a new access credential,
+      // so local cookie deletion must wait for authoritative upstream revoke.
+      logger.error("[Logout] Steward refresh revocation failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.json(
+        {
+          success: false,
+          error: "Refresh-session revocation did not complete; retry logout",
+        },
+        503,
+      );
+    }
+  }
+
   const domain = cookieDomainForHost(c.req.header("host"));
   const stewardOpts = domain ? { path: "/", domain } : { path: "/" };
   // Non-production clears only its suffixed pair. The unsuffixed legacy names
-  // are production's live cookies on the shared parent domain; deleting them
-  // from staging/dev signs the user out of production.
+  // are production's live cookies on the shared parent domain.
   deleteCookie(c, cookieNames.token, stewardOpts);
   deleteCookie(c, cookieNames.refreshToken, stewardOpts);
   deleteCookie(c, cookieNames.authed, stewardOpts);
@@ -56,40 +142,36 @@ app.post("/", async (c) => {
   deleteCookie(c, "eliza-anon-session", { path: "/" });
 
   try {
-    // Non-production may still read legacy access cookies elsewhere during the
-    // migration window, but logout must not use that fallback to mutate
-    // production-side sessions unless this environment-owned token was present.
-    if (stewardToken) {
-      await invalidateSessionCaches(stewardToken);
-      logger.debug("[Logout] Invalidated session caches for token");
+    for (const token of accessTokens) {
+      await invalidateSessionCaches(token);
+    }
+    if (accessTokens.length > 0) {
+      logger.debug("[Logout] Invalidated session caches for tokens");
     }
 
-    if (stewardToken) {
-      const user = await getCurrentUser(c);
-      if (user) {
-        await userSessionsService.endAllUserSessions(user.id);
-        await getAuditDispatcher()
-          .emit({
-            actor: { type: "user", id: user.id },
-            action: "auth.logout",
-            result: "success",
-            resource: null,
-            org_id: user.organization_id ?? undefined,
-            ip:
-              c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ??
-              undefined,
-            user_agent: c.req.header("user-agent") ?? undefined,
-            request_id: c.get("requestId"),
-            metadata: { method: "steward_cookie" },
-          })
-          // error-policy:J7 audit write is diagnostic; logout already succeeded via
-          // the cookie clear above, so a dropped audit event is logged, not fatal.
-          .catch((err: unknown) => {
-            logger.warn("[Logout] audit emit failed", {
-              error: err instanceof Error ? err.message : String(err),
-            });
+    const user = accessTokens.length > 0 ? await getCurrentUser(c) : null;
+    if (user) {
+      await userSessionsService.endAllUserSessions(user.id);
+      await getAuditDispatcher()
+        .emit({
+          actor: { type: "user", id: user.id },
+          action: "auth.logout",
+          result: "success",
+          resource: null,
+          org_id: user.organization_id ?? undefined,
+          ip:
+            c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined,
+          user_agent: c.req.header("user-agent") ?? undefined,
+          request_id: c.get("requestId"),
+          metadata: { method: "steward_session" },
+        })
+        // error-policy:J7 audit write is diagnostic; logout already succeeded via
+        // the cookie clear above, so a dropped audit event is logged, not fatal.
+        .catch((err: unknown) => {
+          logger.warn("[Logout] audit emit failed", {
+            error: err instanceof Error ? err.message : String(err),
           });
-      }
+        });
     }
   } catch (error) {
     // error-policy:J6 best-effort teardown — cookies are already cleared, so the

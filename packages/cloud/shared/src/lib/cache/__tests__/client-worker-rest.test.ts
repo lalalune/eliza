@@ -159,6 +159,47 @@ describe("CacheClient in Worker envs", () => {
     }
   });
 
+  test("explicit Worker KV fails closed when its binding is missing", async () => {
+    const previousWebSocketPair = Object.getOwnPropertyDescriptor(globalThis, "WebSocketPair");
+    const previousMockRedis = process.env.MOCK_REDIS;
+
+    Object.defineProperty(globalThis, "WebSocketPair", {
+      configurable: true,
+      value: class TestWebSocketPair {},
+    });
+    process.env.MOCK_REDIS = "0";
+    try {
+      await runWithCloudBindings(
+        {
+          CACHE_ENABLED: "true",
+          CACHE_BACKEND: "kv",
+          ENVIRONMENT: "staging",
+          NODE_ENV: "production",
+          REDIS_URL: "redis://default:test@railway.example.test:6379",
+        },
+        async () => {
+          const cache = new CacheClient();
+
+          expect(cache.getBackendKind()).toBe("none");
+          expect(cache.isAvailable()).toBe(false);
+          expect(await cache.getWithOutcome("inference:auth:no-kv")).toEqual({
+            kind: "unavailable",
+            backend: "none",
+          });
+          expect(constructedClients).toHaveLength(0);
+        },
+      );
+    } finally {
+      if (previousWebSocketPair) {
+        Object.defineProperty(globalThis, "WebSocketPair", previousWebSocketPair);
+      } else {
+        Reflect.deleteProperty(globalThis, "WebSocketPair");
+      }
+      if (previousMockRedis === undefined) delete process.env.MOCK_REDIS;
+      else process.env.MOCK_REDIS = previousMockRedis;
+    }
+  });
+
   test("uses Upstash REST bindings for durable shared-runtime history", async () => {
     await runWithCloudBindings(
       {

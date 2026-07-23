@@ -74,6 +74,7 @@ function callStreaming(request: Record<string, unknown>) {
     "gateway" as never,
     null,
     false,
+    async () => undefined,
   );
 }
 
