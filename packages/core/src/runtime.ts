@@ -144,6 +144,7 @@ import {
 } from "./streaming-context";
 import {
 	getTrajectoryContext,
+	invalidateTurnMemoPrefix,
 	setTrajectoryPurpose,
 } from "./trajectory-context";
 import {
@@ -4139,7 +4140,7 @@ export class AgentRuntime implements IAgentRuntime {
 	}
 
 	async addParticipant(entityId: UUID, roomId: UUID): Promise<boolean> {
-		const ids = await this.adapter.createRoomParticipants([entityId], roomId);
+		const ids = await this.createRoomParticipants([entityId], roomId);
 		return ids.length > 0;
 	}
 
@@ -4147,7 +4148,9 @@ export class AgentRuntime implements IAgentRuntime {
 		entityIds: UUID[],
 		roomId: UUID,
 	): Promise<UUID[]> {
-		return this.adapter.createRoomParticipants(entityIds, roomId);
+		const ids = await this.adapter.createRoomParticipants(entityIds, roomId);
+		this.invalidateEntityDetailsTurnMemo();
+		return ids;
 	}
 
 	/**
@@ -9408,6 +9411,16 @@ ${section_end}`;
 		);
 		return result[0]?.entities ?? [];
 	}
+	// getEntityDetails memoizes its room-entity scan for the duration of a turn
+	// (keyed `entity-details:<agentId>:<roomId>`). Every entity, component, and
+	// participant mutator must drop that memo so a mid-turn write (e.g.
+	// ensureConnection for a newly-mentioned participant) is visible to the
+	// planner recompose in the same turn. Prefix invalidation is used because
+	// entity/component writes don't reliably know which rooms they affect.
+	private invalidateEntityDetailsTurnMemo(): void {
+		invalidateTurnMemoPrefix(`entity-details:${this.agentId}:`);
+	}
+
 	async createEntity(entity: Entity): Promise<boolean> {
 		if (!entity.agentId) {
 			entity.agentId = this.agentId;
@@ -9421,6 +9434,7 @@ ${section_end}`;
 			e.agentId = this.agentId;
 		});
 		const result = await this.adapter.createEntities(entities);
+		this.invalidateEntityDetailsTurnMemo();
 		// Some adapters (e.g. plugin-sql) return boolean instead of UUID[].
 		// Normalize to UUID[] so callers and wrappers get a consistent contract.
 		if (Array.isArray(result)) return result;
@@ -9431,7 +9445,8 @@ ${section_end}`;
 		entities.forEach((e) => {
 			e.agentId = this.agentId;
 		});
-		return this.adapter.upsertEntities(entities);
+		await this.adapter.upsertEntities(entities);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	async getComponents(
@@ -10293,11 +10308,13 @@ ${section_end}`;
 	}
 
 	async updateEntities(entities: Entity[]): Promise<void> {
-		return this.adapter.updateEntities(entities);
+		await this.adapter.updateEntities(entities);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	async deleteEntities(entityIds: UUID[]): Promise<void> {
-		return this.adapter.deleteEntities(entityIds);
+		await this.adapter.deleteEntities(entityIds);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 	async searchEntitiesByName(params: {
 		query: string;
@@ -10322,12 +10339,15 @@ ${section_end}`;
 
 	// Single-item entity wrapper
 	async updateEntity(entity: Entity): Promise<void> {
-		return this.adapter.updateEntities([entity]);
+		await this.adapter.updateEntities([entity]);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	// Batch component methods
 	async createComponents(components: Component[]): Promise<UUID[]> {
-		return this.adapter.createComponents(components);
+		const ids = await this.adapter.createComponents(components);
+		this.invalidateEntityDetailsTurnMemo();
+		return ids;
 	}
 
 	async getComponentsByIds(componentIds: UUID[]): Promise<Component[]> {
@@ -10335,16 +10355,18 @@ ${section_end}`;
 	}
 
 	async updateComponents(components: Component[]): Promise<void> {
-		return this.adapter.updateComponents(components);
+		await this.adapter.updateComponents(components);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	async deleteComponents(componentIds: UUID[]): Promise<void> {
-		return this.adapter.deleteComponents(componentIds);
+		await this.adapter.deleteComponents(componentIds);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	// Single-item component wrappers
 	async createComponent(component: Component): Promise<boolean> {
-		const ids = await this.adapter.createComponents([component]);
+		const ids = await this.createComponents([component]);
 		return ids.length > 0;
 	}
 
@@ -10363,22 +10385,23 @@ ${section_end}`;
 	}
 
 	async updateComponent(component: Component): Promise<void> {
-		return this.adapter.updateComponents([component]);
+		return this.updateComponents([component]);
 	}
 
 	async deleteComponent(componentId: UUID): Promise<void> {
-		return this.adapter.deleteComponents([componentId]);
+		return this.deleteComponents([componentId]);
 	}
 
 	async upsertComponent(component: Component): Promise<void> {
-		return this.adapter.upsertComponents([component]);
+		return this.upsertComponents([component]);
 	}
 
 	async upsertComponents(
 		components: Component[],
 		options?: { entityContext?: UUID },
 	): Promise<void> {
-		return this.adapter.upsertComponents(components, options);
+		await this.adapter.upsertComponents(components, options);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	async patchComponent(
@@ -10386,14 +10409,15 @@ ${section_end}`;
 		ops: PatchOp[],
 		options?: { entityContext?: UUID },
 	): Promise<void> {
-		return this.adapter.patchComponents([{ componentId, ops }], options);
+		return this.patchComponents([{ componentId, ops }], options);
 	}
 
 	async patchComponents(
 		updates: Array<{ componentId: UUID; ops: PatchOp[] }>,
 		options?: { entityContext?: UUID },
 	): Promise<void> {
-		return this.adapter.patchComponents(updates, options);
+		await this.adapter.patchComponents(updates, options);
+		this.invalidateEntityDetailsTurnMemo();
 	}
 
 	async patchComponentField(
@@ -10401,7 +10425,7 @@ ${section_end}`;
 		op: PatchOp,
 		options?: { entityContext?: UUID },
 	): Promise<void> {
-		return this.adapter.patchComponents([{ componentId, ops: [op] }], options);
+		return this.patchComponents([{ componentId, ops: [op] }], options);
 	}
 
 	async getComponentsByType(
@@ -10650,7 +10674,11 @@ ${section_end}`;
 	}
 
 	async removeParticipant(entityId: UUID, roomId: UUID): Promise<boolean> {
-		return this.adapter.deleteParticipants([{ entityId, roomId }]);
+		const removed = await this.adapter.deleteParticipants([
+			{ entityId, roomId },
+		]);
+		this.invalidateEntityDetailsTurnMemo();
+		return removed;
 	}
 
 	// ── Room passthroughs & wrappers ────────────────────────────────────

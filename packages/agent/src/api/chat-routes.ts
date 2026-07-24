@@ -199,7 +199,14 @@ const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
  * never delays or aborts a response.
  */
 const chatSeenMessageIds = new Map<string, number>();
-const CHAT_DEDUPE_TTL_MS = 5 * 60_000;
+// Generation has no server-imposed deadline (cancellation is caller-owned), so
+// the retention window must comfortably exceed any realistic turn: a retry of
+// the same `clientMessageId` that lands after the window expires while the
+// original turn is STILL generating would start a second billed LLM turn (and
+// with same-room preemption could abort the first). In-repo clients mint a
+// fresh id per send, so a long window costs nothing for them; it only tightens
+// the idempotency contract for API clients that reuse keys.
+const CHAT_DEDUPE_TTL_MS = 30 * 60_000;
 let chatSeenLastSweepAt = 0;
 
 /** Normalize a raw body value into a usable idempotency key, or `null` when

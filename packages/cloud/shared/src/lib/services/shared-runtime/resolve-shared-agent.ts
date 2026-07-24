@@ -25,6 +25,16 @@ import { isDedicatedBootstrapWindow } from "./dedicated-bootstrap";
 
 export { type CachedAgentSandbox, rehydrateCachedAgentDates } from "./cached-agent-dates";
 
+/**
+ * Short-lived record of a terminal authorization denial (see
+ * CacheKeys.sharedAgentScope.resolveDenied). Only 401/403/404 outcomes are
+ * recorded — transient infrastructure failures are never persisted.
+ */
+interface CachedScopeDenial {
+  status: 401 | 403 | 404;
+  error: string;
+}
+
 export type ResolvedSharedAgent =
   | { error: string; status: 400 | 401 | 403 | 404 | 503 }
   | { agent: AgentSandbox; agentId: string; orgId: string; agentName: string };
@@ -237,6 +247,9 @@ export async function resolveSharedAgent(
   const scopeCacheKey = scopeKeyPrefix
     ? CacheKeys.sharedAgentScope.resolve(scopeKeyPrefix, agentId)
     : null;
+  const scopeDeniedKey = scopeKeyPrefix
+    ? CacheKeys.sharedAgentScope.resolveDenied(scopeKeyPrefix, agentId)
+    : null;
   if (options.cacheOnly && !scopeCacheKey) {
     return {
       error: "A supported API key or session credential is required.",
@@ -409,6 +422,23 @@ export async function resolveSharedAgent(
         status: 503,
       };
     }
+    // A fresh terminal denial (revoked key, missing/non-shared agent) is served
+    // as its real status instead of an eternal 503 "retry shortly", and it
+    // suppresses re-scheduling authoritative hydration for its few-second TTL
+    // so a bad-key hammer cannot run auth + DB work per request. Corrected
+    // state self-heals as soon as the marker expires.
+    if (scopeDeniedKey) {
+      let denied: CachedScopeDenial | null = null;
+      try {
+        denied = await cache.get<CachedScopeDenial>(scopeDeniedKey);
+      } catch {
+        // error-policy:J4 an unreadable denial marker degrades to the warming
+        // path below; the authoritative hydration remains the decider.
+      }
+      if (denied) {
+        return { error: denied.error, status: denied.status };
+      }
+    }
     const hydration = (
       cachedEntry
         ? // A stale positive entry that failed revalidation (e.g. cold
@@ -428,13 +458,31 @@ export async function resolveSharedAgent(
           )
     )
       .then(() => undefined)
-      .catch((error) => {
+      .catch(async (error) => {
         // error-policy:J7 cache hydration is deliberately off the inference
         // path; the retry remains fail-closed until an authoritative fill wins.
         logger.warn("[resolveSharedAgent] background scope hydration failed", {
           agentId,
           error: error instanceof Error ? error.message : String(error),
         });
+        // A terminal authorization outcome is a decision, not an outage: record
+        // it briefly so cache-only callers converge to the real 401/403/404
+        // instead of looping 503 + authoritative re-hydration forever.
+        if (
+          scopeDeniedKey &&
+          error instanceof ApiError &&
+          (error.status === 401 || error.status === 403 || error.status === 404)
+        ) {
+          const denial: CachedScopeDenial = {
+            status: error.status,
+            error: error.message,
+          };
+          // error-policy:J6 best-effort marker write; a miss only means the
+          // next request re-runs authoritative hydration.
+          await cache
+            .set(scopeDeniedKey, denial, CacheTTL.sharedAgentScope.resolveDenied)
+            .catch(() => undefined);
+        }
       });
     executionCtx.waitUntil(hydration);
     return {

@@ -770,6 +770,23 @@ async function resolvePersistedAssistantTurn(
     );
   }
   if (!persisted?.id) {
+    // persistAssistantConversationMemory returns null in two benign cases:
+    // empty visible text, or its same-room dedupe found an identical-text
+    // assistant memory committed since turnStartedAt (callback sender,
+    // planner-fallback retry, concurrent turn). Neither is a persistence
+    // failure — recover the already-committed row so the client gets its
+    // durable id instead of a terminal error for a reply that is in the DB.
+    if (!text.trim()) {
+      return { kind: "ephemeral", text };
+    }
+    const committedTurn = await getRecentVisibleAssistantMemorySince(
+      runtime,
+      roomId,
+      turnStartedAt,
+    );
+    if (committedTurn && committedTurn.text === text.trim()) {
+      return { kind: "durable", ...committedTurn };
+    }
     throw new AssistantReplyPersistenceError(
       "Assistant reply persistence returned no durable message id",
     );
@@ -1010,7 +1027,14 @@ async function waitForConversationRestore(
 ): Promise<void> {
   const pending = state.conversationRestorePromise;
   if (!pending) return;
-  await pending;
+  try {
+    await pending;
+  } catch {
+    // error-policy:J4 the restore failure is logged and reported at its launch
+    // boundary (beginConversationRestore's caller in server.ts). Routes that
+    // race the restore window degrade to the in-memory conversation list
+    // instead of surfacing the DB-restore error on every conversation endpoint.
+  }
 }
 
 export function normalizeActionCallbackHistory(value: unknown): string[] {
@@ -3352,6 +3376,19 @@ export async function handleConversationRoutes(
     }
 
     const endActiveChatTurn = beginActiveChatTurn(state);
+    // Cancellation is caller-owned, and for the plain POST path this route is
+    // the caller: the client's disconnect is the only cancel signal it has.
+    // Without wiring it, a hung provider stream would hold the request, the
+    // active-turn counter, and the room turn slot indefinitely with no way to
+    // cancel. Reuse the streaming route's disconnect tracker (a bare
+    // req.on("close") is wrong here — Bun's node:http shim emits it when the
+    // POST body finishes; the tracker distinguishes that via socket state).
+    const postDisconnectTracker = createConversationStreamDisconnectTracker({
+      req,
+      res,
+      conversationId: conv.id,
+      roomId: conv.roomId,
+    });
     try {
       const result = await generateChatResponse(
         runtime,
@@ -3361,6 +3398,8 @@ export async function handleConversationRoutes(
           resolveNoResponseText: () =>
             resolveNoResponseFallback(state.logBuffer, runtime),
           preferredLanguage,
+          abortSignal: postDisconnectTracker.signal,
+          isAborted: () => postDisconnectTracker.isAborted(),
         },
       );
       assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
@@ -3478,6 +3517,8 @@ export async function handleConversationRoutes(
         error(res, getErrorMessage(persistErr), 500);
       }
     } finally {
+      postDisconnectTracker.markCompleted();
+      postDisconnectTracker.dispose();
       endActiveChatTurn();
     }
     return true;

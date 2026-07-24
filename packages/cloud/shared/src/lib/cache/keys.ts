@@ -51,6 +51,16 @@ export const CacheKeys = {
   sharedAgentScope: {
     resolve: (keyHashPrefix: string, agentId: string) =>
       `shared-agent-scope:${keyHashPrefix}:${agentId}:v1`,
+    /**
+     * Short-lived terminal-denial marker for the cache-only inference path.
+     * Without it a revoked key / missing agent can never converge: every
+     * cache-only request would 503 "retry shortly" and schedule fresh
+     * authoritative hydration forever. The marker lets the hot path return the
+     * real 401/403/404 while its few-second TTL keeps a corrected credential,
+     * tier, or agent row observable almost immediately.
+     */
+    resolveDenied: (keyHashPrefix: string, agentId: string) =>
+      `shared-agent-scope:denied:${keyHashPrefix}:${agentId}:v1`,
     voice: (organizationId: string, userId: string, agentId: string) =>
       `shared-agent-scope:voice:${organizationId}:${userId}:${agentId}:v1`,
   },
@@ -299,6 +309,13 @@ export const CacheTTL = {
      * cap even under a continuously active conversation.
      */
     resolveMaxAgeMs: 5 * 60 * 1000,
+    /**
+     * TTL for the terminal-denial marker (seconds). Deliberately a few seconds:
+     * long enough to stop a bad-key hammer from running authoritative auth + DB
+     * work per request, short enough that corrected state (new key, tier flip,
+     * restored agent row) is observed on the next authoritative attempt.
+     */
+    resolveDenied: 5,
   },
   /**
    * Inference hot-path TTLs (#9899). The IAC entry caches a fully-authorized

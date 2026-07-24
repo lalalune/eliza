@@ -1913,9 +1913,15 @@ export class ElizaClient {
 
     // Contract: the API emits a terminal done/error frame and supports explicit
     // cancellation through the caller's AbortSignal. Do not infer failure from
-    // wall-clock silence: local inference, tool execution, and provider streams
-    // have different legitimate gaps, while server heartbeats keep the channel
-    // observable.
+    // wall-clock silence between tokens: local inference, tool execution, and
+    // provider streams have different legitimate gaps. Liveness is judged on
+    // BYTES, not tokens: the server writes a heartbeat comment every 5s, so a
+    // live channel never goes byte-silent for long. A read that delivers
+    // nothing for READ_STALL_TIMEOUT_MS means the transport is dead (silent
+    // TCP drop on mobile hand-off, NAT/proxy timeout without RST, sleep/wake)
+    // and `reader.read()` would otherwise pend forever with the turn stuck on
+    // "sending" dots and no retry affordance.
+    const READ_STALL_TIMEOUT_MS = 90_000;
     while (true) {
       // Client-side abort (user Stop / navigation away) must stop consuming the
       // body IMMEDIATELY — not wait for the separate server-abort POST to close
@@ -1950,7 +1956,27 @@ export class ElizaClient {
             signal.removeEventListener("abort", onAbort),
           );
         });
-        ({ done, value } = await Promise.race([readPromise, abortPromise]));
+        // Byte-recency watchdog (see READ_STALL_TIMEOUT_MS above). Reset on
+        // every settled read; cleared when the read settles so it never leaks.
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        const stallPromise = new Promise<never>((_, reject) => {
+          stallTimer = setTimeout(() => {
+            const stallErr = new Error(
+              "SSE transport stalled: no bytes (including heartbeats) received",
+            );
+            stallErr.name = "SseTransportStallError";
+            reject(stallErr);
+          }, READ_STALL_TIMEOUT_MS);
+        });
+        try {
+          ({ done, value } = await Promise.race([
+            readPromise,
+            abortPromise,
+            stallPromise,
+          ]));
+        } finally {
+          clearTimeout(stallTimer);
+        }
       } catch {
         // A client abort wins over everything else: cancel the reader and stop —
         // the partial streamed so far is returned as an interrupted turn.
