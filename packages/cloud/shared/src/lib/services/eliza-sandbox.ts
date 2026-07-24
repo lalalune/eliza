@@ -79,6 +79,7 @@ import {
   withReusedElizaCharacterOwnership,
 } from "./eliza-agent-config";
 import {
+  configureElizaLifecycleTransaction,
   elizaAgentCreateAdvisoryLockSql,
   elizaCodingContainerImageAdvisoryLockSql,
   elizaProvisionAdvisoryLockSql,
@@ -89,7 +90,7 @@ import {
   prepareManagedElizaSharedEnvironment,
 } from "./managed-eliza-config";
 import { prepareManagedElizaEnvironment } from "./managed-eliza-env";
-import { JOB_TYPES } from "./provisioning-job-types";
+import { EXCLUSIVE_AGENT_LIFECYCLE_JOB_TYPES, JOB_TYPES } from "./provisioning-job-types";
 import { mergeRuntimeAgentSecretsFromEnv } from "./runtime-agent-secrets";
 import { resolveSandboxContainerLaunchConfig } from "./sandbox-container-launch-config";
 import {
@@ -519,6 +520,10 @@ const SNAPSHOT_MAX_EXPANDED_BYTES = (() => {
 })();
 const SNAPSHOT_RESTORE_TIMEOUT_MS = 120_000;
 const UPGRADE_RUNTIME_HEALTH_GATE_TIMEOUT_MS = 30_000;
+// A timed-out lifecycle awaiter does not cancel its underlying work. Keep a
+// pre-cutover replacement out of the crash-recovery sweep long enough for the
+// 15-minute cold-boot job ceiling and any bounded leaf cleanup to settle.
+const PRE_CUTOVER_REPLACEMENT_SWEEP_GRACE_MINUTES = 30;
 // Hard cap on the container+VPN teardown during agent delete. The underlying
 // docker rm (60s) and headscale deletion (15s) are each internally bounded, but
 // an EARLY hang (SSH connect / provider init) was not — and a single stuck node
@@ -1333,6 +1338,7 @@ export class ElizaSandboxService {
       // uses and refuse past the cap.
       const cap = params.maxNonTerminalAgents;
       return dbWrite.transaction(async (tx) => {
+        await configureElizaLifecycleTransaction(tx);
         await tx.execute(elizaAgentCreateAdvisoryLockSql(params.organizationId));
         await assertOrgAgentQuota(tx, params.organizationId, cap);
 
@@ -1350,6 +1356,7 @@ export class ElizaSandboxService {
     // double-call / provision flap can't strand the org with N agents (each =
     // a container + per-tenant DB + ingress).
     return dbWrite.transaction(async (tx) => {
+      await configureElizaLifecycleTransaction(tx);
       await tx.execute(elizaAgentCreateAdvisoryLockSql(params.organizationId));
 
       const [existing] = await tx
@@ -1411,6 +1418,7 @@ export class ElizaSandboxService {
     });
 
     return dbWrite.transaction(async (tx) => {
+      await configureElizaLifecycleTransaction(tx);
       // Acquire the per-ORG agent-create lock BEFORE the per-image lock. The
       // image lock alone (keyed on the exact docker_image) does NOT serialize
       // two concurrent creates for DIFFERENT images against one org, so the
@@ -7782,7 +7790,7 @@ export class ElizaSandboxService {
             replacement_cleanup_preserved_vpn_node_id = NULL,
             replacement_cleanup_vpn_registration_started_at = NULL,
             replacement_cleanup_allocation_counted = TRUE,
-            replacement_cleanup_created_at = NOW(),
+            replacement_cleanup_created_at = date_trunc('milliseconds', NOW()),
             error_message = NULL,
             last_heartbeat_at = NOW(),
             updated_at = NOW()
@@ -7800,7 +7808,7 @@ export class ElizaSandboxService {
             AND replacement_cleanup_preserved_vpn_node_id IS NOT DISTINCT FROM ${cleanupLocator.previousVpnNodeId}
             AND replacement_cleanup_vpn_registration_started_at IS NOT DISTINCT FROM ${cleanupLocator.vpnRegistrationStartedAt}
             AND replacement_cleanup_allocation_counted = ${cleanupLocator.allocationCounted}
-            AND replacement_cleanup_created_at = ${cleanupLocator.createdAt}
+            AND ${this.replacementCleanupCreatedAtMatches(cleanupLocator.createdAt)}
             AND deletion_attempt_id IS NULL
             AND (
               claimed_at IS NULL
@@ -8291,7 +8299,7 @@ export class ElizaSandboxService {
             replacement_cleanup_preserved_vpn_node_id = NULL,
             replacement_cleanup_vpn_registration_started_at = NULL,
             replacement_cleanup_allocation_counted = TRUE,
-            replacement_cleanup_created_at = NOW(),
+            replacement_cleanup_created_at = date_trunc('milliseconds', NOW()),
             last_heartbeat_at = NOW(),
             updated_at = NOW()
           WHERE id = ${agentId}
@@ -8308,7 +8316,7 @@ export class ElizaSandboxService {
             AND replacement_cleanup_preserved_vpn_node_id IS NOT DISTINCT FROM ${cleanupLocator.previousVpnNodeId}
             AND replacement_cleanup_vpn_registration_started_at IS NOT DISTINCT FROM ${cleanupLocator.vpnRegistrationStartedAt}
             AND replacement_cleanup_allocation_counted = ${cleanupLocator.allocationCounted}
-            AND replacement_cleanup_created_at = ${cleanupLocator.createdAt}
+            AND ${this.replacementCleanupCreatedAtMatches(cleanupLocator.createdAt)}
             AND deletion_attempt_id IS NULL
             AND (
               claimed_at IS NULL
@@ -8578,6 +8586,18 @@ export class ElizaSandboxService {
     return parsed;
   }
 
+  /**
+   * PostgreSQL retains microseconds that JavaScript Date cannot round-trip.
+   * The durable placement fields fence identity; this one-millisecond window
+   * preserves the timestamp generation check without making valid CAS writes
+   * miss solely because the database carried sub-millisecond precision.
+   */
+  private replacementCleanupCreatedAtMatches(createdAt: Date) {
+    const nextMillisecond = new Date(createdAt.getTime() + 1);
+    return sql`${agentSandboxes.replacement_cleanup_created_at} >= ${createdAt}
+      AND ${agentSandboxes.replacement_cleanup_created_at} < ${nextMillisecond}`;
+  }
+
   private replacementLocatorFromHandle(
     handle: SandboxHandle,
   ): Omit<ReplacementCleanupLocator, "createdAt"> {
@@ -8767,7 +8787,7 @@ export class ElizaSandboxService {
             AND replacement_cleanup_preserved_vpn_node_id IS NOT DISTINCT FROM ${existing.previousVpnNodeId}
             AND replacement_cleanup_vpn_registration_started_at IS NOT DISTINCT FROM ${existing.vpnRegistrationStartedAt}
             AND replacement_cleanup_allocation_counted = ${existing.allocationCounted}
-            AND replacement_cleanup_created_at = ${existing.createdAt}
+            AND ${this.replacementCleanupCreatedAtMatches(existing.createdAt)}
           RETURNING id
         `);
         if (enriched.rows.length !== 1) {
@@ -8816,7 +8836,7 @@ export class ElizaSandboxService {
           replacement_cleanup_preserved_vpn_node_id = ${incoming.previousVpnNodeId},
           replacement_cleanup_vpn_registration_started_at = ${incoming.vpnRegistrationStartedAt},
           replacement_cleanup_allocation_counted = ${incoming.allocationCounted},
-          replacement_cleanup_created_at = NOW(),
+          replacement_cleanup_created_at = date_trunc('milliseconds', NOW()),
           updated_at = NOW()
         WHERE id = ${agentId}
           AND organization_id = ${orgId}
@@ -8873,7 +8893,7 @@ export class ElizaSandboxService {
           AND replacement_cleanup_preserved_vpn_node_id IS NOT DISTINCT FROM ${existing.previousVpnNodeId}
           AND replacement_cleanup_vpn_registration_started_at IS NOT DISTINCT FROM ${existing.vpnRegistrationStartedAt}
           AND replacement_cleanup_allocation_counted = ${existing.allocationCounted}
-          AND replacement_cleanup_created_at = ${existing.createdAt}
+          AND ${this.replacementCleanupCreatedAtMatches(existing.createdAt)}
         RETURNING id
       `);
       if (persisted.rows.length !== 1) {
@@ -8989,7 +9009,14 @@ export class ElizaSandboxService {
     orgId: string,
     expectation?: AdminCanaryCleanupExpectation,
     onConvergedInTx?: (tx: DbTransaction) => Promise<void>,
-  ): Promise<"missing" | "clean" | "retired"> {
+    source: "lifecycle" | "background-reconcile" | "admin-converge" = "lifecycle",
+  ): Promise<"missing" | "clean" | "deferred" | "retired"> {
+    const startedAt = Date.now();
+    logger.info("[agent-sandbox] Replacement cleanup started", {
+      agentId,
+      organizationId: orgId,
+      source,
+    });
     const snapshot = await dbWrite.transaction(async (tx) => {
       await this.lockLifecycle(tx, agentId, orgId);
       const current = await this.getAgentForLifecycleMutation(tx, agentId, orgId);
@@ -8997,6 +9024,19 @@ export class ElizaSandboxService {
       const locator = this.getReplacementCleanupLocator(current);
       if (expectation) {
         this.assertAdminCanaryCleanupExpectation(current, locator, expectation);
+      }
+      if (
+        source === "background-reconcile" &&
+        (await this.hasActiveExclusiveLifecycleJobTx(tx, agentId, orgId))
+      ) {
+        return { state: "deferred" as const };
+      }
+      if (
+        source === "background-reconcile" &&
+        locator?.replacementAttemptId !== null &&
+        !(await this.isReplacementCleanupSweepEligibleTx(tx, agentId, orgId))
+      ) {
+        return { state: "deferred" as const };
       }
       if (locator) return { state: "pending" as const, locator };
       if (onConvergedInTx) await onConvergedInTx(tx);
@@ -9011,6 +9051,15 @@ export class ElizaSandboxService {
     const stopOnSpecificNodeForReplacement =
       provider.stopOnSpecificNodeForReplacement.bind(provider);
     const { locator } = snapshot;
+    logger.info("[agent-sandbox] Replacement cleanup remote retirement started", {
+      agentId,
+      organizationId: orgId,
+      source,
+      nodeId: locator.nodeId,
+      containerName: locator.containerName,
+      preCutover: locator.replacementAttemptId !== null,
+      elapsedMs: Date.now() - startedAt,
+    });
 
     await stopOnSpecificNodeForReplacement(
       locator.nodeId,
@@ -9025,8 +9074,14 @@ export class ElizaSandboxService {
         allocationCounted: locator.allocationCounted,
       },
     );
+    logger.info("[agent-sandbox] Replacement cleanup remote absence proven", {
+      agentId,
+      organizationId: orgId,
+      source,
+      elapsedMs: Date.now() - startedAt,
+    });
 
-    return dbWrite.transaction(async (tx) => {
+    const outcome = await dbWrite.transaction(async (tx) => {
       await this.lockLifecycle(tx, agentId, orgId);
       const current = await this.getAgentForLifecycleMutation(tx, agentId, orgId);
       if (!current) {
@@ -9070,7 +9125,7 @@ export class ElizaSandboxService {
           AND replacement_cleanup_preserved_vpn_node_id IS NOT DISTINCT FROM ${locator.previousVpnNodeId}
           AND replacement_cleanup_vpn_registration_started_at IS NOT DISTINCT FROM ${locator.vpnRegistrationStartedAt}
           AND replacement_cleanup_allocation_counted = ${locator.allocationCounted}
-          AND replacement_cleanup_created_at = ${locator.createdAt}
+          AND ${this.replacementCleanupCreatedAtMatches(locator.createdAt)}
         RETURNING id
       `);
       if (cleared.rows.length !== 1) {
@@ -9093,6 +9148,13 @@ export class ElizaSandboxService {
       if (onConvergedInTx) await onConvergedInTx(tx);
       return "retired" as const;
     });
+    logger.info("[agent-sandbox] Replacement cleanup fence retired", {
+      agentId,
+      organizationId: orgId,
+      source,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return outcome;
   }
 
   /**
@@ -9109,6 +9171,19 @@ export class ElizaSandboxService {
       SELECT id, organization_id
       FROM ${agentSandboxes}
       WHERE replacement_cleanup_sandbox_id IS NOT NULL
+        AND (
+          replacement_cleanup_attempt_id IS NULL
+          OR replacement_cleanup_created_at <=
+            NOW() - (${PRE_CUTOVER_REPLACEMENT_SWEEP_GRACE_MINUTES} * INTERVAL '1 minute')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ${jobs}
+          WHERE ${jobs.organization_id} = ${agentSandboxes.organization_id}
+            AND ${jobs.agent_id} = ${agentSandboxes.id}::text
+            AND ${jobs.status} IN ('pending', 'in_progress')
+            AND ${inArray(jobs.type, EXCLUSIVE_AGENT_LIFECYCLE_JOB_TYPES)}
+        )
       ORDER BY replacement_cleanup_created_at ASC
       LIMIT ${limit}
     `);
@@ -9117,7 +9192,13 @@ export class ElizaSandboxService {
     for (const row of pending.rows) {
       try {
         if (
-          (await this.retirePersistedReplacementCleanup(row.id, row.organization_id)) === "retired"
+          (await this.retirePersistedReplacementCleanup(
+            row.id,
+            row.organization_id,
+            undefined,
+            undefined,
+            "background-reconcile",
+          )) === "retired"
         ) {
           retired += 1;
         }
@@ -9151,6 +9232,7 @@ export class ElizaSandboxService {
       orgId,
       expectation,
       onConvergedInTx,
+      "admin-converge",
     );
     if (outcome === "missing") {
       throw expectation
@@ -9162,7 +9244,44 @@ export class ElizaSandboxService {
   }
 
   private async lockLifecycle(tx: LifecycleTx, agentId: string, orgId: string): Promise<void> {
+    await configureElizaLifecycleTransaction(tx);
     await tx.execute(elizaProvisionAdvisoryLockSql(orgId, agentId));
+  }
+
+  private async isReplacementCleanupSweepEligibleTx(
+    tx: LifecycleTx,
+    agentId: string,
+    orgId: string,
+  ): Promise<boolean> {
+    const result = await tx.execute<{ eligible: boolean }>(sql`
+      SELECT (
+        replacement_cleanup_attempt_id IS NULL
+        OR replacement_cleanup_created_at <=
+          NOW() - (${PRE_CUTOVER_REPLACEMENT_SWEEP_GRACE_MINUTES} * INTERVAL '1 minute')
+      ) AS eligible
+      FROM ${agentSandboxes}
+      WHERE id = ${agentId}
+        AND organization_id = ${orgId}
+      LIMIT 1
+    `);
+    return result.rows[0]?.eligible === true;
+  }
+
+  private async hasActiveExclusiveLifecycleJobTx(
+    tx: LifecycleTx,
+    agentId: string,
+    orgId: string,
+  ): Promise<boolean> {
+    const result = await tx.execute<{ id: string }>(sql`
+      SELECT id
+      FROM ${jobs}
+      WHERE ${jobs.organization_id} = ${orgId}
+        AND ${jobs.agent_id} = ${agentId}
+        AND ${jobs.status} IN ('pending', 'in_progress')
+        AND ${inArray(jobs.type, EXCLUSIVE_AGENT_LIFECYCLE_JOB_TYPES)}
+      LIMIT 1
+    `);
+    return result.rows.length > 0;
   }
 
   private async getAgentForLifecycleMutation(

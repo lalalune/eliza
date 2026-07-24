@@ -74,6 +74,16 @@ type ReplacementStageService = {
   ): Promise<void>;
 };
 
+type ReplacementCleanupService = {
+  retirePersistedReplacementCleanup(
+    agentId: string,
+    orgId: string,
+    expectation?: undefined,
+    onConvergedInTx?: undefined,
+    source?: "lifecycle" | "background-reconcile" | "admin-converge",
+  ): Promise<"missing" | "clean" | "deferred" | "retired">;
+};
+
 function replacementHandle(params: {
   agentId: string;
   nodeId: string;
@@ -655,6 +665,160 @@ describe("admin agent image rollout on primary PGlite", () => {
     });
   });
 
+  test("replacement enrichment and cleanup preserve a PostgreSQL microsecond fence", async () => {
+    const seeded = await seedAgents(1);
+    const agentId = seeded.targets[0]!.agentId;
+    await dbWrite.insert(dockerNodes).values({
+      node_id: "node-new",
+      hostname: "node-new.internal",
+      status: "healthy",
+      enabled: true,
+      capacity: 8,
+      allocated_count: 2,
+    });
+    const provider = new DockerSandboxProvider();
+    const cleanup = spyOn(provider, "stopOnSpecificNodeForReplacement").mockResolvedValue(
+      undefined,
+    );
+    const service = new ElizaSandboxService(
+      provider as unknown as SandboxProvider,
+    ) as unknown as ElizaSandboxService & ReplacementStageService;
+    const expected = {
+      status: "running" as const,
+      environmentRevision: 0,
+      sandboxId: "sandbox-1",
+      nodeId: "node-1",
+      containerName: "agent-1",
+    };
+    const intent = replacementHandle({
+      agentId,
+      nodeId: "node-new",
+      containerName: "agent-new",
+      previousVpnNodeId: "vpn-old",
+    });
+    const created = replacementHandle({
+      agentId,
+      nodeId: "node-new",
+      containerName: "agent-new",
+      containerId: "sha256:container-new",
+      previousVpnNodeId: "vpn-old",
+    });
+    const registered = replacementHandle({
+      agentId,
+      nodeId: "node-new",
+      containerName: "agent-new",
+      containerId: "sha256:container-new",
+      vpnNodeId: "vpn-new",
+      previousVpnNodeId: "vpn-old",
+    });
+
+    await service.persistReplacementCleanupStage(
+      agentId,
+      seeded.organizationId,
+      intent,
+      expected,
+      "intent",
+    );
+    await dbWrite.execute(sql`
+      UPDATE ${agentSandboxes}
+      SET replacement_cleanup_created_at =
+        TIMESTAMPTZ '2026-07-23 12:01:00.123456+00'
+      WHERE id = ${agentId}
+    `);
+    const precision = await dbWrite.execute<{ fractional: string }>(sql`
+      SELECT to_char(replacement_cleanup_created_at, 'US') AS fractional
+      FROM ${agentSandboxes}
+      WHERE id = ${agentId}
+    `);
+    expect(precision.rows[0]?.fractional).toBe("123456");
+
+    await service.persistReplacementCleanupStage(
+      agentId,
+      seeded.organizationId,
+      created,
+      expected,
+      "created",
+    );
+    const afterCreated = await agentSandboxesRepository.findByIdAndOrg(
+      agentId,
+      seeded.organizationId,
+    );
+    expect(afterCreated).toMatchObject({
+      replacement_cleanup_container_id: "sha256:container-new",
+      replacement_cleanup_vpn_node_id: null,
+      replacement_cleanup_allocation_counted: true,
+    });
+    const createdAt = afterCreated?.replacement_cleanup_created_at;
+    expect(createdAt).toBeInstanceOf(Date);
+    const createdPrecision = await dbWrite.execute<{ fractional: string }>(sql`
+      SELECT to_char(replacement_cleanup_created_at, 'US') AS fractional
+      FROM ${agentSandboxes}
+      WHERE id = ${agentId}
+    `);
+    expect(createdPrecision.rows[0]?.fractional).toBe("123456");
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-new")))[0]
+        ?.allocated_count,
+    ).toBe(3);
+
+    await service.persistReplacementCleanupStage(
+      agentId,
+      seeded.organizationId,
+      created,
+      expected,
+      "created",
+    );
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_container_id: "sha256:container-new",
+      replacement_cleanup_vpn_node_id: null,
+      replacement_cleanup_created_at: createdAt,
+    });
+    await service.persistReplacementCleanupStage(
+      agentId,
+      seeded.organizationId,
+      registered,
+      expected,
+      "vpn",
+    );
+    await service.persistReplacementCleanupStage(
+      agentId,
+      seeded.organizationId,
+      registered,
+      expected,
+      "vpn",
+    );
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_container_id: "sha256:container-new",
+      replacement_cleanup_vpn_node_id: "vpn-new",
+      replacement_cleanup_created_at: createdAt,
+      replacement_cleanup_allocation_counted: true,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-new")))[0]
+        ?.allocated_count,
+    ).toBe(3);
+
+    await service.convergeReplacementCleanupFence(agentId, seeded.organizationId);
+    await service.convergeReplacementCleanupFence(agentId, seeded.organizationId);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: null,
+      replacement_cleanup_attempt_id: null,
+      replacement_cleanup_container_id: null,
+      replacement_cleanup_allocation_counted: null,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-new")))[0]
+        ?.allocated_count,
+    ).toBe(2);
+  });
+
   test("replacement cleanup proves absence outside the transaction and fences a changed locator", async () => {
     const seeded = await seedAgents(1);
     const agentId = seeded.targets[0]!.agentId;
@@ -720,6 +884,290 @@ describe("admin agent image rollout on primary PGlite", () => {
     });
     expect(
       (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-new")))[0]
+        ?.allocated_count,
+    ).toBe(2);
+  });
+
+  test("replacement cleanup sweep waits for lifecycle completion and candidate grace", async () => {
+    const seeded = await seedAgents(1);
+    const agentId = seeded.targets[0]!.agentId;
+    await dbWrite.insert(dockerNodes).values({
+      node_id: "node-candidate",
+      hostname: "node-candidate.internal",
+      status: "healthy",
+      enabled: true,
+      capacity: 8,
+      allocated_count: 3,
+    });
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        replacement_cleanup_sandbox_id: "agent-old",
+        replacement_cleanup_node_id: "node-candidate",
+        replacement_cleanup_container_name: "agent-old",
+        replacement_cleanup_attempt_id: null,
+        replacement_cleanup_container_id: null,
+        replacement_cleanup_vpn_node_id: "vpn-old",
+        replacement_cleanup_vpn_node_name: null,
+        replacement_cleanup_preserved_vpn_node_id: null,
+        replacement_cleanup_vpn_registration_started_at: null,
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+    const [job] = await dbWrite
+      .insert(jobs)
+      .values({
+        type: JOB_TYPES.AGENT_ADMIN_CANARY_IMAGE,
+        status: "pending",
+        organization_id: seeded.organizationId,
+        user_id: seeded.actorUserId,
+        agent_id: agentId,
+        data: {},
+      })
+      .returning();
+
+    const provider = new DockerSandboxProvider();
+    const cleanup = spyOn(provider, "stopOnSpecificNodeForReplacement").mockResolvedValue(
+      undefined,
+    );
+    const service = new ElizaSandboxService(provider as unknown as SandboxProvider);
+
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 0,
+      retired: 0,
+      failed: 0,
+    });
+    await dbWrite.update(jobs).set({ status: "in_progress" }).where(eq(jobs.id, job!.id));
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 0,
+      retired: 0,
+      failed: 0,
+    });
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: "agent-old",
+      replacement_cleanup_vpn_node_id: "vpn-old",
+      replacement_cleanup_allocation_counted: true,
+    });
+
+    await dbWrite.update(jobs).set({ status: "completed" }).where(eq(jobs.id, job!.id));
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 1,
+      retired: 1,
+      failed: 0,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: null,
+      replacement_cleanup_vpn_node_id: null,
+      replacement_cleanup_allocation_counted: null,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-candidate")))[0]
+        ?.allocated_count,
+    ).toBe(2);
+
+    await dbWrite
+      .update(dockerNodes)
+      .set({ allocated_count: 3 })
+      .where(eq(dockerNodes.node_id, "node-candidate"));
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        replacement_cleanup_sandbox_id: "agent-candidate",
+        replacement_cleanup_node_id: "node-candidate",
+        replacement_cleanup_container_name: "agent-candidate",
+        replacement_cleanup_attempt_id: REPLACEMENT_ATTEMPT_ID,
+        replacement_cleanup_container_id: "sha256:container-candidate",
+        replacement_cleanup_vpn_node_id: "vpn-candidate",
+        replacement_cleanup_vpn_node_name: "agent-candidate-vpn",
+        replacement_cleanup_preserved_vpn_node_id: "vpn-live",
+        replacement_cleanup_vpn_registration_started_at: new Date(REPLACEMENT_STARTED_AT),
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 0,
+      retired: 0,
+      failed: 0,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: "agent-candidate",
+      replacement_cleanup_attempt_id: REPLACEMENT_ATTEMPT_ID,
+      replacement_cleanup_allocation_counted: true,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-candidate")))[0]
+        ?.allocated_count,
+    ).toBe(3);
+
+    await dbWrite.execute(sql`
+      UPDATE ${agentSandboxes}
+      SET replacement_cleanup_created_at = NOW() - INTERVAL '31 minutes'
+      WHERE id = ${agentId}
+    `);
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 1,
+      retired: 1,
+      failed: 0,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: null,
+      replacement_cleanup_attempt_id: null,
+      replacement_cleanup_allocation_counted: null,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-candidate")))[0]
+        ?.allocated_count,
+    ).toBe(2);
+
+    await dbWrite
+      .update(dockerNodes)
+      .set({ allocated_count: 3 })
+      .where(eq(dockerNodes.node_id, "node-candidate"));
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        replacement_cleanup_sandbox_id: "agent-failed",
+        replacement_cleanup_node_id: "node-candidate",
+        replacement_cleanup_container_name: "agent-failed",
+        replacement_cleanup_attempt_id: REPLACEMENT_ATTEMPT_ID,
+        replacement_cleanup_container_id: "sha256:container-failed",
+        replacement_cleanup_vpn_node_id: "vpn-failed",
+        replacement_cleanup_vpn_node_name: "agent-failed-vpn",
+        replacement_cleanup_preserved_vpn_node_id: "vpn-live",
+        replacement_cleanup_vpn_registration_started_at: new Date(REPLACEMENT_STARTED_AT),
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+    await dbWrite.execute(sql`
+      UPDATE ${agentSandboxes}
+      SET replacement_cleanup_created_at = NOW() - INTERVAL '31 minutes'
+      WHERE id = ${agentId}
+    `);
+    cleanup.mockRejectedValueOnce(new Error("remote cleanup unavailable"));
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 1,
+      retired: 0,
+      failed: 1,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(3);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: "agent-failed",
+      replacement_cleanup_attempt_id: REPLACEMENT_ATTEMPT_ID,
+      replacement_cleanup_allocation_counted: true,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-candidate")))[0]
+        ?.allocated_count,
+    ).toBe(3);
+  });
+
+  test("replacement cleanup rechecks lifecycle jobs after candidate selection", async () => {
+    const seeded = await seedAgents(1);
+    const agentId = seeded.targets[0]!.agentId;
+    await dbWrite.insert(dockerNodes).values({
+      node_id: "node-race",
+      hostname: "node-race.internal",
+      status: "healthy",
+      enabled: true,
+      capacity: 8,
+      allocated_count: 3,
+    });
+    await dbWrite
+      .update(agentSandboxes)
+      .set({
+        replacement_cleanup_sandbox_id: "agent-race-old",
+        replacement_cleanup_node_id: "node-race",
+        replacement_cleanup_container_name: "agent-race-old",
+        replacement_cleanup_attempt_id: null,
+        replacement_cleanup_container_id: null,
+        replacement_cleanup_vpn_node_id: "vpn-race-old",
+        replacement_cleanup_vpn_node_name: null,
+        replacement_cleanup_preserved_vpn_node_id: null,
+        replacement_cleanup_vpn_registration_started_at: null,
+        replacement_cleanup_allocation_counted: true,
+        replacement_cleanup_created_at: new Date(),
+      })
+      .where(eq(agentSandboxes.id, agentId));
+
+    const provider = new DockerSandboxProvider();
+    const cleanup = spyOn(provider, "stopOnSpecificNodeForReplacement").mockResolvedValue(
+      undefined,
+    );
+    const service = new ElizaSandboxService(provider as unknown as SandboxProvider);
+    const cleanupService = service as unknown as ReplacementCleanupService;
+    const retire = cleanupService.retirePersistedReplacementCleanup.bind(service);
+    let insertedJobId: string | null = null;
+    spyOn(cleanupService, "retirePersistedReplacementCleanup").mockImplementation(
+      async (...args) => {
+        if (!insertedJobId) {
+          const [job] = await dbWrite
+            .insert(jobs)
+            .values({
+              type: JOB_TYPES.AGENT_ADMIN_CANARY_IMAGE,
+              status: "pending",
+              organization_id: seeded.organizationId,
+              user_id: seeded.actorUserId,
+              agent_id: agentId,
+              data: {},
+            })
+            .returning({ id: jobs.id });
+          insertedJobId = job!.id;
+        }
+        return retire(...args);
+      },
+    );
+
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 1,
+      retired: 0,
+      failed: 0,
+    });
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: "agent-race-old",
+      replacement_cleanup_vpn_node_id: "vpn-race-old",
+      replacement_cleanup_allocation_counted: true,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-race")))[0]
+        ?.allocated_count,
+    ).toBe(3);
+
+    await dbWrite.update(jobs).set({ status: "completed" }).where(eq(jobs.id, insertedJobId!));
+    expect(await service.reconcileReplacementCleanupFences()).toEqual({
+      total: 1,
+      retired: 1,
+      failed: 0,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(
+      await agentSandboxesRepository.findByIdAndOrg(agentId, seeded.organizationId),
+    ).toMatchObject({
+      replacement_cleanup_sandbox_id: null,
+      replacement_cleanup_vpn_node_id: null,
+      replacement_cleanup_allocation_counted: null,
+    });
+    expect(
+      (await dbWrite.select().from(dockerNodes).where(eq(dockerNodes.node_id, "node-race")))[0]
         ?.allocated_count,
     ).toBe(2);
   });
