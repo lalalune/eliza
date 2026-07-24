@@ -344,6 +344,13 @@ export function startLifeOpsActivitySignalCapture(
     void track(operation).catch(reportCaptureError);
   };
 
+  const observeUnownedProbe = <T>(operation: Promise<T>): void => {
+    // error-policy:J7 read-only bridge probes have no cancellation boundary and
+    // therefore cannot be teardown-owned. Their late effects are generation
+    // fenced, while failures still surface through the capture diagnostics.
+    void operation.catch(reportCaptureError);
+  };
+
   const observeMobileSignalsOperation = <T>(
     generation: MobileSignalsGeneration,
     operation: () => Promise<T>,
@@ -362,14 +369,17 @@ export function startLifeOpsActivitySignalCapture(
       (error.kind === "http" && error.status === 503));
 
   const refreshRuntimeReady = async (): Promise<boolean> => {
+    if (!mounted) return false;
     try {
       const status = await client.getStatus();
+      if (!mounted) return false;
       const ready = status.state === "running";
       runtimeReady = ready;
       return ready;
     } catch (error) {
       // error-policy:J4 capture stands down until a later poll succeeds;
       // unexpected probe failures still surface as a capture_error status.
+      if (!mounted) return false;
       runtimeReady = false;
       if (!isExpectedProbeFailure(error)) {
         reportCaptureError(error);
@@ -495,13 +505,25 @@ export function startLifeOpsActivitySignalCapture(
     });
   };
 
-  const emitDesktopSnapshot = async (reason: string): Promise<void> => {
-    try {
-      if (!isElectrobunRuntime()) {
-        return;
-      }
+  let desktopSnapshotProbeTask: Promise<void> | null = null;
+  const requestDesktopSnapshot = (reason: string): void => {
+    if (!mounted || desktopSnapshotProbeTask || !isElectrobunRuntime()) {
+      return;
+    }
+
+    let resolveProbe!: () => void;
+    let rejectProbe!: (error: unknown) => void;
+    const probeTask = new Promise<void>((resolve, reject) => {
+      resolveProbe = resolve;
+      rejectProbe = reject;
+    });
+    // Publish the single-flight token before entering Electrobun. A wedged
+    // workspace RPC must retain at most one read-only probe, never one fan-out
+    // per focus/poll event.
+    desktopSnapshotProbeTask = probeTask;
+    const reading = (async () => {
       const snapshot = await loadDesktopWorkspaceSnapshot();
-      if (!snapshot.supported || !snapshot.power) {
+      if (!mounted || !snapshot.supported || !snapshot.power) {
         return;
       }
 
@@ -513,7 +535,9 @@ export function startLifeOpsActivitySignalCapture(
             : snapshot.window.focused && document.visibilityState === "visible"
               ? "active"
               : "background";
-      await sendSignal({
+      // The unbounded read is not teardown-owned; once it produces a value,
+      // persistence crosses the abortable, teardown-owned boundary separately.
+      fireAndForget({
         source: "desktop_power",
         state,
         idleState: snapshot.power.idleState,
@@ -526,11 +550,22 @@ export function startLifeOpsActivitySignalCapture(
           documentVisibility: document.visibilityState,
         },
       });
-    } catch (error) {
-      // error-policy:J7 the desktop snapshot poll must not kill the capture
-      // loop; unexpected failures are surfaced through reportCaptureError.
-      reportCaptureError(error);
-    }
+    })();
+    void reading.then(
+      () => {
+        if (desktopSnapshotProbeTask === probeTask) {
+          desktopSnapshotProbeTask = null;
+        }
+        resolveProbe();
+      },
+      (error) => {
+        if (desktopSnapshotProbeTask === probeTask) {
+          desktopSnapshotProbeTask = null;
+        }
+        rejectProbe(error);
+      },
+    );
+    observeUnownedProbe(probeTask);
   };
 
   const handleVisibilityChange = (): void => {
@@ -538,16 +573,16 @@ export function startLifeOpsActivitySignalCapture(
   };
   const handleFocus = (): void => {
     emitPageState("focus");
-    void track(emitDesktopSnapshot("focus"));
+    requestDesktopSnapshot("focus");
   };
   const handleBlur = (): void => {
     emitPageState("blur");
-    void track(emitDesktopSnapshot("blur"));
+    requestDesktopSnapshot("blur");
   };
   const handleResume = (): void => {
     emitLifecycleState("active");
     emitPageState("resume");
-    void track(emitDesktopSnapshot("resume"));
+    requestDesktopSnapshot("resume");
     // A permission granted in OS Settings while the app was backgrounded
     // becomes effective here, while a revoked grant stops existing native
     // ownership before any fresh health read can begin.
@@ -557,7 +592,7 @@ export function startLifeOpsActivitySignalCapture(
     emitLifecycleState("background");
     emitPageState("pause");
     requestMobileHealthSnapshot("pause");
-    void track(emitDesktopSnapshot("pause"));
+    requestDesktopSnapshot("pause");
   };
 
   const mobileSignals =
@@ -596,7 +631,16 @@ export function startLifeOpsActivitySignalCapture(
     }
     if (requestedGeneration.refreshTask) return;
 
-    let tracked: Promise<void>;
+    let resolveRefresh!: () => void;
+    let rejectRefresh!: (error: unknown) => void;
+    const refreshTask = new Promise<void>((resolve, reject) => {
+      resolveRefresh = resolve;
+      rejectRefresh = reject;
+    });
+    // Publish the single-flight lease before invoking getSnapshot(). A bridge
+    // shim can synchronously dispatch pause/resume while the boundary is being
+    // entered; that reentrant path must observe this read as already owned.
+    requestedGeneration.refreshTask = refreshTask;
     const reading = trackMobileSignalsOperation(
       requestedGeneration,
       async () => {
@@ -614,14 +658,21 @@ export function startLifeOpsActivitySignalCapture(
         }
       },
     );
-    const finalized = reading.finally(() => {
-      if (requestedGeneration.refreshTask === tracked) {
-        requestedGeneration.refreshTask = null;
-      }
-    });
-    tracked = finalized;
-    requestedGeneration.refreshTask = tracked;
-    observeCaptureOperation(tracked);
+    void reading.then(
+      () => {
+        if (requestedGeneration.refreshTask === refreshTask) {
+          requestedGeneration.refreshTask = null;
+        }
+        resolveRefresh();
+      },
+      (error) => {
+        if (requestedGeneration.refreshTask === refreshTask) {
+          requestedGeneration.refreshTask = null;
+        }
+        rejectRefresh(error);
+      },
+    );
+    observeCaptureOperation(refreshTask);
   };
 
   const hasNativeOwnership = (): boolean =>
@@ -635,8 +686,8 @@ export function startLifeOpsActivitySignalCapture(
     mobileBackgroundRefreshNeedsCancel ||
     mobileBackgroundRefreshScheduleTask !== null;
 
-  const releaseNativeOwnership = async (): Promise<void> => {
-    if (!mobileSignals) return;
+  const releaseNativeOwnership = (): Promise<void> => {
+    if (!mobileSignals) return Promise.resolve();
     // Suspending the commit bit before the first native await prevents a
     // poller or already-queued callback from reading/sending while consent or
     // ownership is uncertain. Granular obligations below remain set until
@@ -645,209 +696,238 @@ export function startLifeOpsActivitySignalCapture(
     clearMobileHealthPoller();
     if (nativeReleaseTask) return nativeReleaseTask;
 
-    const generationAtRelease = mobileSignalsGeneration;
-    if (generationAtRelease) {
-      mobileSignalsGeneration = null;
-      generationAtRelease.controller.abort();
-    }
-    const settlingGeneration = generationAtRelease
-      ? settleMobileSignalsOperations(generationAtRelease)
-      : Promise.resolve();
-    const scheduleTaskAtRelease = mobileBackgroundRefreshScheduleTask;
-    const shouldReleaseListeners =
-      mobileSignalListenersNeedRelease ||
-      pendingMobileSignalsHandle !== null ||
-      mobileSignalsHandle !== null;
-    const releasingListeners = shouldReleaseListeners
-      ? typeof mobileSignals.releaseSignalListeners === "function"
-        ? (async () => {
-            const listenerHandles = [
-              ...new Set(
-                [pendingMobileSignalsHandle, mobileSignalsHandle].filter(
-                  (handle): handle is { remove: () => Promise<void> } =>
-                    handle !== null,
+    let resolveRelease!: () => void;
+    let rejectRelease!: (error: unknown) => void;
+    const releaseTask = new Promise<void>((resolve, reject) => {
+      resolveRelease = resolve;
+      rejectRelease = reject;
+    });
+    // Publish the teardown owner before invoking any native method. Capacitor
+    // shims can synchronously re-enter stop() while a bridge call is being
+    // created; that path must join this attempt rather than duplicate release.
+    nativeReleaseTask = releaseTask;
+
+    try {
+      const generationAtRelease = mobileSignalsGeneration;
+      if (generationAtRelease) {
+        mobileSignalsGeneration = null;
+        generationAtRelease.controller.abort();
+      }
+      const settlingGeneration = generationAtRelease
+        ? settleMobileSignalsOperations(generationAtRelease)
+        : Promise.resolve();
+      const scheduleTaskAtRelease = mobileBackgroundRefreshScheduleTask;
+      const shouldReleaseListeners =
+        mobileSignalListenersNeedRelease ||
+        pendingMobileSignalsHandle !== null ||
+        mobileSignalsHandle !== null;
+      const releasingListeners = shouldReleaseListeners
+        ? typeof mobileSignals.releaseSignalListeners === "function"
+          ? (async () => {
+              const listenerHandles = [
+                ...new Set(
+                  [pendingMobileSignalsHandle, mobileSignalsHandle].filter(
+                    (handle): handle is { remove: () => Promise<void> } =>
+                      handle !== null,
+                  ),
                 ),
-              ),
-            ];
-            const pendingHandleAtRelease = pendingMobileSignalsHandle;
-            const committedHandleAtRelease = mobileSignalsHandle;
-            const handleRemovals = listenerHandles.map((handle) => {
-              try {
-                return Promise.resolve(handle.remove());
-              } catch (error) {
-                // error-policy:J6 preserve synchronous handle failures as
-                // teardown outcomes while the authoritative native release is
-                // still invoked in this same pagehide turn.
-                return Promise.reject(error);
-              }
-            });
-            for (const handleRemoval of handleRemovals) {
-              void handleRemoval.catch((error) => {
-                // error-policy:J6 the package-owned native release below is
-                // the authoritative event-registry and bridge-callback
-                // postcondition; a stale generic wrapper cannot retain native
-                // ownership or block teardown once that fence succeeds.
-                console.warn(
-                  `${LOG_PREFIX} generic mobile signal listener removal failed; the package-owned native release remains authoritative:`,
-                  error,
-                );
+              ];
+              const pendingHandleAtRelease = pendingMobileSignalsHandle;
+              const committedHandleAtRelease = mobileSignalsHandle;
+              const handleRemovals = listenerHandles.map((handle) => {
+                try {
+                  return Promise.resolve(handle.remove());
+                } catch (error) {
+                  // error-policy:J6 preserve synchronous handle failures as
+                  // teardown outcomes while the authoritative native release is
+                  // still invoked in this same pagehide turn.
+                  return Promise.reject(error);
+                }
               });
-            }
-            // The package call is authoritative and releases both native
-            // ownership tables. Generic handles are advisory because Capacitor
-            // does not acknowledge their nested removeListener call.
-            const result = await mobileSignals.releaseSignalListeners();
-            if (!result.removed) {
-              throw new ElizaError(
-                "MobileSignals.releaseSignalListeners() did not establish the removed postcondition",
+              for (const handleRemoval of handleRemovals) {
+                void handleRemoval.catch((error) => {
+                  // error-policy:J6 the package-owned native release below is
+                  // the authoritative event-registry and bridge-callback
+                  // postcondition; a stale generic wrapper cannot retain native
+                  // ownership or block teardown once that fence succeeds.
+                  console.warn(
+                    `${LOG_PREFIX} generic mobile signal listener removal failed; the package-owned native release remains authoritative:`,
+                    error,
+                  );
+                });
+              }
+              // The package call is authoritative and releases both native
+              // ownership tables. Generic handles are advisory because Capacitor
+              // does not acknowledge their nested removeListener call.
+              const result = await mobileSignals.releaseSignalListeners();
+              if (!result.removed) {
+                throw new ElizaError(
+                  "MobileSignals.releaseSignalListeners() did not establish the removed postcondition",
+                  {
+                    code: "MOBILE_SIGNAL_LISTENER_RELEASE_INCOMPLETE",
+                    severity: "ephemeral",
+                  },
+                );
+              }
+              mobileSignalListenersNeedRelease = false;
+              if (pendingMobileSignalsHandle === pendingHandleAtRelease) {
+                pendingMobileSignalsHandle = null;
+              }
+              if (mobileSignalsHandle === committedHandleAtRelease) {
+                mobileSignalsHandle = null;
+              }
+            })()
+          : Promise.reject(
+              new ElizaError(
+                "MobileSignals.releaseSignalListeners() disappeared while listener ownership was recorded",
                 {
-                  code: "MOBILE_SIGNAL_LISTENER_RELEASE_INCOMPLETE",
-                  severity: "ephemeral",
+                  code: "MOBILE_SIGNAL_LISTENER_RELEASE_UNAVAILABLE",
+                  severity: "fatal",
                 },
-              );
-            }
-            mobileSignalListenersNeedRelease = false;
-            if (pendingMobileSignalsHandle === pendingHandleAtRelease) {
-              pendingMobileSignalsHandle = null;
-            }
-            if (mobileSignalsHandle === committedHandleAtRelease) {
-              mobileSignalsHandle = null;
-            }
-          })()
-        : Promise.reject(
-            new ElizaError(
-              "MobileSignals.releaseSignalListeners() disappeared while listener ownership was recorded",
-              {
-                code: "MOBILE_SIGNAL_LISTENER_RELEASE_UNAVAILABLE",
-                severity: "fatal",
-              },
-            ),
-          )
-      : Promise.resolve();
-    const shouldStop = mobileSignalsStarted || mobileSignalsStartupAttempted;
-    const stopping = shouldStop
-      ? (async () => {
-          const result = await mobileSignals.stopMonitoring();
-          if (!result.stopped) {
-            throw new ElizaError(
-              "MobileSignals.stopMonitoring() did not establish the stopped postcondition",
-              {
-                code: "MOBILE_SIGNAL_MONITOR_STOP_INCOMPLETE",
-                severity: "ephemeral",
-              },
-            );
-          }
-          mobileSignalsStarted = false;
-          mobileSignalsCommitted = false;
-          mobileSignalsStartupAttempted = false;
-        })()
-      : Promise.resolve();
-    const shouldCancel = mobileBackgroundRefreshNeedsCancel;
-    const cancelling = shouldCancel
-      ? typeof mobileSignals.cancelBackgroundRefresh === "function"
+              ),
+            )
+        : Promise.resolve();
+      const shouldStop = mobileSignalsStarted || mobileSignalsStartupAttempted;
+      const stopping = shouldStop
         ? (async () => {
-            const result = await mobileSignals.cancelBackgroundRefresh();
-            if (!result.cancelled) {
+            const result = await mobileSignals.stopMonitoring();
+            if (!result.stopped) {
               throw new ElizaError(
-                `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
-                  result.reason ? `: ${result.reason}` : ""
-                }`,
+                "MobileSignals.stopMonitoring() did not establish the stopped postcondition",
                 {
-                  code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
-                  context: { reason: result.reason },
+                  code: "MOBILE_SIGNAL_MONITOR_STOP_INCOMPLETE",
                   severity: "ephemeral",
                 },
               );
             }
-            if (!scheduleTaskAtRelease) {
-              mobileBackgroundRefreshNeedsCancel = false;
-            }
+            mobileSignalsStarted = false;
+            mobileSignalsCommitted = false;
+            mobileSignalsStartupAttempted = false;
           })()
-        : Promise.reject(
-            new ElizaError(
+        : Promise.resolve();
+      const shouldCancel = mobileBackgroundRefreshNeedsCancel;
+      const cancelling = shouldCancel
+        ? typeof mobileSignals.cancelBackgroundRefresh === "function"
+          ? (async () => {
+              const result = await mobileSignals.cancelBackgroundRefresh();
+              if (!result.cancelled) {
+                throw new ElizaError(
+                  `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
+                    result.reason ? `: ${result.reason}` : ""
+                  }`,
+                  {
+                    code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
+                    context: { reason: result.reason },
+                    severity: "ephemeral",
+                  },
+                );
+              }
+              if (!scheduleTaskAtRelease) {
+                mobileBackgroundRefreshNeedsCancel = false;
+              }
+            })()
+          : Promise.reject(
+              new ElizaError(
+                "MobileSignals.cancelBackgroundRefresh() disappeared while a cancellation was owned",
+                {
+                  code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_UNAVAILABLE",
+                  severity: "fatal",
+                },
+              ),
+            )
+        : Promise.resolve();
+
+      // Invoke every native release before the first await. A persisted pagehide
+      // can freeze JavaScript immediately after this task, so listener removal,
+      // monitor stop, and job cancellation must already be in the bridge queue.
+      const attempt = (async () => {
+        const [outcomes] = await Promise.all([
+          Promise.allSettled([releasingListeners, stopping, cancelling]),
+          settlingGeneration,
+        ]);
+        const failures = outcomes
+          .slice(0, 2)
+          .flatMap((outcome) =>
+            outcome.status === "rejected" ? [outcome.reason] : [],
+          );
+        let cancellationFailure =
+          outcomes[2]?.status === "rejected" ? outcomes[2].reason : null;
+
+        // A schedule request may accept work after the first cancellation. Wait
+        // only for that package-owned bridge call, then prove the job absent at
+        // the later boundary. A hung call keeps this service safely uncommitted.
+        if (scheduleTaskAtRelease) {
+          await Promise.allSettled([scheduleTaskAtRelease]);
+        }
+        if (mobileBackgroundRefreshNeedsCancel) {
+          if (typeof mobileSignals.cancelBackgroundRefresh !== "function") {
+            cancellationFailure = new ElizaError(
               "MobileSignals.cancelBackgroundRefresh() disappeared while a cancellation was owned",
               {
                 code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_UNAVAILABLE",
                 severity: "fatal",
               },
-            ),
-          )
-      : Promise.resolve();
-
-    // Invoke every native release before the first await. A persisted pagehide
-    // can freeze JavaScript immediately after this task, so listener removal,
-    // monitor stop, and job cancellation must already be in the bridge queue.
-    const attempt = (async () => {
-      const [outcomes] = await Promise.all([
-        Promise.allSettled([releasingListeners, stopping, cancelling]),
-        settlingGeneration,
-      ]);
-      const failures = outcomes
-        .slice(0, 2)
-        .flatMap((outcome) =>
-          outcome.status === "rejected" ? [outcome.reason] : [],
-        );
-      let cancellationFailure =
-        outcomes[2]?.status === "rejected" ? outcomes[2].reason : null;
-
-      // A schedule request may accept work after the first cancellation. Wait
-      // only for that package-owned bridge call, then prove the job absent at
-      // the later boundary. A hung call keeps this service safely uncommitted.
-      if (scheduleTaskAtRelease) {
-        await Promise.allSettled([scheduleTaskAtRelease]);
-      }
-      if (mobileBackgroundRefreshNeedsCancel) {
-        if (typeof mobileSignals.cancelBackgroundRefresh !== "function") {
-          cancellationFailure = new ElizaError(
-            "MobileSignals.cancelBackgroundRefresh() disappeared while a cancellation was owned",
-            {
-              code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_UNAVAILABLE",
-              severity: "fatal",
-            },
-          );
-        } else {
-          try {
-            const result = await mobileSignals.cancelBackgroundRefresh();
-            if (!result.cancelled) {
-              throw new ElizaError(
-                `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
-                  result.reason ? `: ${result.reason}` : ""
-                }`,
-                {
-                  code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
-                  context: { reason: result.reason },
-                  severity: "ephemeral",
-                },
-              );
+            );
+          } else {
+            try {
+              const result = await mobileSignals.cancelBackgroundRefresh();
+              if (!result.cancelled) {
+                throw new ElizaError(
+                  `MobileSignals.cancelBackgroundRefresh() did not establish the cancelled postcondition${
+                    result.reason ? `: ${result.reason}` : ""
+                  }`,
+                  {
+                    code: "MOBILE_SIGNAL_BACKGROUND_CANCEL_INCOMPLETE",
+                    context: { reason: result.reason },
+                    severity: "ephemeral",
+                  },
+                );
+              }
+              mobileBackgroundRefreshNeedsCancel = false;
+              cancellationFailure = null;
+            } catch (error) {
+              // error-policy:J6 a cancellation that raced scheduling is retried
+              // after that bridge call settles; the retained obligation blocks a
+              // successor if the postcondition is still not established.
+              cancellationFailure = error;
             }
-            mobileBackgroundRefreshNeedsCancel = false;
-            cancellationFailure = null;
-          } catch (error) {
-            // error-policy:J6 a cancellation that raced scheduling is retried
-            // after that bridge call settles; the retained obligation blocks a
-            // successor if the postcondition is still not established.
-            cancellationFailure = error;
           }
         }
-      }
-      if (mobileBackgroundRefreshNeedsCancel && cancellationFailure !== null) {
-        failures.push(cancellationFailure);
-      }
-      if (failures.length > 0) {
-        throw combinedLifecycleError(
-          "Failed to fully release mobile activity monitoring ownership",
-          "MOBILE_SIGNAL_NATIVE_RELEASE_FAILED",
-          failures,
-        );
-      }
-    })();
-    const tracked = attempt.finally(() => {
-      if (nativeReleaseTask === tracked) {
+        if (
+          mobileBackgroundRefreshNeedsCancel &&
+          cancellationFailure !== null
+        ) {
+          failures.push(cancellationFailure);
+        }
+        if (failures.length > 0) {
+          throw combinedLifecycleError(
+            "Failed to fully release mobile activity monitoring ownership",
+            "MOBILE_SIGNAL_NATIVE_RELEASE_FAILED",
+            failures,
+          );
+        }
+      })();
+      void attempt.then(
+        () => {
+          if (nativeReleaseTask === releaseTask) {
+            nativeReleaseTask = null;
+          }
+          resolveRelease();
+        },
+        (error) => {
+          if (nativeReleaseTask === releaseTask) {
+            nativeReleaseTask = null;
+          }
+          rejectRelease(error);
+        },
+      );
+    } catch (error) {
+      if (nativeReleaseTask === releaseTask) {
         nativeReleaseTask = null;
       }
-    });
-    nativeReleaseTask = tracked;
-    return tracked;
+      rejectRelease(error);
+    }
+    return releaseTask;
   };
 
   const hasMonitoringConsent = (status: string): boolean =>
@@ -1095,11 +1175,32 @@ export function startLifeOpsActivitySignalCapture(
       }
     };
 
-    const task = track(runRequestedStarts()).finally(() => {
-      if (mobileSignalsStartTask === task) mobileSignalsStartTask = null;
+    let resolveStart!: () => void;
+    let rejectStart!: (error: unknown) => void;
+    const startTask = new Promise<void>((resolve, reject) => {
+      resolveStart = resolve;
+      rejectStart = reject;
     });
-    mobileSignalsStartTask = task;
-    return task;
+    // Install the ownership token before runRequestedStarts() can enter
+    // checkPermissions(). Native shims may synchronously emit a resume event
+    // from that boundary, and the reentrant request must join this generation.
+    mobileSignalsStartTask = startTask;
+    const running = track(runRequestedStarts());
+    void running.then(
+      () => {
+        if (mobileSignalsStartTask === startTask) {
+          mobileSignalsStartTask = null;
+        }
+        resolveStart();
+      },
+      (error) => {
+        if (mobileSignalsStartTask === startTask) {
+          mobileSignalsStartTask = null;
+        }
+        rejectStart(error);
+      },
+    );
+    return startTask;
   };
 
   const requestMobileSignalsResume = (): void => {
@@ -1126,18 +1227,51 @@ export function startLifeOpsActivitySignalCapture(
     if (!mounted) return;
     emitLifecycleState("active");
     emitPageState(reason);
-    void track(emitDesktopSnapshot(reason));
+    requestDesktopSnapshot(reason);
     requestMobileHealthSnapshot(reason);
   };
 
-  observeCaptureOperation(
-    refreshRuntimeReady().then(async (ready) => {
-      if (ready && mounted) {
-        emitCurrentState("mount");
-        await requestMobileSignalsStart();
+  let runtimeProbeTask: Promise<void> | null = null;
+  const requestRuntimeProbe = (
+    reason: string,
+    onlyWhenBecomingReady: boolean,
+  ): void => {
+    if (!mounted || runtimeProbeTask) return;
+    const wasReady = runtimeReady;
+    let resolveProbe!: () => void;
+    let rejectProbe!: (error: unknown) => void;
+    const probeTask = new Promise<void>((resolve, reject) => {
+      resolveProbe = resolve;
+      rejectProbe = reject;
+    });
+    // The token precedes getStatus() so a hung transport has one subscriber and
+    // cannot make every five-second poll retain another promise chain.
+    runtimeProbeTask = probeTask;
+    const probing = refreshRuntimeReady().then(async (ready) => {
+      if (!mounted || !ready || (onlyWhenBecomingReady && wasReady)) {
+        return;
       }
-    }),
-  );
+      emitCurrentState(reason);
+      await requestMobileSignalsStart();
+    });
+    void probing.then(
+      () => {
+        if (runtimeProbeTask === probeTask) {
+          runtimeProbeTask = null;
+        }
+        resolveProbe();
+      },
+      (error) => {
+        if (runtimeProbeTask === probeTask) {
+          runtimeProbeTask = null;
+        }
+        rejectProbe(error);
+      },
+    );
+    observeUnownedProbe(probeTask);
+  };
+
+  requestRuntimeProbe("mount", false);
 
   document.addEventListener("visibilitychange", handleVisibilityChange);
   document.addEventListener(APP_RESUME_EVENT, handleResume);
@@ -1146,16 +1280,7 @@ export function startLifeOpsActivitySignalCapture(
   window.addEventListener("blur", handleBlur);
 
   const runtimePoller = window.setInterval(() => {
-    const wasReady = runtimeReady;
-    observeCaptureOperation(
-      refreshRuntimeReady().then(async (ready) => {
-        if (!mounted || !ready || wasReady) {
-          return;
-        }
-        emitCurrentState("runtime-ready");
-        await requestMobileSignalsStart();
-      }),
-    );
+    requestRuntimeProbe("runtime-ready", true);
   }, RUNTIME_READY_POLL_MS);
   const pageHeartbeat = window.setInterval(() => {
     if (document.visibilityState === "visible") {
@@ -1163,13 +1288,22 @@ export function startLifeOpsActivitySignalCapture(
     }
   }, PAGE_HEARTBEAT_MS);
   const desktopPoller = window.setInterval(() => {
-    void track(emitDesktopSnapshot("poll"));
+    requestDesktopSnapshot("poll");
   }, DESKTOP_POWER_POLL_MS);
 
   let stopPromise: Promise<void> | null = null;
   let detachServiceAbort = (): void => {};
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise;
+    let resolveStop!: () => void;
+    let rejectStop!: (error: unknown) => void;
+    const completion = new Promise<void>((resolve, reject) => {
+      resolveStop = resolve;
+      rejectStop = reject;
+    });
+    // Install the shared completion before aborting or entering native
+    // teardown. Both boundaries can synchronously re-enter this cleanup.
+    stopPromise = completion;
     mounted = false;
     runtimeReady = false;
     captureController.abort();
@@ -1186,7 +1320,7 @@ export function startLifeOpsActivitySignalCapture(
     window.clearInterval(desktopPoller);
 
     const initialNativeRelease = releaseNativeOwnership();
-    stopPromise = (async () => {
+    const stopping = (async () => {
       // error-policy:J6 releaseNativeOwnership attempts every owned native
       // resource before rejecting. Failed resources remain recorded so the
       // same idempotent stop can retry instead of permitting duplicate owners.
@@ -1217,18 +1351,22 @@ export function startLifeOpsActivitySignalCapture(
           initialReleaseOutcome.reason,
         );
       }
-    })().then(
+    })();
+    void stopping.then(
       () => {
         if (activeCaptureStop === stop) {
           activeCaptureStop = null;
         }
+        resolveStop();
       },
       (error) => {
-        stopPromise = null;
-        throw error;
+        if (stopPromise === completion) {
+          stopPromise = null;
+        }
+        rejectStop(error);
       },
     );
-    return stopPromise;
+    return completion;
   };
 
   activeCaptureStop = stop;
