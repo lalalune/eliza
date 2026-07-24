@@ -608,6 +608,10 @@ async function applyStartOutcome(
   if (outcome.status === "skipped") return;
   if (outcome.status === "rejected") {
     instance.status = "failed";
+    // A failed start may already have installed signal-owned resources before
+    // crossing the rejecting boundary. Abort immediately so the service can
+    // run its partial-start rollback even though no cleanup lease was returned.
+    controller.abort();
     if (isCurrentEpoch) {
       store.blockedServiceIds.add(definition.id);
     }
@@ -620,6 +624,10 @@ async function applyStartOutcome(
   const cleanup = outcome.cleanup;
   if (typeof cleanup !== "function") {
     instance.status = "failed";
+    // The invalid return means the host cannot own teardown. Signal-based
+    // rollback is the only remaining release path, while quarantine prevents a
+    // successor from overlapping ownership that cannot be proved absent.
+    controller.abort();
     if (isCurrentEpoch) {
       store.blockedServiceIds.add(definition.id);
     }

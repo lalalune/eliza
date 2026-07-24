@@ -921,10 +921,12 @@ describe("race-safe async start", () => {
 describe("observable failures", () => {
   it("marks a rejecting start failed and reports it", async () => {
     const reportError = vi.fn();
+    const releasedByAbort = vi.fn();
     registerRendererService({
       id: "a.start-fails",
       shells: ["main"],
-      start: async () => {
+      start: async ({ signal }) => {
+        signal.addEventListener("abort", releasedByAbort, { once: true });
         throw new Error("no device");
       },
     });
@@ -932,6 +934,7 @@ describe("observable failures", () => {
     await settleRendererServices();
 
     expect(stateOf("a.start-fails")).toBe("failed");
+    expect(releasedByAbort).toHaveBeenCalledTimes(1);
     expect(reportError).toHaveBeenCalledWith(
       "a.start-fails",
       expect.any(Error),
@@ -941,7 +944,11 @@ describe("observable failures", () => {
 
   it("treats a start that returns no cleanup as a contract violation", async () => {
     const reportError = vi.fn();
-    const start = vi.fn(() => undefined);
+    const releasedByAbort = vi.fn();
+    const start = vi.fn(({ signal }: { signal: AbortSignal }) => {
+      signal.addEventListener("abort", releasedByAbort, { once: true });
+      return undefined;
+    });
     registerRendererService({
       id: "a.no-cleanup",
       shells: ["main"],
@@ -952,6 +959,7 @@ describe("observable failures", () => {
     await settleRendererServices();
 
     expect(stateOf("a.no-cleanup")).toBe("failed");
+    expect(releasedByAbort).toHaveBeenCalledTimes(1);
     expect(reportError).toHaveBeenCalledWith(
       "a.no-cleanup",
       expect.objectContaining({
