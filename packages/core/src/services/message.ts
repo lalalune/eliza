@@ -1662,6 +1662,31 @@ export function normalizeVisibleTextForDuplicateCheck(text: string): string {
 	return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+/**
+ * True when a text already delivered through an action callback covers the
+ * (normalized) planned reply — either verbatim or as a strict superset ending
+ * at a non-word boundary, so a short prefix never swallows an unrelated longer
+ * line ("created" must not match "created issue …"). Shared by the planner
+ * echo suppression and the reply-egress claim gate so both agree on what
+ * "the user already saw this" means.
+ */
+function deliveredTextsCoverReply(
+	deliveredVisibleTexts: ReadonlySet<string>,
+	normalizedReply: string,
+): boolean {
+	if (normalizedReply.length === 0) return false;
+	for (const delivered of deliveredVisibleTexts) {
+		if (
+			delivered === normalizedReply ||
+			(delivered.startsWith(normalizedReply) &&
+				/[^a-z0-9]/i.test(delivered.charAt(normalizedReply.length)))
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /** Zerollama/OpenAI-style async media endpoints should be delivered as attachments, not echoed as chat copy. */
 const MEDIA_CONTENT_URL_RE =
 	/<?\s*https?:\/\/[^\s<>]+\/v1\/(?:videos|images|audio)\/[^\s<>/]+\/content\s*>?/gi;
@@ -8061,7 +8086,20 @@ export async function runV5MessageRuntimeStage1(args: {
 			actionResults: egressActionResults,
 			actions: args.runtime.actions,
 		});
-		if (plannedReplyEgressDecision.verdict === "reject") {
+		// A reply an action callback already delivered this turn (verbatim or as
+		// a strict superset) is a planner echo: the suppression below drops it, so
+		// it never egresses. Bouncing it here instead would follow the visible,
+		// action-owned confirmation with a contradicting "couldn't verify" bubble.
+		const plannedReplyAlreadyDelivered = deliveredTextsCoverReply(
+			deliveredVisibleTexts,
+			normalizeVisibleTextForDuplicateCheck(
+				String(plannerResult.finalMessage ?? ""),
+			),
+		);
+		if (
+			plannedReplyEgressDecision.verdict === "reject" &&
+			!plannedReplyAlreadyDelivered
+		) {
 			args.runtime.logger?.warn?.(
 				{
 					src: "service:message",
@@ -8156,14 +8194,10 @@ export async function runV5MessageRuntimeStage1(args: {
 		// longer line ("created" must not match "created issue …").
 		const normalizedPlannedReply =
 			normalizeVisibleTextForDuplicateCheck(effectiveReplyText);
-		const plannedTextRepeatsActionReply =
-			normalizedPlannedReply.length > 0 &&
-			[...deliveredVisibleTexts].some(
-				(delivered) =>
-					delivered === normalizedPlannedReply ||
-					(delivered.startsWith(normalizedPlannedReply) &&
-						/[^a-z0-9]/i.test(delivered.charAt(normalizedPlannedReply.length))),
-			);
+		const plannedTextRepeatsActionReply = deliveredTextsCoverReply(
+			deliveredVisibleTexts,
+			normalizedPlannedReply,
+		);
 		const shouldSendPlannedText =
 			Boolean(effectiveReplyText) &&
 			!plannedTextRepeatsEarlyReply &&

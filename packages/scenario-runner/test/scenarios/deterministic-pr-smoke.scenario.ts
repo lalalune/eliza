@@ -142,6 +142,12 @@ export default scenario({
         resetAppControlHttpLoopback();
         const runtime = ctx.runtime as RuntimeWithScenarioLlmFixtures;
         runtime.scenarioLlmFixtures?.register(
+          // The simple-reply path answers straight from the stage-1 router
+          // response (`replyText`); no follow-up TEXT_SMALL call fires. The
+          // router fixture is therefore the required one, and the direct
+          // TEXT_SMALL fixture stays registered only as an optional guard so
+          // a regression that reintroduces the second call still resolves
+          // deterministically instead of failing strict-mode.
           {
             name: "pr-smoke-deterministic-direct-reply",
             match: {
@@ -149,7 +155,8 @@ export default scenario({
               input: "hello deterministic proxy",
             },
             response: "deterministic-test-response: hello deterministic proxy",
-            times: 1,
+            required: false,
+            times: { min: 0, max: 1 },
           },
           {
             name: "pr-smoke-deterministic-router-reply",
@@ -170,8 +177,7 @@ export default scenario({
               addressedTo: [],
               emotion: "none",
             },
-            required: false,
-            times: { min: 0, max: 1 },
+            times: 1,
           },
         );
         registerAppControlHttpHandler((request) => {
