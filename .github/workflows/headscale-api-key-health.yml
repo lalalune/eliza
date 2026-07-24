@@ -189,6 +189,72 @@ jobs:
             emit_count headscale_error 'headscale|vpn registration|tunnel'
             emit_count replacement_cleanup 'replacement cleanup|cleanupPending'
 
+      - name: Encrypt provisioning worker fatal window
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' }}
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
+        with:
+          host: ${{ env.DEPLOY_HOST }}
+          username: deploy
+          key: ${{ env.DEPLOY_SSH_KEY }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            temp_dir="$(mktemp -d)"
+            trap 'rm -rf "$temp_dir"' EXIT
+            public_key="$temp_dir/public.pem"
+            journal_file="$temp_dir/journal.log"
+            cat >"$public_key" <<'PEM'
+            -----BEGIN PUBLIC KEY-----
+            MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAvqYnnJ+P2IhDXWHS7b3Q
+            tZWAn4lI5agG8uku6DfwLGu/dWr7ne6IqwQSO0ipq5hCpsp/OlIUUckBvd+f+z+a
+            0WtRjSgjMFzWaYMnh9SlXKfebtIoVzPviMjNvgFeD5zZjga0KFt3wi2YPE6VPlPP
+            jjEbynSqZD/lPK4cWnNYuWBQatlA5LCP5l2JqLDXTI49Hch6PGuf8TP252Xglv13
+            kTRWoLOp8UNPWjbgzCe0o4bdD38GqcOc9h1W+XFRTY/cASohIgzrhf+taqxOrYOD
+            2yZMytf2o7ugr5VtP6UUJzghdbDu/335A4MwHCZWw56Uem7SV1UmC9lA94At2Gyz
+            pY+xjX00T+5AnyCmdDqMSjdrzbC9p8NWFxC1rT76uodbVpr5CgTLrcgJPXWqJDc5
+            815uiGl6IY7+VV41d4idCcVsN7Rr2Y1qrQ64cn28yuKFBBVXQf4SiI259XEHS0GO
+            dvFzcIY+inulxRx48/m/2BjQH0Ix8pUbDEiK8YvRoY7rQFYGbpodwumWIcRTPxPM
+            c4p6fuFNCnOBSaxDRsuzEdlZHlir86390Ph/GVm0kP+qLBh79iCRYpi2twCI1Oi9
+            sI114Dw43u2bMUXyABZExJq32KmSORki5+zlV+peL1OZ69tELYe2wIY7tkB/J1Te
+            H6A4ANu7X2Wl+Gnznd+c/7cCAwEAAQ==
+            -----END PUBLIC KEY-----
+            PEM
+            sudo journalctl -u eliza-provisioning-worker.service \
+              --since "2026-07-24 02:41:45 UTC" \
+              --until "2026-07-24 02:42:16 UTC" \
+              --no-pager --output=cat >"$journal_file"
+            bytes="$(wc -c <"$journal_file" | tr -d ' ')"
+            [ "$bytes" -gt 0 ] && [ "$bytes" -le 8000 ] || {
+              echo "::error::Provisioning worker fatal window violates the encrypted size bound"
+              exit 1
+            }
+            split -b 300 -d -a 2 "$journal_file" "$temp_dir/chunk-"
+            count=0
+            for chunk in "$temp_dir"/chunk-*; do
+              cipher_file="$temp_dir/cipher-$count.bin"
+              openssl pkeyutl -encrypt -pubin -inkey "$public_key" \
+                -pkeyopt rsa_padding_mode:oaep \
+                -pkeyopt rsa_oaep_md:sha256 \
+                -pkeyopt rsa_mgf1_md:sha256 \
+                -in "$chunk" -out "$cipher_file"
+              cipher_bytes="$(wc -c <"$cipher_file" | tr -d ' ')"
+              [ "$cipher_bytes" -eq 512 ] || {
+                echo "::error::Encrypted journal chunk has an invalid RSA ciphertext size"
+                exit 1
+              }
+              ciphertext="$(openssl base64 -A -in "$cipher_file")"
+              [ "${#ciphertext}" -eq 684 ] || {
+                echo "::error::Encrypted journal chunk has an invalid base64 size"
+                exit 1
+              }
+              printf 'journal_ciphertext_%02d=%s\n' "$count" "$ciphertext"
+              count=$((count + 1))
+            done
+            printf 'journal_ciphertext_count=%s\n' "$count"
+            printf 'journal_plaintext_bytes=%s\n' "$bytes"
+            printf 'journal_plaintext_sha256=%s\n' \
+              "$(sha256sum "$journal_file" | cut -d' ' -f1)"
+
       - name: Read failed demo canary outcome
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' }}
         env:
