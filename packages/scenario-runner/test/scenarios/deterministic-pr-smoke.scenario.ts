@@ -186,7 +186,12 @@ export default scenario({
             return jsonResponse({ views });
           }
           if (request.pathname.endsWith("/interact")) {
+            // The interact route contract carries an authoritative `success`
+            // boolean (parseViewInteractionResponse rejects bodies without
+            // one); the receipt summary filters `success` out, so the visible
+            // "(returned ok, capability, value)" text is unchanged.
             return jsonResponse({
+              success: true,
               ok: true,
               capability: "fill-input",
               value: "Remote Ledger Updated",
@@ -369,6 +374,7 @@ export default scenario({
             pathname: "/api/views/remote-ledger/interact",
             response: {
               body: {
+                success: true,
                 ok: true,
                 capability: "fill-input",
                 value: "Remote Ledger Updated",
