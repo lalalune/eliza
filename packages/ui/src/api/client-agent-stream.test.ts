@@ -584,4 +584,49 @@ describe("ElizaClient chat-turn status SSE (#8813)", () => {
     expect(result.text).toContain("par");
     expect(cancel).toHaveBeenCalledWith("elizaos-sse-read-failed");
   });
+
+  it("treats a byte-silent transport as interrupted after the stall watchdog fires", async () => {
+    // The server writes a heartbeat comment every 5s, so a live channel is
+    // never byte-silent for the watchdog window. A read that stays pending
+    // that long is a dead transport (silent TCP drop) and must resolve as an
+    // interrupted turn instead of pending forever on "sending" dots.
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      const read = vi
+        .fn()
+        .mockResolvedValueOnce({
+          done: false,
+          value: encoder.encode(
+            'data: {"type":"token","text":"par","fullText":"par"}\n\n',
+          ),
+        })
+        .mockImplementationOnce(() => new Promise(() => {}));
+      const cancel = vi.fn(async () => {});
+      const request = vi.fn(
+        async () =>
+          ({
+            ok: true,
+            status: 200,
+            body: { getReader: () => ({ read, cancel }) },
+          }) as unknown as Response,
+      );
+      const client = new ElizaClient("http://agent.example:31337", "token");
+      client.setRequestTransport({ request });
+
+      const resultPromise = client.streamChatEndpoint(
+        "/api/conversations/conversation-id/messages/stream",
+        "hello",
+        vi.fn(),
+      );
+      await vi.advanceTimersByTimeAsync(91_000);
+      const result = await resultPromise;
+
+      expect(result.completed).toBe(false);
+      expect(result.text).toContain("par");
+      expect(cancel).toHaveBeenCalledWith("elizaos-sse-read-failed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -189,7 +189,6 @@ import {
 } from "../streaming-context";
 import {
 	getTrajectoryContext,
-	memoizeTurnWork,
 	runWithTrajectoryContext,
 } from "../trajectory-context";
 import type { CharacterSettings } from "../types/agent";
@@ -10534,9 +10533,7 @@ export class DefaultMessageService implements IMessageService {
 				runtime.getParticipantUserState(message.roomId, runtime.agentId),
 			),
 			timeInferenceSpan("message:ingress:room", () =>
-				memoizeTurnWork(`room:${runtime.agentId}:${message.roomId}`, () =>
-					runtime.getRoom(message.roomId),
-				),
+				runtime.getRoom(message.roomId),
 			),
 		]);
 

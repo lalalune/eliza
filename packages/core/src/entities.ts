@@ -564,10 +564,11 @@ export async function getEntityDetails({
 	return memoizeTurnWork(
 		`entity-details:${runtime.agentId}:${roomId}`,
 		async () => {
+			// Room reads go straight to runtime.getRoom: its roomReadMemo already
+			// coalesces duplicates and is invalidated by every room mutator, which a
+			// turn-scoped memo here would not be.
 			const [room, roomEntities] = await Promise.all([
-				memoizeTurnWork(`room:${runtime.agentId}:${roomId}`, () =>
-					runtime.getRoom(roomId),
-				),
+				runtime.getRoom(roomId),
 				runtime.getEntitiesForRoom(roomId, true),
 			]);
 

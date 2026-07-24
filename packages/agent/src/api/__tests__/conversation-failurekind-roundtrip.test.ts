@@ -55,8 +55,14 @@ vi.mock("../chat-routes.ts", async () => {
       metadata: undefined,
     })),
     persistConversationMemory: vi.fn(async () => undefined),
-    persistAssistantConversationMemory: vi.fn(async () => undefined),
-    hasRecentVisibleAssistantMemorySince: vi.fn(async () => false),
+    // The routes withhold the terminal done/JSON payload until the assistant
+    // reply has a durable memory id (resolvePersistedAssistantTurn), so the
+    // persist double must return a committed Memory shape — a bare undefined
+    // would (correctly) surface as a persistence error instead of a done frame.
+    persistAssistantConversationMemory: vi.fn(async () => ({
+      id: stringToUuid("assistant-reply-memory"),
+    })),
+    getRecentVisibleAssistantMemorySince: vi.fn(async () => null),
     generateChatResponse: vi.fn(
       async (
         _runtime,

@@ -1,6 +1,16 @@
 name: Chat Latency Telemetry
 
 on:
+  # The probe-contract job is the only CI consumer of the latency-script test
+  # suites (nothing else runs `node --test` on them); without it a contract
+  # break would stay green until the next manual dispatch.
+  pull_request:
+    paths:
+      - packages/scripts/cloud/chat-latency.mjs
+      - packages/scripts/cloud/chat-latency.test.mjs
+      - packages/scripts/cloud/inference-auth-latency.mjs
+      - packages/scripts/cloud/inference-auth-latency.test.mjs
+      - .github/workflows/chat-latency-live.yml
   workflow_dispatch:
     inputs:
       environment:
@@ -22,15 +32,35 @@ on:
           - "30"
 
 concurrency:
-  group: chat-latency-telemetry-${{ inputs.environment }}
+  group: chat-latency-telemetry-${{ inputs.environment || github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  probe-contract:
+    name: Probe contract
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24.15.0"
+
+      - name: Run latency-script test suites
+        run: |
+          node --test packages/scripts/cloud/chat-latency.test.mjs
+          node --test packages/scripts/cloud/inference-auth-latency.test.mjs
+
   measure:
     name: Cerebras direct + Eliza Cloud
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: ${{ inputs.environment }}
@@ -88,6 +118,11 @@ jobs:
             );
           }
           NODE
+
+      - name: Report probe outcome
+        if: always()
+        run: |
+          echo "Probe step outcome: ${{ steps.probe.outcome }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload telemetry
         if: always() && hashFiles(env.REPORT_PATH) != ''

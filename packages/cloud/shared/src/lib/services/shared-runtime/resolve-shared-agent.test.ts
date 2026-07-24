@@ -224,7 +224,7 @@ describe("resolveSharedAgent", () => {
     expect(validateApiKey).not.toHaveBeenCalled();
   });
 
-  test("cache-only does not freeze a non-shared decision after the agent becomes shared", async () => {
+  test("cache-only serves the terminal 404 briefly, then converges after the agent becomes shared", async () => {
     findByIdAndOrg.mockResolvedValue(
       agent({
         execution_tier: "dedicated-lazy",
@@ -242,8 +242,21 @@ describe("resolveSharedAgent", () => {
     await Promise.all(waited);
 
     const scopeKey = CacheKeys.sharedAgentScope.resolve("keyhashpref0000", "agent-1");
+    const deniedKey = CacheKeys.sharedAgentScope.resolveDenied("keyhashpref0000", "agent-1");
     expect(cacheStore.has(scopeKey)).toBe(false);
+    // The failed hydration recorded a short-lived terminal denial: the hot
+    // path now converges to the real 404 instead of looping 503 + fresh
+    // authoritative hydration per request.
+    expect(cacheStore.has(deniedKey)).toBe(true);
     findByIdAndOrg.mockResolvedValue(agent());
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => waited.push(promise) },
+      }),
+    ).resolves.toMatchObject({ status: 404 });
+    // Denial marker TTL expiry (the in-memory cache double has no clock).
+    cacheStore.delete(deniedKey);
     await expect(
       resolveSharedAgent(apiKeyContext("agent-1") as never, {
         cacheOnly: true,
@@ -308,7 +321,17 @@ describe("resolveSharedAgent", () => {
     await Promise.all(waited);
 
     const scopeKey = CacheKeys.sharedAgentScope.resolve("keyhashpref0000", "agent-1");
+    const deniedKey = CacheKeys.sharedAgentScope.resolveDenied("keyhashpref0000", "agent-1");
     expect(cacheStore.has(scopeKey)).toBe(false);
+    // The rejected credential is a terminal decision: served as its real 401
+    // for the denial marker's few-second TTL instead of an eternal 503 loop.
+    expect(cacheStore.has(deniedKey)).toBe(true);
+    await expect(
+      resolveSharedAgent(apiKeyContext("agent-1") as never, {
+        cacheOnly: true,
+        executionCtx: { waitUntil: (promise) => waited.push(promise) },
+      }),
+    ).resolves.toMatchObject({ status: 401 });
     requireUserOrApiKeyWithOrgLookup.mockImplementation(
       async <T>(_: unknown, lookup: (organizationId: string) => Promise<T>) => ({
         user: { organization_id: "org-1", steward_id: "steward-user-1" },
@@ -316,6 +339,8 @@ describe("resolveSharedAgent", () => {
       }),
     );
     findByIdAndOrg.mockResolvedValue(agent());
+    // Denial marker TTL expiry (the in-memory cache double has no clock).
+    cacheStore.delete(deniedKey);
     await expect(
       resolveSharedAgent(apiKeyContext("agent-1") as never, {
         cacheOnly: true,
