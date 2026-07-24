@@ -144,6 +144,51 @@ jobs:
               --no-pager --output=short-iso-precise |
               grep -F "$unit" || echo "(no matching systemd manager event)"
 
+      - name: Classify provisioning worker fatal window
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' }}
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
+        with:
+          host: ${{ env.DEPLOY_HOST }}
+          username: deploy
+          key: ${{ env.DEPLOY_SSH_KEY }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            journal="$(
+              sudo journalctl -u eliza-provisioning-worker.service \
+                --since "2026-07-24 02:41:45 UTC" \
+                --until "2026-07-24 02:42:16 UTC" \
+                --no-pager --output=cat
+            )"
+            [ -n "$journal" ] || {
+              echo "::error::Provisioning worker fatal window is empty"
+              exit 1
+            }
+            emit_count() {
+              label="$1"
+              pattern="$2"
+              count="$(printf '%s\n' "$journal" | grep -Eic "$pattern" || true)"
+              printf '%s=%s\n' "$label" "$count"
+            }
+            printf 'journal_bytes=%s\n' "$(printf '%s' "$journal" | wc -c | tr -d ' ')"
+            printf 'journal_lines=%s\n' "$(printf '%s\n' "$journal" | wc -l | tr -d ' ')"
+            printf 'journal_sha256=%s\n' "$(printf '%s' "$journal" | sha256sum | cut -d' ' -f1)"
+            emit_count fatal_error 'FATAL ERROR|fatal error'
+            emit_count heap_out_of_memory 'heap out of memory|heap limit|Ineffective mark-compacts'
+            emit_count allocation_failed 'Allocation failed|Cannot allocate memory'
+            emit_count native_assertion 'Assertion failed|CHECK failed|Check failed'
+            emit_count uncaught_exception 'uncaught exception|UncaughtException'
+            emit_count unhandled_rejection 'unhandled rejection|UnhandledPromiseRejection'
+            emit_count abort_signal 'SIGABRT|signal: aborted|status=134'
+            emit_count segmentation_fault 'segmentation fault|SIGSEGV'
+            emit_count node_internal 'node:internal|Error \[ERR_'
+            emit_count too_many_open_files 'EMFILE|too many open files'
+            emit_count permission_denied 'EACCES|permission denied'
+            emit_count database_error 'database|postgres|pglite|drizzle'
+            emit_count docker_error 'docker|container'
+            emit_count headscale_error 'headscale|vpn registration|tunnel'
+            emit_count replacement_cleanup 'replacement cleanup|cleanupPending'
+
       - name: Read failed demo canary outcome
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' }}
         env:
