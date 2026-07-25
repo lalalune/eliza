@@ -128,6 +128,7 @@ import {
 import {
 	actionResultToPlannerToolResult,
 	cacheProviderOptions,
+	FAILED_TOOL_FALLBACK_MESSAGE,
 	type PlannerLoopParams,
 	type PlannerLoopResult,
 	type PlannerRuntime,
@@ -8260,10 +8261,27 @@ export async function runV5MessageRuntimeStage1(args: {
 			deliveredVisibleTexts,
 			normalizedPlannedReply,
 		);
+		// The planner's generic failed-tool fallback exists so a failed turn is
+		// never silent. When the failed action's own callback already delivered
+		// its user-facing explanation (a confirmation preview, a "cloud-only"
+		// boundary notice), appending "I tried … but it failed" contradicts what
+		// the user just read — drop the fallback and let the tool's words stand.
+		const plannedTextIsRedundantFailureFallback =
+			effectiveReplyText === FAILED_TOOL_FALLBACK_MESSAGE &&
+			actionResults.some((result) => {
+				if (result.success !== false) return false;
+				return [result.userFacingText, result.text].some((ownedText) => {
+					const normalized = normalizeVisibleTextForDuplicateCheck(
+						String(ownedText ?? ""),
+					);
+					return normalized.length > 0 && deliveredVisibleTexts.has(normalized);
+				});
+			});
 		const shouldSendPlannedText =
 			Boolean(effectiveReplyText) &&
 			!plannedTextRepeatsEarlyReply &&
-			!plannedTextRepeatsActionReply;
+			!plannedTextRepeatsActionReply &&
+			!plannedTextIsRedundantFailureFallback;
 		// Voice-gate provenance (#14873): only the Stage-1 ack has unambiguous
 		// model provenance here (`messageHandler.plan.reply` is the Stage-1
 		// model's own field). The planner's `finalMessage` is deliberately NOT
