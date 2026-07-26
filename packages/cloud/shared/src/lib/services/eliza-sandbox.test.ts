@@ -26,7 +26,10 @@ import { agentSandboxesRepository } from "../../db/repositories/agent-sandboxes"
 import type { DockerNode } from "../../db/repositories/docker-nodes";
 import { dockerNodesRepository } from "../../db/repositories/docker-nodes";
 import { sharedRuntimeHistoryRepository } from "../../db/repositories/shared-runtime-history";
-import type { StoredAgentSandboxBackup } from "../../db/schemas/agent-sandboxes";
+import type {
+  AgentBackupManifest,
+  StoredAgentSandboxBackup,
+} from "../../db/schemas/agent-sandboxes";
 import { runWithCloudBindings } from "../runtime/cloud-bindings";
 import { logger } from "../utils/logger";
 import { apiKeysService } from "./api-keys";
@@ -5298,5 +5301,192 @@ describe("snapshot hydration budgets (#16639)", () => {
         },
       }),
     ).toThrow("expanded byte budget");
+  });
+
+  // The no-reader fallback exists for null-body responses and non-stream test
+  // doubles. It must uphold the same "never retain past the budget" contract:
+  // an honestly-declared oversized body is refused via Content-Length before
+  // any buffering happens.
+  function bodilessResponse(
+    body: string,
+    contentLength?: number,
+  ): { res: Response; textCalls: () => number } {
+    let calls = 0;
+    const headers = new Headers();
+    if (contentLength !== undefined) headers.set("content-length", String(contentLength));
+    const res = {
+      body: null,
+      headers,
+      text: async () => {
+        calls += 1;
+        return body;
+      },
+    } as unknown as Response;
+    return { res, textCalls: () => calls };
+  }
+
+  test("no-reader fallback returns a within-budget body intact", async () => {
+    const { readBodyWithinBudget } = await import("./eliza-sandbox.ts?actual");
+    const body = JSON.stringify({ ok: true });
+    const { res, textCalls } = bodilessResponse(body, Buffer.byteLength(body, "utf-8"));
+    expect(await readBodyWithinBudget(res, 1024)).toBe(body);
+    expect(textCalls()).toBe(1);
+  });
+
+  test("no-reader fallback refuses via Content-Length before buffering the body", async () => {
+    const { readBodyWithinBudget } = await import("./eliza-sandbox.ts?actual");
+    const { res, textCalls } = bodilessResponse("x".repeat(64), 2048);
+    await expect(readBodyWithinBudget(res, 1024)).rejects.toThrow("raw hydration budget");
+    // The body was never read — an oversized declared payload is rejected
+    // without retaining a single byte.
+    expect(textCalls()).toBe(0);
+  });
+
+  test("no-reader fallback still rejects an oversized body when Content-Length is absent", async () => {
+    const { readBodyWithinBudget } = await import("./eliza-sandbox.ts?actual");
+    const { res, textCalls } = bodilessResponse("x".repeat(2048));
+    await expect(readBodyWithinBudget(res, 1024)).rejects.toThrow("raw hydration budget");
+    expect(textCalls()).toBe(1);
+  });
+
+  function emptyManifest(): AgentBackupManifest {
+    const fileSet = (): AgentBackupManifest["components"]["media"] => ({
+      kind: "file-set",
+      rootLabel: "state-dir",
+      files: [],
+      sha256: "s",
+    });
+    return {
+      schemaVersion: 1,
+      format: "elizaos.agent-backup",
+      createdAt: "2026-07-19T00:00:00Z",
+      agentId: "a",
+      components: {
+        database: { kind: "none", sha256: "s" },
+        media: fileSet(),
+        vault: fileSet(),
+        character: { runtimeCharacter: {}, sha256: "s" },
+        stateFiles: fileSet(),
+      },
+      integrity: { componentHashes: {} },
+    };
+  }
+
+  function workspaceAtFileBudget(): Record<string, string> {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 5_000; i++) files[`f${i}.txt`] = "x";
+    return files;
+  }
+
+  test("manifest pglite files count toward the file budget", async () => {
+    const { assertSnapshotExpandedBudgets } = await import("./eliza-sandbox.ts?actual");
+    const atBudget = workspaceAtFileBudget();
+    // Exactly at the 5000-file budget: passes.
+    assertSnapshotExpandedBudgets({ memories: [], config: {}, workspaceFiles: atBudget });
+    // One pglite entry tips the same payload over — DB files are counted.
+    const manifest = emptyManifest();
+    manifest.components.database = {
+      kind: "pglite-files",
+      sha256: "s",
+      pglite: {
+        kind: "file-set",
+        rootLabel: "pglite-dir",
+        files: [{ path: "pg/base.bin", sha256: "s", size: 1, bytesBase64: "AA==" }],
+        sha256: "s",
+      },
+    };
+    expect(() =>
+      assertSnapshotExpandedBudgets({
+        memories: [],
+        config: {},
+        workspaceFiles: atBudget,
+        manifest,
+      }),
+    ).toThrow("file budget");
+  });
+
+  test("a pglite entry's declared size counts toward the expanded byte budget", async () => {
+    const { assertSnapshotExpandedBudgets } = await import("./eliza-sandbox.ts?actual");
+    const manifest = emptyManifest();
+    manifest.components.database = {
+      kind: "pglite-files",
+      sha256: "s",
+      pglite: {
+        kind: "file-set",
+        rootLabel: "pglite-dir",
+        files: [{ path: "pg/huge.bin", sha256: "s", size: 500 * 1024 * 1024, bytesBase64: "AAAA" }],
+        sha256: "s",
+      },
+    };
+    expect(() =>
+      assertSnapshotExpandedBudgets({ memories: [], config: {}, workspaceFiles: {}, manifest }),
+    ).toThrow("expanded byte budget");
+  });
+
+  test("the character configFile counts toward the file budget", async () => {
+    const { assertSnapshotExpandedBudgets } = await import("./eliza-sandbox.ts?actual");
+    const manifest = emptyManifest();
+    manifest.components.character.configFile = {
+      path: "character.json",
+      sha256: "s",
+      size: 2,
+      bytesBase64: "e30=",
+    };
+    // 5000 workspace files pass alone; the configFile is the 5001st tracked
+    // file — the character config is counted, not exempt.
+    expect(() =>
+      assertSnapshotExpandedBudgets({
+        memories: [],
+        config: {},
+        workspaceFiles: workspaceAtFileBudget(),
+        manifest,
+      }),
+    ).toThrow("file budget");
+  });
+});
+
+describe("fetchSnapshotState bounded hydration (#16639)", () => {
+  type SnapshotFetcher = {
+    fetchAgentApi: (...args: unknown[]) => Promise<Response>;
+    fetchSnapshotState: (rec: AgentSandbox) => Promise<{
+      stateData: unknown;
+      sizeBytes: number;
+      bridgeUrl: string;
+    }>;
+  };
+
+  async function serviceWithSnapshotBody(body: string): Promise<SnapshotFetcher> {
+    const { ElizaSandboxService } = await import("./eliza-sandbox.ts?actual");
+    const service = new ElizaSandboxService() as unknown as SnapshotFetcher;
+    // Shadow the private transport hop only — fetchSnapshotState's own
+    // stream/parse/validate pipeline stays fully real.
+    service.fetchAgentApi = async () => new Response(body, { status: 200 });
+    return service;
+  }
+
+  test("a non-JSON snapshot body fails closed with the parse error as cause", async () => {
+    const service = await serviceWithSnapshotBody("{ definitely not json");
+    const err = await service.fetchSnapshotState(customSandbox()).then(
+      () => {
+        throw new Error("expected fetchSnapshotState to reject");
+      },
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toBe("Snapshot payload is not valid JSON — refusing partial restore");
+    expect(err.cause).toBeInstanceOf(SyntaxError);
+  });
+
+  test("a valid snapshot hydrates with sizeBytes counted from the streamed bytes", async () => {
+    const payload = JSON.stringify({
+      memories: [],
+      config: {},
+      workspaceFiles: { "a.txt": "hi" },
+    });
+    const service = await serviceWithSnapshotBody(payload);
+    const out = await service.fetchSnapshotState(customSandbox());
+    expect(out.stateData).toEqual({ memories: [], config: {}, workspaceFiles: { "a.txt": "hi" } });
+    // The measured size comes from the counted stream, not a re-stringify.
+    expect(out.sizeBytes).toBe(Buffer.byteLength(payload, "utf-8"));
+    expect(out.bridgeUrl).toBe("https://legacy-bridge.example");
   });
 });

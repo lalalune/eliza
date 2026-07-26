@@ -508,6 +508,16 @@ function digestPinnedImageRef(imageRef: string, digest: string): string {
 export async function readBodyWithinBudget(res: Response, maxBytes: number): Promise<string> {
   const reader = res.body?.getReader();
   if (!reader) {
+    // No stream to meter (null-body responses and non-stream test doubles).
+    // Refuse via the declared Content-Length BEFORE buffering so an honestly
+    // oversized body is never retained; the post-read check still catches
+    // senders that omit or understate the header.
+    const declared = Number.parseInt(res.headers.get("content-length") ?? "", 10);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new Error(
+        `Snapshot payload exceeds the raw hydration budget (${maxBytes} bytes) — refusing to retain it`,
+      );
+    }
     const text = await res.text();
     if (Buffer.byteLength(text, "utf-8") > maxBytes) {
       throw new Error(
@@ -533,7 +543,8 @@ export async function readBodyWithinBudget(res: Response, maxBytes: number): Pro
       }
     }
   } finally {
-    // Release the connection whether we finished or bailed over budget.
+    // error-policy:J6 best-effort teardown of a possibly-consumed reader —
+    // release the connection whether we finished or bailed over budget.
     reader.cancel().catch(() => {});
   }
   return Buffer.concat(chunks).toString("utf-8");
@@ -6679,8 +6690,12 @@ export class ElizaSandboxService {
     let stateData: AgentBackupStateData;
     try {
       stateData = JSON.parse(raw) as AgentBackupStateData;
-    } catch {
-      throw new Error("Snapshot payload is not valid JSON — refusing partial restore");
+    } catch (error) {
+      // error-policy:J2 context-adding rethrow — the parse position in `cause`
+      // is the only clue to WHERE a multi-hundred-MB payload is corrupt.
+      throw new Error("Snapshot payload is not valid JSON — refusing partial restore", {
+        cause: error,
+      });
     }
     assertSnapshotExpandedBudgets(stateData);
     const sizeBytes = Buffer.byteLength(raw, "utf-8");
