@@ -145,6 +145,14 @@ function googleEventIntersectsWindow(
   );
 }
 
+function isGoogleCalendarDisconnected(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message === "Google Calendar is not connected." &&
+    (error as Error & { status?: unknown }).status === 409
+  );
+}
+
 function calendarSourceKey(
   calendar: Pick<
     LifeOpsCalendarSummary,
@@ -396,7 +404,10 @@ export class CalendarService extends Service {
       ];
       await restoreMeetingAutoJoinAnchors(this.runtime, this.agentId(), events);
     } catch (error) {
-      logger.debug(
+      // error-policy:J5 Service.start intentionally launches this restoration
+      // in the background; this handler is where its rejection is observed.
+      this.runtime.reportError("calendar:restore-auto-join", error);
+      logger.warn(
         { src: "calendar:service", error },
         "[CalendarService] Meeting auto-join anchor restore skipped (calendar store not ready yet).",
       );
@@ -1479,7 +1490,9 @@ export class CalendarService extends Service {
         request.grantId,
       );
     } catch (error) {
-      if (request.grantId) {
+      // error-policy:J4 With no provider selected, an explicitly disconnected
+      // Google source degrades to the native Apple provider.
+      if (request.grantId || !isGoogleCalendarDisconnected(error)) {
         throw error;
       }
       return this.createAppleCalendarEvent(request, calendarId, {
@@ -1638,7 +1651,9 @@ export class CalendarService extends Service {
         request.grantId,
       );
     } catch (error) {
-      if (request.grantId) {
+      // error-policy:J4 With no provider selected, an explicitly disconnected
+      // Google source degrades to the native Apple provider.
+      if (request.grantId || !isGoogleCalendarDisconnected(error)) {
         throw error;
       }
       if (recurrence || recurrenceScope) {
@@ -1774,7 +1789,9 @@ export class CalendarService extends Service {
         request.grantId,
       );
     } catch (error) {
-      if (request.grantId) {
+      // error-policy:J4 With no provider selected, an explicitly disconnected
+      // Google source degrades to the native Apple provider.
+      if (request.grantId || !isGoogleCalendarDisconnected(error)) {
         throw error;
       }
       if (recurrenceScope) {
