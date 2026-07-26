@@ -279,7 +279,10 @@ describe("adjacency-heavy random-assembly differential (byte-identical)", () => 
     // whole cluster in the live tail scan for exactly this corpus. The wall-clock
     // cost is real but bounded; a shared CI runner under load must not flake it
     // into a false red. The per-frame `toEqual` assertions are the coverage.
-  }, 30_000);
+    // 30s proved to straddle real shared-runner load (green at low load, timeout
+    // under contention with sibling suites); the budget only guards against a
+    // hang, so size it well clear of the observed ~45s worst case.
+  }, 120_000);
 });
 
 describe("normalize seam locality (computeSafeNormCut)", () => {
