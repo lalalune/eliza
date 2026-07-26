@@ -71,6 +71,10 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
         }
         let imageUrl = call.getString("imageUrl")
         let color = call.getString("color").flatMap(Self.color(fromCSSHex:)) ?? .black
+        // Cookie policy is decided by the web layer's pure predicate
+        // (wallpaperRequestForwardsCookies in native-bridge.ts): true only for
+        // the agent-API origin. Absent or false means the fetch is cookie-less.
+        let forwardCookies = call.getBool("forwardCookies") ?? false
         backdropGeneration += 1
         let generation = backdropGeneration
 
@@ -93,7 +97,7 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        loadBackdropData(url: url) { [weak self] data in
+        loadBackdropData(url: url, forwardCookies: forwardCookies) { [weak self] data in
             DispatchQueue.main.async {
                 guard let self, generation == self.backdropGeneration,
                     let data, let image = UIImage(data: data),
@@ -258,7 +262,39 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
         backdropView = next
     }
 
-    private func loadBackdropData(url: URL, completion: @escaping (Data?) -> Void) {
+    /// Refuses every redirect on the wallpaper fetch. URLSession replays the
+    /// original request headers — including a manually set Cookie header — on
+    /// the redirected request, so following a cross-origin redirect would leak
+    /// the forwarded cookies to an arbitrary host. Cancelling the redirect
+    /// completes the task with the 3xx response, which fails the 2xx status
+    /// check below and degrades to the CSS wallpaper.
+    private final class BackdropRedirectBlocker: NSObject, URLSessionTaskDelegate {
+        func urlSession(
+            _ session: URLSession, task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            completionHandler(nil)
+        }
+    }
+
+    /// Ephemeral (no shared cookie jar, `httpShouldSetCookies` off) so the ONLY
+    /// cookies a wallpaper request can ever carry are the ones explicitly
+    /// scoped and attached below — never URLSession's own store.
+    private static let backdropSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        return URLSession(
+            configuration: configuration,
+            delegate: BackdropRedirectBlocker(),
+            delegateQueue: nil
+        )
+    }()
+
+    private func loadBackdropData(
+        url: URL, forwardCookies: Bool, completion: @escaping (Data?) -> Void
+    ) {
         // Capacitor-served public assets live in the app bundle; its custom URL
         // scheme is a WebView handler, not a URLSession endpoint.
         if url.scheme == "capacitor" || (url.host == "localhost" && !url.path.hasPrefix("/api/")) {
@@ -273,15 +309,64 @@ public class GlassBridge: CAPPlugin, CAPBridgedPlugin {
             completion(nil)
             return
         }
-        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-            var request = URLRequest(url: url)
-            let headers = HTTPCookie.requestHeaderFields(with: cookies)
-            for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-            URLSession.shared.dataTask(with: request) { data, response, _ in
+        let fetch = { (request: URLRequest) in
+            Self.backdropSession.dataTask(with: request) { data, response, _ in
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 completion((200..<300).contains(status) ? data : nil)
             }.resume()
         }
+        guard forwardCookies else {
+            fetch(URLRequest(url: url))
+            return
+        }
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+            var request = URLRequest(url: url)
+            // The WebView jar holds cookies for EVERY origin the session has
+            // touched; forwarding it wholesale would replay unrelated origins'
+            // sessions to the wallpaper host. Scope to the target URL first.
+            let scoped = Self.cookiesScoped(to: url, from: cookies)
+            if !scoped.isEmpty {
+                let headers = HTTPCookie.requestHeaderFields(with: scoped)
+                for (key, value) in headers {
+                    request.setValue(value, forHTTPHeaderField: key)
+                }
+            }
+            fetch(request)
+        }
+    }
+
+    /// Pure RFC 6265 request-matching: a stored cookie is forwarded only when
+    /// its Domain, Path, and Secure attributes all admit the wallpaper URL —
+    /// the same filter the WebView itself applies before attaching cookies to
+    /// a subresource request.
+    static func cookiesScoped(to url: URL, from cookies: [HTTPCookie]) -> [HTTPCookie] {
+        guard let host = url.host?.lowercased() else { return [] }
+        let secureChannel = url.scheme?.lowercased() == "https"
+        let requestPath = url.path.isEmpty ? "/" : url.path
+        return cookies.filter { cookie in
+            if cookie.isSecure && !secureChannel { return false }
+            return Self.cookieDomainMatches(cookieDomain: cookie.domain, host: host)
+                && Self.cookiePathMatches(cookiePath: cookie.path, requestPath: requestPath)
+        }
+    }
+
+    /// RFC 6265 §5.1.3: a leading dot marks a Domain cookie (host or any
+    /// subdomain); no leading dot is host-only (exact match).
+    static func cookieDomainMatches(cookieDomain: String, host: String) -> Bool {
+        let domain = cookieDomain.lowercased()
+        guard domain.hasPrefix(".") else { return host == domain }
+        let suffix = String(domain.dropFirst())
+        return host == suffix || host.hasSuffix("." + suffix)
+    }
+
+    /// RFC 6265 §5.1.4 path-match: exact, or prefix ending at a "/" boundary.
+    static func cookiePathMatches(cookiePath: String, requestPath: String) -> Bool {
+        let path = cookiePath.isEmpty ? "/" : cookiePath
+        if requestPath == path { return true }
+        guard requestPath.hasPrefix(path) else { return false }
+        if path.hasSuffix("/") { return true }
+        let boundary = requestPath.index(requestPath.startIndex, offsetBy: path.count)
+        return requestPath[boundary] == "/"
     }
 
     /// Rects arrive viewport-relative (CSS px == points); offset into the
