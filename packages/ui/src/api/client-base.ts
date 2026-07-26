@@ -146,6 +146,40 @@ export function isStreamGenerationError(
   return value instanceof StreamGenerationError;
 }
 
+export type StreamTransportFailureKind = "transport" | "protocol";
+
+/**
+ * The SSE body ended without its required terminal event or the underlying
+ * reader rejected. Callers receive the exact partial text already delivered so
+ * they can preserve the interrupted bubble while surfacing the failure; a
+ * transport rejection also retains its original cause for diagnostics.
+ */
+export class StreamTransportError extends Error {
+  readonly kind: StreamTransportFailureKind;
+  readonly partialText: string;
+
+  constructor(options: {
+    kind: StreamTransportFailureKind;
+    message: string;
+    partialText: string;
+    cause?: unknown;
+  }) {
+    super(
+      options.message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
+    this.name = "StreamTransportError";
+    this.kind = options.kind;
+    this.partialText = options.partialText;
+  }
+}
+
+export function isStreamTransportError(
+  value: unknown,
+): value is StreamTransportError {
+  return value instanceof StreamTransportError;
+}
+
 const CHAT_TURN_STATUS_KINDS: ReadonlySet<ChatTurnStatus["kind"]> = new Set<
   ChatTurnStatus["kind"]
 >([
@@ -1910,6 +1944,7 @@ export class ElizaClient {
       doneActionResults: undefined,
       receivedDone: false,
     };
+    let interruptedByClientAbort = false;
 
     // Contract: the API emits a terminal done/error frame and supports explicit
     // cancellation through the caller's AbortSignal. Do not infer failure from
@@ -1928,10 +1963,12 @@ export class ElizaClient {
       if (signal?.aborted) {
         // error-policy:J6 best-effort reader teardown on client abort.
         void reader.cancel("elizaos-sse-client-abort").catch(() => undefined);
+        interruptedByClientAbort = true;
         break;
       }
       let done = false;
       let value: Uint8Array | undefined;
+      let removeAbortListener = () => {};
       try {
         const readPromise = reader.read();
         // Reject the in-flight read the instant the caller aborts, so a stream
@@ -1946,24 +1983,31 @@ export class ElizaClient {
             reject(abortErr);
           };
           signal.addEventListener("abort", onAbort, { once: true });
-          void readPromise.finally(() =>
-            signal.removeEventListener("abort", onAbort),
-          );
+          removeAbortListener = () =>
+            signal.removeEventListener("abort", onAbort);
         });
         ({ done, value } = await Promise.race([readPromise, abortPromise]));
-      } catch {
+      } catch (cause) {
         // A client abort wins over everything else: cancel the reader and stop —
         // the partial streamed so far is returned as an interrupted turn.
         if (signal?.aborted) {
           // error-policy:J6 best-effort reader teardown on client abort.
           void reader.cancel("elizaos-sse-client-abort").catch(() => undefined);
+          interruptedByClientAbort = true;
           break;
         }
         // A rejected read is a genuine transport interruption. Provider errors
         // arrive as structured SSE error frames from the server.
         // error-policy:J6 best-effort reader teardown after transport failure.
         void reader.cancel("elizaos-sse-read-failed").catch(() => undefined);
-        break;
+        throw new StreamTransportError({
+          kind: "transport",
+          message: "The chat stream connection failed before completion.",
+          partialText: streamState.fullText,
+          cause,
+        });
+      } finally {
+        removeAbortListener();
       }
       if (done || !value) break;
 
@@ -2009,6 +2053,18 @@ export class ElizaClient {
           );
         }
       }
+    }
+
+    if (
+      !streamState.receivedDone &&
+      !interruptedByClientAbort &&
+      !signal?.aborted
+    ) {
+      throw new StreamTransportError({
+        kind: "protocol",
+        message: "The chat stream ended before its terminal event.",
+        partialText: streamState.fullText,
+      });
     }
 
     const resolvedText =

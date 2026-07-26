@@ -20,6 +20,10 @@ on:
           - "3"
           - "10"
           - "30"
+      expected_gateway_sha:
+        description: Exact 40-character commit expected from /api/health
+        required: true
+        type: string
 
 concurrency:
   group: chat-latency-telemetry-${{ inputs.environment }}
@@ -31,6 +35,9 @@ permissions:
 jobs:
   measure:
     name: Cerebras direct + Eliza Cloud
+    if: >-
+      (inputs.environment == 'staging' && github.ref == 'refs/heads/develop') ||
+      (inputs.environment == 'production' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: ${{ inputs.environment }}
@@ -38,6 +45,7 @@ jobs:
       CEREBRAS_CHAT_LATENCY_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
       ELIZA_CLOUD_CHAT_LATENCY_API_KEY: ${{ secrets.ELIZACLOUD_API_KEY }}
       ELIZA_CLOUD_CHAT_LATENCY_BASE_URL: ${{ inputs.environment == 'production' && 'https://api.elizacloud.ai' || 'https://api-staging.elizacloud.ai' }}
+      ELIZA_GATEWAY_DEPLOY_SHA: ${{ inputs.expected_gateway_sha }}
       REPORT_PATH: reports/chat-latency-${{ inputs.environment }}.jsonl
     steps:
       - name: Checkout
@@ -48,11 +56,46 @@ jobs:
         with:
           node-version: "24.15.0"
 
+      - name: Bind checkout to deployed gateway
+        env:
+          EXPECTED_GATEWAY_SHA: ${{ inputs.expected_gateway_sha }}
+        run: |
+          node --input-type=module - <<'NODE'
+          const expected = process.env.EXPECTED_GATEWAY_SHA ?? "";
+          const checkout = process.env.GITHUB_SHA ?? "";
+          if (!/^[a-f0-9]{40}$/.test(expected)) {
+            throw new Error("expected_gateway_sha must be a lowercase 40-character commit");
+          }
+          if (checkout !== expected) {
+            throw new Error(`Checkout ${checkout || "<missing>"} does not match deployed gateway ${expected}`);
+          }
+          NODE
+
+      - name: Verify deployed gateway before measurement
+        env:
+          EXPECTED_GATEWAY_SHA: ${{ inputs.expected_gateway_sha }}
+        run: |
+          node --input-type=module - <<'NODE'
+          const response = await fetch(
+            process.env.ELIZA_CLOUD_CHAT_LATENCY_BASE_URL + "/api/health",
+            {
+              headers: { "user-agent": "eliza-chat-latency/1.0" },
+              signal: AbortSignal.timeout(30_000),
+            },
+          );
+          if (!response.ok) throw new Error(`Gateway health returned HTTP ${response.status}`);
+          const health = await response.json();
+          if (health?.commit !== process.env.EXPECTED_GATEWAY_SHA) {
+            throw new Error(
+              `Gateway serves ${health?.commit ?? "<missing>"}, expected ${process.env.EXPECTED_GATEWAY_SHA}`,
+            );
+          }
+          NODE
+
       - name: Measure Gemma streaming
-        id: probe
-        continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           mkdir -p reports
           node packages/scripts/cloud/chat-latency.mjs \
             --target paired \
@@ -67,6 +110,28 @@ jobs:
             --case gemma-4-31b@omit@512 \
             | tee "$REPORT_PATH"
 
+      - name: Verify deployed gateway after measurement
+        if: always()
+        env:
+          EXPECTED_GATEWAY_SHA: ${{ inputs.expected_gateway_sha }}
+        run: |
+          node --input-type=module - <<'NODE'
+          const response = await fetch(
+            process.env.ELIZA_CLOUD_CHAT_LATENCY_BASE_URL + "/api/health",
+            {
+              headers: { "user-agent": "eliza-chat-latency/1.0" },
+              signal: AbortSignal.timeout(30_000),
+            },
+          );
+          if (!response.ok) throw new Error(`Gateway health returned HTTP ${response.status}`);
+          const health = await response.json();
+          if (health?.commit !== process.env.EXPECTED_GATEWAY_SHA) {
+            throw new Error(
+              `Gateway changed during measurement: ${health?.commit ?? "<missing>"}`,
+            );
+          }
+          NODE
+
       - name: Summarize telemetry
         if: always() && hashFiles(env.REPORT_PATH) != ''
         run: |
@@ -80,6 +145,10 @@ jobs:
             .map((line) => JSON.parse(line));
           const summary = summarizeLatencyRecords(records);
 
+          console.log(`Checkout: ${process.env.GITHUB_SHA ?? "unknown"}`);
+          console.log("");
+          console.log(`Gateway deployment: ${process.env.ELIZA_GATEWAY_DEPLOY_SHA ?? "unknown"}`);
+          console.log("");
           console.log("| Target | Samples | Failures | Headers p50 | First token p50 | Total p50 |");
           console.log("| --- | ---: | ---: | ---: | ---: | ---: |");
           for (const row of summary) {

@@ -362,9 +362,8 @@ describe("simple-path deliver-then-persist ordering", () => {
 			h.makeMessage(),
 			async () => {
 				h.order.push("callback");
-				// Fire-and-forget, exactly like a real client reacting to the
-				// delivered reply. A callback must never AWAIT a same-room turn
-				// to completion (documented on registerPendingReplyPersist).
+				// Fire-and-forget models a client reacting immediately to the
+				// delivered reply while the outer connector callback completes.
 				followUpTurn = h.service.handleMessage(
 					h.runtime,
 					h.makeFollowUp(),
@@ -392,6 +391,40 @@ describe("simple-path deliver-then-persist ordering", () => {
 		);
 		// …and its composed model input actually contains the delivered reply.
 		expect(h.stage1Invocations).toHaveLength(2);
+		expect(h.stage1Invocations[1]).toContain(h.replyText);
+	});
+
+	it("allows a delivery callback to await a same-room follow-up without deadlocking", async () => {
+		const h = await createHarness({ holdReplyPersist: true });
+		let nestedCompleted = false;
+
+		const firstTurn = h.service.handleMessage(
+			h.runtime,
+			h.makeMessage(),
+			async () => {
+				h.order.push("callback");
+				await h.service.handleMessage(
+					h.runtime,
+					h.makeFollowUp(),
+					async () => [],
+				);
+				nestedCompleted = true;
+				return [];
+			},
+		);
+
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(h.order).toContain("callback");
+		expect(h.order).not.toContain("stage1:2");
+		expect(nestedCompleted).toBe(false);
+
+		h.releaseReplyPersist();
+		await firstTurn;
+
+		expect(nestedCompleted).toBe(true);
+		expect(h.order.indexOf("stage1:2")).toBeGreaterThan(
+			h.order.indexOf("persist:reply"),
+		);
 		expect(h.stage1Invocations[1]).toContain(h.replyText);
 	});
 

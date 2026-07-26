@@ -407,6 +407,7 @@ import {
   handleRuntimeModePreDispatch,
   handleRuntimeModeRemoteForward,
 } from "./runtime-mode/pre-dispatch.ts";
+import { createRuntimeReadyGate } from "./runtime-ready-gate.ts";
 import { handleRuntimeSwitchRoutes } from "./runtime-switch-routes.ts";
 import {
   cloneWithoutBlockedObjectKeys,
@@ -3869,6 +3870,7 @@ export async function startApiServer(opts?: {
     trainingService: null,
     shareIngestQueue: [],
     broadcastStatus: null,
+    awaitRuntimeReady: null,
     broadcastWs: null,
     broadcastWsToClientId: null,
     broadcastWsToConversation: null,
@@ -3882,6 +3884,14 @@ export async function startApiServer(opts?: {
     connectorHealthMonitor: null,
     whatsappPairingSessions: new Map(),
   };
+  // Lets chat handlers HOLD a turn through the warming window (early API bind →
+  // runtime ready) instead of 503-dropping it — woken in updateRuntime when
+  // first-turn capability comes online (see runtime-ready-gate.ts).
+  const runtimeReadyGate = createRuntimeReadyGate<AgentRuntime>(
+    () => state.runtime,
+  );
+  state.awaitRuntimeReady = (timeoutMs: number) =>
+    runtimeReadyGate.await(timeoutMs);
   const ensureAppManager = async (): Promise<AppManagerLike> => {
     if (state.appManager) {
       return state.appManager as AppManagerLike;
@@ -5407,6 +5417,9 @@ export async function startApiServer(opts?: {
     state.chatConnectionPromise = null;
     bindRuntimeStreams(rt);
     wireModelRegistrationBroadcast(rt);
+    // Wake any chat turns held through the warming window — first-turn
+    // capability is now online, so they stream their response instead of 503.
+    runtimeReadyGate.markReady(rt);
     // AppManager doesn't need a runtime reference
     state.agentState = "running";
     state.agentName =

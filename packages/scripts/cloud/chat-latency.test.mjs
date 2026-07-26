@@ -554,7 +554,7 @@ test("summarizeLatencyRecords reports warm p50, p90, and p95", () => {
   });
 });
 
-test("paired CLI reports proof misses without a numeric acceptance gate", async () => {
+test("paired CLI fails when a response omits its exact proof token", async () => {
   const originalFetch = globalThis.fetch;
   const originalWrite = process.stdout.write;
   const testEnv = process.env;
@@ -579,7 +579,7 @@ test("paired CLI reports proof misses without a numeric acceptance gate", async 
     "cli-threshold-test",
   ];
   try {
-    assert.equal(await runCli(args), 0);
+    assert.equal(await runCli(args), 2);
   } finally {
     globalThis.fetch = originalFetch;
     process.stdout.write = originalWrite;

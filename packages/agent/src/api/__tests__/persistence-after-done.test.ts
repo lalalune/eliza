@@ -7,7 +7,13 @@
 
 import { EventEmitter } from "node:events";
 import http from "node:http";
-import { ChannelType, logger, stringToUuid, type UUID } from "@elizaos/core";
+import {
+  ChannelType,
+  logger,
+  type Memory,
+  stringToUuid,
+  type UUID,
+} from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Capture the persistence promise so the test can resolve it on demand and
@@ -75,13 +81,18 @@ vi.mock("../chat-routes.ts", async () => {
       source: "api",
       metadata: undefined,
     })),
-    persistConversationMemory: vi.fn(async () => undefined),
     persistAssistantConversationMemory: vi.fn(async () => {
       persistCalledAt = Date.now();
-      return new Promise<{ id: UUID }>((resolve, reject) => {
+      return new Promise<Memory>((resolve, reject) => {
         persistResolve = () => {
           persistResolvedAt = Date.now();
-          resolve({ id: stringToUuid("assistant-msg-store") as UUID });
+          resolve({
+            id: stringToUuid("assistant-msg-store") as UUID,
+            entityId: stringToUuid("agent-1"),
+            agentId: stringToUuid("agent-1"),
+            roomId: stringToUuid("room-1"),
+            content: { text: "ok" },
+          });
         };
         persistReject = (err) => {
           persistResolvedAt = Date.now();
@@ -89,9 +100,6 @@ vi.mock("../chat-routes.ts", async () => {
         };
       });
     }),
-    hasRecentVisibleAssistantMemorySince: vi.fn(
-      async () => assistantMemoryAlreadyPersisted,
-    ),
     generateChatResponse: vi.fn(async (_runtime, _msg, agentName, opts) => {
       captureGenerateAbortSignal = opts?.abortSignal;
       if (generateThrowsTurnAbort) {
@@ -103,6 +111,23 @@ vi.mock("../chat-routes.ts", async () => {
         throw err;
       }
       if (generateThrowsTimeout) {
+        const incomingMessage: Memory = {
+          id: stringToUuid("user-msg-store"),
+          entityId: stringToUuid("admin-1"),
+          agentId: stringToUuid("agent-1"),
+          roomId: stringToUuid("room-1"),
+          content: { text: "hello" },
+        };
+        opts?.onIncomingMessagePersisted?.(incomingMessage);
+        if (assistantMemoryAlreadyPersisted) {
+          opts?.onResponseMessagePersisted?.({
+            id: stringToUuid("already-persisted-assistant"),
+            entityId: stringToUuid("agent-1"),
+            agentId: stringToUuid("agent-1"),
+            roomId: stringToUuid("room-1"),
+            content: { text: "Already persisted exact reply" },
+          });
+        }
         throw new Error("Chat generation timed out after 180000ms");
       }
       if (generateWaitsForAbort) {
@@ -115,9 +140,18 @@ vi.mock("../chat-routes.ts", async () => {
       }
       // Stream a single token so the SSE wire format mirrors a real turn.
       opts?.onChunk?.("ok");
+      const persistedRequestMessageId = stringToUuid("user-msg-store");
+      opts?.onIncomingMessagePersisted?.({
+        id: persistedRequestMessageId,
+        entityId: stringToUuid("admin-1"),
+        agentId: stringToUuid("agent-1"),
+        roomId: stringToUuid("room-1"),
+        content: { text: "hello" },
+      });
       return {
         text: "ok",
         agentName,
+        persistedRequestMessageId,
         usage: undefined,
         usedActionCallbacks: false,
         actionCallbackHistory: undefined,
@@ -167,7 +201,6 @@ vi.mock("../character-routes.ts", async () => {
 });
 
 import {
-  hasRecentVisibleAssistantMemorySince,
   persistAssistantConversationMemory,
   readChatRequestPayload,
 } from "../chat-routes.ts";
@@ -406,17 +439,19 @@ describe("conversation-routes streaming persistence ordering", () => {
     expect(persistCalledAt).toBeNull();
   });
 
-  it("suppresses synthetic fallback when a timed-out turn already persisted a reply", async () => {
+  it("reuses the exact observed assistant receipt when later work times out", async () => {
     generateThrowsTimeout = true;
     assistantMemoryAlreadyPersisted = true;
     const { ctx, record } = createCtx();
 
     await handleConversationRoutes(ctx);
 
-    expect(hasRecentVisibleAssistantMemorySince).toHaveBeenCalled();
     expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
     expect(record.writes.some((w) => w.includes('"type":"done"'))).toBe(true);
-    expect(record.writes.join("")).not.toContain("provider issue");
+    expect(record.writes.join("")).toContain("Already persisted exact reply");
+    expect(record.writes.join("")).toContain(
+      stringToUuid("already-persisted-assistant"),
+    );
     expect(record.ended).toBe(true);
   });
 });

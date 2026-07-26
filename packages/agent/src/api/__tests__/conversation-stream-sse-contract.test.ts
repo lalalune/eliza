@@ -28,7 +28,9 @@ import http from "node:http";
 import {
   type AgentRuntime,
   ChannelType,
+  type IAgentRuntime,
   logger,
+  type Memory,
   ModelType,
   stringToUuid,
   type UUID,
@@ -65,8 +67,11 @@ vi.mock("../chat-routes.ts", async () => {
     persistConversationMemory: vi.fn(async (_runtime, memory) => memory),
     persistAssistantConversationMemory: vi.fn(async () => ({
       id: stringToUuid("stream-contract-assistant-msg"),
+      entityId: AGENT_ID,
+      agentId: AGENT_ID,
+      roomId: ROOM_ID,
+      content: { text: FINAL_TEXT },
     })),
-    hasRecentVisibleAssistantMemorySince: vi.fn(async () => false),
     resolveNoResponseFallback: () => "",
   };
 });
@@ -127,6 +132,32 @@ interface StreamingModelParams {
 interface StreamingModelResult {
   text: string;
   thought: string;
+}
+
+interface FixtureMessageOptions {
+  abortSignal?: AbortSignal;
+  incomingMessageForPersistence?: Memory;
+  onIncomingMessagePersisted?: (message: Memory) => void;
+  onStreamChunk?: (
+    chunk: string,
+    messageId?: string,
+    accumulated?: string,
+  ) => Promise<void> | void;
+}
+
+async function persistFixtureIncoming(
+  runtime: IAgentRuntime,
+  message: Memory,
+  options?: FixtureMessageOptions,
+): Promise<UUID> {
+  const persisted = await persistConversationMemory(
+    runtime as AgentRuntime,
+    options?.incomingMessageForPersistence ?? message,
+  );
+  options?.onIncomingMessagePersisted?.(persisted);
+  if (!persisted.id)
+    throw new Error("fixture incoming persistence lost its id");
+  return persisted.id;
 }
 
 interface MockResponseRecord {
@@ -229,18 +260,16 @@ function createStreamingUseModelFixture() {
 function createModelBackedMessageService() {
   return {
     async handleMessage(
-      runtime: AgentRuntime,
-      message: { content?: { text?: unknown } },
+      runtime: IAgentRuntime,
+      message: Memory,
       _callback: unknown,
-      options?: {
-        abortSignal?: AbortSignal;
-        onStreamChunk?: (
-          chunk: string,
-          messageId?: string,
-          accumulated?: string,
-        ) => Promise<void> | void;
-      },
+      options?: FixtureMessageOptions,
     ) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       const useStreamingModel = runtime.useModel as unknown as (
         modelType: typeof ModelType.TEXT_LARGE,
         params: StreamingModelParams,
@@ -253,6 +282,7 @@ function createModelBackedMessageService() {
       });
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: {
           text: modelResult.text,
           thought: modelResult.thought,
@@ -267,7 +297,7 @@ function createModelBackedMessageService() {
     }),
     deleteMessage: async () => undefined,
     clearChannel: async () => undefined,
-  } satisfies NonNullable<AgentRuntime["messageService"]>;
+  } satisfies NonNullable<IAgentRuntime["messageService"]>;
 }
 
 /**
@@ -283,24 +313,23 @@ function createChunkPlanMessageService(
 ): NonNullable<AgentRuntime["messageService"]> {
   return {
     async handleMessage(
-      _runtime: AgentRuntime,
-      _message: { content?: { text?: unknown } },
+      runtime: IAgentRuntime,
+      message: Memory,
       _callback: unknown,
-      options?: {
-        abortSignal?: AbortSignal;
-        onStreamChunk?: (
-          chunk: string,
-          messageId?: string,
-          accumulated?: string,
-        ) => Promise<void> | void;
-      },
+      options?: FixtureMessageOptions,
     ) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       for (const { chunk, accumulated } of chunks) {
         await Promise.resolve();
         await options?.onStreamChunk?.(chunk, undefined, accumulated);
       }
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: finalText, thought },
         responseMessages: [],
       };
@@ -312,16 +341,22 @@ function createChunkPlanMessageService(
     }),
     deleteMessage: async () => undefined,
     clearChannel: async () => undefined,
-  } satisfies NonNullable<AgentRuntime["messageService"]>;
+  } satisfies NonNullable<IAgentRuntime["messageService"]>;
 }
 
 function createViewShortcutMessageService(): NonNullable<
-  AgentRuntime["messageService"]
+  IAgentRuntime["messageService"]
 > {
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: {
           text: "Navigated to Settings.",
           thought: "Shortcut: app-control:nl:view-navigation",
@@ -348,13 +383,19 @@ function createViewShortcutMessageService(): NonNullable<
 }
 
 function createPersistedReplyMessageService(): NonNullable<
-  AgentRuntime["messageService"]
+  IAgentRuntime["messageService"]
 > {
   const id = stringToUuid("message-service-persisted-assistant");
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: "Already committed by message service." },
         responseMessages: [
           {
@@ -380,10 +421,15 @@ function createPersistedReplyMessageService(): NonNullable<
 }
 
 function createEphemeralReplyMessageService(): NonNullable<
-  AgentRuntime["messageService"]
+  IAgentRuntime["messageService"]
 > {
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       const content = {
         text: "Temporary provider failure.",
         transient: true,
@@ -392,6 +438,7 @@ function createEphemeralReplyMessageService(): NonNullable<
       };
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: content,
         responseMessages: [
           {
@@ -561,11 +608,17 @@ function createGatedMessageService(
   gate: ReturnType<typeof createDeferred>,
 ): NonNullable<AgentRuntime["messageService"]> {
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       started.resolve();
       await gate.promise;
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: FINAL_TEXT, thought: THOUGHT },
         responseMessages: [],
       };
@@ -649,7 +702,6 @@ describe("conversation stream SSE contract (#10712)", () => {
       ROOM_ID,
       expect.objectContaining({ text: FINAL_TEXT }),
       ChannelType.DM,
-      expect.any(Number),
     );
     // `done` is terminal — no token frames after it.
     expect(

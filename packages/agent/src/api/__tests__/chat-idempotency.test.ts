@@ -1,13 +1,7 @@
 /**
- * Unit coverage for the HTTP chat-path idempotency decision logic
- * (report 05, Finding 1 / W3.1). The client stamps a stable `clientMessageId`
- * on every chat send; a retried/double-submitted POST carries the same id and
- * must not start a second LLM turn.
- *
- * These tests pin the pure decision function (`isDuplicateChatMessage`) and the
- * key-normalizer (`normalizeClientMessageId`) — the safety-critical invariant is
- * that an ABSENT/invalid id is NEVER treated as a duplicate, so requests without
- * an idempotency key are completely unaffected.
+ * Pins the HTTP chat idempotency contract used by both conversation send
+ * transports. Active requests remain protected regardless of generation time;
+ * completed receipts age out so the in-memory index stays bounded.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,6 +10,7 @@ import {
   __resetChatDedupeForTests,
   isDuplicateChatMessage,
   normalizeClientMessageId,
+  recordChatMessageReceipt,
 } from "../chat-routes.ts";
 
 const OLD_ARRIVAL_TTL_MS = 30_000;
@@ -90,18 +85,31 @@ describe("isDuplicateChatMessage", () => {
     ).toBe(true);
   });
 
-  it("does not suppress the same id once the TTL has elapsed", () => {
+  it("keeps an in-flight id protected after the completed-receipt TTL", () => {
     const now = 4_000_000;
     expect(isDuplicateChatMessage(SCOPE, "msg-ttl", now)).toBe(false);
-    // Just past the window the id is new again (legitimate re-send of the same
-    // text minutes later must go through).
-    expect(isDuplicateChatMessage(SCOPE, "msg-ttl", now + TTL_MS + 1)).toBe(
-      false,
-    );
-    // ...and is then deduped within its own fresh window.
     expect(isDuplicateChatMessage(SCOPE, "msg-ttl", now + TTL_MS + 1)).toBe(
       true,
     );
+  });
+
+  it("ages out a completed receipt after the TTL", () => {
+    const now = 4_500_000;
+    expect(isDuplicateChatMessage(SCOPE, "msg-complete", now)).toBe(false);
+    recordChatMessageReceipt(
+      SCOPE,
+      "msg-complete",
+      "json",
+      { text: "done" },
+      now,
+    );
+
+    expect(isDuplicateChatMessage(SCOPE, "msg-complete", now + TTL_MS)).toBe(
+      true,
+    );
+    expect(
+      isDuplicateChatMessage(SCOPE, "msg-complete", now + TTL_MS + 1),
+    ).toBe(false);
   });
 
   it("scopes the key per conversation/user — same id in a different scope is new", () => {
@@ -116,14 +124,17 @@ describe("isDuplicateChatMessage", () => {
 
   it("evicts expired entries so the cache stays bounded", () => {
     const start = 6_000_000;
-    // Seed an entry, then let the window pass and trigger the amortized sweep
-    // with a fresh request; the original key must read as new again afterward.
     expect(isDuplicateChatMessage(SCOPE, "old", start)).toBe(false);
-    // A later request past the sweep window evicts "old".
+    recordChatMessageReceipt(
+      SCOPE,
+      "old",
+      "stream",
+      { type: "done", fullText: "done" },
+      start,
+    );
     expect(
       isDuplicateChatMessage(SCOPE, "trigger-sweep", start + TTL_MS + 1),
     ).toBe(false);
-    // "old" is gone → new again, not a stale duplicate.
     expect(isDuplicateChatMessage(SCOPE, "old", start + TTL_MS + 2)).toBe(
       false,
     );

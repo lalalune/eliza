@@ -1052,12 +1052,6 @@ export async function runCli(argv = process.argv.slice(2)) {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     }
   }
-  if (streamedRecords) {
-    const transportPassed = records.every(
-      (record) => record.transportOk === true,
-    );
-    return transportPassed ? 0 : 2;
-  }
   return records.every((record) => record.ok) ? 0 : 2;
 }
 

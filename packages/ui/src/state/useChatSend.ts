@@ -25,6 +25,7 @@ import { isLimitedCloudAgentApiBase } from "../api/app-shell-capabilities";
 import {
   generateChatClientMessageId,
   isStreamGenerationError,
+  isStreamTransportError,
 } from "../api/client-base";
 import {
   expandSavedCustomCommand,
@@ -113,6 +114,7 @@ async function handoffCompletedAction(
 // Module scope (not per-render) so the flush callbacks stay referentially
 // stable across renders.
 const NO_PENDING_STATUS = Symbol("no-pending-status");
+const STREAMING_TIMER_FALLBACK_MS = 16;
 
 /** Derive the rendered-attachment kind for an optimistic bubble from its MIME. */
 function optimisticAttachmentKind(
@@ -231,8 +233,11 @@ export function buildSendFailureNotice(err: unknown): string {
   if (kind === "timeout") {
     return "The agent took too long to respond — give it a moment and resend.";
   }
-  if (kind === "network") {
+  if (kind === "network" || kind === "transport") {
     return "Couldn't reach the agent — check your connection and resend.";
+  }
+  if (kind === "protocol") {
+    return "The agent's response ended unexpectedly — resend your message.";
   }
   return "That message didn't go through — please resend.";
 }
@@ -256,31 +261,26 @@ export function resolveAbortRoomId(
 }
 
 /**
- * Clock-skew slack for matching a just-sent user turn against the server's
- * reloaded history. The persisted turn's server timestamp lands at-or-after
- * the client's send time on the same clock; the slack tolerates a cloud
- * server clock trailing the device's.
- */
-const SENT_TURN_MATCH_SLACK_MS = 60_000;
-
-/**
  * Whether the just-sent user turn survived the post-turn history reload —
  * i.e. the server persisted it and the reload carries it (or the reload never
- * replaced local state, leaving the optimistic bubble in place). Matches by
- * text among user turns no older than the send minus clock-skew slack, so an
- * identical message from an earlier exchange can't mask an eviction.
+ * replaced local state, leaving the optimistic bubble in place). Only immutable
+ * row identity is authoritative; role/text/time similarity must not suppress a
+ * rapid legitimate repeat.
  */
 function sentUserTurnPresent(
   messages: readonly ConversationMessage[],
-  sentText: string,
-  sentAt: number,
+  localRenderId: string,
 ): boolean {
-  const text = sentText.trim();
+  const clientMessageId = localRenderId.startsWith("temp-")
+    ? localRenderId.slice("temp-".length)
+    : "";
   return messages.some(
     (message) =>
       message.role === "user" &&
-      message.timestamp >= sentAt - SENT_TURN_MATCH_SLACK_MS &&
-      message.text.trim() === text,
+      (message.id === localRenderId ||
+        message.renderId === localRenderId ||
+        (clientMessageId.length > 0 &&
+          message.clientMessageId === clientMessageId)),
   );
 }
 
@@ -654,11 +654,10 @@ export function useChatSend(deps: UseChatSendDeps) {
   // commit: `onToken` (cumulative text, often >60/sec on a fast model),
   // `onStatus` (live turn phase), and `onToolEvent` (inline tool-call steps).
   // Committing each one synchronously means up to three React renders per SSE
-  // event; instead every callback parks its latest value here and one microtask
-  // commits the burst. A frame callback is not a delivery clock: browsers can
-  // defer rAF for seconds in a hidden or resource-constrained tab, making an
-  // active SSE stream appear frozen. Microtasks remain prompt and React still
-  // batches the related state writes into one commit.
+  // event. A visible tab parks the latest values until its next animation frame,
+  // which caps React work at one coherent commit per paint. Hidden tabs and
+  // runtimes without rAF use a short timer because hidden-tab rAF can pause
+  // indefinitely. Terminal transitions synchronously drain either scheduler.
   //
   // `pendingStatus` uses the NO_PENDING_STATUS sentinel = "no status update
   // parked", distinct from a parked `null` (an explicit clear-the-status
@@ -671,6 +670,8 @@ export function useChatSend(deps: UseChatSendDeps) {
     pendingToolEvents: ChatToolCallEvent[];
     flushScheduled: boolean;
     flushGeneration: number;
+    scheduledFrameId: number | null;
+    scheduledTimerId: ReturnType<typeof setTimeout> | null;
   }>({
     conversationId: null,
     messageId: "",
@@ -679,6 +680,8 @@ export function useChatSend(deps: UseChatSendDeps) {
     pendingToolEvents: [],
     flushScheduled: false,
     flushGeneration: 0,
+    scheduledFrameId: null,
+    scheduledTimerId: null,
   });
 
   const isConversationCommitActive = useCallback(
@@ -763,18 +766,34 @@ export function useChatSend(deps: UseChatSendDeps) {
     setServerTurnStatus,
   ]);
 
+  const cancelScheduledStreamingFlush = useCallback(() => {
+    const buffer = streamingFlushRef.current;
+    if (
+      buffer.scheduledFrameId !== null &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(buffer.scheduledFrameId);
+    }
+    if (buffer.scheduledTimerId !== null) {
+      clearTimeout(buffer.scheduledTimerId);
+    }
+    buffer.scheduledFrameId = null;
+    buffer.scheduledTimerId = null;
+    buffer.flushScheduled = false;
+  }, []);
+
   // Apply whatever streaming state is parked for the in-flight turn NOW
-  // (synchronously) and invalidate the pending microtask — called before every terminal
-  // / abort transition so no token, tool row, or status is lost. Safe when
-  // nothing is pending (no-op).
+  // (synchronously) and invalidate the pending frame/timer — called before every
+  // terminal / abort transition so no token, tool row, or status is lost. Safe
+  // when nothing is pending (no-op).
   const flushStreamingText = useCallback(() => {
     const buffer = streamingFlushRef.current;
     if (buffer.flushScheduled) {
       buffer.flushGeneration += 1;
-      buffer.flushScheduled = false;
+      cancelScheduledStreamingFlush();
     }
     commitStreamingBuffer();
-  }, [commitStreamingBuffer]);
+  }, [cancelScheduledStreamingFlush, commitStreamingBuffer]);
 
   // Reset the buffer to a fresh turn when `messageId` changes, dropping any
   // stale parked state (text/status/tool) from the prior turn. Runs BEFORE a
@@ -787,28 +806,45 @@ export function useChatSend(deps: UseChatSendDeps) {
         buffer.messageId === messageId
       )
         return;
-      if (buffer.flushScheduled) buffer.flushGeneration += 1;
+      if (buffer.flushScheduled) {
+        buffer.flushGeneration += 1;
+        cancelScheduledStreamingFlush();
+      }
       buffer.conversationId = conversationId;
       buffer.messageId = messageId;
       buffer.pendingText = null;
       buffer.pendingStatus = NO_PENDING_STATUS;
       buffer.pendingToolEvents = [];
-      buffer.flushScheduled = false;
     },
-    [],
+    [cancelScheduledStreamingFlush],
   );
 
-  // Ensure one microtask is scheduled for the current synchronous SSE burst.
+  // Ensure one visible-frame commit, with a bounded fallback for hidden tabs
+  // and environments where rAF is unavailable.
   const ensureStreamingFlush = useCallback(() => {
     const buffer = streamingFlushRef.current;
     if (buffer.flushScheduled) return;
     buffer.flushScheduled = true;
     const generation = buffer.flushGeneration;
-    queueMicrotask(() => {
+    const commitScheduled = () => {
       if (buffer.flushGeneration !== generation) return;
       buffer.flushScheduled = false;
+      buffer.scheduledFrameId = null;
+      buffer.scheduledTimerId = null;
       commitStreamingBuffer();
-    });
+    };
+    const canCommitOnVisibleFrame =
+      typeof document !== "undefined" &&
+      document.visibilityState !== "hidden" &&
+      typeof requestAnimationFrame === "function";
+    if (canCommitOnVisibleFrame) {
+      buffer.scheduledFrameId = requestAnimationFrame(commitScheduled);
+      return;
+    }
+    buffer.scheduledTimerId = setTimeout(
+      commitScheduled,
+      STREAMING_TIMER_FALLBACK_MS,
+    );
   }, [commitStreamingBuffer]);
 
   // Park the latest cumulative text for `messageId`. Synchronous callbacks from
@@ -856,13 +892,13 @@ export function useChatSend(deps: UseChatSendDeps) {
     const buffer = streamingFlushRef.current;
     return () => {
       buffer.flushGeneration += 1;
-      buffer.flushScheduled = false;
+      cancelScheduledStreamingFlush();
       buffer.pendingText = null;
       buffer.conversationId = null;
       buffer.pendingStatus = NO_PENDING_STATUS;
       buffer.pendingToolEvents = [];
     };
-  }, []);
+  }, [cancelScheduledStreamingFlush]);
 
   useEffect(() => {
     return () => {
@@ -1259,11 +1295,12 @@ export function useChatSend(deps: UseChatSendDeps) {
       const sentText = turn.text.trim();
       if (!sentText) return;
       setConversationMessagesForConversation(conversationId, (prev) => {
-        if (sentUserTurnPresent(prev, sentText, turn.timestamp)) return prev;
+        if (sentUserTurnPresent(prev, turn.userMsgId)) return prev;
         return [
           ...prev,
           {
             id: turn.userMsgId,
+            renderId: turn.userMsgId,
             role: "user",
             text: turn.text,
             timestamp: turn.timestamp,
@@ -1273,6 +1310,7 @@ export function useChatSend(deps: UseChatSendDeps) {
           },
           {
             id: `${turn.assistantMsgId}-undelivered`,
+            renderId: `${turn.assistantMsgId}-undelivered`,
             role: "assistant",
             text: UNDELIVERED_TURN_NOTICE,
             timestamp: Date.now(),
@@ -1349,6 +1387,8 @@ export function useChatSend(deps: UseChatSendDeps) {
         : undefined;
       const optimisticUserMessage: ConversationMessage = {
         id: userMsgId,
+        renderId: userMsgId,
+        clientMessageId,
         role: "user",
         text,
         timestamp: now,
@@ -1358,6 +1398,8 @@ export function useChatSend(deps: UseChatSendDeps) {
       };
       const optimisticAssistantMessage: ConversationMessage = {
         id: assistantMsgId,
+        renderId: assistantMsgId,
+        clientMessageId,
         role: "assistant",
         text: "",
         timestamp: now,
@@ -1507,8 +1549,8 @@ export function useChatSend(deps: UseChatSendDeps) {
             if (isConversationCommitActive(convId)) {
               setChatFirstTokenReceived(true);
             }
-            // Coalesce tokens delivered in one transport burst into a microtask;
-            // the parked text is flushed synchronously before terminal changes.
+            // Coalesce tokens delivered between paints into one visible-frame
+            // commit; terminal transitions synchronously drain the parked text.
             scheduleStreamingText(convId, assistantMsgId, nextText);
           },
           channelType,
@@ -1517,12 +1559,12 @@ export function useChatSend(deps: UseChatSendDeps) {
           turn.metadata,
           // Live server phase → the rich status indicator. Additive; the reply
           // streams through onToken above regardless. Coalesced into the same
-          // transport-burst microtask as text/tool commits and flushed
-          // synchronously before any terminal transition.
+          // display frame as text/tool commits and synchronously drained before
+          // any terminal transition.
           (status) => scheduleServerTurnStatus(convId, assistantMsgId, status),
           // Inline tool-call steps → the turn's tool rows (call → result/error),
           // merged by callId so one row flips running → settled (#13535).
-          // Coalesced into the current transport burst with the text + status.
+          // Coalesced into the current display frame with the text + status.
           (event) => scheduleToolEvent(convId, assistantMsgId, event),
           // Stable idempotency key for this logical turn.
           clientMessageId,
@@ -1740,6 +1782,21 @@ export function useChatSend(deps: UseChatSendDeps) {
           return;
         }
 
+        const transportPartial = isStreamTransportError(err)
+          ? err.partialText.trim()
+          : "";
+        if (transportPartial) {
+          applyStreamingModificationForConversation(convId, {
+            messageId: assistantMsgId,
+            mode: "replace",
+            fullText: transportPartial,
+          });
+          applyStreamingModificationForConversation(convId, {
+            messageId: assistantMsgId,
+            mode: "interrupt",
+          });
+        }
+
         const status = (err as { status?: number }).status;
         if (status === 404) {
           // A 404 on send usually means the conversation row was deleted —
@@ -1805,9 +1862,18 @@ export function useChatSend(deps: UseChatSendDeps) {
             // placeholder must survive so streamed tokens have a target;
             // filterRenderableConversationMessages would drop an empty turn.
             setConversationMessagesForConversation(conversation.id, [
-              { id: replayUserId, role: "user", text, timestamp: Date.now() },
+              {
+                id: replayUserId,
+                renderId: replayUserId,
+                clientMessageId,
+                role: "user",
+                text,
+                timestamp: Date.now(),
+              },
               {
                 id: replayAssistantId,
+                renderId: replayAssistantId,
+                clientMessageId,
                 role: "assistant",
                 text: "",
                 timestamp: Date.now(),
@@ -1858,6 +1924,15 @@ export function useChatSend(deps: UseChatSendDeps) {
             // Commit any throttle-parked token before the terminal modification.
             flushStreamingText();
 
+            if (retryData.userMessageId) {
+              applyStreamingModificationForConversation(conversation.id, {
+                messageId: replayUserId,
+                mode: "complete",
+                fullText: text,
+                persistedMessageId: retryData.userMessageId,
+              });
+            }
+
             if (!retryData.text.trim()) {
               applyStreamingModificationForConversation(conversation.id, {
                 messageId: replayAssistantId,
@@ -1876,8 +1951,45 @@ export function useChatSend(deps: UseChatSendDeps) {
                 ...(retryData.reasoning
                   ? { reasoning: retryData.reasoning }
                   : {}),
+                ...(retryData.accountConnect
+                  ? { accountConnect: retryData.accountConnect }
+                  : {}),
                 ...(retryData.messageId
                   ? { persistedMessageId: retryData.messageId }
+                  : {}),
+              });
+            }
+            const replayInterruptedPartial =
+              !retryData.completed && replayStreamedText.trim()
+                ? retryData.text.trim() || replayStreamedText
+                : null;
+            if (replayInterruptedPartial) {
+              applyStreamingModificationForConversation(conversation.id, {
+                messageId: replayAssistantId,
+                mode: "interrupt",
+              });
+            }
+            if (
+              activeConversationIdRef.current === conversation.id &&
+              (retryData.historyRefreshRequired ||
+                !retryData.completed ||
+                (!retryData.messageId && !retryData.assistantEphemeral) ||
+                !retryData.userMessageId)
+            ) {
+              await loadConversationMessages(conversation.id);
+              if (replayInterruptedPartial) {
+                reattachInterruptedPartial(
+                  conversation.id,
+                  replayInterruptedPartial,
+                );
+              }
+              restoreEvictedUserTurn(conversation.id, {
+                userMsgId: replayUserId,
+                assistantMsgId: replayAssistantId,
+                text,
+                timestamp: nextCutoffTs,
+                ...(optimisticAttachments
+                  ? { attachments: optimisticAttachments }
                   : {}),
               });
             }
@@ -1943,6 +2055,9 @@ export function useChatSend(deps: UseChatSendDeps) {
           // this is safe; skip on auth where the reload would just fail again.
           if (!isAuth) {
             await loadConversationMessages(convId);
+            if (transportPartial) {
+              reattachInterruptedPartial(convId, transportPartial);
+            }
             // When the server refused the turn before persisting it (e.g. the
             // 503 warm-up gate), the reconcile just evicted the user's bubble —
             // the "KEEP the user's message" promise above becomes a lie
@@ -2298,16 +2413,31 @@ export function useChatSend(deps: UseChatSendDeps) {
         }
 
         const now = Date.now();
-        const userMsgId = `temp-action-${now}`;
-        const assistantMsgId = `temp-action-resp-${now}`;
+        const clientMessageId = generateChatClientMessageId();
+        const userMsgId = `temp-action-${clientMessageId}`;
+        const assistantMsgId = `temp-action-resp-${clientMessageId}`;
 
         setCompanionMessageCutoffTs(now);
         setConversationMessagesForConversation(
           convId,
           (prev: ConversationMessage[]) => [
             ...prev,
-            { id: userMsgId, role: "user", text: trimmed, timestamp: now },
-            { id: assistantMsgId, role: "assistant", text: "", timestamp: now },
+            {
+              id: userMsgId,
+              renderId: userMsgId,
+              clientMessageId,
+              role: "user",
+              text: trimmed,
+              timestamp: now,
+            },
+            {
+              id: assistantMsgId,
+              renderId: assistantMsgId,
+              clientMessageId,
+              role: "assistant",
+              text: "",
+              timestamp: now,
+            },
           ],
         );
         if (isConversationCommitActive(convId)) {
@@ -2344,8 +2474,8 @@ export function useChatSend(deps: UseChatSendDeps) {
               if (isConversationCommitActive(convId)) {
                 setChatFirstTokenReceived(true);
               }
-              // Coalesce tokens delivered in one transport burst into a microtask;
-              // flush synchronously before terminal changes.
+              // Coalesce tokens delivered between paints into one visible-frame
+              // commit; terminal transitions synchronously drain it.
               scheduleStreamingText(convId, assistantMsgId, nextText);
             },
             "DM",
@@ -2354,9 +2484,10 @@ export function useChatSend(deps: UseChatSendDeps) {
             buildChatViewMetadata(tab),
             // No overlay status on the action/DM path (its finally doesn't clear
             // it); still stream inline tool rows onto the turn (#13535),
-            // coalesced into the current transport burst with the text.
+            // coalesced into the current display frame with the text.
             undefined,
             (event) => scheduleToolEvent(convId, assistantMsgId, event),
+            clientMessageId,
           );
 
           // Commit any token parked by the throttle before the terminal
@@ -2365,6 +2496,15 @@ export function useChatSend(deps: UseChatSendDeps) {
           await handoffCompletedAction(data.actionResults, (message) => {
             setActionNotice(message, "error", 8_000);
           });
+
+          if (data.userMessageId) {
+            applyStreamingModificationForConversation(convId, {
+              messageId: userMsgId,
+              mode: "complete",
+              fullText: trimmed,
+              persistedMessageId: data.userMessageId,
+            });
+          }
 
           if (!data.text.trim()) {
             if (data.failureKind) {
@@ -2384,13 +2524,20 @@ export function useChatSend(deps: UseChatSendDeps) {
               });
             }
           } else if (
-            shouldApplyFinalStreamText(streamedAssistantText, data.text)
+            shouldApplyFinalStreamText(streamedAssistantText, data.text) ||
+            data.reasoning ||
+            data.accountConnect ||
+            data.messageId
           ) {
             applyStreamingModificationForConversation(convId, {
               messageId: assistantMsgId,
               mode: "complete",
               fullText: data.text,
               ...(data.failureKind ? { failureKind: data.failureKind } : {}),
+              ...(data.accountConnect
+                ? { accountConnect: data.accountConnect }
+                : {}),
+              ...(data.reasoning ? { reasoning: data.reasoning } : {}),
               ...(data.messageId ? { persistedMessageId: data.messageId } : {}),
             });
           } else if (data.failureKind) {
@@ -2414,9 +2561,16 @@ export function useChatSend(deps: UseChatSendDeps) {
             });
           }
 
-          // Keep the visible thread authoritative when the server stores
-          // additional action-generated messages during a successful send.
-          if (activeConversationIdRef.current === convId) {
+          // Exact terminal ids reconcile ordinary action turns in place. Only
+          // topologies that explicitly report extra history, interruptions, or
+          // missing durable receipts need a full transcript reload.
+          if (
+            activeConversationIdRef.current === convId &&
+            (data.historyRefreshRequired ||
+              !data.completed ||
+              (!data.messageId && !data.assistantEphemeral) ||
+              !data.userMessageId)
+          ) {
             await loadConversationMessages(convId);
             if (interruptedPartial) {
               reattachInterruptedPartial(convId, interruptedPartial);
@@ -2445,11 +2599,28 @@ export function useChatSend(deps: UseChatSendDeps) {
             dropEmptyAssistantPlaceholder(convId, assistantMsgId);
             return;
           }
+          const transportPartial = isStreamTransportError(err)
+            ? err.partialText.trim()
+            : "";
+          if (transportPartial) {
+            applyStreamingModificationForConversation(convId, {
+              messageId: assistantMsgId,
+              mode: "replace",
+              fullText: transportPartial,
+            });
+            applyStreamingModificationForConversation(convId, {
+              messageId: assistantMsgId,
+              mode: "interrupt",
+            });
+          }
           // Surface a status-specific notice so an inbox/connector send that
           // 5xxs, times out, or auth-fails is never silent dead air — the
           // main-chat send path already does this; this one did not (#10231).
           setActionNotice(buildSendFailureNotice(err), "error", 8_000);
           await loadConversationMessages(convId);
+          if (transportPartial) {
+            reattachInterruptedPartial(convId, transportPartial);
+          }
           // The reconcile evicts a turn the server never persisted (e.g. the
           // 503 warm-up gate) — restore it with a retryable failed turn
           // (#11670).

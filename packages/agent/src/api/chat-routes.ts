@@ -19,6 +19,7 @@ import {
   ChannelType,
   type Content,
   createMessageMemory,
+  ElizaError,
   EventType,
   emitInferenceTiming,
   getInferenceTimer,
@@ -191,14 +192,23 @@ const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
  * a second LLM turn and persist a duplicate assistant memory (report 05,
  * Finding 1 / W3.1).
  *
- * Keyed by `${conversationOrUserScope}:${clientMessageId}` so a legitimately
- * identical message in a different conversation, or the same text re-sent after
- * the retention window, is NOT suppressed. The map stays bounded via an
- * amortized sweep (at most once per retention window) — the same O(1)-check /
- * amortized-eviction shape as the WS cache. This window only retains keys; it
- * never delays or aborts a response.
+ * Keyed by `${conversationOrUserScope}:${clientMessageId}` so identical text in
+ * a different conversation or a new send with a fresh client id is unaffected.
+ * Active entries do not expire; completed receipts use bounded retention and
+ * amortized eviction. This index never delays or aborts a response.
  */
-const chatSeenMessageIds = new Map<string, number>();
+interface ChatIdempotencyReceipt {
+  stream?: Record<string, unknown>;
+  json?: Record<string, unknown>;
+}
+
+interface ChatIdempotencyEntry {
+  startedAt: number;
+  completedAt?: number;
+  receipt: ChatIdempotencyReceipt;
+}
+
+const chatSeenMessageIds = new Map<string, ChatIdempotencyEntry>();
 const CHAT_DEDUPE_TTL_MS = 5 * 60_000;
 let chatSeenLastSweepAt = 0;
 
@@ -215,11 +225,12 @@ export function normalizeClientMessageId(value: unknown): string | null {
 
 /**
  * TTL-aware O(1) duplicate check for an HTTP chat send. Returns `true` when this
- * `(scope, clientMessageId)` pair was already seen within the TTL window. When
+ * `(scope, clientMessageId)` pair is active or has a retained receipt. When
  * `clientMessageId` is absent/invalid the result is ALWAYS `false`, so requests
  * without an idempotency key behave exactly as before (no dedupe). The first
- * sighting records the timestamp and returns `false`; a repeat within the window
- * returns `true`. After the TTL elapses the id is treated as new again.
+ * sighting records the timestamp and returns `false`; an active repeat returns
+ * `true` regardless of elapsed time. A completed entry becomes new only after
+ * its receipt-retention TTL elapses.
  *
  * `scope` is the conversation room id (dashboard chat) or the per-user room key
  * (agent-message API) so the key cannot collide across conversations/users.
@@ -231,16 +242,33 @@ export function isDuplicateChatMessage(
 ): boolean {
   if (!clientMessageId) return false;
   const key = `${scope}:${clientMessageId}`;
-  const seenAt = chatSeenMessageIds.get(key);
-  if (seenAt !== undefined && now - seenAt <= CHAT_DEDUPE_TTL_MS) return true;
-  chatSeenMessageIds.set(key, now);
+  const existing = chatSeenMessageIds.get(key);
+  if (existing !== undefined) {
+    // An in-flight request never expires: generation is caller-cancelled and
+    // may legitimately exceed the completed-receipt retention window. Only a
+    // completed outcome ages out, after which the same key may start a new
+    // logical turn.
+    if (
+      existing.completedAt === undefined ||
+      now - existing.completedAt <= CHAT_DEDUPE_TTL_MS
+    ) {
+      return true;
+    }
+    chatSeenMessageIds.delete(key);
+  }
+  chatSeenMessageIds.set(key, { startedAt: now, receipt: {} });
   // Amortized eviction: sweep expired entries at most once per TTL window
   // rather than on every request, keeping the map bounded without a per-request
   // O(n) scan.
   if (now - chatSeenLastSweepAt > CHAT_DEDUPE_TTL_MS) {
     chatSeenLastSweepAt = now;
-    for (const [seenKey, ts] of chatSeenMessageIds) {
-      if (now - ts > CHAT_DEDUPE_TTL_MS) chatSeenMessageIds.delete(seenKey);
+    for (const [seenKey, entry] of chatSeenMessageIds) {
+      if (
+        entry.completedAt !== undefined &&
+        now - entry.completedAt > CHAT_DEDUPE_TTL_MS
+      ) {
+        chatSeenMessageIds.delete(seenKey);
+      }
     }
   }
   return false;
@@ -268,22 +296,39 @@ export function releaseChatMessageId(
   chatSeenMessageIds.delete(`${scope}:${clientMessageId}`);
 }
 
-/**
- * Original arrival timestamp recorded for a `(scope, clientMessageId)` pair,
- * or `null` when the pair is unknown (never seen, expired and swept, or
- * released). Consulted by the duplicate-suppression branches AFTER
- * {@link isDuplicateChatMessage} returns `true`: the recorded arrival bounds
- * the "since" window for looking up the FIRST attempt's persisted assistant
- * reply, so a retry that lands after delivery can return that reply instead
- * of an empty ignored turn. A duplicate sighting never refreshes the stored
- * timestamp, so this is always the first attempt's arrival.
- */
-export function getChatMessageIdFirstSeenAt(
+export function recordChatMessageReceipt(
   scope: string,
   clientMessageId: string | null,
-): number | null {
+  kind: keyof ChatIdempotencyReceipt,
+  receipt: Record<string, unknown>,
+  now: number = Date.now(),
+): void {
+  if (!clientMessageId) return;
+  const key = `${scope}:${clientMessageId}`;
+  const entry = chatSeenMessageIds.get(key);
+  if (!entry) {
+    throw new ElizaError(
+      "Cannot record a receipt for an unknown chat request",
+      {
+        code: "CHAT_IDEMPOTENCY_RECEIPT_WITHOUT_REQUEST",
+        context: { scope, clientMessageId, kind },
+        severity: "fatal",
+      },
+    );
+  }
+  entry.receipt[kind] = Object.freeze({ ...receipt });
+  entry.completedAt = now;
+}
+
+export function getChatMessageReceipt(
+  scope: string,
+  clientMessageId: string | null,
+  kind: keyof ChatIdempotencyReceipt,
+): Record<string, unknown> | null {
   if (!clientMessageId) return null;
-  return chatSeenMessageIds.get(`${scope}:${clientMessageId}`) ?? null;
+  return (
+    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.receipt[kind] ?? null
+  );
 }
 
 /** Test-only: clear the HTTP chat idempotency cache between cases. */
@@ -823,6 +868,8 @@ export interface ChatGenerationResult {
     id?: string;
     content?: Content;
   }>;
+  /** Exact incoming-message ID durably committed during this turn. */
+  persistedRequestMessageId?: string;
   /** Exact response IDs durably committed by the message service before return. */
   persistedResponseMessageIds?: string[];
   usage?: {
@@ -870,6 +917,9 @@ export interface ChatGenerateOptions {
   resolveNoResponseText?: () => string;
   preferredLanguage?: string;
   timeoutDuration?: number;
+  incomingMessageForPersistence?: ReturnType<typeof createMessageMemory>;
+  onIncomingMessagePersisted?: (message: Memory) => void;
+  onResponseMessagePersisted?: (message: Memory) => void;
 }
 
 // LogEntry is canonical in @elizaos/shared and re-exported above.
@@ -2033,127 +2083,25 @@ export function writeSseJson(
 // Persistence helpers
 // ---------------------------------------------------------------------------
 
-function isDuplicateMemoryError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const msg = err.message.toLowerCase();
-  return (
-    msg.includes("duplicate") ||
-    msg.includes("already exists") ||
-    msg.includes("unique constraint")
-  );
-}
-
 export async function persistConversationMemory(
   runtime: AgentRuntime,
   memory: ReturnType<typeof createMessageMemory>,
 ): Promise<ReturnType<typeof createMessageMemory>> {
+  let persistedId: UUID;
   try {
-    await runtime.createMemory(memory, "messages");
-  } catch (err) {
-    if (isDuplicateMemoryError(err)) return memory;
-    throw err;
+    persistedId = await runtime.createMemory(memory, "messages");
+  } catch (cause) {
+    // error-policy:J2 persistence uncertainty is preserved for the route
+    // boundary; it must never be translated into a fabricated successful write.
+    throw new ElizaError("Failed to persist conversation memory", {
+      code: "CHAT_MEMORY_PERSISTENCE_FAILED",
+      cause,
+      context: { messageId: memory.id, roomId: memory.roomId },
+      severity: "fatal",
+    });
   }
+  memory.id = persistedId;
   return memory;
-}
-
-async function hasRecentAssistantMemory(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  text: string,
-  sinceMs: number,
-): Promise<boolean> {
-  const trimmed = text.trim();
-  if (!trimmed) return false;
-
-  try {
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-
-    return recent.some((memory) => {
-      const contentText = (memory.content as { text?: string })?.text?.trim();
-      const createdAt = memory.createdAt ?? 0;
-      return (
-        memory.entityId === runtime.agentId &&
-        contentText === trimmed &&
-        createdAt >= sinceMs - 2000
-      );
-    });
-  } catch {
-    return false;
-  }
-}
-
-export async function hasRecentVisibleAssistantMemorySince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-): Promise<boolean> {
-  return Boolean(
-    await getRecentVisibleAssistantMemoryTextSince(runtime, roomId, sinceMs),
-  );
-}
-
-export async function getRecentVisibleAssistantMemoryTextSince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-  // Pre-arrival slack. The boolean suppression callers keep the conservative
-  // 2s default (over-matching is safe when the answer is only "suppress").
-  // The dupe-RETURN callers pass 0: `sinceMs` (dedupe first-seen) and memory
-  // `createdAt` come from the same process clock, so any reply persisted
-  // before arrival belongs to a PREVIOUS turn — returning it would ship the
-  // prior turn's answer to a rapid-fire retry.
-  slackMs: number = 2000,
-): Promise<string | null> {
-  return (
-    (
-      await getRecentVisibleAssistantMemorySince(
-        runtime,
-        roomId,
-        sinceMs,
-        slackMs,
-      )
-    )?.text ?? null
-  );
-}
-
-export async function getRecentVisibleAssistantMemorySince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-  slackMs: number = 2000,
-): Promise<{ id: UUID; text: string } | null> {
-  try {
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-
-    const persistedAssistantTurn = recent
-      .filter((memory) => {
-        const contentText = (memory.content as { text?: string })?.text?.trim();
-        const createdAt = memory.createdAt ?? 0;
-        return (
-          memory.entityId === runtime.agentId &&
-          Boolean(contentText) &&
-          createdAt >= sinceMs - slackMs
-        );
-      })
-      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
-
-    const text = (
-      persistedAssistantTurn?.content as { text?: string } | undefined
-    )?.text?.trim();
-    return persistedAssistantTurn?.id && text
-      ? { id: persistedAssistantTurn.id as UUID, text }
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 export async function persistAssistantConversationMemory(
@@ -2161,12 +2109,9 @@ export async function persistAssistantConversationMemory(
   roomId: UUID,
   content: string | Content,
   channelType: ChannelType,
-  dedupeSinceMs?: number,
-  // Caller-supplied memory id. The streaming route pre-mints the id and stamps
-  // it on the SSE `done` frame BEFORE this (possibly deferred) persist runs,
-  // so the client can swap its optimistic temp-resp-* bubble to the durable id
-  // and the proactive-message WS echo reconciles by id instead of appending a
-  // duplicate bubble.
+  // Caller-supplied memory id for exact idempotent persistence. Transport
+  // completion frames are emitted only after this write returns its committed
+  // id; they never advertise a speculative id.
   memoryId?: UUID,
 ): Promise<Memory | null> {
   const persistedContent = markSyntheticChatFailureContent(
@@ -2191,16 +2136,6 @@ export async function persistAssistantConversationMemory(
   );
   const trimmed = persistedContent.text.trim();
   if (!trimmed) return null;
-
-  if (typeof dedupeSinceMs === "number") {
-    const alreadyPersisted = await hasRecentAssistantMemory(
-      runtime,
-      roomId,
-      trimmed,
-      dedupeSinceMs,
-    );
-    if (alreadyPersisted) return null;
-  }
 
   return await persistConversationMemory(
     runtime,
@@ -2608,6 +2543,62 @@ async function generateChatResponseWithTiming(
       }
       replaceCallbackText(incoming);
     };
+    let persistedRequestMessageId: UUID | undefined;
+    const recordIncomingPersistence = (persistedMessage: Memory): void => {
+      if (persistedMessage.id) {
+        persistedRequestMessageId = persistedMessage.id;
+      }
+      try {
+        opts?.onIncomingMessagePersisted?.(persistedMessage);
+      } catch (error) {
+        // error-policy:J7 transport bookkeeping must not make a confirmed
+        // incoming-message commit look like a failed or uncertain write.
+        runtime.reportError("ChatRoutes.incomingPersistenceObserver", error, {
+          messageId: persistedMessage.id,
+          roomId: persistedMessage.roomId,
+        });
+      }
+    };
+    const persistIncomingForDirectResult = async (): Promise<UUID> => {
+      if (persistedRequestMessageId) return persistedRequestMessageId;
+      const persistenceMessage = opts?.incomingMessageForPersistence ?? message;
+      if (
+        persistenceMessage.id !== message.id ||
+        persistenceMessage.roomId !== message.roomId ||
+        persistenceMessage.entityId !== message.entityId
+      ) {
+        throw new ElizaError(
+          "Direct chat persistence copy does not identify the processing message",
+          {
+            code: "CHAT_INCOMING_PERSISTENCE_IDENTITY_MISMATCH",
+            context: {
+              processingMessageId: message.id,
+              persistenceMessageId: persistenceMessage.id,
+              processingRoomId: message.roomId,
+              persistenceRoomId: persistenceMessage.roomId,
+            },
+            severity: "fatal",
+          },
+        );
+      }
+      const persistedMessage = await persistConversationMemory(
+        runtime,
+        persistenceMessage,
+      );
+      if (!persistedMessage.id) {
+        throw new ElizaError(
+          "Direct chat incoming persistence returned no message id",
+          {
+            code: "CHAT_INCOMING_PERSISTENCE_RECEIPT_MISSING",
+            context: { roomId: message.roomId },
+            severity: "fatal",
+          },
+        );
+      }
+      message.id = persistedMessage.id;
+      recordIncomingPersistence(persistedMessage);
+      return persistedMessage.id;
+    };
 
     // Emit inbound events so trajectory/session hooks run for API chat.
     try {
@@ -2646,37 +2637,11 @@ async function generateChatResponseWithTiming(
         }),
     );
     if (androidDirectResult) {
-      try {
-        if (
-          androidDirectResult.responseContent &&
-          typeof runtime.emitEvent === "function"
-        ) {
-          const memoryLike = createMessageMemory({
-            id: crypto.randomUUID() as UUID,
-            roomId: message.roomId,
-            entityId: runtime.agentId,
-            content: ensureMessageMemoryContent(
-              androidDirectResult.responseContent,
-            ),
-          });
-          memoryLike.metadata = message.metadata;
-          await runtime.emitEvent(EventType.MESSAGE_SENT, {
-            message: memoryLike,
-            source: messageSource,
-          });
-        }
-      } catch (err) {
-        runtime.logger.warn(
-          {
-            err,
-            src: "eliza-api",
-            messageId: message.id,
-            roomId: message.roomId,
-          },
-          "Failed to emit MESSAGE_SENT event",
-        );
-      }
-      return androidDirectResult;
+      const incomingMessageId = await persistIncomingForDirectResult();
+      return {
+        ...androidDirectResult,
+        persistedRequestMessageId: incomingMessageId,
+      };
     }
 
     let result:
@@ -2746,6 +2711,7 @@ async function generateChatResponseWithTiming(
               replaceText: emitSnapshot,
             });
             if (preHandlerResult) {
+              const incomingMessageId = await persistIncomingForDirectResult();
               const directText = preHandlerResult.responseText;
               const finalText = isClientVisibleNoResponse(directText)
                 ? directText || "(no response)"
@@ -2754,6 +2720,7 @@ async function generateChatResponseWithTiming(
                 didRespond: true,
                 responseContent: { text: finalText },
                 responseMessages: [],
+                persistedRequestMessageId: incomingMessageId,
               } as typeof result;
               responseText = finalText;
               forcedWalletExecutionText = isClientVisibleNoResponse(directText);
@@ -2813,10 +2780,13 @@ async function generateChatResponseWithTiming(
                   );
                   const finalText =
                     actionResponseText || responseText || "Task created.";
+                  const incomingMessageId =
+                    await persistIncomingForDirectResult();
                   result = {
                     didRespond: true,
                     responseContent: { text: finalText },
                     responseMessages: [],
+                    persistedRequestMessageId: incomingMessageId,
                   } as typeof result;
                   responseText = finalText;
                   return;
@@ -2838,6 +2808,7 @@ async function generateChatResponseWithTiming(
                 localInferenceIntent,
                 originalUserText,
               );
+              const incomingMessageId = await persistIncomingForDirectResult();
               emitSnapshot(localResult.text);
               result = {
                 didRespond: true,
@@ -2855,6 +2826,7 @@ async function generateChatResponseWithTiming(
                       : undefined,
                 } as Content,
                 responseMessages: [],
+                persistedRequestMessageId: incomingMessageId,
               } as typeof result;
               responseText = localResult.text;
               return;
@@ -2912,6 +2884,29 @@ async function generateChatResponseWithTiming(
                       : {}),
                     abortSignal: generationAbortController.signal,
                     keepExistingResponses: true,
+                    ...(opts?.incomingMessageForPersistence
+                      ? {
+                          incomingMessageForPersistence:
+                            opts.incomingMessageForPersistence,
+                        }
+                      : {}),
+                    onIncomingMessagePersisted: recordIncomingPersistence,
+                    onResponseMessagePersisted: (persistedMessage) => {
+                      try {
+                        opts?.onResponseMessagePersisted?.(persistedMessage);
+                      } catch (error) {
+                        // error-policy:J7 transport bookkeeping must not alter
+                        // a confirmed assistant persistence outcome.
+                        runtime.reportError(
+                          "ChatRoutes.responsePersistenceObserver",
+                          error,
+                          {
+                            messageId: persistedMessage.id,
+                            roomId: persistedMessage.roomId,
+                          },
+                        );
+                      }
+                    },
                     onStreamChunk: opts?.onChunk
                       ? async (
                           chunk: string,
@@ -2945,73 +2940,6 @@ async function generateChatResponseWithTiming(
               { phase: "message" },
             );
 
-            // Ensure MESSAGE_SENT hooks run for API chat flows.
-            try {
-              const responseMessages = Array.isArray(result?.responseMessages)
-                ? (result.responseMessages as Array<{
-                    id?: string;
-                    content?: Content;
-                  }>)
-                : [];
-              const fallbackResponseContent =
-                result?.responseContent &&
-                typeof result.responseContent === "object"
-                  ? (result.responseContent as Content)
-                  : responseText
-                    ? ({ text: responseText } as Content)
-                    : null;
-              // Safety net ONLY for flows where the message handler produced no
-              // responseMessages of its own. When responseMessages exist the
-              // handler already emitted MESSAGE_SENT for each (message.ts), so
-              // re-emitting them here double-fires MESSAGE_SENT for one reply
-              // (eliza#10313). Emit just the synthetic fallback in the
-              // no-responseMessages case.
-              const messagesToEmit =
-                responseMessages.length > 0
-                  ? []
-                  : fallbackResponseContent
-                    ? [
-                        {
-                          id: crypto.randomUUID(),
-                          content: fallbackResponseContent,
-                        },
-                      ]
-                    : [];
-              if (
-                messagesToEmit.length > 0 &&
-                typeof runtime.emitEvent === "function"
-              ) {
-                for (const responseMessage of messagesToEmit) {
-                  const memoryLike = createMessageMemory({
-                    id:
-                      (responseMessage.id as UUID | undefined) ??
-                      (crypto.randomUUID() as UUID),
-                    roomId: message.roomId,
-                    entityId: runtime.agentId,
-                    content: markSyntheticChatFailureContent(
-                      ensureMessageMemoryContent(
-                        responseMessage.content ?? { text: "" },
-                      ),
-                    ),
-                  });
-                  memoryLike.metadata = message.metadata;
-                  await runtime.emitEvent(EventType.MESSAGE_SENT, {
-                    message: memoryLike,
-                    source: messageSource,
-                  });
-                }
-              }
-            } catch (err) {
-              runtime.logger.warn(
-                {
-                  err,
-                  src: "eliza-api",
-                  messageId: message.id,
-                  roomId: message.roomId,
-                },
-                "Failed to emit MESSAGE_SENT event",
-              );
-            }
             // Post-process fallback actions
             if (result) {
               const rc = result.responseContent as Record<
@@ -3232,6 +3160,11 @@ async function generateChatResponseWithTiming(
           (id): id is UUID => typeof id === "string" && id.length > 0,
         )
       : [];
+    const exactPersistedRequestMessageId =
+      typeof result?.persistedRequestMessageId === "string" &&
+      result.persistedRequestMessageId.length > 0
+        ? result.persistedRequestMessageId
+        : persistedRequestMessageId;
     const responseContent =
       result?.responseContent && typeof result.responseContent === "object"
         ? ({
@@ -3302,6 +3235,9 @@ async function generateChatResponseWithTiming(
         : {}),
       ...(responseContent ? { responseContent } : {}),
       ...(responseMessages.length > 0 ? { responseMessages } : {}),
+      ...(exactPersistedRequestMessageId
+        ? { persistedRequestMessageId: exactPersistedRequestMessageId }
+        : {}),
       ...(persistedResponseMessageIds.length > 0
         ? { persistedResponseMessageIds }
         : {}),

@@ -32,6 +32,7 @@ interface TimedValue<T> {
 }
 
 interface BrowserChatTelemetry {
+  assistantNodeReplacements: number;
   commits: Array<{
     actualDuration: number;
     at: number;
@@ -48,6 +49,7 @@ interface BrowserChatTelemetry {
   sseFrames: Array<TimedValue<Record<string, unknown>>>;
   startedAt?: number;
   stateSnapshots: Array<TimedValue<ConversationMessage[]>>;
+  userNodeReplacements: number;
 }
 
 declare global {
@@ -59,6 +61,7 @@ declare global {
 }
 
 const telemetry: BrowserChatTelemetry = {
+  assistantNodeReplacements: 0,
   commits: [],
   historyReloads: 0,
   mutations: [],
@@ -67,8 +70,10 @@ const telemetry: BrowserChatTelemetry = {
   renderCounts: {},
   sseFrames: [],
   stateSnapshots: [],
+  userNodeReplacements: 0,
 };
 window.__chatTelemetry = telemetry;
+let latestSseCapture = Promise.resolve();
 
 const telemetryNow = (): number => performance.timeOrigin + performance.now();
 
@@ -96,7 +101,7 @@ window.fetch = async (...args): Promise<Response> => {
   }
 
   const [clientBody, telemetryBody] = response.body.tee();
-  void (async () => {
+  latestSseCapture = (async () => {
     const reader = telemetryBody.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -117,6 +122,8 @@ window.fetch = async (...args): Promise<Response> => {
       }
     }
   })().catch((error: unknown) => {
+    // error-policy:J1 the browser-test boundary turns observer failure into an
+    // explicit harness failure after the production stream client settles.
     telemetry.error = error instanceof Error ? error.message : String(error);
   });
 
@@ -233,6 +240,10 @@ function ChatHarness() {
       if (!conversationId) throw new Error("conversation not ready");
       telemetry.startedAt = telemetryNow();
       await chat.sendChatText(prompt, { conversationId });
+      await latestSseCapture;
+      if (telemetry.error) {
+        throw new Error(`SSE telemetry capture failed: ${telemetry.error}`);
+      }
       telemetry.doneAt = telemetryNow();
     };
   }, [chat]);
@@ -240,7 +251,23 @@ function ChatHarness() {
   useEffect(() => {
     const root = document.querySelector("#transcript");
     if (!root) return;
+    let assistantNode: Element | null = null;
+    let userNode: Element | null = null;
     const observer = new MutationObserver(() => {
+      const nextAssistant = root.querySelector(
+        '[data-testid="thread-line"][data-role="assistant"]',
+      );
+      const nextUser = root.querySelector(
+        '[data-testid="thread-line"][data-role="user"]',
+      );
+      if (assistantNode && nextAssistant && assistantNode !== nextAssistant) {
+        telemetry.assistantNodeReplacements += 1;
+      }
+      if (userNode && nextUser && userNode !== nextUser) {
+        telemetry.userNodeReplacements += 1;
+      }
+      assistantNode = nextAssistant;
+      userNode = nextUser;
       telemetry.mutations.push({
         at: telemetryNow(),
         value: root.textContent ?? "",
@@ -255,8 +282,9 @@ function ChatHarness() {
   }, []);
 
   const renderMessageContent = useCallback((message: ConversationMessage) => {
-    telemetry.renderCounts[message.id] =
-      (telemetry.renderCounts[message.id] ?? 0) + 1;
+    const renderId = message.renderId ?? message.id;
+    telemetry.renderCounts[renderId] =
+      (telemetry.renderCounts[renderId] ?? 0) + 1;
     return <span data-message-id={message.id}>{message.text}</span>;
   }, []);
 

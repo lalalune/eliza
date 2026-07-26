@@ -18,15 +18,16 @@ import { createTestRuntime } from "@elizaos/core/testing";
 import { type Browser, chromium, type Page } from "playwright-core";
 import { build as viteBuild } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import {
-  generateNodeBuiltinStub,
-  nativeModuleStubPlugin,
-} from "../../../app/vite/native-module-stub-plugin.ts";
+import { WebSocketServer } from "ws";
 import type {
   ConversationRouteContext,
   ConversationRouteState,
 } from "../../../agent/src/api/conversation-routes.ts";
 import { handleConversationRoutes } from "../../../agent/src/api/conversation-routes.ts";
+import {
+  generateNodeBuiltinStub,
+  nativeModuleStubPlugin,
+} from "../../../app/vite/native-module-stub-plugin.ts";
 
 const CHROME_PATH =
   process.env.ELIZA_CHROME_PATH ??
@@ -75,6 +76,7 @@ interface ServerFrame {
 }
 
 interface BrowserTelemetry {
+  assistantNodeReplacements: number;
   commits: Array<{ actualDuration: number; at: number; phase: string }>;
   doneAt?: number;
   error?: string;
@@ -88,8 +90,9 @@ interface BrowserTelemetry {
   startedAt?: number;
   stateSnapshots: Array<{
     at: number;
-    value: Array<{ id: string; role: string; text: string }>;
+    value: Array<{ id: string; renderId?: string; role: string; text: string }>;
   }>;
+  userNodeReplacements: number;
 }
 
 interface HarnessState {
@@ -100,7 +103,9 @@ interface HarnessState {
   harnessServer: Server;
   harnessUrl: string;
   page: Page;
+  pageErrors: string[];
   providerChunks: ProviderChunk[];
+  requestFailures: string[];
   runtime: Awaited<ReturnType<typeof createTestRuntime>>["runtime"];
   serverFrames: ServerFrame[];
 }
@@ -110,6 +115,7 @@ async function startConversationServer(
   allowedOrigin: string,
   serverFrames: ServerFrame[],
 ): Promise<{ server: Server; port: number }> {
+  const webSockets = new WebSocketServer({ noServer: true });
   const server = createServer(async (request, response) => {
     const nativeWrite = response.write.bind(response);
     response.write = ((chunk: Parameters<typeof nativeWrite>[0], ...args) => {
@@ -170,6 +176,22 @@ async function startConversationServer(
     if (!handled && !response.writableEnded) {
       context.error(response, "Not found", 404);
     }
+  });
+  server.on("upgrade", (request, socket, head) => {
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (requestUrl.pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+      webSockets.emit("connection", webSocket, request);
+    });
+  });
+  server.on("close", () => {
+    for (const webSocket of webSockets.clients) {
+      webSocket.terminate();
+    }
+    webSockets.close();
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -374,8 +396,8 @@ suite("chat streaming telemetry real e2e", () => {
       process.env.ELIZA_CHAT_TELEMETRY_BUNDLE_PATH?.trim();
     const cachedBundle =
       cachedBundlePath && existsSync(cachedBundlePath)
-      ? await readFile(cachedBundlePath, "utf8")
-      : null;
+        ? await readFile(cachedBundlePath, "utf8")
+        : null;
     const built = cachedBundle
       ? null
       : await viteBuild({
@@ -494,15 +516,21 @@ suite("chat streaming telemetry real e2e", () => {
     const page = await browser.newPage({
       viewport: { height: 800, width: 1280 },
     });
+    const pageErrors: string[] = [];
+    const requestFailures: string[] = [];
     page.on("console", (message) => {
       process.stdout.write(
         `[chat-telemetry][browser:${message.type()}] ${message.text()}\n`,
       );
     });
     page.on("pageerror", (error) => {
+      pageErrors.push(error.stack ?? error.message);
       process.stdout.write(`[chat-telemetry][pageerror] ${error.stack}\n`);
     });
     page.on("requestfailed", (request) => {
+      requestFailures.push(
+        `${request.url()} ${request.failure()?.errorText ?? "unknown failure"}`,
+      );
       process.stdout.write(
         `[chat-telemetry][requestfailed] ${request.url()} ${request.failure()?.errorText}\n`,
       );
@@ -517,7 +545,9 @@ suite("chat streaming telemetry real e2e", () => {
       harnessServer: harness.server,
       harnessUrl: `http://127.0.0.1:${harness.port}/`,
       page,
+      pageErrors,
       providerChunks,
+      requestFailures,
       runtime: runtimeResult.runtime,
       serverFrames,
     };
@@ -604,6 +634,16 @@ suite("chat streaming telemetry real e2e", () => {
     expect(doneFrame?.messageId).toBe(assistantDbMessage?.id);
     expect(doneFrame?.userMessageId).toBe(userDbMessage?.id);
     expect(browserTelemetry.historyReloads).toBe(0);
+    expect(browserTelemetry.assistantNodeReplacements).toBe(0);
+    expect(browserTelemetry.userNodeReplacements).toBe(0);
+    expect(state.pageErrors).toEqual([]);
+    expect(state.requestFailures).toEqual([]);
+    expect(Object.keys(browserTelemetry.renderCounts)).not.toContain(
+      doneFrame?.messageId,
+    );
+    expect(Object.keys(browserTelemetry.renderCounts)).not.toContain(
+      doneFrame?.userMessageId,
+    );
 
     const partialAssistantStates = browserTelemetry.stateSnapshots
       .map(
@@ -639,6 +679,7 @@ suite("chat streaming telemetry real e2e", () => {
         })),
       },
       react: {
+        assistantNodeReplacements: browserTelemetry.assistantNodeReplacements,
         commitCount: browserTelemetry.commits.length,
         commits: browserTelemetry.commits.map((commit) => ({
           ...commit,
@@ -646,6 +687,7 @@ suite("chat streaming telemetry real e2e", () => {
         })),
         renderCounts: browserTelemetry.renderCounts,
         stateSnapshotCount: browserTelemetry.stateSnapshots.length,
+        userNodeReplacements: browserTelemetry.userNodeReplacements,
         historyReloads: browserTelemetry.historyReloads,
       },
       browser: {

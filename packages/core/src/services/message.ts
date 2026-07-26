@@ -39,7 +39,6 @@ import {
 	InferenceTurnTimer,
 	markInference,
 	nextInferenceTurnId,
-	recordInferenceSpan,
 	runWithInferenceTiming,
 	timeInferenceSpan,
 } from "../inference-timing";
@@ -189,7 +188,6 @@ import {
 } from "../streaming-context";
 import {
 	getTrajectoryContext,
-	memoizeTurnWork,
 	runWithTrajectoryContext,
 } from "../trajectory-context";
 import type { CharacterSettings } from "../types/agent";
@@ -1358,6 +1356,9 @@ type ResolvedMessageOptions = {
 	keepExistingResponses: boolean;
 	onStreamChunk?: StreamChunkCallback;
 	shouldRespondModel: ShouldRespondModelType;
+	incomingMessageForPersistence?: Memory;
+	onIncomingMessagePersisted?: (message: Memory) => void;
+	onResponseMessagePersisted?: (message: Memory) => void;
 	/**
 	 * Per-turn abort signal threaded into the streaming context so
 	 * `runtime.useModel` and model handlers downstream can cancel
@@ -6850,7 +6851,6 @@ export async function runV5MessageRuntimeStage1(args: {
 		availableContexts,
 		extraProviderExclusions: stage1ProviderExclusionsForMessage(args.message),
 	});
-	const stage1PreprocessStartedAt = performance.now();
 
 	// G10/G11: construct the per-trajectory recorder. No-op when disabled via
 	// ELIZA_TRAJECTORY_RECORDING=0. Failures inside the recorder must NEVER
@@ -6895,7 +6895,6 @@ export async function runV5MessageRuntimeStage1(args: {
 		result: FactsAndRelationshipsRunResult | null;
 		error?: unknown;
 	} | null> = Promise.resolve(null);
-	let messageHandlerStageTask: Promise<void> = Promise.resolve();
 	try {
 		const messageHandlerStartedAt = Date.now();
 		const directMessageChannel =
@@ -7117,10 +7116,6 @@ export async function runV5MessageRuntimeStage1(args: {
 		// number of times before falling back to the planner.
 		const stage1RetryLimit = readStage1EmptyRetryLimit(args.runtime);
 		let stage1RetryCount = 0;
-		recordInferenceSpan(
-			"message:stage1:preprocess",
-			performance.now() - stage1PreprocessStartedAt,
-		);
 		let rawMessageHandler = (await args.runtime.useModel(
 			ModelType.RESPONSE_HANDLER,
 			stage1ModelParams,
@@ -7290,7 +7285,7 @@ export async function runV5MessageRuntimeStage1(args: {
 		const parsedResponseHandlerReply = getMessageHandlerReply(messageHandler);
 
 		if (recorder && trajectoryId) {
-			messageHandlerStageTask = recordMessageHandlerStage({
+			await recordMessageHandlerStage({
 				recorder,
 				trajectoryId,
 				messages: messageHandlerInput.messages,
@@ -8219,8 +8214,23 @@ export async function runV5MessageRuntimeStage1(args: {
 		endStatus = "errored";
 		throw err;
 	} finally {
-		// Trajectory persistence is diagnostic work. Preserve stage ordering in
-		// its own task without adding filesystem latency to the user-visible turn.
+		// Finalize the trajectory: record the FACTS_AND_RELATIONSHIPS side-effect
+		// stage, then end the trajectory.
+		//
+		// CRITICAL (latency): factsTask is the FACTS_AND_RELATIONSHIPS stage — a
+		// heavy background TEXT_LARGE call that is launched in parallel precisely
+		// so it does NOT block the user reply (see the launch comment above). The
+		// facts/relationships are persisted *inside* runFactsAndRelationshipsStage
+		// independently of this await, so the only thing awaiting it here buys is
+		// the trajectory record's facts-stage entry. Awaiting it in `finally`
+		// gated EVERY reply on the slow facts model — dedicated cloud agents took
+		// 30s+ per turn for a reply that was already ready in ~3s. So run the
+		// finalize in the background by default and let the turn return as soon as
+		// the reply is decided. Await it only when deterministic trajectory
+		// ordering is required (e.g. the scenario-runner) via ELIZA_AWAIT_FACTS_STAGE.
+		// finalizeTrajectoryRecording is the lifecycle guard: it bounds the wait
+		// on the facts stage and writes the terminal status no matter what, so a
+		// hung facts model call can never leave the trajectory stuck `running`.
 		const finalizeTrajectory = async () => {
 			if (!recorder || !trajectoryId) return;
 			await finalizeTrajectoryRecording({
@@ -8228,7 +8238,6 @@ export async function runV5MessageRuntimeStage1(args: {
 				trajectoryId,
 				status: endStatus,
 				beforeEnd: async () => {
-					await messageHandlerStageTask;
 					const factsOutcome = await factsTask;
 					if (factsOutcome) {
 						await recordFactsAndRelationshipsStage({
@@ -8246,12 +8255,8 @@ export async function runV5MessageRuntimeStage1(args: {
 		};
 		if (process.env.ELIZA_AWAIT_FACTS_STAGE === "true") {
 			await finalizeTrajectory();
-		} else if (recorder && trajectoryId) {
-			detachPostDeliverySideEffect(
-				args.runtime,
-				"trajectory-finalization",
-				finalizeTrajectory,
-			);
+		} else {
+			void finalizeTrajectory();
 		}
 	}
 }
@@ -9288,6 +9293,7 @@ export function wrapSingleTurnVisibleCallback(
 	message: Pick<Memory, "id" | "roomId" | "entityId">,
 	callback?: HandlerCallback,
 	recordDeliveredVisibleText?: (text: string) => void,
+	recordPersistedCallbackResponses?: (messages: Memory[]) => void,
 ): HandlerCallback | undefined {
 	if (!callback) return callback;
 	const fullRuntime = runtime as IAgentRuntime;
@@ -9311,7 +9317,9 @@ export function wrapSingleTurnVisibleCallback(
 		if (typeof response?.text === "string" && response.text.trim()) {
 			recordDeliveredVisibleText?.(response.text);
 		}
-		return callback(response, actionName);
+		const deliveredMessages = await callback(response, actionName);
+		recordPersistedCallbackResponses?.(deliveredMessages);
+		return deliveredMessages;
 	};
 	// The character-voice rewrite spends a TEXT_SMALL call per action callback and
 	// restyles the delivered text. Deterministic harnesses (the scenario runner)
@@ -9398,6 +9406,25 @@ export function wrapSingleTurnVisibleCallback(
 		return deliver(response, actionName);
 	};
 	return wrapped;
+}
+
+function notifyPersistenceObserver(
+	runtime: IAgentRuntime,
+	scope: string,
+	observer: ((message: Memory) => void) | undefined,
+	message: Memory,
+): void {
+	if (!observer) return;
+	try {
+		observer(message);
+	} catch (error) {
+		// error-policy:J7 an observer is diagnostic transport state; its failure
+		// must not turn a confirmed database commit into an uncertain write.
+		runtime.reportError(scope, error, {
+			messageId: message.id,
+			roomId: message.roomId,
+		});
+	}
 }
 
 function resolveCallbackActionName(
@@ -9701,10 +9728,9 @@ export class DefaultMessageService implements IMessageService {
 	 * delivery callback fires: the instant the reply reaches the client a
 	 * follow-up can arrive, and its compose must find this barrier already
 	 * pending. Returns the release fn; call it once the persist settles
-	 * (success or failure). Constraint for callback authors: a delivery
-	 * callback must never await a same-room `handleMessage` to completion —
-	 * that turn waits on a barrier this turn only releases after the callback
-	 * returns. Fire-and-forget from a callback is fine.
+	 * (success or failure). The reply write runs independently of the callback,
+	 * so even an awaited nested same-room turn resumes as soon as the write
+	 * settles rather than deadlocking on the outer callback.
 	 */
 	private registerPendingReplyPersist(
 		runtime: IAgentRuntime,
@@ -9886,6 +9912,7 @@ export class DefaultMessageService implements IMessageService {
 					: undefined;
 		}
 
+		const senderRole = await resolveStage1SenderRole(runtime, message);
 		const trajectoryContextBase = {
 			// Minted above (before MESSAGE_RECEIVED) so file, DB, and spawn paths
 			// share it for the whole turn (#13775).
@@ -9893,7 +9920,7 @@ export class DefaultMessageService implements IMessageService {
 			runId: runtime.getCurrentRunId?.(),
 			roomId: message.roomId,
 			messageId: message.id,
-			turnMemo: new Map<string, Promise<unknown>>(),
+			userRole: senderRole,
 		};
 
 		return runWithTrajectoryContext<MessageProcessingResult>(
@@ -9907,13 +9934,6 @@ export class DefaultMessageService implements IMessageService {
 					}
 				: trajectoryContextBase,
 			async (): Promise<MessageProcessingResult> => {
-				const senderRole = await timeInferenceSpan(
-					"message:ingress:sender-role",
-					() => resolveStage1SenderRole(runtime, message),
-				);
-				const trajectoryContext = getTrajectoryContext();
-				if (trajectoryContext) trajectoryContext.userRole = senderRole;
-
 				// Determine shouldRespondModel from options or runtime settings
 				const shouldRespondModelSetting = runtime.getSetting(
 					"SHOULD_RESPOND_MODEL",
@@ -10082,12 +10102,11 @@ export class DefaultMessageService implements IMessageService {
 							}
 						: undefined;
 
+				let persistedRequestMessageId: UUID | undefined;
+				const persistedCallbackResponses = new Map<UUID, Memory>();
 				const opts: ResolvedMessageOptions = {
 					maxRetries: options?.maxRetries ?? 3,
-					// A turn has no implicit wall-clock deadline. Callers that own a
-					// real execution budget may provide one explicitly; cancellation
-					// otherwise travels through abortSignal.
-					timeoutDuration: options?.timeoutDuration ?? 0,
+					timeoutDuration: options?.timeoutDuration ?? 60 * 60 * 1000,
 					continueAfterActions:
 						options?.continueAfterActions ??
 						parseBooleanFromText(
@@ -10101,6 +10120,31 @@ export class DefaultMessageService implements IMessageService {
 						),
 					shouldRespondModel: resolvedShouldRespondModel,
 					...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}),
+					...(options?.incomingMessageForPersistence
+						? {
+								incomingMessageForPersistence:
+									options.incomingMessageForPersistence,
+							}
+						: {}),
+					onIncomingMessagePersisted: (persistedMessage) => {
+						if (persistedMessage.id) {
+							persistedRequestMessageId = persistedMessage.id;
+						}
+						notifyPersistenceObserver(
+							runtime,
+							"MessageService.incomingMessagePersistedObserver",
+							options?.onIncomingMessagePersisted,
+							persistedMessage,
+						);
+					},
+					onResponseMessagePersisted: (persistedMessage) => {
+						notifyPersistenceObserver(
+							runtime,
+							"MessageService.responseMessagePersistedObserver",
+							options?.onResponseMessagePersisted,
+							persistedMessage,
+						);
+					},
 				};
 
 				const deliveredVisibleTexts = new Set<string>();
@@ -10114,6 +10158,21 @@ export class DefaultMessageService implements IMessageService {
 					message,
 					callback,
 					recordDeliveredVisibleText,
+					(messages) => {
+						for (const persistedMessage of messages) {
+							if (!persistedMessage.id) continue;
+							persistedCallbackResponses.set(
+								persistedMessage.id,
+								persistedMessage,
+							);
+							notifyPersistenceObserver(
+								runtime,
+								"MessageService.responseMessagePersistedObserver",
+								options?.onResponseMessagePersisted,
+								persistedMessage,
+							);
+						}
+					},
 				);
 
 				// Set up timeout monitoring
@@ -10202,7 +10261,6 @@ export class DefaultMessageService implements IMessageService {
 					);
 
 					const timeoutPromise = new Promise<never>((_, reject) => {
-						if (opts.timeoutDuration <= 0) return;
 						timeoutId = setTimeout(async () => {
 							await runtime.emitEvent(EventType.RUN_TIMEOUT, {
 								runtime,
@@ -10392,7 +10450,42 @@ export class DefaultMessageService implements IMessageService {
 						}
 					}
 
-					return result;
+					const callbackResponses = Array.from(
+						persistedCallbackResponses.values(),
+					);
+					const responseMessages =
+						callbackResponses.length === 0
+							? result.responseMessages
+							: [
+									...result.responseMessages,
+									...callbackResponses.filter(
+										(callbackResponse) =>
+											!result.responseMessages.some(
+												(responseMessage) =>
+													responseMessage.id === callbackResponse.id,
+											),
+									),
+								];
+					const persistedResponseMessageIds = new Set(
+						result.persistedResponseMessageIds ?? [],
+					);
+					for (const callbackResponse of callbackResponses) {
+						if (callbackResponse.id) {
+							persistedResponseMessageIds.add(callbackResponse.id);
+						}
+					}
+					return {
+						...result,
+						responseMessages,
+						...(persistedRequestMessageId ? { persistedRequestMessageId } : {}),
+						...(persistedResponseMessageIds.size > 0
+							? {
+									persistedResponseMessageIds: Array.from(
+										persistedResponseMessageIds,
+									),
+								}
+							: {}),
+					};
 				} finally {
 					clearTimeout(timeoutId);
 
@@ -10506,14 +10599,47 @@ export class DefaultMessageService implements IMessageService {
 			// wrapper XML back into the user's chat bubble or re-enter context as
 			// history on later turns. `message` (used downstream this turn) keeps its
 			// wrap.
-			const persistableMessage = stripAugmentationForPersistence(message);
+			const persistenceSource = opts.incomingMessageForPersistence ?? message;
+			if (
+				persistenceSource.id !== message.id ||
+				persistenceSource.roomId !== message.roomId ||
+				persistenceSource.entityId !== message.entityId ||
+				persistenceSource.agentId !== message.agentId
+			) {
+				throw new ElizaError(
+					"Incoming persistence copy does not identify the processing message",
+					{
+						code: "INCOMING_MESSAGE_PERSISTENCE_IDENTITY_MISMATCH",
+						context: {
+							processingMessageId: message.id,
+							persistenceMessageId: persistenceSource.id,
+							processingRoomId: message.roomId,
+							persistenceRoomId: persistenceSource.roomId,
+						},
+						severity: "fatal",
+					},
+				);
+			}
+			const persistableMessage =
+				stripAugmentationForPersistence(persistenceSource);
 
 			if (message.id) {
-				const createdMemoryId = await runtime.createMemory(
-					persistableMessage,
-					"messages",
-				);
-				memoryToQueue = { ...persistableMessage, id: createdMemoryId };
+				const existingMemory = await runtime.getMemoryById(message.id);
+				if (existingMemory) {
+					runtime.logger.debug(
+						{ src: "service:message" },
+						"Memory already exists, skipping creation",
+					);
+					memoryToQueue = existingMemory;
+				} else {
+					const createdMemoryId = await runtime.createMemory(
+						persistableMessage,
+						"messages",
+					);
+					memoryToQueue = { ...persistableMessage, id: createdMemoryId };
+				}
+				message.id = memoryToQueue.id;
+				opts.onIncomingMessagePersisted?.(memoryToQueue);
 				await runtime.queueEmbeddingGeneration(memoryToQueue, "high");
 			} else {
 				const memoryId = await runtime.createMemory(
@@ -10522,6 +10648,7 @@ export class DefaultMessageService implements IMessageService {
 				);
 				message.id = memoryId;
 				memoryToQueue = { ...persistableMessage, id: memoryId };
+				opts.onIncomingMessagePersisted?.(memoryToQueue);
 				await runtime.queueEmbeddingGeneration(memoryToQueue, "normal");
 			}
 		});
@@ -10534,9 +10661,7 @@ export class DefaultMessageService implements IMessageService {
 				runtime.getParticipantUserState(message.roomId, runtime.agentId),
 			),
 			timeInferenceSpan("message:ingress:room", () =>
-				memoizeTurnWork(`room:${runtime.agentId}:${message.roomId}`, () =>
-					runtime.getRoom(message.roomId),
-				),
+				runtime.getRoom(message.roomId),
 			),
 		]);
 
@@ -10873,14 +10998,19 @@ export class DefaultMessageService implements IMessageService {
 						roomId: message.roomId,
 						createdAt: Date.now(),
 					};
-					await runtime.createMemory(earlyMemory, "messages");
+					const persistedEarlyResponseId = await runtime.createMemory(
+						earlyMemory,
+						"messages",
+					);
+					earlyMemory.id = persistedEarlyResponseId;
+					opts.onResponseMessagePersisted?.(earlyMemory);
 					await this.emitMessageSent(
 						runtime,
 						earlyMemory,
 						message.content.source ?? "messageHandler",
 					);
 					earlyReplyMessages.push(earlyMemory);
-					persistedEarlyReplyIds.add(earlyResponseId);
+					persistedEarlyReplyIds.add(persistedEarlyResponseId);
 					if (callback) {
 						await callback(earlyContent);
 					}
@@ -11279,12 +11409,13 @@ export class DefaultMessageService implements IMessageService {
 						{ src: "service:message", memoryId: responseMemory.id },
 						"Saving response to memory",
 					);
-					await timeInferenceSpan("message:delivery:persistence", () =>
-						runtime.createMemory(responseMemory, "messages"),
+					const persistedResponseId = await timeInferenceSpan(
+						"message:delivery:persistence",
+						() => runtime.createMemory(responseMemory, "messages"),
 					);
-					if (responseMemory.id) {
-						persistedResponseMessageIds.add(responseMemory.id);
-					}
+					responseMemory.id = persistedResponseId;
+					persistedResponseMessageIds.add(persistedResponseId);
+					opts.onResponseMessagePersisted?.(responseMemory);
 
 					await timeInferenceSpan("message:delivery:event", () =>
 						this.emitMessageSent(
@@ -11300,8 +11431,9 @@ export class DefaultMessageService implements IMessageService {
 				const deliverableResponseContent = responseContent;
 				if (mode === "simple") {
 					// Keep content hooks before delivery so the wire response carries
-					// their edits. The response-memory DB write runs AFTER the
-					// callback: it is the largest post-LLM cost on this path
+					// their edits. The response-memory DB write starts after delivery
+					// callback invocation and runs independently of callback completion;
+					// it is the largest post-LLM cost on this path
 					// (~250-440ms measured via the message:delivery:persistence
 					// InferenceTiming span) and the user must not wait on it. The
 					// persist is still awaited before this turn proceeds, so
@@ -11332,85 +11464,85 @@ export class DefaultMessageService implements IMessageService {
 						runtime,
 						message.roomId,
 					);
-					try {
-						// Settled-result handling instead of catch blocks: a delivery
-						// failure must not skip the persist, and callers classify the
-						// raw delivery error by identity (TURN_ABORTED / generation-
-						// timeout checks at the conversation route), so both failures
-						// are rethrown UNCHANGED after both operations settle.
-						let deliveryOutcome: PromiseSettledResult<unknown> = {
-							status: "fulfilled",
-							value: undefined,
-						};
-						if (callback) {
-							[deliveryOutcome] = await Promise.allSettled([
-								timeInferenceSpan("message:delivery:callback", () =>
+					// Delivery and persistence start in the same turn. An action callback
+					// may synchronously await another message in this room; releasing the
+					// room barrier when persistence settles lets that nested turn compose
+					// without waiting for its own callback to return.
+					const deliveryTask = (
+						callback
+							? timeInferenceSpan("message:delivery:callback", () =>
 									callback(deliverableResponseContent),
-								),
-							]);
-							if (deliveryOutcome.status === "fulfilled") {
-								markInference(INFERENCE_MARKS.replyDelivered);
-							}
+								)
+							: Promise.resolve()
+					).then((value) => {
+						if (callback) {
+							markInference(INFERENCE_MARKS.replyDelivered);
 						}
-						const [persistOutcome] = await Promise.allSettled([
-							(async () => {
-								for (const responseMemory of responseMessages) {
-									if (
-										responseMemory.id &&
-										persistedEarlyReplyIds.has(responseMemory.id)
-									) {
-										continue;
-									}
-									responseMemory.content = deliverableResponseContent;
-									if (shouldSkipResponseMemoryPersistence(responseMemory)) {
-										runtime.logger.debug(
-											{ src: "service:message", memoryId: responseMemory.id },
-											"Skipping transient response memory persistence",
-										);
-										continue;
-									}
+						return value;
+					});
+					const persistTask = (async () => {
+						try {
+							for (const responseMemory of responseMessages) {
+								if (
+									responseMemory.id &&
+									persistedEarlyReplyIds.has(responseMemory.id)
+								) {
+									continue;
+								}
+								responseMemory.content = deliverableResponseContent;
+								if (shouldSkipResponseMemoryPersistence(responseMemory)) {
 									runtime.logger.debug(
 										{ src: "service:message", memoryId: responseMemory.id },
-										"Saving response to memory",
+										"Skipping transient response memory persistence",
 									);
-									await timeInferenceSpan("message:delivery:persistence", () =>
-										runtime.createMemory(responseMemory, "messages"),
-									);
-									if (responseMemory.id) {
-										persistedResponseMessageIds.add(responseMemory.id);
-									}
-
-									detachPostDeliverySideEffect(runtime, "MESSAGE_SENT", () =>
-										this.emitMessageSent(
-											runtime,
-											responseMemory,
-											message.content.source ?? "messageHandler",
-										),
-									);
+									continue;
 								}
-							})(),
-						]);
-						if (persistOutcome.status === "rejected") {
-							// The persist failure (data loss) outranks the delivery
-							// failure for propagation; the held delivery failure is
-							// reported so it is never silently superseded.
-							if (deliveryOutcome.status === "rejected") {
-								runtime.reportError(
-									"MessageService.simpleDeliveryCallback",
-									deliveryOutcome.reason,
-									{
-										agentId: runtime.agentId,
-										roomId: message.roomId,
-									},
+								runtime.logger.debug(
+									{ src: "service:message", memoryId: responseMemory.id },
+									"Saving response to memory",
+								);
+								const persistedResponseId = await timeInferenceSpan(
+									"message:delivery:persistence",
+									() => runtime.createMemory(responseMemory, "messages"),
+								);
+								responseMemory.id = persistedResponseId;
+								persistedResponseMessageIds.add(persistedResponseId);
+								opts.onResponseMessagePersisted?.(responseMemory);
+
+								detachPostDeliverySideEffect(runtime, "MESSAGE_SENT", () =>
+									this.emitMessageSent(
+										runtime,
+										responseMemory,
+										message.content.source ?? "messageHandler",
+									),
 								);
 							}
-							throw persistOutcome.reason;
+						} finally {
+							releaseReplyPersistBarrier();
 						}
+					})();
+					const [deliveryOutcome, persistOutcome] = await Promise.allSettled([
+						deliveryTask,
+						persistTask,
+					]);
+					if (persistOutcome.status === "rejected") {
+						// The persist failure (data loss) outranks the delivery
+						// failure for propagation; the held delivery failure is
+						// reported so it is never silently superseded.
 						if (deliveryOutcome.status === "rejected") {
-							throw deliveryOutcome.reason;
+							runtime.reportError(
+								"MessageService.simpleDeliveryCallback",
+								deliveryOutcome.reason,
+								{
+									agentId: runtime.agentId,
+									roomId: message.roomId,
+								},
+							);
 						}
-					} finally {
-						releaseReplyPersistBarrier();
+						throw persistOutcome.reason;
+					}
+					if (deliveryOutcome.status === "rejected") {
+						throw deliveryOutcome.reason;
 					}
 				}
 			}
@@ -11494,9 +11626,12 @@ export class DefaultMessageService implements IMessageService {
 				roomId: message.roomId,
 				createdAt: Date.now(),
 			};
-			await timeInferenceSpan("message:delivery:persistence", () =>
-				runtime.createMemory(terminalMemory, "messages"),
+			const persistedTerminalId = await timeInferenceSpan(
+				"message:delivery:persistence",
+				() => runtime.createMemory(terminalMemory, "messages"),
 			);
+			terminalMemory.id = persistedTerminalId;
+			opts.onResponseMessagePersisted?.(terminalMemory);
 			await timeInferenceSpan("message:delivery:event", () =>
 				this.emitMessageSent(
 					runtime,

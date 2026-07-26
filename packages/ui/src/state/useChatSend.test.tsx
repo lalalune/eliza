@@ -18,7 +18,10 @@ import type {
   ConversationMessage,
   ImageAttachment,
 } from "../api";
-import { StreamGenerationError } from "../api/client-base";
+import {
+  StreamGenerationError,
+  StreamTransportError,
+} from "../api/client-base";
 import { CLOUD_HANDOFF_PHASE_EVENT, NAVIGATE_VIEW_EVENT } from "../events";
 import type { LoadConversationMessagesResult } from "./internal";
 import { listPendingChatTurns } from "./pending-chat-turns";
@@ -371,15 +374,19 @@ describe("useChatSend stop handling", () => {
     // turn carries an epoch-ms timestamp at ~send time — required for the
     // #11670 eviction guard to recognize it as this send.
     vi.mocked(deps.loadConversationMessages).mockImplementation(async () => {
+      const clientMessageId = String(
+        mocks.client.sendConversationMessageStream.mock.calls.at(-1)?.[9] ?? "",
+      );
       deps.setConversationMessages([
         {
           id: "server-user-1",
+          clientMessageId,
           role: "user",
           text: "hello",
           timestamp: Date.now(),
         },
       ]);
-      return { ok: true };
+      return { ok: true as const };
     });
     const { result } = renderHook(() => useChatSend(deps));
 
@@ -414,22 +421,27 @@ describe("useChatSend stop handling", () => {
     // partial must not be re-attached a second time. Realistic epoch-ms
     // timestamps (see above).
     vi.mocked(deps.loadConversationMessages).mockImplementation(async () => {
+      const clientMessageId = String(
+        mocks.client.sendConversationMessageStream.mock.calls.at(-1)?.[9] ?? "",
+      );
       deps.setConversationMessages([
         {
           id: "server-user-1",
+          clientMessageId,
           role: "user",
           text: "hello",
           timestamp: Date.now(),
         },
         {
           id: "server-asst-1",
+          clientMessageId,
           role: "assistant",
           text: "Here is the par",
           timestamp: Date.now(),
           interrupted: true,
         },
       ]);
-      return { ok: true };
+      return { ok: true as const };
     });
     const { result } = renderHook(() => useChatSend(deps));
 
@@ -570,7 +582,12 @@ describe("useChatSend 404 recovery", () => {
           onToken("hi", "hi");
           onToken(" back", "hi back");
           replayTokens.push(["hi", " back"]);
-          return { text: "hi back", completed: true };
+          return {
+            text: "hi back",
+            completed: true,
+            userMessageId: "replay-user-db-id",
+            messageId: "replay-assistant-db-id",
+          };
         },
       );
     mocks.client.createConversation.mockResolvedValue({
@@ -608,6 +625,15 @@ describe("useChatSend 404 recovery", () => {
     expect(
       remaining.some((m) => m.role === "assistant" && m.text === "hi back"),
     ).toBe(true);
+    expect(remaining.map((message) => message.id)).toEqual([
+      "replay-user-db-id",
+      "replay-assistant-db-id",
+    ]);
+    expect(remaining.map((message) => message.renderId)).toEqual([
+      expect.stringMatching(/^temp-/),
+      expect.stringMatching(/^temp-resp-/),
+    ]);
+    expect(deps.loadConversationMessages).not.toHaveBeenCalled();
   });
 
   it("surfaces a send-failure notice on a non-cloud base when createConversation 404s (#12267: a silent return read as a lost message)", async () => {
@@ -698,6 +724,11 @@ describe("useChatSend always streams (#9174)", () => {
     ).toEqual(
       expect.arrayContaining(["persisted-user", "persisted-assistant"]),
     );
+    const [user, assistant] = deps.conversationMessagesRef.current;
+    expect(user?.renderId).toMatch(/^temp-/);
+    expect(assistant?.renderId).toMatch(/^temp-resp-/);
+    expect(user?.renderId).not.toBe(user?.id);
+    expect(assistant?.renderId).not.toBe(assistant?.id);
   });
 });
 
@@ -917,9 +948,22 @@ describe("useChatSend streaming-burst coalescing (text + status + tool)", () => 
     mocks.client.renameConversation.mockResolvedValue(undefined);
   });
 
-  it("parks token+status+tool from one SSE burst into one microtask, committing all three together", async () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("parks token+status+tool from one SSE burst into one visible frame, committing all three together", async () => {
+    const frameCallbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        frameCallbacks.push(callback);
+        return frameCallbacks.length;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
     // Capture the per-event callbacks from a stream that stays pending so the
-    // microtask can be observed BEFORE the terminal synchronous flush.
+    // scheduled frame can be observed BEFORE the terminal synchronous flush.
     let onTokenCb!: (t: string, a?: string) => void;
     let onStatusCb!: (s: ChatTurnStatus) => void;
     let onToolCb!: (e: ChatToolCallEvent) => void;
@@ -963,7 +1007,7 @@ describe("useChatSend streaming-burst coalescing (text + status + tool)", () => 
     });
 
     // One SSE burst: a token, a status phase, and a tool call all arrive in the
-    // same tick — before the queued microtask runs.
+    // same tick — before the queued frame runs.
     act(() => {
       onTokenCb("Search", "Search");
       onStatusCb({ kind: "running_tool", toolName: "web_search" });
@@ -978,8 +1022,10 @@ describe("useChatSend streaming-burst coalescing (text + status + tool)", () => 
       );
     });
 
-    await act(async () => {
-      await Promise.resolve();
+    act(() => {
+      const frame = frameCallbacks.shift();
+      expect(frame).toBeDefined();
+      frame?.(performance.now());
     });
 
     const assistantAfter = deps.conversationMessagesRef.current.find(
@@ -1000,7 +1046,7 @@ describe("useChatSend streaming-burst coalescing (text + status + tool)", () => 
 
   it("flushes parked tool/status synchronously on the terminal transition even if no frame ran", async () => {
     // A tool event + status arrive, then the stream resolves in the SAME tick
-    // before any microtask runs. The synchronous flushStreamingText() before the
+    // before any frame runs. The synchronous flushStreamingText() before the
     // terminal modification must still commit them (no lost tool row / status).
     mocks.client.sendConversationMessageStream.mockImplementation(
       async (
@@ -1267,6 +1313,61 @@ describe("useChatSend non-404 send failures", () => {
       "error",
       expect.any(Number),
     );
+  });
+
+  it("keeps and marks a delivered partial when the SSE transport fails", async () => {
+    const transportCause = new Error("socket reset");
+    mocks.client.sendConversationMessageStream.mockImplementation(
+      async (
+        _id: string,
+        _text: string,
+        onToken: (token: string, accumulatedText?: string) => void,
+      ) => {
+        onToken("partial reply", "partial reply");
+        throw new StreamTransportError({
+          kind: "transport",
+          message: "stream connection failed",
+          partialText: "partial reply",
+          cause: transportCause,
+        });
+      },
+    );
+    const deps = makeDeps({
+      activeConversationId: "conv-1",
+      conversations: [conversation("conv-1", "room-1")],
+    });
+    deps.loadConversationMessages = vi.fn(async () => {
+      deps.setConversationMessages([
+        {
+          id: "persisted-user",
+          role: "user",
+          text: "hello",
+          timestamp: Date.now(),
+        },
+      ]);
+      return { ok: true as const };
+    });
+    const { result } = renderHook(() => useChatSend(deps));
+
+    await act(async () => {
+      await result.current.sendChatText("hello", {
+        conversationId: "conv-1",
+      });
+    });
+
+    expect(deps.setActionNotice).toHaveBeenCalledWith(
+      expect.stringContaining("check your connection"),
+      "error",
+      expect.any(Number),
+    );
+    expect(
+      deps.conversationMessagesRef.current.filter(
+        (message) =>
+          message.role === "assistant" &&
+          message.text === "partial reply" &&
+          message.interrupted,
+      ),
+    ).toHaveLength(1);
   });
 
   it("does not reload (which could re-fail) on an auth-failure send error, and notifies", async () => {
@@ -1963,10 +2064,6 @@ describe("useChatSend — user turn sent during agent warm-up is never evicted (
     // A legitimately silent reply (agent chose not to answer): the user turn
     // IS in server truth, so the restore must no-op — no duplicate bubble, no
     // spurious failed turn.
-    mocks.client.sendConversationMessageStream.mockResolvedValue({
-      text: "",
-      completed: true,
-    });
     const deps = makeDeps({
       activeConversationId: "conv-1",
       conversations: [conversation("conv-1", "room-1")],
@@ -1981,6 +2078,20 @@ describe("useChatSend — user turn sent during agent warm-up is never evicted (
         } as ConversationMessage,
       ],
     };
+    mocks.client.sendConversationMessageStream.mockImplementation(
+      async (...args: unknown[]) => {
+        serverThread.current[0] = {
+          ...serverThread.current[0],
+          clientMessageId: String(args[9] ?? ""),
+        };
+        return {
+          text: "",
+          completed: true,
+          userMessageId: "server-user-1",
+          assistantEphemeral: true,
+        };
+      },
+    );
     mockServerTruthReload(deps, serverThread);
     const { result } = renderHook(() => useChatSend(deps));
 
@@ -2093,23 +2204,33 @@ describe("useChatSend — user turn sent during agent warm-up is never evicted (
 
     // The model is ready now: the next send succeeds and the server persists
     // the turn, so the post-retry reload carries it.
-    mocks.client.sendConversationMessageStream.mockImplementation(async () => {
-      serverThread.current = [
-        {
-          id: "server-user-1",
-          role: "user",
-          text: "hello while warming",
-          timestamp: Date.now(),
-        } as ConversationMessage,
-        {
-          id: "server-asst-1",
-          role: "assistant",
+    mocks.client.sendConversationMessageStream.mockImplementation(
+      async (...args: unknown[]) => {
+        const clientMessageId = String(args[9] ?? "");
+        serverThread.current = [
+          {
+            id: "server-user-1",
+            clientMessageId,
+            role: "user",
+            text: "hello while warming",
+            timestamp: Date.now(),
+          } as ConversationMessage,
+          {
+            id: "server-asst-1",
+            clientMessageId,
+            role: "assistant",
+            text: "hi! I'm awake now.",
+            timestamp: Date.now(),
+          } as ConversationMessage,
+        ];
+        return {
           text: "hi! I'm awake now.",
-          timestamp: Date.now(),
-        } as ConversationMessage,
-      ];
-      return { text: "hi! I'm awake now.", completed: true };
-    });
+          completed: true,
+          userMessageId: "server-user-1",
+          messageId: "server-asst-1",
+        };
+      },
+    );
 
     await act(async () => {
       await result.current.handleChatRetry(failedTurn.id);
@@ -2167,6 +2288,8 @@ describe("useChatSend — sendActionMessage cold-open defers the create like the
     mocks.client.sendConversationMessageStream.mockResolvedValue({
       text: "ok",
       completed: true,
+      userMessageId: "action-user-db-id",
+      messageId: "action-assistant-db-id",
     } as never);
   });
 
@@ -2194,6 +2317,16 @@ describe("useChatSend — sendActionMessage cold-open defers the create like the
     expect(deps.setActiveConversationId).toHaveBeenCalledWith("agent-123");
     // No failure notice on the happy path.
     expect(deps.setActionNotice).not.toHaveBeenCalled();
+    expect(deps.loadConversationMessages).not.toHaveBeenCalled();
+    expect(
+      deps.conversationMessagesRef.current.map((message) => message.id),
+    ).toEqual(["action-user-db-id", "action-assistant-db-id"]);
+    expect(
+      deps.conversationMessagesRef.current.map((message) => message.renderId),
+    ).toEqual([
+      expect.stringMatching(/^temp-action-/),
+      expect.stringMatching(/^temp-action-resp-/),
+    ]);
   });
 
   it("still creates on a dedicated base and forwards the action title to the REST fallback", async () => {
@@ -2221,6 +2354,7 @@ describe("useChatSend — sendActionMessage cold-open defers the create like the
     );
     expect(deps.setActiveConversationId).toHaveBeenCalledWith("conv-new");
     expect(deps.setActionNotice).not.toHaveBeenCalled();
+    expect(deps.loadConversationMessages).not.toHaveBeenCalled();
   });
 });
 
