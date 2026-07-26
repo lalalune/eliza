@@ -95,3 +95,14 @@ test("every packages/ui __e2e__ runner has a package script and a CI workflow le
   }
   expect(problems).toEqual([]);
 });
+
+test("fork UI fixtures run on an isolated hosted runner", () => {
+  const workflow = fs.readFileSync(
+    path.join(workflowsDir, "ui-fixture-e2e.yml"),
+    "utf8",
+  );
+  const forkSafeRunnerExpression =
+    "runs-on: $" +
+    "{{ fromJSON(((github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || vars.HETZNER_FLEET_ONLINE == 'false') && '[\"ubuntu-24.04\"]' || '[\"self-hosted\",\"hetzner-robot\"]') }}";
+  expect(workflow).toContain(forkSafeRunnerExpression);
+});

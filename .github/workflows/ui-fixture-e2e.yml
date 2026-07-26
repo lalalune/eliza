@@ -51,7 +51,9 @@ env:
 
 jobs:
   fixture-e2e:
-    runs-on: ${{ fromJSON(vars.HETZNER_FLEET_ONLINE == 'false' && '["ubuntu-24.04"]' || '["self-hosted","hetzner-robot"]') }}
+    # Fork-authored browser fixtures run on an isolated hosted VM. Trusted push
+    # and reusable-call lanes may use the fleet while its health toggle is on.
+    runs-on: ${{ fromJSON(((github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || vars.HETZNER_FLEET_ONLINE == 'false') && '["ubuntu-24.04"]' || '["self-hosted","hetzner-robot"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0

@@ -446,13 +446,18 @@ async function loadAppRoutePluginFromSpecifier(
 export const __loadAppRoutePluginFromSpecifierForTest =
   loadAppRoutePluginFromSpecifier;
 
-function getRegistryAppRoutePluginLoaders(): AppRoutePluginRegistryEntry[] {
+interface AppRoutePluginLoaderEntry extends AppRoutePluginRegistryEntry {
+  aliases: readonly string[];
+}
+
+function getRegistryAppRoutePluginLoaders(): AppRoutePluginLoaderEntry[] {
   return getApps(loadRegistry()).flatMap((app) => {
     const routePlugin = app.launch.routePlugin;
     if (!routePlugin) return [];
     return [
       {
         id: app.npmName ?? app.id,
+        aliases: routePlugin.aliases,
         load: () =>
           loadAppRoutePluginFromSpecifier(
             routePlugin.specifier,
@@ -526,13 +531,13 @@ export function normalizeAppRoutePluginId(id: string): string {
     .replace(/-(app|ui|routes)$/, "");
 }
 
-function getAppRoutePluginLoaders(): AppRoutePluginRegistryEntry[] {
-  const byId = new Map<string, AppRoutePluginRegistryEntry>();
+function getAppRoutePluginLoaders(): AppRoutePluginLoaderEntry[] {
+  const byId = new Map<string, AppRoutePluginLoaderEntry>();
   for (const entry of getRegistryAppRoutePluginLoaders()) {
     byId.set(entry.id, entry);
   }
   for (const entry of listAppRoutePluginLoaders()) {
-    byId.set(entry.id, entry);
+    byId.set(entry.id, { ...entry, aliases: [] });
   }
 
   const skip = getSkippedAppRoutePluginIds();
@@ -545,12 +550,15 @@ function getAppRoutePluginLoaders(): AppRoutePluginRegistryEntry[] {
   const skipNormalized = new Set(
     [...skip].map((token) => normalizeAppRoutePluginId(token)),
   );
-  const kept: AppRoutePluginRegistryEntry[] = [];
+  const kept: AppRoutePluginLoaderEntry[] = [];
   const skipped: string[] = [];
   for (const entry of byId.values()) {
+    const ids = [entry.id, ...entry.aliases];
     if (
-      skip.has(entry.id) ||
-      skipNormalized.has(normalizeAppRoutePluginId(entry.id))
+      ids.some(
+        (id) =>
+          skip.has(id) || skipNormalized.has(normalizeAppRoutePluginId(id)),
+      )
     ) {
       skipped.push(entry.id);
     } else {
@@ -563,6 +571,11 @@ function getAppRoutePluginLoaders(): AppRoutePluginRegistryEntry[] {
     );
   }
   return kept;
+}
+
+/** @internal Exported for focused registry alias regression tests. */
+export function __getAppRoutePluginLoaderIdsForTest(): string[] {
+  return getAppRoutePluginLoaders().map((entry) => entry.id);
 }
 
 async function registerAppRoutePlugins(runtime: AgentRuntime): Promise<void> {

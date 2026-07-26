@@ -38,6 +38,7 @@ describe("personal-assistant app registry entry", () => {
         routePlugin: {
           specifier: "@elizaos/plugin-personal-assistant/routes/plugin",
           exportName: "personalAssistantRoutesPlugin",
+          aliases: ["lifeops"],
         },
         runtimeHook: {
           specifier: "@elizaos/plugin-personal-assistant/register-runtime",

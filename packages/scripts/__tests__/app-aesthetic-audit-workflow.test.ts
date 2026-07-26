@@ -29,6 +29,17 @@ function jobBlock(jobId: string): string {
 }
 
 describe("app-aesthetic-audit workflow", () => {
+  test("runs fork code on hosted infrastructure with enough time for every view", () => {
+    const auditJob = jobBlock("aesthetic-audit");
+
+    expect(auditJob).toContain(
+      "github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork",
+    );
+    expect(auditJob).toContain("'[\"ubuntu-24.04\"]'");
+    expect(auditJob).toContain("'[\"self-hosted\",\"hetzner-robot\"]'");
+    expect(auditJob).toMatch(/^\s{4}timeout-minutes:\s*75$/m);
+  });
+
   test("keeps visual audit jobs advisory at the job boundary", () => {
     expect(jobBlock("aesthetic-audit")).toMatch(
       /^\s{4}continue-on-error:\s*true$/m,

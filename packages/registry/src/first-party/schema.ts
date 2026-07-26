@@ -205,6 +205,10 @@ const packageRoutePluginSpecifierSchema = z
 const appRoutePluginSchema = z.object({
   specifier: packageRoutePluginSpecifierSchema,
   exportName: z.string().min(1).optional(),
+  // Product-facing names can differ from package ids; explicit aliases keep
+  // host boot controls data-driven without treating broad discovery tags as
+  // whole-plugin disable switches.
+  aliases: z.array(z.string().min(1)).default([]),
 });
 
 // An app's optional runtime-hook contributor: a named export

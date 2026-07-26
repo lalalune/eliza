@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Static contract for the fork-safe homepage browser smoke.
+ * Static contract for the fork-safe quality and homepage browser smoke.
  *
- * Self-hosted Quality (Fork) runners provide browser system libraries but do
- * not provide passwordless sudo. Playwright must therefore install Chromium
- * without --with-deps, while the real homepage browser test remains mandatory.
+ * Fork-authored code stays on ephemeral GitHub-hosted runners, whose image
+ * already includes browser system libraries. Playwright installs only the
+ * Chromium binary, while the real homepage browser test remains mandatory.
  */
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -37,6 +37,16 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT) {
   const workflow = readFileSync(resolve(repoRoot, WORKFLOW_PATH), "utf8");
   const install = stepBody(workflow, "Install homepage browser");
   const browserTest = stepBody(workflow, "Test homepage downloads");
+  const runners = Array.from(
+    workflow.matchAll(/^ {4}runs-on:\s*(\S.*)$/gm),
+    (match) => match[1].trim(),
+  );
+
+  assert(runners.length > 0, `${WORKFLOW_PATH}: no job runners found`);
+  assert(
+    runners.every((runner) => runner === "ubuntu-24.04"),
+    `${WORKFLOW_PATH}: every job must run on ubuntu-24.04 so fork-authored code never reaches persistent repository runners`,
+  );
 
   assert(
     /^\s*run:\s*\.\/node_modules\/\.bin\/playwright install chromium\s*$/m.test(
@@ -46,10 +56,12 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT) {
   );
   assert(
     !install.includes("--with-deps"),
-    `${WORKFLOW_PATH}: browser install must not use --with-deps on self-hosted runners`,
+    `${WORKFLOW_PATH}: browser install must not request privileged dependency installation`,
   );
   assert(
-    /^\s*run:\s*bun run test:e2e(?: --workers=[1-9]\d*)?\s*$/m.test(browserTest),
+    /^\s*run:\s*bun run test:e2e(?: --workers=[1-9]\d*)?\s*$/m.test(
+      browserTest,
+    ),
     `${WORKFLOW_PATH}: the real homepage browser test must remain enabled; only a positive worker cap is allowed`,
   );
   assert(

@@ -59,6 +59,7 @@ describe("ElizaClient direct Cloud auth on native", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -274,7 +275,26 @@ describe("ElizaClient direct Cloud auth on native", () => {
     expectNoLocalPersistOrStatusProbe();
   });
 
+  it("rejects an unproven bearer when native Cloud routing starts from an empty base", async () => {
+    const client = new ElizaClient(undefined, "local-agent-token");
+
+    expect(client.getBaseUrl()).toBe("");
+    await expect(client.getCloudStatus()).resolves.toEqual(
+      expect.objectContaining({
+        connected: false,
+        reason: "not-authenticated",
+      }),
+    );
+    expect(capacitorMocks.request).not.toHaveBeenCalled();
+  });
+
   it("lists Cloud agents directly on native without a runtime base URL", async () => {
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) =>
+          key === "steward_session_token" ? "cloud-api-key" : null,
+      },
+    });
     capacitorMocks.request.mockResolvedValue({
       status: 200,
       data: {
@@ -291,7 +311,8 @@ describe("ElizaClient direct Cloud auth on native", () => {
       },
     });
 
-    const client = createDirectCloudClient();
+    const client = new ElizaClient();
+    expect(client.getBaseUrl()).toBe("");
     const result = await client.getCloudCompatAgents();
 
     expect(capacitorMocks.request).toHaveBeenCalledWith(

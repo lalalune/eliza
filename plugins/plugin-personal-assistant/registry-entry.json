@@ -26,7 +26,8 @@
     "capabilities": ["lifeops", "goals", "todos"],
     "routePlugin": {
       "specifier": "@elizaos/plugin-personal-assistant/routes/plugin",
-      "exportName": "personalAssistantRoutesPlugin"
+      "exportName": "personalAssistantRoutesPlugin",
+      "aliases": ["lifeops"]
     },
     "runtimeHook": {
       "specifier": "@elizaos/plugin-personal-assistant/register-runtime",

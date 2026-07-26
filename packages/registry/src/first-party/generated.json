@@ -249,7 +249,8 @@
         "curatedSlug": "polymarket",
         "routePlugin": {
           "specifier": "@elizaos/plugin-polymarket/plugin",
-          "exportName": "polymarketPlugin"
+          "exportName": "polymarketPlugin",
+          "aliases": []
         }
       }
     },
@@ -1758,7 +1759,8 @@
         "capabilities": ["documents"],
         "routePlugin": {
           "specifier": "@elizaos/plugin-documents/plugin",
-          "exportName": "documentsPlugin"
+          "exportName": "documentsPlugin",
+          "aliases": []
         }
       }
     },
@@ -3667,7 +3669,8 @@
         "curatedSlug": "hyperliquid",
         "routePlugin": {
           "specifier": "@elizaos/plugin-hyperliquid/plugin",
-          "exportName": "hyperliquidPlugin"
+          "exportName": "hyperliquidPlugin",
+          "aliases": []
         }
       }
     },
@@ -4688,7 +4691,8 @@
         "curatedSlug": "model-tester",
         "routePlugin": {
           "specifier": "@elizaos/app-model-tester/plugin",
-          "exportName": "modelTesterPlugin"
+          "exportName": "modelTesterPlugin",
+          "aliases": []
         }
       }
     },
@@ -5930,7 +5934,8 @@
         "capabilities": ["lifeops", "goals", "todos"],
         "routePlugin": {
           "specifier": "@elizaos/plugin-personal-assistant/routes/plugin",
-          "exportName": "personalAssistantRoutesPlugin"
+          "exportName": "personalAssistantRoutesPlugin",
+          "aliases": ["lifeops"]
         },
         "runtimeHook": {
           "specifier": "@elizaos/plugin-personal-assistant/register-runtime",
@@ -7146,7 +7151,8 @@
         },
         "routePlugin": {
           "specifier": "@elizaos/plugin-training/setup-routes",
-          "exportName": "trainingPlugin"
+          "exportName": "trainingPlugin",
+          "aliases": []
         },
         "runtimeHook": {
           "specifier": "@elizaos/plugin-training",

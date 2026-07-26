@@ -626,11 +626,23 @@ function preserveCloudAuthTokenForFirstRun(
   server: PersistedActiveServer,
 ): void {
   if (server.kind !== "cloud") return;
-  // Cloud = Steward everywhere (DECISIONS.md D3): the Steward session token
-  // persists in localStorage independently of the dropped active server, so
-  // prefer it; fall back to the token captured on the persisted server.
-  const token = readStoredStewardToken()?.trim() || server.accessToken?.trim();
+  // Cloud = Steward everywhere (DECISIONS.md D3): only the dedicated Steward
+  // store proves that this bearer belongs to the control plane. The active
+  // server token may instead be an agent-scoped pairing key and must never be
+  // promoted to Cloud auth while the invalid server record is dropped.
+  const token = readStoredStewardToken()?.trim();
   if (!token) return;
+  // The active-server record is about to be cleared, so establish a transient
+  // direct-Cloud routing context before preserving its bearer. This base is
+  // deliberately not persisted: onboarding will replace it with the selected
+  // agent runtime, while requests during the handoff have an explicit Cloud
+  // destination backed by the canonical Steward credential above.
+  client.setBaseUrl(
+    resolveDirectCloudAuthApiBase(
+      getBootConfig().cloudApiBase || RESTORE_DEFAULT_DIRECT_CLOUD_BASE_URL,
+    ),
+    { persist: false },
+  );
   client.setToken(token);
 }
 

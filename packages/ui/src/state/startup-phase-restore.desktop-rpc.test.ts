@@ -1,18 +1,21 @@
 // @vitest-environment jsdom
 
 /**
- * The restoring-session phase over the desktop RPC bridge
- * (`startup-phase-restore.runRestoringSession`): backend-startup timeout
- * handling and the force-fresh-first-run gate under Electrobun. jsdom with the
- * desktop bridge and first-run bootstrap mocked — no real host process.
+ * The restoring-session phase under Electrobun: backend-startup timeout,
+ * force-fresh-first-run, and Cloud-to-onboarding fallback behavior. Uses jsdom
+ * with the desktop bridge and first-run bootstrap mocked — no real host process.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { client } from "../api";
+import { getCloudAuthToken } from "../api/client-cloud";
+import { DEFAULT_BOOT_CONFIG, setBootConfig } from "../config/boot-config";
 import {
   enableForceFreshFirstRun,
   isForceFreshFirstRunEnabled,
 } from "../platform";
 import {
   clearPersistedActiveServer,
+  loadPersistedActiveServer,
   savePersistedActiveServer,
   savePersistedFirstRunComplete,
 } from "./persistence";
@@ -54,10 +57,21 @@ describe("runRestoringSession desktop bridge startup calls", () => {
   beforeEach(() => {
     localStorage.clear();
     clearPersistedActiveServer();
+    setBootConfig(DEFAULT_BOOT_CONFIG);
+    client.setBaseUrl(null, { persist: false });
+    client.setToken(null);
     vi.clearAllMocks();
     bridgeMock.invokeDesktopBridgeRequestWithTimeout.mockResolvedValue({
       status: "timeout",
     });
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+    clearPersistedActiveServer();
+    client.setBaseUrl(null, { persist: false });
+    client.setToken(null);
+    setBootConfig(DEFAULT_BOOT_CONFIG);
   });
 
   it("routes a fresh desktop launch with no persisted server into onboarding", async () => {
@@ -158,5 +172,56 @@ describe("runRestoringSession desktop bridge startup calls", () => {
       type: "SESSION_RESTORED",
       target: "cloud-managed",
     });
+  });
+
+  it("keeps Cloud auth usable when an unrestorable Cloud target falls back to onboarding", async () => {
+    localStorage.setItem("steward_session_token", "cloud-session-token");
+    savePersistedActiveServer({
+      id: "cloud:tenant/agent",
+      kind: "cloud",
+      label: "Eliza Cloud",
+      accessToken: "agent-api-key",
+    });
+    const deps = makeDeps();
+    const dispatch = vi.fn();
+
+    await runRestoringSession(
+      deps,
+      dispatch,
+      { current: null },
+      {
+        current: false,
+      },
+    );
+
+    expect(loadPersistedActiveServer()).toBeNull();
+    expect(client.getBaseUrl()).toBe("https://api.elizacloud.ai");
+    expect(getCloudAuthToken(client)).toBe("cloud-session-token");
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "NO_SESSION",
+      hadPriorFirstRun: false,
+    });
+  });
+
+  it("does not promote an agent-scoped token while dropping an unrestorable Cloud target", async () => {
+    savePersistedActiveServer({
+      id: "cloud:tenant/agent",
+      kind: "cloud",
+      label: "Eliza Cloud",
+      accessToken: "agent-api-key",
+    });
+    const deps = makeDeps();
+    const dispatch = vi.fn();
+
+    await runRestoringSession(
+      deps,
+      dispatch,
+      { current: null },
+      { current: false },
+    );
+
+    expect(loadPersistedActiveServer()).toBeNull();
+    expect(client.getBaseUrl()).toBe("");
+    expect(getCloudAuthToken(client)).toBeNull();
   });
 });

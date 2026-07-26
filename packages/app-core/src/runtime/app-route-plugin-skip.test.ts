@@ -14,6 +14,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  __getAppRoutePluginLoaderIdsForTest,
   __loadAppRoutePluginFromSpecifierForTest,
   getSkippedAppRoutePluginIds,
   normalizeAppRoutePluginId,
@@ -63,6 +64,16 @@ describe("getSkippedAppRoutePluginIds", () => {
     const skipped = getSkippedAppRoutePluginIds();
     expect(skipped).toEqual(new Set(["lifeops", "training"]));
     expect(skipped.has("")).toBe(false);
+  });
+
+  it("skips the personal-assistant route loader by its LifeOps registry alias", () => {
+    expect(__getAppRoutePluginLoaderIdsForTest()).toContain(
+      "@elizaos/plugin-personal-assistant",
+    );
+    process.env[ENV_KEY] = "lifeops";
+    expect(__getAppRoutePluginLoaderIdsForTest()).not.toContain(
+      "@elizaos/plugin-personal-assistant",
+    );
   });
 });
 

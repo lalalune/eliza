@@ -18,7 +18,7 @@ const REAL_REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const VALID_WORKFLOW = `name: Quality (Fork)
 jobs:
   build:
-    runs-on: [self-hosted, hetzner-robot]
+    runs-on: ubuntu-24.04
     steps:
       - name: Install homepage browser
         working-directory: packages/homepage
@@ -40,6 +40,22 @@ function buildRepo(workflow = VALID_WORKFLOW) {
 }
 
 describe("quality-fork-browser-contract", () => {
+  test("rejects persistent runners for fork-authored code", () => {
+    const root = buildRepo(
+      VALID_WORKFLOW.replace(
+        "runs-on: ubuntu-24.04",
+        "runs-on: [self-hosted, hetzner-robot]",
+      ),
+    );
+    try {
+      expect(() => runContract(root)).toThrow(
+        /every job must run on ubuntu-24\.04/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("accepts unprivileged Chromium install followed by the real browser test", () => {
     const root = buildRepo();
     try {
@@ -104,5 +120,13 @@ describe("quality-fork-browser-contract", () => {
     expect(runContract(REAL_REPO_ROOT)).toEqual({
       workflow: ".github/workflows/quality-fork.yml",
     });
+    const workflow = readFileSync(
+      join(REAL_REPO_ROOT, ".github", "workflows", "quality-fork.yml"),
+      "utf8",
+    );
+    expect(workflow.match(/^ {4}runs-on: ubuntu-24\.04$/gm)).toHaveLength(4);
+    expect(workflow).not.toMatch(
+      /self-hosted|hetzner-robot|HETZNER_FLEET_ONLINE/,
+    );
   });
 });
