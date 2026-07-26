@@ -1,0 +1,3095 @@
+var __rewriteRelativeImportExtension = (this && this.__rewriteRelativeImportExtension) || function (path, preserveJsx) {
+    if (typeof path === "string" && /^\.\.?\//.test(path)) {
+        return path.replace(/\.(tsx)$|((?:\.d)?)((?:\.[^./]+?)?)\.([cm]?)ts$/i, function (m, tsx, d, ext, cm) {
+            return tsx ? preserveJsx ? ".jsx" : ".js" : d && (!ext || !cm) ? m : (d + ext + "." + cm.toLowerCase() + "js");
+        });
+    }
+    return path;
+};
+/**
+ * In-renderer fetch kernel for the iOS local agent: services a subset of routes
+ * (market data, steward session) directly in the webview when the full-bun agent
+ * is not reachable, using the shared market-provider helpers.
+ */
+import { asRecord, buildCoinGeckoMarketsUrl, buildMarketMovers, buildMarketPriceSnapshots, COINGECKO_MARKET_PROVIDER, POLYMARKET_MARKET_PROVIDER, parseCoinGeckoMarkets, } from "@elizaos/shared";
+import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import { summarizeTranscript, transcriptDurationMs, transcriptSpeakerCount, } from "@elizaos/shared/transcripts";
+import { getBootConfig } from "../config/boot-config-store";
+import { findCatalogModel, MODEL_CATALOG, } from "../services/local-inference/catalog";
+import { filterSettingsDefaultLocalModels, isSettingsDefaultLocalModel, } from "../services/local-inference/catalog-policy";
+import { assessCatalogModelFit, catalogDownloadSizeGb, chooseSmallerFallbackModel, selectRecommendedModelForSlot, } from "../services/local-inference/recommendation";
+import { AGENT_MODEL_SLOTS } from "../services/local-inference/types";
+const STORAGE_PREFIX = "eliza:ios-local-agent";
+const CONVERSATIONS_KEY = `${STORAGE_PREFIX}:conversations:v1`;
+const TRANSCRIPTS_KEY = `${STORAGE_PREFIX}:transcripts:v1`;
+const ACTIVE_MODEL_KEY = `${STORAGE_PREFIX}:active-model:v1`;
+const ASSIGNMENTS_KEY = `${STORAGE_PREFIX}:assignments:v1`;
+const BROWSER_WORKSPACE_KEY = `${STORAGE_PREFIX}:browser-workspace:v1`;
+const WALLET_MARKET_OVERVIEW_KEY = `${STORAGE_PREFIX}:wallet-market-overview:v1`;
+const BUNDLE_INDEX_KEY = `${STORAGE_PREFIX}:eliza-1-bundles:v1`;
+const ACTIVE_SERVER_STORAGE_KEY = "elizaos:active-server";
+const AGENT_NAME = "Eliza";
+const IOS_LOCAL_AGENT_IPC_BASE = "eliza-local-agent://ipc";
+const DIRECT_CLOUD_API_BASE = "https://api.elizacloud.ai";
+const DEFAULT_SYSTEM_PROMPT = "You are Eliza, a private on-device assistant. Answer directly and concisely.";
+const DEFAULT_CLOUD_MARKET_PREVIEW_BASE_URL = "https://elizacloud.ai";
+const CLOUD_WALLET_MARKET_OVERVIEW_PATH = "/market/preview/wallet-overview";
+const WALLET_MARKET_OVERVIEW_CACHE_TTL_MS = 120_000;
+const WALLET_MARKET_OVERVIEW_FETCH_TIMEOUT_MS = 8_000;
+const EMPTY_ROUTING_PREFERENCES = {
+    preferredProvider: {},
+    policy: {},
+};
+const IOS_LOCAL_BACKGROUND_UNAVAILABLE_REASON = "iOS local mode uses the WebView ITTP route kernel. Capacitor BackgroundRunner wakes in a separate JSContext and cannot call that WebView kernel while the app is suspended.";
+const IOS_LOCAL_TTS_EXECUTOR_AVAILABLE = false;
+const EMPTY_WALLET_ADDRESSES = {
+    evmAddress: null,
+    solanaAddress: null,
+};
+const EMPTY_WALLET_RPC_SELECTIONS = {
+    evm: "eliza-cloud",
+    bsc: "eliza-cloud",
+    solana: "eliza-cloud",
+};
+let startedAt = Date.now();
+let running = false;
+let activeState = readActiveModelState();
+const downloads = new Map();
+let llamaAdapterPromise = null;
+let llamaCppPromise = null;
+let loadedRuntimeSignature = null;
+function storage() {
+    try {
+        return typeof window === "undefined" ? null : window.localStorage;
+    }
+    catch {
+        // error-policy:J4 storage unavailable (privacy mode / sandbox) — callers
+        // treat null as "no persisted kernel state" and run in-memory.
+        return null;
+    }
+}
+function removeStorageItem(key) {
+    try {
+        storage()?.removeItem(key);
+    }
+    catch {
+        /* localStorage unavailable */
+    }
+}
+function resetIosLocalAgentState() {
+    for (const key of [
+        CONVERSATIONS_KEY,
+        TRANSCRIPTS_KEY,
+        ACTIVE_MODEL_KEY,
+        ASSIGNMENTS_KEY,
+        BROWSER_WORKSPACE_KEY,
+        WALLET_MARKET_OVERVIEW_KEY,
+        BUNDLE_INDEX_KEY,
+    ]) {
+        removeStorageItem(key);
+    }
+    downloads.clear();
+    activeState = readActiveModelState();
+    loadedRuntimeSignature = null;
+    running = true;
+    startedAt = Date.now();
+}
+function nowIso() {
+    return new Date().toISOString();
+}
+function randomId(prefix) {
+    const random = globalThis.crypto?.randomUUID?.() ??
+        `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    return `${prefix}-${random}`;
+}
+function readJson(key, fallback) {
+    try {
+        const raw = storage()?.getItem(key);
+        if (!raw)
+            return fallback;
+        return JSON.parse(raw);
+    }
+    catch {
+        return fallback;
+    }
+}
+function writeJson(key, value) {
+    try {
+        storage()?.setItem(key, JSON.stringify(value));
+    }
+    catch {
+        // localStorage can be unavailable in embedded shells.
+    }
+}
+function stringValue(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+function readIosCloudPairing() {
+    const fallback = {
+        paired: false,
+        agentId: null,
+        token: null,
+        apiBase: DIRECT_CLOUD_API_BASE,
+        label: null,
+    };
+    const activeServer = readJson(ACTIVE_SERVER_STORAGE_KEY, null);
+    if (activeServer?.kind !== "cloud") {
+        return fallback;
+    }
+    const id = stringValue(activeServer.id);
+    const agentId = id?.startsWith("cloud:") ? id.slice("cloud:".length) : null;
+    const storedToken = stringValue(activeServer.accessToken);
+    // The device-code/pairing flow persists its cloud session token through the
+    // steward-session store (see client-cloud.getCloudAuthToken).
+    const token = storedToken ?? readStoredStewardToken()?.trim() ?? null;
+    const label = stringValue(activeServer.label);
+    return {
+        paired: Boolean(agentId && token),
+        agentId,
+        token,
+        apiBase: DIRECT_CLOUD_API_BASE,
+        label,
+    };
+}
+function readBundleIndex() {
+    return readJson(BUNDLE_INDEX_KEY, {});
+}
+function isIosVoiceAssetPath(rawPath) {
+    const path = rawPath.toLowerCase().replace(/\\/g, "/");
+    if (!/\.(bin|codec|gguf|json)$/i.test(path))
+        return false;
+    if (/(^|\/)(asr|tts|vad|voice|voices|wakeword)\//.test(path))
+        return true;
+    return /(^|\/)cache\/[^/]*voice[^/]*\.(bin|codec|gguf|json)$/i.test(path);
+}
+function inferVoiceReadiness(installed, bundles) {
+    const installedVoicePaths = new Set();
+    for (const model of installed) {
+        if (isIosVoiceAssetPath(model.path))
+            installedVoicePaths.add(model.path);
+    }
+    const bundleIdsWithVoice = new Set();
+    for (const record of Object.values(bundles)) {
+        const paths = [
+            ...Object.keys(record.files),
+            ...Object.values(record.files),
+        ].filter(isIosVoiceAssetPath);
+        if (paths.length > 0) {
+            bundleIdsWithVoice.add(record.modelId);
+            for (const path of paths)
+                installedVoicePaths.add(path);
+        }
+    }
+    const modelId = [...bundleIdsWithVoice][0] ??
+        installed.find((model) => model.id.startsWith("eliza-1"))?.id ??
+        null;
+    const installedFiles = installedVoicePaths.size;
+    if (installedFiles === 0) {
+        return {
+            status: "missing",
+            installedFiles: 0,
+            modelId,
+            message: "Eliza-1 voice assets are not visible to the iOS local agent.",
+        };
+    }
+    if (!IOS_LOCAL_TTS_EXECUTOR_AVAILABLE) {
+        return {
+            status: "unavailable",
+            installedFiles,
+            modelId,
+            message: "Eliza-1 voice assets are installed. This build is missing the iOS local voice playback engine.",
+        };
+    }
+    return {
+        status: "assets-ready",
+        installedFiles,
+        modelId,
+        message: "Eliza-1 voice assets are installed. Voice engine will warm on first playback.",
+    };
+}
+function sanitizeLocalSpeechText(input) {
+    let text = input.normalize("NFKC");
+    text = text.replace(/<think\b[^>]*>[\s\S]*?(?:<\/think>|$)/gi, " ");
+    text = text.replace(/<(analysis|reasoning|tool_calls?|tools?)\b[^>]*>[\s\S]*?(?:<\/\1>|$)/gi, " ");
+    text = text.replace(/```[\s\S]*?```/g, " ");
+    text = text.replace(/`([^`]+)`/g, "$1");
+    text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+    text = text.replace(/<[^>\n]+>/g, " ");
+    text = text.replace(/\bhttps?:\/\/\S+/gi, " ");
+    return text.replace(/\s+/g, " ").trim();
+}
+function writeBundleRecord(record) {
+    const current = readBundleIndex();
+    current[record.modelId] = record;
+    writeJson(BUNDLE_INDEX_KEY, current);
+}
+function stringFromUnknown(value) {
+    return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+function numberFromUnknown(value) {
+    if (typeof value === "number" && Number.isFinite(value))
+        return value;
+    if (typeof value !== "string" || value.trim().length === 0)
+        return null;
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+function integerFromUnknown(value) {
+    const parsed = numberFromUnknown(value);
+    if (parsed === null)
+        return null;
+    return Number.isInteger(parsed) ? parsed : Math.round(parsed);
+}
+function readStore() {
+    const parsed = readJson(CONVERSATIONS_KEY, {
+        conversations: [],
+    });
+    return {
+        conversations: Array.isArray(parsed.conversations)
+            ? parsed.conversations
+            : [],
+    };
+}
+function writeStore(store) {
+    writeJson(CONVERSATIONS_KEY, store);
+}
+function readTranscriptStore() {
+    const parsed = readJson(TRANSCRIPTS_KEY, {
+        records: [],
+    });
+    return { records: Array.isArray(parsed.records) ? parsed.records : [] };
+}
+function writeTranscriptStore(state) {
+    writeJson(TRANSCRIPTS_KEY, state);
+}
+const TRANSCRIPT_SOURCES = [
+    "voice-session",
+    "import",
+    "call",
+    "meeting",
+    "unknown",
+];
+const TRANSCRIPT_SCOPES = [
+    "owner-private",
+    "user-private",
+    "global",
+    "agent-private",
+];
+function transcriptSourceFromUnknown(value) {
+    return typeof value === "string" &&
+        TRANSCRIPT_SOURCES.includes(value)
+        ? value
+        : "voice-session";
+}
+function transcriptScopeFromUnknown(value) {
+    return typeof value === "string" &&
+        TRANSCRIPT_SCOPES.includes(value)
+        ? value
+        : "owner-private";
+}
+function defaultLocalTranscriptTitle(createdAt) {
+    return `Recording ${new Date(createdAt).toLocaleString()}`;
+}
+/** Mirror of the server route's transcript construction (transcripts-routes.ts
+ *  buildTranscriptFromRequest) over an untyped request body. The shell sends
+ *  audio as base64 WAV; with no media store in the WebView, the bytes are kept
+ *  as a playable data: URL on the record. */
+function buildLocalTranscript(body, id, now) {
+    const segments = Array.isArray(body.segments)
+        ? body.segments
+        : [];
+    const createdAt = numberFromUnknown(body.createdAt) ?? now;
+    let audioUrl = stringFromUnknown(body.audioUrl) ?? undefined;
+    let audioContentType = stringFromUnknown(body.audioContentType) ?? undefined;
+    const audioBase64 = stringFromUnknown(body.audioBase64);
+    if (audioBase64 && !audioUrl) {
+        audioUrl = `data:audio/wav;base64,${audioBase64}`;
+        audioContentType = "audio/wav";
+    }
+    return {
+        id,
+        title: stringFromUnknown(body.title)?.trim() ||
+            defaultLocalTranscriptTitle(createdAt),
+        createdAt,
+        endedAt: now,
+        durationMs: transcriptDurationMs(segments),
+        audioUrl,
+        audioContentType,
+        segments,
+        source: transcriptSourceFromUnknown(body.source),
+        scope: transcriptScopeFromUnknown(body.scope),
+        status: "ready",
+        speakerCount: transcriptSpeakerCount(segments),
+    };
+}
+async function handleLocalTranscriptsRoute(request, method, pathname, url) {
+    if (method === "GET" && pathname === "/api/transcripts") {
+        const roomId = url.searchParams.get("roomId");
+        const transcripts = readTranscriptStore()
+            .records.filter((record) => !roomId || record.roomId === roomId)
+            .map((record) => record.transcript)
+            .sort((a, b) => b.createdAt - a.createdAt)
+            .map(summarizeTranscript);
+        return json({ transcripts });
+    }
+    if (method === "POST" && pathname === "/api/transcripts") {
+        const body = await requestJson(request);
+        if (!Array.isArray(body.segments) || body.segments.length === 0) {
+            return json({ error: "segments are required" }, 400);
+        }
+        const transcript = buildLocalTranscript(body, randomId("transcript"), Date.now());
+        const store = readTranscriptStore();
+        store.records.unshift({
+            roomId: stringFromUnknown(body.roomId) ?? AGENT_NAME,
+            transcript,
+        });
+        writeTranscriptStore(store);
+        return json({ transcript }, 201);
+    }
+    if (!pathname.startsWith("/api/transcripts/"))
+        return null;
+    const id = decodeURIComponent(pathname.slice("/api/transcripts/".length));
+    if (!id || id.includes("/"))
+        return null;
+    if (method === "GET") {
+        const record = readTranscriptStore().records.find((r) => r.transcript.id === id);
+        if (!record)
+            return json({ error: "not found" }, 404);
+        return json({ transcript: record.transcript });
+    }
+    if (method === "PUT") {
+        const body = await requestJson(request);
+        if (body.title === undefined && body.segments === undefined) {
+            return json({ error: "title or segments is required" }, 400);
+        }
+        if (body.segments !== undefined && !Array.isArray(body.segments)) {
+            return json({ error: "segments must be an array" }, 400);
+        }
+        const store = readTranscriptStore();
+        const record = store.records.find((r) => r.transcript.id === id);
+        if (!record)
+            return json({ error: "not found" }, 404);
+        const existing = record.transcript;
+        const segments = Array.isArray(body.segments)
+            ? body.segments
+            : existing.segments;
+        const updated = {
+            ...existing,
+            title: stringFromUnknown(body.title)?.trim() || existing.title,
+            segments,
+            durationMs: transcriptDurationMs(segments),
+            speakerCount: transcriptSpeakerCount(segments),
+            editedAt: Date.now(),
+        };
+        record.transcript = updated;
+        writeTranscriptStore(store);
+        return json({ transcript: updated });
+    }
+    if (method === "DELETE") {
+        const store = readTranscriptStore();
+        store.records = store.records.filter((r) => r.transcript.id !== id);
+        writeTranscriptStore(store);
+        return json({ ok: true });
+    }
+    return null;
+}
+// ── Memory viewer (feed/browse/by-entity — mirrors packages/agent
+//    memory-routes.ts; the local message store IS the memory source on iOS) ──
+const LOCAL_MEMORY_TABLE_NAMES = [
+    "messages",
+    "memories",
+    "facts",
+    "documents",
+];
+const MEMORY_FEED_DEFAULT_LIMIT = 50;
+const MEMORY_FEED_MAX_LIMIT = 100;
+const MEMORY_BROWSE_DEFAULT_LIMIT = 50;
+const MEMORY_BROWSE_MAX_LIMIT = 200;
+function positiveIntegerParam(value, fallback) {
+    const parsed = integerFromUnknown(value);
+    return parsed !== null && parsed > 0 ? parsed : fallback;
+}
+/** Server semantics (resolveTableFilter): a known table name filters to that
+ *  table; anything else means "all tables". Locally only `messages` has rows. */
+function localMemoryTypeHasRows(typeParam) {
+    if (!typeParam)
+        return true;
+    const t = typeParam.toLowerCase();
+    return (t === "messages" ||
+        !LOCAL_MEMORY_TABLE_NAMES.includes(t));
+}
+/** Every stored conversation message as a browse item, newest first — the same
+ *  projection memory-routes.ts memoryToBrowseItem produces from the messages
+ *  table. iOS local mode has no entity graph, so entityId is null. */
+function localMemoryFeedItems() {
+    const items = [];
+    for (const conversation of readStore().conversations) {
+        for (const message of conversation.messages) {
+            if (!message.text.trim())
+                continue;
+            items.push({
+                id: message.id,
+                type: "messages",
+                text: message.text,
+                entityId: null,
+                roomId: conversation.roomId,
+                agentId: null,
+                createdAt: message.timestamp,
+                metadata: { role: message.role, conversationId: conversation.id },
+                source: null,
+            });
+        }
+    }
+    items.sort((a, b) => b.createdAt - a.createdAt);
+    return items;
+}
+/** Keyword match — mirrors memory-routes.ts matchesKeyword. */
+function localMemoryMatchesKeyword(text, query) {
+    const normalizedText = text.toLowerCase();
+    const normalizedQuery = query.toLowerCase().trim();
+    if (!normalizedText || !normalizedQuery)
+        return false;
+    if (normalizedText.includes(normalizedQuery))
+        return true;
+    return normalizedQuery
+        .split(/\s+/)
+        .filter((term) => term.length >= 2)
+        .some((term) => normalizedText.includes(term));
+}
+function handleLocalMemoriesRoute(method, pathname, url) {
+    if (method !== "GET")
+        return null;
+    if (pathname === "/api/memories/feed") {
+        const limit = Math.min(Math.max(positiveIntegerParam(url.searchParams.get("limit"), MEMORY_FEED_DEFAULT_LIMIT), 1), MEMORY_FEED_MAX_LIMIT);
+        const beforeParam = url.searchParams.get("before");
+        const before = beforeParam ? Number(beforeParam) : undefined;
+        let items = localMemoryTypeHasRows(url.searchParams.get("type"))
+            ? localMemoryFeedItems()
+            : [];
+        if (before) {
+            items = items.filter((item) => item.createdAt < before);
+        }
+        const page = items.slice(0, limit);
+        return json({
+            memories: page,
+            count: page.length,
+            limit,
+            hasMore: items.length > limit,
+        });
+    }
+    if (pathname === "/api/memories/browse") {
+        const limit = Math.min(Math.max(positiveIntegerParam(url.searchParams.get("limit"), MEMORY_BROWSE_DEFAULT_LIMIT), 1), MEMORY_BROWSE_MAX_LIMIT);
+        const offset = positiveIntegerParam(url.searchParams.get("offset"), 0);
+        const searchQuery = url.searchParams.get("q")?.trim() ?? "";
+        const roomId = url.searchParams.get("roomId");
+        const entityIdParam = url.searchParams.get("entityId");
+        const entityIdsParam = url.searchParams.get("entityIds");
+        const hasEntityFilter = Boolean(entityIdParam || entityIdsParam);
+        let items = localMemoryTypeHasRows(url.searchParams.get("type"))
+            ? localMemoryFeedItems()
+            : [];
+        // Local items carry no entity ids — an entity filter matches nothing.
+        if (hasEntityFilter)
+            items = [];
+        if (roomId)
+            items = items.filter((item) => item.roomId === roomId);
+        if (searchQuery) {
+            items = items.filter((item) => localMemoryMatchesKeyword(item.text, searchQuery));
+        }
+        return json({
+            memories: items.slice(offset, offset + limit),
+            total: items.length,
+            limit,
+            offset,
+        });
+    }
+    if (pathname.startsWith("/api/memories/by-entity/")) {
+        const entityId = decodeURIComponent(pathname.slice("/api/memories/by-entity/".length));
+        if (!entityId)
+            return json({ error: "Missing entity identifier." }, 400);
+        const limit = Math.min(Math.max(positiveIntegerParam(url.searchParams.get("limit"), MEMORY_BROWSE_DEFAULT_LIMIT), 1), MEMORY_BROWSE_MAX_LIMIT);
+        const offset = positiveIntegerParam(url.searchParams.get("offset"), 0);
+        // No entity graph in iOS local mode — no memory is attributed to an entity.
+        return json({ entityId, memories: [], total: 0, limit, offset });
+    }
+    return null;
+}
+function readBrowserWorkspaceStore() {
+    const parsed = readJson(BROWSER_WORKSPACE_KEY, {
+        tabs: [],
+    });
+    return {
+        tabs: Array.isArray(parsed.tabs) ? parsed.tabs : [],
+    };
+}
+function writeBrowserWorkspaceStore(store) {
+    writeJson(BROWSER_WORKSPACE_KEY, store);
+}
+function normalizeBrowserWorkspaceUrl(rawUrl) {
+    const value = typeof rawUrl === "string" ? rawUrl.trim() : "";
+    if (!value)
+        return "about:blank";
+    if (value === "about:blank")
+        return value;
+    return /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(value) ? value : `https://${value}`;
+}
+function normalizeBrowserWorkspaceKind(value) {
+    return value === "internal" || value === "standard" ? value : undefined;
+}
+function browserWorkspaceSnapshot() {
+    return {
+        mode: "web",
+        tabs: readBrowserWorkspaceStore().tabs,
+    };
+}
+async function openBrowserWorkspaceTab(request) {
+    const body = await requestJson(request);
+    const now = nowIso();
+    const show = body.show !== false;
+    const tab = {
+        id: randomId("btab"),
+        title: typeof body.title === "string" && body.title.trim()
+            ? body.title.trim()
+            : "New tab",
+        url: normalizeBrowserWorkspaceUrl(body.url),
+        partition: typeof body.partition === "string" && body.partition.trim()
+            ? body.partition.trim()
+            : "persist:eliza-browser-user",
+        visible: show,
+        createdAt: now,
+        updatedAt: now,
+        lastFocusedAt: show ? now : null,
+    };
+    const kind = normalizeBrowserWorkspaceKind(body.kind);
+    if (kind)
+        tab.kind = kind;
+    const store = readBrowserWorkspaceStore();
+    const tabs = show
+        ? store.tabs.map((entry) => ({ ...entry, visible: false }))
+        : store.tabs;
+    tabs.push(tab);
+    writeBrowserWorkspaceStore({ tabs });
+    return json({ tab });
+}
+async function handleBrowserWorkspaceTabRoute(request, pathname) {
+    const method = request.method.toUpperCase();
+    const match = pathname.match(/^\/api\/browser-workspace\/tabs\/([^/]+)(?:\/(navigate|show|hide|snapshot))?$/);
+    if (!match)
+        return null;
+    const tabId = decodeURIComponent(match[1]).trim();
+    const action = match[2] ?? null;
+    const store = readBrowserWorkspaceStore();
+    const index = store.tabs.findIndex((tab) => tab.id === tabId);
+    if (index < 0) {
+        return json({ error: "Browser tab not found" }, 404);
+    }
+    if (!action && method === "DELETE") {
+        store.tabs.splice(index, 1);
+        writeBrowserWorkspaceStore(store);
+        return json({ closed: true });
+    }
+    if (action === "snapshot" && method === "GET") {
+        return json({ data: "" });
+    }
+    if (action === "show" && method === "POST") {
+        const now = nowIso();
+        store.tabs = store.tabs.map((tab) => tab.id === tabId
+            ? { ...tab, visible: true, updatedAt: now, lastFocusedAt: now }
+            : { ...tab, visible: false });
+        writeBrowserWorkspaceStore(store);
+        return json({ tab: store.tabs[index] });
+    }
+    if (action === "hide" && method === "POST") {
+        const now = nowIso();
+        store.tabs[index] = {
+            ...store.tabs[index],
+            visible: false,
+            updatedAt: now,
+        };
+        writeBrowserWorkspaceStore(store);
+        return json({ tab: store.tabs[index] });
+    }
+    if (action === "navigate" && method === "POST") {
+        const body = await requestJson(request);
+        const now = nowIso();
+        const url = normalizeBrowserWorkspaceUrl(body.url);
+        store.tabs[index] = {
+            ...store.tabs[index],
+            url,
+            title: url === "about:blank" ? "New tab" : store.tabs[index].title,
+            updatedAt: now,
+            lastFocusedAt: now,
+            visible: true,
+        };
+        store.tabs = store.tabs.map((tab) => tab.id === tabId ? store.tabs[index] : { ...tab, visible: false });
+        writeBrowserWorkspaceStore(store);
+        return json({ tab: store.tabs.find((tab) => tab.id === tabId) });
+    }
+    return null;
+}
+function readActiveModelState() {
+    const parsed = readJson(ACTIVE_MODEL_KEY, {});
+    if (parsed.status === "ready" &&
+        typeof parsed.modelId === "string" &&
+        parsed.modelId.trim()) {
+        return {
+            modelId: parsed.modelId.trim(),
+            loadedAt: typeof parsed.loadedAt === "string" ? parsed.loadedAt : nowIso(),
+            status: "ready",
+        };
+    }
+    return { modelId: null, loadedAt: null, status: "idle" };
+}
+function writeActiveModelState(state) {
+    activeState = state;
+    writeJson(ACTIVE_MODEL_KEY, state);
+}
+function readAssignments() {
+    const parsed = readJson(ASSIGNMENTS_KEY, {});
+    const next = {};
+    for (const [slot, modelId] of Object.entries(parsed)) {
+        const catalog = modelId ? findCatalogModel(modelId) : null;
+        if (isAgentModelSlot(slot) &&
+            modelId &&
+            catalog &&
+            isSettingsDefaultLocalModel(catalog)) {
+            next[slot] = modelId;
+        }
+    }
+    return next;
+}
+function writeAssignments(assignments) {
+    const next = {};
+    for (const [slot, modelId] of Object.entries(assignments)) {
+        const catalog = modelId ? findCatalogModel(modelId) : null;
+        if (isAgentModelSlot(slot) &&
+            modelId &&
+            catalog &&
+            isSettingsDefaultLocalModel(catalog)) {
+            next[slot] = modelId;
+        }
+    }
+    writeJson(ASSIGNMENTS_KEY, next);
+}
+function isAgentModelSlot(value) {
+    return AGENT_MODEL_SLOTS.includes(value);
+}
+async function capacitorLlamaProviderStatus() {
+    const available = Boolean(await loadCapacitorLlama());
+    return {
+        id: "capacitor-llama",
+        label: "Eliza-1 on-device runtime (mobile)",
+        kind: "local",
+        description: "Runs Eliza-1 natively inside the iOS app.",
+        supportedSlots: ["TEXT_SMALL", "TEXT_LARGE"],
+        configureHref: null,
+        enableState: {
+            enabled: available,
+            reason: available
+                ? "Native Capacitor runtime detected"
+                : "Native Eliza-1 runtime unavailable",
+        },
+        registeredSlots: activeState.status === "ready" ? ["TEXT_SMALL", "TEXT_LARGE"] : [],
+    };
+}
+function localConfig() {
+    const cloud = readIosCloudPairing();
+    return {
+        meta: { firstRunComplete: true },
+        ui: {},
+        cloud: {
+            enabled: cloud.paired,
+            connectionStatus: cloud.paired ? "connected" : "disconnected",
+            cloudProvisioned: cloud.paired,
+            activeAgentId: cloud.agentId,
+        },
+    };
+}
+function localAgentCapabilities() {
+    return {
+        mode: "ios-local",
+        apiBase: IOS_LOCAL_AGENT_IPC_BASE,
+        transport: {
+            foreground: "ittp",
+            background: "unavailable",
+            tcpListener: false,
+            nativeRequestProxy: false,
+        },
+        routeKernel: {
+            shape: "fetch",
+            hostedIn: "webview",
+            honoRoutesDetected: false,
+        },
+        backendRuntime: {
+            state: "compatibility-kernel",
+            fullAgentRuntime: false,
+            node: false,
+            bun: false,
+            taskService: false,
+            pluginLoader: false,
+        },
+        storage: {
+            conversations: "native-synced-localStorage",
+            localInferenceState: "native-synced-localStorage",
+        },
+        localInference: {
+            state: "available-when-native-llama-plugin-is-present",
+            provider: "capacitor-llama",
+        },
+        scheduledTasks: {
+            state: "unavailable",
+            primitive: "ScheduledTask",
+            reason: IOS_LOCAL_BACKGROUND_UNAVAILABLE_REASON,
+        },
+        apps: {
+            state: "catalog-unavailable",
+            reason: "The runtime AppManager is not mounted in the iOS ITTP kernel.",
+        },
+        plugins: {
+            state: "loader-unavailable",
+            reason: "The runtime plugin loader is not mounted in the iOS ITTP kernel.",
+        },
+    };
+}
+function unavailableLocalBackendRoute(error, details = {}, status = 503) {
+    return json({
+        ok: false,
+        error,
+        mode: "ios-local",
+        capabilities: localAgentCapabilities(),
+        ...details,
+    }, status);
+}
+function localCharacter() {
+    return {
+        name: AGENT_NAME,
+        bio: ["Private on-device assistant"],
+        lore: [],
+        knowledge: [],
+        messageExamples: [],
+        postExamples: [],
+        topics: [],
+        style: { all: [], chat: [], post: [] },
+        adjectives: [],
+    };
+}
+function localWalletConfig() {
+    return {
+        ...EMPTY_WALLET_ADDRESSES,
+        selectedRpcProviders: EMPTY_WALLET_RPC_SELECTIONS,
+        walletNetwork: "mainnet",
+        legacyCustomChains: [],
+        alchemyKeySet: false,
+        infuraKeySet: false,
+        ankrKeySet: false,
+        nodeRealBscRpcSet: false,
+        quickNodeBscRpcSet: false,
+        managedBscRpcReady: false,
+        cloudManagedAccess: false,
+        evmBalanceReady: false,
+        ethereumBalanceReady: false,
+        baseBalanceReady: false,
+        bscBalanceReady: false,
+        avalancheBalanceReady: false,
+        solanaBalanceReady: false,
+        heliusKeySet: false,
+        birdeyeKeySet: false,
+        evmChains: [
+            "Ethereum",
+            "Base",
+            "Arbitrum",
+            "Optimism",
+            "Polygon",
+            "BSC",
+            "Avalanche",
+        ],
+        walletSource: "none",
+        automationMode: "connectors-only",
+        pluginEvmLoaded: false,
+        pluginEvmRequired: false,
+        executionReady: false,
+        executionBlockedReason: "No wallet is configured for local iOS mode.",
+        evmSigningCapability: "none",
+        evmSigningReason: "No wallet is configured for local iOS mode.",
+        solanaSigningAvailable: false,
+        wallets: [],
+    };
+}
+function isWalletMarketOverviewSource(value) {
+    const record = asRecord(value);
+    return (record !== null &&
+        typeof record.providerId === "string" &&
+        typeof record.providerName === "string" &&
+        typeof record.providerUrl === "string" &&
+        typeof record.available === "boolean" &&
+        typeof record.stale === "boolean" &&
+        (record.error === null ||
+            record.error === undefined ||
+            typeof record.error === "string"));
+}
+function isWalletMarketOverview(value) {
+    const record = asRecord(value);
+    const sources = asRecord(record?.sources);
+    return (record !== null &&
+        typeof record.generatedAt === "string" &&
+        typeof record.cacheTtlSeconds === "number" &&
+        typeof record.stale === "boolean" &&
+        sources !== null &&
+        isWalletMarketOverviewSource(sources.prices) &&
+        isWalletMarketOverviewSource(sources.movers) &&
+        isWalletMarketOverviewSource(sources.predictions) &&
+        Array.isArray(record.prices) &&
+        Array.isArray(record.movers) &&
+        Array.isArray(record.predictions));
+}
+function readCachedWalletMarketOverview() {
+    const parsed = readJson(WALLET_MARKET_OVERVIEW_KEY, null);
+    if (!parsed ||
+        typeof parsed.expiresAt !== "number" ||
+        !isWalletMarketOverview(parsed.response)) {
+        return null;
+    }
+    return parsed;
+}
+function writeCachedWalletMarketOverview(response) {
+    const cacheTtlSeconds = typeof response.cacheTtlSeconds === "number" && response.cacheTtlSeconds > 0
+        ? response.cacheTtlSeconds
+        : Math.floor(WALLET_MARKET_OVERVIEW_CACHE_TTL_MS / 1000);
+    writeJson(WALLET_MARKET_OVERVIEW_KEY, {
+        response,
+        expiresAt: Date.now() + cacheTtlSeconds * 1000,
+    });
+}
+function staleWalletMarketOverview(response) {
+    const sources = asRecord(response.sources) ?? {};
+    const markStale = (value) => {
+        const source = asRecord(value);
+        return source ? { ...source, stale: true } : value;
+    };
+    return {
+        ...response,
+        stale: true,
+        sources: {
+            prices: markStale(sources.prices),
+            movers: markStale(sources.movers),
+            predictions: markStale(sources.predictions),
+        },
+    };
+}
+function normalizeCloudMarketPreviewBaseUrl(rawBaseUrl) {
+    try {
+        const parsed = new URL(rawBaseUrl);
+        parsed.hash = "";
+        parsed.search = "";
+        parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+        if (!parsed.pathname || parsed.pathname === "/") {
+            parsed.pathname = "/api/v1";
+        }
+        else if (!parsed.pathname.endsWith("/api/v1")) {
+            parsed.pathname = `${parsed.pathname}/api/v1`;
+        }
+        return parsed.toString().replace(/\/+$/, "");
+    }
+    catch {
+        return `${DEFAULT_CLOUD_MARKET_PREVIEW_BASE_URL}/api/v1`;
+    }
+}
+function resolveCloudWalletMarketOverviewUrl() {
+    const rawBase = getBootConfig().cloudApiBase;
+    const cloudApiBase = typeof rawBase === "string"
+        ? rawBase
+        : DEFAULT_CLOUD_MARKET_PREVIEW_BASE_URL;
+    return `${normalizeCloudMarketPreviewBaseUrl(cloudApiBase)}${CLOUD_WALLET_MARKET_OVERVIEW_PATH}`;
+}
+async function fetchJsonWithTimeout(url) {
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => {
+        controller.abort();
+    }, WALLET_MARKET_OVERVIEW_FETCH_TIMEOUT_MS);
+    try {
+        const response = await fetch(url, {
+            method: "GET",
+            headers: { accept: "application/json" },
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            throw new Error(`Market feed responded ${response.status}`);
+        }
+        return response.json();
+    }
+    finally {
+        globalThis.clearTimeout(timeout);
+    }
+}
+async function fetchCoinGeckoWalletMarketOverview() {
+    const payload = await fetchJsonWithTimeout(buildCoinGeckoMarketsUrl());
+    const markets = parseCoinGeckoMarkets(payload);
+    const coinGeckoSource = {
+        ...COINGECKO_MARKET_PROVIDER,
+        available: true,
+        stale: false,
+        error: null,
+    };
+    return {
+        generatedAt: nowIso(),
+        cacheTtlSeconds: Math.floor(WALLET_MARKET_OVERVIEW_CACHE_TTL_MS / 1000),
+        stale: false,
+        sources: {
+            prices: coinGeckoSource,
+            movers: coinGeckoSource,
+            predictions: {
+                ...POLYMARKET_MARKET_PROVIDER,
+                available: false,
+                stale: false,
+                error: "Polymarket preview requires the Eliza Cloud market feed.",
+            },
+        },
+        prices: buildMarketPriceSnapshots(markets),
+        movers: buildMarketMovers(markets),
+        predictions: [],
+    };
+}
+let walletMarketOverviewInFlight = null;
+async function refreshWalletMarketOverview() {
+    if (!walletMarketOverviewInFlight) {
+        walletMarketOverviewInFlight = (async () => {
+            const cloudPayload = await fetchJsonWithTimeout(resolveCloudWalletMarketOverviewUrl()).catch(() => fetchCoinGeckoWalletMarketOverview());
+            if (!isWalletMarketOverview(cloudPayload)) {
+                throw new Error("Wallet market feed returned an invalid response");
+            }
+            writeCachedWalletMarketOverview(cloudPayload);
+            return cloudPayload;
+        })().finally(() => {
+            walletMarketOverviewInFlight = null;
+        });
+    }
+    return walletMarketOverviewInFlight;
+}
+function emptyWalletMarketOverview(error = "Market data is unavailable in local iOS mode.") {
+    const unavailable = (provider) => ({
+        ...provider,
+        available: false,
+        stale: false,
+        error,
+    });
+    return {
+        generatedAt: nowIso(),
+        cacheTtlSeconds: 0,
+        stale: false,
+        sources: {
+            prices: unavailable(COINGECKO_MARKET_PROVIDER),
+            movers: unavailable(COINGECKO_MARKET_PROVIDER),
+            predictions: unavailable(POLYMARKET_MARKET_PROVIDER),
+        },
+        prices: [],
+        movers: [],
+        predictions: [],
+    };
+}
+async function localWalletMarketOverview() {
+    if (typeof window === "undefined") {
+        return emptyWalletMarketOverview();
+    }
+    const cached = readCachedWalletMarketOverview();
+    if (cached) {
+        if (cached.expiresAt > Date.now()) {
+            return cached.response;
+        }
+        void refreshWalletMarketOverview();
+        return staleWalletMarketOverview(cached.response);
+    }
+    try {
+        return await refreshWalletMarketOverview();
+    }
+    catch (error) {
+        return emptyWalletMarketOverview(error instanceof Error ? error.message : "Market data is unavailable.");
+    }
+}
+function emptyWalletTradingProfile(url) {
+    const windowParam = url.searchParams.get("window");
+    const sourceParam = url.searchParams.get("source");
+    const selectedWindow = windowParam === "24h" ||
+        windowParam === "7d" ||
+        windowParam === "30d" ||
+        windowParam === "all"
+        ? windowParam
+        : "30d";
+    const selectedSource = sourceParam === "agent" || sourceParam === "manual" || sourceParam === "all"
+        ? sourceParam
+        : "all";
+    return {
+        window: selectedWindow,
+        source: selectedSource,
+        generatedAt: nowIso(),
+        summary: {
+            totalSwaps: 0,
+            buyCount: 0,
+            sellCount: 0,
+            settledCount: 0,
+            successCount: 0,
+            revertedCount: 0,
+            tradeWinRate: null,
+            txSuccessRate: null,
+            winningTrades: 0,
+            evaluatedTrades: 0,
+            realizedPnlBnb: "0",
+            volumeBnb: "0",
+        },
+        pnlSeries: [],
+        tokenBreakdown: [],
+        recentSwaps: [],
+    };
+}
+function json(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+        },
+    });
+}
+function textEventStream(events) {
+    const body = events
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join("");
+    return new Response(body, {
+        headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-store",
+        },
+    });
+}
+async function requestJson(request) {
+    const text = await request.text();
+    if (!text.trim())
+        return {};
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return {};
+    return parsed;
+}
+async function loadCapacitorLlama() {
+    llamaAdapterPromise ??= (async () => {
+        try {
+            const packageName = "@elizaos/capacitor-llama";
+            const mod = (await import(__rewriteRelativeImportExtension(
+            /* @vite-ignore */ packageName)));
+            return mod?.capacitorLlama ?? null;
+        }
+        catch {
+            // error-policy:J4 optional native module — builds without the llama
+            // bridge get null; callers throw an explicit "runtime unavailable".
+            return null;
+        }
+    })();
+    return llamaAdapterPromise;
+}
+async function loadLlamaCpp() {
+    llamaCppPromise ??= (async () => {
+        try {
+            const packageName = "llama-cpp-capacitor";
+            return (await import(__rewriteRelativeImportExtension(/* @vite-ignore */ packageName)));
+        }
+        catch {
+            // error-policy:J4 optional native module — builds without llama.cpp
+            // get null; callers throw an explicit "runtime unavailable".
+            return null;
+        }
+    })();
+    return llamaCppPromise;
+}
+function modelFilename(model) {
+    return `${model.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.gguf`;
+}
+function buildHuggingFaceResolveUrlForPath(model, filePath) {
+    const encodedPath = filePath
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+    return `https://huggingface.co/${model.hfRepo}/resolve/main/${encodedPath}?download=true`;
+}
+function buildHuggingFaceResolveUrl(model) {
+    return buildHuggingFaceResolveUrlForPath(model, model.ggufFile);
+}
+function basename(filePath) {
+    return filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
+}
+function dirname(filePath) {
+    const index = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
+    return index > 0 ? filePath.slice(0, index) : undefined;
+}
+function commonBundleRoot(paths) {
+    const dirs = [...paths]
+        .map(dirname)
+        .filter((dir) => Boolean(dir));
+    if (dirs.length === 0)
+        return undefined;
+    const [first, ...rest] = dirs;
+    return rest.every((dir) => dir === first) ? first : undefined;
+}
+function normalizedSha256(value) {
+    return typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
+        ? value
+        : null;
+}
+function normalizeNativeHashResult(result) {
+    if (typeof result === "string") {
+        const sha256 = normalizedSha256(result);
+        if (!sha256)
+            throw new Error("Native hashFile returned an invalid SHA256");
+        return { sha256 };
+    }
+    const sha256 = normalizedSha256(result.sha256 ?? result.hash);
+    if (!sha256)
+        throw new Error("Native hashFile returned an invalid SHA256");
+    const sizeBytes = typeof result.sizeBytes === "number"
+        ? result.sizeBytes
+        : typeof result.size === "number"
+            ? result.size
+            : undefined;
+    return {
+        sha256,
+        ...(typeof sizeBytes === "number" && sizeBytes >= 0 ? { sizeBytes } : {}),
+    };
+}
+async function hashNativeBundleFile(llama, filePath, label) {
+    if (!llama.hashFile) {
+        throw new Error(`Native Eliza-1 downloader cannot verify SHA256 for ${label}; refusing bundle install.`);
+    }
+    return normalizeNativeHashResult(await llama.hashFile(filePath));
+}
+async function verifyNativeBundleFile(llama, filePath, expectedSha256, label) {
+    const hashed = await hashNativeBundleFile(llama, filePath, label);
+    if (hashed.sha256 !== expectedSha256) {
+        throw new Error(`SHA256 mismatch for ${label}: expected ${expectedSha256}, got ${hashed.sha256}`);
+    }
+    return hashed;
+}
+function iosBundleFilename(model, filePath) {
+    if (filePath === model.bundleManifestFile) {
+        return `${model.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.manifest.json`;
+    }
+    const name = basename(filePath);
+    if (/\.gguf$/i.test(name))
+        return name;
+    const safePath = filePath.replace(/[^a-zA-Z0-9._-]/g, "_");
+    return `${model.id.replace(/[^a-zA-Z0-9._-]/g, "_")}__${safePath}`;
+}
+function parseIosBundleManifest(input, model) {
+    if (!input || typeof input !== "object") {
+        throw new Error("Invalid Eliza-1 manifest: expected object");
+    }
+    const raw = input;
+    if (raw.id !== model.id) {
+        throw new Error(`Invalid Eliza-1 manifest id for ${model.id}`);
+    }
+    if (raw.defaultEligible !== true || typeof raw.version !== "string") {
+        throw new Error("Invalid Eliza-1 manifest metadata");
+    }
+    if (!raw.files || typeof raw.files !== "object") {
+        throw new Error("Invalid Eliza-1 manifest files");
+    }
+    for (const kind of [
+        "text",
+        "voice",
+        "asr",
+        "vision",
+        "cache",
+        "vad",
+    ]) {
+        if (!Array.isArray(raw.files[kind])) {
+            throw new Error(`Invalid Eliza-1 manifest files.${kind}`);
+        }
+    }
+    for (const kind of ["text", "voice", "asr", "cache", "vad"]) {
+        if (raw.files[kind].length === 0) {
+            throw new Error(`Invalid Eliza-1 manifest files.${kind} must be non-empty`);
+        }
+    }
+    if (!raw.files.text.some((entry) => entry.path === model.ggufFile)) {
+        throw new Error(`Eliza-1 manifest missing text file ${model.ggufFile}`);
+    }
+    return raw;
+}
+function collectIosBundleFiles(manifest) {
+    const files = new Map();
+    for (const entries of [
+        manifest.files.text,
+        manifest.files.voice,
+        manifest.files.asr,
+        manifest.files.vision,
+        manifest.files.cache,
+        manifest.files.embedding ?? [],
+        manifest.files.vad ?? [],
+        manifest.files.wakeword ?? [],
+    ]) {
+        for (const entry of entries)
+            files.set(entry.path, entry);
+    }
+    return [...files.values()];
+}
+function catalogForAvailableModel(model) {
+    const haystack = `${model.name ?? ""} ${model.path ?? ""}`.toLowerCase();
+    const filenameCandidates = [model.name, model.path?.split(/[\\/]/).pop()]
+        .filter((value) => Boolean(value))
+        .map((value) => value.toLowerCase());
+    const fileMatch = MODEL_CATALOG.find((candidate) => {
+        const file = candidate.ggufFile.split("/").pop()?.toLowerCase() ?? "";
+        return file.length > 0 && filenameCandidates.includes(file);
+    });
+    if (fileMatch)
+        return fileMatch;
+    return [...MODEL_CATALOG]
+        .sort((a, b) => b.id.length - a.id.length)
+        .find((candidate) => haystack.includes(candidate.id.toLowerCase()));
+}
+function mobileRecommendedBucket(totalRamGb) {
+    if (totalRamGb >= 32)
+        return "xl";
+    if (totalRamGb >= 16)
+        return "large";
+    if (totalRamGb >= 12)
+        return "mid";
+    return "small";
+}
+function positiveFiniteNumber(value) {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? value
+        : null;
+}
+function fallbackMobileTotalRamGb(platform) {
+    const browserMemory = typeof navigator === "undefined"
+        ? null
+        : positiveFiniteNumber(navigator.deviceMemory);
+    if (browserMemory)
+        return browserMemory;
+    return platform === "ios" ? 8 : 4;
+}
+function normalizeMobilePlatform(platform) {
+    return platform === "android" ? "android" : "ios";
+}
+function gpuBackendForMobile(platform, backend) {
+    if (backend === "vulkan")
+        return "vulkan";
+    return platform === "android" ? "vulkan" : "metal";
+}
+function mobileContextSize(hardware, catalog) {
+    const target = catalog?.contextLength ?? 4096;
+    if (hardware.totalRamGb >= 12)
+        return Math.min(target, 8192);
+    if (hardware.totalRamGb >= 8)
+        return Math.min(target, 6144);
+    return Math.min(target, 4096);
+}
+function mobileThreadCount(hardware) {
+    if (!Number.isFinite(hardware.cpuCores) || hardware.cpuCores <= 0)
+        return 0;
+    return Math.max(2, Math.min(Math.floor(hardware.cpuCores) - 1, 6));
+}
+function _companionInstalled(installed, modelId) {
+    return installed.find((entry) => entry.id === modelId);
+}
+async function listInstalledModels() {
+    const llama = await loadLlamaCpp();
+    const result = await llama?.getAvailableModels?.().catch(() => []);
+    const models = Array.isArray(result) ? result : (result?.models ?? []);
+    const installedAt = nowIso();
+    const bundles = readBundleIndex();
+    return models
+        .filter((model) => typeof model.path === "string" && model.path.length > 0)
+        .map((model) => {
+        const catalog = catalogForAvailableModel(model);
+        if (!catalog)
+            return null;
+        const id = catalog.id;
+        const bundle = bundles[catalog.id];
+        return {
+            id,
+            displayName: catalog.displayName,
+            path: model.path,
+            sizeBytes: typeof model.size === "number" ? model.size : 0,
+            ...(bundle?.bundleRoot ? { bundleRoot: bundle.bundleRoot } : {}),
+            ...(bundle?.manifestPath ? { manifestPath: bundle.manifestPath } : {}),
+            ...(bundle?.manifestSha256
+                ? { manifestSha256: bundle.manifestSha256 }
+                : {}),
+            ...(bundle?.bundleVersion
+                ? { bundleVersion: bundle.bundleVersion }
+                : {}),
+            ...(typeof bundle?.bundleSizeBytes === "number"
+                ? { bundleSizeBytes: bundle.bundleSizeBytes }
+                : {}),
+            hfRepo: catalog.hfRepo,
+            installedAt,
+            lastUsedAt: activeState.modelId === id ? activeState.loadedAt : null,
+            source: "eliza-download",
+            ...(bundle?.installedAt
+                ? { bundleVerifiedAt: bundle.installedAt }
+                : {}),
+            ...(catalog.runtimeRole ? { runtimeRole: catalog.runtimeRole } : {}),
+        };
+    })
+        .filter((model) => model !== null);
+}
+async function hardwareProbe() {
+    const llama = await loadCapacitorLlama();
+    // error-policy:J4 capability probe — without native hardware info the probe
+    // degrades to navigator hints + per-platform RAM defaults below.
+    const hardware = await llama?.getHardwareInfo?.().catch(() => null);
+    const cpuCores = hardware?.cpuCores ?? navigator.hardwareConcurrency ?? 0;
+    const platform = normalizeMobilePlatform(hardware?.platform);
+    const totalRamGb = positiveFiniteNumber(hardware?.totalRamGb) ??
+        fallbackMobileTotalRamGb(platform);
+    const availableRamGb = positiveFiniteNumber(hardware?.availableRamGb) ?? totalRamGb;
+    const gpu = hardware?.gpu?.available && hardware.gpuSupported !== false
+        ? {
+            backend: gpuBackendForMobile(platform, hardware.gpu.backend),
+            totalVramGb: 0,
+            freeVramGb: 0,
+        }
+        : null;
+    return {
+        totalRamGb,
+        freeRamGb: availableRamGb,
+        gpu,
+        cpuCores,
+        platform: platform,
+        arch: "arm64",
+        appleSilicon: true,
+        recommendedBucket: mobileRecommendedBucket(totalRamGb),
+        source: "os-fallback",
+        mobile: {
+            platform,
+            ...(hardware?.deviceModel ? { deviceModel: hardware.deviceModel } : {}),
+            ...(hardware?.machineId ? { machineId: hardware.machineId } : {}),
+            ...(hardware?.osVersion ? { osVersion: hardware.osVersion } : {}),
+            ...(typeof hardware?.isSimulator === "boolean"
+                ? { isSimulator: hardware.isSimulator }
+                : {}),
+            availableRamGb,
+            ...(typeof hardware?.freeStorageGb === "number"
+                ? { freeStorageGb: hardware.freeStorageGb }
+                : {}),
+            ...(typeof hardware?.lowPowerMode === "boolean"
+                ? { lowPowerMode: hardware.lowPowerMode }
+                : {}),
+            ...(hardware?.thermalState
+                ? { thermalState: hardware.thermalState }
+                : {}),
+            gpuSupported: hardware?.gpuSupported ?? Boolean(gpu),
+            mtpSupported: hardware?.mtpSupported ?? true,
+            mtpReason: hardware?.mtpReason ?? "native MTP is catalog-enabled",
+            source: hardware?.source ?? "adapter-fallback",
+        },
+    };
+}
+function buildMobileLoadOptions(model, installed, hardware) {
+    void installed;
+    const catalog = findCatalogModel(model.id);
+    const mtp = catalog?.runtime?.mtp;
+    const options = {
+        modelPath: model.path,
+        contextSize: mobileContextSize(hardware, catalog),
+        useGpu: hardware.mobile?.gpuSupported !== false,
+        maxThreads: mobileThreadCount(hardware),
+    };
+    return {
+        ...options,
+        draftContextSize: options.contextSize,
+        draftMin: mtp?.draftMin ?? 1,
+        draftMax: mtp?.draftMax ?? 1,
+        speculativeSamples: Math.min(mtp?.draftMax ?? 1, 4),
+        mobileSpeculative: true,
+        cacheTypeK: catalog?.runtime?.kvCache?.typeK,
+        cacheTypeV: catalog?.runtime?.kvCache?.typeV,
+        disableThinking: true,
+    };
+}
+function runtimeSignature(options) {
+    return [
+        options.modelPath,
+        options.contextSize ?? "",
+        options.draftModelPath ?? "",
+        options.draftContextSize ?? "",
+        options.speculativeSamples ?? "",
+        options.cacheTypeK ?? "",
+        options.cacheTypeV ?? "",
+    ].join("|");
+}
+async function validateMobileModelFit(model) {
+    const hardware = await hardwareProbe();
+    const fit = assessCatalogModelFit(hardware, model, MODEL_CATALOG);
+    if (fit === "wontfit") {
+        return `${model.displayName} is above this device's local inference minspec. Switch to a smaller model.`;
+    }
+    const freeStorageGb = hardware.mobile?.freeStorageGb;
+    if (typeof freeStorageGb === "number" && freeStorageGb > 0) {
+        const requiredGb = catalogDownloadSizeGb(model, MODEL_CATALOG);
+        if (requiredGb > freeStorageGb * 0.9) {
+            return `Not enough free storage for ${model.displayName}: needs about ${requiredGb.toFixed(1)} GB including companions, ${freeStorageGb.toFixed(1)} GB available.`;
+        }
+    }
+    return null;
+}
+let loadInFlightPromise = null;
+async function ensureActiveModelLoadedImpl() {
+    if (activeState.status !== "ready" || !activeState.modelId) {
+        throw new Error("No local model is active. Install and activate a GGUF model first.");
+    }
+    const installed = await listInstalledModels();
+    const model = installed.find((entry) => entry.id === activeState.modelId);
+    if (!model) {
+        writeActiveModelState({
+            modelId: activeState.modelId,
+            loadedAt: null,
+            status: "error",
+            error: "Active model file is missing",
+        });
+        throw new Error("Active model file is missing");
+    }
+    const catalog = findCatalogModel(model.id);
+    if (!catalog ||
+        !isSettingsDefaultLocalModel(catalog) ||
+        !model.bundleVerifiedAt) {
+        writeActiveModelState({
+            modelId: activeState.modelId,
+            loadedAt: null,
+            status: "error",
+            error: "Active model is not a verified Eliza-1 bundle",
+        });
+        throw new Error("Active model is not a verified Eliza-1 bundle");
+    }
+    const llama = await loadCapacitorLlama();
+    if (!llama?.load || !llama.generate) {
+        throw new Error("Native Eliza-1 runtime is not available on this build.");
+    }
+    const hardware = await hardwareProbe();
+    const loadOptions = buildMobileLoadOptions(model, installed, hardware);
+    const signature = runtimeSignature(loadOptions);
+    // error-policy:J4 already-loaded probe — an unanswerable probe falls
+    // through to the real llama.load below, whose failure throws to the caller.
+    const loaded = await llama.isLoaded?.().catch(() => null);
+    if (loaded?.loaded &&
+        loaded.modelPath === model.path &&
+        loadedRuntimeSignature === signature) {
+        return;
+    }
+    await llama.load(loadOptions);
+    loadedRuntimeSignature = signature;
+}
+/**
+ * Load the active local model into the native llama runtime.
+ *
+ * Mutex: concurrent callers (e.g. a chat send racing the background-runner
+ * pre-warm) share the same in-flight promise. Without this, two parallel
+ * `llama.load(...)` calls can land back-to-back during a cold boot and
+ * either tear down each other's mmap state or double-allocate the KV cache.
+ */
+async function ensureActiveModelLoaded() {
+    if (loadInFlightPromise) {
+        return loadInFlightPromise;
+    }
+    loadInFlightPromise = ensureActiveModelLoadedImpl().finally(() => {
+        loadInFlightPromise = null;
+    });
+    return loadInFlightPromise;
+}
+function emptyUsage(modelId) {
+    return {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        ...(modelId ? { model: modelId } : {}),
+    };
+}
+async function localModelStatusReply(text) {
+    const intent = classifyLocalModelIntent(text);
+    if (activeState.status === "ready" && intent !== "status")
+        return null;
+    const hardware = await hardwareProbe();
+    const activeCatalog = activeState.modelId
+        ? findCatalogModel(activeState.modelId)
+        : null;
+    let model = activeCatalog ??
+        selectRecommendedModelForSlot("TEXT_LARGE", hardware, MODEL_CATALOG).model;
+    if (!model) {
+        return {
+            text: "I could not find a local model that fits this device.",
+            usage: emptyUsage(activeState.modelId),
+            localInference: {
+                intent: intent ?? "status",
+                status: "failed",
+                activeModelId: activeState.modelId,
+                error: "No fitting local model in catalog",
+            },
+        };
+    }
+    if (intent === "switch_smaller") {
+        const smaller = chooseSmallerFallbackModel(model.id, hardware, "TEXT_LARGE", MODEL_CATALOG);
+        if (smaller)
+            model = smaller;
+        const validationError = await validateMobileModelFit(model);
+        if (validationError) {
+            return {
+                text: validationError,
+                usage: emptyUsage(model.id),
+                localInference: {
+                    intent,
+                    status: validationError.toLowerCase().includes("storage")
+                        ? "no_space"
+                        : "failed",
+                    modelId: model.id,
+                    activeModelId: activeState.modelId,
+                    error: validationError,
+                },
+            };
+        }
+        startDownload(model);
+    }
+    else if (intent === "download" ||
+        intent === "redownload" ||
+        activeState.status === "idle" ||
+        !activeState.modelId) {
+        const validationError = await validateMobileModelFit(model);
+        if (validationError) {
+            const smaller = chooseSmallerFallbackModel(model.id, hardware, "TEXT_LARGE", MODEL_CATALOG);
+            if (smaller) {
+                model = smaller;
+            }
+            else {
+                return {
+                    text: validationError,
+                    usage: emptyUsage(model.id),
+                    localInference: {
+                        intent: intent ?? "download",
+                        status: validationError.toLowerCase().includes("storage")
+                            ? "no_space"
+                            : "failed",
+                        modelId: model.id,
+                        activeModelId: activeState.modelId,
+                        error: validationError,
+                    },
+                };
+            }
+        }
+        startDownload(model);
+    }
+    else if (intent === "cancel") {
+        for (const job of aggregateDownloadJobs(model)) {
+            if (["queued", "downloading"].includes(job.state)) {
+                updateDownload(job, { state: "cancelled", etaMs: 0 });
+            }
+        }
+    }
+    const jobs = aggregateDownloadJobs(model);
+    const progress = aggregateProgress(jobs);
+    if (activeState.status === "ready") {
+        return {
+            text: `Local inference is ready on ${model.displayName}.`,
+            usage: emptyUsage(model.id),
+            localInference: {
+                intent: "status",
+                status: "ready",
+                modelId: model.id,
+                activeModelId: activeState.modelId,
+            },
+        };
+    }
+    const state = activeState.status === "loading"
+        ? "loading"
+        : progress.state === "failed"
+            ? progress.error?.toLowerCase().includes("space")
+                ? "no_space"
+                : "failed"
+            : progress.state === "cancelled"
+                ? "cancelled"
+                : progress.state === "completed"
+                    ? "loading"
+                    : progress.state === "missing"
+                        ? "missing"
+                        : "downloading";
+    return {
+        text: statusLine(model, jobs),
+        usage: emptyUsage(model.id),
+        localInference: {
+            intent: intent ?? "status",
+            status: state,
+            modelId: model.id,
+            activeModelId: activeState.modelId,
+            ...(progress.error ? { error: progress.error } : {}),
+            progress: {
+                ...(progress.percent !== null ? { percent: progress.percent } : {}),
+                receivedBytes: progress.received,
+                totalBytes: progress.total ||
+                    Math.round(catalogDownloadSizeGb(model, MODEL_CATALOG) * 1024 ** 3),
+                bytesPerSec: progress.bytesPerSec,
+                etaMs: progress.etaMs,
+            },
+        },
+    };
+}
+function buildPrompt(messages, latestText) {
+    const history = messages
+        .slice(-12)
+        .map((message) => {
+        const role = message.role === "assistant" ? "Assistant" : "User";
+        return `${role}: ${message.text}`;
+    })
+        .join("\n");
+    return `${DEFAULT_SYSTEM_PROMPT}\n\n${history}${history ? "\n" : ""}User: ${latestText}\nAssistant:`;
+}
+function classifyIosLocalGenerateError(err) {
+    if (err instanceof Error) {
+        const name = err.name;
+        const msg = err.message.toLowerCase();
+        if (name === "AbortError") {
+            return { fallback: false, reason: "local-aborted-pre-completion" };
+        }
+        if (msg.includes("native eliza-1 runtime is not available") ||
+            msg.includes("not loaded") ||
+            msg.includes("not installed") ||
+            msg.includes("not staged")) {
+            return { fallback: true, reason: "local-unavailable" };
+        }
+        if (msg.includes("thermal") ||
+            msg.includes("low-power") ||
+            msg.includes("memory slot")) {
+            return { fallback: true, reason: "local-overloaded" };
+        }
+    }
+    return { fallback: false, reason: "local-error" };
+}
+const CLOUD_PAIRED_PROBE_TIMEOUT_MS = 2_000;
+const fetchWithOptionalPreconnect = fetch;
+const fetchIosKernelRoute = Object.assign(async function fetchIosKernelRoute(input, init) {
+    const request = input instanceof Request ? input : new Request(input, init);
+    return handleIosLocalAgentRequest(request);
+}, {
+    preconnect: (...args) => fetchWithOptionalPreconnect.preconnect?.(...args),
+});
+async function probeAgentCloudPaired(fetchImpl = fetchIosKernelRoute) {
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(() => controller.abort(), CLOUD_PAIRED_PROBE_TIMEOUT_MS);
+    let response;
+    try {
+        response = await fetchImpl(`${IOS_LOCAL_AGENT_IPC_BASE}/api/auth/status`, {
+            method: "GET",
+            headers: { accept: "application/json" },
+            signal: controller.signal,
+        });
+    }
+    catch (err) {
+        return {
+            kind: "unknown",
+            reason: err instanceof Error ? err.message : String(err),
+        };
+    }
+    finally {
+        globalThis.clearTimeout(timer);
+    }
+    if (!response.ok) {
+        return { kind: "unknown", reason: `auth-status http ${response.status}` };
+    }
+    // error-policy:J3 body-parse failure maps to the explicit "unknown" pairing
+    // result below — never a fake "paired"/"not-paired".
+    const body = await response.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+        return { kind: "unknown", reason: "auth-status non-object body" };
+    }
+    const cloudProvisioned = body
+        .cloudProvisioned;
+    if (cloudProvisioned === true) {
+        return { kind: "paired" };
+    }
+    return { kind: "not-paired", reason: "cloudProvisioned=false" };
+}
+function cloudBridgeResultText(result) {
+    const record = asRecord(result);
+    if (!record)
+        return null;
+    return (stringValue(record.text) ??
+        stringValue(record.reply) ??
+        stringValue(record.message));
+}
+async function sendPromptToIosCloud(prompt) {
+    const pairing = readIosCloudPairing();
+    if (!pairing.paired || !pairing.agentId || !pairing.token) {
+        throw new Error("Eliza Cloud is not paired.");
+    }
+    const response = await fetch(`${pairing.apiBase}/api/v1/eliza/agents/${encodeURIComponent(pairing.agentId)}/bridge`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            authorization: `Bearer ${pairing.token}`,
+        },
+        body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: randomId("cloud"),
+            method: "message.send",
+            params: { text: prompt },
+        }),
+    });
+    if (!response.ok) {
+        throw new Error(`Cloud bridge failed: HTTP ${response.status}`);
+    }
+    // error-policy:J3 body-parse failure becomes the explicit non-object throw
+    // below instead of a fabricated bridge reply.
+    const body = asRecord(await response.json().catch(() => null));
+    if (!body) {
+        throw new Error("Cloud bridge returned a non-object response.");
+    }
+    const error = asRecord(body.error);
+    if (error) {
+        throw new Error(stringValue(error.message) ?? "Cloud bridge returned an error.");
+    }
+    const result = asRecord(body.result);
+    const text = cloudBridgeResultText(result);
+    if (!text) {
+        throw new Error("Cloud bridge response missing text.");
+    }
+    const modelId = stringValue(result?.model);
+    return {
+        text,
+        promptTokens: 0,
+        completionTokens: 0,
+        ...(modelId ? { modelId } : {}),
+    };
+}
+async function handleIosCloudChat(request) {
+    const body = await requestJson(request);
+    const prompt = stringValue(body.prompt) ??
+        stringValue(body.text) ??
+        stringValue(body.message);
+    if (!prompt)
+        return json({ error: "prompt is required" }, 400);
+    try {
+        return json(await sendPromptToIosCloud(prompt));
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, message.includes("not paired") ? 409 : 502);
+    }
+}
+/**
+ * Forward a prompt to the paired Eliza Cloud agent. The local agent's
+ * `/api/cloud/chat` proxy already understands how to relay this to the
+ * cloud-side model; we send a typed POST and return the canonical
+ * `CloudForwardResult` shape. Errors propagate so the caller can decide
+ * whether to surface "honest cloud failed" or just rethrow.
+ */
+async function forwardToAgentCloudChat(prompt, fetchImpl = fetchIosKernelRoute) {
+    const response = await fetchImpl(`${IOS_LOCAL_AGENT_IPC_BASE}/api/cloud/chat`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+        },
+        body: JSON.stringify({ prompt, maxTokens: 256, temperature: 0.7 }),
+    });
+    if (!response.ok) {
+        throw new Error(`[ios-local-agent] Cloud fallback failed: HTTP ${response.status} ${response.statusText}`);
+    }
+    const body = await response.json();
+    if (!body || typeof body !== "object") {
+        throw new Error("[ios-local-agent] Cloud fallback: non-object response");
+    }
+    const record = body;
+    const textValue = record.text;
+    if (typeof textValue !== "string") {
+        throw new Error("[ios-local-agent] Cloud fallback: response missing string 'text'");
+    }
+    const promptTokens = Number.isFinite(record.promptTokens)
+        ? record.promptTokens
+        : 0;
+    const completionTokens = Number.isFinite(record.completionTokens)
+        ? record.completionTokens
+        : 0;
+    const modelId = typeof record.modelId === "string" ? record.modelId : undefined;
+    return {
+        text: textValue,
+        promptTokens,
+        completionTokens,
+        ...(modelId ? { modelId } : {}),
+    };
+}
+async function generateLocalReply(conversation, text) {
+    const cloudProbe = await probeAgentCloudPaired();
+    if (cloudProbe.kind === "paired") {
+        const prompt = buildPrompt(conversation.messages, text);
+        const cloud = await forwardToAgentCloudChat(prompt);
+        return {
+            text: cloud.text.trim() || "Cloud returned an empty response.",
+            usage: {
+                promptTokens: cloud.promptTokens,
+                completionTokens: cloud.completionTokens,
+                totalTokens: cloud.promptTokens + cloud.completionTokens,
+                ...(cloud.modelId ? { model: cloud.modelId } : {}),
+            },
+        };
+    }
+    const statusReply = await localModelStatusReply(text);
+    if (statusReply)
+        return statusReply;
+    await ensureActiveModelLoaded();
+    const llama = await loadCapacitorLlama();
+    if (!llama?.generate) {
+        // Surface as a fallback-eligible failure so the caller / future cloud
+        // routing layer can detect it cleanly instead of grepping the message.
+        const err = new Error("Native Eliza-1 runtime is not available on this build.");
+        err.name = "LocalRuntimeUnavailableError";
+        throw err;
+    }
+    const prompt = buildPrompt(conversation.messages, text);
+    try {
+        const result = await llama.generate({
+            prompt,
+            maxTokens: 256,
+            temperature: 0.7,
+            topP: 0.9,
+            stopSequences: ["\nUser:", "\nAssistant:"],
+        });
+        const cleaned = result.text.trim() || "I could not generate a local response.";
+        return {
+            text: cleaned,
+            usage: {
+                promptTokens: result.promptTokens,
+                completionTokens: result.outputTokens,
+                totalTokens: result.promptTokens + result.outputTokens,
+                ...(activeState.modelId ? { model: activeState.modelId } : {}),
+            },
+        };
+    }
+    catch (err) {
+        const cls = classifyIosLocalGenerateError(err);
+        if (!cls.fallback) {
+            throw err;
+        }
+        // Local failed in a fallback-eligible way. Probe the in-process agent
+        // for cloud-paired state via `/api/auth/status`; if paired, forward
+        // the prompt to the agent's cloud proxy and return its response. If
+        // NOT paired, surface an honest, actionable error — silently inventing
+        // a synthetic response is a bigger bug than telling the user "pair cloud
+        // or use a smaller model".
+        const probe = await probeAgentCloudPaired();
+        if (probe.kind === "paired") {
+            try {
+                const cloud = await forwardToAgentCloudChat(prompt);
+                return {
+                    text: cloud.text.trim() || "Cloud returned an empty response.",
+                    usage: {
+                        promptTokens: cloud.promptTokens,
+                        completionTokens: cloud.completionTokens,
+                        totalTokens: cloud.promptTokens + cloud.completionTokens,
+                        ...(cloud.modelId
+                            ? { model: cloud.modelId }
+                            : activeState.modelId
+                                ? { model: activeState.modelId }
+                                : {}),
+                    },
+                };
+            }
+            catch (cloudErr) {
+                // Cloud was paired but the forward failed. We can't pretend it
+                // succeeded, so we surface a precise error that names both the
+                // local cause AND the cloud attempt's failure.
+                const honest = new Error(`Local model failed (${cls.reason}) and the paired cloud fallback also failed: ${cloudErr instanceof Error ? cloudErr.message : String(cloudErr)}`);
+                honest.name = "LocalInferenceFallbackFailed";
+                honest.cause = cloudErr;
+                throw honest;
+            }
+        }
+        // Not paired (or probe unreachable). HONEST error per the wave-4 spec —
+        // do NOT swallow.
+        const honest = new Error("Local model failed and cloud is not paired. Pair Eliza Cloud or download a smaller model.");
+        honest.name = "LocalInferenceFallbackRequired";
+        const cause = err instanceof Error ? err : undefined;
+        if (cause) {
+            honest.cause = cause;
+        }
+        throw honest;
+    }
+}
+async function generateLocalGreeting() {
+    const setupReply = await localModelStatusReply("download the default local model");
+    if (setupReply && setupReply.localInference?.status !== "ready") {
+        return setupReply;
+    }
+    return {
+        text: "What would you like to work on?",
+        usage: emptyUsage(activeState.modelId),
+        ...(setupReply?.localInference
+            ? { localInference: setupReply.localInference }
+            : {}),
+    };
+}
+function createConversation(title) {
+    const createdAt = nowIso();
+    const id = randomId("conv");
+    return {
+        id,
+        roomId: id,
+        title: title?.trim() || "New chat",
+        createdAt,
+        updatedAt: createdAt,
+        messages: [],
+    };
+}
+function conversationDto(conversation) {
+    return {
+        id: conversation.id,
+        title: conversation.title,
+        roomId: conversation.roomId,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+    };
+}
+async function hubSnapshot() {
+    const [installed, hardware] = await Promise.all([
+        listInstalledModels(),
+        hardwareProbe(),
+    ]);
+    const bundles = readBundleIndex();
+    return {
+        catalog: MODEL_CATALOG,
+        installed,
+        active: activeState,
+        downloads: [...downloads.values()],
+        hardware,
+        assignments: readAssignments(),
+        voiceReadiness: inferVoiceReadiness(installed, bundles),
+    };
+}
+function updateDownload(job, patch) {
+    Object.assign(job, patch, { updatedAt: nowIso() });
+    downloads.set(job.modelId, { ...job });
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function formatGb(bytes) {
+    return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+function aggregateDownloadJobs(model) {
+    const ids = [model.id];
+    return ids.flatMap((id) => {
+        const job = downloads.get(id);
+        return job ? [job] : [];
+    });
+}
+function aggregateProgress(jobs) {
+    if (jobs.length === 0) {
+        return {
+            received: 0,
+            total: 0,
+            percent: null,
+            bytesPerSec: 0,
+            etaMs: null,
+            state: "missing",
+        };
+    }
+    const received = jobs.reduce((sum, job) => sum + Math.max(0, job.received), 0);
+    const total = jobs.reduce((sum, job) => sum + Math.max(0, job.total), 0);
+    const bytesPerSec = jobs.reduce((sum, job) => sum + Math.max(0, job.bytesPerSec), 0);
+    const failed = jobs.find((job) => job.state === "failed");
+    const cancelled = jobs.find((job) => job.state === "cancelled");
+    const active = jobs.find((job) => ["queued", "downloading"].includes(job.state));
+    const allCompleted = jobs.every((job) => job.state === "completed");
+    const etaMs = total > received && bytesPerSec > 0
+        ? Math.round(((total - received) / bytesPerSec) * 1000)
+        : null;
+    return {
+        received,
+        total,
+        percent: total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null,
+        bytesPerSec,
+        etaMs,
+        state: failed
+            ? "failed"
+            : cancelled
+                ? "cancelled"
+                : active
+                    ? active.state
+                    : allCompleted
+                        ? "completed"
+                        : "missing",
+        ...(failed?.error ? { error: failed.error } : {}),
+    };
+}
+function classifyLocalModelIntent(text) {
+    const normalized = text.toLowerCase();
+    if (/\b(cancel|stop|pause|abort)\b/.test(normalized))
+        return "cancel";
+    if (/\b(redownload|re-download|download again|fresh copy|retry download)\b/.test(normalized)) {
+        return "redownload";
+    }
+    if (/\b(smaller|lighter|tiny|low memory|less memory|save space|not enough space)\b/.test(normalized)) {
+        return "switch_smaller";
+    }
+    if (/\b(download|install|fetch|pull|resume|retry)\b/.test(normalized))
+        return "download";
+    if (/\b(status|progress|percent|percentage|eta|what.*happen|how.*long)\b/.test(normalized)) {
+        return "status";
+    }
+    return null;
+}
+function statusLine(model, jobs, detail) {
+    const progress = aggregateProgress(jobs);
+    const templates = [
+        () => `I'm still downloading ${model.displayName}: ${progress.percent ?? 0}% (${formatGb(progress.received)}/${formatGb(progress.total || Math.round(catalogDownloadSizeGb(model, MODEL_CATALOG) * 1024 ** 3))}). Please hold on.`,
+        () => `${model.displayName} is still downloading: ${progress.percent ?? 0}% complete, ${formatGb(progress.received)} of ${formatGb(progress.total || Math.round(catalogDownloadSizeGb(model, MODEL_CATALOG) * 1024 ** 3))}.`,
+        () => `Local inference is still downloading. ${model.displayName} is at ${progress.percent ?? 0}% (${formatGb(progress.received)}/${formatGb(progress.total ||
+            Math.round(catalogDownloadSizeGb(model, MODEL_CATALOG) * 1024 ** 3))}).`,
+    ];
+    if (progress.state === "failed") {
+        return `The ${model.displayName} download failed${progress.error ? `: ${progress.error}` : "."}`;
+    }
+    if (progress.state === "cancelled") {
+        return `The ${model.displayName} download is cancelled.`;
+    }
+    if (detail)
+        return detail;
+    const index = Math.abs(Math.floor(Date.now() / 10_000)) % templates.length;
+    return templates[index]();
+}
+async function queueCompanionDownloads(model) {
+    void model;
+}
+async function downloadNativeModelFile(llama, url, filename) {
+    if (!llama.downloadModel) {
+        throw new Error("Native Eliza-1 downloader is unavailable.");
+    }
+    const result = await llama.downloadModel(url, filename);
+    return typeof result === "string" ? result : (result.path ?? filename);
+}
+async function downloadIosBundle(model, llama, job) {
+    if (!model.bundleManifestFile) {
+        throw new Error(`${model.displayName} does not declare an Eliza-1 manifest.`);
+    }
+    const manifestUrl = buildHuggingFaceResolveUrlForPath(model, model.bundleManifestFile);
+    const manifestResponse = await fetch(manifestUrl, { redirect: "follow" });
+    if (!manifestResponse.ok) {
+        throw new Error(`HTTP ${manifestResponse.status} while fetching ${model.displayName} manifest`);
+    }
+    const manifest = parseIosBundleManifest(await manifestResponse.json(), model);
+    const files = {};
+    let bundleSizeBytes = 0;
+    const manifestPath = await downloadNativeModelFile(llama, manifestUrl, iosBundleFilename(model, model.bundleManifestFile));
+    files[model.bundleManifestFile] = manifestPath;
+    const manifestHash = await hashNativeBundleFile(llama, manifestPath, model.bundleManifestFile);
+    bundleSizeBytes += manifestHash.sizeBytes ?? 0;
+    const entries = collectIosBundleFiles(manifest);
+    const totalSteps = Math.max(entries.length + 1, 1);
+    let completedSteps = 1;
+    updateDownload(job, {
+        received: Math.min(job.total, Math.round((completedSteps / totalSteps) * job.total)),
+    });
+    for (const entry of entries) {
+        const url = buildHuggingFaceResolveUrlForPath(model, entry.path);
+        const downloadedPath = await downloadNativeModelFile(llama, url, iosBundleFilename(model, entry.path));
+        files[entry.path] = downloadedPath;
+        const fileHash = await verifyNativeBundleFile(llama, downloadedPath, entry.sha256, entry.path);
+        bundleSizeBytes += fileHash.sizeBytes ?? 0;
+        completedSteps += 1;
+        updateDownload(job, {
+            received: Math.min(job.total, Math.round((completedSteps / totalSteps) * job.total)),
+        });
+    }
+    const textPath = files[model.ggufFile];
+    if (!textPath) {
+        throw new Error(`Eliza-1 bundle did not install ${model.ggufFile}`);
+    }
+    writeBundleRecord({
+        modelId: model.id,
+        bundleVersion: manifest.version,
+        manifestPath,
+        manifestSha256: manifestHash.sha256,
+        bundleRoot: commonBundleRoot(Object.values(files)),
+        bundleSizeBytes: bundleSizeBytes > 0 ? bundleSizeBytes : job.total,
+        files,
+        installedAt: nowIso(),
+    });
+    return textPath;
+}
+function startDownload(model) {
+    const existing = downloads.get(model.id);
+    if (existing && ["queued", "downloading"].includes(existing.state)) {
+        return existing;
+    }
+    const job = {
+        jobId: randomId("download"),
+        modelId: model.id,
+        state: "queued",
+        received: 0,
+        total: Math.round(model.sizeGb * 1024 ** 3),
+        bytesPerSec: 0,
+        etaMs: null,
+        startedAt: nowIso(),
+        updatedAt: nowIso(),
+    };
+    downloads.set(model.id, job);
+    void (async () => {
+        try {
+            if (!model.bundleManifestFile) {
+                void queueCompanionDownloads(model);
+            }
+            updateDownload(job, { state: "downloading" });
+            const llama = await loadLlamaCpp();
+            if (!llama?.downloadModel) {
+                throw new Error("Native Eliza-1 downloader is unavailable.");
+            }
+            if (model.bundleManifestFile) {
+                const textPath = await downloadIosBundle(model, llama, job);
+                updateDownload(job, {
+                    state: "completed",
+                    received: job.total,
+                    etaMs: 0,
+                });
+                if (activeState.status === "idle" || !activeState.modelId) {
+                    // error-policy:J5 opportunistic auto-activate — activateModel
+                    // records failures in the active-model state the models UI renders.
+                    await activateModel(model.id, textPath).catch(() => undefined);
+                }
+                return;
+            }
+            const downloadUrl = buildHuggingFaceResolveUrl(model);
+            let polling = true;
+            void (async () => {
+                while (polling && ["queued", "downloading"].includes(job.state)) {
+                    try {
+                        const progress = await llama.getDownloadProgress?.(downloadUrl);
+                        if (progress) {
+                            const received = typeof progress.downloaded === "number"
+                                ? progress.downloaded
+                                : typeof progress.received === "number"
+                                    ? progress.received
+                                    : job.received;
+                            const total = typeof progress.total === "number" && progress.total > 0
+                                ? progress.total
+                                : job.total;
+                            const bytesPerSec = typeof progress.bytesPerSec === "number"
+                                ? progress.bytesPerSec
+                                : job.bytesPerSec;
+                            updateDownload(job, {
+                                received,
+                                total,
+                                bytesPerSec,
+                                etaMs: typeof progress.etaMs === "number" || progress.etaMs === null
+                                    ? progress.etaMs
+                                    : total > received && bytesPerSec > 0
+                                        ? Math.round(((total - received) / bytesPerSec) * 1000)
+                                        : job.etaMs,
+                                ...(progress.error ? { error: progress.error } : {}),
+                            });
+                        }
+                    }
+                    catch {
+                        // The native progress endpoint is best-effort; the download promise
+                        // remains the source of truth for completion or failure.
+                    }
+                    await sleep(1000);
+                }
+            })();
+            let result;
+            try {
+                result = await llama.downloadModel(downloadUrl, modelFilename(model));
+            }
+            finally {
+                polling = false;
+            }
+            const path = typeof result === "string"
+                ? result
+                : (result.path ?? modelFilename(model));
+            updateDownload(job, {
+                state: "completed",
+                received: job.total,
+                etaMs: 0,
+            });
+            if (activeState.status === "idle" || !activeState.modelId) {
+                // error-policy:J5 opportunistic auto-activate — activateModel records
+                // failures in the active-model state the models UI renders.
+                await activateModel(model.id, path).catch(() => undefined);
+            }
+        }
+        catch (error) {
+            updateDownload(job, {
+                state: "failed",
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
+    })();
+    return job;
+}
+async function activateModel(modelId, knownPath) {
+    const catalog = findCatalogModel(modelId);
+    const bundle = catalog ? readBundleIndex()[catalog.id] : undefined;
+    const installed = await listInstalledModels();
+    const model = installed.find((entry) => entry.id === modelId) ??
+        (knownPath
+            ? {
+                id: modelId,
+                displayName: findCatalogModel(modelId)?.displayName ?? modelId,
+                path: knownPath,
+                sizeBytes: 0,
+                installedAt: nowIso(),
+                lastUsedAt: null,
+                source: "eliza-download",
+                ...(bundle?.installedAt
+                    ? { bundleVerifiedAt: bundle.installedAt }
+                    : {}),
+                ...(bundle?.bundleRoot ? { bundleRoot: bundle.bundleRoot } : {}),
+                ...(bundle?.manifestPath
+                    ? { manifestPath: bundle.manifestPath }
+                    : {}),
+                ...(bundle?.manifestSha256
+                    ? { manifestSha256: bundle.manifestSha256 }
+                    : {}),
+                ...(bundle?.bundleVersion
+                    ? { bundleVersion: bundle.bundleVersion }
+                    : {}),
+                ...(typeof bundle?.bundleSizeBytes === "number"
+                    ? { bundleSizeBytes: bundle.bundleSizeBytes }
+                    : {}),
+                ...(catalog?.runtimeRole ? { runtimeRole: catalog.runtimeRole } : {}),
+            }
+            : null);
+    if (!model) {
+        const state = {
+            modelId,
+            loadedAt: null,
+            status: "error",
+            error: `Model ${modelId} is not installed.`,
+        };
+        writeActiveModelState(state);
+        return state;
+    }
+    if (!catalog ||
+        !isSettingsDefaultLocalModel(catalog) ||
+        !model.bundleVerifiedAt) {
+        const state = {
+            modelId,
+            loadedAt: null,
+            status: "error",
+            error: `Model ${modelId} is not a verified Eliza-1 bundle.`,
+        };
+        writeActiveModelState(state);
+        return state;
+    }
+    writeActiveModelState({ modelId, loadedAt: null, status: "loading" });
+    try {
+        const llama = await loadCapacitorLlama();
+        if (!llama?.load) {
+            throw new Error("Native Eliza-1 runtime is not available on this build.");
+        }
+        const hardware = await hardwareProbe();
+        if (catalog) {
+            const fit = assessCatalogModelFit(hardware, catalog, MODEL_CATALOG);
+            if (fit === "wontfit") {
+                throw new Error(`${catalog.displayName} is above this device's local inference minspec. Switch to a smaller model.`);
+            }
+        }
+        const loadOptions = buildMobileLoadOptions(model, installed, hardware);
+        await llama.load(loadOptions);
+        loadedRuntimeSignature = runtimeSignature(loadOptions);
+        const state = {
+            modelId,
+            loadedAt: nowIso(),
+            status: "ready",
+        };
+        writeActiveModelState(state);
+        const assignments = readAssignments();
+        writeAssignments({
+            ...assignments,
+            TEXT_SMALL: assignments.TEXT_SMALL ?? modelId,
+            TEXT_LARGE: assignments.TEXT_LARGE ?? modelId,
+        });
+        return state;
+    }
+    catch (error) {
+        const state = {
+            modelId,
+            loadedAt: null,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+        };
+        writeActiveModelState(state);
+        return state;
+    }
+}
+export function startIosLocalAgentKernel() {
+    running = true;
+    startedAt = startedAt || Date.now();
+}
+export async function handleIosLocalAgentRequest(request, _context = {}) {
+    startIosLocalAgentKernel();
+    const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+    const pathname = url.pathname;
+    if (method === "OPTIONS")
+        return new Response(null, { status: 204 });
+    if (method === "GET" && pathname === "/api/health") {
+        return json({
+            ready: running,
+            runtime: "ok",
+            database: "localStorage",
+            plugins: { loaded: 0, failed: 0 },
+            coordinator: "not_wired",
+            connectors: {},
+            uptime: Math.floor((Date.now() - startedAt) / 1000),
+            agentState: running ? "running" : "not_started",
+            localAgent: {
+                mode: "ios-local",
+                transport: "ittp",
+                fullAgentRuntime: false,
+                taskService: false,
+            },
+        });
+    }
+    if (method === "GET" && pathname === "/api/local-agent/capabilities") {
+        return json(localAgentCapabilities());
+    }
+    if (method === "GET" && pathname === "/api/runtime/mode") {
+        return json({
+            mode: "local",
+            deploymentRuntime: "local",
+            isRemoteController: false,
+            remoteApiBaseConfigured: false,
+        });
+    }
+    if (method === "GET" && pathname === "/api/status") {
+        const cloud = readIosCloudPairing();
+        return json({
+            state: running ? "running" : "not_started",
+            agentName: AGENT_NAME,
+            model: activeState.status === "ready" ? activeState.modelId : null,
+            startedAt,
+            uptime: Date.now() - startedAt,
+            cloud: {
+                connectionStatus: cloud.paired ? "connected" : "disconnected",
+                activeAgentId: cloud.agentId,
+                cloudProvisioned: cloud.paired,
+                hasApiKey: Boolean(cloud.token),
+            },
+            pendingRestart: false,
+            pendingRestartReasons: [],
+        });
+    }
+    if (method === "POST" && pathname === "/api/agent/reset") {
+        resetIosLocalAgentState();
+        return json({ ok: true });
+    }
+    if (method === "POST" && pathname === "/api/agent/restart") {
+        running = true;
+        startedAt = Date.now();
+        const cloud = readIosCloudPairing();
+        return json({
+            status: {
+                state: "running",
+                agentName: AGENT_NAME,
+                model: activeState.status === "ready" ? activeState.modelId : null,
+                startedAt,
+                uptime: 0,
+                cloud: {
+                    connectionStatus: cloud.paired ? "connected" : "disconnected",
+                    activeAgentId: cloud.agentId,
+                    cloudProvisioned: cloud.paired,
+                    hasApiKey: Boolean(cloud.token),
+                },
+                pendingRestart: false,
+                pendingRestartReasons: [],
+            },
+        });
+    }
+    if (method === "POST" && pathname === "/api/background/run-due-tasks") {
+        return unavailableLocalBackendRoute("task_service_unavailable", {
+            reason: IOS_LOCAL_BACKGROUND_UNAVAILABLE_REASON,
+            ranTasks: 0,
+        });
+    }
+    if (method === "POST" && pathname === "/api/internal/wake") {
+        return unavailableLocalBackendRoute("task_service_unavailable", {
+            reason: IOS_LOCAL_BACKGROUND_UNAVAILABLE_REASON,
+            ranTasks: 0,
+        });
+    }
+    if (method === "GET" && pathname === "/api/auth/status") {
+        const cloud = readIosCloudPairing();
+        return json({
+            required: false,
+            pairingEnabled: false,
+            expiresAt: null,
+            cloudProvisioned: cloud.paired,
+            cloudAgentId: cloud.agentId,
+            cloudConnectionStatus: cloud.paired ? "connected" : "disconnected",
+        });
+    }
+    if (method === "GET" && pathname === "/api/auth/me") {
+        return json({
+            identity: {
+                id: "local-agent",
+                displayName: "Local Agent",
+                kind: "machine",
+            },
+            session: { id: "local", kind: "local", expiresAt: null },
+            access: {
+                mode: "local",
+                passwordConfigured: false,
+                ownerConfigured: false,
+            },
+        });
+    }
+    if (method === "GET" && pathname === "/api/first-run/status") {
+        const cloud = readIosCloudPairing();
+        return json({
+            complete: true,
+            cloudProvisioned: cloud.paired,
+            deploymentTarget: cloud.paired ? "cloud" : "local",
+        });
+    }
+    // First-run finish persist. The on-device JSContext kernel completes
+    // onboarding client-side (the conductor clears local first-run state and flips
+    // firstRunComplete), and `/api/first-run/status` already reports complete —
+    // but `submitFirstRun` POSTs the finish payload here. Without this route the
+    // POST fell through to the catch-all 404 ("Not found"), which the local finish
+    // rethrew and the conductor turned into a re-offer of the runtime chooser
+    // (the "not found → pick again" loop). Accept + ack; there is no server-side
+    // profile store on the local kernel, so this is a no-op success that matches
+    // the full-Bun bundle's behavior.
+    if (method === "POST" && pathname === "/api/first-run") {
+        return json({ ok: true });
+    }
+    if (method === "GET" && pathname === "/api/config") {
+        return json(localConfig());
+    }
+    if (method === "PUT" && pathname === "/api/config") {
+        return json(localConfig());
+    }
+    if (method === "POST" && pathname === "/api/cloud/chat") {
+        return handleIosCloudChat(request);
+    }
+    if (method === "GET" && pathname === "/api/config/schema") {
+        return json({ schema: {}, defaults: localConfig() });
+    }
+    if (method === "GET" && pathname === "/api/character") {
+        return json(localCharacter());
+    }
+    if (method === "PUT" && pathname === "/api/character") {
+        return json(localCharacter());
+    }
+    if (method === "GET" && pathname === "/api/wallet/addresses") {
+        return json(EMPTY_WALLET_ADDRESSES);
+    }
+    if (method === "GET" && pathname === "/api/wallet/config") {
+        return json(localWalletConfig());
+    }
+    if (method === "PUT" && pathname === "/api/wallet/config") {
+        return json({ ok: true });
+    }
+    if (method === "GET" && pathname === "/api/wallet/balances") {
+        return json({ evm: null, solana: null });
+    }
+    if (method === "GET" && pathname === "/api/wallet/nfts") {
+        return json({ evm: [], solana: null });
+    }
+    if (method === "GET" && pathname === "/api/wallet/market-overview") {
+        return json(await localWalletMarketOverview());
+    }
+    if (method === "GET" && pathname === "/api/wallet/trading/profile") {
+        return json(emptyWalletTradingProfile(url));
+    }
+    if (method === "POST" && pathname === "/api/wallet/refresh-cloud") {
+        return json({
+            ok: false,
+            warnings: ["Cloud wallet refresh is unavailable in local iOS mode."],
+        });
+    }
+    if (method === "POST" && pathname === "/api/wallet/primary") {
+        return json({ ok: false, error: "No wallet is configured." }, 400);
+    }
+    if (method === "GET" && pathname === "/api/browser-workspace") {
+        return json(browserWorkspaceSnapshot());
+    }
+    if (method === "GET" && pathname === "/api/browser-workspace/tabs") {
+        return json({ tabs: readBrowserWorkspaceStore().tabs });
+    }
+    if (method === "POST" && pathname === "/api/browser-workspace/tabs") {
+        return openBrowserWorkspaceTab(request);
+    }
+    if (pathname.startsWith("/api/browser-workspace/tabs/")) {
+        const response = await handleBrowserWorkspaceTabRoute(request, pathname);
+        if (response)
+            return response;
+    }
+    if (method === "GET" && pathname === "/api/stream/settings") {
+        return json({ settings: {} });
+    }
+    if (method === "HEAD" && pathname.startsWith("/api/avatar/")) {
+        return new Response(null, { status: 404 });
+    }
+    if (method === "GET" && pathname === "/api/agent/events") {
+        return json({ events: [] });
+    }
+    if (method === "GET" && pathname === "/api/workbench/overview") {
+        return json({
+            tasks: [],
+            triggers: [],
+            todos: [],
+            autonomy: { enabled: false, thinking: false, lastEventAt: null },
+            summary: {
+                totalTasks: 0,
+                completedTasks: 0,
+                totalTriggers: 0,
+                activeTriggers: 0,
+                totalTodos: 0,
+                completedTodos: 0,
+            },
+            tasksAvailable: false,
+            triggersAvailable: false,
+            todosAvailable: false,
+        });
+    }
+    if (method === "GET" &&
+        (pathname === "/api/workbench/tasks" || pathname === "/api/workbench/todos")) {
+        return json(pathname.endsWith("/todos") ? { todos: [] } : { tasks: [] });
+    }
+    if (method !== "GET" &&
+        (pathname === "/api/workbench/tasks" ||
+            pathname.startsWith("/api/workbench/tasks/") ||
+            pathname === "/api/workbench/todos" ||
+            pathname.startsWith("/api/workbench/todos/"))) {
+        return unavailableLocalBackendRoute("task_service_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/triggers") {
+        return json({ triggers: [] });
+    }
+    if (method === "GET" && pathname === "/api/triggers/health") {
+        return json({
+            ok: true,
+            triggersEnabled: false,
+            workflowAvailable: false,
+            reason: "The AgentRuntime trigger service is not mounted in iOS local mode.",
+        });
+    }
+    if (pathname.startsWith("/api/triggers/") ||
+        (method !== "GET" && pathname === "/api/triggers")) {
+        return unavailableLocalBackendRoute("task_service_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/documents/stats") {
+        return json({
+            totalDocuments: 0,
+            totalFragments: 0,
+            totalBytes: 0,
+            bySource: {},
+        });
+    }
+    if (method === "GET" && pathname === "/api/documents") {
+        return json({
+            documents: [],
+            total: 0,
+            limit: integerFromUnknown(url.searchParams.get("limit")) ?? 100,
+            offset: integerFromUnknown(url.searchParams.get("offset")) ?? 0,
+        });
+    }
+    if (method === "GET" && pathname === "/api/documents/search") {
+        return json({ documents: [], results: [], total: 0 });
+    }
+    if (method === "GET" && pathname.startsWith("/api/documents/")) {
+        if (pathname.endsWith("/fragments")) {
+            const documentId = decodeURIComponent(pathname.slice("/api/documents/".length, -"/fragments".length));
+            return json({ documentId, fragments: [], count: 0 });
+        }
+        return json({ error: "Document not found" }, 404);
+    }
+    if (pathname.startsWith("/api/documents")) {
+        return unavailableLocalBackendRoute("document_store_unavailable");
+    }
+    if (pathname === "/api/transcripts" ||
+        pathname.startsWith("/api/transcripts/")) {
+        const response = await handleLocalTranscriptsRoute(request, method, pathname, url);
+        if (response)
+            return response;
+    }
+    if (method === "GET" && pathname === "/api/memories/stats") {
+        return json({ total: 0, byType: {}, recent: [] });
+    }
+    if (pathname.startsWith("/api/memories/")) {
+        const response = handleLocalMemoriesRoute(method, pathname, url);
+        if (response)
+            return response;
+    }
+    if (method === "GET" && pathname === "/api/mcp/config") {
+        return json({ servers: {} });
+    }
+    if (method === "GET" && pathname === "/api/mcp/status") {
+        return json({ servers: [] });
+    }
+    if (method === "GET" && pathname === "/api/mcp/marketplace/search") {
+        return json({ results: [] });
+    }
+    if (pathname.startsWith("/api/mcp/")) {
+        return unavailableLocalBackendRoute("mcp_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/secrets/manager/backends") {
+        return json({
+            backends: [
+                {
+                    id: "in-house",
+                    label: "Local (encrypted)",
+                    available: false,
+                    signedIn: false,
+                    detail: "Secrets manager backend is not mounted in iOS local mode.",
+                    authMode: null,
+                },
+            ],
+        });
+    }
+    if (pathname === "/api/secrets/manager/preferences") {
+        return json({ preferences: { enabled: ["in-house"], routing: {} } });
+    }
+    if (method === "GET" && pathname === "/api/secrets/manager/install/methods") {
+        return json({ methods: [] });
+    }
+    if (method === "GET" && pathname === "/api/secrets/inventory") {
+        return json({ entries: [] });
+    }
+    if (method === "GET" && pathname === "/api/secrets/routing") {
+        return json({ rules: [] });
+    }
+    if (method === "GET" && pathname === "/api/secrets/logins") {
+        return json({ logins: [] });
+    }
+    if (pathname.startsWith("/api/secrets/")) {
+        return unavailableLocalBackendRoute("secrets_manager_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/training/auto/config") {
+        return json({ enabled: false });
+    }
+    if (method === "GET" && pathname === "/api/training/auto/status") {
+        return json({ enabled: false, running: false, jobs: [] });
+    }
+    if (method === "GET" &&
+        (pathname === "/api/training/status" ||
+            pathname === "/api/training/datasets" ||
+            pathname === "/api/training/jobs" ||
+            pathname === "/api/training/models" ||
+            pathname === "/api/training/inference/endpoints")) {
+        if (pathname.endsWith("/status"))
+            return json({ available: false });
+        if (pathname.endsWith("/datasets"))
+            return json({ datasets: [] });
+        if (pathname.endsWith("/jobs"))
+            return json({ jobs: [] });
+        if (pathname.endsWith("/models"))
+            return json({ models: [] });
+        return json({ endpoints: [] });
+    }
+    if (pathname.startsWith("/api/training/")) {
+        return unavailableLocalBackendRoute("training_service_unavailable");
+    }
+    if (method === "GET" &&
+        (pathname === "/api/apps" || pathname === "/api/catalog/apps")) {
+        return json([]);
+    }
+    if (method === "GET" &&
+        (pathname === "/api/apps/search" ||
+            pathname === "/api/apps/installed" ||
+            pathname === "/api/apps/runs" ||
+            pathname === "/api/apps/plugins" ||
+            pathname === "/api/apps/plugins/search" ||
+            pathname === "/api/apps/permissions")) {
+        return json([]);
+    }
+    if (pathname === "/api/apps/favorites") {
+        if (method === "GET")
+            return json({ favoriteApps: [] });
+        if (method === "PUT")
+            return json({ favoriteApps: [] });
+    }
+    if (method === "POST" && pathname === "/api/apps/favorites/replace") {
+        return json({ favoriteApps: [] });
+    }
+    if (method === "POST" && pathname === "/api/apps/overlay-presence") {
+        return json({ ok: true });
+    }
+    if (method === "POST" &&
+        (pathname === "/api/apps/launch" ||
+            pathname === "/api/apps/create" ||
+            pathname === "/api/apps/relaunch" ||
+            pathname === "/api/apps/load-from-directory")) {
+        return unavailableLocalBackendRoute("app_manager_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/plugins") {
+        return json({ plugins: [] });
+    }
+    if (method === "GET" && pathname === "/api/plugins/installed") {
+        return json({ count: 0, plugins: [] });
+    }
+    if (method === "GET" && pathname === "/api/plugins/core") {
+        return json({ core: [], optional: [] });
+    }
+    if (method === "POST" && pathname === "/api/plugins/core/toggle") {
+        return unavailableLocalBackendRoute("plugin_loader_unavailable");
+    }
+    if (method === "POST" &&
+        (pathname === "/api/plugins/install" ||
+            pathname === "/api/plugins/update" ||
+            pathname === "/api/plugins/uninstall")) {
+        return unavailableLocalBackendRoute("plugin_loader_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/skills") {
+        return json({ skills: [] });
+    }
+    if (method === "POST" && pathname === "/api/skills/refresh") {
+        return json({ ok: true, skills: [] });
+    }
+    if (method === "GET" && pathname === "/api/skills/curated") {
+        return json({ skills: [] });
+    }
+    if ((method === "POST" || method === "DELETE") &&
+        pathname.startsWith("/api/skills/curated/")) {
+        return json({ ok: true });
+    }
+    if (method === "GET" && pathname === "/api/skills/catalog") {
+        return json({
+            total: 0,
+            page: 1,
+            perPage: 50,
+            totalPages: 0,
+            installedCount: 0,
+            skills: [],
+        });
+    }
+    if (method === "GET" && pathname === "/api/skills/catalog/search") {
+        return json({
+            query: url.searchParams.get("q") ?? "",
+            count: 0,
+            results: [],
+        });
+    }
+    if (method === "POST" && pathname === "/api/skills/catalog/refresh") {
+        return json({ ok: true, count: 0 });
+    }
+    if (method === "POST" &&
+        (pathname === "/api/skills/catalog/install" ||
+            pathname === "/api/skills/catalog/uninstall" ||
+            pathname === "/api/skills/marketplace/install" ||
+            pathname === "/api/skills/marketplace/uninstall")) {
+        return unavailableLocalBackendRoute("skill_installer_unavailable");
+    }
+    if (method === "GET" && pathname === "/api/skills/marketplace/search") {
+        return json({ ok: true, results: [] });
+    }
+    if (pathname === "/api/skills/marketplace/config") {
+        if (method === "GET" || method === "PUT")
+            return json({ keySet: false });
+    }
+    if (method === "GET" && pathname === "/api/registry/plugins") {
+        return json({ plugins: [] });
+    }
+    if (method === "GET" && pathname.startsWith("/api/registry/plugins/")) {
+        return json({ plugin: null }, 404);
+    }
+    if (method === "GET" && pathname === "/api/models") {
+        return json({
+            provider: url.searchParams.get("provider") ?? null,
+            models: [],
+        });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/hub") {
+        return json(await hubSnapshot());
+    }
+    if (method === "POST" && pathname === "/api/tts/local-inference") {
+        const body = await requestJson(request);
+        const text = typeof body.text === "string" ? sanitizeLocalSpeechText(body.text) : "";
+        if (!text)
+            return json({ error: "Missing text" }, 400);
+        const voiceReadiness = inferVoiceReadiness(await listInstalledModels(), readBundleIndex());
+        return json({
+            error: voiceReadiness.message,
+            code: voiceReadiness.status === "unavailable"
+                ? "ios_local_tts_executor_missing"
+                : "ios_local_voice_assets_missing",
+            voiceReadiness,
+        }, 503);
+    }
+    if (method === "GET" && pathname === "/api/local-inference/hardware") {
+        return json(await hardwareProbe());
+    }
+    if (method === "GET" && pathname === "/api/local-inference/catalog") {
+        return json({ models: filterSettingsDefaultLocalModels(MODEL_CATALOG) });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/installed") {
+        return json({ models: await listInstalledModels() });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/downloads") {
+        return json({ downloads: [...downloads.values()] });
+    }
+    if (method === "GET" &&
+        pathname === "/api/local-inference/downloads/stream") {
+        return textEventStream([
+            {
+                type: "snapshot",
+                downloads: [...downloads.values()],
+                active: activeState,
+            },
+        ]);
+    }
+    if (method === "POST" && pathname === "/api/local-inference/downloads") {
+        const body = await requestJson(request);
+        const modelId = typeof body.modelId === "string" ? body.modelId : "";
+        const catalog = findCatalogModel(modelId);
+        if (!catalog || !isSettingsDefaultLocalModel(catalog)) {
+            return json({ error: `Unknown model id: ${modelId}` }, 404);
+        }
+        const validationError = await validateMobileModelFit(catalog);
+        if (validationError)
+            return json({ error: validationError }, 409);
+        return json({ job: startDownload(catalog) });
+    }
+    const downloadMatch = pathname.match(/^\/api\/local-inference\/downloads\/([^/]+)$/);
+    if (downloadMatch) {
+        const modelId = decodeURIComponent(downloadMatch[1]);
+        const job = downloads.get(modelId);
+        if (method === "GET") {
+            return job ? json({ job }) : json({ error: "Download not found" }, 404);
+        }
+        if (method === "DELETE") {
+            if (job && ["queued", "downloading"].includes(job.state)) {
+                const catalog = findCatalogModel(modelId);
+                if (catalog) {
+                    const llama = await loadLlamaCpp();
+                    const cancelPath = catalog.bundleManifestFile ?? catalog.ggufFile;
+                    await llama
+                        ?.cancelDownload?.(buildHuggingFaceResolveUrlForPath(catalog, cancelPath))
+                        .catch(() => false);
+                }
+                updateDownload(job, { state: "cancelled", etaMs: 0 });
+            }
+            return json({ ok: true, job: downloads.get(modelId) ?? null });
+        }
+    }
+    if (method === "GET" && pathname === "/api/local-inference/active") {
+        return json(activeState);
+    }
+    if (method === "POST" && pathname === "/api/local-inference/active") {
+        const body = await requestJson(request);
+        const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+        if (!modelId)
+            return json({ error: "modelId is required" }, 400);
+        return json(await activateModel(modelId));
+    }
+    if (method === "DELETE" && pathname === "/api/local-inference/active") {
+        writeActiveModelState({ modelId: null, loadedAt: null, status: "idle" });
+        loadedRuntimeSignature = null;
+        return json(activeState);
+    }
+    if (method === "GET" && pathname === "/api/local-inference/assignments") {
+        return json({ assignments: readAssignments() });
+    }
+    if (method === "POST" && pathname === "/api/local-inference/assignments") {
+        const body = await requestJson(request);
+        const slot = typeof body.slot === "string" ? body.slot : "";
+        const modelId = typeof body.modelId === "string" ? body.modelId : null;
+        if (!isAgentModelSlot(slot)) {
+            return json({ error: "slot is required" }, 400);
+        }
+        if (modelId !== null) {
+            const catalog = findCatalogModel(modelId);
+            const installed = await listInstalledModels();
+            const installedModel = installed.find((entry) => entry.id === modelId);
+            if (!catalog ||
+                !isSettingsDefaultLocalModel(catalog) ||
+                installedModel?.source !== "eliza-download" ||
+                !installedModel.bundleVerifiedAt) {
+                return json({
+                    error: "Local inference assignments are limited to verified Eliza-1 bundles.",
+                }, 400);
+            }
+        }
+        const assignments = { ...readAssignments(), [slot]: modelId };
+        if (modelId === null)
+            delete assignments[slot];
+        writeAssignments(assignments);
+        return json({ assignments });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/providers") {
+        return json({ providers: [await capacitorLlamaProviderStatus()] });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/routing") {
+        return json({
+            registrations: [],
+            preferences: EMPTY_ROUTING_PREFERENCES,
+        });
+    }
+    if (method === "POST" &&
+        (pathname === "/api/local-inference/routing/preferred" ||
+            pathname === "/api/local-inference/routing/policy")) {
+        return json({
+            preferences: EMPTY_ROUTING_PREFERENCES,
+        });
+    }
+    if (method === "GET" && pathname === "/api/local-inference/device") {
+        return json({
+            enabled: true,
+            connected: true,
+            devices: [
+                {
+                    id: "ios-local",
+                    label: "This iPhone",
+                    platform: "ios",
+                    connectedAt: startedAt,
+                    lastSeenAt: Date.now(),
+                },
+            ],
+        });
+    }
+    const installedMatch = pathname.match(/^\/api\/local-inference\/installed\/([^/]+)(?:\/verify)?$/);
+    if (installedMatch) {
+        const id = decodeURIComponent(installedMatch[1]);
+        const installed = await listInstalledModels();
+        const model = installed.find((entry) => entry.id === id);
+        if (!model)
+            return json({ error: "Model not found" }, 404);
+        if (method === "GET")
+            return json({ model });
+        if (method === "DELETE") {
+            return json({ ok: false, error: "Uninstall is not supported on iOS yet." }, 400);
+        }
+        if (method === "POST" && pathname.endsWith("/verify")) {
+            return json({ ok: true, model, errors: [] });
+        }
+    }
+    if (method === "GET" && pathname === "/api/conversations") {
+        const store = readStore();
+        return json({
+            conversations: store.conversations
+                .map(conversationDto)
+                .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+        });
+    }
+    if (method === "POST" && pathname === "/api/conversations") {
+        const body = await requestJson(request);
+        const conversation = createConversation(typeof body.title === "string" ? body.title : undefined);
+        const store = readStore();
+        store.conversations.unshift(conversation);
+        writeStore(store);
+        return json({ conversation: conversationDto(conversation) });
+    }
+    const greetingMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/greeting$/);
+    if (greetingMatch && method === "POST") {
+        const greeting = await generateLocalGreeting();
+        return json({
+            text: greeting.text,
+            agentName: AGENT_NAME,
+            generated: true,
+            persisted: false,
+            ...(greeting.localInference
+                ? { localInference: greeting.localInference }
+                : {}),
+        });
+    }
+    const messageMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/messages(?:\/stream|\/truncate)?$/);
+    if (messageMatch) {
+        const conversationId = decodeURIComponent(messageMatch[1]);
+        const store = readStore();
+        const conversation = store.conversations.find((entry) => entry.id === conversationId);
+        if (!conversation)
+            return json({ error: "Conversation not found" }, 404);
+        if (method === "GET" && pathname.endsWith("/messages")) {
+            return json({ messages: conversation.messages });
+        }
+        if (method === "POST" && pathname.endsWith("/messages/truncate")) {
+            const body = await requestJson(request);
+            const messageId = typeof body.messageId === "string" ? body.messageId : null;
+            if (!messageId)
+                return json({ error: "messageId is required" }, 400);
+            const index = conversation.messages.findIndex((m) => m.id === messageId);
+            if (index < 0)
+                return json({ ok: true, deletedCount: 0 });
+            const inclusive = body.inclusive === true;
+            const deleteFrom = inclusive ? index : index + 1;
+            const deletedCount = conversation.messages.length - deleteFrom;
+            conversation.messages.splice(deleteFrom);
+            conversation.updatedAt = nowIso();
+            writeStore(store);
+            return json({ ok: true, deletedCount });
+        }
+        if (method === "POST") {
+            const body = await requestJson(request);
+            const text = typeof body.text === "string" ? body.text.trim() : "";
+            if (!text)
+                return json({ error: "text is required" }, 400);
+            const userMessage = {
+                id: randomId("msg"),
+                role: "user",
+                text,
+                timestamp: Date.now(),
+            };
+            conversation.messages.push(userMessage);
+            if (conversation.title === "New chat") {
+                conversation.title = text.slice(0, 60) || conversation.title;
+            }
+            const reply = await generateLocalReply(conversation, text);
+            const assistantMessage = {
+                id: randomId("msg"),
+                role: "assistant",
+                text: reply.text,
+                timestamp: Date.now(),
+                ...(reply.localInference
+                    ? { localInference: reply.localInference }
+                    : {}),
+            };
+            conversation.messages.push(assistantMessage);
+            conversation.updatedAt = nowIso();
+            writeStore(store);
+            if (pathname.endsWith("/stream")) {
+                return textEventStream([
+                    { type: "token", text: reply.text, fullText: reply.text },
+                    {
+                        type: "done",
+                        fullText: reply.text,
+                        agentName: AGENT_NAME,
+                        usage: reply.usage,
+                        ...(reply.localInference
+                            ? { localInference: reply.localInference }
+                            : {}),
+                    },
+                ]);
+            }
+            return json({
+                text: reply.text,
+                agentName: AGENT_NAME,
+                blocks: [{ type: "text", text: reply.text }],
+                ...(reply.localInference
+                    ? { localInference: reply.localInference }
+                    : {}),
+            });
+        }
+    }
+    const conversationMatch = pathname.match(/^\/api\/conversations\/([^/]+)$/);
+    if (conversationMatch) {
+        const conversationId = decodeURIComponent(conversationMatch[1]);
+        const store = readStore();
+        const index = store.conversations.findIndex((entry) => entry.id === conversationId);
+        if (index < 0)
+            return json({ error: "Conversation not found" }, 404);
+        if (method === "DELETE") {
+            store.conversations.splice(index, 1);
+            writeStore(store);
+            return json({ ok: true });
+        }
+        if (method === "PATCH") {
+            const body = await requestJson(request);
+            if (typeof body.title === "string" && body.title.trim()) {
+                store.conversations[index].title = body.title.trim();
+            }
+            store.conversations[index].updatedAt = nowIso();
+            writeStore(store);
+            return json({
+                conversation: conversationDto(store.conversations[index]),
+            });
+        }
+    }
+    return json({ error: "Not found" }, 404);
+}

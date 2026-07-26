@@ -133,7 +133,11 @@ export function ViewHeader({
       <h1 className="pointer-events-none absolute inset-x-0 mx-auto max-w-[calc(100%-6rem)] truncate px-12 text-center text-lg font-semibold tracking-tight text-txt-strong">
         {title}
       </h1>
-      {right ? <div className="relative z-10">{right}</div> : <span aria-hidden />}
+      {right ? (
+        <div className="relative z-10">{right}</div>
+      ) : (
+        <span aria-hidden />
+      )}
     </header>
   );
 }

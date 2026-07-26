@@ -1,0 +1,13 @@
+import { jsx as _jsx } from "react/jsx-runtime";
+/**
+ * Checkbox primitive over Radix `@radix-ui/react-checkbox`, styled with this
+ * package's theme tokens. Derived from shadcn/ui `checkbox`
+ * (https://ui.shadcn.com/docs/components/checkbox).
+ */
+import * as CheckboxPrimitive from "@radix-ui/react-checkbox";
+import { Check } from "lucide-react";
+import * as React from "react";
+import { cn } from "../../lib/utils";
+const Checkbox = React.forwardRef(({ className, ...props }, ref) => (_jsx(CheckboxPrimitive.Root, { ref: ref, className: cn("peer h-4 w-4 shrink-0 rounded-sm border border-primary      disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=checked]:text-primary-fg", className), ...props, children: _jsx(CheckboxPrimitive.Indicator, { className: cn("flex items-center justify-center text-current"), children: _jsx(Check, { className: "h-4 w-4" }) }) })));
+Checkbox.displayName = CheckboxPrimitive.Root.displayName;
+export { Checkbox };

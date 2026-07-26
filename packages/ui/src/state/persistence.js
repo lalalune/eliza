@@ -1,0 +1,1084 @@
+/**
+ * localStorage + server persistence for shell state: the active-server record,
+ * UI language, favorite/recent apps, and background config/history. The single
+ * read/write layer the state modules go through.
+ */
+import { logger } from "@elizaos/logger";
+import { asRecord } from "@elizaos/shared";
+import { fetchWithCsrf } from "../api/csrf-client";
+import { isTerminalIosNativeAgentBootErrorMessage } from "../api/ios-local-agent-transport";
+import { isPlausibleFragmentSource, normalizeUniforms, } from "../backgrounds/shader-schema";
+import { MAX_BACKGROUND_HISTORY } from "./background-history";
+// Re-exported so existing `import { MAX_BACKGROUND_HISTORY } from "./persistence"`
+// sites keep working; the single source is the pure reducer module.
+export { MAX_BACKGROUND_HISTORY } from "./background-history";
+import { getBootConfig } from "../config/boot-config-store";
+import { DEFAULT_UI_LANGUAGE, normalizeLanguage, } from "../i18n";
+import { detectClientLanguage } from "../i18n/region";
+import { normalizeDirectCloudSharedAgentApiBase } from "../utils/cloud-agent-base";
+import { DEFAULT_LOCAL_ASR_AUTO_STOP } from "../voice/local-asr-capture";
+import { DEFAULT_ACCENT_ID, DEFAULT_BACKGROUND_COLOR, DEFAULT_BACKGROUND_CONFIG, normalizeAccentId, } from "./ui-preferences";
+import { normalizeAvatarIndex } from "./vrm";
+/* ── Shared localStorage helper ──────────────────────────────────────── */
+function tryLocalStorage(fn, fallback) {
+    try {
+        return fn();
+    }
+    catch {
+        // error-policy:J3 localStorage can throw (private mode, quota, security
+        // policy); preference reads start from their designed default rather than
+        // wedging the shell on an inaccessible store.
+        return fallback;
+    }
+}
+function describePersistenceError(err) {
+    return err instanceof Error ? err.message : String(err);
+}
+const UI_THEME_STORAGE_KEY = "eliza:ui-theme";
+const LEGACY_UI_THEME_STORAGE_KEY = "elizaos:ui-theme";
+const UI_THEME_MODE_STORAGE_KEY = "eliza:ui-theme-mode";
+function normalizeUiThemeMode(value) {
+    return value === "light" || value === "dark" || value === "system"
+        ? value
+        : "system";
+}
+export { normalizeUiThemeMode };
+/**
+ * The app ships a single curated light look — there is no dark theme. Kept as a
+ * function (not a constant) so existing callers and the system-change listener
+ * keep their shape.
+ */
+export function getSystemTheme() {
+    if (typeof window !== "undefined" &&
+        typeof window.matchMedia === "function") {
+        return window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+    }
+    return "light";
+}
+/**
+ * Resolve a {@link UiThemeMode} to a concrete {@link UiTheme}: an explicit
+ * `light`/`dark` choice wins; `system` follows the OS color-scheme.
+ */
+export function resolveUiTheme(mode) {
+    return mode === "system" ? getSystemTheme() : mode;
+}
+/**
+ * Load the persisted theme mode. New users (no stored value) default to
+ * `system`. A legacy concrete `eliza:ui-theme` value is treated as an
+ * explicit user choice and migrated into a `light`/`dark` mode.
+ */
+export function loadUiThemeMode() {
+    return tryLocalStorage(() => {
+        const mode = localStorage.getItem(UI_THEME_MODE_STORAGE_KEY);
+        if (mode != null)
+            return normalizeUiThemeMode(mode);
+        const legacy = localStorage.getItem(UI_THEME_STORAGE_KEY) ??
+            localStorage.getItem(LEGACY_UI_THEME_STORAGE_KEY);
+        return legacy === "light" || legacy === "dark" ? legacy : "system";
+    }, "system");
+}
+/* ── Home time/date widget visibility (#10706) ───────────────────────── */
+const HOME_TIME_WIDGET_HIDDEN_STORAGE_KEY = "eliza:home-time-widget-hidden";
+/** Load whether the home time/date tile is hidden. Defaults to shown (false). */
+export function loadHomeTimeWidgetHidden() {
+    return tryLocalStorage(() => localStorage.getItem(HOME_TIME_WIDGET_HIDDEN_STORAGE_KEY) === "1", false);
+}
+export function saveHomeTimeWidgetHidden(hidden) {
+    tryLocalStorage(() => {
+        localStorage.setItem(HOME_TIME_WIDGET_HIDDEN_STORAGE_KEY, hidden ? "1" : "0");
+    }, undefined);
+}
+export function saveUiThemeMode(mode) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_THEME_MODE_STORAGE_KEY, normalizeUiThemeMode(mode));
+    }, undefined);
+}
+const THEME_SWITCHING_ATTRIBUTE = "data-theme-switching";
+let themeSwitchResetFrameId = null;
+function normalizeUiTheme(value) {
+    return value === "light" ? "light" : "dark";
+}
+export { normalizeUiTheme };
+function suppressThemeTransitions(root) {
+    if (typeof window === "undefined")
+        return;
+    root.setAttribute(THEME_SWITCHING_ATTRIBUTE, "");
+    if (themeSwitchResetFrameId != null) {
+        window.cancelAnimationFrame(themeSwitchResetFrameId);
+    }
+    themeSwitchResetFrameId = window.requestAnimationFrame(() => {
+        themeSwitchResetFrameId = window.requestAnimationFrame(() => {
+            root.removeAttribute(THEME_SWITCHING_ATTRIBUTE);
+            themeSwitchResetFrameId = null;
+        });
+    });
+}
+export function loadUiTheme() {
+    return tryLocalStorage(() => {
+        const current = localStorage.getItem(UI_THEME_STORAGE_KEY);
+        if (current != null)
+            return normalizeUiTheme(current);
+        return normalizeUiTheme(localStorage.getItem(LEGACY_UI_THEME_STORAGE_KEY));
+    }, "dark");
+}
+export function saveUiTheme(theme) {
+    tryLocalStorage(() => {
+        const normalized = normalizeUiTheme(theme);
+        localStorage.setItem(UI_THEME_STORAGE_KEY, normalized);
+        localStorage.setItem(LEGACY_UI_THEME_STORAGE_KEY, normalized);
+    }, undefined);
+}
+/* ── Background persistence ───────────────────────────────────────────── */
+const UI_BACKGROUND_STORAGE_KEY = "eliza:ui-background";
+/** Accept a 6-digit hex color; anything else falls back to the default. */
+function normalizeHexColor(value) {
+    return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)
+        ? value.toLowerCase()
+        : DEFAULT_BACKGROUND_COLOR;
+}
+export function normalizeBackgroundConfig(value) {
+    const record = asRecord(value);
+    if (!record)
+        return { ...DEFAULT_BACKGROUND_CONFIG };
+    const color = normalizeHexColor(record.color);
+    const imageUrl = typeof record.imageUrl === "string" && record.imageUrl.length > 0
+        ? record.imageUrl
+        : undefined;
+    // Image mode without a usable source is meaningless — fall back to the shader.
+    if (record.mode === "image" && imageUrl) {
+        return { mode: "image", color, imageUrl };
+    }
+    // GLSL mode requires a plausible fragment source; a malformed/oversized/absent
+    // source (or a hostile persisted value) falls back to the color field so a bad
+    // shader can never wedge the background on load.
+    if (record.mode === "glsl") {
+        const shaderRecord = asRecord(record.shader);
+        const source = shaderRecord?.source;
+        if (isPlausibleFragmentSource(source)) {
+            const presetId = typeof shaderRecord?.presetId === "string"
+                ? shaderRecord.presetId
+                : undefined;
+            return {
+                mode: "glsl",
+                color,
+                shader: {
+                    presetId,
+                    source,
+                    uniforms: normalizeUniforms(shaderRecord?.uniforms),
+                },
+            };
+        }
+        return { mode: "shader", color };
+    }
+    return { mode: "shader", color };
+}
+export function loadBackgroundConfig() {
+    return tryLocalStorage(() => {
+        const raw = localStorage.getItem(UI_BACKGROUND_STORAGE_KEY);
+        return raw
+            ? normalizeBackgroundConfig(JSON.parse(raw))
+            : { ...DEFAULT_BACKGROUND_CONFIG };
+    }, { ...DEFAULT_BACKGROUND_CONFIG });
+}
+export function saveBackgroundConfig(config) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_BACKGROUND_STORAGE_KEY, JSON.stringify(normalizeBackgroundConfig(config)));
+    }, undefined);
+}
+/**
+ * Bounded undo history for the background. The most recent previous config is
+ * last. Capped so a long session never grows localStorage without bound; image
+ * configs carry a data/media URL so the cap is deliberately small.
+ */
+const UI_BACKGROUND_HISTORY_STORAGE_KEY = "eliza:ui-background-history";
+/**
+ * Data-URL image entries are the quota hazard: one downscaled photo is 1–4 MB
+ * against localStorage's ~5 MB total, and `tryLocalStorage` swallows
+ * QuotaExceededError — the write silently fails and the wallpaper reverts on
+ * reload. Media-store (`/api/media/<hash>`) entries are tiny, so only inline
+ * data URLs are capped: keep the single most recent one (uploads are re-hosted
+ * to the media store on the primary path; a data URL only persists as the
+ * offline fallback).
+ */
+export const MAX_BACKGROUND_HISTORY_DATA_URLS = 1;
+export function normalizeBackgroundHistory(value) {
+    if (!Array.isArray(value))
+        return [];
+    const bounded = value
+        .map((entry) => normalizeBackgroundConfig(entry))
+        .slice(-MAX_BACKGROUND_HISTORY);
+    let dataUrlBudget = MAX_BACKGROUND_HISTORY_DATA_URLS;
+    const kept = [];
+    // Walk newest → oldest so the retained data-URL entry is the most recent.
+    for (let i = bounded.length - 1; i >= 0; i--) {
+        const entry = bounded[i];
+        if (entry.imageUrl?.startsWith("data:")) {
+            if (dataUrlBudget === 0)
+                continue;
+            dataUrlBudget--;
+        }
+        kept.unshift(entry);
+    }
+    return kept;
+}
+export function loadBackgroundHistory() {
+    return tryLocalStorage(() => {
+        const raw = localStorage.getItem(UI_BACKGROUND_HISTORY_STORAGE_KEY);
+        return raw ? normalizeBackgroundHistory(JSON.parse(raw)) : [];
+    }, []);
+}
+export function saveBackgroundHistory(history) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_BACKGROUND_HISTORY_STORAGE_KEY, JSON.stringify(normalizeBackgroundHistory(history)));
+    }, undefined);
+}
+// Redo stack (#10694) — persisted symmetrically with the undo history (the issue
+// deliverable is "undo + redo, bounded, persisted") so "step forward" survives a
+// reload just like "step back" does. Same bound + data-URL quota cap.
+const UI_BACKGROUND_REDO_STORAGE_KEY = "eliza:ui-background-redo";
+export function loadBackgroundRedo() {
+    return tryLocalStorage(() => {
+        const raw = localStorage.getItem(UI_BACKGROUND_REDO_STORAGE_KEY);
+        return raw ? normalizeBackgroundHistory(JSON.parse(raw)) : [];
+    }, []);
+}
+export function saveBackgroundRedo(redo) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_BACKGROUND_REDO_STORAGE_KEY, JSON.stringify(normalizeBackgroundHistory(redo)));
+    }, undefined);
+}
+/**
+ * Apply the theme to the document root.
+ * Sets both `data-theme` attribute and `.dark` class so both CSS selectors
+ * in base.css (`[data-theme="dark"]` and `.dark`) are satisfied.
+ */
+export function applyUiTheme(theme) {
+    if (typeof document === "undefined")
+        return;
+    const normalizedTheme = normalizeUiTheme(theme);
+    const root = document.documentElement;
+    if (!root)
+        return;
+    const currentTheme = typeof root.getAttribute === "function"
+        ? root.getAttribute("data-theme")
+        : (root.dataset?.theme ?? null);
+    const shouldBeDark = normalizedTheme === "dark";
+    const classMatchesTheme = root.classList
+        ? root.classList.contains("dark") === shouldBeDark
+        : true;
+    const colorSchemeMatches = root.style.colorScheme === normalizedTheme;
+    const uiThemeChanged = !(currentTheme === normalizedTheme &&
+        classMatchesTheme &&
+        colorSchemeMatches);
+    if (uiThemeChanged) {
+        suppressThemeTransitions(root);
+        if (currentTheme !== normalizedTheme) {
+            if (typeof root.setAttribute === "function") {
+                root.setAttribute("data-theme", normalizedTheme);
+            }
+            else if ("dataset" in root && root.dataset) {
+                root.dataset.theme = normalizedTheme;
+            }
+            else {
+                return;
+            }
+        }
+        if (root.style && root.style.colorScheme !== normalizedTheme) {
+            root.style.colorScheme = normalizedTheme;
+        }
+        if (root.classList && !classMatchesTheme) {
+            if (shouldBeDark) {
+                root.classList.add("dark");
+            }
+            else {
+                root.classList.remove("dark");
+            }
+        }
+    }
+}
+/* ── Accent color persistence ─────────────────────────────────────────── */
+const UI_ACCENT_STORAGE_KEY = "eliza:ui-accent";
+/** Load the persisted accent preset id. Defaults to the brand accent. */
+export function loadUiAccentId() {
+    return tryLocalStorage(() => normalizeAccentId(localStorage.getItem(UI_ACCENT_STORAGE_KEY)), DEFAULT_ACCENT_ID);
+}
+/** Persist the chosen accent preset id (normalized). */
+export function saveUiAccentId(id) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_ACCENT_STORAGE_KEY, normalizeAccentId(id));
+    }, undefined);
+}
+// The `--accent` family a user accent choice overrides. Applied as inline
+// styles on <html> so they win over base.css and any host brand theme; the
+// `default` accent clears them, restoring the brand accent.
+const ACCENT_OVERRIDE_VARS = [
+    "--accent",
+    "--accent-rgb",
+    "--accent-hover",
+    "--accent-muted",
+    "--accent-subtle",
+    "--ring",
+    "--border-hover",
+    "--primary",
+];
+function hexToRgb(hex) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+    if (!m)
+        return null;
+    const int = Number.parseInt(m[1], 16);
+    return [(int >> 16) & 255, (int >> 8) & 255, int & 255];
+}
+function mixChannel(channel, target, amount) {
+    return Math.round(channel + (target - channel) * amount);
+}
+function rgbToHex(r, g, b) {
+    return `#${[r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("")}`;
+}
+/**
+ * Apply a user-chosen accent color to the document root by overriding the
+ * `--accent` family inline (so it wins over base.css / any host brand theme).
+ * `null` (the `default` preset) clears the overrides, restoring the brand
+ * accent. `--accent-foreground` is intentionally left untouched — every preset
+ * is dark enough for the existing near-white foreground.
+ */
+export function applyUiAccent(color) {
+    if (typeof document === "undefined")
+        return;
+    const root = document.documentElement;
+    if (!root?.style)
+        return;
+    const rgb = color == null ? null : hexToRgb(color);
+    if (color == null || rgb == null) {
+        for (const cssVar of ACCENT_OVERRIDE_VARS)
+            root.style.removeProperty(cssVar);
+        return;
+    }
+    const [r, g, b] = rgb;
+    root.style.setProperty("--accent", color);
+    root.style.setProperty("--accent-rgb", `${r}, ${g}, ${b}`);
+    root.style.setProperty("--accent-hover", rgbToHex(mixChannel(r, 255, 0.12), mixChannel(g, 255, 0.12), mixChannel(b, 255, 0.12)));
+    root.style.setProperty("--accent-muted", rgbToHex(mixChannel(r, 0, 0.18), mixChannel(g, 0, 0.18), mixChannel(b, 0, 0.18)));
+    root.style.setProperty("--accent-subtle", `rgba(${r}, ${g}, ${b}, 0.14)`);
+    root.style.setProperty("--ring", color);
+    root.style.setProperty("--border-hover", color);
+    root.style.setProperty("--primary", color);
+}
+const UI_LANGUAGE_STORAGE_KEY = "eliza:ui-language";
+const UI_SHELL_MODE_STORAGE_KEY = "eliza:ui-shell-mode";
+const LAST_NATIVE_TAB_STORAGE_KEY = "eliza:last-native-tab";
+/* ── First-run completion persistence ────────────────────────────────── */
+const FIRST_RUN_COMPLETE_STORAGE_KEY = "eliza:first-run-complete";
+export function loadPersistedFirstRunComplete() {
+    if (typeof localStorage === "undefined") {
+        return false;
+    }
+    try {
+        return localStorage.getItem(FIRST_RUN_COMPLETE_STORAGE_KEY) === "1";
+    }
+    catch (err) {
+        // error-policy:J3 an unreadable store reads as "first run not complete";
+        // the native-store mirror (hydratePersistedFirstRunCompleteFromNativeStore)
+        // is the durability backstop against a wiped WebView store.
+        logger.warn(`[persistence] failed to load first-run completion flag: ${describePersistenceError(err)}`);
+        return false;
+    }
+}
+/**
+ * Mirror the completion flag into the Capacitor Preferences native store
+ * (Android SharedPreferences / iOS UserDefaults). WebView localStorage can be
+ * cleared by the OS independently of app-scoped native storage; the native
+ * mirror is what lets a WebView-storage wipe NOT re-trigger onboarding for an
+ * already set-up install. No-op (and never throws) in web / unit-test shells
+ * where Capacitor is unavailable. Mirrors the mobile-runtime-mode dual-write.
+ */
+async function persistNativeFirstRunComplete(complete) {
+    try {
+        const [{ Capacitor }, { Preferences }] = await Promise.all([
+            import("@capacitor/core"),
+            import("@capacitor/preferences"),
+        ]);
+        if (!Capacitor.isNativePlatform())
+            return;
+        if (complete) {
+            await Preferences.set({
+                key: FIRST_RUN_COMPLETE_STORAGE_KEY,
+                value: "1",
+            });
+        }
+        else {
+            await Preferences.remove({ key: FIRST_RUN_COMPLETE_STORAGE_KEY });
+        }
+    }
+    catch {
+        // error-policy:J4 Capacitor Preferences is unavailable in web / unit-test
+        // shells; localStorage stays the sole store there by design.
+    }
+}
+export function savePersistedFirstRunComplete(complete) {
+    void persistNativeFirstRunComplete(complete);
+    if (typeof localStorage === "undefined") {
+        return;
+    }
+    try {
+        if (complete) {
+            localStorage.setItem(FIRST_RUN_COMPLETE_STORAGE_KEY, "1");
+        }
+        else {
+            localStorage.removeItem(FIRST_RUN_COMPLETE_STORAGE_KEY);
+        }
+    }
+    catch (err) {
+        logger.warn(`[persistence] failed to save first-run completion flag: ${describePersistenceError(err)}`);
+    }
+}
+/**
+ * Boot-time durability restore for the onboarding-complete flag (issue #11506).
+ *
+ * Android/iOS can clear a WebView's localStorage independently of the app's
+ * Capacitor Preferences store, which would drop `eliza:first-run-complete` and
+ * re-show onboarding on the next launch even though the agent config on disk is
+ * intact. Completion is mirrored into Preferences on save; on boot, when the
+ * WebView lost the localStorage flag but the durable native store still has it,
+ * restore the localStorage value so the synchronous boot readers
+ * (`loadPersistedFirstRunComplete` in restore, the lifecycle-state init, and
+ * the first-run completion ref) see the completed state and route straight
+ * home instead of re-prompting.
+ *
+ * Awaited early in the restoring-session phase (before `hadPrior` is read), so
+ * the restore repopulates localStorage on the SAME boot. No-op when
+ * localStorage already carries the flag or Capacitor is unavailable.
+ */
+export async function hydratePersistedFirstRunCompleteFromNativeStore() {
+    if (typeof localStorage === "undefined")
+        return;
+    if (loadPersistedFirstRunComplete())
+        return;
+    try {
+        const [{ Capacitor }, { Preferences }] = await Promise.all([
+            import("@capacitor/core"),
+            import("@capacitor/preferences"),
+        ]);
+        if (!Capacitor.isNativePlatform())
+            return;
+        const { value } = await Preferences.get({
+            key: FIRST_RUN_COMPLETE_STORAGE_KEY,
+        });
+        if (value === "1") {
+            localStorage.setItem(FIRST_RUN_COMPLETE_STORAGE_KEY, "1");
+        }
+    }
+    catch {
+        // error-policy:J4 native store unavailable — localStorage remains
+        // authoritative for this boot.
+    }
+}
+/* ── Content pack persistence ───────────────────────────────────────── */
+const ACTIVE_PACK_STORAGE_KEY = "elizaos:active-pack-id";
+const ACTIVE_PACK_URL_STORAGE_KEY = "elizaos:active-pack-url";
+export function loadPersistedActivePackId() {
+    return tryLocalStorage(() => localStorage.getItem(ACTIVE_PACK_STORAGE_KEY), null);
+}
+export function savePersistedActivePackId(packId) {
+    tryLocalStorage(() => {
+        if (packId) {
+            localStorage.setItem(ACTIVE_PACK_STORAGE_KEY, packId);
+        }
+        else {
+            localStorage.removeItem(ACTIVE_PACK_STORAGE_KEY);
+        }
+    }, undefined);
+}
+export function loadPersistedActivePackUrl() {
+    return tryLocalStorage(() => localStorage.getItem(ACTIVE_PACK_URL_STORAGE_KEY), null);
+}
+export function savePersistedActivePackUrl(packUrl) {
+    tryLocalStorage(() => {
+        if (packUrl) {
+            localStorage.setItem(ACTIVE_PACK_URL_STORAGE_KEY, packUrl);
+        }
+        else {
+            localStorage.removeItem(ACTIVE_PACK_URL_STORAGE_KEY);
+        }
+    }, undefined);
+}
+export function loadUiLanguage() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(UI_LANGUAGE_STORAGE_KEY);
+        if (stored != null)
+            return normalizeLanguage(stored);
+        // No explicit user choice yet — guess from browser/region hints.
+        return detectClientLanguage() ?? DEFAULT_UI_LANGUAGE;
+    }, DEFAULT_UI_LANGUAGE);
+}
+export function saveUiLanguage(language) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, normalizeLanguage(language));
+    }, undefined);
+}
+/** Whether the user has a persisted UI language (vs. a fresh first visit). */
+export function hasStoredUiLanguage() {
+    return tryLocalStorage(() => localStorage.getItem(UI_LANGUAGE_STORAGE_KEY) != null, false);
+}
+function normalizeUiShellMode(_mode) {
+    return "native";
+}
+export { normalizeUiShellMode };
+export function loadUiShellMode() {
+    return tryLocalStorage(() => normalizeUiShellMode(localStorage.getItem(UI_SHELL_MODE_STORAGE_KEY)), "native");
+}
+export function saveUiShellMode(mode) {
+    tryLocalStorage(() => {
+        localStorage.setItem(UI_SHELL_MODE_STORAGE_KEY, normalizeUiShellMode(mode));
+    }, undefined);
+}
+function normalizeLastNativeTab(tab) {
+    switch (tab) {
+        case "advanced":
+            return "fine-tuning";
+        case "chat":
+        case "stream":
+        case "apps":
+        case "browser":
+        case "inventory":
+        case "documents":
+        case "triggers":
+        case "plugins":
+        case "skills":
+        case "fine-tuning":
+        case "trajectories":
+        case "relationships":
+        case "voice":
+        case "runtime":
+        case "database":
+        case "desktop":
+        case "settings":
+        case "logs":
+            return tab;
+        default:
+            return "chat";
+    }
+}
+export function loadLastNativeTab() {
+    return tryLocalStorage(() => normalizeLastNativeTab(localStorage.getItem(LAST_NATIVE_TAB_STORAGE_KEY)), "chat");
+}
+export function saveLastNativeTab(tab) {
+    tryLocalStorage(() => {
+        localStorage.setItem(LAST_NATIVE_TAB_STORAGE_KEY, normalizeLastNativeTab(tab));
+    }, undefined);
+}
+/* ── Avatar persistence ───────────────────────────────────────────────── */
+const AVATAR_INDEX_KEY = "eliza_avatar_index";
+export function loadAvatarIndex() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(AVATAR_INDEX_KEY);
+        if (stored) {
+            const n = parseInt(stored, 10);
+            return normalizeAvatarIndex(n);
+        }
+        return 1;
+    }, 1);
+}
+export function saveAvatarIndex(index) {
+    tryLocalStorage(() => {
+        localStorage.setItem(AVATAR_INDEX_KEY, String(normalizeAvatarIndex(index)));
+    }, undefined);
+}
+export function clearAvatarIndex() {
+    tryLocalStorage(() => {
+        localStorage.removeItem(AVATAR_INDEX_KEY);
+    }, undefined);
+}
+/* ── Favorite apps persistence ────────────────────────────────────────── */
+const FAVORITE_APPS_KEY = "eliza:favorite-apps";
+function sanitizeFavoriteApps(value) {
+    if (!Array.isArray(value))
+        return [];
+    const seen = new Set();
+    const apps = [];
+    for (const item of value) {
+        if (typeof item !== "string" || item.length === 0 || seen.has(item)) {
+            continue;
+        }
+        seen.add(item);
+        apps.push(item);
+    }
+    return apps;
+}
+function getDefaultFavoriteApps() {
+    return sanitizeFavoriteApps(getBootConfig().defaultApps);
+}
+export function loadFavoriteApps() {
+    const defaultApps = getDefaultFavoriteApps();
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(FAVORITE_APPS_KEY);
+        if (stored === null)
+            return defaultApps;
+        try {
+            const parsed = JSON.parse(stored);
+            return sanitizeFavoriteApps(parsed);
+        }
+        catch (err) {
+            // error-policy:J3 corrupt saved favorites start clean from the defaults
+            // (documented start-clean parse; the warn keeps corruption observable).
+            logger.warn(`[persistence] failed to parse favorite apps from localStorage: ${describePersistenceError(err)}`);
+            return defaultApps;
+        }
+    }, defaultApps);
+}
+export function saveFavoriteApps(apps) {
+    tryLocalStorage(() => {
+        localStorage.setItem(FAVORITE_APPS_KEY, JSON.stringify(sanitizeFavoriteApps(apps)));
+    }, undefined);
+}
+/**
+ * Hydrate the favorites list from the server-side persisted store
+ * (config.ui.favoriteApps), falling back to the local cache on failure.
+ * Mirrors the result back into localStorage so the next boot is fast.
+ *
+ * During iOS boot the native transport can be legitimately mode-gated (cloud
+ * builds reject local-agent IPC until runtime-mode reconciliation finishes) —
+ * that is an expected startup phase, not a broken pipeline, so it logs at
+ * debug level; `useAppShellState` re-fetches once after the agent-ready
+ * event. Every other failure still warns.
+ */
+export async function fetchServerFavoriteApps() {
+    try {
+        const resp = await fetchWithCsrf("/api/apps/favorites", {
+            method: "GET",
+            headers: { Accept: "application/json" },
+        });
+        if (!resp.ok)
+            return null;
+        const data = (await resp.json());
+        const sanitized = sanitizeFavoriteApps(data.favoriteApps);
+        saveFavoriteApps(sanitized);
+        return sanitized;
+    }
+    catch (err) {
+        const message = describePersistenceError(err);
+        // error-policy:J4 `null` is the documented failure signal (caller keeps
+        // the local cache); iOS mode-gated boot logs debug, real failures warn.
+        if (isTerminalIosNativeAgentBootErrorMessage(message)) {
+            logger.debug(`[persistence] server favorite apps unavailable while the native transport is mode-gated (will retry after agent-ready): ${message}`);
+            return null;
+        }
+        logger.warn(`[persistence] failed to fetch server favorite apps: ${message}`);
+        return null;
+    }
+}
+/**
+ * Replace the server-persisted favorites list. Used when the UI commits
+ * a bulk reorder/edit. Best-effort: returns null on failure.
+ */
+export async function replaceServerFavoriteApps(favoriteAppNames) {
+    try {
+        const resp = await fetchWithCsrf("/api/apps/favorites/replace", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ favoriteAppNames }),
+        });
+        if (!resp.ok)
+            return null;
+        const data = (await resp.json());
+        const sanitized = sanitizeFavoriteApps(data.favoriteApps);
+        saveFavoriteApps(sanitized);
+        return sanitized;
+    }
+    catch (err) {
+        // error-policy:J4 `null` is the documented failure signal — the caller
+        // keeps its optimistic UI state; the warn keeps a broken route observable.
+        logger.warn(`[persistence] failed to replace server favorite apps: ${describePersistenceError(err)}`);
+        return null;
+    }
+}
+/**
+ * Toggle a single app's favorite state on the server. Returns the updated
+ * list, or `null` if the request failed (caller should keep optimistic UI
+ * state). Local cache is updated on success.
+ */
+export async function toggleServerFavoriteApp(appName, isFavorite) {
+    try {
+        const resp = await fetchWithCsrf("/api/apps/favorites", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ appName, isFavorite }),
+        });
+        if (!resp.ok)
+            return null;
+        const data = (await resp.json());
+        const sanitized = sanitizeFavoriteApps(data.favoriteApps);
+        saveFavoriteApps(sanitized);
+        return sanitized;
+    }
+    catch (err) {
+        // error-policy:J4 `null` is the documented failure signal — the caller
+        // keeps its optimistic UI state; the warn keeps a broken route observable.
+        logger.warn(`[persistence] failed to toggle server favorite app: ${describePersistenceError(err)}`);
+        return null;
+    }
+}
+/* ── Recent apps persistence ──────────────────────────────────────────── */
+const RECENT_APPS_KEY = "eliza:recent-apps";
+/** Cap on persisted recency list. Older entries are evicted. */
+export const RECENT_APPS_MAX = 10;
+export function loadRecentApps() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(RECENT_APPS_KEY);
+        if (!stored)
+            return [];
+        try {
+            const parsed = JSON.parse(stored);
+            if (!Array.isArray(parsed))
+                return [];
+            return parsed
+                .filter((item) => typeof item === "string")
+                .slice(0, RECENT_APPS_MAX);
+        }
+        catch (err) {
+            // error-policy:J3 corrupt saved recents start clean; warn keeps the
+            // corruption observable.
+            logger.warn(`[persistence] failed to parse recent apps from localStorage: ${describePersistenceError(err)}`);
+            return [];
+        }
+    }, []);
+}
+export function saveRecentApps(apps) {
+    tryLocalStorage(() => {
+        localStorage.setItem(RECENT_APPS_KEY, JSON.stringify(apps.slice(0, RECENT_APPS_MAX)));
+    }, undefined);
+}
+/* ── Wallet enabled persistence ─────────────────────────────────────── */
+const WALLET_ENABLED_KEY = "eliza:wallet:enabled";
+export function loadWalletEnabled() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(WALLET_ENABLED_KEY);
+        return stored === null ? true : stored === "true";
+    }, true);
+}
+export function saveWalletEnabled(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(WALLET_ENABLED_KEY, String(value));
+    }, undefined);
+}
+/* ── Continuous chat mode persistence ───────────────────────────────────── */
+const CONTINUOUS_CHAT_MODE_KEY = "eliza:voice:continuous-chat-mode";
+function normalizeContinuousChatMode(value) {
+    if (value === "vad-gated" || value === "always-on")
+        return value;
+    return "off";
+}
+export function loadContinuousChatMode() {
+    return tryLocalStorage(() => normalizeContinuousChatMode(localStorage.getItem(CONTINUOUS_CHAT_MODE_KEY)), "off");
+}
+export function saveContinuousChatMode(mode) {
+    tryLocalStorage(() => {
+        localStorage.setItem(CONTINUOUS_CHAT_MODE_KEY, mode);
+    }, undefined);
+}
+/* ── Wake-word listening persistence ────────────────────────────────────── */
+// Device-local master switch for the "hey <name>" wake-word listening window
+// (see useWakeListenWindow). Stored here — not under `messages.voice` — because
+// it gates a device-local capture loop the shell reads synchronously on render,
+// the same dual-store pattern continuous-chat-mode and vad-auto-stop use. It
+// defaults ON so existing installs keep the always-available wake entry ramp;
+// the Settings → Voice toggle is what lets a user turn it off.
+const WAKE_WORD_ENABLED_KEY = "eliza:voice:wake-word-enabled";
+export function loadWakeWordEnabled() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(WAKE_WORD_ENABLED_KEY);
+        return stored === null ? true : stored === "true";
+    }, true);
+}
+export function saveWakeWordEnabled(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(WAKE_WORD_ENABLED_KEY, String(value));
+    }, undefined);
+}
+/* ── VAD auto-stop persistence ──────────────────────────────────────────── */
+// Local mirror of the `vadAutoStop` voice setting (source of truth is the agent
+// config under `messages.voice`). Stored here too so the capture hot path
+// (`useShellController.startCapture`) can read it synchronously on the user
+// gesture without an async config fetch — mirrors how continuous-chat-mode is
+// dual-stored above.
+const VAD_AUTO_STOP_KEY = "eliza:voice:vad-auto-stop";
+const DEFAULT_VAD_AUTO_STOP = {
+    silenceMs: DEFAULT_LOCAL_ASR_AUTO_STOP.silenceMs,
+    speechRmsThreshold: DEFAULT_LOCAL_ASR_AUTO_STOP.speechRmsThreshold,
+};
+export function loadVadAutoStop() {
+    return tryLocalStorage(() => {
+        const raw = localStorage.getItem(VAD_AUTO_STOP_KEY);
+        if (!raw)
+            return DEFAULT_VAD_AUTO_STOP;
+        const parsed = JSON.parse(raw);
+        return {
+            silenceMs: typeof parsed.silenceMs === "number" &&
+                Number.isFinite(parsed.silenceMs)
+                ? parsed.silenceMs
+                : DEFAULT_VAD_AUTO_STOP.silenceMs,
+            speechRmsThreshold: typeof parsed.speechRmsThreshold === "number" &&
+                Number.isFinite(parsed.speechRmsThreshold)
+                ? parsed.speechRmsThreshold
+                : DEFAULT_VAD_AUTO_STOP.speechRmsThreshold,
+        };
+    }, DEFAULT_VAD_AUTO_STOP);
+}
+export function saveVadAutoStop(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(VAD_AUTO_STOP_KEY, JSON.stringify(value));
+    }, undefined);
+}
+/* ── Browser enabled persistence ────────────────────────────────────── */
+const BROWSER_ENABLED_KEY = "eliza:browser:enabled";
+export function loadBrowserEnabled() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(BROWSER_ENABLED_KEY);
+        return stored === null ? true : stored === "true";
+    }, true);
+}
+export function saveBrowserEnabled(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(BROWSER_ENABLED_KEY, String(value));
+    }, undefined);
+}
+/* ── Computer Use enabled persistence ───────────────────────────────── */
+const COMPUTER_USE_ENABLED_KEY = "eliza:computeruse:enabled";
+export function loadComputerUseEnabled() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(COMPUTER_USE_ENABLED_KEY);
+        return stored === null ? false : stored === "true";
+    }, false);
+}
+export function saveComputerUseEnabled(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(COMPUTER_USE_ENABLED_KEY, String(value));
+    }, undefined);
+}
+/* ── Chat UI persistence ──────────────────────────────────────────────── */
+const CHAT_AVATAR_VISIBLE_KEY = "eliza:chat:avatarVisible";
+const CHAT_VOICE_MUTED_KEY = "eliza:chat:voiceMuted";
+export function loadChatAvatarVisible() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(CHAT_AVATAR_VISIBLE_KEY);
+        return stored === null ? true : stored === "true";
+    }, true);
+}
+export function loadChatVoiceMuted() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(CHAT_VOICE_MUTED_KEY);
+        return stored === null ? false : stored === "true";
+    }, false);
+}
+export function saveChatAvatarVisible(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(CHAT_AVATAR_VISIBLE_KEY, String(value));
+    }, undefined);
+}
+export function saveChatVoiceMuted(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(CHAT_VOICE_MUTED_KEY, String(value));
+    }, undefined);
+}
+const ACTIVE_CONVERSATION_ID_KEY = "eliza:chat:activeConversationId";
+const COMPANION_MESSAGE_CUTOFF_TS_KEY = "eliza:chat:companionMessageCutoffTs";
+export function loadActiveConversationId() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(ACTIVE_CONVERSATION_ID_KEY)?.trim();
+        return stored ? stored : null;
+    }, null);
+}
+export function saveActiveConversationId(value) {
+    tryLocalStorage(() => {
+        if (value?.trim()) {
+            localStorage.setItem(ACTIVE_CONVERSATION_ID_KEY, value);
+            return;
+        }
+        localStorage.removeItem(ACTIVE_CONVERSATION_ID_KEY);
+    }, undefined);
+}
+export function loadCompanionMessageCutoffTs() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(COMPANION_MESSAGE_CUTOFF_TS_KEY);
+        const parsed = stored ? Number.parseInt(stored, 10) : Number.NaN;
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }, 0);
+}
+export function saveCompanionMessageCutoffTs(value) {
+    tryLocalStorage(() => {
+        localStorage.setItem(COMPANION_MESSAGE_CUTOFF_TS_KEY, String(Math.max(0, Math.trunc(value))));
+    }, undefined);
+}
+const ACTIVE_SERVER_STORAGE_KEY = "elizaos:active-server";
+const ELIZA_CLOUD_CONTROL_PLANE_HOSTS = new Set([
+    "api.elizacloud.ai",
+    "elizacloud.ai",
+    "www.elizacloud.ai",
+    "dev.elizacloud.ai",
+]);
+function trimPersistedValue(value) {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+}
+function normalizeApiBase(value) {
+    const trimmed = trimPersistedValue(value);
+    if (!trimmed)
+        return trimmed;
+    let end = trimmed.length;
+    while (end > 0 && trimmed.charCodeAt(end - 1) === 47)
+        end--;
+    return normalizeDirectCloudSharedAgentApiBase(trimmed.slice(0, end));
+}
+function isElizaCloudControlPlaneApiBase(value) {
+    const apiBase = normalizeApiBase(value);
+    if (!apiBase)
+        return false;
+    try {
+        const url = new URL(apiBase);
+        if (!ELIZA_CLOUD_CONTROL_PLANE_HOSTS.has(url.hostname.toLowerCase())) {
+            return false;
+        }
+        // The BARE control-plane origin (no path) AND the agent-id-less agents
+        // COLLECTION (`/api/v1/eliza/agents`, no `/<id>`) are both "managed cloud"
+        // endpoints with no agent selected — their apiBase is derived at runtime and
+        // must NOT be persisted (persisting the id-less collection makes every
+        // /api/* call concat to `.../agents/api/...` and 404 with "Backend
+        // Unreachable"). A specific per-agent base on the same host — a shared-runtime
+        // REST adapter at /api/v1/eliza/agents/<id> — IS concrete and MUST be
+        // persisted; dropping it loses the agent the client must talk to. Treat any
+        // other non-trivial path as concrete.
+        const pathname = url.pathname.replace(/\/+$/, "");
+        return pathname === "" || pathname === "/api/v1/eliza/agents";
+    }
+    catch (err) {
+        // error-policy:J3 an unparseable apiBase is not a control-plane base;
+        // downstream trust gates reject it on their own.
+        logger.debug(`[persistence] failed to parse apiBase URL while checking Eliza Cloud control plane: apiBase=${apiBase}; error=${describePersistenceError(err)}`);
+        return false;
+    }
+}
+export function createPersistedActiveServer(args) {
+    const normalizedApiBase = normalizeApiBase(args.apiBase);
+    const apiBase = isElizaCloudControlPlaneApiBase(normalizedApiBase)
+        ? undefined
+        : normalizedApiBase;
+    const accessToken = trimPersistedValue(args.accessToken);
+    const explicitLabel = trimPersistedValue(args.label);
+    switch (args.kind) {
+        case "local":
+            return {
+                id: "local:embedded",
+                kind: "local",
+                label: explicitLabel ?? "This device",
+            };
+        case "cloud":
+            return {
+                id: trimPersistedValue(args.id) ?? `cloud:${apiBase ?? "managed"}`,
+                kind: "cloud",
+                label: explicitLabel ?? "Eliza Cloud",
+                ...(apiBase ? { apiBase } : {}),
+                ...(accessToken ? { accessToken } : {}),
+            };
+        case "remote": {
+            let label = explicitLabel ?? "Remote server";
+            if (!explicitLabel && apiBase) {
+                try {
+                    label = new URL(apiBase).host || label;
+                }
+                catch (err) {
+                    // error-policy:J3 label derivation only — an unparseable base keeps
+                    // the raw string as the display label.
+                    logger.debug(`[persistence] failed to parse apiBase URL for remote server label; using raw apiBase: apiBase=${apiBase}; error=${describePersistenceError(err)}`);
+                    label = apiBase;
+                }
+            }
+            return {
+                id: `remote:${apiBase ?? "manual"}`,
+                kind: "remote",
+                label,
+                ...(apiBase ? { apiBase } : {}),
+                ...(accessToken ? { accessToken } : {}),
+            };
+        }
+    }
+}
+function normalizePersistedActiveServer(value) {
+    const record = asRecord(value);
+    if (!record) {
+        return null;
+    }
+    const kind = record.kind === "local" ||
+        record.kind === "cloud" ||
+        record.kind === "remote"
+        ? record.kind
+        : null;
+    const id = trimPersistedValue(record.id);
+    const label = trimPersistedValue(record.label);
+    if (!kind || !id || !label) {
+        return null;
+    }
+    const normalizedApiBase = normalizeApiBase(record.apiBase);
+    const apiBase = isElizaCloudControlPlaneApiBase(normalizedApiBase)
+        ? undefined
+        : normalizedApiBase;
+    const accessToken = trimPersistedValue(record.accessToken);
+    return {
+        id,
+        kind,
+        label,
+        ...(apiBase ? { apiBase } : {}),
+        ...(accessToken ? { accessToken } : {}),
+    };
+}
+export function loadPersistedActiveServer() {
+    return tryLocalStorage(() => {
+        const stored = localStorage.getItem(ACTIVE_SERVER_STORAGE_KEY);
+        if (!stored) {
+            return null;
+        }
+        return normalizePersistedActiveServer(JSON.parse(stored));
+    }, null);
+}
+export function savePersistedActiveServer(server) {
+    if (typeof localStorage === "undefined") {
+        return;
+    }
+    // The active-server record carries the sign-in state (kind/apiBase/token) and
+    // the backend the app reconnects to. A swallowed persist failure (quota,
+    // private-mode SecurityError) silently loses a freshly-recovered apiBase, so
+    // backfillCloudApiBase re-runs every boot with no diagnostic. Mirror
+    // savePersistedFirstRunComplete: still no-throw + no-op when unavailable, but
+    // surface the failure instead of swallowing it.
+    try {
+        localStorage.setItem(ACTIVE_SERVER_STORAGE_KEY, JSON.stringify(server));
+    }
+    catch (err) {
+        // error-policy:J4 documented above — no-throw persistence write with the
+        // failure surfaced at warn instead of swallowed.
+        logger.warn(`[persistence] failed to save active server: ${describePersistenceError(err)}`);
+    }
+}
+export function clearPersistedActiveServer() {
+    tryLocalStorage(() => {
+        localStorage.removeItem(ACTIVE_SERVER_STORAGE_KEY);
+    }, undefined);
+}
+/**
+ * Drop the bearer access token from the persisted active server while keeping
+ * the server selection (kind/apiBase/label). Call this on sign-out: the token
+ * is a JWT and leaving it in localStorage after sign-out is an at-rest leak,
+ * but clearing the whole record would needlessly forget which backend to
+ * re-authenticate against.
+ */
+export function scrubPersistedActiveServerToken() {
+    const current = loadPersistedActiveServer();
+    if (!current?.accessToken)
+        return;
+    const scrubbed = { ...current };
+    delete scrubbed.accessToken;
+    savePersistedActiveServer(scrubbed);
+}
