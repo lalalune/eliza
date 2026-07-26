@@ -193,7 +193,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       expect(days).toBeLessThanOrEqual(8.1);
     });
 
-    it("flags warning-only severity for overlap without shared attendees", async () => {
+    it("treats confirmed overlap as hard even when provider attendees are absent", async () => {
       setConflictDetectLoader({
         loadFeed: async () => [
           {
@@ -221,7 +221,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       });
       const data = result.data as { conflicts: { severity: string }[] };
       expect(data.conflicts).toHaveLength(1);
-      expect(data.conflicts[0]?.severity).toBe("warning");
+      expect(data.conflicts[0]?.severity).toBe("hard");
     });
   });
 
@@ -425,7 +425,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
 
     function makeRuntimeWithFeed(
       events: readonly StubEvent[],
-      calls: { timeMin?: string; timeMax?: string }[] = [],
+      calls: { side?: string; timeMin?: string; timeMax?: string }[] = [],
     ): IAgentRuntime {
       return {
         agentId: "agent-conflict-test" as UUID,
@@ -438,7 +438,11 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
         getService: () => ({
           getCalendarFeed: async (
             _url: URL,
-            request: { timeMin?: string; timeMax?: string },
+            request: {
+              side?: string;
+              timeMin?: string;
+              timeMax?: string;
+            },
           ) => {
             calls.push(request);
             return {
@@ -455,7 +459,11 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
     }
 
     it("detects a seeded 2-event overlap end-to-end through the handler", async () => {
-      const calls: { timeMin?: string; timeMax?: string }[] = [];
+      const calls: {
+        side?: string;
+        timeMin?: string;
+        timeMax?: string;
+      }[] = [];
       const runtime = makeRuntimeWithFeed(
         [
           {
@@ -488,7 +496,9 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       });
       expect(result.success).toBe(true);
       // The scan window is forwarded to the calendar read.
-      expect(calls).toEqual([{ timeMin: range.start, timeMax: range.end }]);
+      expect(calls).toEqual([
+        { side: "owner", timeMin: range.start, timeMax: range.end },
+      ]);
       const data = result.data as {
         conflicts: {
           eventA: { id: string };

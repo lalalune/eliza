@@ -10,6 +10,7 @@ export {
   __resetConflictDetectLoaderForTests,
   type ConflictDetectActionDeps,
   type ConflictDetectEvent,
+  type ConflictDetectHostAdapter,
   type ConflictDetectLoadBatch,
   type ConflictDetectLoader,
   type ConflictDetectLoadResult,
@@ -22,6 +23,7 @@ export {
   conflictDetectAction,
   createCalendarFeedConflictLoader,
   createConflictDetectAction,
+  registerConflictDetectHostAdapter,
   setConflictDetectLoader,
 } from "./conflict-detect.js";
 export type {

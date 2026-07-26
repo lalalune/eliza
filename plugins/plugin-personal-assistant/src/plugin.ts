@@ -63,7 +63,10 @@ import { MEETING_TRANSCRIPT_FINALIZED_EVENT } from "@elizaos/shared";
 import { blockAction } from "./actions/block.js";
 import { briefAction } from "./actions/brief.js";
 import { calendarAction } from "./actions/calendar.js";
-import { conflictDetectAction } from "./actions/conflict-detect.js";
+import {
+  conflictDetectAction,
+  registerPersonalAssistantConflictDetectHost,
+} from "./actions/conflict-detect.js";
 import { connectorAction } from "./actions/connector.js";
 import { creativeDraftAction } from "./actions/creative-draft.js";
 import { credentialsAction } from "./actions/credentials.js";
@@ -785,6 +788,7 @@ const rawPersonalAssistantPlugin: Plugin = {
     _pluginConfig: Record<string, unknown>,
     runtime: IAgentRuntime,
   ) => {
+    registerPersonalAssistantConflictDetectHost(runtime);
     runtime.registerEvent(MEETING_TRANSCRIPT_FINALIZED_EVENT, async (payload) =>
       handleMeetingTranscriptFinalized(
         payload as EventPayload & MeetingTranscriptFinalizedPayload,

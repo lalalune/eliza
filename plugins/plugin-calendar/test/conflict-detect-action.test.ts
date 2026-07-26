@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   type ConflictDetectEvent,
   createConflictDetectAction,
+  registerConflictDetectHostAdapter,
 } from "../src/actions/conflict-detect.js";
 
 function runtime(overrides: Partial<IAgentRuntime> = {}): IAgentRuntime {
@@ -154,6 +155,38 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
     ]);
   });
 
+  it("applies a runtime host adapter even when the calendar action was created first", async () => {
+    const seen: Array<{ start: string; end: string }> = [];
+    const action = createConflictDetectAction({
+      now: () => new Date("2026-03-08T12:00:00.000Z"),
+      loader: {
+        loadFeed: async ({ range }) => {
+          seen.push(range);
+          return [];
+        },
+      },
+    });
+    const testRuntime = runtime();
+    registerConflictDetectHostAdapter(testRuntime, {
+      authorize: async () => true,
+      resolveTimeZone: async () => "America/New_York",
+    });
+
+    const result = await invoke(
+      action,
+      { subaction: "scan_today" },
+      testRuntime,
+    );
+
+    expect(result.success).toBe(true);
+    expect(seen).toEqual([
+      {
+        start: "2026-03-08T05:00:00.000Z",
+        end: "2026-03-09T04:00:00.000Z",
+      },
+    ]);
+  });
+
   it("marks a guest proposal partial when no real free/busy loader exists", async () => {
     const action = testAction({ feed: [] });
     const result = await invoke(action, {
@@ -199,6 +232,28 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
     });
   });
 
+  it("keeps an empty multi-guest response partial without per-guest coverage", async () => {
+    const action = testAction({ feed: [], freeBusy: [] });
+    const result = await invoke(action, {
+      subaction: "scan_event_proposal",
+      proposal: {
+        startISO: "2026-05-11T09:00:00.000Z",
+        endISO: "2026-05-11T10:00:00.000Z",
+        attendees: ["first@example.com", "second@example.com"],
+      },
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        completeness: "partial",
+        definitive: false,
+        warning: "CALENDAR_INCOMPLETE",
+      },
+    });
+    expect(String(result.text)).toMatch(/incomplete/i);
+  });
+
   it("keeps guest loader failure visible as a redacted partial result", async () => {
     const action = createConflictDetectAction({
       authorize: async () => true,
@@ -212,14 +267,19 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
         },
       },
     });
-    const result = await invoke(action, {
-      subaction: "scan_event_proposal",
-      proposal: {
-        startISO: "2026-05-11T09:00:00.000Z",
-        endISO: "2026-05-11T10:00:00.000Z",
-        attendees: ["guest@example.com"],
+    const testRuntime = runtime();
+    const result = await invoke(
+      action,
+      {
+        subaction: "scan_event_proposal",
+        proposal: {
+          startISO: "2026-05-11T09:00:00.000Z",
+          endISO: "2026-05-11T10:00:00.000Z",
+          attendees: ["guest@example.com"],
+        },
       },
-    });
+      testRuntime,
+    );
 
     expect(result).toMatchObject({
       success: true,
@@ -235,6 +295,11 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
       },
     });
     expect(JSON.stringify(result.data)).not.toContain(
+      "private-guest@example.com",
+    );
+    const warn = testRuntime.logger.warn as ReturnType<typeof vi.fn>;
+    expect(warn).toHaveBeenCalled();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(
       "private-guest@example.com",
     );
   });
@@ -424,7 +489,7 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
         completeness: "partial",
         definitive: false,
         checkedEvents: 2,
-        conflicts: [expect.objectContaining({ severity: "warning" })],
+        conflicts: [expect.objectContaining({ severity: "hard" })],
         sources: [
           expect.objectContaining({ status: "fresh", eventCount: 1 }),
           expect.objectContaining({ status: "stale", eventCount: 1 }),

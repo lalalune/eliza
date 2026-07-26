@@ -12,6 +12,7 @@ export {
   type CalendarTravelIntent,
   type ConflictDetectActionDeps,
   type ConflictDetectEvent,
+  type ConflictDetectHostAdapter,
   type ConflictDetectLoadBatch,
   type ConflictDetectLoader,
   type ConflictDetectLoadResult,
@@ -26,6 +27,7 @@ export {
   createCalendarFeedConflictLoader,
   createConflictDetectAction,
   extractCalendarPlanWithLlm,
+  registerConflictDetectHostAdapter,
   setConflictDetectLoader,
 } from "./actions/index.js";
 export {

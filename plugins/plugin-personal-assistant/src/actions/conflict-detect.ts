@@ -10,6 +10,7 @@ import type { IAgentRuntime } from "@elizaos/core";
 import {
   type ConflictDetectActionDeps,
   createConflictDetectAction,
+  registerConflictDetectHostAdapter,
 } from "@elizaos/plugin-calendar";
 import { hasLifeOpsAccess } from "../lifeops/access.js";
 import { resolveOwnerTimeZone } from "../lifeops/owner/fact-store.js";
@@ -24,9 +25,16 @@ export const conflictDetectAction = createConflictDetectAction(
   personalAssistantConflictDeps,
 );
 
+export function registerPersonalAssistantConflictDetectHost(
+  runtime: IAgentRuntime,
+): void {
+  registerConflictDetectHostAdapter(runtime, personalAssistantConflictDeps);
+}
+
 export {
   __resetConflictDetectLoaderForTests,
   type ConflictDetectEvent,
+  type ConflictDetectHostAdapter,
   type ConflictDetectLoadBatch,
   type ConflictDetectLoader,
   type ConflictDetectLoadResult,
@@ -37,5 +45,6 @@ export {
   type ConflictRange,
   type ConflictSeverity,
   createCalendarFeedConflictLoader,
+  registerConflictDetectHostAdapter,
   setConflictDetectLoader,
 } from "@elizaos/plugin-calendar";

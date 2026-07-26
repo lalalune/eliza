@@ -29,6 +29,7 @@ import type {
 } from "@elizaos/core";
 import {
   recentConversationTexts as collectRecentConversationTexts,
+  ElizaError,
   ModelType,
   parseJsonModelRecord,
   resolveOptimizedPromptForRuntime,
@@ -863,8 +864,17 @@ async function enqueueSchedulingDraft(args: {
   const payload = approvalPayloadForDraft(args.draft);
   const scheduling = readSchedulingApprovalCorrelation(payload);
   if (!scheduling) {
-    throw new Error(
+    throw new ElizaError(
       "[SchedulingApproval] scheduling draft lost its typed correlation",
+      {
+        code: "SCHEDULING_APPROVAL_CORRELATION_LOST",
+        context: {
+          negotiationId: args.draft.negotiationId,
+          proposalId: args.draft.proposalId,
+          messageKind: args.draft.messageKind,
+        },
+        severity: "fatal",
+      },
     );
   }
   const queue = createApprovalQueue(args.runtime, {
@@ -1245,8 +1255,16 @@ export async function runSchedulingNegotiationHandler(
       });
       const negotiation = await service.getNegotiation(proposal.negotiationId);
       if (!negotiation) {
-        throw new Error(
+        throw new ElizaError(
           `[SchedulingApproval] negotiation ${proposal.negotiationId} disappeared after proposal persistence`,
+          {
+            code: "SCHEDULING_NEGOTIATION_RELOAD_FAILED",
+            context: {
+              negotiationId: proposal.negotiationId,
+              proposalId: proposal.id,
+            },
+            severity: "fatal",
+          },
         );
       }
       const draft =
@@ -1333,8 +1351,16 @@ export async function runSchedulingNegotiationHandler(
         (candidate) => candidate.id === params.proposalId,
       );
       if (!proposal) {
-        throw new Error(
+        throw new ElizaError(
           `[SchedulingApproval] proposal ${params.proposalId} disappeared after selection`,
+          {
+            code: "SCHEDULING_PROPOSAL_RELOAD_FAILED",
+            context: {
+              negotiationId: neg.id,
+              proposalId: params.proposalId,
+            },
+            severity: "fatal",
+          },
         );
       }
       const draft = await service.draftConfirmationMessage(neg, proposal);

@@ -438,7 +438,7 @@ describe("evaluateCalendarAvailability", () => {
     expect(evaluation.conflicts).toHaveLength(1);
     expect(evaluation.conflicts[0]).toMatchObject({
       severity: "hard",
-      reasons: ["time_overlap", "guest_busy", "shared_attendee"],
+      reasons: ["time_overlap", "guest_busy"],
       eventB: {
         id: "private-busy-1",
         title: "Busy",

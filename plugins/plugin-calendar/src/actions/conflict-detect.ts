@@ -24,6 +24,7 @@ import type {
 } from "@elizaos/shared";
 import { resolveDefaultTimeZone } from "../internal/constants.js";
 import { CalendarServiceError } from "../internal/errors.js";
+import { getZonedDateParts } from "../internal/time.js";
 import {
   buildZonedCalendarRange,
   type CalendarAvailabilityAttendee,
@@ -120,10 +121,29 @@ export interface ConflictDetectActionDeps {
   readonly loader?: Partial<ConflictDetectLoader>;
 }
 
+export type ConflictDetectHostAdapter = Pick<
+  ConflictDetectActionDeps,
+  "authorize" | "resolveTimeZone"
+>;
+
+const hostAdapters = new WeakMap<IAgentRuntime, ConflictDetectHostAdapter>();
+
+/**
+ * Bind host-owned authorization and timezone semantics to one runtime. The
+ * runtime-keyed registry lets an already-registered calendar action gain the
+ * host adapter without cross-runtime state or plugin-order dependence.
+ */
+export function registerConflictDetectHostAdapter(
+  runtime: IAgentRuntime,
+  adapter: ConflictDetectHostAdapter,
+): void {
+  hostAdapters.set(runtime, adapter);
+}
+
 interface CalendarConflictFeedService {
   getCalendarFeed(
     requestUrl: URL,
-    request: { timeMin: string; timeMax: string },
+    request: { side: "owner"; timeMin: string; timeMax: string },
   ): Promise<LifeOpsCalendarFeed>;
 }
 
@@ -187,6 +207,20 @@ function attendeeFromCalendarEvent(
   };
 }
 
+function allDayDateForCalendarEvent(
+  event: LifeOpsCalendarEvent,
+  instant: string,
+): string {
+  if (event.provider !== "apple_calendar" || !event.timezone?.trim()) {
+    return instant.slice(0, 10);
+  }
+  const local = getZonedDateParts(new Date(instant), event.timezone);
+  return `${String(local.year).padStart(4, "0")}-${String(local.month).padStart(
+    2,
+    "0",
+  )}-${String(local.day).padStart(2, "0")}`;
+}
+
 function calendarEventForAvailability(
   event: LifeOpsCalendarEvent,
 ): ConflictDetectEvent {
@@ -197,8 +231,8 @@ function calendarEventForAvailability(
     endISO: event.endAt,
     ...(event.isAllDay
       ? {
-          startDate: event.startAt.slice(0, 10),
-          endDate: event.endAt.slice(0, 10),
+          startDate: allDayDateForCalendarEvent(event, event.startAt),
+          endDate: allDayDateForCalendarEvent(event, event.endAt),
         }
       : {}),
     timeZone: event.timezone,
@@ -255,8 +289,8 @@ function feedSourcesForAvailability(
   const health = (feed as Partial<Pick<LifeOpsCalendarFeed, "sources">>)
     .sources;
 
-  // Compatibility for older host stubs. Real CalendarService feeds always
-  // carry `sources`, including an empty array when no source can be named.
+  // Structural feed doubles may omit per-source health; production feeds use
+  // an explicit empty array when no calendar source can be named.
   if (!Array.isArray(health)) {
     return [
       {
@@ -310,9 +344,9 @@ function feedSourcesForAvailability(
 }
 
 /**
- * Production loader for the owner's merged feed. A cache-only response remains
- * explicitly stale, and a cache response with no sync watermark is treated as
- * disconnected rather than as a healthy empty calendar.
+ * Production loader for the owner's merged feed. Per-source health remains
+ * authoritative, so a fresh cache can remain complete while stale, failed, or
+ * disconnected calendars keep the aggregate result visibly incomplete.
  */
 export function createCalendarFeedConflictLoader(): Pick<
   ConflictDetectLoader,
@@ -329,6 +363,7 @@ export function createCalendarFeedConflictLoader(): Pick<
         );
       }
       const feed = await service.getCalendarFeed(INTERNAL_URL, {
+        side: "owner",
         timeMin: range.start,
         timeMax: range.end,
       });
@@ -464,6 +499,17 @@ function privateBusySources(
   }));
 }
 
+function requestedGuestCalendarCount(
+  proposal: ConflictDetectProposal,
+): number {
+  return new Set(
+    (proposal.attendees ?? [])
+      .filter((attendee): attendee is string => typeof attendee === "string")
+      .map((attendee) => attendee.trim().toLowerCase())
+      .filter(Boolean),
+  ).size;
+}
+
 async function defaultAuthorize(
   runtime: IAgentRuntime,
   message: Memory,
@@ -471,7 +517,7 @@ async function defaultAuthorize(
   return hasRoleAccess(runtime, message, "OWNER");
 }
 
-async function defaultTimeZone(): Promise<string> {
+async function defaultTimeZone(_runtime: IAgentRuntime): Promise<string> {
   return resolveDefaultTimeZone();
 }
 
@@ -527,8 +573,18 @@ function unavailableResult(args: {
 export function createConflictDetectAction(
   deps: ConflictDetectActionDeps = {},
 ): Action & { suppressPostActionContinuation?: boolean } {
-  const authorize = deps.authorize ?? defaultAuthorize;
-  const resolveTimeZone = deps.resolveTimeZone ?? defaultTimeZone;
+  const authorize = (runtime: IAgentRuntime, message: Memory) =>
+    (
+      deps.authorize ??
+      hostAdapters.get(runtime)?.authorize ??
+      defaultAuthorize
+    )(runtime, message);
+  const resolveTimeZone = (runtime: IAgentRuntime) =>
+    (
+      deps.resolveTimeZone ??
+      hostAdapters.get(runtime)?.resolveTimeZone ??
+      defaultTimeZone
+    )(runtime);
   const productionFeedLoader = createCalendarFeedConflictLoader().loadFeed;
 
   return {
@@ -561,7 +617,13 @@ export function createConflictDetectAction(
         name: "range",
         description:
           "'today' | 'week' or { start, end } RFC 3339 window with explicit offsets.",
-        schema: { type: "object" as const, additionalProperties: true },
+        schema: {
+          type: "object" as const,
+          oneOf: [
+            { type: "string" as const, enum: ["today", "week"] },
+            { type: "object" as const, additionalProperties: true },
+          ],
+        },
       },
       {
         name: "proposal",
@@ -669,6 +731,7 @@ export function createConflictDetectAction(
           now: deps.now?.() ?? new Date(),
         });
       } catch (error) {
+        // error-policy:J1 action boundary translates invalid timezone/range.
         const detail = error instanceof Error ? error.message : String(error);
         return {
           success: false,
@@ -722,9 +785,12 @@ export function createConflictDetectAction(
       }
 
       const sources: CalendarAvailabilitySource[] = [...feedSources];
+      const requestedGuestCalendars = proposal
+        ? requestedGuestCalendarCount(proposal)
+        : 0;
       const requestedGuestAvailability =
         subaction === "scan_event_proposal" &&
-        (proposal?.attendees?.length ?? 0) > 0;
+        requestedGuestCalendars > 0;
       if (requestedGuestAvailability && proposal) {
         const loadFreeBusy =
           activeLoader.loadFreeBusy ?? deps.loader?.loadFreeBusy;
@@ -739,21 +805,35 @@ export function createConflictDetectAction(
         } else {
           try {
             const result = await loadFreeBusy({ runtime, proposal, range });
-            sources.push(
-              ...privateBusySources(
-                normalizeLoadResult(result, {
-                  id: "guest-freebusy",
-                  status: "fresh",
-                  visibility: "busy_only",
-                }),
-              ),
+            const guestSources = privateBusySources(
+              normalizeLoadResult(result, {
+                id: "guest-freebusy",
+                status: "fresh",
+                visibility: "busy_only",
+              }),
             );
+            sources.push(
+              ...guestSources,
+            );
+            if (guestSources.length < requestedGuestCalendars) {
+              sources.push({
+                id: "guest-freebusy-incomplete",
+                status: "disconnected",
+                visibility: "busy_only",
+                events: [],
+                error: "Guest availability coverage is incomplete.",
+              });
+            }
           } catch (error) {
             // error-policy:J4 the partial result remains visibly incomplete.
             const detail =
               error instanceof Error ? error.message : String(error);
             runtime.logger.warn(
-              { src: "action:conflict-detect", subaction, detail },
+              {
+                src: "action:conflict-detect",
+                subaction,
+                errorType: error instanceof Error ? error.name : "UnknownError",
+              },
               "Conflict scan guest free/busy load failed",
             );
             sources.push({

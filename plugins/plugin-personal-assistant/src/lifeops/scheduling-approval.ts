@@ -4,6 +4,7 @@
  * so approval always applies to one recipient, channel, subject, and body.
  */
 import { createHash } from "node:crypto";
+import { ElizaError } from "@elizaos/core";
 import {
   type ApprovalPayload,
   SCHEDULING_APPROVAL_MESSAGE_KINDS,
@@ -21,6 +22,17 @@ export type SchedulingApprovalCorrelationSeed = Omit<
   "contentSha256"
 >;
 
+function failInvalidCorrelation(
+  message: string,
+  context: Record<string, unknown>,
+): never {
+  throw new ElizaError(`[SchedulingApproval] ${message}`, {
+    code: "SCHEDULING_APPROVAL_INVALID_CORRELATION",
+    context,
+    severity: "fatal",
+  });
+}
+
 function requireNonEmptyString(
   record: Record<string, unknown>,
   field: string,
@@ -28,8 +40,9 @@ function requireNonEmptyString(
 ): string {
   const value = record[field];
   if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.${field}: expected non-empty string`,
+    return failInvalidCorrelation(
+      `invalid ${label}.${field}: expected non-empty string`,
+      { label, field },
     );
   }
   return value;
@@ -40,14 +53,16 @@ function parseSchedulingCorrelation(
   label: string,
 ): SchedulingApprovalCorrelation {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}: expected scheduling correlation object`,
+    return failInvalidCorrelation(
+      `invalid ${label}: expected scheduling correlation object`,
+      { label },
     );
   }
   const record = value as Record<string, unknown>;
   if (record.kind !== "scheduling_message") {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.kind: expected scheduling_message`,
+    return failInvalidCorrelation(
+      `invalid ${label}.kind: expected scheduling_message`,
+      { label, field: "kind" },
     );
   }
   const negotiationId = requireNonEmptyString(record, "negotiationId", label);
@@ -60,8 +75,9 @@ function parseSchedulingCorrelation(
       record.messageKind as SchedulingApprovalCorrelation["messageKind"],
     )
   ) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.messageKind: unsupported value`,
+    return failInvalidCorrelation(
+      `invalid ${label}.messageKind: unsupported value`,
+      { label, field: "messageKind" },
     );
   }
   if (
@@ -69,8 +85,9 @@ function parseSchedulingCorrelation(
       record.transportChannel as SchedulingApprovalCorrelation["transportChannel"],
     )
   ) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.transportChannel: unsupported value`,
+    return failInvalidCorrelation(
+      `invalid ${label}.transportChannel: unsupported value`,
+      { label, field: "transportChannel" },
     );
   }
   const sourceUpdatedAt = requireNonEmptyString(
@@ -83,24 +100,28 @@ function parseSchedulingCorrelation(
     !Number.isFinite(sourceUpdatedAtMs) ||
     new Date(sourceUpdatedAtMs).toISOString() !== sourceUpdatedAt
   ) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.sourceUpdatedAt: expected canonical UTC ISO-8601 timestamp`,
+    return failInvalidCorrelation(
+      `invalid ${label}.sourceUpdatedAt: expected canonical UTC ISO-8601 timestamp`,
+      { label, field: "sourceUpdatedAt" },
     );
   }
   if (record.draftVersion !== 1) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.draftVersion: expected 1`,
-    );
+    return failInvalidCorrelation(`invalid ${label}.draftVersion: expected 1`, {
+      label,
+      field: "draftVersion",
+    });
   }
   const contentSha256 = requireNonEmptyString(record, "contentSha256", label);
   if (!/^[a-f0-9]{64}$/u.test(contentSha256)) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.contentSha256: expected lowercase SHA-256`,
+    return failInvalidCorrelation(
+      `invalid ${label}.contentSha256: expected lowercase SHA-256`,
+      { label, field: "contentSha256" },
     );
   }
   if (record.messageKind === "opening" && proposalId !== null) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.proposalId: opening drafts cannot reference a proposal`,
+    return failInvalidCorrelation(
+      `invalid ${label}.proposalId: opening drafts cannot reference a proposal`,
+      { label, field: "proposalId", messageKind: record.messageKind },
     );
   }
   if (
@@ -108,8 +129,9 @@ function parseSchedulingCorrelation(
       record.messageKind === "confirmation") &&
     proposalId === null
   ) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.proposalId: ${record.messageKind} drafts require a proposal`,
+    return failInvalidCorrelation(
+      `invalid ${label}.proposalId: ${record.messageKind} drafts require a proposal`,
+      { label, field: "proposalId", messageKind: record.messageKind },
     );
   }
   return {
@@ -141,8 +163,14 @@ export function readSchedulingApprovalCorrelation(
     (payload.action === "send_email") !==
     (correlation.transportChannel === "email")
   ) {
-    throw new Error(
-      `[SchedulingApproval] invalid ${label}.transportChannel: ${payload.action} does not match ${correlation.transportChannel}`,
+    return failInvalidCorrelation(
+      `invalid ${label}.transportChannel: ${payload.action} does not match ${correlation.transportChannel}`,
+      {
+        label,
+        field: "transportChannel",
+        action: payload.action,
+        transportChannel: correlation.transportChannel,
+      },
     );
   }
   return correlation;
@@ -192,8 +220,13 @@ export function computeSchedulingApprovalContentSha256(
 ): string {
   const scheduling = readSchedulingApprovalCorrelation(payload);
   if (!scheduling) {
-    throw new Error(
+    throw new ElizaError(
       "[SchedulingApproval] cannot hash a payload without scheduling correlation",
+      {
+        code: "SCHEDULING_APPROVAL_MISSING_CORRELATION",
+        context: { action: payload.action },
+        severity: "fatal",
+      },
     );
   }
   return createHash("sha256")
