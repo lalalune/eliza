@@ -1,7 +1,10 @@
 /** Unit tests for the workbench-todos route handler against an in-memory task-backed runtime (deterministic). */
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { AgentRuntime, Task, UUID } from '@elizaos/core';
-import { handleWorkbenchTodosRoutes } from '../../../src/routes/workbench-todos';
+import {
+  handleWorkbenchTodosRoutes,
+  type WorkbenchTodoView,
+} from '../../../src/routes/workbench-todos';
 
 // ---------------------------------------------------------------------------
 // In-memory task-backed runtime — mirrors the AgentRuntime task surface the
@@ -103,7 +106,8 @@ async function call(
   runtime: AgentRuntime,
   method: string,
   pathname: string,
-  body?: unknown
+  body?: unknown,
+  principalId?: string
 ): Promise<{ handled: boolean; status: number; body: unknown }> {
   const { res, result } = createRes();
   const handled = await handleWorkbenchTodosRoutes({
@@ -112,15 +116,23 @@ async function call(
     method,
     pathname,
     runtime,
+    ...(principalId ? { principalId } : {}),
   });
   return { handled, ...result() };
 }
 
 describe('workbench todos CRUD route', () => {
   let store: TaskStore;
+  const initialCloudProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
 
   beforeEach(() => {
+    delete process.env.ELIZA_CLOUD_PROVISIONED;
     store = createTaskRuntime();
+  });
+
+  afterEach(() => {
+    if (initialCloudProvisioned === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+    else process.env.ELIZA_CLOUD_PROVISIONED = initialCloudProvisioned;
   });
 
   test('POST creates a todo and returns the exact DTO shape', async () => {
@@ -166,6 +178,23 @@ describe('workbench todos CRUD route', () => {
     expect((res.body as { error: string }).error).toBe('name is required');
   });
 
+  test('POST rejects caller-controlled ownership fields', async () => {
+    const response = await call(
+      store.runtime,
+      'POST',
+      '/api/workbench/todos',
+      {
+        name: 'Spoofed todo',
+        entityId: 'owner-b',
+        metadata: { ownership: { ownerId: 'owner-b' } },
+      },
+      'owner-a'
+    );
+
+    expect(response.status).toBe(400);
+    expect(store.tasks.size).toBe(0);
+  });
+
   test('GET lists only workbench todos, sorted by name', async () => {
     await call(store.runtime, 'POST', '/api/workbench/todos', { name: 'Zebra' });
     await call(store.runtime, 'POST', '/api/workbench/todos', { name: 'Apple' });
@@ -180,6 +209,112 @@ describe('workbench todos CRUD route', () => {
     expect(res.status).toBe(200);
     const todos = (res.body as { todos: Array<{ name: string }> }).todos;
     expect(todos.map((t) => t.name)).toEqual(['Apple', 'Zebra']);
+  });
+
+  test('principal-scoped CRUD stamps ownership and isolates two users', async () => {
+    const ownerA = 'owner-a';
+    const ownerB = 'owner-b';
+    const createdA = await call(
+      store.runtime,
+      'POST',
+      '/api/workbench/todos',
+      { name: 'Owner A todo' },
+      ownerA
+    );
+    const createdB = await call(
+      store.runtime,
+      'POST',
+      '/api/workbench/todos',
+      { name: 'Owner B todo' },
+      ownerB
+    );
+    const idA = (createdA.body as { todo: { id: string } }).todo.id;
+    const idB = (createdB.body as { todo: { id: string } }).todo.id;
+
+    expect(store.tasks.get(idA)).toMatchObject({
+      entityId: ownerA,
+      metadata: { ownership: { ownerId: ownerA } },
+    });
+    expect(store.tasks.get(idB)).toMatchObject({
+      entityId: ownerB,
+      metadata: { ownership: { ownerId: ownerB } },
+    });
+
+    const listA = await call(store.runtime, 'GET', '/api/workbench/todos', undefined, ownerA);
+    const listB = await call(store.runtime, 'GET', '/api/workbench/todos', undefined, ownerB);
+    expect((listA.body as { todos: WorkbenchTodoView[] }).todos).toEqual([
+      expect.objectContaining({ id: idA, name: 'Owner A todo' }),
+    ]);
+    expect((listB.body as { todos: WorkbenchTodoView[] }).todos).toEqual([
+      expect.objectContaining({ id: idB, name: 'Owner B todo' }),
+    ]);
+
+    // The local single-user route remains unscoped for existing installations.
+    const localList = await call(store.runtime, 'GET', '/api/workbench/todos');
+    expect((localList.body as { todos: WorkbenchTodoView[] }).todos).toHaveLength(2);
+  });
+
+  test('foreign principals receive the same 404 for every item operation', async () => {
+    const created = await call(
+      store.runtime,
+      'POST',
+      '/api/workbench/todos',
+      { name: 'Private todo' },
+      'owner-a'
+    );
+    const id = (created.body as { todo: { id: string } }).todo.id;
+
+    const attempts = await Promise.all([
+      call(store.runtime, 'GET', `/api/workbench/todos/${id}`, undefined, 'owner-b'),
+      call(store.runtime, 'PUT', `/api/workbench/todos/${id}`, { name: 'Stolen' }, 'owner-b'),
+      call(
+        store.runtime,
+        'POST',
+        `/api/workbench/todos/${id}/complete`,
+        { isCompleted: true },
+        'owner-b'
+      ),
+      call(store.runtime, 'DELETE', `/api/workbench/todos/${id}`, undefined, 'owner-b'),
+    ]);
+
+    for (const attempt of attempts) {
+      expect(attempt.status).toBe(404);
+      expect(attempt.body).toMatchObject({ error: 'Todo not found' });
+    }
+    expect(store.tasks.get(id)).toMatchObject({
+      name: 'Private todo',
+      metadata: { isCompleted: false },
+    });
+  });
+
+  test('scoped reads fail closed for unowned or conflicting ownership markers', async () => {
+    store.seed({
+      id: 'unowned',
+      name: 'Legacy local todo',
+      tags: ['workbench-todo'],
+    });
+    store.seed({
+      id: 'conflicting',
+      name: 'Corrupt todo',
+      tags: ['workbench-todo'],
+      entityId: 'owner-a' as UUID,
+      metadata: { ownership: { ownerId: 'owner-b' } },
+    });
+
+    const scoped = await call(store.runtime, 'GET', '/api/workbench/todos', undefined, 'owner-a');
+    expect((scoped.body as { todos: WorkbenchTodoView[] }).todos).toEqual([]);
+    const local = await call(store.runtime, 'GET', '/api/workbench/todos');
+    expect((local.body as { todos: WorkbenchTodoView[] }).todos).toHaveLength(2);
+  });
+
+  test('managed Cloud direct dispatch requires a principal', async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = '1';
+    const response = await call(store.runtime, 'GET', '/api/workbench/todos');
+    expect(response.status).toBe(401);
+    expect(response.body).toMatchObject({
+      success: false,
+      code: 'workflow_principal_required',
+    });
   });
 
   test('GET :id returns the todo, 404 for unknown', async () => {

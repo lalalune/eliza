@@ -120,24 +120,24 @@ describe("workflow action handoff", () => {
     expect(dispatchNavigate).not.toHaveBeenCalled();
   });
 
-  it.each([
-    "canceled",
-    "no_pending_draft",
-  ])("keeps chat open for a %s clarification-draft result", (status) => {
-    const dispatchNavigate = vi.fn();
+  it.each(["canceled", "no_pending_draft"])(
+    "keeps chat open for a %s clarification-draft result",
+    (status) => {
+      const dispatchNavigate = vi.fn();
 
-    expect(
-      dispatchWorkflowActionHandoff(
-        [
-          {
-            actionName: "WORKFLOW",
-            success: true,
-            values: { status },
-          },
-        ],
-        { dispatchNavigate },
-      ),
-    ).toBe(false);
-    expect(dispatchNavigate).not.toHaveBeenCalled();
-  });
+      expect(
+        dispatchWorkflowActionHandoff(
+          [
+            {
+              actionName: "WORKFLOW",
+              success: true,
+              values: { status },
+            },
+          ],
+          { dispatchNavigate },
+        ),
+      ).toBe(false);
+      expect(dispatchNavigate).not.toHaveBeenCalled();
+    },
+  );
 });

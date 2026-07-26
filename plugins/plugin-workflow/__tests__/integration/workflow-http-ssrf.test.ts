@@ -23,6 +23,7 @@ import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
 
 const SSRF_CHILD_ENV = 'ELIZA_WORKFLOW_HTTP_SSRF_CHILD';
 const SSRF_CHILD_TIMEOUT_MS = 90_000;
+const ERROR_SECRET_SENTINEL = 'workflow-secret-sentinel-4f7d91c2';
 const testPath = fileURLToPath(import.meta.url);
 const pluginRoot = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -81,6 +82,7 @@ async function runSsrfProofInIsolatedProcess(): Promise<void> {
       `Isolated workflow HTTP SSRF proof failed with exit ${exitCode}.\nstdout:\n${stdout}\nstderr:\n${stderr}`
     );
   }
+  expect(`${stdout}\n${stderr}`).not.toContain(ERROR_SECRET_SENTINEL);
 }
 
 test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pinned public redirect', async () => {
@@ -146,6 +148,7 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
           new ReadableStream<Uint8Array>({
             cancel() {
               declaredBodyCancelled = true;
+              throw new Error(`cancel transport reflected ${ERROR_SECRET_SENTINEL}`);
             },
           }),
           {
@@ -196,6 +199,16 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
           status: 503,
           headers: { 'content-type': 'application/json' },
         });
+      }
+      if (url.pathname === '/echo-secret') {
+        return new Response(
+          JSON.stringify({
+            authorization: new Headers(init.headers).get('authorization'),
+            body: init.body,
+            query: url.search,
+          }),
+          { status: 422, headers: { 'content-type': 'application/json' } }
+        );
       }
       if (url.pathname === '/items/42') {
         dynamicRequest = {
@@ -308,7 +321,12 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
     const exactLimitItem = exactLimitExecution.data?.resultData?.runData?.['HTTP Request']?.[0]
       ?.data?.main?.[0]?.[0]?.json as Record<string, unknown> | undefined;
     expect(exactLimitExecution.status).toBe('success');
-    expect((exactLimitItem?.body as string).length).toBe(1_048_576);
+    const exactLimitBody = exactLimitItem?.body;
+    expect(typeof exactLimitBody).toBe('string');
+    if (typeof exactLimitBody !== 'string') {
+      throw new Error('expected the exact-limit HTTP response body to be a string');
+    }
+    expect(exactLimitBody.length).toBe(1_048_576);
 
     for (const [path, statusCode] of [
       ['/not-found', 404],
@@ -323,11 +341,80 @@ test('HTTP Request blocks loopback and metadata targets while allowing a DNS-pin
         code: 'WORKFLOW_HTTP_STATUS_ERROR',
         context: {
           method: 'GET',
-          url: `https://public.example${path}`,
           statusCode,
         },
       });
     }
+
+    const secretWorkflowId = `http-secret-${crypto.randomUUID()}`;
+    workflowIds.push(secretWorkflowId);
+    const secretWorkflow = await service.createWorkflow({
+      id: secretWorkflowId,
+      name: 'HTTP error secret boundary',
+      nodes: [
+        {
+          id: 'manual',
+          name: 'Manual Trigger',
+          type: 'workflows-nodes-base.manualTrigger',
+          typeVersion: 1,
+          position: [0, 0],
+          parameters: {},
+        },
+        {
+          id: 'http',
+          name: 'HTTP Request',
+          type: 'workflows-nodes-base.httpRequest',
+          typeVersion: 4.2,
+          position: [200, 0],
+          parameters: {
+            method: 'POST',
+            url: `https://public.example/echo-secret?token=${ERROR_SECRET_SENTINEL}`,
+            headers: { authorization: `Bearer ${ERROR_SECRET_SENTINEL}` },
+            body: ERROR_SECRET_SENTINEL,
+          },
+        },
+      ],
+      connections: {
+        'Manual Trigger': { main: [[{ node: 'HTTP Request', type: 'main', index: 0 }]] },
+      },
+    });
+    const secretFailure = await service.executeWorkflow(secretWorkflow.id, {
+      throwOnError: false,
+    });
+    const storedSecretFailure = await service.getExecution(secretFailure.id);
+    let thrownSecretFailure: unknown;
+    try {
+      await service.executeWorkflow(secretWorkflow.id);
+    } catch (error) {
+      thrownSecretFailure = error;
+    }
+    expect(thrownSecretFailure).toBeInstanceOf(Error);
+    const publicFailureSurfaces = JSON.stringify({
+      returned: secretFailure.data?.resultData?.error,
+      stored: storedSecretFailure.data?.resultData?.error,
+      thrown:
+        thrownSecretFailure instanceof Error
+          ? {
+              message: thrownSecretFailure.message,
+              stack: thrownSecretFailure.stack,
+              code: (thrownSecretFailure as { code?: unknown }).code,
+              context: (thrownSecretFailure as { context?: unknown }).context,
+            }
+          : thrownSecretFailure,
+    });
+    expect(publicFailureSurfaces).not.toContain(ERROR_SECRET_SENTINEL);
+    expect(secretFailure.data?.resultData?.error).toEqual({
+      message: 'HTTP request failed with status 422',
+      code: 'WORKFLOW_HTTP_STATUS_ERROR',
+      context: {
+        workflowId: secretWorkflow.id,
+        executionId: secretFailure.id,
+        method: 'POST',
+        statusCode: 422,
+      },
+    });
+    expect(secretFailure.data?.resultData?.error).not.toHaveProperty('stack');
+    expect(secretFailure.data?.resultData?.error).not.toHaveProperty('responseBodyPreview');
 
     const dynamicWorkflowId = `http-expression-${crypto.randomUUID()}`;
     workflowIds.push(dynamicWorkflowId);

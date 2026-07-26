@@ -14,8 +14,8 @@ import type http from "node:http";
 import { isIP } from "node:net";
 import type { AgentRuntime } from "@elizaos/core";
 import {
+	isCloudProvisionedEnvironment,
 	isLoopbackBindHost,
-	readAliasedEnv,
 	resolveApiToken,
 } from "@elizaos/shared";
 
@@ -116,10 +116,6 @@ function proxyClientHeaderBlocksLocalTrust(
 	return false;
 }
 
-function isCloudProvisionedByEnv(): boolean {
-	return readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
-}
-
 function isLocalAuthRequiredByEnv(): boolean {
 	return process.env.ELIZA_REQUIRE_LOCAL_AUTH === "1";
 }
@@ -150,7 +146,7 @@ export function isTrustedLocalRequest(
 	req: Pick<http.IncomingMessage, "headers" | "socket">,
 ): boolean {
 	if (isLocalAuthRequiredByEnv()) return false;
-	if (isCloudProvisionedByEnv()) return false;
+	if (isCloudProvisionedEnvironment()) return false;
 	if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) return false;
 	if (proxyClientHeaderBlocksLocalTrust(req.headers)) return false;
 

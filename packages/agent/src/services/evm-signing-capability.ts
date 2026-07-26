@@ -8,10 +8,8 @@
  *
  * Paths (see `EvmSigningCapabilityKind` in shared/contracts/wallet.ts):
  *   - "local"         — EVM_PRIVATE_KEY is set and non-placeholder
- *   - "steward-self"  — self-hosted Steward (STEWARD_API_URL + STEWARD_AGENT_TOKEN,
- *                       ELIZA_CLOUD_PROVISIONED != "1")
- *   - "steward-cloud" — cloud-provisioned Steward sidecar (same creds,
- *                       ELIZA_CLOUD_PROVISIONED == "1")
+ *   - "steward-self"  — self-hosted Steward (STEWARD_API_URL + STEWARD_AGENT_TOKEN)
+ *   - "steward-cloud" — cloud-provisioned Steward sidecar (same credentials)
  *   - "cloud-view-only" — cloud bind stored ELIZA_CLOUD_EVM_ADDRESS, but
  *                         signing is unavailable in this local process.
  *                         Address is visible, but no transactions can be
@@ -21,7 +19,10 @@
  * The UI surfaces `reason` verbatim, so it should be short and user-facing.
  */
 
-import type { EvmSigningCapabilityKind } from "@elizaos/shared";
+import {
+  type EvmSigningCapabilityKind,
+  isCloudFlagEnabled,
+} from "@elizaos/shared";
 
 export type { EvmSigningCapabilityKind };
 
@@ -66,7 +67,7 @@ export function resolveEvmSigningCapability(
   const stewardUrl = env.STEWARD_API_URL?.trim();
   const stewardToken = env.STEWARD_AGENT_TOKEN?.trim();
   if (stewardUrl && stewardToken) {
-    const isCloud = env.ELIZA_CLOUD_PROVISIONED === "1";
+    const isCloud = isCloudFlagEnabled(env.ELIZA_CLOUD_PROVISIONED);
     return isCloud
       ? {
           kind: "steward-cloud",

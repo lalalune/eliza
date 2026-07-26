@@ -3962,6 +3962,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
           description: task.description,
           roomId: task.roomId as UUID,
           worldId: task.worldId as UUID,
+          entityId: task.entityId as UUID,
           tags: task.tags,
           metadata: metadata,
           createdAt: now,
@@ -3995,6 +3996,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
             and(
               eq(taskTable.agentId, this.agentId),
               ...(params.roomId ? [eq(taskTable.roomId, params.roomId)] : []),
+              ...(params.entityId ? [eq(taskTable.entityId, params.entityId)] : []),
               ...(params.tags && params.tags.length > 0
                 ? [
                     sql`${taskTable.tags} @> ARRAY[${sql.join(
@@ -4013,6 +4015,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
           description: row.description ?? "",
           roomId: row.roomId as UUID,
           worldId: row.worldId as UUID,
+          entityId: row.entityId as UUID,
           tags: row.tags || [],
           metadata: row.metadata as TaskMetadata,
         }));
@@ -4040,6 +4043,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
           description: row.description ?? "",
           roomId: row.roomId as UUID,
           worldId: row.worldId as UUID,
+          entityId: row.entityId as UUID,
           tags: row.tags || [],
           metadata: (row.metadata || {}) as TaskMetadata,
         }));
@@ -4073,6 +4077,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
           description: row.description ?? "",
           roomId: row.roomId as UUID,
           worldId: row.worldId as UUID,
+          entityId: row.entityId as UUID,
           tags: row.tags || [],
           metadata: (row.metadata || {}) as TaskMetadata,
         };
@@ -4096,6 +4101,7 @@ export abstract class BaseDrizzleAdapter extends DatabaseAdapter<DrizzleDatabase
         if (task.description !== undefined) updateValues.description = task.description;
         if (task.roomId !== undefined) updateValues.roomId = task.roomId;
         if (task.worldId !== undefined) updateValues.worldId = task.worldId;
+        if (task.entityId !== undefined) updateValues.entityId = task.entityId;
         if (task.tags !== undefined) updateValues.tags = task.tags;
         if (task.metadata !== undefined)
           updateValues.metadata = task.metadata as typeof taskTable.$inferInsert.metadata;

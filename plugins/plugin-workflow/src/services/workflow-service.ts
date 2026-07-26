@@ -41,7 +41,13 @@ import {
   searchNodes,
 } from '../utils/catalog';
 import { CATALOG_CLARIFICATION_SUFFIX, isCatalogClarification } from '../utils/clarification';
-import { getLocalOwnerEntityId, getUserTagName, isPotentialLegacyUserTag } from '../utils/context';
+import {
+  getLocalOwnerEntityId,
+  getUserTagName,
+  isPotentialLegacyUserTag,
+  readWorkflowExecutionContext,
+  withWorkflowExecutionContext,
+} from '../utils/context';
 import { resolveCredentials } from '../utils/credentialResolver';
 import { buildWorkflowEvaluationSuite } from '../utils/evaluation-samples';
 import {
@@ -898,7 +904,7 @@ export class WorkflowService extends Service {
   async deployWorkflow(
     workflow: WorkflowDefinition,
     userId: string,
-    options?: { activate?: boolean }
+    options?: { activate?: boolean; sourceRoomId?: string }
   ): Promise<WorkflowCreationResult> {
     logger.info(
       { src: 'plugin:workflow:service:main' },
@@ -943,7 +949,24 @@ export class WorkflowService extends Service {
       };
     }
 
-    const setParameterResult = normalizeSetNodeParametersInWorkflow(credentialResult.workflow);
+    const previousContext = existingWorkflow
+      ? readWorkflowExecutionContext(existingWorkflow)
+      : undefined;
+    const deploymentWorkflow = withWorkflowExecutionContext(
+      {
+        ...credentialResult.workflow,
+        meta: {
+          ...(existingWorkflow?.meta ?? {}),
+          ...(credentialResult.workflow.meta ?? {}),
+        },
+      },
+      {
+        ownerEntityId: userId,
+        sourceRoomId: options?.sourceRoomId ?? previousContext?.sourceRoomId,
+      }
+    );
+
+    const setParameterResult = normalizeSetNodeParametersInWorkflow(deploymentWorkflow);
     if (setParameterResult.corrections > 0) {
       logger.debug(
         { src: 'plugin:workflow:service:main' },
@@ -968,13 +991,13 @@ export class WorkflowService extends Service {
       // forward so saving cannot erase the ownership tag and immediately make
       // the workflow disappear from both chat and HTTP owner scopes.
       const updateDefinition: WorkflowDefinition = {
-        ...credentialResult.workflow,
+        ...deploymentWorkflow,
         ...(existingWorkflow?.tags ? { tags: existingWorkflow.tags } : {}),
       };
       deployedWorkflow = await client.updateWorkflow(workflow.id, updateDefinition);
       wasUpdate = true;
     } else {
-      deployedWorkflow = await client.createWorkflow(credentialResult.workflow);
+      deployedWorkflow = await client.createWorkflow(deploymentWorkflow);
     }
 
     logger.info(
@@ -1189,6 +1212,7 @@ export class WorkflowService extends Service {
       mode?: WorkflowExecution['mode'];
       triggerData?: Record<string, unknown>;
       idempotencyKey?: string;
+      sourceRoomId?: string;
       throwOnError?: boolean;
     },
     userId?: string
@@ -1201,6 +1225,8 @@ export class WorkflowService extends Service {
         mode,
         triggerData: options?.triggerData,
         idempotencyKey,
+        ownerEntityId: userId,
+        sourceRoomId: options?.sourceRoomId,
         throwOnError: options?.throwOnError,
       });
     };

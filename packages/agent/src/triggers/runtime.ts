@@ -11,17 +11,23 @@
  */
 import crypto from "node:crypto";
 import type { IAgentRuntime, Memory, Service, Task, UUID } from "@elizaos/core";
-import { ServiceType, stringToUuid } from "@elizaos/core";
+import { ChannelType, ServiceType, stringToUuid } from "@elizaos/core";
 import {
   buildTriggerMetadata,
   DISABLED_TRIGGER_INTERVAL_MS,
   MAX_TRIGGER_RUN_HISTORY,
 } from "./scheduling.ts";
+import {
+  ALWAYS_ON_REQUIRED_MESSAGE,
+  activeTriggerRequiresAlwaysOn,
+  isManagedCloudRuntime,
+} from "./subscription-policy.ts";
 import type {
   PromptTriggerConfig,
   TriggerConfig,
   TriggerHealthSnapshot,
   TriggerRunRecord,
+  TriggerSubscriptionPolicyBlock,
   TriggerSummary,
   TriggerTaskMetadata,
   WorkflowTriggerConfig,
@@ -134,6 +140,66 @@ function taskMetadata(task: Task): TriggerTaskMetadata {
     : {};
 }
 
+async function disableTriggerForSubscriptionPolicy(
+  runtime: IAgentRuntime,
+  task: Task,
+  taskId: UUID,
+  trigger: TriggerConfig,
+): Promise<TriggerExecutionResult> {
+  const blockedAt = Date.now();
+  const existingMetadata = taskMetadata(task);
+  const subscriptionPolicy: TriggerSubscriptionPolicyBlock = {
+    code: "workflow_requires_always_on",
+    error: ALWAYS_ON_REQUIRED_MESSAGE,
+    capability: "scheduled_workflows",
+    currentExecutionTier: "dedicated-lazy",
+    requiredExecutionTier: "dedicated-always",
+    upgradeRequired: true,
+    requiresContinuousBillingConfirmation: true,
+    blockedAt,
+  };
+  const metadata: TriggerTaskMetadata = {
+    ...existingMetadata,
+    blocking: true,
+    updatedAt: blockedAt,
+    updateInterval: DISABLED_TRIGGER_INTERVAL_MS,
+    subscriptionPolicy,
+    trigger: {
+      ...trigger,
+      enabled: false,
+      nextRunAtMs: blockedAt + DISABLED_TRIGGER_INTERVAL_MS,
+      lastStatus: "error",
+      lastError: ALWAYS_ON_REQUIRED_MESSAGE,
+    },
+  };
+
+  await runtime.updateTask(taskId, {
+    description: trigger.displayName,
+    metadata,
+  });
+  runtime.logger.error(
+    {
+      src: "trigger-runtime",
+      agentId: runtime.agentId,
+      taskId,
+      triggerId: trigger.triggerId,
+      triggerType: trigger.triggerType,
+      errorCode: subscriptionPolicy.code,
+      upgradeRequired: true,
+    },
+    "Scheduled trigger disabled because its runtime is not always-on",
+  );
+  recordExecutionMetric(runtime.agentId, "error", blockedAt);
+
+  return {
+    status: "error",
+    error: ALWAYS_ON_REQUIRED_MESSAGE,
+    taskDeleted: false,
+    trigger: taskToTriggerSummary({ ...task, id: taskId, metadata }),
+    updateInterval: DISABLED_TRIGGER_INTERVAL_MS,
+  };
+}
+
 export function readTriggerConfig(task: Task): TriggerConfig | null {
   const trigger = taskMetadata(task).trigger;
   if (!trigger || typeof trigger !== "object" || Array.isArray(trigger))
@@ -182,6 +248,8 @@ interface WorkflowDispatchOptionsLike {
   triggerData?: Record<string, unknown>;
   idempotencyKey?: string;
   scheduleNodeId?: string;
+  ownerEntityId?: string;
+  sourceRoomId?: string;
 }
 
 interface WorkflowDispatchServiceLike {
@@ -213,6 +281,65 @@ function readTaskScheduleNodeId(task: Task): string | undefined {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : undefined;
+}
+
+interface TriggerExecutionContext {
+  ownerEntityId?: string;
+  sourceRoomId?: string;
+}
+
+function readTaskExecutionContext(
+  runtime: IAgentRuntime,
+  task: Task,
+): TriggerExecutionContext {
+  const metadata = taskMetadata(task);
+  const requireAuthoritativeOwnership = isManagedCloudRuntime(runtime);
+  const ownership =
+    metadata.ownership && typeof metadata.ownership === "object"
+      ? metadata.ownership
+      : undefined;
+  const ownerEntityId =
+    typeof ownership?.ownerEntityId === "string" &&
+    ownership.ownerEntityId.trim()
+      ? ownership.ownerEntityId.trim()
+      : !requireAuthoritativeOwnership &&
+          typeof metadata.ownerEntityId === "string" &&
+          metadata.ownerEntityId.trim()
+        ? metadata.ownerEntityId.trim()
+        : undefined;
+  const sourceRoomId =
+    typeof ownership?.sourceRoomId === "string" && ownership.sourceRoomId.trim()
+      ? ownership.sourceRoomId.trim()
+      : !requireAuthoritativeOwnership &&
+          typeof metadata.sourceRoomId === "string" &&
+          metadata.sourceRoomId.trim()
+        ? metadata.sourceRoomId.trim()
+        : undefined;
+  return { ownerEntityId, sourceRoomId };
+}
+
+async function ensureOwnerAutomationRoom(
+  runtime: IAgentRuntime,
+  ownerEntityId: string,
+): Promise<UUID> {
+  const ownerId = stringToUuid(ownerEntityId);
+  const worldId = stringToUuid(
+    `workflow-automation-world:${runtime.agentId}:${ownerId}`,
+  );
+  const roomId = stringToUuid(
+    `workflow-automation-room:${runtime.agentId}:${ownerId}`,
+  );
+  await runtime.ensureConnection({
+    entityId: ownerId,
+    roomId,
+    worldId,
+    source: "workflow-automation",
+    type: ChannelType.DM,
+    roomName: "Workflow automations",
+    worldName: "Workflow automations",
+    metadata: { ownership: { ownerId } },
+  });
+  return roomId;
 }
 
 function buildWorkflowTaskIdempotencyKey(
@@ -288,6 +415,10 @@ async function dispatchWorkflow(
   }
   const idempotencyKey = readTaskIdempotencyKey(task);
   const scheduleNodeId = readTaskScheduleNodeId(task);
+  const executionContext = readTaskExecutionContext(runtime, task);
+  if (isManagedCloudRuntime(runtime) && !executionContext.ownerEntityId) {
+    return { ok: false, error: "workflow trigger missing owner context" };
+  }
   const payload = event
     ? {
         eventKind: event.kind,
@@ -297,6 +428,12 @@ async function dispatchWorkflow(
   const result = await svc.execute(trigger.workflowId, payload, {
     idempotencyKey,
     scheduleNodeId,
+    ...(executionContext.ownerEntityId
+      ? { ownerEntityId: executionContext.ownerEntityId }
+      : {}),
+    ...(executionContext.sourceRoomId
+      ? { sourceRoomId: executionContext.sourceRoomId }
+      : {}),
   });
   return result.ok
     ? {
@@ -324,6 +461,7 @@ interface AutonomyRoomService {
  */
 async function dispatchPrompt(
   runtime: IAgentRuntime,
+  task: Task,
   trigger: PromptTriggerConfig,
 ): Promise<
   { ok: true; executionId?: undefined } | { ok: false; error: string }
@@ -337,12 +475,21 @@ async function dispatchPrompt(
     return { ok: false, error: "message service not available" };
   }
 
-  const roomId =
-    (
-      runtime.getService("AUTONOMY") as AutonomyRoomService | null
-    )?.getAutonomousRoomId?.() ??
-    stringToUuid(`trigger-room:${runtime.agentId}`);
-  const entityId = stringToUuid(`trigger-entity:${trigger.triggerId}`);
+  const executionContext = readTaskExecutionContext(runtime, task);
+  if (isManagedCloudRuntime(runtime) && !executionContext.ownerEntityId) {
+    return { ok: false, error: "prompt trigger missing owner context" };
+  }
+  const roomId = executionContext.sourceRoomId
+    ? stringToUuid(executionContext.sourceRoomId)
+    : executionContext.ownerEntityId
+      ? await ensureOwnerAutomationRoom(runtime, executionContext.ownerEntityId)
+      : ((
+          runtime.getService("AUTONOMY") as AutonomyRoomService | null
+        )?.getAutonomousRoomId?.() ??
+        stringToUuid(`trigger-room:${runtime.agentId}`));
+  const entityId = executionContext.ownerEntityId
+    ? stringToUuid(executionContext.ownerEntityId)
+    : stringToUuid(`trigger-entity:${trigger.triggerId}`);
 
   const message: Memory = {
     id: stringToUuid(crypto.randomUUID()),
@@ -356,6 +503,12 @@ async function dispatchPrompt(
         type: "prompt-automation",
         triggerId: trigger.triggerId,
         wakeMode: trigger.wakeMode,
+        ...(executionContext.ownerEntityId
+          ? { ownerEntityId: executionContext.ownerEntityId }
+          : {}),
+        ...(executionContext.sourceRoomId
+          ? { sourceRoomId: executionContext.sourceRoomId }
+          : {}),
       },
     },
     createdAt: Date.now(),
@@ -392,6 +545,13 @@ export async function executeTriggerTask(
   ) {
     recordExecutionMetric(runtime.agentId, "skipped", Date.now());
     return { status: "skipped", taskDeleted: false };
+  }
+
+  if (
+    options.source === "scheduler" &&
+    activeTriggerRequiresAlwaysOn(runtime, trigger)
+  ) {
+    return disableTriggerForSubscriptionPolicy(runtime, task, task.id, trigger);
   }
 
   if (
@@ -445,7 +605,7 @@ export async function executeTriggerTask(
   const result =
     trigger.kind === "workflow"
       ? await dispatchWorkflow(runtime, task, trigger, options.event)
-      : await dispatchPrompt(runtime, trigger);
+      : await dispatchPrompt(runtime, task, trigger);
   if (result.ok === true) {
     // Only workflow dispatch carries an execution id; prompt dispatch types it
     // as `undefined`, so this reads `string | undefined` without a cast.

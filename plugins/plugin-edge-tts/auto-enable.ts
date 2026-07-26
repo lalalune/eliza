@@ -4,7 +4,10 @@
 // `elizaos.plugin.autoEnableModule`. Keep this module light: env reads only,
 // no service init, no transitive imports of the full plugin runtime. The
 // auto-enable engine loads dozens of these per boot.
-import type { PluginAutoEnableContext } from "@elizaos/core";
+import {
+  isTruthyEnvValue,
+  type PluginAutoEnableContext,
+} from "@elizaos/core";
 
 function isFeatureEnabled(
   config: PluginAutoEnableContext["config"],
@@ -24,7 +27,7 @@ function isFeatureEnabled(
  */
 export function shouldEnable(ctx: PluginAutoEnableContext): boolean {
   return (
-    ctx.env.ELIZA_CLOUD_PROVISIONED === "1" ||
+    isTruthyEnvValue(ctx.env.ELIZA_CLOUD_PROVISIONED) ||
     isFeatureEnabled(ctx.config, "tts")
   );
 }

@@ -6,6 +6,7 @@
  */
 
 import {
+  AgentRuntime,
   CODING_AGENT_SELECTOR_BRIDGE_SYMBOL,
   type GenerateTextParams,
   type IAgentRuntime,
@@ -18,6 +19,7 @@ import {
   buildRotatedSubprocessEnv,
   isSubscriptionLimitError,
   type RotationAccountSelection,
+  type RotationContext,
   resetRotationStateForTests,
   rotationAgentTypeForBackend,
   rotationEnabled,
@@ -77,17 +79,17 @@ function codexAccount(id: string): RotationAccountSelection {
 type TextModelHandler = (runtime: IAgentRuntime, params: GenerateTextParams) => Promise<string>;
 
 function claudeSdkRuntime(): IAgentRuntime {
-  return {
-    agentId: "00000000-0000-0000-0000-000000000001",
-    getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "claude-sdk" : undefined),
-  } as IAgentRuntime;
+  return new AgentRuntime({
+    settings: { ELIZA_CHAT_VIA_CLI: "claude-sdk" },
+    logLevel: "fatal",
+  });
 }
 
 function codexSdkRuntime(): IAgentRuntime {
-  return {
-    agentId: "00000000-0000-0000-0000-000000000001",
-    getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "codex-sdk" : undefined),
-  } as IAgentRuntime;
+  return new AgentRuntime({
+    settings: { ELIZA_CHAT_VIA_CLI: "codex-sdk" },
+    logLevel: "fatal",
+  });
 }
 
 function requiredModelHandler(models: Record<string, TextModelHandler>, modelType: string) {
@@ -275,7 +277,7 @@ describe("buildRotatedSubprocessEnv", () => {
 });
 
 describe("withAccountRotation", () => {
-  const ctx = (overrides: Record<string, unknown> = {}) => ({
+  const ctx = (overrides: Partial<RotationContext> = {}): RotationContext => ({
     backend: "claude-sdk",
     getValue: enabledGetter,
     scope: {},
@@ -295,9 +297,7 @@ describe("withAccountRotation", () => {
     });
     const c = ctx();
     try {
-      await expect(withAccountRotation(attempt, c as never)).resolves.toBe(
-        "first-turn-on-pooled-account"
-      );
+      await expect(withAccountRotation(attempt, c)).resolves.toBe("first-turn-on-pooled-account");
       expect(attempt).toHaveBeenCalledTimes(1);
       // Pool consulted BEFORE the first attempt, without an exclude list.
       expect(bridge.select).toHaveBeenCalledTimes(1);
@@ -320,7 +320,7 @@ describe("withAccountRotation", () => {
     const reportError = vi.fn();
 
     await expect(
-      withAccountRotation(async () => "answer", ctx({ scope: { reportError } }) as never)
+      withAccountRotation(async () => "answer", ctx({ scope: { reportError } }))
     ).resolves.toBe("answer");
     await vi.waitFor(() => expect(reportError).toHaveBeenCalledTimes(1));
     expect(reportError).toHaveBeenCalledWith(
@@ -339,7 +339,7 @@ describe("withAccountRotation", () => {
     const warn = vi.spyOn(logger, "warn");
 
     await expect(
-      withAccountRotation(async () => "answer", ctx({ scope: { reportError } }) as never)
+      withAccountRotation(async () => "answer", ctx({ scope: { reportError } }))
     ).resolves.toBe("answer");
     await vi.waitFor(() =>
       expect(warn).toHaveBeenCalledWith(
@@ -359,7 +359,7 @@ describe("withAccountRotation", () => {
       return "ambient-answer";
     });
     const c = ctx();
-    await expect(withAccountRotation(attempt, c as never)).resolves.toBe("ambient-answer");
+    await expect(withAccountRotation(attempt, c)).resolves.toBe("ambient-answer");
     expect(attempt).toHaveBeenCalledTimes(1);
     expect(bridge.select).toHaveBeenCalledTimes(1);
   });
@@ -372,7 +372,7 @@ describe("withAccountRotation", () => {
       expect(env?.PATH).toBe(process.env.PATH);
       return "ambient-answer";
     });
-    await expect(withAccountRotation(attempt, ctx() as never)).resolves.toBe("ambient-answer");
+    await expect(withAccountRotation(attempt, ctx())).resolves.toBe("ambient-answer");
     expect(attempt).toHaveBeenCalledTimes(1);
   });
 
@@ -392,7 +392,7 @@ describe("withAccountRotation", () => {
     });
     const c = ctx();
     try {
-      await expect(withAccountRotation(attempt, c as never)).resolves.toBe("answer-on-account-c");
+      await expect(withAccountRotation(attempt, c)).resolves.toBe("answer-on-account-c");
       expect(attempt).toHaveBeenCalledTimes(2);
       // First attempt already runs on the pool-selected account b (pool-first),
       // with the ambient token/key stripped from the subprocess env.
@@ -437,7 +437,7 @@ describe("withAccountRotation", () => {
           if (attempts === 1) throw new Error("429 too many requests");
           return "answer";
         },
-        ctx({ scope: { reportError } }) as never
+        ctx({ scope: { reportError } })
       )
     ).resolves.toBe("answer");
     await vi.waitFor(() =>
@@ -461,7 +461,7 @@ describe("withAccountRotation", () => {
             expect(env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok-b");
             return "first-turn";
           },
-          ctx({ sessionKey: "stable-session", scope }) as never
+          ctx({ sessionKey: "stable-session", scope })
         )
       ).resolves.toBe("first-turn");
 
@@ -470,7 +470,7 @@ describe("withAccountRotation", () => {
         return "still-on-selected-account";
       });
       await expect(
-        withAccountRotation(secondAttempt, ctx({ sessionKey: "stable-session", scope }) as never)
+        withAccountRotation(secondAttempt, ctx({ sessionKey: "stable-session", scope }))
       ).resolves.toBe("still-on-selected-account");
 
       expect(secondAttempt).toHaveBeenCalledTimes(1);
@@ -487,12 +487,8 @@ describe("withAccountRotation", () => {
     const bridge = installFakeBridge([account("request-a"), account("request-b")]);
     const scope = {};
 
-    await expect(withAccountRotation(async () => "first", ctx({ scope }) as never)).resolves.toBe(
-      "first"
-    );
-    await expect(withAccountRotation(async () => "second", ctx({ scope }) as never)).resolves.toBe(
-      "second"
-    );
+    await expect(withAccountRotation(async () => "first", ctx({ scope }))).resolves.toBe("first");
+    await expect(withAccountRotation(async () => "second", ctx({ scope }))).resolves.toBe("second");
 
     const firstOptions = bridge.select.mock.calls[0]?.[1];
     const secondOptions = bridge.select.mock.calls[1]?.[1];
@@ -505,7 +501,7 @@ describe("withAccountRotation", () => {
   it("fails closed if the bridge violates an exact-account refresh pin", async () => {
     installFakeBridge([account("b"), account("c")]);
     const scope = {};
-    const context = ctx({ sessionKey: "stable-session", scope }) as never;
+    const context = ctx({ sessionKey: "stable-session", scope });
 
     await expect(withAccountRotation(async () => "first", context)).resolves.toBe("first");
     await expect(withAccountRotation(async () => "second", context)).rejects.toThrow(
@@ -522,7 +518,7 @@ describe("withAccountRotation", () => {
           seen.push(env?.CLAUDE_CODE_OAUTH_TOKEN ?? "missing");
           return "ok";
         },
-        ctx({ sessionKey: "same-model-mode", scope }) as never
+        ctx({ sessionKey: "same-model-mode", scope })
       );
 
     await run({});
@@ -552,7 +548,7 @@ describe("withAccountRotation", () => {
         await firstGate;
         return "first";
       },
-      ctx({ sessionKey: "serialized", scope }) as never
+      ctx({ sessionKey: "serialized", scope })
     );
     await firstStarted;
     const second = withAccountRotation(
@@ -560,7 +556,7 @@ describe("withAccountRotation", () => {
         secondAttemptEntered = true;
         return "second";
       },
-      ctx({ sessionKey: "serialized", scope }) as never
+      ctx({ sessionKey: "serialized", scope })
     );
 
     await Promise.resolve();
@@ -747,7 +743,7 @@ describe("withAccountRotation", () => {
       return "answer-on-account-c";
     });
     const c = ctx({ backend: "codex-sdk" });
-    await expect(withAccountRotation(attempt, c as never)).resolves.toBe("answer-on-account-c");
+    await expect(withAccountRotation(attempt, c)).resolves.toBe("answer-on-account-c");
     expect(attempt).toHaveBeenCalledTimes(2);
     expect(bridge.select).toHaveBeenCalledTimes(2);
   });
@@ -758,7 +754,7 @@ describe("withAccountRotation", () => {
       throw new Error("[cli-inference:sdk] empty completion (subtype=success)");
     });
     const c = ctx();
-    await expect(withAccountRotation(attempt, c as never)).rejects.toThrow("empty completion");
+    await expect(withAccountRotation(attempt, c)).rejects.toThrow("empty completion");
     expect(attempt).toHaveBeenCalledTimes(1);
     // Only the pool-first initial selection ran — no rotation select.
     expect(bridge.select).toHaveBeenCalledTimes(1);
@@ -773,7 +769,7 @@ describe("withAccountRotation", () => {
       if (calls <= 2) throw new Error("429 too many requests");
       return "answer-on-account-d";
     });
-    await expect(withAccountRotation(attempt, ctx() as never)).resolves.toBe("answer-on-account-d");
+    await expect(withAccountRotation(attempt, ctx())).resolves.toBe("answer-on-account-d");
     expect(attempt).toHaveBeenCalledTimes(3);
     expect(bridge.select).toHaveBeenCalledTimes(3);
     // Each rotation select excludes every account already tried.
@@ -787,9 +783,7 @@ describe("withAccountRotation", () => {
       throw new Error("429 too many requests");
     });
 
-    await expect(withAccountRotation(attempt, ctx() as never, 1)).rejects.toThrow(
-      "429 too many requests"
-    );
+    await expect(withAccountRotation(attempt, ctx(), 1)).rejects.toThrow("429 too many requests");
     expect(attempt).toHaveBeenCalledTimes(2);
     expect(bridge.select).toHaveBeenCalledTimes(2);
   });
@@ -800,7 +794,7 @@ describe("withAccountRotation", () => {
       throw new Error("429 too many requests");
     });
 
-    await expect(withAccountRotation(attempt, ctx() as never)).rejects.toThrow(
+    await expect(withAccountRotation(attempt, ctx())).rejects.toThrow(
       /selector returned an excluded account/
     );
     expect(attempt).toHaveBeenCalledTimes(1);
@@ -813,7 +807,7 @@ describe("withAccountRotation", () => {
       throw new Error("subscription rate limit reached: session limit");
     });
     // Pool-first start on b; b limits → select returns null → rethrow.
-    await expect(withAccountRotation(attempt, ctx() as never)).rejects.toThrow(
+    await expect(withAccountRotation(attempt, ctx())).rejects.toThrow(
       "subscription rate limit reached"
     );
     expect(bridge.select).toHaveBeenCalledTimes(2);
@@ -832,7 +826,7 @@ describe("withAccountRotation", () => {
       throw new Error("subscription rate limit reached: session limit");
     });
     const c = ctx();
-    await expect(withAccountRotation(attempt, c as never)).rejects.toThrow(
+    await expect(withAccountRotation(attempt, c)).rejects.toThrow(
       "subscription rate limit reached"
     );
     expect(attempt).toHaveBeenCalledTimes(1);
@@ -844,7 +838,7 @@ describe("withAccountRotation", () => {
       throw new Error("subscription rate limit reached: session limit");
     });
     const c = ctx({ getValue: () => "0" });
-    await expect(withAccountRotation(attempt, c as never)).rejects.toThrow(
+    await expect(withAccountRotation(attempt, c)).rejects.toThrow(
       "subscription rate limit reached"
     );
     expect(attempt).toHaveBeenCalledTimes(1);
@@ -857,7 +851,7 @@ describe("withAccountRotation", () => {
       throw new Error("subscription rate limit reached: session limit");
     });
     const c = ctx({ backend: "claude" });
-    await expect(withAccountRotation(attempt, c as never)).rejects.toThrow(
+    await expect(withAccountRotation(attempt, c)).rejects.toThrow(
       "subscription rate limit reached"
     );
     expect(attempt).toHaveBeenCalledTimes(1);

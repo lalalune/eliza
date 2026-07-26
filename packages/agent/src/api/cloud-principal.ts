@@ -17,7 +17,8 @@ type CloudRealtimeConversation = Pick<
 export const CLOUD_PRINCIPAL_METADATA_KEY = "elizaCloudPrincipal";
 
 export function isCloudPrincipalRequired(): boolean {
-  return readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+  const provisioned = readAliasedEnv("ELIZA_CLOUD_PROVISIONED");
+  return provisioned === "1" || provisioned?.trim().toLowerCase() === "true";
 }
 
 export function resolveTrustedCloudPrincipal(

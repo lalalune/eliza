@@ -21,15 +21,23 @@ import {
   TRIGGER_TASK_NAME,
   TRIGGER_TASK_TAGS,
 } from "./runtime.ts";
-import { buildTriggerConfig } from "./scheduling.ts";
-import type { NormalizedTriggerDraft } from "./types.ts";
+import {
+  buildTriggerConfig,
+  DISABLED_TRIGGER_INTERVAL_MS,
+} from "./scheduling.ts";
+import type { NormalizedTriggerDraft, TriggerTaskMetadata } from "./types.ts";
 
 const AGENT_ID = stringToUuid("trigger-runtime-test-agent");
 
 interface WorkflowDispatchCall {
   workflowId: string;
   payload?: Record<string, unknown>;
-  options?: { idempotencyKey?: string; scheduleNodeId?: string };
+  options?: {
+    idempotencyKey?: string;
+    scheduleNodeId?: string;
+    ownerEntityId?: string;
+    sourceRoomId?: string;
+  };
 }
 
 interface PromptMessageCall {
@@ -58,6 +66,7 @@ interface MockRuntimeHandle {
   ) => void;
   setWorkflowServicePresent: (present: boolean) => void;
   setNotificationFailure: (error: Error | null) => void;
+  setRuntimeSetting: (key: string, value: unknown) => void;
 }
 
 function makeRuntime(): MockRuntimeHandle {
@@ -68,6 +77,7 @@ function makeRuntime(): MockRuntimeHandle {
   const warnings: unknown[][] = [];
   const notifyCalls: Array<Record<string, unknown>> = [];
   const reportedErrors: MockRuntimeHandle["reportedErrors"] = [];
+  const runtimeSettings = new Map<string, unknown>();
   let notificationFailure: Error | null = null;
 
   const messageService = {
@@ -106,7 +116,12 @@ function makeRuntime(): MockRuntimeHandle {
     async execute(
       workflowId: string,
       payload?: Record<string, unknown>,
-      options?: { idempotencyKey?: string; scheduleNodeId?: string },
+      options?: {
+        idempotencyKey?: string;
+        scheduleNodeId?: string;
+        ownerEntityId?: string;
+        sourceRoomId?: string;
+      },
     ) {
       dispatchCalls.push({ workflowId, payload, options });
       return dispatchResult;
@@ -116,6 +131,7 @@ function makeRuntime(): MockRuntimeHandle {
   const runtime = {
     agentId: AGENT_ID,
     character: { name: "trigger-test" },
+    getSetting: (key: string) => runtimeSettings.get(key) ?? null,
     messageService,
     logger: {
       info: vi.fn(),
@@ -162,6 +178,9 @@ function makeRuntime(): MockRuntimeHandle {
     setNotificationFailure: (error) => {
       notificationFailure = error;
     },
+    setRuntimeSetting: (key, value) => {
+      runtimeSettings.set(key, value);
+    },
   };
 }
 
@@ -194,6 +213,8 @@ function makeTriggerTask(
     kindOverride?: "workflow" | "prompt";
     scheduleNodeId?: string;
     idempotencyKey?: string;
+    ownerEntityId?: string;
+    sourceRoomId?: string;
   } = {},
 ): Task {
   const draft = makeDraft(draftOverrides);
@@ -221,6 +242,20 @@ function makeTriggerTask(
         : {}),
       ...(options.idempotencyKey
         ? { idempotencyKey: options.idempotencyKey }
+        : {}),
+      ...(options.ownerEntityId
+        ? { ownerEntityId: options.ownerEntityId }
+        : {}),
+      ...(options.sourceRoomId ? { sourceRoomId: options.sourceRoomId } : {}),
+      ...(options.ownerEntityId
+        ? {
+            ownership: {
+              ownerEntityId: options.ownerEntityId,
+              ...(options.sourceRoomId
+                ? { sourceRoomId: options.sourceRoomId }
+                : {}),
+            },
+          }
         : {}),
       trigger,
     },
@@ -280,6 +315,176 @@ describe("executeTriggerTask", () => {
     expect(persistedMetadata?.idempotencyKey).toBe(
       `wf-1:schedule-node-a:${nextRunAtMs}`,
     );
+  });
+
+  it("forwards the durable owner and source-chat context to workflow dispatch", async () => {
+    const ownerEntityId = stringToUuid("workflow-owner");
+    const sourceRoomId = stringToUuid("workflow-source-room");
+    const task = makeTriggerTask(
+      { triggerType: "interval" },
+      { ownerEntityId, sourceRoomId },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result.status).toBe("success");
+    expect(handle.dispatchCalls[0]?.options).toMatchObject({
+      ownerEntityId,
+      sourceRoomId,
+    });
+  });
+
+  it("rejects a managed Cloud workflow trigger without authoritative owner metadata", async () => {
+    const previous = process.env.ELIZA_CLOUD_PROVISIONED;
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    try {
+      const task = makeTriggerTask({ triggerType: "interval" });
+
+      const result = await executeTriggerTask(handle.runtime, task, {
+        source: "scheduler",
+      });
+
+      expect(result.status).toBe("error");
+      expect(result.error).toBe("workflow trigger missing owner context");
+      expect(handle.dispatchCalls).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+      else process.env.ELIZA_CLOUD_PROVISIONED = previous;
+    }
+  });
+
+  it("preserves a blocked once row without consuming its run count", async () => {
+    handle.setRuntimeSetting("ELIZA_CLOUD_PROVISIONED", "1");
+    handle.setRuntimeSetting("ELIZA_CLOUD_EXECUTION_TIER", "dedicated-lazy");
+    const task = makeTriggerTask(
+      {
+        triggerType: "once",
+        scheduledAtIso: new Date(Date.now() + 60_000).toISOString(),
+      },
+      { ownerEntityId: stringToUuid("lazy-owner") },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("always-on agent runtime");
+    expect(handle.dispatchCalls).toHaveLength(0);
+    expect(handle.deletedTaskIds).toHaveLength(0);
+    expect(handle.updatedTasks).toHaveLength(1);
+    const metadata = handle.updatedTasks[0]?.patch
+      .metadata as TriggerTaskMetadata;
+    expect(metadata.trigger?.enabled).toBe(false);
+    expect(metadata.trigger?.runCount).toBe(0);
+    expect(metadata.trigger?.lastRunAtIso).toBeUndefined();
+    expect(metadata.trigger?.lastStatus).toBe("error");
+    expect(metadata.triggerRuns).toBeUndefined();
+    expect(metadata.updateInterval).toBe(DISABLED_TRIGGER_INTERVAL_MS);
+    expect(result.updateInterval).toBe(DISABLED_TRIGGER_INTERVAL_MS);
+    expect(metadata.subscriptionPolicy).toMatchObject({
+      code: "workflow_requires_always_on",
+      currentExecutionTier: "dedicated-lazy",
+      requiredExecutionTier: "dedicated-always",
+      upgradeRequired: true,
+      requiresContinuousBillingConfirmation: true,
+    });
+  });
+
+  it.each([
+    ["interval", { triggerType: "interval" }],
+    ["cron", { triggerType: "cron", cronExpression: "0 9 * * *" }],
+  ] as const)(
+    "disables a historical %s row and does not retry it",
+    async (_label, draft) => {
+      handle.setRuntimeSetting("ELIZA_CLOUD_PROVISIONED", "true");
+      handle.setRuntimeSetting("ELIZA_CLOUD_EXECUTION_TIER", "dedicated-lazy");
+      const task = makeTriggerTask(draft, {
+        ownerEntityId: stringToUuid(`lazy-${draft.triggerType}-owner`),
+      });
+
+      const first = await executeTriggerTask(handle.runtime, task, {
+        source: "scheduler",
+      });
+
+      expect(first.status).toBe("error");
+      expect(first.taskDeleted).toBe(false);
+      expect(first.updateInterval).toBe(DISABLED_TRIGGER_INTERVAL_MS);
+      expect(handle.dispatchCalls).toHaveLength(0);
+      expect(handle.deletedTaskIds).toHaveLength(0);
+      expect(handle.updatedTasks).toHaveLength(1);
+
+      const persistedTask: Task = {
+        ...task,
+        metadata: handle.updatedTasks[0]?.patch.metadata,
+      };
+      const persisted = readTriggerConfig(persistedTask);
+      expect(persisted?.enabled).toBe(false);
+      expect(persisted?.runCount).toBe(0);
+
+      const second = await executeTriggerTask(handle.runtime, persistedTask, {
+        source: "scheduler",
+      });
+      expect(second.status).toBe("skipped");
+      expect(handle.dispatchCalls).toHaveLength(0);
+      expect(handle.updatedTasks).toHaveLength(1);
+      expect(handle.deletedTaskIds).toHaveLength(0);
+    },
+  );
+
+  it("allows Run Now for a time trigger on dedicated-lazy", async () => {
+    handle.setRuntimeSetting("ELIZA_CLOUD_PROVISIONED", true);
+    handle.setRuntimeSetting("ELIZA_CLOUD_EXECUTION_TIER", "dedicated-lazy");
+    const task = makeTriggerTask(
+      { triggerType: "cron", cronExpression: "0 9 * * *" },
+      { ownerEntityId: stringToUuid("manual-owner") },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "manual",
+      force: true,
+    });
+
+    expect(result.status).toBe("success");
+    expect(handle.dispatchCalls).toHaveLength(1);
+  });
+
+  it("allows scheduler execution on dedicated-always", async () => {
+    handle.setRuntimeSetting("ELIZA_CLOUD_PROVISIONED", "true");
+    handle.setRuntimeSetting("ELIZA_CLOUD_EXECUTION_TIER", "dedicated-always");
+    const task = makeTriggerTask(
+      {
+        triggerType: "once",
+        scheduledAtIso: new Date(Date.now() + 60_000).toISOString(),
+      },
+      { ownerEntityId: stringToUuid("always-owner") },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result.status).toBe("success");
+    expect(handle.dispatchCalls).toHaveLength(1);
+  });
+
+  it("allows event-trigger execution on dedicated-lazy", async () => {
+    handle.setRuntimeSetting("ELIZA_CLOUD_PROVISIONED", "1");
+    handle.setRuntimeSetting("ELIZA_CLOUD_EXECUTION_TIER", "dedicated-lazy");
+    const task = makeTriggerTask(
+      { triggerType: "event", eventKind: "mail.received" },
+      { ownerEntityId: stringToUuid("event-owner") },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "event",
+      event: { kind: "mail.received", payload: {} },
+    });
+
+    expect(result.status).toBe("success");
+    expect(handle.dispatchCalls).toHaveLength(1);
   });
 
   it("uses a distinct idempotency key for each sub-minute scheduled occurrence", async () => {
@@ -585,6 +790,60 @@ describe("executeTriggerTask", () => {
     } as Task);
     expect(persisted?.runCount).toBe(1);
     expect(persisted?.kind).toBe("prompt");
+  });
+
+  it("delivers a contextual prompt trigger into its originating chat as its owner", async () => {
+    const ownerEntityId = stringToUuid("prompt-owner");
+    const sourceRoomId = stringToUuid("prompt-source-room");
+    const task = makeTriggerTask(
+      {
+        kind: "prompt",
+        instructions: "Send the contextual update",
+        workflowId: undefined,
+        workflowName: undefined,
+      },
+      { kindOverride: "prompt", ownerEntityId, sourceRoomId },
+    );
+
+    const result = await executeTriggerTask(handle.runtime, task, {
+      source: "scheduler",
+    });
+
+    expect(result.status).toBe("success");
+    expect(handle.promptMessages).toEqual([
+      {
+        text: "Send the contextual update",
+        roomId: sourceRoomId,
+        entityId: ownerEntityId,
+      },
+    ]);
+  });
+
+  it("fails closed instead of using the process-global room when Cloud context is missing", async () => {
+    const previous = process.env.ELIZA_CLOUD_PROVISIONED;
+    process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    try {
+      const task = makeTriggerTask(
+        {
+          kind: "prompt",
+          instructions: "Do not leak this instruction",
+          workflowId: undefined,
+          workflowName: undefined,
+        },
+        { kindOverride: "prompt" },
+      );
+
+      const result = await executeTriggerTask(handle.runtime, task, {
+        source: "scheduler",
+      });
+
+      expect(result.status).toBe("error");
+      expect(result.error).toBe("prompt trigger missing owner context");
+      expect(handle.promptMessages).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+      else process.env.ELIZA_CLOUD_PROVISIONED = previous;
+    }
   });
 
   it("deletes the task when maxRuns is already reached (before dispatch)", async () => {

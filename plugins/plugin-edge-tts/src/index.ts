@@ -7,7 +7,14 @@
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { type IAgentRuntime, logger, ModelType, type Plugin, resolveSetting } from "@elizaos/core";
+import {
+  type IAgentRuntime,
+  isTruthyEnvValue,
+  logger,
+  ModelType,
+  type Plugin,
+  resolveSetting,
+} from "@elizaos/core";
 import { EdgeTTS } from "node-edge-tts";
 
 /**
@@ -333,7 +340,7 @@ export const edgeTTSPlugin: Plugin = {
   // running in an Eliza Cloud-provisioned container (cloud voice output).
   autoEnable: {
     shouldEnable: (env, config) => {
-      if (env.ELIZA_CLOUD_PROVISIONED === "1") return true;
+      if (isTruthyEnvValue(env.ELIZA_CLOUD_PROVISIONED)) return true;
       const f = (config?.features as Record<string, unknown> | undefined)?.tts;
       return (
         f === true ||

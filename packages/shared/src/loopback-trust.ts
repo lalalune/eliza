@@ -12,7 +12,7 @@
  * The two consumers differ ONLY in their policy gates, expressed via
  * {@link LoopbackTrustOptions}:
  *  - app-core: requireLocalAuthEnv + devAuthBypassEnv, cloudCheck "env"
- *    (`ELIZA_CLOUD_PROVISIONED === "1"` through the boot alias table).
+ *    (`ELIZA_CLOUD_PROVISIONED` is `1`/`true` through the boot alias table).
  *  - agent:    requireLocalAuthEnv (no dev bypass), cloudCheck "container"
  *    (`isCloudProvisionedContainer()` — flag AND a provisioning token).
  *
@@ -28,9 +28,11 @@
 
 import type http from "node:http";
 import { isIP } from "node:net";
-import { isCloudProvisionedContainer } from "./elizacloud/cloud-provisioning.js";
+import {
+  isCloudProvisionedContainer,
+  isCloudProvisionedEnvironment,
+} from "./elizacloud/cloud-provisioning.js";
 import { isLoopbackBindHost } from "./runtime-env.js";
-import { readAliasedEnv } from "./utils/env.js";
 
 export interface LoopbackTrustOptions {
   /**
@@ -48,9 +50,9 @@ export interface LoopbackTrustOptions {
   devAuthBypassEnv: boolean;
   /**
    * Cloud-container detection strategy. `"env"` trusts the raw
-   * `ELIZA_CLOUD_PROVISIONED` flag; `"container"` requires the flag AND a
-   * provisioning token (see {@link isCloudProvisionedContainer}). These are
-   * DIFFERENT semantics — do not swap them between consumers.
+   * `ELIZA_CLOUD_PROVISIONED` flag (`1`/`true`); `"container"` requires the flag
+   * AND a provisioning token (see {@link isCloudProvisionedContainer}). These
+   * are DIFFERENT semantics — do not swap them between consumers.
    */
   cloudCheck: "env" | "container";
 }
@@ -250,7 +252,7 @@ function isTrustedLocalOrigin(raw: string): boolean {
 
 function cloudBlocksLocalTrust(cloudCheck: "env" | "container"): boolean {
   if (cloudCheck === "container") return isCloudProvisionedContainer();
-  return readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+  return isCloudProvisionedEnvironment();
 }
 
 function localAuthRequired(options: LoopbackTrustOptions): boolean {

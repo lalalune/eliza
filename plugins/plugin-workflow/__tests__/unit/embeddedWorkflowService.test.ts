@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
-import type { IAgentRuntime } from '@elizaos/core';
+import { type IAgentRuntime, stringToUuid } from '@elizaos/core';
 import { and, eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import * as dbSchema from '../../src/db/schema';
@@ -12,6 +12,12 @@ import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-se
 import { resolveSmithersDbPath } from '../../src/services/smithers-runtime';
 import { WorkflowService } from '../../src/services/workflow-service';
 import type { WorkflowDefinition } from '../../src/types/index';
+import {
+  getUserTagName,
+  readWorkflowExecutionContext,
+} from '../../src/utils/context';
+
+const DELETION_CHECK_SECRET = 'default-deletion-query-secret-6db24f';
 
 function runtime(
   settings: Record<string, unknown> = {},
@@ -88,7 +94,7 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
             }
             return (table: unknown) => {
               if (control.failPriorDeletionCheck && table === dbSchema.workflowRevisions) {
-                throw new Error('workflow revision query unavailable');
+                throw new Error(`workflow revision query unavailable: ${DELETION_CHECK_SECRET}`);
               }
               return Reflect.apply(selectTarget.from, selectTarget, [table]);
             };
@@ -176,6 +182,37 @@ async function seedingHarness(settings: Record<string, unknown> = {}) {
 
 const DEFAULT_WORKFLOW_ID = 'system-device-health-check';
 const SEED_MARKER_KEY = 'eliza:workflow:seeded-defaults:v1';
+const LEGACY_OWNER_A = '11111111-1111-4111-8111-111111111111';
+const LEGACY_OWNER_B = '22222222-2222-4222-8222-222222222222';
+
+async function attachCanonicalOwnerTags(
+  service: EmbeddedWorkflowService,
+  workflowId: string,
+  ownerEntityIds: string[]
+): Promise<void> {
+  const tagIds: string[] = [];
+  for (const ownerEntityId of ownerEntityIds) {
+    const name = await getUserTagName(
+      { agentId: 'agent-test' } as IAgentRuntime,
+      ownerEntityId
+    );
+    tagIds.push((await service.getOrCreateTag(name)).id);
+  }
+  await service.updateWorkflowTags(workflowId, tagIds);
+}
+
+async function attachLegacyOwnerTag(
+  service: EmbeddedWorkflowService,
+  workflowId: string,
+  ownerEntityId: string
+): Promise<void> {
+  const ownerPrefix = ownerEntityId.replace(/-/g, '').slice(0, 8);
+  const agentScope = stringToUuid('agent-test').replace(/-/g, '');
+  const tag = await service.getOrCreateTag(
+    `eliza_legacy-owner_${ownerPrefix}_agent_${agentScope}`
+  );
+  await service.updateWorkflowTags(workflowId, [tag.id]);
+}
 
 function scheduledDefinition(id: string, intervalsInSeconds: number[]): WorkflowDefinition {
   const nodes = intervalsInSeconds.map((seconds, index) => ({
@@ -588,6 +625,66 @@ describe('EmbeddedWorkflowService', () => {
     }
   }, 90_000);
 
+  test('migrates a canonical legacy owner before explicit managed-Cloud activation arms a task', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: 'true',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
+    });
+    const service = await harness.start();
+    try {
+      const workflow = await service.createWorkflow(
+        scheduledDefinition('legacy-explicit-activation', [30])
+      );
+      await attachCanonicalOwnerTags(service, workflow.id, [LEGACY_OWNER_A]);
+      expect(readWorkflowExecutionContext(await service.getWorkflow(workflow.id))).toBeUndefined();
+
+      await service.activateWorkflow(workflow.id);
+
+      expect(readWorkflowExecutionContext(await service.getWorkflow(workflow.id))).toEqual({
+        ownerEntityId: LEGACY_OWNER_A,
+      });
+      expect(harness.tasks).toHaveLength(1);
+      expect(harness.tasks[0]).toMatchObject({
+        entityId: LEGACY_OWNER_A,
+        metadata: {
+          ownerEntityId: LEGACY_OWNER_A,
+          ownership: { ownerEntityId: LEGACY_OWNER_A },
+        },
+      });
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('rejects explicit managed-Cloud activation when no canonical owner can be migrated', async () => {
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
+    });
+    const service = await harness.start();
+    try {
+      const workflow = await service.createWorkflow(
+        scheduledDefinition('legacy-explicit-activation-missing-owner', [30])
+      );
+
+      await expect(service.activateWorkflow(workflow.id)).rejects.toMatchObject({
+        statusCode: 409,
+        response: {
+          code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+          reason: 'missing',
+        },
+      });
+      expect((await service.getWorkflow(workflow.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
   test('keeps manual workflows available on scale-to-zero Cloud agents but rejects schedule activation', async () => {
     const harness = await seedingHarness({
       WORKFLOW_SEED_DEFAULTS: false,
@@ -619,6 +716,38 @@ describe('EmbeddedWorkflowService', () => {
     } finally {
       await service.stop();
       await harness.close();
+    }
+  }, 90_000);
+
+  test('rejects schedule activation when the lazy Cloud tier is available only through process env', async () => {
+    const previousProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
+    const previousTier = process.env.ELIZA_CLOUD_EXECUTION_TIER;
+    process.env.ELIZA_CLOUD_PROVISIONED = 'true';
+    process.env.ELIZA_CLOUD_EXECUTION_TIER = 'dedicated-lazy';
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    try {
+      const scheduled = await service.createWorkflow(
+        scheduledDefinition('env-lazy-schedule', [30])
+      );
+
+      await expect(service.activateWorkflow(scheduled.id)).rejects.toMatchObject({
+        statusCode: 409,
+        response: {
+          code: 'workflow_requires_always_on',
+          currentExecutionTier: 'dedicated-lazy',
+          requiredExecutionTier: 'dedicated-always',
+        },
+      });
+      expect((await service.getWorkflow(scheduled.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+      if (previousProvisioned === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+      else process.env.ELIZA_CLOUD_PROVISIONED = previousProvisioned;
+      if (previousTier === undefined) delete process.env.ELIZA_CLOUD_EXECUTION_TIER;
+      else process.env.ELIZA_CLOUD_EXECUTION_TIER = previousTier;
     }
   }, 90_000);
 
@@ -683,10 +812,94 @@ describe('EmbeddedWorkflowService', () => {
     }
   }, 90_000);
 
+  test('migrates a canonical legacy owner before restoring an active schedule in managed Cloud', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    try {
+      const workflow = await service.createWorkflow(
+        scheduledDefinition('legacy-restore-active-owner', [30])
+      );
+      await attachCanonicalOwnerTags(service, workflow.id, [LEGACY_OWNER_A]);
+      await service.activateWorkflow(workflow.id);
+      await service.deactivateWorkflow(workflow.id);
+      const activeRevision = (await service.listWorkflowRevisions(workflow.id)).data.find(
+        (revision) => revision.active && revision.operation === 'deactivate'
+      );
+      if (!activeRevision) throw new Error('Expected a legacy active revision');
+      harness.setSetting('ELIZA_CLOUD_PROVISIONED', 'true');
+      harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-always');
+
+      const restored = await service.restoreWorkflowRevision(
+        workflow.id,
+        activeRevision.versionId
+      );
+
+      expect(restored.active).toBe(true);
+      expect(readWorkflowExecutionContext(restored)).toEqual({ ownerEntityId: LEGACY_OWNER_A });
+      expect(harness.tasks).toHaveLength(1);
+      expect(harness.tasks[0]).toMatchObject({
+        entityId: LEGACY_OWNER_A,
+        metadata: { ownership: { ownerEntityId: LEGACY_OWNER_A } },
+      });
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('leaves a workflow inactive when restoring its legacy active revision has no canonical owner', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const service = await harness.start();
+    try {
+      const workflow = await service.createWorkflow(
+        scheduledDefinition('legacy-restore-active-missing-owner', [30])
+      );
+      await service.activateWorkflow(workflow.id);
+      await service.deactivateWorkflow(workflow.id);
+      const activeRevision = (await service.listWorkflowRevisions(workflow.id)).data.find(
+        (revision) => revision.active && revision.operation === 'deactivate'
+      );
+      if (!activeRevision) throw new Error('Expected a legacy active revision');
+      harness.setSetting('ELIZA_CLOUD_PROVISIONED', '1');
+      harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-always');
+
+      await expect(
+        service.restoreWorkflowRevision(workflow.id, activeRevision.versionId)
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        response: {
+          code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+          reason: 'missing',
+        },
+      });
+      expect((await service.getWorkflow(workflow.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
   test('does not seed a scheduled default on a scale-to-zero Cloud agent', async () => {
     const harness = await seedingHarness({
       ELIZA_CLOUD_PROVISIONED: '1',
       ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-lazy',
+    });
+    const service = await harness.start();
+    try {
+      expect((await service.listWorkflows()).data).toHaveLength(0);
+      expect(harness.tasks).toHaveLength(0);
+      expect(harness.cache.get(SEED_MARKER_KEY)).toBeUndefined();
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  test('does not invent an owner for the scheduled default on dedicated-always Cloud', async () => {
+    const harness = await seedingHarness({
+      ELIZA_CLOUD_PROVISIONED: 'true',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
     });
     const service = await harness.start();
     try {
@@ -733,6 +946,154 @@ describe('EmbeddedWorkflowService', () => {
       await harness.close();
     }
   }, 90_000);
+
+  test('deactivates persisted schedules on startup when the lazy Cloud tier is env-only', async () => {
+    const previousProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
+    const previousTier = process.env.ELIZA_CLOUD_EXECUTION_TIER;
+    delete process.env.ELIZA_CLOUD_PROVISIONED;
+    delete process.env.ELIZA_CLOUD_EXECUTION_TIER;
+    const harness = await seedingHarness({
+      WORKFLOW_SEED_DEFAULTS: false,
+      ELIZA_CLOUD_PROVISIONED: '1',
+      ELIZA_CLOUD_EXECUTION_TIER: 'dedicated-always',
+    });
+    const first = await harness.start();
+    try {
+      const scheduled = await first.createWorkflow(scheduledDefinition('env-lazy-rehydrate', [30]));
+      await first.activateWorkflow(scheduled.id);
+      expect(harness.tasks).toHaveLength(1);
+      await first.stop();
+
+      harness.setSetting('ELIZA_CLOUD_PROVISIONED', null);
+      harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', null);
+      process.env.ELIZA_CLOUD_PROVISIONED = '1';
+      process.env.ELIZA_CLOUD_EXECUTION_TIER = 'dedicated-lazy';
+
+      const second = await harness.start();
+      try {
+        expect((await second.getWorkflow(scheduled.id)).active).toBe(false);
+        expect(harness.tasks).toHaveLength(0);
+        expect(harness.reports).toContainEqual(
+          expect.objectContaining({
+            scope: 'EmbeddedWorkflowService.rehydrateSchedules',
+            context: {
+              workflowId: scheduled.id,
+              currentExecutionTier: 'dedicated-lazy',
+            },
+          })
+        );
+      } finally {
+        await second.stop();
+      }
+    } finally {
+      await harness.close();
+      if (previousProvisioned === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+      else process.env.ELIZA_CLOUD_PROVISIONED = previousProvisioned;
+      if (previousTier === undefined) delete process.env.ELIZA_CLOUD_EXECUTION_TIER;
+      else process.env.ELIZA_CLOUD_EXECUTION_TIER = previousTier;
+    }
+  }, 90_000);
+
+  test('rehydrates a legacy managed schedule by durably migrating its one canonical owner tag', async () => {
+    const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+    const first = await harness.start();
+    const workflow = await first.createWorkflow(
+      scheduledDefinition('legacy-rehydrate-canonical-owner', [30])
+    );
+    await attachCanonicalOwnerTags(first, workflow.id, [LEGACY_OWNER_A]);
+    await first.activateWorkflow(workflow.id);
+    expect(readWorkflowExecutionContext(await first.getWorkflow(workflow.id))).toBeUndefined();
+    await first.stop();
+    harness.setSetting('ELIZA_CLOUD_PROVISIONED', 'true');
+    harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-always');
+
+    const second = await harness.start();
+    try {
+      expect((await second.getWorkflow(workflow.id)).active).toBe(true);
+      expect(readWorkflowExecutionContext(await second.getWorkflow(workflow.id))).toEqual({
+        ownerEntityId: LEGACY_OWNER_A,
+      });
+      expect(harness.tasks).toHaveLength(1);
+      expect(harness.tasks[0]).toMatchObject({
+        entityId: LEGACY_OWNER_A,
+        metadata: {
+          ownerEntityId: LEGACY_OWNER_A,
+          ownership: { ownerEntityId: LEGACY_OWNER_A },
+        },
+      });
+      expect(harness.reports).toHaveLength(0);
+    } finally {
+      await second.stop();
+      await harness.close();
+    }
+  }, 90_000);
+
+  for (const scenario of [
+    {
+      name: 'ambiguous canonical owner tags',
+      reason: 'ambiguous',
+      attach: (service: EmbeddedWorkflowService, workflowId: string) =>
+        attachCanonicalOwnerTags(service, workflowId, [LEGACY_OWNER_A, LEGACY_OWNER_B]),
+    },
+    {
+      name: 'a truncated legacy owner tag',
+      reason: 'missing',
+      attach: (service: EmbeddedWorkflowService, workflowId: string) =>
+        attachLegacyOwnerTag(service, workflowId, LEGACY_OWNER_A),
+    },
+    {
+      name: 'no owner tag',
+      reason: 'missing',
+      attach: async (_service: EmbeddedWorkflowService, _workflowId: string) => {},
+    },
+  ] as const) {
+    test(`deactivates ${scenario.name} on managed rehydrate and does not retry it`, async () => {
+      const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
+      const first = await harness.start();
+      const workflow = await first.createWorkflow(
+        scheduledDefinition(`legacy-rehydrate-${scenario.reason}-${scenario.name}`, [30])
+      );
+      await scenario.attach(first, workflow.id);
+      await first.activateWorkflow(workflow.id);
+      expect(harness.tasks).toHaveLength(1);
+      await first.stop();
+      harness.setSetting('ELIZA_CLOUD_PROVISIONED', '1');
+      harness.setSetting('ELIZA_CLOUD_EXECUTION_TIER', 'dedicated-always');
+
+      const second = await harness.start();
+      expect((await second.getWorkflow(workflow.id)).active).toBe(false);
+      expect(harness.tasks).toHaveLength(0);
+      expect(harness.reports).toContainEqual(
+        expect.objectContaining({
+          scope: 'EmbeddedWorkflowService.rehydrateSchedules',
+          error: expect.objectContaining({
+            response: expect.objectContaining({
+              code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+              reason: scenario.reason,
+            }),
+          }),
+          context: {
+            workflowId: workflow.id,
+            code: 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED',
+          },
+        })
+      );
+      await second.stop();
+
+      const taskOpsAfterDisable = { ...harness.taskOps };
+      const reportsAfterDisable = harness.reports.length;
+      const third = await harness.start();
+      try {
+        expect((await third.getWorkflow(workflow.id)).active).toBe(false);
+        expect(harness.tasks).toHaveLength(0);
+        expect(harness.taskOps).toEqual(taskOpsAfterDisable);
+        expect(harness.reports).toHaveLength(reportsAfterDisable);
+      } finally {
+        await third.stop();
+        await harness.close();
+      }
+    }, 90_000);
+  }
 
   test('serializes activation and deactivation across schedule reconciliation', async () => {
     const harness = await seedingHarness({ WORKFLOW_SEED_DEFAULTS: false });
@@ -1153,10 +1514,17 @@ describe('EmbeddedWorkflowService', () => {
     harness.control.failPriorDeletionCheck = true;
 
     try {
-      await expect(harness.start()).rejects.toMatchObject({
+      let thrown: unknown;
+      try {
+        await harness.start();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({
         code: 'WORKFLOW_DEFAULT_SEED_DELETION_CHECK_FAILED',
         context: { workflowId: DEFAULT_WORKFLOW_ID },
       });
+      expect((thrown as Error & { cause?: Error }).cause?.message).toContain(DELETION_CHECK_SECRET);
       expect(await harness.listDefaultRows()).toHaveLength(0);
       expect(harness.tasks).toHaveLength(0);
       expect(harness.reports).toHaveLength(1);
@@ -1164,6 +1532,16 @@ describe('EmbeddedWorkflowService', () => {
         scope: 'EmbeddedWorkflowService.seedDefaultWorkflows',
         context: { workflowId: DEFAULT_WORKFLOW_ID },
       });
+      const diagnosticError = harness.reports[0]?.error as Error & {
+        cause?: unknown;
+        code?: string;
+      };
+      expect(diagnosticError.code).toBe('WORKFLOW_DEFAULT_SEED_DELETION_CHECK_FAILED');
+      expect(diagnosticError.message).toBe(
+        'Default workflow deletion history could not be checked'
+      );
+      expect(diagnosticError.cause).toBeUndefined();
+      expect(diagnosticError.stack).not.toContain(DELETION_CHECK_SECRET);
     } finally {
       await harness.close();
     }
@@ -1515,6 +1893,70 @@ describe('EmbeddedWorkflowService', () => {
     }
   }, 60_000);
 
+  test('preserves trusted execution routing across spoofed updates and malicious or old revisions', async () => {
+    const harness = await persistentRuntime();
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    const trustedContext = {
+      ownerEntityId: LEGACY_OWNER_A,
+      sourceRoomId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    };
+    try {
+      for (const revisionKind of ['malicious', 'old'] as const) {
+        const created = await service.createWorkflow({
+          ...manualDefinition(`revision-context-${revisionKind}`),
+          meta: { elizaExecutionContext: trustedContext },
+        });
+        const updated = await service.updateWorkflow(created.id, {
+          ...created,
+          name: `Updated ${revisionKind}`,
+          meta: {
+            ...created.meta,
+            elizaExecutionContext: {
+              ownerEntityId: LEGACY_OWNER_B,
+              sourceRoomId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+            },
+          },
+        });
+        expect(readWorkflowExecutionContext(updated)).toEqual(trustedContext);
+
+        const captured = (await service.listWorkflowRevisions(created.id)).data.find(
+          (revision) => revision.versionId === created.versionId
+        );
+        if (!captured) throw new Error('Expected captured revision');
+        const poisonedMeta = { ...(captured.workflow.meta ?? {}) };
+        if (revisionKind === 'malicious') {
+          poisonedMeta.elizaExecutionContext = {
+            ownerEntityId: LEGACY_OWNER_B,
+            sourceRoomId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          };
+        } else {
+          delete poisonedMeta.elizaExecutionContext;
+        }
+        await harness.db
+          .update(dbSchema.workflowRevisions)
+          .set({
+            workflow: {
+              ...captured.workflow,
+              meta: poisonedMeta,
+            },
+          })
+          .where(
+            and(
+              eq(dbSchema.workflowRevisions.agentId, 'agent-test'),
+              eq(dbSchema.workflowRevisions.workflowId, created.id),
+              eq(dbSchema.workflowRevisions.versionId, created.versionId)
+            )
+          );
+
+        const restored = await service.restoreWorkflowRevision(created.id, created.versionId);
+        expect(readWorkflowExecutionContext(restored)).toEqual(trustedContext);
+      }
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
   test('runs Code node in the QuickJS sandbox', async () => {
     const pluginRoot = join(import.meta.dir, '../..');
     const resultDir = await mkdtemp(join(tmpdir(), 'embedded-workflows-code-result-'));
@@ -1624,13 +2066,9 @@ describe('EmbeddedWorkflowService', () => {
 
       expect(execution.status).toBe('error');
       expect(execution.finished).toBe(true);
-      expect(execution.data?.resultData?.error?.message).toContain(
-        'Unable to resolve workflow execution order'
-      );
+      expect(execution.data?.resultData?.error?.message).toBe('Workflow execution failed');
       expect(persisted.status).toBe('error');
-      expect(persisted.data?.resultData?.error?.message).toContain(
-        'Unable to resolve workflow execution order'
-      );
+      expect(persisted.data?.resultData?.error?.message).toBe('Workflow execution failed');
     } finally {
       await service.stop();
       await harness.close();

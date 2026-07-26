@@ -410,12 +410,12 @@ describe("CodexSdkSession — TEXT mode", () => {
     session.dispose();
   });
 
-  it.each([
-    "none",
-    "impossible",
-  ])("rejects unsupported %s effort before starting a subscription turn", (reasoningEffort) => {
-    expect(() => makeSession([], { reasoningEffort })).toThrow(/unsupported reasoning effort/);
-  });
+  it.each(["none", "impossible"])(
+    "rejects unsupported %s effort before starting a subscription turn",
+    (reasoningEffort) => {
+      expect(() => makeSession([], { reasoningEffort })).toThrow(/unsupported reasoning effort/);
+    }
+  );
 
   it("falls back to the last agent_message item text", async () => {
     const { session } = makeSession([{ itemText: "from item" }]);

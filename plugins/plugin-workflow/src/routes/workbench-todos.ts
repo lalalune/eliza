@@ -9,7 +9,9 @@
  * The response DTO, the `workbench-todo` tag convention, and the validation
  * schemas are shared with the rest of the platform (`@elizaos/shared`
  * `contracts/workbench-routes`), so the endpoints behave identically to the
- * previous host-side implementations.
+ * previous host-side implementations. Managed Cloud calls carry an attested
+ * principal; every persisted todo is stamped and filtered by that principal,
+ * while local single-owner runtimes keep their headerless behavior.
  */
 
 import type http from 'node:http';
@@ -34,6 +36,7 @@ import {
   readTaskMetadata,
   WORKBENCH_TODO_TAG,
 } from '../lib/automations-types';
+import { isCloudWorkflowPrincipalRequired } from './_helpers';
 
 export interface WorkbenchTodoView {
   id: string;
@@ -51,6 +54,8 @@ export interface WorkbenchTodosRouteContext {
   method: string;
   pathname: string;
   runtime: AgentRuntime | null;
+  /** Authenticated end-user principal installed by the Cloud gateway. */
+  principalId?: string;
 }
 
 type WorkbenchTodoMutation = 'created' | 'updated' | 'completed' | 'deleted';
@@ -102,6 +107,42 @@ function readTodoMeta(task: Task): Record<string, unknown> {
     (isObject(metadata.todo) ? metadata.todo : null) ??
     {}
   );
+}
+
+function readOwnerMarker(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * Ownership is written redundantly for database filtering and portable task
+ * metadata. Conflicting markers are treated as corrupt and hidden from every
+ * Cloud tenant rather than letting either marker broaden access.
+ */
+function isOwnedByPrincipal(task: Task, principalId: string): boolean {
+  const metadata = readTaskMetadata(task);
+  const ownership = isObject(metadata.ownership) ? metadata.ownership : null;
+  const declaredOwners = [
+    readOwnerMarker(ownership?.ownerId),
+    readOwnerMarker(metadata.ownerEntityId),
+    readOwnerMarker(metadata.createdBy),
+    readOwnerMarker(task.entityId),
+  ].filter((owner): owner is string => owner !== null);
+  return declaredOwners.length > 0 && declaredOwners.every((owner) => owner === principalId);
+}
+
+function isTodoVisibleToPrincipal(task: Task, principalId: string | undefined): boolean {
+  return !principalId || isOwnedByPrincipal(task, principalId);
+}
+
+async function getVisibleTodoTask(
+  runtime: AgentRuntime,
+  todoId: string,
+  principalId: string | undefined
+): Promise<Task | null> {
+  const task = await runtime.getTask(todoId as UUID);
+  return task && toWorkbenchTodoView(task) && isTodoVisibleToPrincipal(task, principalId)
+    ? task
+    : null;
 }
 
 export function toWorkbenchTodoView(task: Task): WorkbenchTodoView | null {
@@ -190,9 +231,23 @@ export async function handleWorkbenchTodosRoutes(
   ctx: WorkbenchTodosRouteContext
 ): Promise<boolean> {
   const { req, res, method, pathname, runtime } = ctx;
+  const principalId = ctx.principalId?.trim() || undefined;
 
   if (pathname !== '/api/workbench/todos' && !pathname.startsWith('/api/workbench/todos/')) {
     return false;
+  }
+
+  if (!principalId && isCloudWorkflowPrincipalRequired()) {
+    sendJson(
+      res,
+      {
+        success: false,
+        code: 'workflow_principal_required',
+        error: 'Workflow user principal is required',
+      },
+      401
+    );
+    return true;
   }
 
   // ── GET /api/workbench/todos ─────────────────────────────────────────
@@ -203,6 +258,7 @@ export async function handleWorkbenchTodosRoutes(
     }
     const runtimeTasks = await runtime.getTasks({});
     const todos = runtimeTasks
+      .filter((task) => isTodoVisibleToPrincipal(task, principalId))
       .map((task) => toWorkbenchTodoView(task))
       .filter((todo): todo is WorkbenchTodoView => todo !== null)
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -232,6 +288,7 @@ export async function handleWorkbenchTodosRoutes(
 
     const metadata = {
       isCompleted,
+      ...(principalId ? { ownership: { ownerId: principalId } } : {}),
       workbenchTodo: {
         description,
         priority,
@@ -245,9 +302,14 @@ export async function handleWorkbenchTodosRoutes(
       description,
       tags: normalizeTags(body.tags, [WORKBENCH_TODO_TAG, 'todo']),
       metadata,
+      agentId: runtime.agentId,
+      ...(principalId ? { entityId: principalId as UUID } : {}),
     });
     const created = await runtime.getTask(taskId);
-    const todo = created ? toWorkbenchTodoView(created) : null;
+    const todo =
+      created && isTodoVisibleToPrincipal(created, principalId)
+        ? toWorkbenchTodoView(created)
+        : null;
     if (!todo) {
       sendJsonError(res, 'Todo created but unavailable', 500);
       return true;
@@ -272,8 +334,8 @@ export async function handleWorkbenchTodosRoutes(
       return true;
     }
     const isCompleted = parsedComp.data.isCompleted === true;
-    const todoTask = await runtime.getTask(decodedTodoId as UUID);
-    if (!todoTask?.id || !toWorkbenchTodoView(todoTask)) {
+    const todoTask = await getVisibleTodoTask(runtime, decodedTodoId, principalId);
+    if (!todoTask?.id) {
       sendJsonError(res, 'Todo not found', 404);
       return true;
     }
@@ -283,6 +345,7 @@ export async function handleWorkbenchTodosRoutes(
       metadata: {
         ...metadata,
         isCompleted,
+        ...(principalId ? { ownership: { ownerId: principalId } } : {}),
         workbenchTodo: {
           ...todoMeta,
           isCompleted,
@@ -307,7 +370,7 @@ export async function handleWorkbenchTodosRoutes(
     if (!decodedTodoId) return true;
 
     if (method === 'GET') {
-      const todoTask = await runtime.getTask(decodedTodoId as UUID);
+      const todoTask = await getVisibleTodoTask(runtime, decodedTodoId, principalId);
       const todoView = todoTask ? toWorkbenchTodoView(todoTask) : null;
       if (!todoTask?.id || !todoView) {
         sendJsonError(res, 'Todo not found', 404);
@@ -318,8 +381,8 @@ export async function handleWorkbenchTodosRoutes(
     }
 
     if (method === 'DELETE') {
-      const todoTask = await runtime.getTask(decodedTodoId as UUID);
-      if (!todoTask?.id || !toWorkbenchTodoView(todoTask)) {
+      const todoTask = await getVisibleTodoTask(runtime, decodedTodoId, principalId);
+      if (!todoTask?.id) {
         sendJsonError(res, 'Todo not found', 404);
         return true;
       }
@@ -337,7 +400,7 @@ export async function handleWorkbenchTodosRoutes(
     }
     const body = parsedPut.data;
 
-    const todoTask = await runtime.getTask(decodedTodoId as UUID);
+    const todoTask = await getVisibleTodoTask(runtime, decodedTodoId, principalId);
     const todoView = todoTask ? toWorkbenchTodoView(todoTask) : null;
     if (!todoTask?.id || !todoView) {
       sendJsonError(res, 'Todo not found', 404);
@@ -386,6 +449,7 @@ export async function handleWorkbenchTodosRoutes(
     update.metadata = {
       ...metadata,
       isCompleted,
+      ...(principalId ? { ownership: { ownerId: principalId } } : {}),
       workbenchTodo: nextTodoMeta,
     };
 

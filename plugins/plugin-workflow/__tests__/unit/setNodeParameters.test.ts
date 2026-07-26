@@ -20,11 +20,11 @@ function workflow(parameters: Record<string, unknown>, type = 'workflows-nodes-b
 }
 
 function assignments(definition: WorkflowDefinition): Array<Record<string, unknown>> {
-  return (
-    definition.nodes[0]?.parameters.assignments as {
-      assignments: Array<Record<string, unknown>>;
-    }
-  ).assignments;
+  const node = definition.nodes[0];
+  if (!node) throw new Error('expected the workflow to contain a Set node');
+  const values = (node.parameters.assignments as { assignments?: unknown }).assignments;
+  if (!Array.isArray(values)) throw new Error('expected normalized Set assignments');
+  return values as Array<Record<string, unknown>>;
 }
 
 describe('Set/Edit Fields parameter normalization', () => {

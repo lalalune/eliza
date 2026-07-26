@@ -13,6 +13,7 @@ import {
 import type { WorkflowDefinition, WorkflowExecution, WorkflowNode } from '../../src/types/index';
 
 const RESULT_PREFIX = 'SMITHERS_RUNTIME_CASE_RESULT ';
+const CONTINUE_ERROR_SECRET = 'smithers-continue-secret-8fd027';
 
 type RunNode = SmithersWorkflowRunOptions['runNode'];
 type NodeInput = Parameters<RunNode>[1];
@@ -134,6 +135,35 @@ async function continueCase(): Promise<Record<string, unknown>> {
   return {
     status: result.status,
     errorItem: fRun?.[0]?.data.main[0][0].json.error,
+    errorCode: fRun?.[0]?.data.main[0][0].json.errorCode,
+  };
+}
+
+async function continueKnownErrorCase(): Promise<Record<string, unknown>> {
+  const nodes = [node('known-error', { continueOnFail: true })];
+  const plan: SmithersExecutionPlan = {
+    enabledNodes: nodes,
+    startNodes: ['known-error'],
+    incoming: {},
+  };
+  const result = await run('wf-continue-known-error', nodes, plan, async () => {
+    throw new ElizaError(`upstream reflected ${CONTINUE_ERROR_SECRET}`, {
+      code: 'WORKFLOW_HTTP_STATUS_ERROR',
+      context: {
+        method: 'POST',
+        statusCode: 503,
+        workflowId: CONTINUE_ERROR_SECRET,
+        executionId: CONTINUE_ERROR_SECRET,
+        url: `https://example.test/?token=${CONTINUE_ERROR_SECRET}`,
+        headers: { authorization: CONTINUE_ERROR_SECRET },
+      },
+    });
+  });
+  const runEntry = result.data?.resultData?.runData?.['known-error'] as RunDataEntry[] | undefined;
+  const errorItem = runEntry?.[0]?.data.main[0][0].json;
+  return {
+    status: result.status,
+    errorItem,
   };
 }
 
@@ -439,6 +469,7 @@ const cases: Record<string, () => Promise<Record<string, unknown>>> = {
   fanout: fanoutCase,
   retry: retryCase,
   continue: continueCase,
+  'continue-known-error': continueKnownErrorCase,
   fail: failCase,
   timeout: timeoutCase,
   'timeout-cancellation': timeoutCancellationCase,

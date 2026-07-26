@@ -6,6 +6,8 @@
  * by TriggersView and its tests so neither duplicates the logic.
  */
 
+import { parsePositiveInteger } from "@elizaos/shared";
+import { CronExpressionParser } from "cron-parser";
 import type {
   CreateTriggerRequest,
   TriggerSummary,
@@ -13,18 +15,44 @@ import type {
   TriggerWakeMode,
   UpdateTriggerRequest,
 } from "../../api/client";
-
-export type TriggerKind = "text" | "workflow";
-
-import { parsePositiveInteger } from "@elizaos/shared";
-import { CronExpressionParser } from "cron-parser";
 import { shellLocalStorage } from "../../surface-realm-channel";
 import type { TranslateFn as AppTranslateFn } from "../../types";
-import { formatDurationMs } from "../../utils/format";
+import { formatDateTime, formatDurationMs } from "../../utils/format";
+
+export type TriggerKind = NonNullable<CreateTriggerRequest["kind"]>;
 
 // ── Translation helper type ────────────────────────────────────────
 
 export type TranslateFn = AppTranslateFn;
+
+/** Event kinds available before a user has saved any event triggers. */
+export const EVENT_KIND_OPTIONS = [
+  {
+    value: "message.received",
+    labelKey: "triggerform.event.messageReceived",
+    defaultLabel: "Message received",
+  },
+  {
+    value: "discord.message.received",
+    labelKey: "triggerform.event.discordMessage",
+    defaultLabel: "Discord message",
+  },
+  {
+    value: "telegram.message.received",
+    labelKey: "triggerform.event.telegramMessage",
+    defaultLabel: "Telegram message",
+  },
+  {
+    value: "gmail.message.received",
+    labelKey: "triggerform.event.gmailMessage",
+    defaultLabel: "Gmail message",
+  },
+  {
+    value: "calendar.event.ended",
+    labelKey: "triggerform.event.calendarEventEnded",
+    defaultLabel: "Calendar event ended",
+  },
+] as const;
 
 // ── Duration units ─────────────────────────────────────────────────
 
@@ -262,7 +290,7 @@ export function formFromTrigger(trigger: TriggerSummary): TriggerFormState {
   return {
     displayName: trigger.displayName,
     instructions: trigger.instructions,
-    kind: "workflow",
+    kind: trigger.kind ?? (trigger.workflowId ? "workflow" : "prompt"),
     workflowId: trigger.workflowId ?? "",
     workflowName: trigger.workflowName ?? "",
     triggerType: trigger.triggerType,
@@ -284,9 +312,12 @@ export function buildCreateRequest(
   return {
     displayName: form.displayName.trim(),
     instructions: form.instructions.trim() || undefined,
-    kind: form.kind === "workflow" ? "workflow" : undefined,
-    workflowId: form.workflowId,
-    workflowName: form.workflowName || undefined,
+    kind: form.kind,
+    workflowId: form.kind === "workflow" ? form.workflowId.trim() : undefined,
+    workflowName:
+      form.kind === "workflow"
+        ? form.workflowName.trim() || undefined
+        : undefined,
     triggerType: form.triggerType,
     wakeMode: form.wakeMode,
     enabled: form.enabled,
@@ -375,7 +406,7 @@ export function nextRunsForCron(
     return results;
   } catch {
     // error-policy:J3 an invalid cron expression previews as "no upcoming
-    // runs"; validateTriggerKind reports the parse error to the form.
+    // runs"; validateForm reports the parse error to the form.
     return [];
   }
 }
@@ -385,7 +416,12 @@ export function validateTriggerKind(
   form: TriggerFormState,
   t: TranslateFn,
 ): string | null {
-  if (!form.workflowId) {
+  if (form.kind === "prompt" && !form.instructions.trim()) {
+    return t("taskeditor.promptRequired", {
+      defaultValue: "Prompt is required.",
+    });
+  }
+  if (form.kind === "workflow" && !form.workflowId.trim()) {
     return t("triggers.workflowPlaceholder");
   }
   return null;
@@ -463,7 +499,3 @@ export function localizedExecutionStatus(
       return status;
   }
 }
-
-// ── Private import used by scheduleLabel ───────────────────────────
-
-import { formatDateTime } from "../../utils/format";

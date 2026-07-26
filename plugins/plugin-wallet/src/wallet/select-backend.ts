@@ -4,7 +4,7 @@
  * preferring Steward when the agent is cloud-provisioned.
  */
 import type { IAgentRuntime } from "@elizaos/core";
-import { readAliasedEnv } from "@elizaos/shared";
+import { isCloudProvisionedEnvironment } from "@elizaos/shared";
 import type { WalletBackend } from "./backend.js";
 import { LocalEoaBackend } from "./local-eoa-backend.js";
 import { StewardBackend } from "./steward-backend.js";
@@ -26,7 +26,7 @@ function preferStewardInAuto(): boolean {
   if (process.env.ELIZA_WALLET_STEWARD_AUTO === "1") {
     return true;
   }
-  return readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+  return isCloudProvisionedEnvironment();
 }
 
 /**

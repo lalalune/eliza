@@ -773,6 +773,7 @@ function TriggersLayout() {
                     onClick={() => {
                       setForm({
                         ...emptyForm,
+                        kind: "prompt",
                         displayName: templateName,
                         instructions: templateInstructions,
                         durationValue: template.interval,

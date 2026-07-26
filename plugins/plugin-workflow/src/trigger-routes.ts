@@ -19,6 +19,7 @@ import {
   type TriggerWakeMode,
   type UUID,
 } from '@elizaos/core';
+import { readAliasedEnv } from '@elizaos/shared';
 
 export type TriggerRouteHelpers = RouteHelpers;
 
@@ -28,6 +29,7 @@ export interface TriggerTaskMetadata {
   blocking?: boolean;
   trigger?: TriggerConfig;
   triggerRuns?: CoreTriggerRunRecord[];
+  ownership?: { ownerEntityId: string; sourceRoomId?: string };
   [key: string]:
     | string
     | number
@@ -143,6 +145,9 @@ interface NormalizeTriggerDraftFallback {
 
 export interface TriggerRouteContext extends RouteRequestContext {
   runtime: IAgentRuntime | null;
+  /** Principal attested by the agent-server boundary. Never sourced from a
+   * caller-controlled workflow header. */
+  principalId?: string;
   executeTriggerTask: (
     runtime: IAgentRuntime,
     task: Task,
@@ -218,6 +223,139 @@ async function findTask(
   );
 }
 
+const ALWAYS_ON_REQUIRED_MESSAGE =
+  'Scheduled workflows require an always-on agent runtime. Confirm continuous billing before activating this workflow.';
+
+function runtimeSetting(runtime: IAgentRuntime, key: string): unknown {
+  const value = runtime.getSetting?.(key);
+  return value === null || value === undefined || value === '' ? readAliasedEnv(key) : value;
+}
+
+function isEnabledSetting(value: unknown): boolean {
+  return (
+    value === true ||
+    (typeof value === 'string' && ['1', 'true'].includes(value.trim().toLowerCase()))
+  );
+}
+
+function isManagedCloudRuntime(runtime: IAgentRuntime | null): boolean {
+  return (
+    isEnabledSetting(runtime?.getSetting?.('ELIZA_CLOUD_PROVISIONED')) ||
+    isEnabledSetting(readAliasedEnv('ELIZA_CLOUD_PROVISIONED'))
+  );
+}
+
+function isScaleToZeroCloudRuntime(runtime: IAgentRuntime): boolean {
+  const tier = runtimeSetting(runtime, 'ELIZA_CLOUD_EXECUTION_TIER');
+  return (
+    isManagedCloudRuntime(runtime) &&
+    typeof tier === 'string' &&
+    tier.trim().toLowerCase() === 'dedicated-lazy'
+  );
+}
+
+function activeTimeTriggerRequiresAlwaysOn(
+  runtime: IAgentRuntime,
+  trigger: Pick<NormalizedTriggerDraft, 'enabled' | 'triggerType'>
+): boolean {
+  return (
+    trigger.enabled &&
+    (trigger.triggerType === 'once' ||
+      trigger.triggerType === 'interval' ||
+      trigger.triggerType === 'cron') &&
+    isScaleToZeroCloudRuntime(runtime)
+  );
+}
+
+function alwaysOnRequiredContract(): Record<string, unknown> {
+  return {
+    success: false,
+    code: 'workflow_requires_always_on',
+    error: ALWAYS_ON_REQUIRED_MESSAGE,
+    capability: 'scheduled_workflows',
+    currentExecutionTier: 'dedicated-lazy',
+    requiredExecutionTier: 'dedicated-always',
+    upgradeRequired: true,
+    upgrade: {
+      automatic: false,
+      available: true,
+      requiresContinuousBillingConfirmation: true,
+    },
+  };
+}
+
+function taskOwner(
+  task: Task,
+  readTriggerConfig: (task: Task) => TriggerConfig | null,
+  allowLegacyCreator: boolean
+): string | undefined {
+  const metadata = task.metadata;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    const flatOwnerValue = Reflect.get(metadata, 'ownerEntityId');
+    const flatOwner =
+      typeof flatOwnerValue === 'string' && flatOwnerValue.trim()
+        ? flatOwnerValue.trim()
+        : undefined;
+    const ownership = Reflect.get(metadata, 'ownership');
+    let nestedOwner: string | undefined;
+    if (ownership && typeof ownership === 'object' && !Array.isArray(ownership)) {
+      const ownerEntityId = Reflect.get(ownership, 'ownerEntityId');
+      if (typeof ownerEntityId === 'string' && ownerEntityId.trim()) {
+        nestedOwner = ownerEntityId.trim();
+      }
+    }
+    if (flatOwner && nestedOwner && flatOwner !== nestedOwner) return undefined;
+    if (nestedOwner ?? flatOwner) return nestedOwner ?? flatOwner;
+  }
+  return allowLegacyCreator ? readTriggerConfig(task)?.createdBy?.trim() || undefined : undefined;
+}
+
+function isVisibleTask(
+  task: Task,
+  managedCloud: boolean,
+  principalId: string | undefined,
+  readTriggerConfig: (task: Task) => TriggerConfig | null
+): boolean {
+  return !managedCloud || taskOwner(task, readTriggerConfig, false) === principalId;
+}
+
+function ownedHealthSnapshot(
+  tasks: Task[],
+  readTriggerConfig: (task: Task) => TriggerConfig | null,
+  readTriggerRuns: (task: Task) => CoreTriggerRunRecord[],
+  triggersEnabled: boolean
+): TriggerHealthSnapshot {
+  let activeTriggers = 0;
+  let disabledTriggers = 0;
+  let totalExecutions = 0;
+  let totalFailures = 0;
+  let totalSkipped = 0;
+  let lastExecutionAt: number | undefined;
+  for (const task of tasks) {
+    const trigger = readTriggerConfig(task);
+    if (!trigger) continue;
+    if (trigger.enabled) activeTriggers += 1;
+    else disabledTriggers += 1;
+    for (const run of readTriggerRuns(task)) {
+      totalExecutions += 1;
+      if (run.status === 'error') totalFailures += 1;
+      if (run.status === 'skipped') totalSkipped += 1;
+      if (lastExecutionAt === undefined || run.finishedAt > lastExecutionAt) {
+        lastExecutionAt = run.finishedAt;
+      }
+    }
+  }
+  return {
+    triggersEnabled,
+    activeTriggers,
+    disabledTriggers,
+    totalExecutions,
+    totalFailures,
+    totalSkipped,
+    lastExecutionAt,
+  };
+}
+
 export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boolean> {
   const {
     method,
@@ -225,6 +363,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     req,
     res,
     runtime,
+    principalId: attestedPrincipalId,
     readJsonBody,
     json,
     error,
@@ -252,6 +391,20 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
   };
 
   if (!pathname.startsWith('/api/triggers')) return false;
+  const managedCloud = isManagedCloudRuntime(runtime);
+  const principalId = attestedPrincipalId?.trim() || undefined;
+  if (managedCloud && !principalId) {
+    json(
+      res,
+      {
+        success: false,
+        code: 'workflow_principal_required',
+        error: 'Workflow user principal is required',
+      },
+      401
+    );
+    return true;
+  }
   if (!runtime) {
     error(res, 'Agent is not running', 503);
     return true;
@@ -262,12 +415,29 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
   }
 
   if (method === 'GET' && pathname === '/api/triggers/health') {
-    json(res, await getTriggerHealthSnapshot(runtime));
+    if (!managedCloud) {
+      json(res, await getTriggerHealthSnapshot(runtime));
+      return true;
+    }
+    const tasks = (await listTriggerTasks(runtime)).filter((task) =>
+      isVisibleTask(task, managedCloud, principalId, readTriggerConfig)
+    );
+    json(
+      res,
+      ownedHealthSnapshot(
+        tasks,
+        readTriggerConfig,
+        readTriggerRuns,
+        triggersFeatureEnabled(runtime)
+      )
+    );
     return true;
   }
 
   if (method === 'GET' && pathname === '/api/triggers') {
-    const tasks = await listTriggerTasks(runtime);
+    const tasks = (await listTriggerTasks(runtime)).filter((task) =>
+      isVisibleTask(task, managedCloud, principalId, readTriggerConfig)
+    );
     const triggers = tasks
       .map(taskToTriggerSummary)
       .filter((summary): summary is TriggerSummary => summary !== null)
@@ -280,7 +450,9 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     const body = await readJsonBody<Record<string, unknown>>(req, res);
     if (!body) return true;
 
-    const creator = typeof body.createdBy === 'string' ? trim(body.createdBy) || 'api' : 'api';
+    const requestedCreator =
+      typeof body.createdBy === 'string' ? trim(body.createdBy) || 'api' : 'api';
+    const creator = managedCloud ? (principalId as string) : requestedCreator;
     const kindParsed = parseTriggerKindStrict(body.kind);
     if (kindParsed !== undefined && kindParsed.ok === false) {
       error(res, kindParsed.error, 400);
@@ -338,11 +510,20 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
       error(res, normalized.error ?? 'Invalid trigger request', 400);
       return true;
     }
+    if (activeTimeTriggerRequiresAlwaysOn(runtime, normalized.draft)) {
+      json(res, alwaysOnRequiredContract(), 409);
+      return true;
+    }
 
     const existingTasks = await listTriggerTasks(runtime);
     const activeCount = existingTasks.filter((task) => {
       const trigger = readTriggerConfig(task);
-      return trigger?.enabled && trigger.createdBy === creator;
+      return (
+        trigger?.enabled === true &&
+        (managedCloud
+          ? isVisibleTask(task, managedCloud, principalId, readTriggerConfig)
+          : trigger.createdBy === creator)
+      );
     }).length;
     const limit = getTriggerLimit(runtime);
     if (activeCount >= limit) {
@@ -356,6 +537,9 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     const duplicate = existingTasks.find((task) => {
       const existingTrigger = readTriggerConfig(task);
       return (
+        (managedCloud
+          ? isVisibleTask(task, managedCloud, principalId, readTriggerConfig)
+          : existingTrigger?.createdBy === creator) &&
         existingTrigger?.enabled &&
         existingTrigger.dedupeKey &&
         existingTrigger.dedupeKey === trigger.dedupeKey
@@ -367,7 +551,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     }
 
     const nowMs = Date.now();
-    const metadata = trigger.enabled
+    const scheduledMetadata = trigger.enabled
       ? buildTriggerMetadata({ trigger, nowMs })
       : ({
           updatedAt: nowMs,
@@ -377,10 +561,15 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
             nextRunAtMs: nowMs + DISABLED_TRIGGER_INTERVAL_MS,
           },
         } as TriggerTaskMetadata);
-    if (!metadata) {
+    if (!scheduledMetadata) {
       error(res, 'Unable to compute trigger schedule', 400);
       return true;
     }
+    const metadata: TriggerTaskMetadata = {
+      ...scheduledMetadata,
+      ownerEntityId: creator,
+      ownership: { ownerEntityId: creator },
+    };
 
     const roomId = (
       runtime.getService('AUTONOMY') as { getAutonomousRoomId?(): UUID } | null
@@ -388,6 +577,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     const taskId = await runtime.createTask({
       name: TRIGGER_TASK_NAME,
       description: trigger.displayName,
+      ...(managedCloud ? { entityId: stringToUuid(creator) } : {}),
       roomId,
       tags: [...TRIGGER_TASK_TAGS],
       metadata: metadata as Task['metadata'],
@@ -410,7 +600,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
       listTriggerTasks,
       readTriggerConfig
     );
-    if (!task) {
+    if (!task || !isVisibleTask(task, managedCloud, principalId, readTriggerConfig)) {
       error(res, 'Trigger not found', 404);
       return true;
     }
@@ -426,7 +616,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
       listTriggerTasks,
       readTriggerConfig
     );
-    if (!task) {
+    if (!task || !isVisibleTask(task, managedCloud, principalId, readTriggerConfig)) {
       error(res, 'Trigger not found', 404);
       return true;
     }
@@ -455,6 +645,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
     const matchingTasks = tasks.filter((task) => {
       const trigger = readTriggerConfig(task);
       return (
+        isVisibleTask(task, managedCloud, principalId, readTriggerConfig) &&
         trigger?.enabled === true &&
         trigger.triggerType === 'event' &&
         trigger.eventKind === eventKind
@@ -492,7 +683,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
 
   if (method === 'GET') {
     const task = await findTask(runtime, triggerId, listTriggerTasks, readTriggerConfig);
-    if (!task) {
+    if (!task || !isVisibleTask(task, managedCloud, principalId, readTriggerConfig)) {
       error(res, 'Trigger not found', 404);
       return true;
     }
@@ -507,7 +698,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
 
   if (method === 'DELETE') {
     const task = await findTask(runtime, triggerId, listTriggerTasks, readTriggerConfig);
-    if (!task?.id) {
+    if (!task?.id || !isVisibleTask(task, managedCloud, principalId, readTriggerConfig)) {
       error(res, 'Trigger not found', 404);
       return true;
     }
@@ -518,7 +709,7 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
 
   if (method === 'PUT') {
     const task = await findTask(runtime, triggerId, listTriggerTasks, readTriggerConfig);
-    if (!task?.id) {
+    if (!task?.id || !isVisibleTask(task, managedCloud, principalId, readTriggerConfig)) {
       error(res, 'Trigger not found', 404);
       return true;
     }
@@ -606,6 +797,10 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
       triggerId: current.triggerId,
       previous: current,
     });
+    if (activeTimeTriggerRequiresAlwaysOn(runtime, nextTrigger)) {
+      json(res, alwaysOnRequiredContract(), 409);
+      return true;
+    }
     const existingMeta = (task.metadata ?? {}) as TriggerTaskMetadata;
     const existingRuns = readTriggerRuns(task);
 
@@ -632,7 +827,17 @@ export async function handleTriggerRoutes(ctx: TriggerRouteContext): Promise<boo
         return true;
       }
       nextMeta = built;
+      delete nextMeta.subscriptionPolicy;
     }
+
+    nextMeta = {
+      ...nextMeta,
+      ownerEntityId: taskOwner(task, readTriggerConfig, !managedCloud) ?? current.createdBy,
+      ownership: {
+        ...(existingMeta.ownership ?? {}),
+        ownerEntityId: taskOwner(task, readTriggerConfig, !managedCloud) ?? current.createdBy,
+      },
+    };
 
     await runtime.updateTask(task.id, {
       description: nextTrigger.displayName,

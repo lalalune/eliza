@@ -17,7 +17,6 @@ import type {
   AutomationListResponse,
   AutomationNodeCatalogResponse,
   AutomationNodeDescriptor,
-  WorkbenchTask,
   WorkflowDefinition,
   WorkflowStatusResponse,
 } from "@elizaos/ui";
@@ -91,15 +90,15 @@ async function runCase(name: string, body: () => Promise<void>): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Case 1: Text-kind trigger lifecycle
+// Case 1: Prompt interval trigger lifecycle
 // ---------------------------------------------------------------------------
 
-async function caseTextTriggerLifecycle(): Promise<void> {
-  const displayName = `e2e-text-trigger-${Date.now()}`;
+async function casePromptIntervalTriggerLifecycle(): Promise<void> {
+  const displayName = `e2e-prompt-interval-trigger-${Date.now()}`;
   const createRes = await apiFetch("/api/triggers", {
     method: "POST",
     body: JSON.stringify({
-      kind: "text",
+      kind: "prompt",
       displayName,
       instructions: "E2E probe trigger - safe to ignore",
       triggerType: "interval",
@@ -282,53 +281,92 @@ async function caseWorkflowDefinitionsAndStatus(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Case 4: Workbench task lifecycle
+// Case 4: One-time prompt trigger lifecycle
 // ---------------------------------------------------------------------------
 
-async function caseWorkbenchTaskLifecycle(): Promise<void> {
-  const taskName = `e2e-task-${Date.now()}`;
-  const createRes = await apiFetch("/api/workbench/tasks", {
+async function casePromptOnceTriggerLifecycle(): Promise<void> {
+  const displayName = `e2e-prompt-once-trigger-${Date.now()}`;
+  const scheduledAtIso = new Date(Date.now() + 86_400_000).toISOString();
+  const createRes = await apiFetch("/api/triggers", {
     method: "POST",
     body: JSON.stringify({
-      name: taskName,
-      description: "E2E probe task - safe to ignore",
+      kind: "prompt",
+      displayName,
+      instructions: "E2E one-time prompt trigger - safe to ignore",
+      triggerType: "once",
+      scheduledAtIso,
+      enabled: true,
     }),
   });
   assert(
     createRes.status === 201,
-    `POST /api/workbench/tasks ${createRes.status}`,
+    `POST /api/triggers once ${createRes.status}`,
   );
-  const created = await readJson<{ task: WorkbenchTask }>(createRes);
-  const taskId = created.task.id;
-  assert(taskId, "created task missing id");
+  const created = await readJson<{ trigger: TriggerSummary }>(createRes);
+  const triggerId = created.trigger?.id;
+  assert(triggerId, "created one-time prompt trigger missing id");
+  assert(
+    created.trigger.kind === "prompt",
+    `expected kind=prompt, got ${created.trigger.kind}`,
+  );
+  assert(
+    created.trigger.triggerType === "once",
+    `expected triggerType=once, got ${created.trigger.triggerType}`,
+  );
+  assert(
+    created.trigger.scheduledAtIso === scheduledAtIso,
+    `scheduledAtIso mismatch: ${created.trigger.scheduledAtIso}`,
+  );
 
   try {
     const listRes = await apiFetch("/api/automations");
+    assert(listRes.status === 200, `GET /api/automations ${listRes.status}`);
     const list = await readJson<AutomationListResponse>(listRes);
     const hit = list.automations.find(
-      (a: AutomationItem) => a.taskId === taskId,
+      (automation: AutomationItem) => automation.triggerId === triggerId,
     );
-    assert(hit, `workbench task ${taskId} not in /api/automations`);
+    assert(hit, `prompt trigger ${triggerId} not in /api/automations`);
     assert(
-      hit.source === "workbench_task",
-      `expected source=workbench_task, got ${hit.source}`,
+      hit.source === "trigger",
+      `expected source=trigger, got ${hit.source}`,
+    );
+    assert(
+      hit.type === "coordinator_text",
+      `expected type=coordinator_text, got ${hit.type}`,
     );
 
-    const patchRes = await apiFetch(`/api/workbench/tasks/${taskId}`, {
+    const updatedName = `${displayName}-updated`;
+    const updatedScheduledAtIso = new Date(
+      Date.now() + 172_800_000,
+    ).toISOString();
+    const updateRes = await apiFetch(`/api/triggers/${triggerId}`, {
       method: "PUT",
-      body: JSON.stringify({ isCompleted: true }),
+      body: JSON.stringify({
+        kind: "prompt",
+        displayName: updatedName,
+        instructions: "Updated one-time prompt instructions",
+        triggerType: "once",
+        scheduledAtIso: updatedScheduledAtIso,
+      }),
     });
-    assert(patchRes.status === 200, `PUT workbench task ${patchRes.status}`);
-    const patched = await readJson<{ task: WorkbenchTask }>(patchRes);
     assert(
-      patched.task.isCompleted === true,
-      "task did not transition to isCompleted=true",
+      updateRes.status === 200,
+      `PUT /api/triggers/:id once ${updateRes.status}`,
+    );
+    const updated = await readJson<{ trigger: TriggerSummary }>(updateRes);
+    assert(
+      updated.trigger.displayName === updatedName,
+      "one-time prompt trigger name did not update",
+    );
+    assert(
+      updated.trigger.scheduledAtIso === updatedScheduledAtIso,
+      "one-time prompt trigger schedule did not update",
     );
   } finally {
-    const delRes = await apiFetch(`/api/workbench/tasks/${taskId}`, {
+    const delRes = await apiFetch(`/api/triggers/${triggerId}`, {
       method: "DELETE",
     });
-    assert(delRes.status === 200, `DELETE task ${delRes.status}`);
+    assert(delRes.status === 200, `DELETE trigger ${delRes.status}`);
   }
 }
 
@@ -451,8 +489,11 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  console.log("\nCase 1: Text-kind trigger lifecycle");
-  await runCase("text-trigger lifecycle", caseTextTriggerLifecycle);
+  console.log("\nCase 1: Prompt interval trigger lifecycle");
+  await runCase(
+    "prompt interval trigger lifecycle",
+    casePromptIntervalTriggerLifecycle,
+  );
 
   console.log("\nCase 2: Workflow-kind trigger validation");
   await runCase("workflow-trigger validation", caseWorkflowTriggerValidation);
@@ -460,8 +501,11 @@ async function main(): Promise<void> {
   console.log("\nCase 3: workflow listing + status");
   await runCase("workflows + status", caseWorkflowDefinitionsAndStatus);
 
-  console.log("\nCase 4: Workbench task lifecycle");
-  await runCase("workbench task lifecycle", caseWorkbenchTaskLifecycle);
+  console.log("\nCase 4: One-time prompt trigger lifecycle");
+  await runCase(
+    "one-time prompt trigger lifecycle",
+    casePromptOnceTriggerLifecycle,
+  );
 
   console.log("\nCase 5: Automations list shape");
   await runCase("automations list", caseAutomationsList);

@@ -486,17 +486,20 @@ describe("legacy Cloud SDK workflow routes", () => {
     ["DELETE", "/api/v1/agents/agent-1/workflows/workflow-1"],
     ["POST", "/api/v1/agents/agent-1/workflows/workflow-1/run"],
     ["GET", "/api/v1/agents/agent-1/workflows/executions/execution-1"],
-  ])("%s %s uses the canonical shared-tier capability response", async (method, path) => {
-    const response = await legacyWorkflowRequest(path, { method });
+  ])(
+    "%s %s uses the canonical shared-tier capability response",
+    async (method, path) => {
+      const response = await legacyWorkflowRequest(path, { method });
 
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      code: "workflow_requires_dedicated",
-      capability: "workflows",
-      upgradeRequired: true,
-    });
-    expect(proxyWorkflowRequest).not.toHaveBeenCalled();
-  });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        code: "workflow_requires_dedicated",
+        capability: "workflows",
+        upgradeRequired: true,
+      });
+      expect(proxyWorkflowRequest).not.toHaveBeenCalled();
+    },
+  );
 
   test("preserves trusted app-origin CORS on legacy preflight and responses", async () => {
     const origin = "https://localhost";

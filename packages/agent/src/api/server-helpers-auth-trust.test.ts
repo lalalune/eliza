@@ -78,6 +78,12 @@ describe("agent isTrustedLocalRequest wrapper (policy gates)", () => {
     expect(isTrustedLocalRequest(localReq())).toBe(false);
   });
 
+  it("cloudCheck=container: true flag + provisioning token denies trust", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "true";
+    process.env.STEWARD_AGENT_TOKEN = "steward-token";
+    expect(isTrustedLocalRequest(localReq())).toBe(false);
+  });
+
   it("rejects a spoofed X-Forwarded-For", () => {
     expect(
       isTrustedLocalRequest(
@@ -110,6 +116,19 @@ describe("WebSocket auth no-token trust parity", () => {
   it("rejects remote WebSocket upgrades without a token in local mode", () => {
     const req = makeReq({ host: "203.0.113.10:2138" }, "203.0.113.10");
     const url = new URL("http://203.0.113.10:2138/ws");
+
+    expect(isWebSocketAuthorized(req, url)).toBe(false);
+    expect(resolveWebSocketUpgradeRejection(req, url)).toEqual({
+      status: 401,
+      reason: "Unauthorized",
+    });
+  });
+
+  it("rejects tokenless loopback WebSockets in a true-flag managed container", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "true";
+    process.env.STEWARD_AGENT_TOKEN = "steward-token";
+    const req = localReq();
+    const url = new URL("http://localhost:2138/ws");
 
     expect(isWebSocketAuthorized(req, url)).toBe(false);
     expect(resolveWebSocketUpgradeRejection(req, url)).toEqual({

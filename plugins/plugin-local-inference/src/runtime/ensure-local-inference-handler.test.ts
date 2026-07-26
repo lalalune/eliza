@@ -5,9 +5,9 @@
  */
 
 import { type AgentRuntime, ModelType } from "@elizaos/core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const modeState = vi.hoisted(() => ({ mode: "local" }));
+const modeState = vi.hoisted(() => ({ mode: "local" as string | undefined }));
 const assignmentsState = vi.hoisted(() => ({
 	assignments: {} as Record<string, string>,
 }));
@@ -179,6 +179,8 @@ beforeEach(() => {
 	delete process.env.ELIZA_LOCAL_LLAMA;
 	delete process.env.ELIZA_DEVICE_BRIDGE_ENABLED;
 	delete process.env.ELIZA_DISABLE_LOCAL_EMBEDDINGS;
+	delete process.env.ELIZA_CLOUD_PROVISIONED;
+	delete process.env.ELIZAOS_CLOUD_ENABLED;
 	engineState.available.mockResolvedValue(true);
 	engineState.currentModelPath.mockReturnValue(null);
 	engineState.hasLoadedModel.mockReturnValue(false);
@@ -192,6 +194,11 @@ beforeEach(() => {
 	vi.mocked(resolveLocalInferenceLoadArgs).mockImplementation(
 		async (target) => target,
 	);
+});
+
+afterEach(() => {
+	delete process.env.ELIZA_CLOUD_PROVISIONED;
+	delete process.env.ELIZAOS_CLOUD_ENABLED;
 });
 
 describe("ensureLocalInferenceHandler", () => {
@@ -287,6 +294,23 @@ describe("ensureLocalInferenceHandler", () => {
 		expect(registrations).toHaveLength(0);
 		expect(engineState.available).not.toHaveBeenCalled();
 	});
+
+	it.each([
+		["ELIZA_CLOUD_PROVISIONED", " TrUe "],
+		["ELIZAOS_CLOUD_ENABLED", "TRUE"],
+	] as const)(
+		"infers cloud mode from %s=%s when no runtime mode is configured",
+		async (key, value) => {
+			modeState.mode = undefined;
+			process.env[key] = value;
+			const { registrations, runtime } = makeRuntime();
+
+			await ensureLocalInferenceHandler(runtime);
+
+			expect(registrations).toHaveLength(0);
+			expect(engineState.available).not.toHaveBeenCalled();
+		},
+	);
 
 	it("does not duplicate registrations on the same runtime", async () => {
 		const { registrations, runtime } = makeRuntime();

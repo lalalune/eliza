@@ -24,6 +24,7 @@ vi.mock("node-edge-tts", () => ({
 }));
 
 import edgeTTSPlugin, { _test, synthesizeEdgeSpeech } from "../src/index.ts";
+import { shouldEnable } from "../auto-enable.ts";
 
 const EDGE_ENV_KEYS = [
 	"EDGE_TTS_VOICE",
@@ -111,6 +112,12 @@ describe("@elizaos/plugin-edge-tts", () => {
 		expect(() =>
 			_test.getEdgeTTSSettings(runtimeWithSettings({ EDGE_TTS_VOICE: " \t" }))
 		).toThrow("EDGE_TTS_VOICE must be a non-empty string");
+	});
+
+	it('auto-enables for ELIZA_CLOUD_PROVISIONED="true" in both plugin contracts', () => {
+		const env = { ELIZA_CLOUD_PROVISIONED: " TrUe " };
+		expect(shouldEnable({ env, config: {} })).toBe(true);
+		expect(edgeTTSPlugin.autoEnable?.shouldEnable(env, {})).toBe(true);
 	});
 
 	it("rejects malformed text payloads before attempting synthesis", async () => {

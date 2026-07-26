@@ -139,11 +139,12 @@ function fakeReq(opts: {
 	method: string;
 	pathname: string;
 	body?: unknown;
+	headers?: http.IncomingHttpHeaders;
 }): http.IncomingMessage {
 	const req = new http.IncomingMessage(new Socket());
 	req.method = opts.method;
 	req.url = opts.pathname;
-	req.headers = { host: "localhost:2138" };
+	req.headers = { host: "localhost:2138", ...opts.headers };
 	Object.defineProperty(req.socket, "remoteAddress", {
 		value: "127.0.0.1",
 		configurable: true,
@@ -155,6 +156,68 @@ function fakeReq(opts: {
 }
 
 // ── tests ──────────────────────────────────────────────────────────────
+
+describe("managed Cloud compat authorization", () => {
+	const originalProvisioned = process.env.ELIZA_CLOUD_PROVISIONED;
+	const originalToken = process.env.ELIZA_API_TOKEN;
+
+	beforeAll(async () => {
+		handleLocalInferenceCompatRoutes = (
+			await import("./local-inference-compat-routes")
+		).handleLocalInferenceCompatRoutes;
+	}, 120_000);
+
+	afterEach(() => {
+		if (originalProvisioned === undefined) {
+			delete process.env.ELIZA_CLOUD_PROVISIONED;
+		} else {
+			process.env.ELIZA_CLOUD_PROVISIONED = originalProvisioned;
+		}
+		if (originalToken === undefined) {
+			delete process.env.ELIZA_API_TOKEN;
+		} else {
+			process.env.ELIZA_API_TOKEN = originalToken;
+		}
+	});
+
+	it('rejects loopback access when the managed flag is "true"', async () => {
+		process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+		delete process.env.ELIZA_API_TOKEN;
+		const res = fakeRes();
+
+		const handled = await handleLocalInferenceCompatRoutes(
+			fakeReq({
+				method: "GET",
+				pathname: "/api/local-inference/catalog",
+			}),
+			res.res,
+			STATE,
+		);
+
+		expect(handled).toBe(true);
+		expect(res.status()).toBe(401);
+		expect(res.body()).toEqual({ error: "Unauthorized" });
+	});
+
+	it('accepts a bearer token when the managed flag is "true"', async () => {
+		process.env.ELIZA_CLOUD_PROVISIONED = "true";
+		process.env.ELIZA_API_TOKEN = "managed-agent-token";
+		const res = fakeRes();
+
+		await handleLocalInferenceCompatRoutes(
+			fakeReq({
+				method: "GET",
+				pathname: "/api/local-inference/catalog",
+				headers: { authorization: "Bearer managed-agent-token" },
+			}),
+			res.res,
+			STATE,
+		);
+
+		expect(res.status()).toBe(200);
+		expect(res.body()).toEqual({ models: [] });
+	});
+});
 
 describe("POST /api/local-inference/active", () => {
 	beforeAll(async () => {

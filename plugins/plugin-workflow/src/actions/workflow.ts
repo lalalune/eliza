@@ -440,6 +440,7 @@ async function handleCreate(
       try {
         deployed = await service.deployWorkflow(draft, ownerEntityId, {
           activate: readBoolean(params.active),
+          sourceRoomId: String(message.roomId),
         });
       } catch (deployError) {
         // error-policy:J2 restore the claimed conversation state before the
@@ -729,6 +730,7 @@ async function handleExecutions(
 
 async function handleRunWorkflow(
   service: WorkflowService,
+  message: Memory,
   params: WorkflowActionParameters,
   ownerEntityId: string,
   callback: HandlerCallback | undefined
@@ -738,7 +740,11 @@ async function handleRunWorkflow(
     return { success: false, text: 'workflowId is required to run a workflow.' };
   }
   try {
-    const execution = await service.runWorkflow(workflowId, { throwOnError: false }, ownerEntityId);
+    const execution = await service.runWorkflow(
+      workflowId,
+      { throwOnError: false, sourceRoomId: String(message.roomId) },
+      ownerEntityId
+    );
     invalidateAutomationExecutionCache(service, ownerEntityId, workflowId);
     const text = `Ran workflow ${workflowId}: ${execution.status}.`;
     if (callback) {
@@ -1188,7 +1194,7 @@ export const workflowAction: Action = {
       case 'delete':
         return handleDeleteWorkflow(service, params, ownerEntityId, callback);
       case 'run':
-        return handleRunWorkflow(service, params, ownerEntityId, callback);
+        return handleRunWorkflow(service, message, params, ownerEntityId, callback);
       case 'executions':
         return handleExecutions(service, params, ownerEntityId, callback);
       case 'revisions':

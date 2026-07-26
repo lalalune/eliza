@@ -98,6 +98,8 @@ function makeWorkbenchTodosHandler() {
     const url = new URL(httpReq.url ?? '/', 'http://localhost');
     const method = (httpReq.method ?? 'GET').toUpperCase();
     const state = buildState(runtime);
+    const principalId = getForwardedWorkflowPrincipal(httpReq);
+    if (rejectMissingCloudPrincipal(httpRes, principalId)) return;
 
     await handleWorkbenchTodosRoutes({
       req: httpReq,
@@ -105,6 +107,7 @@ function makeWorkbenchTodosHandler() {
       method,
       pathname: url.pathname,
       runtime: state.current,
+      ...(principalId ? { principalId } : {}),
     });
   };
 }

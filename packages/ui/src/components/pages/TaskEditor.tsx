@@ -1,20 +1,15 @@
 /**
- * TaskEditor — single-screen editor for a prompt automation (glossary term):
- * title, prompt, and a schedule (once / recurring cron / on-event). No node
- * graph — that's a workflow, a separate surface (WorkflowEditor).
- *
- * Most users land here and don't need a node graph. A recurring or
- * on-event schedule is a prompt-kind `TriggerConfig` — the editor creates
- * it via the trigger API (`client.createTrigger` with `kind: "prompt"`,
- * no workflowId), and the one trigger clock fires the prompt as an agent
- * turn. A plain "once" task with no recurrence stays a workbench task
- * (`client.createWorkbenchTask`). Schedule is never encoded onto tags.
+ * Single-screen editor for prompt automations: a title, an agent prompt, and a
+ * one-time, recurring, or event schedule. Every editable automation persists
+ * through the canonical prompt-trigger API so all schedules share one clock;
+ * legacy Workbench rows may still be displayed here in read-only mode.
  */
 
-import { Calendar, Clock3, Zap } from "lucide-react";
+import { AlertTriangle, Calendar, Clock3, Rocket, Zap } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { useAgentElement } from "../../agent-surface";
 import { client } from "../../api";
+import { isApiError } from "../../api/client-types-core";
 import { useTranslation } from "../../state/TranslationContext.hooks";
 import { CRON_PRESETS, formatSchedule } from "../../utils/cron-format";
 import { PagePanel } from "../composites/page-panel";
@@ -31,39 +26,55 @@ import {
 import { Spinner } from "../ui/spinner";
 import { Textarea } from "../ui/textarea";
 
-/** How the simple automation recurs. Drives which persistence path runs. */
+/** The schedule shape persisted on a prompt trigger. */
 export type TaskScheduleKind = "once" | "recurring" | "event";
 
 export interface TaskEditorInitialValue {
-  /** Workbench-task id, set only when editing a plain "once" task. */
-  id?: string;
-  /**
-   * Trigger id, set only when editing an existing prompt-kind trigger
-   * (`scheduleKind` is "recurring" or "event"). Mutually exclusive with `id`.
-   */
+  /** Trigger id, set when editing an existing prompt automation. */
   triggerId?: string;
   name: string;
   prompt: string;
   scheduleKind: TaskScheduleKind;
+  scheduledAtIso: string;
   cronExpression: string;
   eventName: string;
 }
 
 export interface TaskEditorProps {
   initial?: Partial<TaskEditorInitialValue>;
+  cloudAgentId?: string | null;
+  onEnableAlwaysOn?: (agentId: string) => void;
   /**
    * Available trigger events the user can pick from. The host should
    * source this from the runtime's trigger catalog. We accept it as a
    * prop so this component stays free of upstream coupling.
    */
   availableEvents?: ReadonlyArray<{ id: string; label: string }>;
+  /**
+   * Displays a legacy Workbench automation without exposing its retired write
+   * path. New and editable automations are always prompt triggers.
+   */
+  readOnly?: boolean;
   onSaved?: () => void;
   onCancel?: () => void;
 }
 
+function toDateTimeLocalValue(value: string | undefined): string {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return "";
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp)) return trimmed;
+  const date = new Date(timestamp);
+  const localTimestamp = timestamp - date.getTimezoneOffset() * 60_000;
+  return new Date(localTimestamp).toISOString().slice(0, 16);
+}
+
 export function TaskEditor({
   initial,
+  cloudAgentId = null,
+  onEnableAlwaysOn,
   availableEvents = [],
+  readOnly = false,
   onSaved,
   onCancel,
 }: TaskEditorProps) {
@@ -73,6 +84,9 @@ export function TaskEditor({
   const [scheduleKind, setScheduleKind] = useState<TaskScheduleKind>(
     initial?.scheduleKind ?? "once",
   );
+  const [scheduledAt, setScheduledAt] = useState(() =>
+    toDateTimeLocalValue(initial?.scheduledAtIso),
+  );
   const [cron, setCron] = useState(
     initial?.cronExpression ?? CRON_PRESETS[1].expression,
   );
@@ -81,10 +95,11 @@ export function TaskEditor({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [alwaysOnRequirement, setAlwaysOnRequirement] = useState<string | null>(
+    null,
+  );
 
-  // Editing an existing automation when either a workbench-task id (plain
-  // "once" task) or a trigger id (recurring/event prompt trigger) is present.
-  const isEditing = Boolean(initial?.id || initial?.triggerId);
+  const isEditing = Boolean(initial?.triggerId || readOnly);
 
   const cronPreview = useMemo(
     () => (scheduleKind === "recurring" ? formatSchedule(cron) : null),
@@ -98,7 +113,7 @@ export function TaskEditor({
     group: "task-editor",
     description: "Prompt automation title",
     getValue: () => name,
-    onFill: (value) => setName(value),
+    onFill: readOnly ? undefined : (value) => setName(value),
   });
   const promptField = useAgentElement<HTMLTextAreaElement>({
     id: "task-prompt",
@@ -107,7 +122,7 @@ export function TaskEditor({
     group: "task-editor",
     description: "Prompt the agent runs for this prompt automation",
     getValue: () => prompt,
-    onFill: (value) => setPrompt(value),
+    onFill: readOnly ? undefined : (value) => setPrompt(value),
   });
   const cronField = useAgentElement<HTMLInputElement>({
     id: "task-cron",
@@ -116,7 +131,16 @@ export function TaskEditor({
     group: "task-editor",
     description: "Cron expression for the recurring schedule",
     getValue: () => cron,
-    onFill: (value) => setCron(value),
+    onFill: readOnly ? undefined : (value) => setCron(value),
+  });
+  const scheduledAtField = useAgentElement<HTMLInputElement>({
+    id: "task-scheduled-at",
+    role: "text-input",
+    label: t("taskeditor.runAtLabel", { defaultValue: "Run at" }),
+    group: "task-editor",
+    description: "Date and time for this prompt automation to run once",
+    getValue: () => scheduledAt,
+    onFill: readOnly ? undefined : (value) => setScheduledAt(value),
   });
   const eventField = useAgentElement<HTMLButtonElement>({
     id: "task-event",
@@ -126,7 +150,7 @@ export function TaskEditor({
     description: "Trigger event that runs this prompt automation",
     options: availableEvents.map((event) => event.id),
     getValue: () => eventName,
-    onFill: (value) => setEventName(value),
+    onFill: readOnly ? undefined : (value) => setEventName(value),
   });
   const cancelButton = useAgentElement<HTMLButtonElement>({
     id: "task-cancel",
@@ -149,6 +173,7 @@ export function TaskEditor({
   });
 
   const submit = useCallback(async () => {
+    if (readOnly) return;
     const trimmedName = name.trim();
     const trimmedPrompt = prompt.trim();
     if (!trimmedName) {
@@ -163,54 +188,72 @@ export function TaskEditor({
       );
       return;
     }
+    let scheduledAtIso: string | undefined;
+    if (scheduleKind === "once") {
+      const scheduledAtMs = Date.parse(scheduledAt.trim());
+      if (!Number.isFinite(scheduledAtMs)) {
+        setError(
+          t("taskeditor.scheduledTimeRequired", {
+            defaultValue: "Choose a date and time to run this automation.",
+          }),
+        );
+        return;
+      }
+      if (scheduledAtMs <= Date.now()) {
+        setError(
+          t("taskeditor.scheduledTimeFuture", {
+            defaultValue: "Choose a future date and time.",
+          }),
+        );
+        return;
+      }
+      scheduledAtIso = new Date(scheduledAtMs).toISOString();
+    }
+    if (scheduleKind === "recurring" && !cron.trim()) {
+      setError(
+        t("taskeditor.cronRequired", {
+          defaultValue: "Cron expression is required.",
+        }),
+      );
+      return;
+    }
+    if (scheduleKind === "event" && !eventName.trim()) {
+      setError(
+        t("taskeditor.eventRequired", { defaultValue: "Event is required." }),
+      );
+      return;
+    }
     setError(null);
+    setAlwaysOnRequirement(null);
     setBusy(true);
     try {
-      if (scheduleKind === "recurring" || scheduleKind === "event") {
-        // A recurring or on-event schedule is a prompt-kind trigger: the one
-        // trigger clock fires `instructions` as an agent turn. No workflowId.
-        const request = {
-          kind: "prompt" as const,
-          displayName: trimmedName,
-          instructions: trimmedPrompt,
-          triggerType:
-            scheduleKind === "recurring"
+      const request = {
+        kind: "prompt" as const,
+        displayName: trimmedName,
+        instructions: trimmedPrompt,
+        triggerType:
+          scheduleKind === "once"
+            ? ("once" as const)
+            : scheduleKind === "recurring"
               ? ("cron" as const)
               : ("event" as const),
-          cronExpression:
-            scheduleKind === "recurring" ? cron.trim() : undefined,
-          eventKind: scheduleKind === "event" ? eventName.trim() : undefined,
-          wakeMode: "inject_now" as const,
-          enabled: true,
-        };
-        if (initial?.triggerId) {
-          await client.updateTrigger(initial.triggerId, request);
-        } else {
-          await client.createTrigger(request);
-          // Cross-boundary edit: this automation was a workbench "once" task and
-          // is now a trigger. Delete the stale workbench task so it doesn't keep
-          // existing alongside the new trigger (no duplicate).
-          if (initial?.id) {
-            await client.deleteWorkbenchTask(initial.id);
-          }
-        }
+        scheduledAtIso,
+        cronExpression: scheduleKind === "recurring" ? cron.trim() : undefined,
+        eventKind: scheduleKind === "event" ? eventName.trim() : undefined,
+        wakeMode: "inject_now" as const,
+        enabled: true,
+      };
+      if (initial?.triggerId) {
+        await client.updateTrigger(initial.triggerId, request);
       } else {
-        // Plain "once" task with no recurrence — a workbench task.
-        const payload = { name: trimmedName, description: trimmedPrompt };
-        if (initial?.id) {
-          await client.updateWorkbenchTask(initial.id, payload);
-        } else {
-          await client.createWorkbenchTask(payload);
-          // Cross-boundary edit: this automation was a recurring/event trigger
-          // and is now a plain "once" task. Delete the stale trigger so it stops
-          // firing (no duplicate).
-          if (initial?.triggerId) {
-            await client.deleteTrigger(initial.triggerId);
-          }
-        }
+        await client.createTrigger(request);
       }
       onSaved?.();
     } catch (e) {
+      if (isApiError(e) && e.code === "workflow_requires_always_on") {
+        setAlwaysOnRequirement(e.message);
+        return;
+      }
       setError(
         e instanceof Error
           ? e.message
@@ -225,17 +268,65 @@ export function TaskEditor({
     name,
     prompt,
     scheduleKind,
+    scheduledAt,
     cron,
     eventName,
-    initial?.id,
     initial?.triggerId,
+    readOnly,
     onSaved,
     t,
   ]);
 
   return (
     <PagePanel variant="padded" className="space-y-5">
-      {error && <div className="p-2 text-sm text-danger">{error}</div>}
+      {readOnly && (
+        <div className="rounded-sm bg-bg-accent/40 p-2 text-sm text-muted-strong">
+          {t("taskeditor.legacyReadOnly", {
+            defaultValue:
+              "This legacy automation is read-only. New automations use scheduled triggers.",
+          })}
+        </div>
+      )}
+      {error && (
+        <div role="alert" className="p-2 text-sm text-danger">
+          {error}
+        </div>
+      )}
+      {alwaysOnRequirement && (
+        <div
+          role="alert"
+          data-testid="task-always-on-required"
+          className="flex flex-col gap-3 rounded-sm border border-warning/25 bg-warning/10 p-3 text-sm text-accent-muted dark:text-warning sm:flex-row sm:items-center"
+        >
+          <AlertTriangle className="h-5 w-5 shrink-0" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              {t("taskeditor.alwaysOnRequired", {
+                defaultValue: "Always-on agent required",
+              })}
+            </p>
+            <p className="mt-1 text-xs opacity-90">{alwaysOnRequirement}</p>
+            <p className="mt-1 text-xs opacity-90">
+              {t("taskeditor.alwaysOnBilling", {
+                defaultValue:
+                  "Enabling always-on changes this agent from scale-to-zero to continuous hosting and starts continuous hourly credit usage.",
+              })}
+            </p>
+          </div>
+          {cloudAgentId && onEnableAlwaysOn && (
+            <Button
+              size="sm"
+              className="min-h-11 shrink-0 sm:min-h-8"
+              onClick={() => onEnableAlwaysOn(cloudAgentId)}
+            >
+              <Rocket className="h-4 w-4" aria-hidden />
+              {t("taskeditor.enableAlwaysOn", {
+                defaultValue: "Enable always-on",
+              })}
+            </Button>
+          )}
+        </div>
+      )}
 
       <div className="space-y-2">
         <FieldLabel>
@@ -245,6 +336,7 @@ export function TaskEditor({
           ref={nameField.ref}
           value={name}
           onChange={(e) => setName(e.target.value)}
+          readOnly={readOnly}
           placeholder={t("taskeditor.titlePlaceholder", {
             defaultValue: "Summarise yesterday's emails",
           })}
@@ -262,6 +354,7 @@ export function TaskEditor({
           ref={promptField.ref}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
+          readOnly={readOnly}
           placeholder={t("taskeditor.promptPlaceholder", {
             defaultValue: "What should the agent do when this runs?",
           })}
@@ -282,6 +375,7 @@ export function TaskEditor({
             icon={<Zap className="h-3.5 w-3.5" aria-hidden />}
             checked={scheduleKind === "once"}
             onSelect={() => setScheduleKind("once")}
+            disabled={readOnly}
           />
           <ScheduleRadio
             id="task-sched-recurring"
@@ -291,6 +385,7 @@ export function TaskEditor({
             icon={<Clock3 className="h-3.5 w-3.5" aria-hidden />}
             checked={scheduleKind === "recurring"}
             onSelect={() => setScheduleKind("recurring")}
+            disabled={readOnly}
           />
           <ScheduleRadio
             id="task-sched-event"
@@ -298,9 +393,26 @@ export function TaskEditor({
             icon={<Calendar className="h-3.5 w-3.5" aria-hidden />}
             checked={scheduleKind === "event"}
             onSelect={() => setScheduleKind("event")}
-            disabled={availableEvents.length === 0}
+            disabled={readOnly || availableEvents.length === 0}
           />
         </div>
+
+        {scheduleKind === "once" && !readOnly && (
+          <div className="space-y-2">
+            <FieldLabel htmlFor="task-scheduled-at">
+              {t("taskeditor.runAtLabel", { defaultValue: "Run at" })}
+            </FieldLabel>
+            <Input
+              ref={scheduledAtField.ref}
+              id="task-scheduled-at"
+              type="datetime-local"
+              value={scheduledAt}
+              onChange={(event) => setScheduledAt(event.target.value)}
+              data-testid="task-editor-scheduled-at"
+              {...scheduledAtField.agentProps}
+            />
+          </div>
+        )}
 
         {scheduleKind === "recurring" && (
           <div className="space-y-2">
@@ -312,6 +424,7 @@ export function TaskEditor({
                   expression={preset.expression}
                   active={cron === preset.expression}
                   onSelect={setCron}
+                  disabled={readOnly}
                 />
               ))}
             </div>
@@ -319,6 +432,7 @@ export function TaskEditor({
               ref={cronField.ref}
               value={cron}
               onChange={(e) => setCron(e.target.value)}
+              readOnly={readOnly}
               placeholder="0 9 * * 1-5"
               className="font-mono text-xs"
               data-testid="task-editor-cron"
@@ -334,7 +448,11 @@ export function TaskEditor({
         )}
 
         {scheduleKind === "event" && availableEvents.length > 0 && (
-          <Select value={eventName} onValueChange={setEventName}>
+          <Select
+            value={eventName}
+            onValueChange={setEventName}
+            disabled={readOnly}
+          >
             <SelectTrigger
               ref={eventField.ref}
               className="w-full rounded-sm border-border/40 bg-bg text-sm text-txt"
@@ -367,24 +485,26 @@ export function TaskEditor({
             {t("taskeditor.cancel", { defaultValue: "Cancel" })}
           </Button>
         )}
-        <Button
-          ref={saveButton.ref}
-          variant="default"
-          size="sm"
-          onClick={() => void submit()}
-          disabled={busy || !name.trim() || !prompt.trim()}
-          data-testid="task-editor-save"
-          {...saveButton.agentProps}
-        >
-          {busy ? <Spinner className="mr-2 h-3.5 w-3.5" /> : null}
-          {isEditing
-            ? t("taskeditor.saveTask", {
-                defaultValue: "Save prompt automation",
-              })
-            : t("taskeditor.createTask", {
-                defaultValue: "Create prompt automation",
-              })}
-        </Button>
+        {!readOnly && (
+          <Button
+            ref={saveButton.ref}
+            variant="default"
+            size="sm"
+            onClick={() => void submit()}
+            disabled={busy || !name.trim() || !prompt.trim()}
+            data-testid="task-editor-save"
+            {...saveButton.agentProps}
+          >
+            {busy ? <Spinner className="mr-2 h-3.5 w-3.5" /> : null}
+            {isEditing
+              ? t("taskeditor.saveTask", {
+                  defaultValue: "Save prompt automation",
+                })
+              : t("taskeditor.createTask", {
+                  defaultValue: "Create prompt automation",
+                })}
+          </Button>
+        )}
       </div>
     </PagePanel>
   );
@@ -412,7 +532,9 @@ function ScheduleRadio({
     group: "task-schedule-kind",
     description: `Set the schedule to ${label}`,
     status: checked ? "active" : "inactive",
-    onActivate: onSelect,
+    onActivate: () => {
+      if (!disabled) onSelect();
+    },
   });
   return (
     <label
@@ -448,11 +570,13 @@ function CronPresetButton({
   expression,
   active,
   onSelect,
+  disabled,
 }: {
   label: string;
   expression: string;
   active: boolean;
   onSelect: (expression: string) => void;
+  disabled?: boolean;
 }) {
   const { ref, agentProps } = useAgentElement<HTMLButtonElement>({
     id: `task-cron-preset-${expression.replace(/[^a-z0-9]+/gi, "-")}`,
@@ -461,7 +585,9 @@ function CronPresetButton({
     group: "task-cron-presets",
     description: `Use the ${label} cron preset`,
     status: active ? "active" : "inactive",
-    onActivate: () => onSelect(expression),
+    onActivate: () => {
+      if (!disabled) onSelect(expression);
+    },
   });
   return (
     <Button
@@ -474,6 +600,7 @@ function CronPresetButton({
           ? "border-accent bg-accent/10 text-accent"
           : "border-border/40 text-muted-strong hover:border-border"
       }`}
+      disabled={disabled}
       {...agentProps}
     >
       {label}

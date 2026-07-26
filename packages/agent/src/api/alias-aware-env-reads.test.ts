@@ -87,6 +87,14 @@ describe("#13422 P3 — alias-aware boot-critical env reads", () => {
       expect(process.env.ELIZA_CLOUD_PROVISIONED).toBeUndefined();
     });
 
+    it('allows managed origins for the trimmed "true" spelling', () => {
+      process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+
+      expect(resolveCorsOrigin("https://dashboard.milady.example")).toBe(
+        "https://dashboard.milady.example",
+      );
+    });
+
     it("lets a present canonical ELIZA_CLOUD_PROVISIONED win over the branded alias", () => {
       process.env.ELIZA_CLOUD_PROVISIONED = "0";
       process.env.MILADY_CLOUD_PROVISIONED = "1";

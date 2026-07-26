@@ -17,10 +17,12 @@ type TriggerSummary = {
   createdBy: string;
   eventKind?: string;
   intervalMs?: number;
+  scheduledAtIso?: string;
+  cronExpression?: string;
   runCount: number;
   nextRunAtMs?: number;
   updatedAt?: number;
-  kind?: "text" | "workflow";
+  kind?: "prompt" | "workflow";
   workflowId?: string;
   workflowName?: string;
 };
@@ -48,15 +50,6 @@ type Workflow = {
   >;
 };
 
-type WorkbenchTask = {
-  id: string;
-  name: string;
-  description: string;
-  tags: string[];
-  isCompleted: boolean;
-  updatedAt?: number;
-};
-
 type AutomationItem = {
   id: string;
   type: "coordinator_text" | "workflow" | "automation_draft";
@@ -79,7 +72,6 @@ type AutomationItem = {
   triggerId?: string;
   workflowId?: string;
   draftId?: string;
-  task?: WorkbenchTask;
   trigger?: TriggerSummary;
   workflow?: Workflow;
   schedules: TriggerSummary[];
@@ -102,11 +94,15 @@ type Conversation = {
 };
 
 type AutomationsMockApi = {
-  getCreatedTask: () => Record<string, unknown> | null;
   getCreatedTrigger: () => Record<string, unknown> | null;
+  getTriggerCreateCount: () => number;
   getCreatedWorkflow: () => Record<string, unknown> | null;
   getGeneratedWorkflow: () => Record<string, unknown> | null;
   getDeletedConversationIds: () => string[];
+};
+
+type AutomationsMockOptions = {
+  triggerCreateError?: { code: string; message: string };
 };
 
 const NOW_ISO = "2026-04-23T20:00:00.000Z";
@@ -162,17 +158,9 @@ function workflowFixture(id: string, name: string, active = true): Workflow {
 }
 
 function eventTaskItem(): AutomationItem {
-  const task: WorkbenchTask = {
-    id: "task-event-message",
-    name: "Message triage",
-    description: "Summarize each inbound message.",
-    tags: ["event:message.received"],
-    isCompleted: false,
-    updatedAt: Date.parse(NOW_ISO),
-  };
   const trigger: TriggerSummary = {
     id: "trigger-event-message",
-    taskId: task.id,
+    taskId: "task-trigger-event-message",
     displayName: "Message triage",
     instructions: "Summarize each inbound message.",
     triggerType: "event",
@@ -182,7 +170,7 @@ function eventTaskItem(): AutomationItem {
     createdBy: "playwright",
     runCount: 0,
     updatedAt: Date.parse(NOW_ISO),
-    kind: "text",
+    kind: "prompt",
   };
   return {
     id: "trigger:trigger-event-message",
@@ -196,9 +184,8 @@ function eventTaskItem(): AutomationItem {
     isDraft: false,
     hasBackingWorkflow: false,
     updatedAt: NOW_ISO,
-    taskId: task.id,
+    taskId: trigger.taskId,
     triggerId: trigger.id,
-    task,
     trigger,
     schedules: [trigger],
   };
@@ -291,12 +278,13 @@ function automationSummary(automations: AutomationItem[]) {
 async function installAutomationsApi(
   page: Page,
   initialAutomations: AutomationItem[],
+  options: AutomationsMockOptions = {},
 ): Promise<AutomationsMockApi> {
   let automations = [...initialAutomations];
   const workflows = new Map<string, Workflow>();
   const conversations = new Map<string, Conversation>();
-  let createdTask: Record<string, unknown> | null = null;
   let createdTrigger: Record<string, unknown> | null = null;
+  let triggerCreateCount = 0;
   let createdWorkflow: Record<string, unknown> | null = null;
   let generatedWorkflow: Record<string, unknown> | null = null;
   const deletedConversationIds: string[] = [];
@@ -334,88 +322,6 @@ async function installAutomationsApi(
       body: JSON.stringify(body),
     });
   };
-
-  await page.route("**/api/workbench/tasks**", async (route) => {
-    const request = route.request();
-    const url = new URL(request.url());
-    const path = url.pathname;
-
-    if (request.method() === "GET" && path === "/api/workbench/tasks") {
-      await fulfillJson(route, {
-        tasks: automations.map((item) => item.task).filter(Boolean),
-      });
-      return;
-    }
-
-    if (request.method() === "POST" && path === "/api/workbench/tasks") {
-      createdTask = request.postDataJSON() as Record<string, unknown>;
-      const task: WorkbenchTask = {
-        id: "task-created",
-        name: String(createdTask.name ?? "Created task"),
-        description: String(createdTask.description ?? ""),
-        tags: Array.isArray(createdTask.tags)
-          ? createdTask.tags.map(String)
-          : [],
-        isCompleted: false,
-        updatedAt: Date.parse(NOW_ISO),
-      };
-      automations = [
-        ...automations,
-        {
-          id: `task:${task.id}`,
-          type: "coordinator_text",
-          source: "workbench_task",
-          title: task.name,
-          description: task.description,
-          status: "active",
-          enabled: true,
-          system: false,
-          isDraft: false,
-          hasBackingWorkflow: false,
-          updatedAt: NOW_ISO,
-          taskId: task.id,
-          task,
-          schedules: [],
-        },
-      ];
-      await fulfillJson(route, { task });
-      return;
-    }
-
-    if (request.method() === "PUT") {
-      const taskId = decodeURIComponent(path.split("/").pop() ?? "");
-      const body = request.postDataJSON() as Record<string, unknown>;
-      let updatedTask: WorkbenchTask | null = null;
-      automations = automations.map((item) => {
-        if (item.task?.id !== taskId) return item;
-        const nextTask = {
-          ...item.task,
-          name: String(body.name ?? item.task.name),
-          description: String(body.description ?? item.task.description),
-          tags: Array.isArray(body.tags)
-            ? body.tags.map(String)
-            : item.task.tags,
-          updatedAt: Date.parse(NOW_ISO),
-        };
-        updatedTask = nextTask;
-        return {
-          ...item,
-          title: nextTask.name,
-          description: nextTask.description,
-          updatedAt: NOW_ISO,
-          task: nextTask,
-        };
-      });
-      if (updatedTask) {
-        await fulfillJson(route, { task: updatedTask });
-        return;
-      }
-      await fulfillJson(route, { error: "not found" }, 404);
-      return;
-    }
-
-    await fulfillJson(route, { ok: true });
-  });
 
   await page.route("**/api/automations", async (route) => {
     if (route.request().method() !== "GET") {
@@ -484,10 +390,22 @@ async function installAutomationsApi(
       return;
     }
     if (request.method() === "POST" && url.pathname === "/api/triggers") {
+      triggerCreateCount += 1;
       createdTrigger = request.postDataJSON() as Record<string, unknown>;
+      if (options.triggerCreateError) {
+        await fulfillJson(
+          route,
+          {
+            error: options.triggerCreateError.message,
+            code: options.triggerCreateError.code,
+          },
+          409,
+        );
+        return;
+      }
       const trigger: TriggerSummary = {
-        id: "trigger-created-event",
-        taskId: "task-created-event",
+        id: "trigger-created",
+        taskId: "task-trigger-created",
         displayName: String(createdTrigger.displayName ?? "Created task"),
         instructions: String(createdTrigger.instructions ?? ""),
         triggerType:
@@ -496,12 +414,20 @@ async function installAutomationsApi(
           typeof createdTrigger.eventKind === "string"
             ? createdTrigger.eventKind
             : undefined,
+        scheduledAtIso:
+          typeof createdTrigger.scheduledAtIso === "string"
+            ? createdTrigger.scheduledAtIso
+            : undefined,
+        cronExpression:
+          typeof createdTrigger.cronExpression === "string"
+            ? createdTrigger.cronExpression
+            : undefined,
         enabled: true,
         wakeMode: "inject_now",
         createdBy: "playwright",
         runCount: 0,
         updatedAt: Date.parse(NOW_ISO),
-        kind: "text",
+        kind: "prompt",
       };
       automations = [
         ...automations,
@@ -522,7 +448,7 @@ async function installAutomationsApi(
           schedules: [trigger],
         },
       ];
-      await fulfillJson(route, trigger);
+      await fulfillJson(route, { trigger }, 201);
       return;
     }
     await fulfillJson(route, { ok: true });
@@ -648,8 +574,8 @@ async function installAutomationsApi(
   });
 
   return {
-    getCreatedTask: () => createdTask,
     getCreatedTrigger: () => createdTrigger,
+    getTriggerCreateCount: () => triggerCreateCount,
     getCreatedWorkflow: () => createdWorkflow,
     getGeneratedWorkflow: () => generatedWorkflow,
     getDeletedConversationIds: () => [...deletedConversationIds],
@@ -761,7 +687,7 @@ test("automations empty state remains reachable beside chat in short landscape",
   expect(geometry?.sidePadding).toBeGreaterThan(0);
 });
 
-test("automations can list tasks, create a task, and inspect workflow JSON", async ({
+test("automations can list prompts, create a one-time trigger, and inspect workflow JSON", async ({
   page,
 }) => {
   const workflow = workflowFixture(
@@ -808,33 +734,32 @@ test("automations can list tasks, create a task, and inspect workflow JSON", asy
   await page
     .getByTestId("task-editor-prompt")
     .fill("Summarize inbound messages and flag urgent ones.");
+  await page.getByTestId("task-editor-scheduled-at").fill("2099-04-24T09:00");
   await page.getByTestId("task-editor-save").click();
   await expect
-    .poll(() => api.getCreatedTask())
+    .poll(() => api.getCreatedTrigger())
     .toMatchObject({
-      name: "Escalate inbound messages",
-      description: "Summarize inbound messages and flag urgent ones.",
+      kind: "prompt",
+      displayName: "Escalate inbound messages",
+      instructions: "Summarize inbound messages and flag urgent ones.",
+      triggerType: "once",
     });
+  expect(api.getTriggerCreateCount()).toBe(1);
+  const scheduledAtIso = api.getCreatedTrigger()?.scheduledAtIso;
+  expect(typeof scheduledAtIso).toBe("string");
+  expect(Date.parse(String(scheduledAtIso))).toBeGreaterThan(Date.now());
   await expect(page.getByText("Escalate inbound messages")).toBeVisible();
 });
 
-// NOTE: the in-app "generate a workflow from a prompt" surface was removed from
-// the WorkflowEditor (workflow generation is backend-only now; the UI no longer
-// exposes a "Generate from prompt" affordance — see WorkflowEditor.test.tsx
-// asserting its absence). The former Playwright case for it is intentionally
-// gone; its mock seam (`getGeneratedWorkflow` / the `/generate` route) is left in
-// `installAutomationsApi` as a harmless no-op for any future re-introduction.
+// Workflow generation is a backend-only capability. This smoke suite exercises
+// the editor's direct workflow JSON surface; the shared fixture retains the
+// generation route because it also models the complete workflow API boundary.
 
 // Event-triggered automation coverage.
 //
-// Wiring note: the automations surface creates simple automations through the
-// TaskEditor, which POSTs to `/api/workbench/tasks` and encodes the trigger in
-// the WorkbenchTask `tags` (`event:<kind>`). The `/api/triggers` POST mock
-// (whose captured body is now exposed via `api.getCreatedTrigger()`) is the
-// trigger-CRUD seam used by other surfaces; the automations page itself does
-// not call it, so `getCreatedTrigger()` stays null here. This test asserts the
-// real automations contract: an event trigger renders in the list, and a newly
-// created automation is persisted with the expected POST body.
+// The editor and list share the canonical prompt-trigger representation: the
+// seeded event supplies the available event catalog entry, and the new row is
+// persisted through `/api/triggers` before the aggregate list refreshes.
 test("automations renders an event trigger and creates a new event automation", async ({
   page,
 }) => {
@@ -857,16 +782,78 @@ test("automations renders an event trigger and creates a new event automation", 
   await page
     .getByTestId("task-editor-prompt")
     .fill("When a chat message arrives, summarize and route it.");
+  await page.getByText("On event", { exact: true }).click();
   await page.getByTestId("task-editor-save").click();
 
   await expect
-    .poll(() => api.getCreatedTask())
+    .poll(() => api.getCreatedTrigger())
     .toMatchObject({
-      name: "Triage new chat events",
-      description: "When a chat message arrives, summarize and route it.",
+      kind: "prompt",
+      displayName: "Triage new chat events",
+      instructions: "When a chat message arrives, summarize and route it.",
+      triggerType: "event",
+      eventKind: "message.received",
     });
-  // The automations editor never reaches the trigger-CRUD endpoint.
-  expect(api.getCreatedTrigger()).toBeNull();
+  expect(api.getTriggerCreateCount()).toBe(1);
 
   await expect(page.getByText("Triage new chat events")).toBeVisible();
+});
+
+test("a fresh account can create its first event prompt trigger", async ({
+  page,
+}) => {
+  const api = await installAutomationsApi(page, []);
+
+  await openAppPath(page, "/automations");
+  await page.evaluate(() => {
+    window.location.hash = "#automations/task/__new__";
+  });
+
+  await page.getByTestId("task-editor-name").fill("Fresh event automation");
+  await page
+    .getByTestId("task-editor-prompt")
+    .fill("Summarize the first incoming message.");
+  await page.getByText("On event", { exact: true }).click();
+  await expect(page.getByTestId("task-editor-event")).toBeVisible();
+  await page.getByTestId("task-editor-save").click();
+
+  await expect
+    .poll(() => api.getCreatedTrigger())
+    .toMatchObject({
+      kind: "prompt",
+      displayName: "Fresh event automation",
+      instructions: "Summarize the first incoming message.",
+      triggerType: "event",
+      eventKind: "message.received",
+    });
+  expect(api.getTriggerCreateCount()).toBe(1);
+  await expect(
+    page.locator('[data-agent-label="Open Fresh event automation"]'),
+  ).toBeVisible();
+});
+
+test("time-based prompt rejection explains always-on hourly credits", async ({
+  page,
+}) => {
+  const api = await installAutomationsApi(page, [], {
+    triggerCreateError: {
+      code: "workflow_requires_always_on",
+      message:
+        "Scheduled prompt automations require an always-on agent runtime.",
+    },
+  });
+
+  await openAppPath(page, "/automations");
+  await page.evaluate(() => {
+    window.location.hash = "#automations/task/__new__";
+  });
+  await page.getByTestId("task-editor-name").fill("Morning digest");
+  await page.getByTestId("task-editor-prompt").fill("Summarize my calendar");
+  await page.getByTestId("task-editor-scheduled-at").fill("2099-04-24T09:00");
+  await page.getByTestId("task-editor-save").click();
+
+  const notice = page.getByTestId("task-always-on-required");
+  await expect(notice).toContainText("Always-on agent required");
+  await expect(notice).toContainText("continuous hourly credit usage");
+  expect(api.getTriggerCreateCount()).toBe(1);
 });

@@ -24,6 +24,7 @@ import shortIdPluginMap from "@elizaos/registry/first-party/short-id-plugin-map.
 };
 import {
   hasExplicitCanonicalRuntimeConfig,
+  isCloudProvisionedEnvironment,
   isAndroidMobile,
   isMobilePlatform,
   migrateLegacyRuntimeConfig,
@@ -80,7 +81,7 @@ function orchestratorCompatPluginRequested(config: ElizaConfig): boolean {
   // match a local desktop agent instead of requiring a per-container env
   // opt-in. Explicit config/env opt-outs above still win, and lean-chat
   // containers force-drop it via LEAN_CHAT_EXCLUDED_PLUGINS regardless.
-  if (readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1") {
+  if (isCloudProvisionedEnvironment()) {
     return true;
   }
   return [
@@ -375,7 +376,7 @@ export function collectPluginNames(
   const hasCanonicalRuntimeConfig = hasExplicitCanonicalRuntimeConfig(
     config as Record<string, unknown>,
   );
-  const isCloudContainer = readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+  const isCloudContainer = isCloudProvisionedEnvironment();
   const storeBuild = isStoreBuildVariant();
   const cloudExplicitlyDisabled = config.cloud?.enabled === false;
   // `ELIZA_LOCAL_LLAMA=1` is the AOSP / on-device signal that the in-process
@@ -521,7 +522,7 @@ export function collectPluginNames(
   if (
     !onMobile &&
     !leanChat &&
-    readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1"
+    isCloudProvisionedEnvironment()
   ) {
     pluginsToLoad.add("@elizaos/plugin-pty");
     track(

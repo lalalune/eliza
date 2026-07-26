@@ -3,9 +3,9 @@
  * and catalog-backed validation; no workflow backend or live model is used.
  */
 import { describe, expect, mock, test } from 'bun:test';
-import type { IAgentRuntime } from '@elizaos/core';
 import { WorkflowService } from '../../src/services/workflow-service';
 import { WORKFLOW_CREDENTIAL_PROVIDER_TYPE } from '../../src/types/index';
+import { createModelRuntime } from '../helpers/modelRuntime';
 
 const MANUAL_TRIGGER = 'workflows-nodes-base.manualTrigger';
 const WEBHOOK = 'workflows-nodes-base.webhook';
@@ -33,13 +33,7 @@ describe('WorkflowService generation boundary', () => {
         ? { keywords: ['manual', 'trigger'] }
         : JSON.stringify(generatedWorkflow)
     );
-    const runtime = {
-      agentId: '00000000-0000-4000-8000-000000000001',
-      character: { settings: {} },
-      getSetting: () => undefined,
-      getService: () => null,
-      useModel,
-    } as unknown as IAgentRuntime;
+    const runtime = createModelRuntime({ useModel });
     const service = new WorkflowService(runtime);
     Object.assign(service, {
       apiClient: {
@@ -86,14 +80,10 @@ describe('WorkflowService generation boundary', () => {
     const useModel = mock(async (_modelType: unknown, params: { responseSchema?: unknown }) =>
       params.responseSchema ? { keywords: ['webhook'] } : JSON.stringify(generatedWorkflow)
     );
-    const runtime = {
-      agentId: '00000000-0000-4000-8000-000000000001',
-      character: { settings: {} },
-      getSetting: () => undefined,
+    const runtime = Object.assign(createModelRuntime({ useModel }), {
       getService: (serviceType: string) =>
         serviceType === WORKFLOW_CREDENTIAL_PROVIDER_TYPE ? credentialProvider : null,
-      useModel,
-    } as unknown as IAgentRuntime;
+    });
     const service = new WorkflowService(runtime);
     Object.assign(service, {
       apiClient: {

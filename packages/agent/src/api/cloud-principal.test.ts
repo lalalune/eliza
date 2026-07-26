@@ -81,6 +81,21 @@ describe("managed Cloud principal attestation", () => {
     expect(process.env.ELIZA_API_TOKEN).toBeUndefined();
   });
 
+  it('treats the canonical string "true" as a managed Cloud runtime', () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "true";
+    process.env.ELIZA_API_TOKEN = "agent-token";
+
+    expect(isCloudPrincipalRequired()).toBe(true);
+    expect(
+      resolveTrustedCloudPrincipal({
+        headers: {
+          "x-eliza-user-id": "cloud-user-true",
+          "x-eliza-principal-token": "agent-token",
+        },
+      }),
+    ).toBe(stringToUuid("cloud-user-true"));
+  });
+
   it("lets explicit canonical settings override branded aliases", () => {
     process.env.ELIZA_CLOUD_PROVISIONED = "0";
     process.env.MILADY_CLOUD_PROVISIONED = "1";

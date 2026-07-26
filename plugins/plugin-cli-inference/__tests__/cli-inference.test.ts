@@ -6,7 +6,12 @@
  * so no real model runs; the few real-binary cases are skipped unless
  * `claude`/`codex` resolve through the SOC2 allowlist on this box.
  */
-import type { ChatMessage, IAgentRuntime, PluginAutoEnableContext } from "@elizaos/core";
+import {
+  AgentRuntime,
+  type ChatMessage,
+  type IAgentRuntime,
+  type PluginAutoEnableContext,
+} from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { shouldEnable } from "../auto-enable";
 import {
@@ -57,7 +62,11 @@ function binaryOnPath(bin: string): boolean {
 }
 
 function autoEnableCtx(env: Record<string, string | undefined>): PluginAutoEnableContext {
-  return { env } as unknown as PluginAutoEnableContext;
+  return { env, config: {}, isNativePlatform: false };
+}
+
+function runtimeWithSettings(settings: Record<string, string> = {}): AgentRuntime {
+  return new AgentRuntime({ settings, logLevel: "fatal" });
 }
 
 // Pin fake binary paths so the SOC2 `resolveSafeBinary` allowlist check never
@@ -573,12 +582,8 @@ describe("models map gating (large-tier only)", () => {
       string,
       (runtime: IAgentRuntime, params: { prompt: string }) => Promise<string>
     >;
-    const runtime = (): IAgentRuntime =>
-      ({
-        getSetting: (key: string) => (key === "ELIZA_CHAT_VIA_CLI" ? "claude-sdk" : undefined),
-      }) as IAgentRuntime;
-    const runtimeA = runtime();
-    const runtimeB = runtime();
+    const runtimeA = runtimeWithSettings({ ELIZA_CHAT_VIA_CLI: "claude-sdk" });
+    const runtimeB = runtimeWithSettings({ ELIZA_CHAT_VIA_CLI: "claude-sdk" });
 
     const callA = models.TEXT_LARGE(runtimeA, { prompt: "runtime-a" });
     const callB = models.TEXT_LARGE(runtimeB, { prompt: "runtime-b" });
@@ -746,12 +751,13 @@ describe("models map gating (large-tier only)", () => {
   });
 
   it("keeps init inert when disabled and rejects colliding Claude routes", async () => {
+    const runtime = runtimeWithSettings();
     delete process.env.ELIZA_CHAT_VIA_CLI;
-    await expect(cliInferencePlugin.init?.({} as never)).resolves.toBeUndefined();
+    await expect(cliInferencePlugin.init?.({}, runtime)).resolves.toBeUndefined();
 
     process.env.ELIZA_CHAT_VIA_CLI = "claude-sdk";
     process.env.ELIZA_ENABLE_CLAUDE_STEALTH = "1";
-    await expect(cliInferencePlugin.init?.({} as never)).rejects.toThrow(/collides/);
+    await expect(cliInferencePlugin.init?.({}, runtime)).rejects.toThrow(/collides/);
   });
 
   it("resolveCliBackend accepts claude|codex|claude-sdk (case-insensitive)", () => {
@@ -874,16 +880,13 @@ describe("resolveSdkEffort (per-tier effort env precedence)", () => {
     else process.env.ELIZA_CLI_CLAUDE_PLANNER_EFFORT = prev.planner;
   });
 
-  const runtimeWith = (settings: Record<string, string>): IAgentRuntime =>
-    ({ getSetting: (key: string) => settings[key] }) as unknown as IAgentRuntime;
-
   it("reply tier (router=false) reads ELIZA_CLI_CLAUDE_EFFORT", () => {
-    const runtime = runtimeWith({ ELIZA_CLI_CLAUDE_EFFORT: "high" });
+    const runtime = runtimeWithSettings({ ELIZA_CLI_CLAUDE_EFFORT: "high" });
     expect(resolveSdkEffort(runtime, "text")).toBe("high");
   });
 
   it("reply tier ignores the planner override even when it is set", () => {
-    const runtime = runtimeWith({
+    const runtime = runtimeWithSettings({
       ELIZA_CLI_CLAUDE_EFFORT: "medium",
       ELIZA_CLI_CLAUDE_PLANNER_EFFORT: "max",
     });
@@ -891,7 +894,7 @@ describe("resolveSdkEffort (per-tier effort env precedence)", () => {
   });
 
   it("planner tier (router=true) prefers ELIZA_CLI_CLAUDE_PLANNER_EFFORT", () => {
-    const runtime = runtimeWith({
+    const runtime = runtimeWithSettings({
       ELIZA_CLI_CLAUDE_EFFORT: "low",
       ELIZA_CLI_CLAUDE_PLANNER_EFFORT: "max",
     });
@@ -899,12 +902,12 @@ describe("resolveSdkEffort (per-tier effort env precedence)", () => {
   });
 
   it("planner tier falls back to the shared ELIZA_CLI_CLAUDE_EFFORT when its own key is unset", () => {
-    const runtime = runtimeWith({ ELIZA_CLI_CLAUDE_EFFORT: "high" });
+    const runtime = runtimeWithSettings({ ELIZA_CLI_CLAUDE_EFFORT: "high" });
     expect(resolveSdkEffort(runtime, "route")).toBe("high");
   });
 
   it("returns undefined for both tiers when no effort is configured (SDK keeps its default)", () => {
-    const runtime = runtimeWith({});
+    const runtime = runtimeWithSettings();
     expect(resolveSdkEffort(runtime, "text")).toBeUndefined();
     expect(resolveSdkEffort(runtime, "route")).toBeUndefined();
   });
@@ -913,7 +916,7 @@ describe("resolveSdkEffort (per-tier effort env precedence)", () => {
     // resolveSdkEffort only resolves precedence; the session's normalizeEffort
     // (tested above) drops unknown levels. Keeping the two concerns split means a
     // bad env never silently downgrades a valid per-tier override.
-    const runtime = runtimeWith({ ELIZA_CLI_CLAUDE_EFFORT: "ultra" });
+    const runtime = runtimeWithSettings({ ELIZA_CLI_CLAUDE_EFFORT: "ultra" });
     expect(resolveSdkEffort(runtime, "text")).toBe("ultra");
     expect(normalizeEffort(resolveSdkEffort(runtime, "text"))).toBeNull();
   });

@@ -82,6 +82,22 @@ describe("StewardTradingService", () => {
     });
   });
 
+  it('reports managed Steward capability for the "true" provisioning spelling', () => {
+    const service = new StewardTradingService(
+      runtime({
+        ELIZA_CLOUD_PROVISIONED: " TrUe ",
+        STEWARD_API_URL: "https://steward.local",
+        STEWARD_AGENT_ID: "agent-fixture",
+        STEWARD_AGENT_TOKEN: "token-fixture",
+      }),
+    );
+
+    expect(service.capability()).toMatchObject({
+      kind: "steward-cloud",
+      canTrade: true,
+    });
+  });
+
   it("allows bracketed IPv6 loopback Steward sidecar URLs", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse(200, stewardFixtures.tokenStatusObserved),

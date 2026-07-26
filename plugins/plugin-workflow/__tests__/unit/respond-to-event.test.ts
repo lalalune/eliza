@@ -40,6 +40,7 @@ interface RuntimeMockOptions {
   autonomy?: AutonomyMockOptions | null;
   serviceKey?: 'AUTONOMY' | 'autonomy';
   db?: unknown;
+  managedCloud?: boolean;
 }
 
 type RespondToEventRuntime = Pick<
@@ -48,6 +49,7 @@ type RespondToEventRuntime = Pick<
   | 'db'
   | 'getSetting'
   | 'getService'
+  | 'ensureConnection'
   | 'createMemory'
   | 'createTask'
   | 'getTasks'
@@ -71,8 +73,10 @@ function buildRuntime(options: RuntimeMockOptions = {}): {
   const runtimeDouble: RespondToEventRuntime = {
     agentId: 'agent-respond-to-event' as UUID,
     db: options.db,
-    getSetting: () => null,
+    getSetting: (key: string) =>
+      key === 'ELIZA_CLOUD_PROVISIONED' && options.managedCloud ? '1' : null,
     getService: (type: string) => services[type] ?? services[type.toLowerCase()] ?? null,
+    ensureConnection: mock(async () => {}),
     createMemory: mock(async (memory: CapturedMemory, _table: string) => {
       capturedMemories.push(memory);
       return memory;
@@ -126,7 +130,11 @@ const ROOM_ID = 'autonomy-room-id' as UUID;
 async function runRespondToEventWorkflow(
   service: EmbeddedWorkflowService,
   parameters: Record<string, unknown>,
-  options: { withInputEvent?: { kind: string; payload: Record<string, unknown> } } = {}
+  options: {
+    withInputEvent?: { kind: string; payload: Record<string, unknown> };
+    executionContext?: { ownerEntityId?: string; sourceRoomId?: string };
+    persistedExecutionContext?: { ownerEntityId?: string; sourceRoomId?: string };
+  } = {}
 ) {
   const startNodes = options.withInputEvent
     ? [
@@ -177,8 +185,11 @@ async function runRespondToEventWorkflow(
     connections: {
       [startNodeName]: { main: [[{ node: 'Respond', type: 'main', index: 0 }]] },
     },
+    ...(options.persistedExecutionContext
+      ? { meta: { elizaExecutionContext: options.persistedExecutionContext } }
+      : {}),
   });
-  return service.executeWorkflow(created.id);
+  return service.executeWorkflow(created.id, options.executionContext);
 }
 
 function firstRunJson(
@@ -228,7 +239,61 @@ describe('workflows-nodes-base.respondToEvent', () => {
     }
   }, 60_000);
 
-  test('returns failure when no autonomy service is registered (does not throw)', async () => {
+  test('routes a managed execution back to its owner and originating chat', async () => {
+    const harness = await persistentRuntime({
+      autonomy: { roomId: ROOM_ID },
+      managedCloud: true,
+    });
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    const ownerEntityId = stringToUuid('respond-owner');
+    const sourceRoomId = stringToUuid('respond-source-chat');
+    try {
+      const execution = await runRespondToEventWorkflow(
+        service,
+        { instructions: 'Reply in the original conversation' },
+        { persistedExecutionContext: { ownerEntityId, sourceRoomId } }
+      );
+
+      expect(execution.status).toBe('success');
+      expect(harness.capturedMemories).toHaveLength(1);
+      expect(harness.capturedMemories[0]).toMatchObject({
+        entityId: ownerEntityId,
+        roomId: sourceRoomId,
+        content: {
+          metadata: { ownerEntityId, sourceRoomId },
+        },
+      });
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('managed Cloud fails closed when durable owner context is absent', async () => {
+    const harness = await persistentRuntime({
+      autonomy: { roomId: ROOM_ID },
+      managedCloud: true,
+    });
+    const service = await EmbeddedWorkflowService.start(harness.runtime);
+    try {
+      const execution = await runRespondToEventWorkflow(service, {
+        instructions: 'Never inject globally',
+      });
+
+      expect(execution.status).toBe('error');
+      expect(harness.capturedMemories).toHaveLength(0);
+      expect(execution.data?.resultData?.error).toMatchObject({
+        code: 'WORKFLOW_RESPOND_OWNER_CONTEXT_REQUIRED',
+        message: 'Workflow response requires owner context in managed Cloud',
+      });
+      expect(firstRunJson(execution, 'Respond')).toBeUndefined();
+    } finally {
+      await service.stop();
+      await harness.close();
+    }
+  }, 60_000);
+
+  test('fails execution when no autonomy service is registered', async () => {
     const harness = await persistentRuntime({ autonomy: null });
     const service = await EmbeddedWorkflowService.start(harness.runtime);
     try {
@@ -236,21 +301,21 @@ describe('workflows-nodes-base.respondToEvent', () => {
         instructions: 'Should be skipped',
       });
 
-      expect(execution.status).toBe('success');
+      expect(execution.status).toBe('error');
       expect(harness.capturedMemories).toHaveLength(0);
-      const json = firstRunJson(execution, 'Respond');
-      expect(json?.instructionInjected).toBe(false);
-      expect(json?.reason).toBe('autonomy_service_unavailable');
-      expect(
-        harness.warnings.some((w) => w.message.includes('Autonomy service not registered'))
-      ).toBe(true);
+      expect(execution.data?.resultData?.error).toMatchObject({
+        code: 'WORKFLOW_RESPOND_AUTONOMY_UNAVAILABLE',
+        message: 'Workflow response could not access an autonomy service',
+      });
+      expect(firstRunJson(execution, 'Respond')).toBeUndefined();
+      expect(harness.warnings.some((w) => w.message.includes('Autonomy service'))).toBe(true);
     } finally {
       await service.stop();
       await harness.close();
     }
   }, 60_000);
 
-  test('returns failure when autonomy service has no resolvable room (does not throw)', async () => {
+  test('fails execution when autonomy service has no resolvable room', async () => {
     const harness = await persistentRuntime({ autonomy: { roomId: null } });
     const service = await EmbeddedWorkflowService.start(harness.runtime);
     try {
@@ -258,14 +323,14 @@ describe('workflows-nodes-base.respondToEvent', () => {
         instructions: 'Should be skipped',
       });
 
-      expect(execution.status).toBe('success');
+      expect(execution.status).toBe('error');
       expect(harness.capturedMemories).toHaveLength(0);
-      const json = firstRunJson(execution, 'Respond');
-      expect(json?.instructionInjected).toBe(false);
-      expect(json?.reason).toBe('no_autonomy_room');
-      expect(harness.warnings.some((w) => w.message.includes('No autonomy room resolvable'))).toBe(
-        true
-      );
+      expect(execution.data?.resultData?.error).toMatchObject({
+        code: 'WORKFLOW_RESPOND_ROOM_UNAVAILABLE',
+        message: 'Workflow response could not resolve a destination room',
+      });
+      expect(firstRunJson(execution, 'Respond')).toBeUndefined();
+      expect(harness.warnings.some((w) => w.message.includes('destination room'))).toBe(true);
     } finally {
       await service.stop();
       await harness.close();

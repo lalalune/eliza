@@ -334,36 +334,36 @@ describe("follow-up prompt account pinning (cli transport)", () => {
     ).toBe(false);
   });
 
-  it.each([
-    "native",
-    "cli",
-  ] as const)("translates %s credential-resolution failures without leaving the session busy", async (transportMode) => {
-    const { bridge } = makeBridge({ healthyIds: [] });
-    setCodingAgentSelectorBridge(bridge);
-    const promptStore = new InMemorySessionStore();
-    const promptService = new AcpService(
-      makeRuntime({ ELIZA_ACP_TRANSPORT: transportMode }),
-      { store: promptStore },
-    );
-    (promptService as unknown as { started: boolean }).started = true;
-    const session: SessionInfo = {
-      ...makeSession(),
-      metadata: {
-        transportMode,
-        [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
-      },
-    };
-    await promptStore.create(session);
-    const events: string[] = [];
-    promptService.onSessionEvent((sessionId, event) => {
-      if (sessionId === session.id) events.push(event);
-    });
+  it.each(["native", "cli"] as const)(
+    "translates %s credential-resolution failures without leaving the session busy",
+    async (transportMode) => {
+      const { bridge } = makeBridge({ healthyIds: [] });
+      setCodingAgentSelectorBridge(bridge);
+      const promptStore = new InMemorySessionStore();
+      const promptService = new AcpService(
+        makeRuntime({ ELIZA_ACP_TRANSPORT: transportMode }),
+        { store: promptStore },
+      );
+      (promptService as unknown as { started: boolean }).started = true;
+      const session: SessionInfo = {
+        ...makeSession(),
+        metadata: {
+          transportMode,
+          [POOLED_ACCOUNT_RECOVERY_METADATA_KEY]: { ...ACCOUNT_A },
+        },
+      };
+      await promptStore.create(session);
+      const events: string[] = [];
+      promptService.onSessionEvent((sessionId, event) => {
+        if (sessionId === session.id) events.push(event);
+      });
 
-    await expect(
-      promptService.sendPrompt(session.id, "continue"),
-    ).rejects.toThrow(/unavailable for durable recovery/);
+      await expect(
+        promptService.sendPrompt(session.id, "continue"),
+      ).rejects.toThrow(/unavailable for durable recovery/);
 
-    expect((await promptStore.get(session.id))?.status).toBe("errored");
-    expect(events).toContain("error");
-  });
+      expect((await promptStore.get(session.id))?.status).toBe("errored");
+      expect(events).toContain("error");
+    },
+  );
 });

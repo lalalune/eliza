@@ -1,6 +1,8 @@
 /** Unit tests for the WORKFLOW action's op dispatch against a mocked WorkflowService (deterministic). */
 import { describe, expect, mock, test } from 'bun:test';
 import {
+  AgentRuntime,
+  createCharacter,
   type HandlerCallback,
   type HandlerOptions,
   type IAgentRuntime,
@@ -23,19 +25,27 @@ function makeRuntime(
     contentMetadata?: Record<string, unknown>;
   } = {}
 ): IAgentRuntime {
-  return {
-    agentId: 'agent-test',
-    character: { name: 'Workflow Test Agent', settings: {} },
-    getSetting: (key: string) => (key === 'ELIZA_ADMIN_ENTITY_ID' ? canonicalOwnerId : undefined),
-    getService: (type: string) => (type === WORKFLOW_SERVICE_TYPE ? service : null),
-    getCache: <T>(key: string) => Promise.resolve(cache.get(key) as T | undefined),
-    setCache: <T>(key: string, value: T) => {
-      cache.set(key, value);
-      return Promise.resolve(true);
-    },
-    deleteCache: cacheBoundary.deleteCache ?? ((key: string) => Promise.resolve(cache.delete(key))),
-    reportError: cacheBoundary.reportError ?? (() => {}),
-  } as IAgentRuntime;
+  const agentId = stringToUuid('workflow-action-test-agent');
+  return Object.assign(
+    new AgentRuntime({
+      agentId,
+      character: createCharacter({ id: agentId, name: 'Workflow Test Agent', settings: {} }),
+      enableAutonomy: false,
+      logLevel: 'fatal',
+    }),
+    {
+      getSetting: (key: string) => (key === 'ELIZA_ADMIN_ENTITY_ID' ? canonicalOwnerId : undefined),
+      getService: (type: string) => (type === WORKFLOW_SERVICE_TYPE ? service : null),
+      getCache: <T>(key: string) => Promise.resolve(cache.get(key) as T | undefined),
+      setCache: <T>(key: string, value: T) => {
+        cache.set(key, value);
+        return Promise.resolve(true);
+      },
+      deleteCache:
+        cacheBoundary.deleteCache ?? ((key: string) => Promise.resolve(cache.delete(key))),
+      reportError: cacheBoundary.reportError ?? (() => {}),
+    }
+  );
 }
 
 const message = {
@@ -157,7 +167,7 @@ describe('workflowAction chat operations', () => {
     const deleteCache = mock(() => Promise.resolve(false));
 
     await expect(
-      clearPendingWorkflowDraft({ deleteCache } as IAgentRuntime, {
+      clearPendingWorkflowDraft(makeRuntime({}, 'user-test', new Map(), { deleteCache }), {
         ownerEntityId: 'user-test',
         roomId: 'room-test',
         cacheKey: 'workflow_draft:v2:user-test:room:room-test',

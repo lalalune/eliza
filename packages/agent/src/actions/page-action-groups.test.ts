@@ -7,9 +7,9 @@ import type {
   Action,
   ActionResult,
   HandlerOptions,
-  IAgentRuntime,
   Memory,
 } from "@elizaos/core";
+import { AgentRuntime } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
 import { pageDelegateAction } from "./page-action-groups.ts";
 
@@ -22,7 +22,7 @@ function makeMessage(): Memory {
   } as Memory;
 }
 
-function makeRuntime(handler: Action["handler"]): IAgentRuntime {
+function makeRuntime(handler: Action["handler"]): AgentRuntime {
   const workflowAction: Action = {
     name: "WORKFLOW",
     description: "Manage workflows through a canonical action discriminator.",
@@ -50,11 +50,13 @@ function makeRuntime(handler: Action["handler"]): IAgentRuntime {
     validate: async () => true,
     handler,
   };
-  return { actions: [pageDelegateAction, workflowAction] } as IAgentRuntime;
+  const runtime = new AgentRuntime({ logLevel: "fatal" });
+  runtime.actions.push(pageDelegateAction, workflowAction);
+  return runtime;
 }
 
 async function invoke(
-  runtime: IAgentRuntime,
+  runtime: AgentRuntime,
   action: string,
   parameters: Record<string, unknown>,
 ): Promise<ActionResult> {
@@ -71,43 +73,43 @@ async function invoke(
 }
 
 describe("PAGE_DELEGATE workflow alias repair", () => {
-  it.each([
-    "WORKFLOW_CREATE",
-    "CREATE_WORKFLOW",
-  ])("canonicalizes %s to WORKFLOW action=create using the user's request", async (alias) => {
-    let calls = 0;
-    let receivedOptions: HandlerOptions | undefined;
-    const handler: Action["handler"] = async (
-      _runtime,
-      _message,
-      _state,
-      options,
-    ): Promise<ActionResult> => {
-      calls += 1;
-      receivedOptions = options;
-      return {
-        success: true,
-        text: "created",
+  it.each(["WORKFLOW_CREATE", "CREATE_WORKFLOW"])(
+    "canonicalizes %s to WORKFLOW action=create using the user's request",
+    async (alias) => {
+      let calls = 0;
+      let receivedOptions: HandlerOptions | undefined;
+      const handler: Action["handler"] = async (
+        _runtime,
+        _message,
+        _state,
+        options,
+      ): Promise<ActionResult> => {
+        calls += 1;
+        receivedOptions = options;
+        return {
+          success: true,
+          text: "created",
+        };
       };
-    };
-    const runtime = makeRuntime(handler);
+      const runtime = makeRuntime(handler);
 
-    const result = await invoke(runtime, alias, {
-      definition: {
-        nodes: [{ type: "invented", parameters: { value: "wrong" } }],
-      },
-      active: false,
-    });
+      const result = await invoke(runtime, alias, {
+        definition: {
+          nodes: [{ type: "invented", parameters: { value: "wrong" } }],
+        },
+        active: false,
+      });
 
-    expect(result.success).toBe(true);
-    expect(calls).toBe(1);
-    expect(receivedOptions?.parameters).toEqual({
-      action: "create",
-      seedPrompt: CREATE_REQUEST,
-      active: false,
-    });
-    expect(receivedOptions?.parameters).not.toHaveProperty("definition");
-  });
+      expect(result.success).toBe(true);
+      expect(calls).toBe(1);
+      expect(receivedOptions?.parameters).toEqual({
+        action: "create",
+        seedPrompt: CREATE_REQUEST,
+        active: false,
+      });
+      expect(receivedOptions?.parameters).not.toHaveProperty("definition");
+    },
+  );
 
   it("preserves an already-canonical WORKFLOW delegation", async () => {
     let receivedOptions: HandlerOptions | undefined;

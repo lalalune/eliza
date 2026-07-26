@@ -170,12 +170,12 @@ describe('WORKFLOW action run op e2e (real WorkflowService + embedded engine, ke
     expect(executions).toHaveLength(1);
     expect(executions[0].status).toBe('error');
     expect(executions[0].finished).toBe(true);
-    // The persisted diagnostics name the failing node (the embedded engine
-    // echoes the node failure ahead of Smithers' wrapper error).
+    // Durable diagnostics classify the failure without persisting the raw
+    // QuickJS message or a user-controlled node name.
     const runError = (executions[0] as WorkflowExecution).data?.resultData?.error as
       | { message?: string }
       | undefined;
-    expect(runError?.message ?? '').toContain('Node "Work" failed');
+    expect(runError?.message).toBe('Workflow node execution failed');
   });
 
   test('(c) run without workflowId is a structured failure and executes nothing', async () => {

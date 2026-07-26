@@ -261,113 +261,115 @@ describe("multi-account coding-agent spawn", () => {
     }
   });
 
-  it.each([
-    "revoked",
-    "materialization failure",
-  ] as const)("fails durable recovery closed after %s even if host auth is valid", async (failureMode) => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const previousOpenAiKey = process.env.OPENAI_API_KEY;
-    const hostCodexHome = fs.mkdtempSync(
-      path.join(os.tmpdir(), "acp-host-codex-auth-"),
-    );
-    fs.writeFileSync(
-      path.join(hostCodexHome, "auth.json"),
-      JSON.stringify({
-        auth_mode: "chatgpt",
-        tokens: {
-          access_token: "valid-host-access",
-          refresh_token: "valid-host-refresh",
-        },
-      }),
-      { mode: 0o600 },
-    );
-    process.env.CODEX_HOME = hostCodexHome;
-    process.env.OPENAI_API_KEY = "valid-host-api-key";
+  it.each(["revoked", "materialization failure"] as const)(
+    "fails durable recovery closed after %s even if host auth is valid",
+    async (failureMode) => {
+      const previousCodexHome = process.env.CODEX_HOME;
+      const previousOpenAiKey = process.env.OPENAI_API_KEY;
+      const hostCodexHome = fs.mkdtempSync(
+        path.join(os.tmpdir(), "acp-host-codex-auth-"),
+      );
+      fs.writeFileSync(
+        path.join(hostCodexHome, "auth.json"),
+        JSON.stringify({
+          auth_mode: "chatgpt",
+          tokens: {
+            access_token: "valid-host-access",
+            refresh_token: "valid-host-refresh",
+          },
+        }),
+        { mode: 0o600 },
+      );
+      process.env.CODEX_HOME = hostCodexHome;
+      process.env.OPENAI_API_KEY = "valid-host-api-key";
 
-    let recoveryFailure = false;
-    const select = vi.fn(
-      async (_agentType: string, opts?: { accountIds?: string[] }) => {
-        if (recoveryFailure && failureMode === "materialization failure") {
-          throw new Error("could not materialize linked CODEX_HOME");
-        }
-        if (
-          recoveryFailure ||
-          opts?.accountIds?.includes("acc-linked") === false
-        ) {
-          return null;
-        }
-        return {
+      let recoveryFailure = false;
+      const select = vi.fn(
+        async (_agentType: string, opts?: { accountIds?: string[] }) => {
+          if (recoveryFailure && failureMode === "materialization failure") {
+            throw new Error("could not materialize linked CODEX_HOME");
+          }
+          if (
+            recoveryFailure ||
+            opts?.accountIds?.includes("acc-linked") === false
+          ) {
+            return null;
+          }
+          return {
+            providerId: "openai-codex",
+            accountId: "acc-linked",
+            label: "Linked",
+            source: "oauth" as const,
+            strategy: "least-used",
+            envPatch: {
+              CODEX_HOME: "/tmp/auth/_codex-home/acc-linked/generation",
+            },
+          };
+        },
+      );
+      (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
+        describe: () => ({ codex: [{ total: 1, enabled: 0, healthy: 0 }] }),
+        select,
+        markRateLimited: vi.fn(async () => undefined),
+        markNeedsReauth: vi.fn(async () => undefined),
+        recordUsage: vi.fn(async () => undefined),
+      };
+
+      const service = new AcpService(runtime());
+      try {
+        await service.start();
+        const first = await service.spawnSession({
+          name: "codex-recovery-pin",
+          agentType: "codex",
+          workdir: "/tmp/acp-test",
+        });
+        expect(firstNativeClient().opts.env?.CODEX_HOME).toContain(
+          "_codex-home/acc-linked",
+        );
+        expect(firstNativeClient().opts.env?.CODEX_HOME).not.toBe(
+          hostCodexHome,
+        );
+        await service.stop();
+
+        recoveryFailure = true;
+        await service.start();
+        await expect(
+          service.prepareSessionForDurableRecovery(first.sessionId),
+        ).rejects.toMatchObject({
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+        });
+
+        // The required-account check runs before a replacement child can inherit
+        // either valid host credential, so only the original linked client exists.
+        expect(nativeClientMock.instances).toHaveLength(1);
+        expect(select.mock.calls.at(-1)?.[1]).toMatchObject({
+          accountIds: ["acc-linked"],
+        });
+        const failed = await service.getSession(first.sessionId);
+        expect(failed?.status).toBe("errored");
+        expect(failed?.metadata?.account).toBeUndefined();
+        expect(
+          failed?.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY],
+        ).toMatchObject({
           providerId: "openai-codex",
           accountId: "acc-linked",
-          label: "Linked",
-          source: "oauth" as const,
-          strategy: "least-used",
-          envPatch: {
-            CODEX_HOME: "/tmp/auth/_codex-home/acc-linked/generation",
-          },
-        };
-      },
-    );
-    (globalThis as Record<symbol, unknown>)[BRIDGE_SYMBOL] = {
-      describe: () => ({ codex: [{ total: 1, enabled: 0, healthy: 0 }] }),
-      select,
-      markRateLimited: vi.fn(async () => undefined),
-      markNeedsReauth: vi.fn(async () => undefined),
-      recordUsage: vi.fn(async () => undefined),
-    };
-
-    const service = new AcpService(runtime());
-    try {
-      await service.start();
-      const first = await service.spawnSession({
-        name: "codex-recovery-pin",
-        agentType: "codex",
-        workdir: "/tmp/acp-test",
-      });
-      expect(firstNativeClient().opts.env?.CODEX_HOME).toContain(
-        "_codex-home/acc-linked",
-      );
-      expect(firstNativeClient().opts.env?.CODEX_HOME).not.toBe(hostCodexHome);
-      await service.stop();
-
-      recoveryFailure = true;
-      await service.start();
-      await expect(
-        service.prepareSessionForDurableRecovery(first.sessionId),
-      ).rejects.toMatchObject({
-        code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
-      });
-
-      // The required-account check runs before a replacement child can inherit
-      // either valid host credential, so only the original linked client exists.
-      expect(nativeClientMock.instances).toHaveLength(1);
-      expect(select.mock.calls.at(-1)?.[1]).toMatchObject({
-        accountIds: ["acc-linked"],
-      });
-      const failed = await service.getSession(first.sessionId);
-      expect(failed?.status).toBe("errored");
-      expect(failed?.metadata?.account).toBeUndefined();
-      expect(
-        failed?.metadata?.[POOLED_ACCOUNT_RECOVERY_METADATA_KEY],
-      ).toMatchObject({
-        providerId: "openai-codex",
-        accountId: "acc-linked",
-      });
-      await expect(
-        service.prepareSessionForDurableRecovery(first.sessionId),
-      ).rejects.toMatchObject({
-        code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
-      });
-      expect(nativeClientMock.instances).toHaveLength(1);
-    } finally {
-      await service.stop();
-      fs.rmSync(hostCodexHome, { recursive: true, force: true });
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previousOpenAiKey;
-    }
-  });
+        });
+        await expect(
+          service.prepareSessionForDurableRecovery(first.sessionId),
+        ).rejects.toMatchObject({
+          code: POOLED_ACCOUNT_RECOVERY_UNAVAILABLE_CODE,
+        });
+        expect(nativeClientMock.instances).toHaveLength(1);
+      } finally {
+        await service.stop();
+        fs.rmSync(hostCodexHome, { recursive: true, force: true });
+        if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previousCodexHome;
+        if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      }
+    },
+  );
 
   it("leaves strategy precedence to the bridge so app config can beat the env fallback", async () => {
     const previous = process.env.ELIZA_CODING_ACCOUNT_STRATEGY;

@@ -5,7 +5,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBootConfig, setBootConfig } from "../config/boot-config.js";
-import { isCloudProvisionedContainer } from "./cloud-provisioning.js";
+import {
+  isCloudFlagEnabled,
+  isCloudProvisionedContainer,
+} from "./cloud-provisioning.js";
 
 const CLOUD_PROVISIONING_KEYS = [
   "ACME_API_TOKEN",
@@ -48,6 +51,13 @@ describe("isCloudProvisionedContainer", () => {
     expect(isCloudProvisionedContainer()).toBe(true);
   });
 
+  it("accepts a trimmed case-insensitive true flag with a provisioning credential", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+    process.env.STEWARD_AGENT_TOKEN = "steward-token";
+
+    expect(isCloudProvisionedContainer()).toBe(true);
+  });
+
   it("accepts a branded API-token alias without materializing ELIZA_API_TOKEN", () => {
     setBootConfig({
       ...savedConfig,
@@ -81,5 +91,22 @@ describe("isCloudProvisionedContainer", () => {
     expect(process.env.ELIZA_CLOUD_PROVISIONED).toBeUndefined();
     expect(process.env.ELIZAOS_CLOUD_ENABLED).toBeUndefined();
     expect(process.env.ELIZAOS_CLOUD_API_KEY).toBeUndefined();
+  });
+
+  it("accepts either supported Cloud flag spelling and rejects lookalikes", () => {
+    expect(isCloudFlagEnabled("1")).toBe(true);
+    expect(isCloudFlagEnabled(" TrUe ")).toBe(true);
+    expect(isCloudFlagEnabled(true)).toBe(true);
+    expect(isCloudFlagEnabled("yes")).toBe(false);
+    expect(isCloudFlagEnabled("0")).toBe(false);
+    expect(isCloudFlagEnabled(undefined)).toBe(false);
+  });
+
+  it("accepts the numeric cloud-enabled spelling for API-key provisioning", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "true";
+    process.env.ELIZAOS_CLOUD_ENABLED = "1";
+    process.env.ELIZAOS_CLOUD_API_KEY = "cloud-key";
+
+    expect(isCloudProvisionedContainer()).toBe(true);
   });
 });

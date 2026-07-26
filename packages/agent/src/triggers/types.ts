@@ -25,6 +25,17 @@ export type {
   UpdateTriggerRequest,
 } from "@elizaos/shared";
 
+export interface TriggerSubscriptionPolicyBlock {
+  code: "workflow_requires_always_on";
+  error: string;
+  capability: "scheduled_workflows";
+  currentExecutionTier: "dedicated-lazy";
+  requiredExecutionTier: "dedicated-always";
+  upgradeRequired: true;
+  requiresContinuousBillingConfirmation: true;
+  blockedAt: number;
+}
+
 export interface TriggerTaskMetadata {
   updatedAt?: number;
   updateInterval?: number;
@@ -32,6 +43,10 @@ export interface TriggerTaskMetadata {
   trigger?: TriggerConfig;
   triggerRuns?: TriggerRunRecord[];
   idempotencyKey?: string;
+  ownerEntityId?: string;
+  sourceRoomId?: string;
+  ownership?: { ownerEntityId: string; sourceRoomId?: string };
+  subscriptionPolicy?: TriggerSubscriptionPolicyBlock;
   [key: string]:
     | string
     | number
@@ -41,7 +56,8 @@ export interface TriggerTaskMetadata {
     | Record<string, string | number | boolean>
     | undefined
     | TriggerConfig
-    | TriggerRunRecord[];
+    | TriggerRunRecord[]
+    | TriggerSubscriptionPolicyBlock;
 }
 
 export interface NormalizedTriggerDraft {

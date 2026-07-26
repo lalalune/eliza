@@ -8,8 +8,8 @@
  *
  * Consumed by EmbeddedWorkflowService as the node-execution backend. Reads
  * optional `SMITHERS_DB_*`, `ELIZA_SMITHERS_TIMEOUT_MS`, and `BUN_BIN` env vars.
- * Failed delegated nodes are echoed before Smithers' wrapper error so execution
- * diagnostics retain the original node error.
+ * Errors cross the process boundary through a fixed public envelope so request
+ * credentials, response bodies, and user payloads never enter durable results.
  */
 import { spawn } from 'node:child_process';
 import { mkdir, readFile } from 'node:fs/promises';
@@ -22,6 +22,10 @@ import type {
   WorkflowExecutionEngineMetrics,
   WorkflowNode,
 } from '../types/index';
+import {
+  serializeWorkflowExecutionError,
+  toSafeWorkflowExecutionError,
+} from './workflow-execution-error';
 
 interface SmithersNodeExecutionData {
   json: Record<string, unknown>;
@@ -91,7 +95,6 @@ interface SmithersProtocolResponse {
   outputData?: SmithersNodeExecutionData[][];
   error?: {
     message: string;
-    stack?: string;
     code?: string;
     context?: Record<string, unknown>;
   };
@@ -207,32 +210,12 @@ async function resolvePluginRoot(): Promise<string> {
 
 function toErrorPayload(error: unknown): {
   message: string;
-  stack?: string;
-  code?: string;
+  code: string;
   context?: Record<string, unknown>;
 } {
-  if (error instanceof ElizaError) {
-    return {
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
-      context: error.context,
-    };
-  }
-  if (error instanceof Error) return { message: error.message, stack: error.stack };
-  if (error !== null && typeof error === 'object') {
-    const candidate = error as Record<string, unknown>;
-    return {
-      message: typeof candidate.message === 'string' ? candidate.message : String(error),
-      stack: typeof candidate.stack === 'string' ? candidate.stack : undefined,
-      code: typeof candidate.code === 'string' ? candidate.code : undefined,
-      context:
-        candidate.context !== null && typeof candidate.context === 'object'
-          ? (candidate.context as Record<string, unknown>)
-          : undefined,
-    };
-  }
-  return { message: String(error) };
+  return serializeWorkflowExecutionError(error, {
+    fallbackCode: 'WORKFLOW_NODE_EXECUTION_FAILED',
+  });
 }
 
 export function buildSmithersWorkerEnv(): NodeJS.ProcessEnv {
@@ -319,7 +302,11 @@ export async function runWorkflowWithSmithers({
       // authoritative observation for the subprocess lifecycle.
       logger.warn(
         {
-          error,
+          error: serializeWorkflowExecutionError(error, {
+            fallbackCode: 'SMITHERS_WORKFLOW_FAILED',
+            workflowId: workflow.id ?? '',
+            executionId,
+          }),
           workflowId: workflow.id ?? '',
           executionId,
         },
@@ -393,7 +380,10 @@ export async function runWorkflowWithSmithers({
       writeResponse({
         requestId: message.requestId,
         ok: false,
-        error: { message: `Smithers requested unknown workflow node "${message.nodeName}"` },
+        error: {
+          message: 'Workflow node execution failed',
+          code: 'WORKFLOW_NODE_EXECUTION_FAILED',
+        },
       });
       return;
     }
@@ -414,7 +404,6 @@ export async function runWorkflowWithSmithers({
   };
 
   let stdoutBuffer = '';
-  let stderr = '';
   proc.stdout.setEncoding('utf8');
   proc.stdout.on('data', (chunk: string) => {
     stdoutBuffer += chunk;
@@ -422,10 +411,9 @@ export async function runWorkflowWithSmithers({
     stdoutBuffer = lines.pop() ?? '';
     for (const line of lines) handleLine(line);
   });
-  proc.stderr.setEncoding('utf8');
-  proc.stderr.on('data', (chunk: string) => {
-    stderr += chunk;
-  });
+  // The worker's stderr is diagnostic-only and may contain third-party output.
+  // Drain it without retaining or reflecting it into public execution errors.
+  proc.stderr.resume();
 
   let timedOut = false;
   const exitCode = await new Promise<number>((resolve, reject) => {
@@ -435,8 +423,13 @@ export async function runWorkflowWithSmithers({
     }, timeoutMs);
     proc.once('error', (error) => {
       clearTimeout(timeout);
-      if (!executionAbort.signal.aborted) executionAbort.abort(error);
-      reject(error);
+      const safeError = toSafeWorkflowExecutionError(error, {
+        fallbackCode: 'SMITHERS_WORKFLOW_FAILED',
+        workflowId: workflow.id ?? '',
+        executionId,
+      });
+      if (!executionAbort.signal.aborted) executionAbort.abort(safeError);
+      reject(safeError);
     });
     proc.once('close', (code) => {
       clearTimeout(timeout);
@@ -490,32 +483,18 @@ export async function runWorkflowWithSmithers({
       .values()
       .next();
     if (!nodeExecutionError.done) {
-      const [nodeName, error] = nodeExecutionError.value;
-      const payload = toErrorPayload(error);
-      throw new ElizaError(`Node "${nodeName}" failed: ${payload.message}`, {
-        code: error instanceof ElizaError ? error.code : 'WORKFLOW_NODE_EXECUTION_FAILED',
-        cause: error,
-        context:
-          error instanceof ElizaError
-            ? error.context
-            : { workflowId: workflow.id ?? '', executionId, nodeName },
-        severity: error instanceof ElizaError ? error.severity : undefined,
+      const [, error] = nodeExecutionError.value;
+      throw toSafeWorkflowExecutionError(error, {
+        fallbackCode: 'WORKFLOW_NODE_EXECUTION_FAILED',
+        workflowId: workflow.id ?? '',
+        executionId,
       });
     }
-    throw new ElizaError(
-      `Smithers workflow execution failed: ${stderr.trim() || `exit ${exitCode}`}`,
-      {
-        code: 'SMITHERS_WORKFLOW_FAILED',
-        context: {
-          workflowId: workflow.id ?? '',
-          executionId,
-          exitCode,
-          command: `${bunBinary} --cwd=${pluginRoot} ${workerPath}`,
-          cwd: pluginRoot,
-        },
-        severity: 'ephemeral',
-      }
-    );
+    throw new ElizaError('Smithers workflow execution failed', {
+      code: 'SMITHERS_WORKFLOW_FAILED',
+      context: { workflowId: workflow.id ?? '', executionId, exitCode },
+      severity: 'ephemeral',
+    });
   }
   if (!executionResult) {
     throw new ElizaError(

@@ -26,6 +26,7 @@ import {
   DURATION_UNITS,
   durationToMs,
   durationUnitLabel,
+  EVENT_KIND_OPTIONS,
   formFromTrigger,
   humanizeEventKind,
   localizedExecutionStatus,
@@ -35,34 +36,6 @@ import {
   type TriggerFormState,
   validateCronExpression,
 } from "./trigger-form-utils";
-
-const EVENT_KIND_OPTIONS = [
-  {
-    value: "message.received",
-    labelKey: "triggerform.event.messageReceived",
-    defaultLabel: "Message received",
-  },
-  {
-    value: "discord.message.received",
-    labelKey: "triggerform.event.discordMessage",
-    defaultLabel: "Discord message",
-  },
-  {
-    value: "telegram.message.received",
-    labelKey: "triggerform.event.telegramMessage",
-    defaultLabel: "Telegram message",
-  },
-  {
-    value: "gmail.message.received",
-    labelKey: "triggerform.event.gmailMessage",
-    defaultLabel: "Gmail message",
-  },
-  {
-    value: "calendar.event.ended",
-    labelKey: "triggerform.event.calendarEventEnded",
-    defaultLabel: "Calendar event ended",
-  },
-] as const;
 
 // ── Agent-surface select wrapper ────────────────────────────────────
 // FormSelect is a Radix Select and forwards neither a ref nor DOM props, so we
@@ -696,7 +669,8 @@ export function TriggerForm({
               className="h-10 px-6 text-sm text-white hover:text-white"
               disabled={
                 triggersSaving ||
-                (form.kind === "workflow" && !form.workflowId) ||
+                (form.kind === "workflow" && !form.workflowId.trim()) ||
+                (form.kind === "prompt" && !form.instructions.trim()) ||
                 cronInvalid
               }
               onClick={() => void onSubmit()}
@@ -801,9 +775,9 @@ function TriggerKindSection({
     role: "tab",
     label: t("triggerform.prompt", { defaultValue: "Prompt" }),
     group: "trigger-kind",
-    status: form.kind === "text" ? "active" : "inactive",
+    status: form.kind === "prompt" ? "active" : "inactive",
     description: "Run a free-text prompt when this trigger fires",
-    onActivate: () => setField("kind", "text"),
+    onActivate: () => setField("kind", "prompt"),
   });
   const workflowKindButton = useAgentElement<HTMLButtonElement>({
     id: "trigger-kind-workflow",
@@ -840,12 +814,12 @@ function TriggerKindSection({
       <div className="mt-1.5 flex gap-2">
         <Button
           ref={promptKindButton.ref}
-          aria-pressed={form.kind === "text"}
-          onClick={() => setField("kind", "text")}
+          aria-pressed={form.kind === "prompt"}
+          onClick={() => setField("kind", "prompt")}
           variant="ghost"
           size="sm"
           className={`rounded-sm border px-3 py-1.5 text-sm font-medium transition-colors ${
-            form.kind === "text"
+            form.kind === "prompt"
               ? "border-accent bg-accent/10 text-accent"
               : "border-border/40 text-muted hover:border-border hover:text-txt"
           }`}
@@ -870,7 +844,7 @@ function TriggerKindSection({
         </Button>
       </div>
 
-      {form.kind === "text" && (
+      {form.kind === "prompt" && (
         <div className="mt-4">
           <FieldLabel variant="form">
             {t("triggerform.prompt", { defaultValue: "Prompt" })}

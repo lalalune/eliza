@@ -104,21 +104,22 @@ describe("ElizaAgentActions always-on transition", () => {
     );
 
     await waitFor(() => {
-      expect(apiWithStatusMock).toHaveBeenCalledWith(
+      expect(apiWithStatusMock.mock.calls).toContainEqual([
         "/api/v1/eliza/agents/agent-lazy-1/upgrade-tier",
         {
           method: "POST",
           json: { confirmContinuousBilling: true },
         },
-      );
+      ]);
     });
-    expect(pollerTrackMock).toHaveBeenCalledWith(
+    expect(pollerTrackMock.mock.calls).toContainEqual([
       "agent-lazy-1",
       "job-always-1",
-    );
-    expect(toastSuccessMock).toHaveBeenCalledWith(
+    ]);
+    expect(toastSuccessMock.mock.calls[0]?.[0]).toEqual(
       expect.stringContaining("restart or wake in place"),
     );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 
   it("keeps shared migration and lazy always-on actions distinct", () => {

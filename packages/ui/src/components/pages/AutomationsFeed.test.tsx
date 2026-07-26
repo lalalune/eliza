@@ -39,6 +39,8 @@ const clientMock = vi.hoisted(() => ({
   applyScheduledTask: vi.fn(),
   getWorkflowDefinition: vi.fn(),
   runWorkflowDefinition: vi.fn(),
+  createTrigger: vi.fn(),
+  updateTrigger: vi.fn(),
 }));
 const openExternalUrlMock = vi.hoisted(() => vi.fn(async () => undefined));
 
@@ -180,6 +182,8 @@ beforeEach(() => {
   clientMock.listScheduledTasks.mockResolvedValue({ tasks: [] });
   clientMock.getWorkflowDefinition.mockResolvedValue(workflowDefinition());
   clientMock.runWorkflowDefinition.mockResolvedValue({ id: "execution-1" });
+  clientMock.createTrigger.mockResolvedValue({ trigger: {} });
+  clientMock.updateTrigger.mockResolvedValue({ trigger: {} });
 });
 
 afterEach(() => {
@@ -228,11 +232,11 @@ describe("AutomationsFeed", () => {
     fireEvent.click(runButton);
 
     await waitFor(() => {
-      expect(clientMock.runWorkflowDefinition).toHaveBeenCalledWith(
+      expect(clientMock.runWorkflowDefinition.mock.calls).toContainEqual([
         "workflow-1",
-      );
+      ]);
     });
-    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
   });
 
   it("keeps the feed header focused on status instead of generic creation", async () => {
@@ -265,7 +269,7 @@ describe("AutomationsFeed", () => {
     expect(await screen.findByTestId("automations-layout")).toBeTruthy();
     expect(window.location.hash).toBe("#automations");
     await waitFor(() => {
-      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+      expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
     });
   });
 
@@ -312,7 +316,7 @@ describe("AutomationsFeed", () => {
       (await screen.findByTestId("workflow-editor-stub")).textContent,
     ).toContain("Chat-created workflow");
     await waitFor(() => {
-      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+      expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
     });
     expect(
       getCached<AutomationListResponse>(
@@ -349,9 +353,9 @@ describe("AutomationsFeed", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Upgrade to Dedicated" }),
     );
-    expect(openExternalUrlMock).toHaveBeenCalledWith(
+    expect(openExternalUrlMock.mock.calls).toContainEqual([
       "https://elizacloud.ai/dashboard/agents/de42b5ff-72d3-4a1a-8a16-19aee293bfea",
-    );
+    ]);
   });
 
   it("passes a dedicated subdomain agent id to the workflow subscription control", async () => {
@@ -363,9 +367,42 @@ describe("AutomationsFeed", () => {
     const editor = await screen.findByTestId("workflow-editor-stub");
     expect(editor.getAttribute("data-cloud-agent-id")).toBe("agent-lazy-1");
     fireEvent.click(screen.getByRole("button", { name: "Enable always-on" }));
-    expect(openExternalUrlMock).toHaveBeenCalledWith(
+    expect(openExternalUrlMock.mock.calls).toContainEqual([
       "https://elizacloud.ai/dashboard/agents/agent-lazy-1",
+    ]);
+  });
+
+  it("routes a prompt-trigger always-on rejection to the cloud agent control", async () => {
+    window.location.hash = "#automations/task/__new__";
+    clientMock.createTrigger.mockRejectedValueOnce(
+      new ApiError({
+        kind: "http",
+        path: "/api/triggers",
+        status: 409,
+        code: "workflow_requires_always_on",
+        message:
+          "Scheduled prompt automations require an always-on agent runtime.",
+      }),
     );
+
+    render(<AutomationsFeed />);
+
+    fireEvent.change(await screen.findByTestId("task-editor-name"), {
+      target: { value: "Morning digest" },
+    });
+    fireEvent.change(screen.getByTestId("task-editor-prompt"), {
+      target: { value: "Summarize my calendar" },
+    });
+    fireEvent.change(screen.getByTestId("task-editor-scheduled-at"), {
+      target: { value: "2099-01-02T03:04" },
+    });
+    fireEvent.click(screen.getByTestId("task-editor-save"));
+
+    expect(await screen.findByTestId("task-always-on-required")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Enable always-on" }));
+    expect(openExternalUrlMock.mock.calls).toContainEqual([
+      "https://elizacloud.ai/dashboard/agents/de42b5ff-72d3-4a1a-8a16-19aee293bfea",
+    ]);
   });
 
   it("retries a transient workflow deep-link load without leaving the editor", async () => {
@@ -382,7 +419,7 @@ describe("AutomationsFeed", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(await screen.findByTestId("workflow-editor-stub")).toBeTruthy();
-    expect(clientMock.getWorkflowDefinition).toHaveBeenCalledTimes(2);
+    expect(clientMock.getWorkflowDefinition.mock.calls).toHaveLength(2);
   });
 
   it("never paints one Cloud agent's cached workflows after switching agents", async () => {
@@ -446,7 +483,7 @@ describe("AutomationsFeed", () => {
     if (!openButton) throw new Error("Workflow row button was not rendered");
     fireEvent.click(openButton);
     await waitFor(() => {
-      expect(clientMock.getWorkflowDefinition).toHaveBeenCalledTimes(1);
+      expect(clientMock.getWorkflowDefinition.mock.calls).toHaveLength(1);
     });
 
     clientMock.baseUrl = SECOND_AGENT_BASE;
@@ -495,7 +532,7 @@ describe("AutomationsFeed", () => {
     expect(screen.queryByText("Run failed")).toBeNull();
     expect(screen.queryByText("Run status unknown")).toBeNull();
     expect(screen.queryByText("stale Agent A run failure")).toBeNull();
-    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
   });
 
   it("prevents duplicate run requests while a workflow execution is pending", async () => {
@@ -513,7 +550,7 @@ describe("AutomationsFeed", () => {
     fireEvent.click(runButton);
     fireEvent.click(runButton);
 
-    expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(1);
+    expect(clientMock.runWorkflowDefinition.mock.calls).toHaveLength(1);
     expect(runButton.hasAttribute("disabled")).toBe(true);
 
     finishRun?.({ id: "execution-1" });
@@ -533,15 +570,15 @@ describe("AutomationsFeed", () => {
     expect(await screen.findByText("Run failed")).toBeTruthy();
     expect(screen.getByText("Smithers execution failed")).toBeTruthy();
     expect(screen.queryByText("Automations couldn't be loaded")).toBeNull();
-    expect(clientMock.listAutomations).toHaveBeenCalledTimes(1);
+    expect(clientMock.listAutomations.mock.calls).toHaveLength(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Run again" }));
 
     await waitFor(() =>
-      expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(2),
+      expect(clientMock.runWorkflowDefinition.mock.calls).toHaveLength(2),
     );
     await waitFor(() =>
-      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2),
+      expect(clientMock.listAutomations.mock.calls).toHaveLength(2),
     );
     expect(screen.queryByText("Run failed")).toBeNull();
   });
@@ -566,7 +603,7 @@ describe("AutomationsFeed", () => {
       screen.getByRole("button", { name: "Run Broken workflow now" }),
     );
     await waitFor(() => {
-      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+      expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
     });
 
     expect(screen.getByText("Run failed")).toBeTruthy();
@@ -594,12 +631,12 @@ describe("AutomationsFeed", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
 
     await waitFor(() => {
-      expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+      expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
     });
     await waitFor(() => {
       expect(screen.queryByText("Run status unknown")).toBeNull();
     });
-    expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(1);
+    expect(clientMock.runWorkflowDefinition.mock.calls).toHaveLength(1);
   });
 
   it("keeps a post-run refresh when an older silent revalidation resolves last", async () => {
@@ -632,7 +669,7 @@ describe("AutomationsFeed", () => {
       await screen.findByRole("button", { name: "Run Cached workflow now" }),
     );
     expect(await screen.findByText("Fresh post-run workflow")).toBeTruthy();
-    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
 
     await act(async () => {
       resolveStaleRefresh?.(staleResponse);
@@ -648,30 +685,30 @@ describe("AutomationsFeed", () => {
     ).toBe("Fresh post-run workflow");
   });
 
-  it.each([
-    "running",
-    "waiting",
-  ] as const)("disables Run now while the persisted execution is %s", async (status) => {
-    const response = responseFixture();
-    response.automations = [
-      automationItem({
-        lastExecution: {
-          status,
-          startedAt: "2026-06-20T14:00:00.000Z",
-        },
-      }),
-    ];
-    clientMock.listAutomations.mockResolvedValue(response);
-    render(<AutomationsFeed />);
+  it.each(["running", "waiting"] as const)(
+    "disables Run now while the persisted execution is %s",
+    async (status) => {
+      const response = responseFixture();
+      response.automations = [
+        automationItem({
+          lastExecution: {
+            status,
+            startedAt: "2026-06-20T14:00:00.000Z",
+          },
+        }),
+      ];
+      clientMock.listAutomations.mockResolvedValue(response);
+      render(<AutomationsFeed />);
 
-    const runButton = await screen.findByRole("button", {
-      name: "Run Nightly review now",
-    });
-    expect(runButton.hasAttribute("disabled")).toBe(true);
-    expect(runButton.getAttribute("aria-busy")).toBe("true");
-    fireEvent.click(runButton);
-    expect(clientMock.runWorkflowDefinition).not.toHaveBeenCalled();
-  });
+      const runButton = await screen.findByRole("button", {
+        name: "Run Nightly review now",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(true);
+      expect(runButton.getAttribute("aria-busy")).toBe("true");
+      fireEvent.click(runButton);
+      expect(clientMock.runWorkflowDefinition.mock.calls).toHaveLength(0);
+    },
+  );
 
   it("exposes the filters as keyboard-navigable selected tabs", async () => {
     render(<AutomationsFeed />);
@@ -832,9 +869,9 @@ describe("AutomationsFeed", () => {
       screen.getByRole("button", { name: "Upgrade to Dedicated" }),
     );
 
-    expect(openExternalUrlMock).toHaveBeenCalledWith(
+    expect(openExternalUrlMock.mock.calls).toContainEqual([
       "https://elizacloud.ai/dashboard/agents/de42b5ff-72d3-4a1a-8a16-19aee293bfea",
-    );
+    ]);
   });
 
   it("renders a failed initial load as an exclusive retryable error state", async () => {
@@ -857,7 +894,7 @@ describe("AutomationsFeed", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(await screen.findByText("Nightly review")).toBeTruthy();
-    expect(clientMock.listAutomations).toHaveBeenCalledTimes(2);
+    expect(clientMock.listAutomations.mock.calls).toHaveLength(2);
     expect(screen.queryByText("Automations couldn't be loaded")).toBeNull();
   });
 

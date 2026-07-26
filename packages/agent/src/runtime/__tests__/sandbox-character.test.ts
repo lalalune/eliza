@@ -170,6 +170,20 @@ describe("applySandboxConnectorOwnership", () => {
     expect(conns.telegram).toBeUndefined();
   });
 
+  it('strips connector ownership for ELIZA_CLOUD_PROVISIONED="true"', async () => {
+    const { applySandboxConnectorOwnership } = await import(
+      "../sandbox-character.ts"
+    );
+    const env: NodeJS.ProcessEnv = {
+      ELIZA_CLOUD_PROVISIONED: " TrUe ",
+      DISCORD_BOT_TOKEN: "tok",
+    };
+
+    applySandboxConnectorOwnership(env);
+
+    expect(env.DISCORD_BOT_TOKEN).toBeUndefined();
+  });
+
   it("keeps connector tokens when the container owns connectors", async () => {
     const { applySandboxConnectorOwnership } = await import(
       "../sandbox-character.ts"

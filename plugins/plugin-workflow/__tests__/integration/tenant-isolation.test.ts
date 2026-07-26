@@ -7,9 +7,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
-import { type IAgentRuntime, stringToUuid, type Task, type UUID } from '@elizaos/core';
+import { AgentRuntime, createCharacter, stringToUuid, type Task, type UUID } from '@elizaos/core';
 import { and, eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
+import { InMemoryDatabaseAdapter } from '../../../../packages/core/src/database/inMemoryAdapter.ts';
 import * as dbSchema from '../../src/db/schema';
 import { LEGACY_UNSCOPED_WORKFLOW_AGENT_ID } from '../../src/db/schema';
 import { EmbeddedWorkflowService } from '../../src/services/embedded-workflow-service';
@@ -27,8 +28,8 @@ interface SharedHarness {
   client: PGlite;
   db: ReturnType<typeof drizzle<typeof dbSchema>>;
   tasks: StoredTask[];
-  runtimeA: IAgentRuntime;
-  runtimeB: IAgentRuntime;
+  runtimeA: AgentRuntime;
+  runtimeB: AgentRuntime;
   close(): Promise<void>;
 }
 
@@ -45,34 +46,42 @@ async function makeSharedHarness(): Promise<SharedHarness> {
   const tasks: StoredTask[] = [];
   let taskSequence = 0;
 
-  const buildRuntime = (agentSeed: string): IAgentRuntime => {
+  const buildRuntime = (agentSeed: string): AgentRuntime => {
     const agentId = stringToUuid(agentSeed);
-    return {
-      agentId,
-      character: { settings: {} },
-      db,
-      getSetting: (key: string) => (key === 'WORKFLOW_SEED_DEFAULTS' ? false : null),
-      getService: () => null,
-      getEntityById: async () => null,
-      registerEvent: () => {},
-      unregisterEvent: () => {},
-      createTask: async (task: Task) => {
-        taskSequence += 1;
-        const id = stringToUuid(`${agentId}:workflow-task:${taskSequence}`);
-        tasks.push({ ...task, id, agentId });
-        return id;
-      },
-      getTasks: async (params: { tags?: string[]; agentIds?: UUID[] }) =>
-        tasks.filter(
-          (task) =>
-            (!params.agentIds?.length || params.agentIds.includes(task.agentId)) &&
-            (!params.tags?.length || params.tags.every((tag) => task.tags?.includes(tag)))
-        ),
-      deleteTask: async (id: UUID) => {
-        const index = tasks.findIndex((task) => task.id === id && task.agentId === agentId);
-        if (index >= 0) tasks.splice(index, 1);
-      },
-    } as IAgentRuntime;
+    const adapter = new InMemoryDatabaseAdapter();
+    Reflect.set(adapter, 'db', db);
+    return Object.assign(
+      new AgentRuntime({
+        agentId,
+        character: createCharacter({ id: agentId, name: `Tenant ${agentSeed}`, settings: {} }),
+        adapter,
+        enableAutonomy: false,
+        logLevel: 'fatal',
+      }),
+      {
+        getSetting: (key: string) => (key === 'WORKFLOW_SEED_DEFAULTS' ? false : null),
+        getService: () => null,
+        getEntityById: async () => null,
+        registerEvent: () => {},
+        unregisterEvent: () => {},
+        createTask: async (task: Task) => {
+          taskSequence += 1;
+          const id = stringToUuid(`${agentId}:workflow-task:${taskSequence}`);
+          tasks.push({ ...task, id, agentId });
+          return id;
+        },
+        getTasks: async (params: { tags?: string[]; agentIds?: UUID[] }) =>
+          tasks.filter(
+            (task) =>
+              (!params.agentIds?.length || params.agentIds.includes(task.agentId)) &&
+              (!params.tags?.length || params.tags.every((tag) => task.tags?.includes(tag)))
+          ),
+        deleteTask: async (id: UUID) => {
+          const index = tasks.findIndex((task) => task.id === id && task.agentId === agentId);
+          if (index >= 0) tasks.splice(index, 1);
+        },
+      }
+    );
   };
 
   let closed = false;
@@ -201,7 +210,7 @@ describe('EmbeddedWorkflowService tenant isolation', () => {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
-    Reflect.set(harness.runtimeB, 'db', migratedDb);
+    Reflect.set(harness.runtimeB.adapter, 'db', migratedDb);
 
     await EmbeddedWorkflowService.start(harness.runtimeB);
     expect(transactionCalls).toBe(0);

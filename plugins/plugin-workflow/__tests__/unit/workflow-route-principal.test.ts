@@ -54,6 +54,12 @@ describe('workflow route principal proof', () => {
     ).toBe('user-1');
   });
 
+  test('requires a principal when the branded provisioning flag uses true', () => {
+    process.env.MILADY_CLOUD_PROVISIONED = 'true';
+
+    expect(isCloudWorkflowPrincipalRequired()).toBe(true);
+  });
+
   test('rejects spoofed proof and honors an explicit canonical override', () => {
     process.env.ELIZA_CLOUD_PROVISIONED = '0';
     process.env.MILADY_CLOUD_PROVISIONED = '1';

@@ -17,10 +17,15 @@
 import type { IAgentRuntime } from '@elizaos/core';
 import { logger } from '@elizaos/core';
 import type { WorkflowExecution } from '../types/index';
+import { isManagedCloudRuntime } from '../utils/context';
 import {
   EMBEDDED_WORKFLOW_SERVICE_TYPE,
   type EmbeddedWorkflowService,
 } from './embedded-workflow-service';
+import {
+  serializeWorkflowExecutionError,
+  toSafeWorkflowExecutionError,
+} from './workflow-execution-error';
 
 export const WORKFLOW_DISPATCH_SERVICE_TYPE = 'WORKFLOW_DISPATCH' as const;
 
@@ -47,6 +52,8 @@ export interface WorkflowDispatchOptions {
   triggerData?: Record<string, unknown>;
   idempotencyKey?: string;
   scheduleNodeId?: string;
+  ownerEntityId?: string;
+  sourceRoomId?: string;
 }
 
 export interface WorkflowDispatchService {
@@ -163,20 +170,36 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
       if (!id) {
         return { ok: false, error: 'workflow id required' };
       }
+      const ownerEntityId = options.ownerEntityId?.trim() || undefined;
+      if (isManagedCloudRuntime(runtime) && !ownerEntityId) {
+        return { ok: false, error: 'workflow owner context required in managed Cloud' };
+      }
       let service: EmbeddedWorkflowService | null;
       try {
         service = await resolveEmbeddedService(runtime);
-      } catch (error) {
+      } catch {
         // error-policy:J1 scheduled-trigger dispatch translates startup failure
         // into the explicit failure result consumed by the scheduler boundary.
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          ok: false,
-          error: `embedded workflow service failed to start: ${message}`,
-        };
+        return { ok: false, error: 'embedded workflow service failed to start' };
       }
       if (!service) {
         return { ok: false, error: 'embedded workflow service not registered' };
+      }
+
+      if (ownerEntityId) {
+        const ownerScopedService = runtime.getService('workflow') as unknown as {
+          getWorkflow(id: string, userId: string): Promise<unknown>;
+        } | null;
+        if (!ownerScopedService || typeof ownerScopedService.getWorkflow !== 'function') {
+          return { ok: false, error: 'owner-scoped workflow service not registered' };
+        }
+        try {
+          await ownerScopedService.getWorkflow(id, ownerEntityId);
+        } catch {
+          // error-policy:J1 the trigger dispatch boundary returns an explicit
+          // failed dispatch after the owner-scoped facade denies access.
+          return { ok: false, error: 'workflow not found or not owned by caller' };
+        }
       }
 
       const partitioned = partitionPayload(payload);
@@ -192,7 +215,7 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
           return resultFromExecution(existing, true);
         }
 
-        const inflightKey = `${id}::${idempotencyKey}`;
+        const inflightKey = `${ownerEntityId ?? ''}::${id}::${idempotencyKey}`;
         const pending = inflight.get(inflightKey);
         if (pending) {
           const result = await pending;
@@ -204,7 +227,9 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
           id,
           triggerData,
           idempotencyKey,
-          options.scheduleNodeId
+          options.scheduleNodeId,
+          ownerEntityId,
+          options.sourceRoomId
         ).finally(() => {
           inflight.delete(inflightKey);
         });
@@ -212,7 +237,15 @@ export function createWorkflowDispatchService(runtime: IAgentRuntime): WorkflowD
         return promise;
       }
 
-      return runDispatch(service, id, triggerData, undefined, options.scheduleNodeId);
+      return runDispatch(
+        service,
+        id,
+        triggerData,
+        undefined,
+        options.scheduleNodeId,
+        ownerEntityId,
+        options.sourceRoomId
+      );
     },
   };
 }
@@ -222,7 +255,9 @@ async function runDispatch(
   workflowId: string,
   triggerData: Record<string, unknown>,
   idempotencyKey: string | undefined,
-  scheduleNodeId: string | undefined
+  scheduleNodeId: string | undefined,
+  ownerEntityId: string | undefined,
+  sourceRoomId: string | undefined
 ): Promise<WorkflowDispatchResult> {
   try {
     if (idempotencyKey) {
@@ -231,6 +266,8 @@ async function runDispatch(
         triggerData,
         idempotencyKey,
         scheduleNodeId,
+        ...(ownerEntityId ? { ownerEntityId } : {}),
+        ...(sourceRoomId ? { sourceRoomId } : {}),
       });
       return resultFromExecution(result.execution, result.dedup);
     }
@@ -239,15 +276,24 @@ async function runDispatch(
       mode: 'trigger',
       triggerData,
       scheduleNodeId,
+      ...(ownerEntityId ? { ownerEntityId } : {}),
+      ...(sourceRoomId ? { sourceRoomId } : {}),
     });
     return execution.id ? { ok: true, executionId: execution.id } : { ok: true };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const safeError = toSafeWorkflowExecutionError(err, {
+      workflowId,
+      fallbackCode: 'WORKFLOW_DISPATCH_FAILED',
+    });
     logger.warn(
-      { src: 'plugin:workflow:dispatch' },
-      `Workflow execution failed for ${workflowId}: ${message}`
+      {
+        src: 'plugin:workflow:dispatch',
+        workflowId,
+        error: serializeWorkflowExecutionError(safeError, { workflowId }),
+      },
+      'Workflow execution failed'
     );
-    return { ok: false, error: message };
+    return { ok: false, error: 'workflow execution failed' };
   }
 }
 

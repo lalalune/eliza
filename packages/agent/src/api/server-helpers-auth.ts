@@ -7,6 +7,7 @@ import type http from "node:http";
 import { logger } from "@elizaos/core";
 import {
   isCloudProvisionedContainer,
+  isCloudProvisionedEnvironment,
   isLoopbackBindHost,
   isNullOriginAllowed,
   isTrustedLocalRequest as isTrustedLocalRequestShared,
@@ -118,7 +119,7 @@ export function resolveCorsOrigin(origin?: string): string | null {
 
   // Cloud-provisioned containers default to allowing all origins so the
   // browser web UI can reach the agent API without extra config.
-  if (readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1") {
+  if (isCloudProvisionedEnvironment()) {
     return trimmed;
   }
 

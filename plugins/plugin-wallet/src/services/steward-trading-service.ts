@@ -9,6 +9,10 @@ import fs from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ElizaError, type IAgentRuntime, Service } from "@elizaos/core";
+import {
+  isCloudFlagEnabled,
+  isCloudProvisionedEnvironment,
+} from "@elizaos/shared";
 import type {
   CancelOrderRequest,
   CancelResult,
@@ -521,10 +525,12 @@ export class StewardTradingService extends Service {
           "STEWARD_API_URL, STEWARD_AGENT_ID, and a Steward auth token are required.",
       };
     }
+    const runtimeProvisioned = this.runtime.getSetting(
+      "ELIZA_CLOUD_PROVISIONED",
+    );
     const isCloud =
-      normalizeOptionalString(
-        this.runtime.getSetting("ELIZA_CLOUD_PROVISIONED"),
-      ) === "1" || process.env.ELIZA_CLOUD_PROVISIONED === "1";
+      isCloudFlagEnabled(runtimeProvisioned) ||
+      isCloudProvisionedEnvironment();
     return {
       kind: isCloud ? "steward-cloud" : "steward-self",
       canTrade: true,

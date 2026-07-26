@@ -28,6 +28,7 @@
  *   (c) WORKFLOW_DISPATCH not registered → structured failure, no execution
  *   (d) unknown workflowId → structured failure from the real dispatch, no row
  *   (e) malformed step (no workflowId) fails schema validation before dispatch
+ *   (f) a known workflow owned by another principal is denied before execution
  */
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
@@ -44,14 +45,21 @@ import {
   registerWorkflowDispatchService,
   type WorkflowDispatchResult,
 } from '../../src/services/workflow-dispatch';
+import { WorkflowService } from '../../src/services/workflow-service';
+import { getUserTagName } from '../../src/utils/context';
 import { type EmbeddedHarness, makeEmbeddedHarness } from './embedded-harness';
 
 setDefaultTimeout(60_000);
 
+const OWNER_ENTITY_ID = '11111111-1111-4111-8111-111111111111';
+const FOREIGN_OWNER_ENTITY_ID = '22222222-2222-4222-8222-222222222222';
+
 /** A runnable two-node workflow the nested dispatch executes for real. */
 async function createDispatchableWorkflow(
   workflow: EmbeddedWorkflowService,
-  name: string
+  name: string,
+  runtime: EmbeddedHarness['runtime'],
+  ownerEntityId = OWNER_ENTITY_ID
 ): Promise<string> {
   const created = await workflow.createWorkflow({
     name,
@@ -77,18 +85,19 @@ async function createDispatchableWorkflow(
       'Schedule Trigger': { main: [[{ node: 'Set', type: 'main', index: 0 }]] },
     },
   });
+  const ownerTag = await workflow.getOrCreateTag(await getUserTagName(runtime, ownerEntityId));
+  await workflow.updateWorkflowTags(created.id, [ownerTag.id]);
   return created.id;
 }
 
-/** The minimal owner-workflow definition the step args carry; only ownership
- * defaults are read from it by contributions, none by dispatch_workflow. */
+/** The minimal owner-workflow definition the step args carry. */
 function makeLifeOpsDefinition(): WorkflowStepExecuteArgs['definition'] {
   return {
     id: 'lifeops-wf-1',
     agentId: 'agent',
     domain: 'personal',
-    subjectType: 'agent',
-    subjectId: 'agent',
+    subjectType: 'owner',
+    subjectId: OWNER_ENTITY_ID,
     visibilityScope: 'owner_only',
     contextPolicy: 'default',
     title: 'Nested dispatch',
@@ -134,7 +143,10 @@ async function executeStepViaRegistry(
   const contribution = registry.get(String(step.kind));
   if (!contribution) throw new Error(`no contribution for kind ${step.kind}`);
   const validated = contribution.paramSchema.parse(step);
-  const ctx = { runtime: h.runtime } as unknown as WorkflowStepExecuteContext;
+  const ctx = {
+    runtime: h.runtime,
+    ownerEntityId: () => OWNER_ENTITY_ID,
+  } as unknown as WorkflowStepExecuteContext;
   return contribution.execute(validated, args, ctx);
 }
 
@@ -143,6 +155,12 @@ describe('dispatch_workflow step e2e (LifeOps registry -> WORKFLOW_DISPATCH -> e
 
   beforeEach(async () => {
     h = await makeEmbeddedHarness('dispatch-step-e2e-agent');
+    await h.runtime.registerPlugin({
+      name: 'workflow-owner-scope-integration-harness',
+      description: 'Owner-scoped workflow facade for nested dispatch coverage',
+      services: [WorkflowService],
+    });
+    await h.runtime.getServiceLoadPromise(WorkflowService.serviceType);
     registerWorkflowDispatchService(h.runtime);
     // The same wiring plugin-personal-assistant's init performs: default pack
     // registered into a registry bound to this runtime.
@@ -156,7 +174,11 @@ describe('dispatch_workflow step e2e (LifeOps registry -> WORKFLOW_DISPATCH -> e
   });
 
   test("(a) the step lands a real execution row and threads request + outputs into the nested run's triggerData", async () => {
-    const workflowId = await createDispatchableWorkflow(h.workflow, 'Nested digest');
+    const workflowId = await createDispatchableWorkflow(
+      h.workflow,
+      'Nested digest',
+      h.runtime
+    );
 
     const args = makeStepArgs({
       request: { reason: 'parent-run' },
@@ -197,7 +219,7 @@ describe('dispatch_workflow step e2e (LifeOps registry -> WORKFLOW_DISPATCH -> e
   });
 
   test('(b) two step fires sharing an idempotency key collapse onto one execution row', async () => {
-    const workflowId = await createDispatchableWorkflow(h.workflow, 'Nested dedup');
+    const workflowId = await createDispatchableWorkflow(h.workflow, 'Nested dedup', h.runtime);
 
     const step = {
       kind: 'dispatch_workflow',
@@ -232,7 +254,11 @@ describe('dispatch_workflow step e2e (LifeOps registry -> WORKFLOW_DISPATCH -> e
       const registry = createWorkflowStepRegistry();
       registerDefaultWorkflowStepPack(registry);
       registerWorkflowStepRegistry(missing.runtime, registry);
-      const workflowId = await createDispatchableWorkflow(missing.workflow, 'Nested orphan');
+      const workflowId = await createDispatchableWorkflow(
+        missing.workflow,
+        'Nested orphan',
+        missing.runtime
+      );
 
       const result = (await executeStepViaRegistry(
         missing,
@@ -270,5 +296,27 @@ describe('dispatch_workflow step e2e (LifeOps registry -> WORKFLOW_DISPATCH -> e
     await expect(
       executeStepViaRegistry(h, { kind: 'dispatch_workflow' }, makeStepArgs())
     ).rejects.toThrow();
+  });
+
+  test('(f) a known foreign workflow id is denied before any nested execution row exists', async () => {
+    const workflowId = await createDispatchableWorkflow(
+      h.workflow,
+      'Foreign nested workflow',
+      h.runtime,
+      FOREIGN_OWNER_ENTITY_ID
+    );
+
+    const result = (await executeStepViaRegistry(
+      h,
+      { kind: 'dispatch_workflow', workflowId },
+      makeStepArgs()
+    )) as WorkflowDispatchResult;
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'workflow not found or not owned by caller',
+    });
+    const { data: executions } = await h.workflow.listExecutions({ workflowId });
+    expect(executions).toHaveLength(0);
   });
 });

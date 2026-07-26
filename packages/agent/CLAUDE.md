@@ -62,7 +62,7 @@ src/
   services/               Business-logic services (capability-broker, permissions-registry, config-plugin-manager, plugin-installer/-compiler, relationships-graph, agent-export, shell-execution-router, tee-*, dstack-tee-provider, cove-quote)
   actions/                Eliza actions registered by createElizaPlugin (terminal, trigger, contact, settings, plugin, logs, runtime, database, memory, compact-conversation)
   providers/              Providers for createElizaPlugin (workspace, admin-trust/-panel, session, rolodex, recent/relevant-conversations, pending-permissions, escalation-trigger, page-scoped-context, ...)
-  triggers/               runtime.ts (registerTriggerTaskWorker), scheduling.ts, types.ts
+  triggers/               runtime.ts (task worker), scheduling.ts, subscription-policy.ts, types.ts
   auth/                   Credential storage + OAuth/Anthropic/OpenAI-Codex flows (account-storage, oauth-flow, refresh-mutex)
   security/               access.ts, audit-log.ts, network-policy.ts, mcp-server-config.ts (validateMcpServerConfig)
   awareness/              Re-exports AwarenessRegistry from @elizaos/shared
@@ -145,6 +145,7 @@ supervisor relaunches) — never a silent `process.exit`.
 - `core-plugins.ts` splits plugins into blocking vs deferred boot phases; slow feature/provider plugins must stay in the deferred set or boot regresses.
 - Several barrel re-exports avoid duplicate-symbol (`TS2308`) collisions and lazy-load heavy plugins (wallet, app-manager, elizacloud) — read the inline comments in `index.ts`/`api/index.ts`/`services/index.ts` before adding broad `export *` lines.
 - `lint`/`lint:check` only cover a curated subset of `src/` directories (see the script in `package.json`); `format` covers all of `src`.
+- Clock-driven managed Cloud triggers share one subscription policy in `triggers/subscription-policy.ts`: `dedicated-lazy` may keep disabled drafts and accept event/manual dispatch, but active `once`/`interval`/`cron` creation, enablement, and scheduler delivery require `dedicated-always`. Keep chat action responses and plugin-workflow's typed HTTP contract aligned with that policy.
 - TEE work (dstack) is gated behind `services/tee-boot-gate*` and validated by `scripts/validate-tee-*.mjs` + `scripts/tee-*-smoke.ts`; see `docs/tee-agent-implementation-plan.md`.
 - **Files / media storage.** Attachment bytes live in one content-addressed store, `api/media-store.ts` (`${STATE_DIR}/media/<sha256>.<ext>`, served pre-auth at `/api/media/<sha256>` with `nosniff` + a download `Content-Disposition` for SVG/active types). `services/file-storage.ts` (`LocalFileStorageService`, fills `ServiceType.REMOTE_FILES`) is the contract the rest of the system resolves via `runtime.getService(ServiceType.REMOTE_FILES)` — `store`/`getUrl`/`list`/`delete`; the authenticated `api/files-routes.ts` (`GET`/`DELETE /api/files`) and the `actions/files.ts` `FILES` agent tool both go through it. `api/media-runtime.ts` rehosts inline `data:` and remote generated-media URLs into the store on the outgoing path (SSRF-guarded) and runs the reference-aware orphan GC (which also counts document `metadata.mediaUrl`). Do NOT add a second file store, a `files` DB table, or a refcount/GC engine — see issue #8876 and the root AGENTS.md anti-pattern clause.
 

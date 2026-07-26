@@ -139,14 +139,32 @@ describe('runWorkflowWithSmithers (in-process Smithers engine)', () => {
     const { result } = await runCase('continue');
 
     expect(result.status).toBe('success');
-    expect(result.errorItem).toBe('boom');
+    expect(result.errorItem).toBe('Workflow node execution failed');
+    expect(result.errorCode).toBe('WORKFLOW_NODE_EXECUTION_FAILED');
+  }, 60_000);
+
+  it('keeps safe operational detail for continueOnFail without reflecting node secrets', async () => {
+    const { result, stdout, stderr } = await runCase('continue-known-error');
+
+    expect(result.status).toBe('success');
+    expect(result.errorItem).toEqual({
+      error: 'HTTP request failed with status 503',
+      errorCode: 'WORKFLOW_HTTP_STATUS_ERROR',
+      errorContext: {
+        method: 'POST',
+        statusCode: 503,
+      },
+    });
+    expect(JSON.stringify({ result, stdout, stderr })).not.toContain(
+      'smithers-continue-secret-8fd027'
+    );
   }, 60_000);
 
   it('fails the run when a node throws without retry or continueOnFail', async () => {
     const { result } = await runCase('fail');
 
     expect(result.threw).toBe(true);
-    expect(String(result.message)).toContain('fatal');
+    expect(result.message).toBe('Workflow node execution failed');
   }, 60_000);
 
   it('kills a stalled workflow at the configured execution deadline', async () => {
@@ -173,17 +191,22 @@ describe('runWorkflowWithSmithers (in-process Smithers engine)', () => {
     expect(Number(result.elapsedMs)).toBeGreaterThanOrEqual(1_400);
   }, 60_000);
 
-  it('preserves typed node failures across the Smithers subprocess boundary', async () => {
+  it('redacts arbitrary typed node failures across the Smithers subprocess boundary', async () => {
     const { result } = await runCase('typed-node-error');
 
-    expect(result.code).toBe('WORKFLOW_NODE_TYPED_FAILURE');
-    expect(result.context).toEqual({ boundary: 'fixture' });
+    expect(result.code).toBe('WORKFLOW_NODE_EXECUTION_FAILED');
+    expect(result.context).toEqual({
+      workflowId: expect.any(String),
+      executionId: expect.any(String),
+    });
+    expect(JSON.stringify(result)).not.toContain('typed node failure');
+    expect(JSON.stringify(result)).not.toContain('boundary');
   }, 60_000);
 
   it('surfaces the fatal parallel branch instead of an intentionally continued failure', async () => {
     const { result } = await runCase('parallel-fatal-error');
 
-    expect(result.code).toBe('FATAL_BRANCH_FAILURE');
+    expect(result.code).toBe('WORKFLOW_NODE_EXECUTION_FAILED');
   }, 60_000);
 
   it('delivers workflow results larger than the subprocess pipe buffer without truncation', async () => {

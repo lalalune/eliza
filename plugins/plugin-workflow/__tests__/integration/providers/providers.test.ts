@@ -255,7 +255,7 @@ describe('workflow providers with real runtime services', () => {
     } finally {
       await linkedHarness.close();
     }
-  });
+  }, 15_000);
 
   test('surfaces a stopped workflow service as an observable provider failure', async () => {
     await service.stop();

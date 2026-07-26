@@ -18,16 +18,27 @@ function hasCompatApiToken(): boolean {
 
 function hasCloudApiKeyProvisioning(): boolean {
   return (
-    readAliasedEnv("ELIZAOS_CLOUD_ENABLED") === "true" &&
+    isCloudFlagEnabled(readAliasedEnv("ELIZAOS_CLOUD_ENABLED")) &&
     hasValue(readAliasedEnv("ELIZAOS_CLOUD_API_KEY"))
   );
 }
 
-export function isCloudProvisionedContainer(): boolean {
-  const hasCloudFlag = readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+/** Parse the two supported spellings for Cloud topology flags. */
+export function isCloudFlagEnabled(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true";
+}
 
+/** Whether the alias-resolved provisioning flag marks this process as managed. */
+export function isCloudProvisionedEnvironment(): boolean {
+  return isCloudFlagEnabled(readAliasedEnv("ELIZA_CLOUD_PROVISIONED"));
+}
+
+export function isCloudProvisionedContainer(): boolean {
   return (
-    hasCloudFlag &&
+    isCloudProvisionedEnvironment() &&
     (hasValue(process.env.STEWARD_AGENT_TOKEN) ||
       hasCompatApiToken() ||
       hasCloudApiKeyProvisioning())

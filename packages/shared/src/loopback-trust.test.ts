@@ -269,6 +269,11 @@ describe("isTrustedLocalRequest — app-core policy gates (cloudCheck=env, dev b
     expect(isTrustedLocalRequest(localReq(), APP_CORE_OPTIONS)).toBe(false);
   });
 
+  it("cloudCheck=env: raw ELIZA_CLOUD_PROVISIONED=true denies trust", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+    expect(isTrustedLocalRequest(localReq(), APP_CORE_OPTIONS)).toBe(false);
+  });
+
   it("cloudCheck=env: branded cloud-provisioned alias denies trust without syncing env", () => {
     setBootConfig({
       ...savedConfig,
@@ -308,6 +313,12 @@ describe("isTrustedLocalRequest — agent policy gates (cloudCheck=container, no
 
   it("cloudCheck=container: flag + STEWARD_AGENT_TOKEN denies trust", () => {
     process.env.ELIZA_CLOUD_PROVISIONED = "1";
+    process.env.STEWARD_AGENT_TOKEN = "steward-token";
+    expect(isTrustedLocalRequest(localReq(), AGENT_OPTIONS)).toBe(false);
+  });
+
+  it("cloudCheck=container: true flag + provisioning token denies trust", () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = "true";
     process.env.STEWARD_AGENT_TOKEN = "steward-token";
     expect(isTrustedLocalRequest(localReq(), AGENT_OPTIONS)).toBe(false);
   });

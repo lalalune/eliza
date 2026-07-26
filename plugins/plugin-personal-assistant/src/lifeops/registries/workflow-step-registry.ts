@@ -40,6 +40,10 @@ export interface WorkflowStepExecuteContext {
     updateBrowserSession(session: LifeOpsBrowserSession): Promise<void>;
   };
 
+  /** Canonical owner configured at the LifeOps service boundary. Nested
+   * workflows use this trusted identity rather than step parameters. */
+  ownerEntityId(): string;
+
   createDefinition(
     request: CreateLifeOpsDefinitionRequest,
   ): Promise<LifeOpsDefinitionRecord>;

@@ -16,7 +16,7 @@
  */
 
 import { type CharacterSettings, logger } from "@elizaos/core";
-import type { AgentConfig } from "@elizaos/shared";
+import { type AgentConfig, isCloudFlagEnabled } from "@elizaos/shared";
 import type { ElizaConfig } from "../config/config.ts";
 
 /** Raw character shape as stored in `agent_sandboxes.agent_config`. */
@@ -225,14 +225,14 @@ const CONNECTOR_CONFIG_KEYS = ["discord", "telegram"] as const;
  * repopulate the env tokens from config.connectors) and BEFORE plugin
  * auto-enable / resolvePlugins.
  *
- * Skipped outside a provisioned container (ELIZA_CLOUD_PROVISIONED != "1"), so
+ * Skipped outside a provisioned container, so
  * local dev and the in-worker path are unaffected.
  */
 export function applySandboxConnectorOwnership(
   env: NodeJS.ProcessEnv = process.env,
   config?: ElizaConfig,
 ): void {
-  if (env.ELIZA_CLOUD_PROVISIONED !== "1") return;
+  if (!isCloudFlagEnabled(env.ELIZA_CLOUD_PROVISIONED)) return;
   if (sandboxOwnsConnectors(env)) return;
 
   const stripped: string[] = [];

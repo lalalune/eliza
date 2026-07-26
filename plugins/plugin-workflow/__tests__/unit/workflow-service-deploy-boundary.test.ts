@@ -3,7 +3,7 @@
  * The embedded client is a deterministic protocol peer; no model is involved.
  */
 import { describe, expect, mock, test } from 'bun:test';
-import type { IAgentRuntime } from '@elizaos/core';
+import { AgentRuntime, createCharacter, stringToUuid } from '@elizaos/core';
 import { DEVICE_HEALTH_CHECK_WORKFLOW_ID } from '../../src/services/embedded-workflow-service';
 import { WorkflowService } from '../../src/services/workflow-service';
 import { WorkflowApiError, type WorkflowDefinition } from '../../src/types/index';
@@ -37,13 +37,20 @@ function setWorkflow(assignments: Array<Record<string, unknown>>): WorkflowDefin
   };
 }
 
-function runtime(): IAgentRuntime {
-  return {
-    agentId: '00000000-0000-4000-8000-000000000001',
-    character: { settings: {} },
-    getService: () => null,
-    getEntityById: async () => null,
-  } as unknown as IAgentRuntime;
+function runtime(): AgentRuntime {
+  const agentId = stringToUuid('00000000-0000-4000-8000-000000000001');
+  return Object.assign(
+    new AgentRuntime({
+      agentId,
+      character: createCharacter({ id: agentId, name: 'Workflow deploy-boundary test agent' }),
+      enableAutonomy: false,
+      logLevel: 'fatal',
+    }),
+    {
+      getService: () => null,
+      getEntityById: async () => null,
+    }
+  );
 }
 
 async function harness(overrides: Record<string, unknown> = {}) {

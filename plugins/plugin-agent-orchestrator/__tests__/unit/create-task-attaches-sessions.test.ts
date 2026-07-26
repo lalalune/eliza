@@ -23,6 +23,8 @@
  *      the minted task is NOT falsely promoted to `active` and its
  *      `activeSessionCount` stays 0, because every attached session is already
  *      terminal. This is the regression the stale-status bug produced.
+ *   5. Prompt failure remains durable — the task and its error event survive
+ *      the rejected prompt so the workbench and wave supervisor see the lane.
  *
  * These complement `create-task-emits-widget-block.test.ts` (which pins the
  * mint+widget-block contract) and `attach-session.test.ts` (which pins the
@@ -37,6 +39,7 @@ import { createTaskAction } from "../../src/actions/tasks.js";
 import { OrchestratorTaskService } from "../../src/services/orchestrator-task-service.js";
 import { OrchestratorTaskStore } from "../../src/services/orchestrator-task-store.js";
 import {
+  runtimeWith as actionRuntimeWith,
   callback,
   memory,
   serviceMock,
@@ -164,7 +167,7 @@ function runtimeWithServices(opts: {
       }
     | OrchestratorTaskService;
 }): IAgentRuntime {
-  return {
+  return Object.assign(actionRuntimeWith(opts.acp), {
     getService: vi.fn((serviceType: string) => {
       if (
         serviceType === "ACP_SERVICE" ||
@@ -177,10 +180,8 @@ function runtimeWithServices(opts: {
       }
       return null;
     }),
-    hasService: vi.fn(() => true),
-    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     getSetting: vi.fn(() => undefined),
-  } as never;
+  });
 }
 
 describe("TASKS:create attaches spawned sessions to the minted task thread", () => {
@@ -324,8 +325,10 @@ describe("TASKS:create attaches spawned sessions to the minted task thread", () 
     const acp = statefulAcp();
     const store = new OrchestratorTaskStore({ backend: "memory" });
     const taskService = new OrchestratorTaskService(
-      { getService: () => acp, logger: console } as never,
-      { store },
+      runtimeWithServices({ acp }),
+      {
+        store,
+      },
     );
     await taskService.start();
 
@@ -371,5 +374,60 @@ describe("TASKS:create attaches spawned sessions to the minted task thread", () 
     expect(detail?.status).toBe("validating");
     expect(detail?.sessions[0]?.status).toBe("completed");
     expect(detail?.sessions[0]?.stoppedAt).toBeTypeOf("number");
+  });
+
+  it("keeps a rejected direct prompt durably visible as a failed task", async () => {
+    const acp = statefulAcp();
+    acp.sendPrompt.mockRejectedValueOnce(new Error("lane prompt failed"));
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const taskService = new OrchestratorTaskService(
+      runtimeWithServices({ acp }),
+      {
+        store,
+      },
+    );
+    await taskService.start();
+
+    try {
+      const result = await createTaskAction.handler(
+        runtimeWithServices({ acp, taskService }),
+        memory({}),
+        state,
+        {
+          parameters: {
+            action: "create",
+            title: "Persist failed lane",
+            goal: "Keep the failed lane observable",
+            task: "run the lane",
+            agentType: "codex",
+            workdir: os.tmpdir(),
+            approvalPreset: "readonly",
+            timeout_ms: 1000,
+          },
+        },
+        callback(),
+      );
+
+      expect(result?.success).toBe(false);
+      await vi.waitFor(async () => {
+        const tasks = await taskService.listTasks();
+        expect(tasks).toHaveLength(1);
+        expect(tasks[0]?.status).toBe("failed");
+      });
+      const [task] = await taskService.listTasks();
+      if (!task) throw new Error("expected the rejected lane task to persist");
+      const detail = await taskService.getTask(task.id);
+      expect(detail?.sessionCount).toBe(1);
+      expect(detail?.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "error",
+            summary: "lane prompt failed",
+          }),
+        ]),
+      );
+    } finally {
+      await taskService.stop();
+    }
   });
 });

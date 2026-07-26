@@ -73,6 +73,15 @@ describe("issue #13422 P8 aliased reads resolve a branded prefix with zero mirro
     expect(process.env).toEqual(before);
   });
 
+  it("accepts a branded true provisioning flag with a token", () => {
+    process.env.MILADY_CLOUD_PROVISIONED = " TrUe ";
+    process.env.MILADY_API_TOKEN = "milady-inbound-token";
+
+    expect(isCloudProvisionedContainer()).toBe(true);
+    expect(process.env.ELIZA_CLOUD_PROVISIONED).toBeUndefined();
+    expect(process.env.ELIZA_API_TOKEN).toBeUndefined();
+  });
+
   it("canonical ELIZA_CLOUD_PROVISIONED wins over the branded alias", () => {
     // Canonical "0" beats branded "1": provisioning gate stays closed.
     process.env.ELIZA_CLOUD_PROVISIONED = "0";

@@ -8,7 +8,7 @@ import type { IAgentRuntime } from '@elizaos/core';
 import { readAliasedEnv } from '@elizaos/shared';
 import type { WorkflowService } from '../services/workflow-service';
 import { WORKFLOW_SERVICE_TYPE } from '../services/workflow-service';
-import { getLocalOwnerEntityId } from '../utils/context';
+import { getLocalOwnerEntityId, isManagedCloudEnvironment } from '../utils/context';
 
 /**
  * Extract WorkflowService from runtime services
@@ -39,7 +39,7 @@ export function getRouteOwnerEntityId(runtime: IAgentRuntime): string {
  * back to the local owner would merge every paired Cloud user into one tenant.
  */
 export function isCloudWorkflowPrincipalRequired(): boolean {
-  return readAliasedEnv('ELIZA_CLOUD_PROVISIONED') === '1';
+  return isManagedCloudEnvironment();
 }
 
 /**

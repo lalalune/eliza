@@ -10,6 +10,7 @@ import { createInterface } from 'node:readline/promises';
 import { __builderInternals, Smithers, type WorkflowGraph } from '@smithers-orchestrator/engine';
 import { Effect, Schema } from 'effect';
 import type { WorkflowNode } from '../types/index';
+import { serializeWorkflowExecutionError } from './workflow-execution-error';
 
 interface NodeExecutionData {
   json: Record<string, unknown>;
@@ -46,7 +47,6 @@ interface WorkerPayload {
 
 interface ProtocolErrorPayload {
   message?: string;
-  stack?: string;
   code?: string;
   context?: Record<string, unknown>;
 }
@@ -61,11 +61,6 @@ interface ProtocolResponse {
 interface PendingRequest {
   resolve: (outputData: NodeOutputData) => void;
   reject: (error: Error) => void;
-}
-
-interface NodeFailure {
-  nodeName: string;
-  message: string;
 }
 
 interface StepRunEntry {
@@ -105,10 +100,6 @@ interface NodeExecutionError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? (error.stack ?? error.message) : String(error);
 }
 
 function isNodeExecutionData(value: unknown): value is NodeExecutionData {
@@ -230,7 +221,6 @@ function parseProtocolResponse(value: unknown): ProtocolResponse | null {
   const error: ProtocolErrorPayload | undefined = isRecord(rawError)
     ? {
         ...(typeof rawError.message === 'string' ? { message: rawError.message } : {}),
-        ...(typeof rawError.stack === 'string' ? { stack: rawError.stack } : {}),
         ...(typeof rawError.code === 'string' ? { code: rawError.code } : {}),
         ...(isRecord(rawError.context) ? { context: rawError.context } : {}),
       }
@@ -249,8 +239,10 @@ let payload: WorkerPayload;
 try {
   const parsed: unknown = JSON.parse(await Bun.file(3).text());
   payload = parseWorkerPayload(parsed);
-} catch (error) {
-  writeSync(2, `${errorMessage(error)}\n`);
+} catch {
+  // error-policy:J1 the worker process boundary emits a fixed failure rather
+  // than reflecting malformed payload data into stderr.
+  writeSync(2, 'Smithers worker payload was invalid\n');
   process.exit(1);
 }
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -266,7 +258,6 @@ const metrics: WorkerMetrics = {
   skipped: 0,
   retries: 0,
 };
-let lastNodeError: NodeFailure | null = null;
 
 function emit(message: Record<string, unknown>): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -308,10 +299,6 @@ function isStepResult(value: unknown): value is StepResult {
   );
 }
 
-function currentNodeFailure(): NodeFailure | null {
-  return lastNodeError;
-}
-
 // Smithers 0.28's public graph-factory declaration incorrectly types `needs`
 // as compiled handles even though the factory and compiler consume graph refs.
 // Constructing the documented graph expression through the exported helper
@@ -349,12 +336,12 @@ void (async () => {
     if (!entry) continue;
     pending.delete(response.requestId);
     if (!response.ok) {
-      const error: NodeExecutionError = new Error(
-        response.error?.message ?? 'Node execution failed'
-      );
-      if (response.error?.stack) error.stack = response.error.stack;
-      if (response.error?.code) error.code = response.error.code;
-      if (response.error?.context) error.context = response.error.context;
+      const safeError = serializeWorkflowExecutionError(response.error, {
+        fallbackCode: 'WORKFLOW_NODE_EXECUTION_FAILED',
+      });
+      const error: NodeExecutionError = new Error(safeError.message);
+      error.code = safeError.code;
+      if (safeError.context) error.context = safeError.context;
       entry.reject(error);
       continue;
     }
@@ -468,7 +455,6 @@ async function runNodeWithPolicy(
       return { outputData: await sendNodeRequest(node.name, inputData), retries };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      lastNodeError = { nodeName: node.name, message: lastError.message };
       if (attempt < maxAttempts) {
         retries += 1;
         metrics.retries += 1;
@@ -478,8 +464,21 @@ async function runNodeWithPolicy(
   }
   if (!lastError) throw new Error(`Node execution exhausted without an error: ${node.name}`);
   if (node.continueOnFail) {
+    const safeError = serializeWorkflowExecutionError(lastError, {
+      fallbackCode: 'WORKFLOW_NODE_EXECUTION_FAILED',
+    });
     return {
-      outputData: [[{ json: { error: lastError.message } }]],
+      outputData: [
+        [
+          {
+            json: {
+              error: safeError.message,
+              errorCode: safeError.code,
+              ...(safeError.context ? { errorContext: safeError.context } : {}),
+            },
+          },
+        ],
+      ],
       retries,
     };
   }
@@ -656,10 +655,14 @@ try {
   await emit({ type: 'workflowResult', execution, metrics });
   process.exit(0);
 } catch (error) {
-  const nodeFailure = currentNodeFailure();
-  const nodeDiagnostic = nodeFailure
-    ? `Node "${nodeFailure.nodeName}" failed: ${nodeFailure.message}\n`
-    : '';
-  writeSync(2, `${nodeDiagnostic}${errorMessage(error)}\n`);
+  // error-policy:J1 stderr is an operator diagnostic boundary. The same fixed
+  // envelope used for persisted results prevents secrets in node failures from
+  // escaping through child-process capture.
+  const safeError = serializeWorkflowExecutionError(error, {
+    fallbackCode: 'SMITHERS_WORKFLOW_FAILED',
+    workflowId: payload.pending.workflowId as string | undefined,
+    executionId: payload.executionId,
+  });
+  writeSync(2, `${JSON.stringify(safeError)}\n`);
   process.exit(1);
 }

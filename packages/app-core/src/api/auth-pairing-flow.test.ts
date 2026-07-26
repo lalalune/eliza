@@ -392,4 +392,26 @@ describe("production device-pairing auth path — real DB + real HTTP (#13692)",
       delete process.env.ELIZA_PAIRING_DISABLED;
     }
   });
+
+  it('goes dark in a managed container using ELIZA_CLOUD_PROVISIONED="true"', async () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+    try {
+      const code = await request(harness.baseUrl, {
+        method: "GET",
+        path: "/api/auth/pair-code",
+      });
+      expect(code.status).toBe(503);
+      expect(code.json).toMatchObject({ error: "Pairing not enabled" });
+
+      const pair = await request(harness.baseUrl, {
+        method: "POST",
+        path: "/api/auth/pair",
+        body: { code: "ANY0-CODE-HERE" },
+      });
+      expect(pair.status).toBe(403);
+      expect(pair.json).toMatchObject({ error: "Pairing disabled" });
+    } finally {
+      delete process.env.ELIZA_CLOUD_PROVISIONED;
+    }
+  });
 });

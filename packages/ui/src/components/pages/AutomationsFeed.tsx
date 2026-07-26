@@ -50,6 +50,7 @@ import {
   directCloudSharedAgentIdFromBase,
 } from "../../utils/cloud-agent-base";
 import { formatSchedule } from "../../utils/cron-format";
+import { formatDateTime } from "../../utils/format";
 import { mergeUnifiedTasks } from "../../utils/merge-unified-tasks";
 import { openExternalUrl } from "../../utils/openExternalUrl";
 import { PagePanel } from "../composites/page-panel";
@@ -61,6 +62,7 @@ import { StatusDot } from "../ui/status-badge";
 import { ShellViewAgentSurface } from "../views/ShellViewAgentSurface";
 import { ScheduledTaskEditor } from "./ScheduledTaskEditor";
 import { TaskEditor } from "./TaskEditor";
+import { EVENT_KIND_OPTIONS } from "./trigger-form-utils";
 import { WorkflowEditor } from "./WorkflowEditor";
 import {
   SHOW_AUTOMATIONS_LIST_EVENT,
@@ -176,6 +178,14 @@ function schedulesLabel(
       .map((trigger) => {
         if (trigger.cronExpression)
           return formatSchedule(trigger.cronExpression);
+        if (trigger.triggerType === "once" && trigger.scheduledAtIso) {
+          const scheduledTime = formatDateTime(trigger.scheduledAtIso, {
+            fallback: trigger.scheduledAtIso,
+          });
+          return t("automationsfeed.onceAt", {
+            defaultValue: `Once at ${scheduledTime}`,
+          });
+        }
         if (trigger.triggerType === "event" && trigger.eventKind) {
           return t("automationsfeed.onEvent", {
             event: trigger.eventKind,
@@ -589,6 +599,27 @@ export function AutomationsFeed({
   const rows = useMemo(() => {
     return allRows.filter((r) => passesFilter(r, filter));
   }, [allRows, filter]);
+  const availableEvents = useMemo(() => {
+    const events = new Map<string, string>(
+      EVENT_KIND_OPTIONS.map((option) => [
+        option.value,
+        t(option.labelKey, { defaultValue: option.defaultLabel }),
+      ]),
+    );
+    for (const item of data?.automations ?? []) {
+      const triggers = item.trigger
+        ? [item.trigger, ...item.schedules]
+        : item.schedules;
+      for (const trigger of triggers) {
+        if (trigger.triggerType === "event" && trigger.eventKind) {
+          if (!events.has(trigger.eventKind)) {
+            events.set(trigger.eventKind, trigger.eventKind);
+          }
+        }
+      }
+    }
+    return [...events].map(([id, label]) => ({ id, label }));
+  }, [data, t]);
 
   const filterCounts = useMemo<Record<FeedFilter, number>>(
     () => ({
@@ -678,12 +709,12 @@ export function AutomationsFeed({
     // Item vanished (e.g. refreshed away) — fall through to the list.
   }
   if (editor.kind === "task") {
-    // `editor.taskId` is a workbench-task id for a plain task, or a trigger id
-    // for a prompt-kind (recurring/event) automation.
+    // Canonical rows use trigger ids. The task-id fallback keeps old deep links
+    // readable without restoring the retired Workbench write path.
     const existing =
       editor.taskId && data
-        ? (data.automations.find((a) => a.task?.id === editor.taskId) ??
-          data.automations.find((a) => a.triggerId === editor.taskId))
+        ? (data.automations.find((a) => a.triggerId === editor.taskId) ??
+          data.automations.find((a) => a.task?.id === editor.taskId))
         : null;
     const trigger = existing?.trigger;
     const initial =
@@ -694,19 +725,25 @@ export function AutomationsFeed({
             prompt: trigger.instructions,
             scheduleKind: (trigger.triggerType === "event"
               ? "event"
-              : "recurring") as "event" | "recurring",
+              : trigger.triggerType === "cron"
+                ? "recurring"
+                : "once") as "event" | "recurring" | "once",
+            scheduledAtIso: trigger.scheduledAtIso ?? "",
             cronExpression: trigger.cronExpression ?? "",
             eventName: trigger.eventKind ?? "",
           }
         : {
-            id: existing?.task?.id,
-            name: existing?.task?.name,
-            prompt: existing?.task?.description,
+            name: existing?.task?.name ?? existing?.title,
+            prompt: existing?.task?.description ?? existing?.description,
             scheduleKind: "once" as const,
           };
     return (
       <TaskEditor
         initial={initial}
+        cloudAgentId={cloudAgentIdFromApiBase(apiBaseUrl)}
+        onEnableAlwaysOn={openDedicatedUpgrade}
+        availableEvents={availableEvents}
+        readOnly={existing?.source === "workbench_task"}
         onSaved={() => {
           setEditor({ kind: "none" });
           void refresh();
@@ -922,13 +959,14 @@ export function AutomationsFeed({
                             itemId: row.source.id,
                           });
                         } else if (row.kind === "task") {
-                          // A prompt-kind trigger has no backing workbench task —
-                          // key the editor by its trigger id instead.
+                          // A Workbench id is retained only so legacy rows can
+                          // still open in the editor's read-only mode.
                           setEditor({
                             kind: "task",
                             taskId:
-                              row.source.task?.id ??
                               row.source.triggerId ??
+                              row.source.task?.id ??
+                              row.source.taskId ??
                               null,
                           });
                         } else {

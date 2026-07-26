@@ -225,9 +225,9 @@ describe("WorkflowEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /run now/i }));
 
     await waitFor(() => {
-      expect(clientMock.runWorkflowDefinition).toHaveBeenCalledWith(
+      expect(clientMock.runWorkflowDefinition.mock.calls).toContainEqual([
         "workflow-1",
-      );
+      ]);
     });
     expect(await screen.findByText("Add Review Fields")).toBeTruthy();
     expect(
@@ -277,9 +277,8 @@ describe("WorkflowEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /copy eval samples/i }));
 
     await waitFor(() => {
-      expect(clientMock.getWorkflowEvaluationSamples).toHaveBeenCalledWith(
-        "workflow-1",
-        10,
+      expect(clientMock.getWorkflowEvaluationSamples.mock.calls).toContainEqual(
+        ["workflow-1", 10],
       );
     });
     expect(clipboardWriteText).toHaveBeenCalledWith(
@@ -300,7 +299,7 @@ describe("WorkflowEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
     await waitFor(() => {
-      expect(clientMock.createWorkflowDefinition).toHaveBeenCalled();
+      expect(clientMock.createWorkflowDefinition.mock.calls).toHaveLength(1);
     });
     expect(onSaved).toHaveBeenCalledWith(saved);
     expect(
@@ -319,17 +318,17 @@ describe("WorkflowEditor", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /activate/i }));
     await waitFor(() => {
-      expect(clientMock.activateWorkflowDefinition).toHaveBeenCalledWith(
+      expect(clientMock.activateWorkflowDefinition.mock.calls).toContainEqual([
         "workflow-1",
-      );
+      ]);
     });
     expect(onChanged).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: /run now/i }));
     await waitFor(() => {
-      expect(clientMock.runWorkflowDefinition).toHaveBeenCalledWith(
+      expect(clientMock.runWorkflowDefinition.mock.calls).toContainEqual([
         "workflow-1",
-      );
+      ]);
     });
     expect(onChanged).toHaveBeenCalledTimes(2);
   });
@@ -387,7 +386,7 @@ describe("WorkflowEditor", () => {
     }) as HTMLButtonElement;
     expect(blockedRunButton.disabled).toBe(true);
     fireEvent.click(blockedRunButton);
-    expect(clientMock.runWorkflowDefinition).toHaveBeenCalledTimes(1);
+    expect(clientMock.runWorkflowDefinition.mock.calls).toHaveLength(1);
 
     fireEvent.click(
       screen.getByRole("button", { name: /refresh workflow runs/i }),
@@ -443,10 +442,10 @@ describe("WorkflowEditor", () => {
     fireEvent.click(restoreButton);
 
     await waitFor(() => {
-      expect(clientMock.restoreWorkflowRevision).toHaveBeenCalledWith(
+      expect(clientMock.restoreWorkflowRevision.mock.calls).toContainEqual([
         "workflow-1",
         "version-previous",
-      );
+      ]);
     });
     expect(await screen.findByText("Restored workflow")).toBeTruthy();
   });

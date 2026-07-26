@@ -83,6 +83,15 @@ describe("applyCloudConfigToEnv cloud-container embeddings (#8769)", () => {
     expect(process.env.ELIZAOS_CLOUD_USE_INFERENCE).toBe("true");
   });
 
+  it('treats ELIZA_CLOUD_PROVISIONED="true" as managed topology', () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+
+    applyCloudConfigToEnv({} as ElizaConfig);
+
+    expect(process.env.ELIZAOS_CLOUD_USE_INFERENCE).toBe("true");
+    expect(process.env.ELIZAOS_CLOUD_ENABLED).toBe("true");
+  });
+
   it("honors BYO embedding ownership from config.env in a cloud-provisioned container", () => {
     process.env.ELIZA_CLOUD_PROVISIONED = "1";
 

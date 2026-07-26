@@ -181,6 +181,17 @@ describe("collectPluginNames cloud-container operator defaults", () => {
     expect(names.has("@elizaos/plugin-cli-inference")).toBe(true);
   });
 
+  it('applies cloud-container defaults for ELIZA_CLOUD_PROVISIONED="true"', () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = " TrUe ";
+
+    const names = collectPluginNames({} as ElizaConfig);
+
+    expect(names.has("agent-orchestrator")).toBe(true);
+    expect(names.has("@elizaos/plugin-pty")).toBe(true);
+    expect(names.has("@elizaos/plugin-cli-inference")).toBe(true);
+    expect(names.has("@elizaos/plugin-local-inference")).toBe(false);
+  });
+
   it("keeps ELIZA_AGENT_ORCHESTRATOR=0 authoritative on cloud containers", () => {
     process.env.ELIZA_CLOUD_PROVISIONED = "1";
     process.env.ELIZA_AGENT_ORCHESTRATOR = "0";

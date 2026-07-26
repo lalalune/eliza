@@ -235,9 +235,9 @@ async function workflowScheduleTasks(
 
 describe('local workflow route/chat ownership and lifecycle', () => {
   test('Cloud routes require an attested principal and isolate users within one organization', async () => {
-    process.env.ELIZA_CLOUD_PROVISIONED = '1';
+    process.env.ELIZA_CLOUD_PROVISIONED = 'true';
     process.env.ELIZA_API_TOKEN = 'per-agent-principal-proof';
-    const { baseUrl } = await makeHarness();
+    const { harness, baseUrl } = await makeHarness();
     const ownerA = stringToUuid('cloud-workflow-owner-a');
     const ownerB = stringToUuid('cloud-workflow-owner-b');
     const trustedHeaders = (owner: string) => ({
@@ -253,13 +253,15 @@ describe('local workflow route/chat ownership and lifecycle', () => {
         'x-eliza-principal-token': 'caller-controlled-secret',
       },
     ]) {
-      const denied = await requestJson(baseUrl, '/api/automations', {
-        ...(headers ? { headers } : {}),
-      });
-      expect(denied.status).toBe(401);
-      expect(denied.body).toMatchObject({
-        code: 'workflow_principal_required',
-      });
+      for (const path of ['/api/automations', '/api/workbench/todos']) {
+        const denied = await requestJson(baseUrl, path, {
+          ...(headers ? { headers } : {}),
+        });
+        expect(denied.status).toBe(401);
+        expect(denied.body).toMatchObject({
+          code: 'workflow_principal_required',
+        });
+      }
     }
 
     const createdA = await requestJson(baseUrl, '/api/workflow/workflows', {
@@ -287,6 +289,66 @@ describe('local workflow route/chat ownership and lifecycle', () => {
     expect(listB.body.workflows).toEqual([
       expect.objectContaining({ id: createdB.body.id, name: 'Owner B workflow' }),
     ]);
+
+    const todoCreatedA = await requestJson(baseUrl, '/api/workbench/todos', {
+      method: 'POST',
+      body: { name: 'Owner A private todo' },
+      headers: trustedHeaders(ownerA),
+    });
+    const todoCreatedB = await requestJson(baseUrl, '/api/workbench/todos', {
+      method: 'POST',
+      body: { name: 'Owner B private todo' },
+      headers: trustedHeaders(ownerB),
+    });
+    expect(todoCreatedA.status).toBe(201);
+    expect(todoCreatedB.status).toBe(201);
+    const todoA = todoCreatedA.body.todo as Record<string, unknown>;
+    const todoB = todoCreatedB.body.todo as Record<string, unknown>;
+    const persistedTodos = await harness.runtime.getTasks({});
+    expect(persistedTodos.filter((task) => task.tags?.includes('workbench-todo'))).toHaveLength(2);
+    const todoListA = await requestJson(baseUrl, '/api/workbench/todos', {
+      headers: trustedHeaders(ownerA),
+    });
+    const todoListB = await requestJson(baseUrl, '/api/workbench/todos', {
+      headers: trustedHeaders(ownerB),
+    });
+    expect(todoListA.body.todos).toEqual([
+      expect.objectContaining({ id: todoA.id, name: 'Owner A private todo' }),
+    ]);
+    expect(todoListB.body.todos).toEqual([
+      expect.objectContaining({ id: todoB.id, name: 'Owner B private todo' }),
+    ]);
+
+    const foreignTodoPath = `/api/workbench/todos/${String(todoA.id)}`;
+    const foreignAttempts = await Promise.all([
+      requestJson(baseUrl, foreignTodoPath, { headers: trustedHeaders(ownerB) }),
+      requestJson(baseUrl, foreignTodoPath, {
+        method: 'PUT',
+        body: { name: 'Cross-tenant overwrite' },
+        headers: trustedHeaders(ownerB),
+      }),
+      requestJson(baseUrl, `${foreignTodoPath}/complete`, {
+        method: 'POST',
+        body: { isCompleted: true },
+        headers: trustedHeaders(ownerB),
+      }),
+      requestJson(baseUrl, foreignTodoPath, {
+        method: 'DELETE',
+        headers: trustedHeaders(ownerB),
+      }),
+    ]);
+    for (const attempt of foreignAttempts) {
+      expect(attempt.status).toBe(404);
+      expect(attempt.body).toMatchObject({ error: 'Todo not found' });
+    }
+    const todoAfterForeignAttempts = await requestJson(baseUrl, foreignTodoPath, {
+      headers: trustedHeaders(ownerA),
+    });
+    expect(todoAfterForeignAttempts.status).toBe(200);
+    expect(todoAfterForeignAttempts.body.todo).toMatchObject({
+      name: 'Owner A private todo',
+      isCompleted: false,
+    });
 
     const runPath = `/api/workflow/workflows/${String(createdA.body.id)}/run`;
     const firstRun = await requestJson(baseUrl, runPath, {
@@ -322,6 +384,24 @@ describe('local workflow route/chat ownership and lifecycle', () => {
     expect((distinctRun.body.execution as WorkflowExecution).id).not.toBe(
       (firstRun.body.execution as WorkflowExecution).id
     );
+  });
+
+  test('local workbench todo routes remain usable without Cloud principal headers', async () => {
+    const { baseUrl } = await makeHarness();
+    const created = await requestJson(baseUrl, '/api/workbench/todos', {
+      method: 'POST',
+      body: { name: 'Local todo' },
+    });
+    expect(created.status).toBe(201);
+
+    const listed = await requestJson(baseUrl, '/api/workbench/todos');
+    expect(listed.status).toBe(200);
+    expect(listed.body.todos).toEqual([
+      expect.objectContaining({
+        id: (created.body.todo as Record<string, unknown>).id,
+        name: 'Local todo',
+      }),
+    ]);
   });
 
   test('free-text clarification resolves once and deploys instead of looping', async () => {

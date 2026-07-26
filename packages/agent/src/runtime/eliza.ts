@@ -134,6 +134,8 @@ import {
 import {
   DEFAULT_ELIZA_CLOUD_TEXT_MODEL,
   formatError,
+  isCloudFlagEnabled,
+  isCloudProvisionedEnvironment,
   isElizaSettingsDebugEnabled,
   isMobilePlatform,
   migrateLegacyRuntimeConfig,
@@ -182,7 +184,7 @@ async function runVaultBootHydration(): Promise<void> {
   // Same environments the old inline block skipped: Android has no D-Bus for
   // libsecret and no plaintext secrets to migrate; cloud-provisioned sandboxes
   // get real env vars from the daemon and vault-pglite init has hung there.
-  if (isMobilePlatform() || readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1") {
+  if (isMobilePlatform() || isCloudProvisionedEnvironment()) {
     return;
   }
   const bridge = importAppCoreRuntime();
@@ -1171,8 +1173,10 @@ function readEffectiveCloudCredential(
   );
 }
 
-function isProvisionedCloudContainer(env: NodeJS.ProcessEnv = process.env) {
-  return env.ELIZA_CLOUD_PROVISIONED === "1";
+function isProvisionedCloudContainer(env?: NodeJS.ProcessEnv): boolean {
+  return env
+    ? isCloudFlagEnabled(env.ELIZA_CLOUD_PROVISIONED)
+    : isCloudProvisionedEnvironment();
 }
 
 function isExplicitFalseEnvValue(value: string | undefined): boolean {
@@ -3706,7 +3710,7 @@ export async function startEliza(
   // records which of those keys the launch environment actually set, letting
   // the deferred hydrate keep that exact precedence (vault beats config-merged
   // values; never clobbers a real env var).
-  const isCloudProvisioned = readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1";
+  const isCloudProvisioned = isCloudProvisionedEnvironment();
   vaultBootHydration = null;
   if (!isMobilePlatform() && !isCloudProvisioned) {
     importAppCoreRuntime().captureWalletEnvBootBaseline();
@@ -3869,7 +3873,7 @@ export async function startEliza(
   // injected by the daemon as env vars, so there's nothing to multiplex. The
   // pool implementation is supplied by the host through the injected agent host
   // bridge (see ./host-bridge.ts) — no app-core import, no boot-time cycle.
-  if (readAliasedEnv("ELIZA_CLOUD_PROVISIONED") !== "1")
+  if (!isCloudProvisionedEnvironment())
     try {
       const accountPool = await importAppCoreRuntime();
       accountPool.getDefaultAccountPool();
@@ -4050,7 +4054,7 @@ export async function startEliza(
   // PGlite cold start this inventory listing would otherwise trigger.
   if (
     process.env.ELIZA_DISABLE_VAULT_PROFILE_RESOLVER !== "1" &&
-    readAliasedEnv("ELIZA_CLOUD_PROVISIONED") !== "1" &&
+    !isCloudProvisionedEnvironment() &&
     existsSync(resolveDefaultVaultDataDir())
   ) {
     try {
@@ -5010,7 +5014,7 @@ export async function startEliza(
   > => {
     if (
       process.env.ELIZA_DISABLE_AGENT_WALLET_BOOTSTRAP === "1" ||
-      readAliasedEnv("ELIZA_CLOUD_PROVISIONED") === "1"
+      isCloudProvisionedEnvironment()
     ) {
       return Promise.resolve([]);
     }

@@ -13,7 +13,7 @@
  */
 
 import type { IAgentRuntime } from "@elizaos/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   __resetWorkflowStepRegistryForTests,
@@ -229,6 +229,46 @@ describe("WorkflowStepRegistry", () => {
     )) as { text: string };
     expect(typeof result.text).toBe("string");
     expect(result.text.length).toBeGreaterThan(0);
+  });
+
+  it("dispatch_workflow forwards the canonical LifeOps owner outside the step payload", async () => {
+    const registry = createWorkflowStepRegistry();
+    registerDefaultWorkflowStepPack(registry);
+    const dispatchWorkflow = registry.get("dispatch_workflow");
+    expect(dispatchWorkflow).not.toBeNull();
+    const execute = vi.fn(async () => ({ ok: true }));
+    const ownerEntityId = "11111111-1111-4111-8111-111111111111";
+    const ctx = {
+      runtime: {
+        getService: () => ({ execute }),
+      },
+      ownerEntityId: () => ownerEntityId,
+    } as unknown as WorkflowStepExecuteContext;
+    const validated = dispatchWorkflow?.paramSchema.parse({
+      kind: "dispatch_workflow",
+      workflowId: "nested-workflow",
+      payload: { note: "from-parent" },
+    });
+
+    await dispatchWorkflow?.execute(
+      validated,
+      {
+        ...makeStubArgs(),
+        request: { requestId: "request-1" },
+        outputs: { prior: { ok: true } },
+      },
+      ctx,
+    );
+
+    expect(execute).toHaveBeenCalledWith(
+      "nested-workflow",
+      {
+        note: "from-parent",
+        request: { requestId: "request-1" },
+        outputs: { prior: { ok: true } },
+      },
+      { ownerEntityId },
+    );
   });
 
   it("default browser contribution short-circuits when permissionPolicy.allowBrowserActions=false", async () => {

@@ -259,6 +259,7 @@ interface WorkflowDispatchServiceLike {
   execute?: (
     workflowId: string,
     payload?: Record<string, unknown>,
+    options?: { ownerEntityId: string },
   ) => Promise<unknown>;
 }
 
@@ -282,11 +283,15 @@ const dispatchWorkflowContribution: AnyWorkflowStepContribution = {
         error: "WORKFLOW_DISPATCH service not registered",
       };
     }
-    return dispatch.execute(typed.workflowId, {
-      ...(typed.payload ?? {}),
-      request: args.request,
-      outputs: args.outputs,
-    });
+    return dispatch.execute(
+      typed.workflowId,
+      {
+        ...(typed.payload ?? {}),
+        request: args.request,
+        outputs: args.outputs,
+      },
+      { ownerEntityId: ctx.ownerEntityId() },
+    );
   },
 };
 

@@ -4,6 +4,7 @@
  */
 import { describe, expect, mock, test } from "bun:test";
 import {
+  AgentRuntime,
   type HandlerCallback,
   type IAgentRuntime,
   type IMessageService,
@@ -16,6 +17,7 @@ import { createRoutes } from "../../src/routes";
 
 interface FakeRuntimeOptions {
   messageService: IMessageService | null;
+  ensureConnection?: IAgentRuntime["ensureConnection"];
 }
 
 /**
@@ -23,11 +25,11 @@ interface FakeRuntimeOptions {
  * is a no-op and messageService is injectable (nullable) to model a runtime
  * whose message pipeline failed to initialize.
  */
-function makeRuntime(opts: FakeRuntimeOptions): IAgentRuntime {
-  return {
-    ensureConnection: mock(async () => {}),
-    messageService: opts.messageService,
-  } as unknown as IAgentRuntime;
+function makeRuntime(opts: FakeRuntimeOptions): AgentRuntime {
+  const runtime = new AgentRuntime({ logLevel: "fatal" });
+  runtime.ensureConnection = opts.ensureConnection ?? mock(async () => {});
+  runtime.messageService = opts.messageService;
+  return runtime;
 }
 
 /**
@@ -51,10 +53,10 @@ function withRunningAgent(
   });
 }
 
-const OK_RESULT = {
+const OK_RESULT: MessageProcessingResult = {
   didRespond: true,
   responseMessages: [],
-} as unknown as MessageProcessingResult;
+};
 
 describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("throws a structural error when the runtime has no message service", async () => {
@@ -107,10 +109,10 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
     const handleMessage = mock(async () => OK_RESULT);
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: { handleMessage } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
 
     await manager.handleMessage(
@@ -141,12 +143,12 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("does not grant OWNER to an unlinked connector sender", async () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: {
         handleMessage: mock(async () => OK_RESULT),
       } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
 
     await manager.handleMessage(
@@ -173,12 +175,12 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("does not grant OWNER to a plain internal message without an authenticated user principal", async () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: {
         handleMessage: mock(async () => OK_RESULT),
       } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
 
     await manager.handleMessage("agent-1", "user-1", "create a workflow");
@@ -193,12 +195,12 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("namespaces connector identity away from an authenticated Cloud principal with the same raw id", async () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: {
         handleMessage: mock(async () => OK_RESULT),
       } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
 
     await manager.handleMessage(
@@ -231,12 +233,12 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("accepts OWNER identity only from the forwarded Cloud principal header", async () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: {
         handleMessage: mock(async () => OK_RESULT),
       } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
     const app = createRoutes(manager, "server-secret");
 
@@ -262,12 +264,12 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("rejects a body identity that disagrees with the forwarded Cloud principal", async () => {
     const manager = new AgentManager();
     const ensureConnection = mock(async () => {});
-    const runtime = {
+    const runtime = makeRuntime({
       ensureConnection,
       messageService: {
         handleMessage: mock(async () => OK_RESULT),
       } as unknown as IMessageService,
-    } as unknown as IAgentRuntime;
+    });
     withRunningAgent(manager, "agent-1", runtime);
     const app = createRoutes(manager, "server-secret");
 
@@ -293,11 +295,10 @@ describe("AgentManager.handleMessage fail-closed message pipeline", () => {
   test("returns empty string (not a fabricated literal) on a deliberate no-response", async () => {
     const manager = new AgentManager();
     const handleMessage = mock(
-      async () =>
-        ({
-          didRespond: false,
-          responseMessages: [],
-        }) as unknown as MessageProcessingResult,
+      async (): Promise<MessageProcessingResult> => ({
+        didRespond: false,
+        responseMessages: [],
+      }),
     );
     withRunningAgent(
       manager,

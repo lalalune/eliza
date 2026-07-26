@@ -176,7 +176,9 @@ test.describe("pairing token exchange", () => {
       sub: seededUser.userId,
       aud: "dedicated-agent-session",
     });
-    expect(Number(claims.exp) * 1000).toBe(Date.parse(ok.body.expiresAt as string));
+    expect(Number(claims.exp) * 1000).toBe(
+      Date.parse(ok.body.expiresAt as string),
+    );
 
     // Replaying the same token is rejected (single-use; used_at already set).
     const replay = await pair(stack.urls.api, token as string, webUiOrigin);

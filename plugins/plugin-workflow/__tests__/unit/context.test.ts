@@ -1,20 +1,34 @@
 /** Verifies conversation flattening and immutable owner tags used by workflow boundaries. */
-import { describe, expect, test } from 'bun:test';
-import type { IAgentRuntime } from '@elizaos/core';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { AgentRuntime, createCharacter, stringToUuid } from '@elizaos/core';
 import {
   buildConversationContext,
+  getAttestedCloudWorkflowPrincipal,
   getUserTagName,
   isPotentialLegacyUserTag,
 } from '../../src/utils/context';
 import { createMockMessage, createMockState } from '../helpers/mockRuntime';
 
-const AGENT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const AGENT_ID = stringToUuid('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+const INITIAL_CLOUD_PROVISIONED = process.env.ELIZA_CLOUD_PROVISIONED;
 
-function runtime(entityName = 'Owner'): IAgentRuntime {
-  return {
-    agentId: AGENT_ID,
-    getEntityById: async () => ({ names: [entityName] }),
-  } as IAgentRuntime;
+afterEach(() => {
+  if (INITIAL_CLOUD_PROVISIONED === undefined) delete process.env.ELIZA_CLOUD_PROVISIONED;
+  else process.env.ELIZA_CLOUD_PROVISIONED = INITIAL_CLOUD_PROVISIONED;
+});
+
+function runtime(entityName = 'Owner'): AgentRuntime {
+  return Object.assign(
+    new AgentRuntime({
+      agentId: AGENT_ID,
+      character: createCharacter({ id: AGENT_ID, name: 'Workflow owner-tag test agent' }),
+      enableAutonomy: false,
+      logLevel: 'fatal',
+    }),
+    {
+      getEntityById: async () => ({ names: [entityName] }),
+    }
+  );
 }
 
 describe('buildConversationContext', () => {
@@ -111,5 +125,40 @@ describe('workflow owner tags', () => {
         'Renamed Owner_12345678_agent_aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa'
       )
     ).toBe(false);
+  });
+});
+
+describe('managed Cloud workflow principal attestation', () => {
+  test('recognizes a matching attested tenant when provisioning uses true', () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = 'true';
+    const ownerId = stringToUuid('managed-cloud-workflow-owner');
+    const message = createMockMessage({
+      entityId: ownerId,
+      content: {
+        text: 'Create my workflow',
+        metadata: {
+          elizaCloudPrincipal: { id: ownerId, attested: true },
+        },
+      },
+    });
+
+    expect(getAttestedCloudWorkflowPrincipal(message)).toBe(ownerId);
+  });
+
+  test('rejects a foreign attestation instead of crossing tenant scope', () => {
+    process.env.ELIZA_CLOUD_PROVISIONED = 'true';
+    const ownerId = stringToUuid('managed-cloud-workflow-owner');
+    const foreignOwnerId = stringToUuid('managed-cloud-workflow-foreign-owner');
+    const message = createMockMessage({
+      entityId: ownerId,
+      content: {
+        text: 'Create my workflow',
+        metadata: {
+          elizaCloudPrincipal: { id: foreignOwnerId, attested: true },
+        },
+      },
+    });
+
+    expect(getAttestedCloudWorkflowPrincipal(message)).toBeNull();
   });
 });

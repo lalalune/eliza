@@ -865,7 +865,7 @@ describe("TASKS create lane planner integration", () => {
     expect(resolveCalls).toBe(2);
   });
 
-  it("returns an ordinary failed lane result without replaying the original request", async () => {
+  it("persists every admitted lane and returns a failed lane without replaying the request", async () => {
     const acp = makeAcp();
     acp.sendPrompt
       .mockResolvedValueOnce({
@@ -899,6 +899,24 @@ describe("TASKS create lane planner integration", () => {
     expect(result?.success).toBe(false);
     expect(acp.spawnSession).toHaveBeenCalledTimes(2);
     expect(acp.sendPrompt).toHaveBeenCalledTimes(2);
-    expect(taskService.createTask).toHaveBeenCalledTimes(1);
+    expect(taskService.createTask).toHaveBeenCalledTimes(2);
+    expect(taskService.attachSession).toHaveBeenCalledTimes(2);
+    const firstTask = taskService.createTask.mock.calls[0]?.[0] as Record<
+      string,
+      unknown
+    >;
+    const secondTask = taskService.createTask.mock.calls[1]?.[0] as Record<
+      string,
+      unknown
+    >;
+    const firstMetadata = firstTask.metadata as Record<string, unknown>;
+    expect(firstMetadata).toMatchObject({
+      waveId: expect.any(String),
+      lane: { id: "lane-1" },
+    });
+    expect(secondTask.metadata).toMatchObject({
+      waveId: firstMetadata.waveId,
+      lane: { id: "lane-2" },
+    });
   });
 });

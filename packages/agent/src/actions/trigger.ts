@@ -44,10 +44,16 @@ import {
 } from "../triggers/runtime.ts";
 import {
   buildTriggerMetadata,
+  DISABLED_TRIGGER_INTERVAL_MS,
   normalizeTriggerIntervalMs,
   parseCronExpression,
   parseScheduledAtIso,
 } from "../triggers/scheduling.ts";
+import {
+  activeTriggerRequiresAlwaysOn,
+  alwaysOnRequiredContract,
+  isManagedCloudRuntime,
+} from "../triggers/subscription-policy.ts";
 import type { TriggerTaskMetadata } from "../triggers/types.ts";
 
 type AutonomyRoomService = {
@@ -141,6 +147,11 @@ function failed(
   };
 }
 
+function alwaysOnFailure(op: TriggerOp): ActionResult {
+  const contract = alwaysOnRequiredContract();
+  return failed(op, contract.error, contract.code, contract);
+}
+
 function ok(
   op: TriggerOp,
   text: string,
@@ -183,14 +194,68 @@ function triggersDisabled(runtime: IAgentRuntime): boolean {
   return env === "0" || env === "false";
 }
 
+function actionTriggerMetadata(
+  trigger: TriggerConfig,
+  existingMetadata?: TriggerTaskMetadata,
+): TriggerTaskMetadata | null {
+  const nowMs = Date.now();
+  if (!trigger.enabled) {
+    return {
+      ...(existingMetadata ?? {}),
+      blocking: true,
+      updatedAt: nowMs,
+      updateInterval: DISABLED_TRIGGER_INTERVAL_MS,
+      trigger: {
+        ...trigger,
+        nextRunAtMs: nowMs + DISABLED_TRIGGER_INTERVAL_MS,
+      },
+    };
+  }
+  const metadata = buildTriggerMetadata({ trigger, nowMs, existingMetadata });
+  if (metadata) delete metadata.subscriptionPolicy;
+  return metadata;
+}
+
 async function loadTriggerTask(
   runtime: IAgentRuntime,
   taskId: UUID,
+  ownerEntityId: string,
 ): Promise<{ task: Task; trigger: TriggerConfig } | null> {
   const task = await runtime.getTask(taskId);
   if (!task?.id) return null;
   const trigger = readTriggerConfig(task);
-  return trigger ? { task, trigger } : null;
+  return trigger &&
+    (!isManagedCloudRuntime(runtime) ||
+      authoritativeTaskOwner(task) === ownerEntityId)
+    ? { task, trigger }
+    : null;
+}
+
+function authoritativeTaskOwner(task: Task): string | undefined {
+  const metadata =
+    task.metadata && typeof task.metadata === "object"
+      ? (task.metadata as Record<string, unknown>)
+      : undefined;
+  const ownership =
+    metadata?.ownership && typeof metadata.ownership === "object"
+      ? (metadata.ownership as Record<string, unknown>)
+      : undefined;
+  const flatOwner = readString(metadata?.ownerEntityId);
+  const nestedOwner = readString(ownership?.ownerEntityId);
+  if (flatOwner && nestedOwner && flatOwner !== nestedOwner) return undefined;
+  return nestedOwner ?? flatOwner;
+}
+
+function triggerTaskBelongsToOwner(
+  runtime: IAgentRuntime,
+  task: Task,
+  trigger: TriggerConfig,
+  ownerEntityId: string,
+): boolean {
+  if (isManagedCloudRuntime(runtime)) {
+    return authoritativeTaskOwner(task) === ownerEntityId;
+  }
+  return trigger.createdBy === ownerEntityId;
 }
 
 function isTriggerOp(value: string): value is TriggerOp {
@@ -231,6 +296,8 @@ async function opCreate(
   const scheduledAtIso = readString(params.scheduledAtIso);
   const cronExpression = readString(params.cronExpression);
   const maxRuns = parsePositiveInt(params.maxRuns);
+  const enabled =
+    params.enabled === undefined ? true : readBool(params.enabled, true);
 
   if (
     triggerType === "once" &&
@@ -252,6 +319,14 @@ async function opCreate(
       "INVALID_CRON",
     );
   }
+  const workflowId = readString(params.workflowId);
+  if (!workflowId) {
+    return failed("create", "workflowId is required.", "MISSING_WORKFLOW_ID");
+  }
+  const workflowName = readString(params.workflowName);
+  if (activeTriggerRequiresAlwaysOn(runtime, { enabled, triggerType })) {
+    return alwaysOnFailure("create");
+  }
 
   const dedupeKey = dedupeHash(
     `${triggerType}|${instructions.toLowerCase()}|${intervalMs}|${scheduledAtIso ?? ""}|${cronExpression ?? ""}`,
@@ -261,11 +336,18 @@ async function opCreate(
     tags: [...TRIGGER_TASK_TAGS],
     agentIds: [runtime.agentId],
   });
-  const ownedActive = existingTasks.filter((t) => {
-    const cfg = readTriggerConfig(t);
-    return cfg?.enabled && cfg.createdBy === creatorId;
+  const ownedTasks = existingTasks.filter((task) => {
+    const trigger = readTriggerConfig(task);
+    return (
+      trigger !== null &&
+      triggerTaskBelongsToOwner(runtime, task, trigger, creatorId)
+    );
   });
-  if (ownedActive.length >= MAX_TRIGGERS_PER_CREATOR) {
+  const ownedActive = ownedTasks.filter((t) => {
+    const cfg = readTriggerConfig(t);
+    return cfg?.enabled;
+  });
+  if (enabled && ownedActive.length >= MAX_TRIGGERS_PER_CREATOR) {
     return failed(
       "create",
       `Trigger limit reached (${MAX_TRIGGERS_PER_CREATOR}).`,
@@ -273,27 +355,23 @@ async function opCreate(
     );
   }
 
-  const duplicate = existingTasks.find((t) => {
-    const cfg = readTriggerConfig(t);
-    if (!cfg?.enabled) return false;
-    if (cfg.dedupeKey) return cfg.dedupeKey === dedupeKey;
-    return (
-      cfg.instructions.trim().toLowerCase() === instructions.toLowerCase() &&
-      cfg.triggerType === triggerType
-    );
-  });
+  const duplicate = enabled
+    ? ownedTasks.find((t) => {
+        const cfg = readTriggerConfig(t);
+        if (!cfg?.enabled) return false;
+        if (cfg.dedupeKey) return cfg.dedupeKey === dedupeKey;
+        return (
+          cfg.instructions.trim().toLowerCase() ===
+            instructions.toLowerCase() && cfg.triggerType === triggerType
+        );
+      })
+    : undefined;
   if (duplicate?.id) {
     return ok("create", "An equivalent trigger already exists.", {
       duplicateTaskId: duplicate.id,
       dedupeKey,
     });
   }
-
-  const workflowId = readString(params.workflowId);
-  if (!workflowId) {
-    return failed("create", "workflowId is required.", "MISSING_WORKFLOW_ID");
-  }
-  const workflowName = readString(params.workflowName);
 
   const triggerId = stringToUuid(crypto.randomUUID());
   const triggerConfig: TriggerConfig = {
@@ -302,7 +380,7 @@ async function opCreate(
     displayName,
     instructions,
     triggerType,
-    enabled: true,
+    enabled,
     wakeMode,
     createdBy: creatorId,
     runCount: 0,
@@ -316,10 +394,7 @@ async function opCreate(
     workflowName,
   };
 
-  const metadata = buildTriggerMetadata({
-    trigger: triggerConfig,
-    nowMs: Date.now(),
-  });
+  const metadata = actionTriggerMetadata(triggerConfig);
   if (!metadata) {
     return failed(
       "create",
@@ -335,9 +410,18 @@ async function opCreate(
   const taskId = await runtime.createTask({
     name: TRIGGER_TASK_NAME,
     description: displayName,
+    entityId: message.entityId,
     roomId,
     tags: [...TRIGGER_TASK_TAGS],
-    metadata,
+    metadata: {
+      ...metadata,
+      ownerEntityId: creatorId,
+      sourceRoomId: String(message.roomId),
+      ownership: {
+        ownerEntityId: creatorId,
+        sourceRoomId: String(message.roomId),
+      },
+    },
   });
 
   return ok(
@@ -359,12 +443,17 @@ async function opCreate(
 
 async function opUpdate(
   runtime: IAgentRuntime,
+  message: Memory,
   params: TriggerParameters,
 ): Promise<ActionResult> {
   const taskId = readUuid(params.taskId);
   if (!taskId)
     return failed("update", "taskId is required.", "MISSING_TASK_ID");
-  const loaded = await loadTriggerTask(runtime, taskId);
+  const loaded = await loadTriggerTask(
+    runtime,
+    taskId,
+    String(message.entityId),
+  );
   if (!loaded)
     return failed(
       "update",
@@ -401,15 +490,19 @@ async function opUpdate(
     next.cronExpression = cronExpression;
   }
   if (maxRuns !== undefined) next.maxRuns = maxRuns;
+  if (params.enabled !== undefined)
+    next.enabled = readBool(params.enabled, next.enabled);
   if (wakeModeRaw === "inject_now" || wakeModeRaw === "next_autonomy_cycle") {
     next.wakeMode = wakeModeRaw;
   }
+  if (activeTriggerRequiresAlwaysOn(runtime, next)) {
+    return alwaysOnFailure("update");
+  }
 
-  const metadata = buildTriggerMetadata({
-    trigger: next,
-    nowMs: Date.now(),
-    existingMetadata: task.metadata as TriggerTaskMetadata | undefined,
-  });
+  const metadata = actionTriggerMetadata(
+    next,
+    task.metadata as TriggerTaskMetadata | undefined,
+  );
   if (!metadata) {
     return failed(
       "update",
@@ -429,12 +522,17 @@ async function opUpdate(
 
 async function opDelete(
   runtime: IAgentRuntime,
+  message: Memory,
   params: TriggerParameters,
 ): Promise<ActionResult> {
   const taskId = readUuid(params.taskId);
   if (!taskId)
     return failed("delete", "taskId is required.", "MISSING_TASK_ID");
-  const loaded = await loadTriggerTask(runtime, taskId);
+  const loaded = await loadTriggerTask(
+    runtime,
+    taskId,
+    String(message.entityId),
+  );
   if (!loaded)
     return failed(
       "delete",
@@ -451,11 +549,16 @@ async function opDelete(
 
 async function opRun(
   runtime: IAgentRuntime,
+  message: Memory,
   params: TriggerParameters,
 ): Promise<ActionResult> {
   const taskId = readUuid(params.taskId);
   if (!taskId) return failed("run", "taskId is required.", "MISSING_TASK_ID");
-  const loaded = await loadTriggerTask(runtime, taskId);
+  const loaded = await loadTriggerTask(
+    runtime,
+    taskId,
+    String(message.entityId),
+  );
   if (!loaded)
     return failed(
       "run",
@@ -484,12 +587,17 @@ async function opRun(
 
 async function opToggle(
   runtime: IAgentRuntime,
+  message: Memory,
   params: TriggerParameters,
 ): Promise<ActionResult> {
   const taskId = readUuid(params.taskId);
   if (!taskId)
     return failed("toggle", "taskId is required.", "MISSING_TASK_ID");
-  const loaded = await loadTriggerTask(runtime, taskId);
+  const loaded = await loadTriggerTask(
+    runtime,
+    taskId,
+    String(message.entityId),
+  );
   if (!loaded)
     return failed(
       "toggle",
@@ -501,11 +609,13 @@ async function opToggle(
   const enabled =
     params.enabled === undefined ? !trigger.enabled : readBool(params.enabled);
   const next: TriggerConfig = { ...trigger, enabled };
-  const metadata = buildTriggerMetadata({
-    trigger: next,
-    nowMs: Date.now(),
-    existingMetadata: task.metadata as TriggerTaskMetadata | undefined,
-  });
+  if (activeTriggerRequiresAlwaysOn(runtime, next)) {
+    return alwaysOnFailure("toggle");
+  }
+  const metadata = actionTriggerMetadata(
+    next,
+    task.metadata as TriggerTaskMetadata | undefined,
+  );
   if (!metadata) {
     return failed(
       "toggle",
@@ -573,16 +683,16 @@ export const triggerAction: Action = {
         result = await opCreate(runtime, message, params);
         break;
       case "update":
-        result = await opUpdate(runtime, params);
+        result = await opUpdate(runtime, message, params);
         break;
       case "delete":
-        result = await opDelete(runtime, params);
+        result = await opDelete(runtime, message, params);
         break;
       case "run":
-        result = await opRun(runtime, params);
+        result = await opRun(runtime, message, params);
         break;
       case "toggle":
-        result = await opToggle(runtime, params);
+        result = await opToggle(runtime, message, params);
         break;
     }
 
@@ -666,7 +776,7 @@ export const triggerAction: Action = {
     },
     {
       name: "enabled",
-      description: "Enable or disable a trigger (toggle).",
+      description: "Create, update, or toggle a trigger as enabled/disabled.",
       required: false,
       schema: { type: "boolean" as const },
     },

@@ -4,7 +4,7 @@ Free text-to-speech synthesis for Eliza agents using Microsoft Edge TTS — no A
 
 ## Purpose / role
 
-Registers a `ModelType.TEXT_TO_SPEECH` model handler that calls Microsoft's Edge TTS WebSocket service via the `node-edge-tts` npm package. The plugin auto-enables when `ELIZA_CLOUD_PROVISIONED=1` or when `config.features.tts` is truthy. It is Node-only; the browser export is an unavailable-entry plugin shape that logs a warning.
+Registers a `ModelType.TEXT_TO_SPEECH` model handler that calls Microsoft's Edge TTS WebSocket service via the `node-edge-tts` npm package. The plugin auto-enables when `ELIZA_CLOUD_PROVISIONED` is truthy or when `config.features.tts` is truthy. It is Node-only; the browser export is an unavailable-entry plugin shape that logs a warning.
 
 The plugin is loaded by including `@elizaos/plugin-edge-tts` in the agent's plugin list, or automatically via the elizaOS auto-enable engine (checks `auto-enable.ts`).
 
@@ -75,7 +75,7 @@ OpenAI-style voice name aliases resolved in `resolveVoice()` (src/index.ts):
 `onyx→en-US-DavisNeural`, `nova→en-US-JennyNeural`, `shimmer→en-US-AriaNeural`.
 
 Auto-enable triggers (`auto-enable.ts`, also duplicated inline in the plugin object):
-- `ELIZA_CLOUD_PROVISIONED=1` in env, OR
+- truthy `ELIZA_CLOUD_PROVISIONED` in env (`1` or `true`), OR
 - `config.features.tts === true` (or object with `enabled !== false`).
 
 ## How to extend

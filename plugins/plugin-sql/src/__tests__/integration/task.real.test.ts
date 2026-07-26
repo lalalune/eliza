@@ -115,6 +115,52 @@ describe("Task Integration Tests", () => {
       expect(byQuery.find((item) => item.id === taskId)?.agentId).toBe(testAgentId);
     });
 
+    it("round-trips, filters, and updates task entity ownership", async () => {
+      const firstEntityId = uuidv4() as UUID;
+      const secondEntityId = uuidv4() as UUID;
+      const firstTaskId = uuidv4() as UUID;
+      const secondTaskId = uuidv4() as UUID;
+
+      await adapter.createTask({
+        id: firstTaskId,
+        roomId: testRoomId,
+        worldId: testWorldId,
+        entityId: firstEntityId,
+        name: "Owned Task",
+        tags: ["ownership"],
+      });
+      await adapter.createTask({
+        id: secondTaskId,
+        roomId: testRoomId,
+        worldId: testWorldId,
+        entityId: secondEntityId,
+        name: "Owned Task",
+        tags: ["ownership"],
+      });
+
+      const firstEntityTasks = await adapter.getTasks({ entityId: firstEntityId });
+      expect(firstEntityTasks).toHaveLength(1);
+      expect(firstEntityTasks[0]).toMatchObject({ id: firstTaskId, entityId: firstEntityId });
+
+      const byId = await adapter.getTask(secondTaskId);
+      expect(byId?.entityId).toBe(secondEntityId);
+
+      const byName = await adapter.getTasksByName("Owned Task");
+      expect(byName).toHaveLength(2);
+      expect(byName.map((task) => task.entityId)).toEqual(
+        expect.arrayContaining([firstEntityId, secondEntityId])
+      );
+
+      await adapter.updateTask(firstTaskId, { entityId: secondEntityId });
+
+      expect(await adapter.getTasks({ entityId: firstEntityId })).toEqual([]);
+      const secondEntityTasks = await adapter.getTasks({ entityId: secondEntityId });
+      expect(secondEntityTasks).toHaveLength(2);
+      expect(secondEntityTasks.find((task) => task.id === firstTaskId)?.entityId).toBe(
+        secondEntityId
+      );
+    });
+
     it("should update a task", async () => {
       const taskId = uuidv4() as UUID;
       const originalTask: Task = {

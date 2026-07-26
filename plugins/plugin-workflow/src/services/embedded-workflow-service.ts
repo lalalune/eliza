@@ -17,6 +17,7 @@ import { statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, totalmem, uptime } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  ChannelType,
   ElizaError,
   fetchWithSsrfGuard,
   type GuardedFetchOptions,
@@ -29,7 +30,7 @@ import {
   type TriggerConfig,
   type UUID,
 } from '@elizaos/core';
-import { detectHostCapabilities } from '@elizaos/shared';
+import { detectHostCapabilities, readAliasedEnv } from '@elizaos/shared';
 import { and, desc, eq, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import {
@@ -45,6 +46,7 @@ import type {
   WorkflowDefinition,
   WorkflowDefinitionResponse,
   WorkflowExecution,
+  WorkflowExecutionContext,
   WorkflowNode,
   WorkflowRevision,
   WorkflowRevisionOperation,
@@ -52,10 +54,20 @@ import type {
 } from '../types/index';
 import { WorkflowApiError } from '../types/index';
 import {
+  readWorkflowExecutionContext,
+  resolveCanonicalWorkflowOwnerTag,
+  withWorkflowExecutionContext,
+} from '../utils/context';
+import {
   resolveSmithersTimeoutMs,
   runWorkflowWithSmithers,
   type SmithersExecutionPlan,
 } from './smithers-runtime';
+import {
+  sanitizeWorkflowExecution,
+  serializeWorkflowExecutionError,
+  toSafeWorkflowExecutionError,
+} from './workflow-execution-error';
 
 export const EMBEDDED_WORKFLOW_SERVICE_TYPE = 'embedded_workflow_service';
 
@@ -87,6 +99,7 @@ const CLOUD_EXECUTION_TIER_SETTING = 'ELIZA_CLOUD_EXECUTION_TIER';
 const CLOUD_PROVISIONED_SETTING = 'ELIZA_CLOUD_PROVISIONED';
 const DEDICATED_LAZY_EXECUTION_TIER = 'dedicated-lazy';
 const SCHEDULE_TRIGGER_NODE_TYPE = 'workflows-nodes-base.scheduleTrigger';
+const WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED_CODE = 'WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED';
 
 // Workflow node output is persisted and can also enter later model context, so
 // one public endpoint must not be able to consume the agent process's memory.
@@ -111,6 +124,8 @@ interface IExecuteFunctions {
   /** Identifier of the in-progress workflow execution, used by nodes that emit
    *  audit metadata (e.g. respondToEvent records it on the injected memory). */
   getExecutionId?(): string | null;
+  /** Trusted owner/chat routing captured when the execution was admitted. */
+  getExecutionContext?(): WorkflowExecutionContext | undefined;
   /** Cancellation from the Smithers run boundary. Network and wait nodes use
    * this to stop before a timed-out execution can produce late side effects. */
   getAbortSignal?(): AbortSignal;
@@ -185,11 +200,41 @@ interface ExecuteOptions {
   /** Stable identity of the schedule node whose task fired. Omitted only for
    * explicit debug runs that intentionally exercise every schedule branch. */
   scheduleNodeId?: string;
+  /** Server-resolved execution owner. Never read from trigger payload data. */
+  ownerEntityId?: string;
+  /** Conversation that originated the workflow or manual run. */
+  sourceRoomId?: string;
   /**
    * When false, failed manual/debug runs are returned as persisted error
    * executions instead of being thrown away as route-level exceptions.
    */
   throwOnError?: boolean;
+}
+
+function resolveWorkflowExecutionContext(
+  workflow: WorkflowDefinition,
+  explicit?: WorkflowExecutionContext
+): WorkflowExecutionContext | undefined {
+  const stored = readWorkflowExecutionContext(workflow);
+  const ownerEntityId = explicit?.ownerEntityId?.trim() || stored?.ownerEntityId;
+  const sourceRoomId = explicit?.sourceRoomId?.trim() || stored?.sourceRoomId;
+  return ownerEntityId || sourceRoomId ? { ownerEntityId, sourceRoomId } : undefined;
+}
+
+function readPendingExecutionContext(
+  execution: WorkflowExecution
+): WorkflowExecutionContext | undefined {
+  const ownerEntityId =
+    typeof execution.customData?.ownerEntityId === 'string' &&
+    execution.customData.ownerEntityId.trim()
+      ? execution.customData.ownerEntityId.trim()
+      : undefined;
+  const sourceRoomId =
+    typeof execution.customData?.sourceRoomId === 'string' &&
+    execution.customData.sourceRoomId.trim()
+      ? execution.customData.sourceRoomId.trim()
+      : undefined;
+  return ownerEntityId || sourceRoomId ? { ownerEntityId, sourceRoomId } : undefined;
 }
 
 export interface WorkflowExecutionClaimResult {
@@ -513,20 +558,60 @@ function buildDeviceHealthCheckWorkflow(): WorkflowDefinition {
 
 function shouldSeedDefaultWorkflows(runtime: IAgentRuntime): boolean {
   const raw = runtime.getSetting?.('WORKFLOW_SEED_DEFAULTS');
-  return raw !== false && raw !== 'false' && !isScaleToZeroCloudRuntime(runtime);
+  // Managed Cloud has no authenticated owner at service startup. Seeding an
+  // active schedule here would either invent one or create an ownerless task,
+  // so Cloud starts empty and lets an authenticated user create the first row.
+  return raw !== false && raw !== 'false' && !isManagedCloudRuntime(runtime);
+}
+
+function runtimeSetting(runtime: IAgentRuntime, key: string): unknown {
+  const value = runtime.getSetting?.(key);
+  return value === null || value === undefined || value === '' ? readAliasedEnv(key) : value;
+}
+
+function isEnabledSetting(value: unknown): boolean {
+  return (
+    value === true ||
+    (typeof value === 'string' && ['1', 'true'].includes(value.trim().toLowerCase()))
+  );
 }
 
 function isScaleToZeroCloudRuntime(runtime: IAgentRuntime): boolean {
-  const cloudProvisioned = runtime.getSetting?.(CLOUD_PROVISIONED_SETTING);
-  const executionTier = runtime.getSetting?.(CLOUD_EXECUTION_TIER_SETTING);
+  const executionTier = runtimeSetting(runtime, CLOUD_EXECUTION_TIER_SETTING);
   return (
-    (cloudProvisioned === true || cloudProvisioned === '1' || cloudProvisioned === 'true') &&
-    executionTier === DEDICATED_LAZY_EXECUTION_TIER
+    isManagedCloudRuntime(runtime) &&
+    typeof executionTier === 'string' &&
+    executionTier.trim().toLowerCase() === DEDICATED_LAZY_EXECUTION_TIER
   );
 }
 
 function hasEnabledScheduleTrigger(workflow: WorkflowDefinition): boolean {
   return workflow.nodes.some((node) => !node.disabled && node.type === SCHEDULE_TRIGGER_NODE_TYPE);
+}
+
+function workflowOwnerTagMigrationError(
+  workflowId: string,
+  reason: 'missing' | 'ambiguous'
+): WorkflowApiError {
+  const error =
+    reason === 'ambiguous'
+      ? 'Scheduled workflow has multiple canonical owner tags and cannot be migrated safely.'
+      : 'Scheduled workflow has no canonical owner tag and cannot be migrated safely.';
+  return new WorkflowApiError(error, 409, {
+    success: false,
+    code: WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED_CODE,
+    error,
+    workflowId,
+    reason,
+  });
+}
+
+function isWorkflowOwnerTagMigrationError(error: unknown): error is WorkflowApiError {
+  return (
+    error instanceof WorkflowApiError &&
+    isRecord(error.response) &&
+    error.response.code === WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED_CODE
+  );
 }
 
 /**
@@ -843,7 +928,7 @@ async function readResponseTextWithLimit(response: Response): Promise<string> {
         logger.warn(
           {
             src: 'plugin:workflow:http',
-            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+            error: serializeWorkflowExecutionError(cancelError),
           },
           'failed to cancel oversized workflow HTTP response'
         );
@@ -878,7 +963,7 @@ async function readResponseTextWithLimit(response: Response): Promise<string> {
       logger.warn(
         {
           src: 'plugin:workflow:http',
-          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          error: serializeWorkflowExecutionError(cancelError),
         },
         'failed to cancel workflow HTTP response after a body read failure'
       );
@@ -1139,9 +1224,9 @@ function createHttpRequestNode(): INodeType {
         const item = sourceItems[itemIndex];
         const url = readString(resolveParameterValue(nodeParameters.url, item), '');
         if (!url) {
-          throw new Error(
-            `HTTP Request node requires a url parameter; got ${JSON.stringify(nodeParameters)}`
-          );
+          throw new ElizaError('HTTP Request node requires a URL', {
+            code: 'WORKFLOW_HTTP_URL_REQUIRED',
+          });
         }
 
         const method = readString(resolveParameterValue(nodeParameters.method, item), 'GET')
@@ -1193,27 +1278,10 @@ function createHttpRequestNode(): INodeType {
         try {
           const body = await parseResponseBody(guarded.response);
           if (!guarded.response.ok) {
-            const safeUrl = new URL(url);
-            safeUrl.username = '';
-            safeUrl.password = '';
-            safeUrl.search = '';
-            safeUrl.hash = '';
-            const serializedBody =
-              typeof body === 'string' ? body : body === null ? '' : JSON.stringify(body);
-            const responseBodyPreview = serializedBody.slice(0, 2_048);
-            throw new ElizaError(
-              `HTTP Request ${method} ${safeUrl.toString()} failed with status ${guarded.response.status}`,
-              {
-                code: 'WORKFLOW_HTTP_STATUS_ERROR',
-                context: {
-                  method,
-                  url: safeUrl.toString(),
-                  statusCode: guarded.response.status,
-                  statusText: guarded.response.statusText,
-                  ...(responseBodyPreview ? { responseBodyPreview } : {}),
-                },
-              }
-            );
+            throw new ElizaError('HTTP request failed', {
+              code: 'WORKFLOW_HTTP_STATUS_ERROR',
+              context: { method, statusCode: guarded.response.status },
+            });
           }
           output.push({
             json: {
@@ -1689,6 +1757,33 @@ function resolveAutonomyRoomId(svc: AutonomyServiceLike): UUID | null {
   return fromTarget ?? null;
 }
 
+function isManagedCloudRuntime(runtime: IAgentRuntime): boolean {
+  return (
+    isEnabledSetting(runtime.getSetting(CLOUD_PROVISIONED_SETTING)) ||
+    isEnabledSetting(readAliasedEnv(CLOUD_PROVISIONED_SETTING))
+  );
+}
+
+async function ensureWorkflowOwnerRoom(
+  runtime: IAgentRuntime,
+  ownerEntityId: string
+): Promise<UUID> {
+  const ownerId = stringToUuid(ownerEntityId);
+  const worldId = stringToUuid(`workflow-automation-world:${runtime.agentId}:${ownerId}`);
+  const roomId = stringToUuid(`workflow-automation-room:${runtime.agentId}:${ownerId}`);
+  await runtime.ensureConnection({
+    entityId: ownerId,
+    roomId,
+    worldId,
+    source: 'workflow-automation',
+    type: ChannelType.DM,
+    roomName: 'Workflow automations',
+    worldName: 'Workflow automations',
+    metadata: { ownership: { ownerId } },
+  });
+  return roomId;
+}
+
 function extractEventFromInputItems(inputItems: INodeExecutionData[]): {
   kind?: string;
   payload?: Record<string, unknown>;
@@ -1729,43 +1824,54 @@ function createRespondToEventNode(): INodeType {
       const wakeMode = readString(parameters.wakeMode, 'inject_now');
       const runtime = this.getRuntime?.() ?? null;
       const executionId = this.getExecutionId?.() ?? null;
-
-      const failure = (reason: string): INodeExecutionData[][] => [
-        [
-          {
-            json: {
-              instructionInjected: false,
-              reason,
-              nodeName: node.name,
-            } as INodeExecutionData['json'],
-          },
-        ],
-      ];
+      const executionContext = this.getExecutionContext?.();
 
       if (!runtime) {
         logger.warn(
           { src: 'plugin:workflow:respondToEvent', nodeName: node.name },
-          '[respondToEvent] No agent runtime available in execution context — skipping injection'
+          '[respondToEvent] Agent runtime is unavailable'
         );
-        return failure('runtime_unavailable');
+        throw new ElizaError('Workflow response could not access the agent runtime', {
+          code: 'WORKFLOW_RESPOND_RUNTIME_UNAVAILABLE',
+        });
       }
 
-      const autonomyService = resolveAutonomyService(runtime);
-      if (!autonomyService) {
-        runtime.logger.warn(
-          { src: 'plugin:workflow:respondToEvent', nodeName: node.name, executionId },
-          '[respondToEvent] Autonomy service not registered — skipping injection'
-        );
-        return failure('autonomy_service_unavailable');
-      }
-
-      const roomId = resolveAutonomyRoomId(autonomyService);
-      if (!roomId) {
-        runtime.logger.warn(
-          { src: 'plugin:workflow:respondToEvent', nodeName: node.name, executionId },
-          '[respondToEvent] No autonomy room resolvable — skipping injection'
-        );
-        return failure('no_autonomy_room');
+      let roomId: UUID;
+      if (executionContext?.sourceRoomId) {
+        roomId = stringToUuid(executionContext.sourceRoomId);
+      } else if (executionContext?.ownerEntityId) {
+        roomId = await ensureWorkflowOwnerRoom(runtime, executionContext.ownerEntityId);
+      } else {
+        if (isManagedCloudRuntime(runtime)) {
+          runtime.logger.warn(
+            { src: 'plugin:workflow:respondToEvent', nodeName: node.name, executionId },
+            '[respondToEvent] Managed Cloud execution lacks owner context'
+          );
+          throw new ElizaError('Workflow response requires owner context in managed Cloud', {
+            code: 'WORKFLOW_RESPOND_OWNER_CONTEXT_REQUIRED',
+          });
+        }
+        const autonomyService = resolveAutonomyService(runtime);
+        if (!autonomyService) {
+          runtime.logger.warn(
+            { src: 'plugin:workflow:respondToEvent', nodeName: node.name, executionId },
+            '[respondToEvent] Autonomy service is unavailable'
+          );
+          throw new ElizaError('Workflow response could not access an autonomy service', {
+            code: 'WORKFLOW_RESPOND_AUTONOMY_UNAVAILABLE',
+          });
+        }
+        const autonomyRoomId = resolveAutonomyRoomId(autonomyService);
+        if (!autonomyRoomId) {
+          runtime.logger.warn(
+            { src: 'plugin:workflow:respondToEvent', nodeName: node.name, executionId },
+            '[respondToEvent] Autonomy destination room is unavailable'
+          );
+          throw new ElizaError('Workflow response could not resolve a destination room', {
+            code: 'WORKFLOW_RESPOND_ROOM_UNAVAILABLE',
+          });
+        }
+        roomId = autonomyRoomId;
       }
 
       const event = extractEventFromInputItems(inputItems);
@@ -1776,9 +1882,11 @@ function createRespondToEventNode(): INodeType {
       if (!executionId) {
         runtime.logger.warn(
           { src: 'plugin:workflow:respondToEvent', nodeName: node.name },
-          '[respondToEvent] No workflow execution id available — skipping injection'
+          '[respondToEvent] Workflow execution id is unavailable'
         );
-        return failure('execution_id_unavailable');
+        throw new ElizaError('Workflow response could not identify its execution', {
+          code: 'WORKFLOW_RESPOND_EXECUTION_ID_UNAVAILABLE',
+        });
       }
       // Smithers may replay a node after a crash that occurred between the side
       // effect and its durable step commit. A deterministic primary key turns
@@ -1790,7 +1898,9 @@ function createRespondToEventNode(): INodeType {
       await runtime.createMemory(
         {
           id: memoryId,
-          entityId: runtime.agentId,
+          entityId: executionContext?.ownerEntityId
+            ? stringToUuid(executionContext.ownerEntityId)
+            : runtime.agentId,
           roomId,
           content: {
             text: instructionText,
@@ -1800,6 +1910,12 @@ function createRespondToEventNode(): INodeType {
               nodeName: node.name,
               wakeMode,
               isAutonomousInstruction: true,
+              ...(executionContext?.ownerEntityId
+                ? { ownerEntityId: executionContext.ownerEntityId }
+                : {}),
+              ...(executionContext?.sourceRoomId
+                ? { sourceRoomId: executionContext.sourceRoomId }
+                : {}),
             },
           },
         },
@@ -2371,9 +2487,19 @@ export class EmbeddedWorkflowService extends Service {
     const db = this.getDb();
     const updatedAt = nowIso();
     const versionId = randomUUID();
-    const stored = normalizeWorkflowPayload(workflow, id, existing.workflow.active ?? false);
+    let stored = normalizeWorkflowPayload(workflow, id, existing.workflow.active ?? false);
+    // This CRUD surface has no authenticated principal of its own. The facade
+    // stamps new definitions, but updates must carry the already-persisted
+    // server-owned routing context rather than trusting reserved caller meta.
+    stored = withWorkflowExecutionContext(
+      stored,
+      readWorkflowExecutionContext(existing.workflow) ?? {}
+    );
     this.assertHostSupports(stored);
-    if (stored.active) this.assertScheduleActivationAllowed(stored);
+    if (stored.active) {
+      this.assertScheduleActivationAllowed(stored);
+      stored = this.resolveManagedScheduleExecutionContext(id, stored).workflow;
+    }
     await this.captureWorkflowRevision(id, existing, 'update');
     await db
       .update(embeddedWorkflows)
@@ -2466,8 +2592,10 @@ export class EmbeddedWorkflowService extends Service {
     };
     this.assertHostSupports(entry.workflow);
     this.assertScheduleActivationAllowed(entry.workflow);
+    const prepared = this.resolveManagedScheduleExecutionContext(id, entry.workflow).workflow;
     const db = this.getDb();
     await this.captureWorkflowRevision(id, entry, 'activate');
+    entry.workflow = prepared;
     entry.workflow.active = true;
     entry.updatedAt = nowIso();
     entry.versionId = randomUUID();
@@ -2622,15 +2750,22 @@ export class EmbeddedWorkflowService extends Service {
     }
 
     const current = await this.getStoredWorkflow(workflowId);
-    const restored = normalizeWorkflowPayload(revision.workflow, workflowId, revision.active);
+    let restored = normalizeWorkflowPayload(revision.workflow, workflowId, revision.active);
     // Tags carry the live ownership boundary. The first revision is captured
     // before a newly deployed workflow receives its owner tag, so replaying
     // revision content must never replace current authorization metadata.
     if (current.workflow.tags === undefined) delete restored.tags;
     else restored.tags = cloneJson(current.workflow.tags);
+    restored = withWorkflowExecutionContext(
+      restored,
+      readWorkflowExecutionContext(current.workflow) ?? {}
+    );
     this.assertRegisteredNodes(restored);
     this.assertHostSupports(restored);
-    if (restored.active) this.assertScheduleActivationAllowed(restored);
+    if (restored.active) {
+      this.assertScheduleActivationAllowed(restored);
+      restored = this.resolveManagedScheduleExecutionContext(workflowId, restored).workflow;
+    }
     await this.captureWorkflowRevision(workflowId, current, 'restore');
 
     const updatedAt = nowIso();
@@ -2734,7 +2869,7 @@ export class EmbeddedWorkflowService extends Service {
     const rows = limit === undefined ? await query : await query.limit(limit + 1);
     const hasMore = limit !== undefined && rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const data = pageRows.map((row) => cloneJson(row.execution));
+    const data = pageRows.map((row) => sanitizeWorkflowExecution(row.execution));
     const last = pageRows.at(-1);
     return {
       data,
@@ -2759,7 +2894,7 @@ export class EmbeddedWorkflowService extends Service {
       .limit(1);
     const execution = rows[0]?.execution;
     if (!execution) throw new WorkflowApiError(`Execution not found: ${id}`, 404);
-    return cloneJson(execution);
+    return sanitizeWorkflowExecution(execution);
   }
 
   async deleteExecution(id: string): Promise<void> {
@@ -2848,6 +2983,10 @@ export class EmbeddedWorkflowService extends Service {
       this.assertAcceptingExecutions();
       const mode = options.mode ?? 'manual';
       const throwOnError = options.throwOnError ?? true;
+      const executionContext = resolveWorkflowExecutionContext(entry.workflow, {
+        ownerEntityId: options.ownerEntityId,
+        sourceRoomId: options.sourceRoomId,
+      });
       if (!options.idempotencyKey) {
         return {
           execution: await this.runWorkflow(
@@ -2856,7 +2995,8 @@ export class EmbeddedWorkflowService extends Service {
             options.triggerData,
             undefined,
             throwOnError,
-            options.scheduleNodeId
+            options.scheduleNodeId,
+            executionContext
           ),
           dedup: false,
         };
@@ -2867,10 +3007,11 @@ export class EmbeddedWorkflowService extends Service {
         mode,
         options.triggerData,
         options.idempotencyKey,
-        options.scheduleNodeId
+        options.scheduleNodeId,
+        executionContext
       );
       if (!claim.claimed) {
-        return { execution: claim.execution, dedup: true };
+        return { execution: sanitizeWorkflowExecution(claim.execution), dedup: true };
       }
 
       return {
@@ -2910,7 +3051,7 @@ export class EmbeddedWorkflowService extends Service {
       .orderBy(desc(embeddedExecutions.startedAt))
       .limit(1);
     const row = rows[0];
-    return row ? cloneJson(row.execution) : null;
+    return row ? sanitizeWorkflowExecution(row.execution) : null;
   }
 
   executeWebhook(
@@ -3164,6 +3305,32 @@ export class EmbeddedWorkflowService extends Service {
     );
   }
 
+  /** Legacy definitions predate the reserved execution-context field. In
+   * managed Cloud, only the complete server-created owner tag for this exact
+   * agent is strong enough to migrate one before a schedule is armed. */
+  private resolveManagedScheduleExecutionContext(
+    workflowId: string,
+    workflow: WorkflowDefinition
+  ): { workflow: WorkflowDefinition; migrated: boolean } {
+    if (!isManagedCloudRuntime(this.runtime) || !hasEnabledScheduleTrigger(workflow)) {
+      return { workflow, migrated: false };
+    }
+    const currentContext = readWorkflowExecutionContext(workflow);
+    if (currentContext?.ownerEntityId) return { workflow, migrated: false };
+
+    const owner = resolveCanonicalWorkflowOwnerTag(this.runtime, workflow);
+    if (owner.status !== 'resolved') {
+      throw workflowOwnerTagMigrationError(workflowId, owner.status);
+    }
+    return {
+      workflow: withWorkflowExecutionContext(workflow, {
+        ownerEntityId: owner.ownerEntityId,
+        sourceRoomId: currentContext?.sourceRoomId,
+      }),
+      migrated: true,
+    };
+  }
+
   /** Re-create core Tasks for every active workflow on service start.
    *  Tasks themselves persist across restart; this is a reconcile step that
    *  ensures workflows whose schedule changed (or whose tasks were never
@@ -3206,7 +3373,24 @@ export class EmbeddedWorkflowService extends Service {
         });
         continue;
       }
-      await this.armSchedules(row.id);
+      try {
+        await this.armSchedules(row.id);
+      } catch (error) {
+        if (!isWorkflowOwnerTagMigrationError(error)) throw error;
+        await this.deactivateWorkflow(row.id);
+        logger.warn(
+          {
+            src: 'plugin:workflow:embedded',
+            workflowId: row.id,
+            code: WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED_CODE,
+          },
+          'Deactivated scheduled workflow whose legacy owner could not be migrated safely'
+        );
+        this.runtime.reportError('EmbeddedWorkflowService.rehydrateSchedules', error, {
+          workflowId: row.id,
+          code: WORKFLOW_OWNER_TAG_MIGRATION_REQUIRED_CODE,
+        });
+      }
     }
   }
 
@@ -3409,13 +3593,21 @@ export class EmbeddedWorkflowService extends Service {
         context: { workflowId: DEVICE_HEALTH_CHECK_WORKFLOW_ID },
         severity: 'ephemeral',
       });
+      const diagnosticError = toSafeWorkflowExecutionError(wrapped, {
+        workflowId: DEVICE_HEALTH_CHECK_WORKFLOW_ID,
+      });
       if (typeof this.runtime.reportError === 'function') {
-        this.runtime.reportError('EmbeddedWorkflowService.seedDefaultWorkflows', wrapped, {
+        this.runtime.reportError('EmbeddedWorkflowService.seedDefaultWorkflows', diagnosticError, {
           workflowId: DEVICE_HEALTH_CHECK_WORKFLOW_ID,
         });
       } else {
         logger.error(
-          { src: 'plugin:workflow:embedded', error: wrapped },
+          {
+            src: 'plugin:workflow:embedded',
+            error: serializeWorkflowExecutionError(diagnosticError, {
+              workflowId: DEVICE_HEALTH_CHECK_WORKFLOW_ID,
+            }),
+          },
           'Default-workflow deletion-history check failed'
         );
       }
@@ -3502,7 +3694,8 @@ export class EmbeddedWorkflowService extends Service {
     workflowId: string,
     workflowName: string,
     scheduleNodeId: string,
-    intervalMs: number
+    intervalMs: number,
+    executionContext: WorkflowExecutionContext | undefined
   ): TriggerConfig {
     const triggerId = stringToUuid(`${workflowId}:schedule:${scheduleNodeId}`);
     return {
@@ -3513,7 +3706,7 @@ export class EmbeddedWorkflowService extends Service {
       triggerType: 'interval',
       enabled: true,
       wakeMode: 'inject_now',
-      createdBy: 'workflow.schedule',
+      createdBy: executionContext?.ownerEntityId ?? 'workflow.schedule',
       intervalMs,
       runCount: 0,
       kind: 'workflow',
@@ -3551,6 +3744,7 @@ export class EmbeddedWorkflowService extends Service {
     existingTasks: Task[]
   ): Task[] {
     const nowMs = Date.now();
+    const executionContext = readWorkflowExecutionContext(workflow);
     const claimedExisting = new Set<Task>();
     return workflow.nodes
       .filter((node) => !node.disabled && node.type === 'workflows-nodes-base.scheduleTrigger')
@@ -3579,7 +3773,8 @@ export class EmbeddedWorkflowService extends Service {
           workflowId,
           workflow.name,
           scheduleNodeId,
-          intervalMs
+          intervalMs,
+          executionContext
         );
         const triggerId =
           preservesCadence && typeof existingTrigger?.triggerId === 'string'
@@ -3591,6 +3786,9 @@ export class EmbeddedWorkflowService extends Service {
             existing?.id ??
             stringToUuid(`${workflowId}:schedule-task:${encodeURIComponent(scheduleNodeId)}`),
           agentId: this.runtime.agentId,
+          ...(executionContext?.ownerEntityId
+            ? { entityId: stringToUuid(executionContext.ownerEntityId) }
+            : {}),
           name: TRIGGER_TASK_NAME,
           description: trigger.displayName,
           tags: [...TRIGGER_TASK_TAGS, WORKFLOW_TASK_TAG],
@@ -3607,6 +3805,22 @@ export class EmbeddedWorkflowService extends Service {
             workflowId,
             scheduleNodeId,
             idempotencyKey,
+            ...(executionContext?.ownerEntityId
+              ? { ownerEntityId: executionContext.ownerEntityId }
+              : {}),
+            ...(executionContext?.sourceRoomId
+              ? { sourceRoomId: executionContext.sourceRoomId }
+              : {}),
+            ...(executionContext?.ownerEntityId
+              ? {
+                  ownership: {
+                    ownerEntityId: executionContext.ownerEntityId,
+                    ...(executionContext.sourceRoomId
+                      ? { sourceRoomId: executionContext.sourceRoomId }
+                      : {}),
+                  },
+                }
+              : {}),
             trigger: {
               ...trigger,
               triggerId,
@@ -3727,7 +3941,23 @@ export class EmbeddedWorkflowService extends Service {
 
   private async armSchedules(workflowId: string): Promise<void> {
     const entry = await this.getStoredWorkflow(workflowId);
-    await this.reconcileSchedules(workflowId, entry.workflow);
+    const prepared = this.resolveManagedScheduleExecutionContext(workflowId, entry.workflow);
+    if (prepared.migrated) {
+      await this.getDb()
+        .update(embeddedWorkflows)
+        .set({ workflow: prepared.workflow })
+        .where(
+          and(
+            eq(embeddedWorkflows.agentId, this.tenantAgentId),
+            eq(embeddedWorkflows.id, workflowId)
+          )
+        );
+      logger.info(
+        { src: 'plugin:workflow:embedded', workflowId },
+        'Migrated scheduled workflow owner context from its canonical owner tag'
+      );
+    }
+    await this.reconcileSchedules(workflowId, prepared.workflow);
   }
 
   /** Remove every core Task tagged for this workflow with rollback on a
@@ -3837,10 +4067,14 @@ export class EmbeddedWorkflowService extends Service {
         try {
           await this.renewExecutionLease(executionId);
         } catch (error) {
-          this.runtime.reportError?.('EmbeddedWorkflowService.executionLeaseHeartbeat', error, {
+          const safeError = toSafeWorkflowExecutionError(error, {
+            fallbackCode: 'WORKFLOW_EXECUTION_LEASE_LOST',
             executionId,
           });
-          controller.abort(error);
+          this.runtime.reportError?.('EmbeddedWorkflowService.executionLeaseHeartbeat', safeError, {
+            executionId,
+          });
+          controller.abort(safeError);
         }
       }
     })();
@@ -3861,7 +4095,8 @@ export class EmbeddedWorkflowService extends Service {
     mode: WorkflowExecuteMode,
     triggerData: Record<string, unknown> | undefined,
     idempotencyKey: string,
-    scheduleNodeId: string | undefined
+    scheduleNodeId: string | undefined,
+    executionContext: WorkflowExecutionContext | undefined
   ): Promise<{ execution: WorkflowExecution; claimed: boolean }> {
     await this.ensureSchema();
     const tenantAgentId = this.tenantAgentId;
@@ -3886,7 +4121,7 @@ export class EmbeddedWorkflowService extends Service {
         .limit(1);
       const existing = existingRows[0];
       if (existing) {
-        return { execution: cloneJson(existing.execution), claimed: false };
+        return { execution: sanitizeWorkflowExecution(existing.execution), claimed: false };
       }
 
       const pending = this.createPendingExecution(
@@ -3894,7 +4129,8 @@ export class EmbeddedWorkflowService extends Service {
         mode,
         triggerData,
         idempotencyKey,
-        scheduleNodeId
+        scheduleNodeId,
+        executionContext
       );
       await tx.insert(embeddedExecutions).values({
         agentId: tenantAgentId,
@@ -3930,11 +4166,12 @@ export class EmbeddedWorkflowService extends Service {
           if (signal.aborted) return;
           // error-policy:J7 recovery polling is supervised in the background;
           // scan failures remain observable and the durable rows remain eligible.
-          this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecutions', error, {});
+          const safeError = toSafeWorkflowExecutionError(error);
+          this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecutions', safeError, {});
           logger.warn(
             {
               src: 'plugin:workflow:embedded',
-              error: error instanceof Error ? error.message : String(error),
+              error: serializeWorkflowExecutionError(safeError),
             },
             'unfinished workflow recovery scan failed'
           );
@@ -4060,7 +4297,11 @@ export class EmbeddedWorkflowService extends Service {
         // error-policy:J7 a failed startup recovery remains `running` so a later
         // startup can retry it; report the failed attempt without fabricating a
         // terminal workflow result.
-        this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecution', error, {
+        const safeError = toSafeWorkflowExecutionError(error, {
+          workflowId: claimed.workflowId,
+          executionId: claimed.id,
+        });
+        this.runtime.reportError?.('EmbeddedWorkflowService.recoverExecution', safeError, {
           workflowId: claimed.workflowId,
           executionId: claimed.id,
         });
@@ -4069,7 +4310,10 @@ export class EmbeddedWorkflowService extends Service {
             src: 'plugin:workflow:embedded',
             workflowId: claimed.workflowId,
             executionId: claimed.id,
-            error: error instanceof Error ? error.message : String(error),
+            error: serializeWorkflowExecutionError(safeError, {
+              workflowId: claimed.workflowId,
+              executionId: claimed.id,
+            }),
           },
           'unfinished workflow recovery failed; execution remains resumable'
         );
@@ -4263,6 +4507,7 @@ export class EmbeddedWorkflowService extends Service {
     node: WorkflowNode,
     inputData: INodeExecutionData[][],
     executionId: string,
+    executionContext: WorkflowExecutionContext | undefined,
     signal: AbortSignal
   ): Promise<INodeExecutionData[][]> {
     signal.throwIfAborted();
@@ -4277,6 +4522,7 @@ export class EmbeddedWorkflowService extends Service {
       getInputData: (inputIndex = 0) => inputData[inputIndex] ?? [],
       getRuntime: () => this.runtime,
       getExecutionId: () => executionId,
+      getExecutionContext: () => executionContext,
       getAbortSignal: () => signal,
     };
     const output = await nodeType.execute.call(context);
@@ -4290,14 +4536,16 @@ export class EmbeddedWorkflowService extends Service {
     triggerData?: Record<string, unknown>,
     idempotencyKey?: string,
     throwOnError = true,
-    scheduleNodeId?: string
+    scheduleNodeId?: string,
+    executionContext?: WorkflowExecutionContext
   ): Promise<WorkflowExecution> {
     const pending = this.createPendingExecution(
       workflowData,
       mode,
       triggerData,
       idempotencyKey,
-      scheduleNodeId
+      scheduleNodeId,
+      executionContext
     );
     await this.savePendingExecution(pending, idempotencyKey);
 
@@ -4315,8 +4563,10 @@ export class EmbeddedWorkflowService extends Service {
     mode: WorkflowExecuteMode,
     triggerData?: Record<string, unknown>,
     idempotencyKey?: string,
-    scheduleNodeId?: string
+    scheduleNodeId?: string,
+    executionContext?: WorkflowExecutionContext
   ): WorkflowExecution {
+    const resolvedContext = resolveWorkflowExecutionContext(workflowData, executionContext);
     const pending: WorkflowExecution = {
       id: randomUUID(),
       finished: false,
@@ -4328,6 +4578,8 @@ export class EmbeddedWorkflowService extends Service {
         ...(triggerData ? { triggerData } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...(scheduleNodeId ? { scheduleNodeId } : {}),
+        ...(resolvedContext?.ownerEntityId ? { ownerEntityId: resolvedContext.ownerEntityId } : {}),
+        ...(resolvedContext?.sourceRoomId ? { sourceRoomId: resolvedContext.sourceRoomId } : {}),
         [SMITHERS_RESUME_STATE_KEY]: {
           version: 1,
           workflow: cloneJson(workflowData),
@@ -4392,6 +4644,7 @@ export class EmbeddedWorkflowService extends Service {
         typeof pending.customData?.scheduleNodeId === 'string'
           ? pending.customData.scheduleNodeId
           : undefined;
+      const executionContext = readPendingExecutionContext(pending);
       const plan = this.resolveExecutionPlan(workflowData, pending.mode, scheduleNodeId);
       const execution = await runWorkflowWithSmithers({
         tenantId: this.tenantAgentId,
@@ -4402,7 +4655,8 @@ export class EmbeddedWorkflowService extends Service {
         triggerData,
         plan,
         signal: lease.signal,
-        runNode: (node, inputData, signal) => this.executeNode(node, inputData, pending.id, signal),
+        runNode: (node, inputData, signal) =>
+          this.executeNode(node, inputData, pending.id, executionContext, signal),
       });
       completed = execution;
     } catch (error) {
@@ -4418,6 +4672,10 @@ export class EmbeddedWorkflowService extends Service {
         throw runError;
       }
       if (!persistFailure) throw runError;
+      const safeError = serializeWorkflowExecutionError(runError, {
+        workflowId: pending.workflowId,
+        executionId: pending.id,
+      });
       const failedExecution: WorkflowExecution = {
         ...pending,
         finished: true,
@@ -4425,12 +4683,7 @@ export class EmbeddedWorkflowService extends Service {
         stoppedAt: nowIso(),
         data: {
           resultData: {
-            error: {
-              message: runError instanceof Error ? runError.message : String(runError),
-              stack: runError instanceof Error ? runError.stack : undefined,
-              code: runError instanceof ElizaError ? runError.code : undefined,
-              context: runError instanceof ElizaError ? runError.context : undefined,
-            },
+            error: safeError,
           },
         },
       };
@@ -4438,7 +4691,10 @@ export class EmbeddedWorkflowService extends Service {
       if (!throwOnError) {
         return cloneJson(failedExecution);
       }
-      throw runError;
+      throw toSafeWorkflowExecutionError(runError, {
+        workflowId: pending.workflowId,
+        executionId: pending.id,
+      });
     }
 
     if (!completed) {

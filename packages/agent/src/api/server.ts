@@ -2384,6 +2384,7 @@ async function handleRequest(
       method,
       pathname,
       runtime: state.runtime,
+      principalId: resolveTrustedCloudPrincipal(req) ?? undefined,
       readJsonBody,
       json,
       error,

@@ -39,11 +39,21 @@ function fakeExecution(id: string, overrides: Partial<WorkflowExecution> = {}): 
   };
 }
 
-function makeRuntime(service: unknown = null, loadPromise?: Promise<unknown>) {
+function makeRuntime(
+  service: unknown = null,
+  loadPromise?: Promise<unknown>,
+  ownerScopedService?: unknown,
+  settings: Record<string, unknown> = {}
+) {
   const services = new Map<string, unknown>();
   return {
     services,
-    getService: mock((type: string) => (type === EMBEDDED_WORKFLOW_SERVICE_TYPE ? service : null)),
+    getService: mock((type: string) => {
+      if (type === EMBEDDED_WORKFLOW_SERVICE_TYPE) return service;
+      if (type === 'workflow') return ownerScopedService ?? null;
+      return null;
+    }),
+    getSetting: mock((key: string) => settings[key] ?? null),
     ...(loadPromise
       ? {
           getServiceLoadPromise: mock((type: string) => {
@@ -64,6 +74,8 @@ function makeEmbeddedService() {
         triggerData: Record<string, unknown>;
         idempotencyKey?: string;
         scheduleNodeId?: string;
+        ownerEntityId?: string;
+        sourceRoomId?: string;
       }
     ): Promise<WorkflowExecution> =>
       fakeExecution(`${workflowId}:${options.idempotencyKey ?? 'fresh'}`, {
@@ -80,6 +92,8 @@ function makeEmbeddedService() {
           triggerData: Record<string, unknown>;
           idempotencyKey?: string;
           scheduleNodeId?: string;
+          ownerEntityId?: string;
+          sourceRoomId?: string;
         }
       ) => ({ execution: await executeWorkflow(workflowId, options), dedup: false })
     ),
@@ -112,6 +126,21 @@ describe('workflow dispatch service', () => {
       ok: false,
       error: 'embedded workflow service not registered',
     });
+  });
+
+  it('rejects a bare workflow id in managed Cloud before resolving any service', async () => {
+    const embedded = makeEmbeddedService();
+    const runtime = makeRuntime(embedded, undefined, undefined, {
+      ELIZA_CLOUD_PROVISIONED: 'true',
+    });
+    const dispatch = createWorkflowDispatchService(runtime as never);
+
+    await expect(dispatch.execute('known-workflow-id')).resolves.toEqual({
+      ok: false,
+      error: 'workflow owner context required in managed Cloud',
+    });
+    expect(runtime.getService).not.toHaveBeenCalled();
+    expect(embedded.executeWorkflow).not.toHaveBeenCalled();
   });
 
   it('waits for the embedded workflow service to finish starting before dispatching', async () => {
@@ -160,6 +189,56 @@ describe('workflow dispatch service', () => {
       idempotencyKey: 'tick-1',
       scheduleNodeId: 'schedule-a',
     });
+  });
+
+  it('authorizes the owner before lookup and forwards owner/chat context', async () => {
+    const embedded = makeEmbeddedService();
+    const ownerScopedService = { getWorkflow: mock(async () => ({ id: 'wf-1' })) };
+    const dispatch = createWorkflowDispatchService(
+      makeRuntime(embedded, undefined, ownerScopedService) as never
+    );
+
+    await expect(
+      dispatch.execute(
+        'wf-1',
+        {},
+        {
+          idempotencyKey: 'tick-owner',
+          ownerEntityId: 'owner-a',
+          sourceRoomId: 'room-a',
+        }
+      )
+    ).resolves.toEqual({ ok: true, executionId: 'wf-1:tick-owner' });
+    expect(ownerScopedService.getWorkflow).toHaveBeenCalledWith('wf-1', 'owner-a');
+    expect(embedded.executeWorkflowWithDedup).toHaveBeenCalledWith('wf-1', {
+      mode: 'trigger',
+      triggerData: {},
+      idempotencyKey: 'tick-owner',
+      scheduleNodeId: undefined,
+      ownerEntityId: 'owner-a',
+      sourceRoomId: 'room-a',
+    });
+  });
+
+  it('denies a foreign owner before exposing an idempotent execution row', async () => {
+    const embedded = makeEmbeddedService();
+    embedded.findExecutionByIdempotencyKey.mockImplementation(async () =>
+      fakeExecution('must-not-leak')
+    );
+    const ownerScopedService = {
+      getWorkflow: mock(async () => {
+        throw new Error('Workflow not found');
+      }),
+    };
+    const dispatch = createWorkflowDispatchService(
+      makeRuntime(embedded, undefined, ownerScopedService) as never
+    );
+
+    await expect(
+      dispatch.execute('wf-1', {}, { idempotencyKey: 'tick-owner', ownerEntityId: 'owner-b' })
+    ).resolves.toEqual({ ok: false, error: 'workflow not found or not owned by caller' });
+    expect(embedded.findExecutionByIdempotencyKey).not.toHaveBeenCalled();
+    expect(embedded.executeWorkflowWithDedup).not.toHaveBeenCalled();
   });
 
   it('returns a dedup result for an existing idempotency row', async () => {
@@ -296,8 +375,8 @@ describe('workflow dispatch service', () => {
     release();
 
     await expect(Promise.all([first, second])).resolves.toEqual([
-      { ok: false, error: 'engine offline' },
-      { ok: false, error: 'engine offline', dedup: true },
+      { ok: false, error: 'workflow execution failed' },
+      { ok: false, error: 'workflow execution failed', dedup: true },
     ]);
     expect(embedded.executeWorkflow).toHaveBeenCalledTimes(1);
   });
@@ -311,11 +390,15 @@ describe('workflow dispatch service', () => {
 
     await expect(dispatch.execute('wf-1')).resolves.toEqual({
       ok: false,
-      error: 'engine offline',
+      error: 'workflow execution failed',
     });
     expect(logger.warn).toHaveBeenCalledWith(
-      { src: 'plugin:workflow:dispatch' },
-      'Workflow execution failed for wf-1: engine offline'
+      expect.objectContaining({
+        src: 'plugin:workflow:dispatch',
+        workflowId: 'wf-1',
+        error: expect.objectContaining({ code: 'WORKFLOW_DISPATCH_FAILED' }),
+      }),
+      'Workflow execution failed'
     );
   });
 
