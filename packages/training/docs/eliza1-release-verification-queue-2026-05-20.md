@@ -40,14 +40,9 @@ Known remaining blockers:
 Commands used:
 
 ```bash
-python3 packages/training/scripts/manifest/audit_hf_eliza1_release.py \
-  --summary > /tmp/eliza-1-hf-audit-current.json
-
 python3 packages/training/scripts/manifest/release_verification_queue.py \
-  --summary-json /tmp/eliza-1-hf-audit-current.json \
   --format json > /tmp/eliza-1-verification-queue-current.json
 
 python3 packages/training/scripts/manifest/release_verification_queue.py \
-  --summary-json /tmp/eliza-1-hf-audit-current.json \
   --format markdown --limit 80 > /tmp/eliza-1-verification-queue-current.md
 ```

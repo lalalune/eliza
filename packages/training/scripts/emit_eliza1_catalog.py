@@ -63,7 +63,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from manifest.eliza1_manifest import ELIZA_1_TIERS
+from manifest.eliza1_manifest import (
+    ELIZA_1_TIERS,
+    tokenizer_family_for_text_architecture,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,6 +219,29 @@ def _slug_from_repo(hf_repo: str) -> str:
     return last.lower()
 
 
+def _tokenizer_family_from_manifest(manifest: dict[str, object]) -> str | None:
+    tokenizer = manifest.get("tokenizer")
+    if isinstance(tokenizer, dict) and isinstance(tokenizer.get("family"), str):
+        return tokenizer["family"]
+    files = manifest.get("files")
+    text_files = files.get("text") if isinstance(files, dict) else None
+    if not isinstance(text_files, list):
+        return None
+    families = {
+        tokenizer_family_for_text_architecture(entry["architecture"])
+        for entry in text_files
+        if isinstance(entry, dict) and isinstance(entry.get("architecture"), str)
+    }
+    if len(families) == 1:
+        return families.pop()
+    if len(families) > 1:
+        raise SystemExit(
+            "manifest files.text[].architecture maps to multiple tokenizer families: "
+            f"{sorted(families)}"
+        )
+    return None
+
+
 def build_catalog_entry(manifest: dict[str, object]) -> Eliza1CatalogEntry:
     base_model = str(manifest.get("base_model", ""))
     base_meta = KNOWN_BASE_MODELS.get(base_model)
@@ -235,6 +261,12 @@ def build_catalog_entry(manifest: dict[str, object]) -> Eliza1CatalogEntry:
     gguf_file = str(gguf.get("filename") or "")
     if not gguf_file:
         raise SystemExit("manifest.gguf.filename is required")
+    tokenizer_family = _tokenizer_family_from_manifest(manifest)
+    if tokenizer_family is None:
+        raise SystemExit(
+            "manifest must include tokenizer.family or files.text[].architecture "
+            "derived from the GGUF bytes"
+        )
 
     runtime = manifest.get("runtime") or {}
     if not isinstance(runtime, dict):
@@ -271,7 +303,7 @@ def build_catalog_entry(manifest: dict[str, object]) -> Eliza1CatalogEntry:
         category=str(base_meta["category"]),
         bucket=str(base_meta["bucket"]),
         context_length=int(base_meta["context_length"]),
-        tokenizer_family=str(base_meta["tokenizer_family"]),
+        tokenizer_family=tokenizer_family,
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
         spec_type=spec_type,

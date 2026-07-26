@@ -1,4 +1,4 @@
-"""Emit a Eliza-typed GGUF using the elizaOS/llama.cpp fork's converter.
+"""Emit a legacy Eliza-typed GGUF using the elizaOS/llama.cpp fork's converter.
 
 The elizaOS/llama.cpp v1.0.0-eliza fork registers the following
 non-upstream GGML types:
@@ -93,8 +93,8 @@ def _resolve_convert_script(llama_cpp_dir: Path | None) -> Path:
     """Locate ``convert_hf_to_gguf.py`` in the elizaOS/llama.cpp fork checkout.
 
     Resolution order: --llama-cpp-dir → $LLAMA_CPP_DIR → the in-repo fork
-    submodule (``packages/inference/llama.cpp``, the single canonical
-    llama.cpp checkout) → the standalone clone at
+    submodule (``plugins/plugin-local-inference/native/llama.cpp``, the
+    single canonical llama.cpp checkout) → the standalone clone at
     ``~/.cache/eliza-mtp/eliza-llama-cpp`` (used when the build scripts'
     ELIZA_MTP_LLAMA_CPP_REMOTE/_REF override forces one) → $PATH.
     """
@@ -104,11 +104,11 @@ def _resolve_convert_script(llama_cpp_dir: Path | None) -> Path:
     env_dir = os.environ.get("LLAMA_CPP_DIR")
     if env_dir:
         cands.append(Path(env_dir))
-    # packages/inference/llama.cpp is the canonical fork submodule
-    # (.gitmodules: url=https://github.com/elizaOS/llama.cpp.git).
+    # plugins/plugin-local-inference/native/llama.cpp is the canonical fork
+    # submodule (.gitmodules: url=https://github.com/elizaOS/llama.cpp.git).
     here = Path(__file__).resolve()
     for p in here.parents:
-        cand = p / "packages" / "inference" / "llama.cpp"
+        cand = p / "plugins" / "plugin-local-inference" / "native" / "llama.cpp"
         if cand.is_dir():
             cands.append(cand)
             break
@@ -123,7 +123,7 @@ def _resolve_convert_script(llama_cpp_dir: Path | None) -> Path:
     raise FileNotFoundError(
         "convert_hf_to_gguf.py not found. Pass --llama-cpp-dir <path>, set "
         "LLAMA_CPP_DIR=<elizaOS/llama.cpp checkout>, or run "
-        "`git submodule update --init packages/inference/llama.cpp`."
+        "`git submodule update --init plugins/plugin-local-inference/native/llama.cpp`."
     )
 
 
@@ -144,6 +144,7 @@ def _convert_script_supports_eliza1(convert_path: Path) -> bool:
 def _build_ext_metadata(
     *,
     base_model: str,
+    actual_outtype: str,
     polar_sidecar: dict[str, object] | None,
     qjl_sidecar: dict[str, object] | None,
     tbq_sidecar: dict[str, object] | None,
@@ -216,12 +217,59 @@ def _build_ext_metadata(
             "architecture": fused_tbq_sidecar.get("architecture"),
         }
 
-    fragments = [
-        sidecar.get("kernel_manifest")
-        for sidecar in (polar_sidecar, qjl_sidecar, tbq_sidecar, fused_tbq_sidecar)
-        if isinstance(sidecar, dict)
-        and isinstance(sidecar.get("kernel_manifest"), dict)
-    ]
+    fragments: list[dict[str, object]] = []
+    recipe_status: dict[str, dict[str, object]] = {}
+
+    def record_recipe_status(
+        name: str,
+        sidecar: dict[str, object] | None,
+        *,
+        cited: bool,
+        reason: str,
+    ) -> None:
+        recipe_status[name] = {
+            "sidecarPresent": sidecar is not None,
+            "manifestCited": cited,
+            "reason": reason,
+        }
+
+    if polar_sidecar is not None and actual_outtype == "q4_polar":
+        fragment = polar_sidecar.get("kernel_manifest")
+        if isinstance(fragment, dict):
+            fragments.append(fragment)
+        record_recipe_status(
+            "polarquant",
+            polar_sidecar,
+            cited=True,
+            reason="q4_polar is the actual GGUF tensor type",
+        )
+    else:
+        record_recipe_status(
+            "polarquant",
+            polar_sidecar,
+            cited=False,
+            reason=(
+                "PolarQuant sidecars are not cited unless the produced GGUF "
+                "actually uses q4_polar tensor blocks"
+            ),
+        )
+
+    for name, sidecar in (
+        ("qjl", qjl_sidecar),
+        ("turboquant", tbq_sidecar),
+        ("fused_turboquant", fused_tbq_sidecar),
+    ):
+        record_recipe_status(
+            name,
+            sidecar,
+            cited=False,
+            reason=(
+                "Runtime KV-cache sidecar metadata is not recipe provenance "
+                "until the publish gate verifies the tier enables that cache"
+            ),
+        )
+
+    out["recipeStatus"] = recipe_status
     if fragments:
         out["recipeManifest"] = merge_kernel_manifest_fragments(fragments)
     return out
@@ -251,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         "--llama-cpp-dir",
         type=Path,
         default=None,
-        help="Path to the elizaOS/llama.cpp v1.0.0-eliza checkout (defaults to the in-repo submodule packages/inference/llama.cpp).",
+        help="Path to the elizaOS/llama.cpp v1.0.0-eliza checkout (defaults to the in-repo submodule plugins/plugin-local-inference/native/llama.cpp).",
     )
     ap.add_argument(
         "--polarquant-sidecar",
@@ -440,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ext_metadata = _build_ext_metadata(
             base_model=base_model,
+            actual_outtype=args.outtype,
             polar_sidecar=polar_sidecar,
             qjl_sidecar=qjl_sidecar,
             tbq_sidecar=tbq_sidecar,

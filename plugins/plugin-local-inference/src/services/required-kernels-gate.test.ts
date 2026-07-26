@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+	assertGemmaRuntimeDispatchContract,
 	assertRequiredKernelsPresent,
+	GemmaRuntimeDispatchContractError,
 	MissingRequiredKernelsError,
 } from "./active-model";
+import { findCatalogModel } from "./catalog";
 import type { Eliza1Manifest } from "./manifest";
 import { REQUIRED_KERNELS_BY_TIER } from "./manifest";
 import type { ManifestLoader } from "./ram-budget";
@@ -46,8 +49,8 @@ describe("assertRequiredKernelsPresent (native/CLAUDE.md §3#5)", () => {
 	});
 
 	it("throws MissingRequiredKernelsError when a required kernel is absent", () => {
-		// The 2B tier requires `turboquant_q4`; a manifest that only declares an
-		// optional KV kernel is missing it.
+		// The 2B tier requires `turboquant_q4` + `mtp`; a manifest that only
+		// declares an optional KV kernel is missing both.
 		const broken: ManifestLoader = () => manifestWithKernels(["qjl"]);
 		let thrown: unknown;
 		try {
@@ -59,6 +62,56 @@ describe("assertRequiredKernelsPresent (native/CLAUDE.md §3#5)", () => {
 		const err = thrown as MissingRequiredKernelsError;
 		expect(err.tier).toBe("2b");
 		expect(err.missing).toContain("turboquant_q4");
+		expect(err.missing).toContain("mtp");
 		expect(err.modelId).toBe("eliza-1-2b");
+	});
+});
+
+describe("assertGemmaRuntimeDispatchContract", () => {
+	const manifest = manifestWithKernels(REQUIRED_KERNELS_BY_TIER["2b"]);
+	const catalog = findCatalogModel("eliza-1-2b");
+
+	it("accepts the shipped Gemma dispatch shape", () => {
+		expect(() =>
+			assertGemmaRuntimeDispatchContract(
+				installed2b(),
+				{
+					modelPath: "/tmp/eliza-1-2b/text/model.gguf",
+					cacheTypeK: "q8_0",
+					cacheTypeV: "q8_0",
+					flashAttention: true,
+					draftModelPath: "/tmp/eliza-1-2b/mtp/drafter-2b.gguf",
+					draftMin: 1,
+					draftMax: 1,
+					speculativeSamples: 1,
+					mobileSpeculative: true,
+				},
+				{ catalog, manifest },
+			),
+		).not.toThrow();
+	});
+
+	it("rejects legacy KV kernels and missing drafter-backed MTP", () => {
+		let thrown: unknown;
+		try {
+			assertGemmaRuntimeDispatchContract(
+				installed2b(),
+				{
+					modelPath: "/tmp/eliza-1-2b/text/model.gguf",
+					cacheTypeK: "qjl1_256",
+					cacheTypeV: "q4_polar",
+					flashAttention: false,
+				},
+				{ catalog, manifest },
+			);
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).toBeInstanceOf(GemmaRuntimeDispatchContractError);
+		const err = thrown as GemmaRuntimeDispatchContractError;
+		expect(err.failures.join("\n")).toMatch(/cacheTypeK=qjl1_256/);
+		expect(err.failures.join("\n")).toMatch(/cacheTypeV=q4_polar/);
+		expect(err.failures.join("\n")).toMatch(/draftModelPath/);
+		expect(err.failures.join("\n")).toMatch(/flashAttention=true/);
 	});
 });

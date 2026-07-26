@@ -16,7 +16,7 @@
  * metadata is gated until the Gemma drafter GGUFs are actually hosted.
  */
 
-import { resolveHfDownloadBase } from "./hf-proxy.js";
+import { type HfDownloadBase, resolveHfDownloadBases } from "./hf-proxy.js";
 import type {
   CatalogModel,
   CatalogQuantizationId,
@@ -128,11 +128,6 @@ export function isDefaultEligibleId(id: string): boolean {
  * `CatalogModel`) before recommending a first-run default — see
  * `recommendForFirstRun` and elizaOS/eliza#7629.
  *
- * Set the override env var `ELIZA_PUBLISH_STATUS_OVERRIDES` to a JSON
- * object like `{"eliza-1-2b":"published","eliza-1-9b":"pending"}` to
- * override at runtime without changing the static map (useful for QA
- * and for installs that depend on a private HF mirror).
- *
  * W3-12 audit (2026-05-14): the following areas require publish attention:
  *   - 2B vision: enabled in the catalog and canonical vision tier set;
  *     publish staging must include `vision/mmproj-2b.gguf` or manifest
@@ -162,8 +157,6 @@ export const ELIZA_1_TIER_PUBLISH_STATUS: Readonly<
 export function eliza1TierPublishStatus(
   id: Eliza1TierId | string,
 ): "published" | "pending" {
-  const override = readPublishStatusOverride(id);
-  if (override) return override;
   const hint = (
     ELIZA_1_TIER_PUBLISH_STATUS as Record<
       string,
@@ -171,25 +164,6 @@ export function eliza1TierPublishStatus(
     >
   )[id];
   return hint ?? "published";
-}
-
-function readPublishStatusOverride(
-  id: string,
-): "published" | "pending" | undefined {
-  const raw =
-    typeof process !== "undefined"
-      ? process.env.ELIZA_PUBLISH_STATUS_OVERRIDES
-      : undefined;
-  if (!raw) return undefined;
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const value = parsed[id];
-    if (value === "published" || value === "pending") return value;
-  } catch {
-    // Malformed override JSON is non-fatal — fall back to the static
-    // publish-status hint and the catalog's own `publishStatus` field.
-  }
-  return undefined;
 }
 
 export const ELIZA_1_PLACEHOLDER_IDS: ReadonlySet<string> = new Set(
@@ -642,6 +616,18 @@ export function buildHuggingFaceResolveUrlForPath(
   model: CatalogModel,
   filePath: string,
 ): string {
+  return buildHuggingFaceResolveUrlCandidatesForPath(model, filePath)[0].url;
+}
+
+export interface HfResolveUrlCandidate extends HfDownloadBase {
+  /** Fully-qualified URL for this candidate base. */
+  url: string;
+}
+
+export function buildHuggingFaceResolveUrlCandidatesForPath(
+  model: CatalogModel,
+  filePath: string,
+): HfResolveUrlCandidate[] {
   const cleanFilePath = filePath.replace(/^\/+/, "");
   const cleanPrefix = model.hfPathPrefix?.replace(/^\/+|\/+$/g, "");
   const pathWithPrefix =
@@ -658,14 +644,23 @@ export function buildHuggingFaceResolveUrlForPath(
       .split("/")
       .map((segment) => encodeURIComponent(segment))
       .join("/");
-    return `${base}/models/${model.hfRepo}/resolve/master/${encodedPath}`;
+    return [
+      {
+        base,
+        url: `${base}/models/${model.hfRepo}/resolve/master/${encodedPath}`,
+        viaCloud: false,
+        label: "direct",
+      },
+    ];
   }
-  const { base } = resolveHfDownloadBase();
   const encodedPath = pathWithPrefix
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
-  return `${base}/${model.hfRepo}/resolve/main/${encodedPath}?download=true`;
+  return resolveHfDownloadBases().map((candidate) => ({
+    ...candidate,
+    url: `${candidate.base}/${model.hfRepo}/resolve/main/${encodedPath}?download=true`,
+  }));
 }
 
 export function buildHuggingFaceResolveUrl(model: CatalogModel): string {

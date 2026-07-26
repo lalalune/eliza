@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,8 @@ from scripts.manifest.eliza1_manifest import (
     build_manifest,
     parse_ctx_string,
     parse_text_ctx_from_filename,
+    read_gguf_architecture,
+    read_gguf_architecture_from_bytes,
     text_context_for_manifest,
     validate_manifest,
     write_manifest,
@@ -48,7 +51,26 @@ def quantization_kernel_fragments() -> list[dict[str, object]]:
 
 
 def text_file_for_tier(tier: str) -> FileEntry:
-    return FileEntry(path=f"text/eliza-1-{tier}-128k.gguf", sha256=SHA, ctx=131072)
+    return FileEntry(
+        path=f"text/eliza-1-{tier}-128k.gguf",
+        sha256=SHA,
+        ctx=131072,
+        architecture="gemma4",
+    )
+
+
+def gguf_header(arch: str) -> bytes:
+    def s(value: str) -> bytes:
+        data = value.encode("utf-8")
+        return struct.pack("<Q", len(data)) + data
+
+    return (
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 1)
+        + s("general.architecture")
+        + struct.pack("<I", 8)
+        + s(arch)
+    )
 
 
 def base_kwargs(tier: str = "4b") -> dict:
@@ -135,6 +157,31 @@ def test_text_context_prefers_gguf_metadata_over_filename(
     )
 
     assert text_context_for_manifest(text_path) == 262144
+
+
+def test_read_gguf_architecture_from_bytes_reads_gemma_and_qwen(tmp_path: Path):
+    gemma = tmp_path / "gemma.gguf"
+    gemma.write_bytes(gguf_header("gemma4"))
+
+    assert read_gguf_architecture(gemma) == "gemma4"
+    assert read_gguf_architecture_from_bytes(gguf_header("qwen35")) == "qwen35"
+
+
+def test_build_manifest_blocks_non_gemma_text_architecture():
+    kwargs = base_kwargs("4b")
+    kwargs["files"]["text"] = [
+        FileEntry(
+            path="text/eliza-1-4b-128k.gguf",
+            sha256=SHA,
+            ctx=131072,
+            architecture="qwen35",
+        )
+    ]
+
+    with pytest.raises(Eliza1ManifestError) as exc:
+        build_manifest(**kwargs)
+
+    assert any("expected gemma*" in e and "qwen35" in e for e in exc.value.errors)
 
 
 def test_eliza1_tier_ids_are_canonical():
@@ -497,7 +544,12 @@ def test_desktop_tier_requires_rocm_pass():
 def test_long_context_requires_turbo3_tcq():
     kwargs = base_kwargs("4b")
     kwargs["files"]["text"] = [
-        FileEntry(path="text/eliza-1-4b-128k.gguf", sha256=SHA, ctx=131072)
+        FileEntry(
+            path="text/eliza-1-4b-128k.gguf",
+            sha256=SHA,
+            ctx=131072,
+            architecture="gemma4",
+        )
     ]
     kwargs["kernels_required"] = [
         k for k in kwargs["kernels_required"] if k != "turbo3_tcq"
@@ -510,7 +562,12 @@ def test_long_context_requires_turbo3_tcq():
 def test_long_context_rejects_turbo3_tcq_optional_only():
     kwargs = base_kwargs("4b")
     kwargs["files"]["text"] = [
-        FileEntry(path="text/eliza-1-4b-128k.gguf", sha256=SHA, ctx=131072)
+        FileEntry(
+            path="text/eliza-1-4b-128k.gguf",
+            sha256=SHA,
+            ctx=131072,
+            architecture="gemma4",
+        )
     ]
     kwargs["kernels_required"] = [
         k for k in kwargs["kernels_required"] if k != "turbo3_tcq"
@@ -524,7 +581,12 @@ def test_long_context_rejects_turbo3_tcq_optional_only():
 def test_long_context_with_turbo3_tcq_in_required_passes():
     kwargs = base_kwargs("4b")
     kwargs["files"]["text"] = [
-        FileEntry(path="text/eliza-1-4b-128k.gguf", sha256=SHA, ctx=131072)
+        FileEntry(
+            path="text/eliza-1-4b-128k.gguf",
+            sha256=SHA,
+            ctx=131072,
+            architecture="gemma4",
+        )
     ]
     kwargs["kernels_required"] = list(REQUIRED_KERNELS_BY_TIER["4b"])
     kwargs["kernels_optional"] = []
@@ -535,7 +597,12 @@ def test_long_context_with_turbo3_tcq_in_required_passes():
 def test_text_context_below_128k_is_rejected():
     kwargs = base_kwargs("2b")
     kwargs["files"]["text"] = [
-        FileEntry(path="text/eliza-1-2b-64k.gguf", sha256=SHA, ctx=65536)
+        FileEntry(
+            path="text/eliza-1-2b-64k.gguf",
+            sha256=SHA,
+            ctx=65536,
+            architecture="gemma4",
+        )
     ]
     with pytest.raises(Eliza1ManifestError) as exc:
         build_manifest(**kwargs)
@@ -545,7 +612,12 @@ def test_text_context_below_128k_is_rejected():
 def test_32k_release_path_is_rejected_even_when_gguf_metadata_is_long():
     kwargs = base_kwargs("2b")
     kwargs["files"]["text"] = [
-        FileEntry(path="text/eliza-1-2b-32k.gguf", sha256=SHA, ctx=262144)
+        FileEntry(
+            path="text/eliza-1-2b-32k.gguf",
+            sha256=SHA,
+            ctx=262144,
+            architecture="gemma4",
+        )
     ]
     with pytest.raises(Eliza1ManifestError) as exc:
         build_manifest(**kwargs)

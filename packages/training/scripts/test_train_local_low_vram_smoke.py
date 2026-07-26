@@ -1,4 +1,4 @@
-"""CPU-only smoke tests for the `--low-vram-smoke` preset in train_local.py.
+"""Parser-level contract tests for the `--low-vram-smoke` preset.
 
 The preset is a flag bundle. It must override the registry defaults to
 fit a 12 GB consumer GPU (seq_len 2048, batch 1, grad_accum 16, memory
@@ -7,6 +7,8 @@ explicit CLI flag the caller passed win.
 
 These tests parse args via the same argparse layout as `train_local.main`
 and assert the merged values without touching torch/cuda/the data layer.
+The real Stage 2 forward/backward smoke lives in
+`test_train_local_stage2_smoke.py`.
 """
 
 from __future__ import annotations

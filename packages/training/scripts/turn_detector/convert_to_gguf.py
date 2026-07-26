@@ -12,7 +12,7 @@ The two ship targets for the semantic end-of-turn detector are:
 R8 §3.2 / §6.5 / §7.4: all three candidates are Llama-shaped (SmolLM2 is
 a LLaMA-2-style arch by Hugging Face's classification) or qwen2-shaped
 (pruned Qwen2.5), and the in-repo llama.cpp fork at
-``packages/inference/llama.cpp`` already supports both via
+``plugins/plugin-local-inference/native/llama.cpp`` already supports both via
 ``LLM_ARCH_LLAMA`` and ``LLM_ARCH_QWEN2``. ``convert_hf_to_gguf.py``
 handles the LM body conversion natively; the sequence-classification head
 is exposed through the standard ``forward()`` path so the runtime reads
@@ -42,9 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -57,9 +55,15 @@ _QUANT_DIR = _REPO_ROOT / "packages" / "training" / "scripts" / "quantization"
 if str(_QUANT_DIR) not in sys.path:
     sys.path.insert(0, str(_QUANT_DIR))
 
-# Reuse the same write_sidecar helper as the LM K-quant siblings so the
-# manifest pipeline can parse turn-detector sidecars identically.
-from _common import write_sidecar  # noqa: E402
+# Reuse the same helpers as the LM K-quant siblings so the manifest pipeline
+# parses turn-detector sidecars identically and converter resolution is shared.
+from _common import (  # noqa: E402
+    DEFAULT_LLAMA_CPP_DIR,
+    find_llama_convert_script,
+    find_llama_quantize_binary,
+    llama_cpp_vendor_hint,
+    write_sidecar,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -74,68 +78,16 @@ SUPPORTED_QUANTS = ("Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0")
 DEFAULT_QUANT = "Q4_K_M"
 
 # In-repo llama.cpp fork submodule. Same path the K-quant LM siblings use.
-_FORK_LLAMA_CPP = _REPO_ROOT / "packages" / "inference" / "llama.cpp"
-
-_VENDOR_HINT = (
-    "The llama.cpp fork submodule should already be checked out. If it's "
-    "missing:\n"
-    "  git submodule update --init packages/inference/llama.cpp\n"
-    "Then build the llama-quantize binary from it:\n"
-    "  cmake -S packages/inference/llama.cpp -B packages/inference/llama.cpp/build \\\n"
-    "        -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF "
-    "-DBUILD_SHARED_LIBS=OFF\n"
-    "  cmake --build packages/inference/llama.cpp/build --target llama-quantize "
-    "-j\"$(nproc)\""
-)
+_FORK_LLAMA_CPP = DEFAULT_LLAMA_CPP_DIR
+_VENDOR_HINT = llama_cpp_vendor_hint()
 
 
 def _find_convert_script(llama_cpp_dir: Path | None) -> Path:
-    candidates: list[Path] = []
-    if llama_cpp_dir is not None:
-        candidates.append(llama_cpp_dir / "convert_hf_to_gguf.py")
-    env_dir = os.environ.get("LLAMA_CPP_DIR")
-    if env_dir:
-        candidates.append(Path(env_dir) / "convert_hf_to_gguf.py")
-    candidates.append(_FORK_LLAMA_CPP / "convert_hf_to_gguf.py")
-    which = shutil.which("convert_hf_to_gguf.py")
-    if which:
-        candidates.append(Path(which))
-    for c in candidates:
-        if c.exists():
-            return c
-    raise SystemExit("convert_hf_to_gguf.py not found.\n" + _VENDOR_HINT)
+    return find_llama_convert_script(llama_cpp_dir)
 
 
 def _find_quantize_binary(llama_cpp_dir: Path | None) -> Path:
-    candidates: list[Path] = []
-    if llama_cpp_dir is not None:
-        candidates.extend(
-            [
-                llama_cpp_dir / "build" / "bin" / "llama-quantize",
-                llama_cpp_dir / "llama-quantize",
-            ]
-        )
-    env_dir = os.environ.get("LLAMA_CPP_DIR")
-    if env_dir:
-        candidates.extend(
-            [
-                Path(env_dir) / "build" / "bin" / "llama-quantize",
-                Path(env_dir) / "llama-quantize",
-            ]
-        )
-    candidates.extend(
-        [
-            _FORK_LLAMA_CPP / "build" / "bin" / "llama-quantize",
-            _FORK_LLAMA_CPP / "llama-quantize",
-        ]
-    )
-    which = shutil.which("llama-quantize")
-    if which:
-        candidates.append(Path(which))
-    for c in candidates:
-        if c.exists() and os.access(c, os.X_OK):
-            return c
-    raise SystemExit("llama-quantize binary not found.\n" + _VENDOR_HINT)
+    return find_llama_quantize_binary(llama_cpp_dir)
 
 
 def _run(cmd: list[str | Path]) -> None:

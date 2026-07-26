@@ -59,6 +59,7 @@ try:
         KernelVerification,
         LineageEntry,
         build_manifest,
+        read_gguf_architecture,
         text_context_for_manifest,
         validate_manifest,
         write_manifest,
@@ -83,6 +84,7 @@ except ImportError:  # pragma: no cover - direct script execution path
         KernelVerification,
         LineageEntry,
         build_manifest,
+        read_gguf_architecture,
         text_context_for_manifest,
         validate_manifest,
         write_manifest,
@@ -755,6 +757,7 @@ def _collect_files(bundle_dir: Path, *, tier: str) -> dict[str, list[FileEntry]]
                     path=str(path.relative_to(bundle_dir)),
                     sha256=sha256_file(path),
                     ctx=text_context_for_manifest(path) if text else None,
+                    architecture=read_gguf_architecture(path) if text else None,
                 )
             )
         return out

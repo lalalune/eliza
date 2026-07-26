@@ -35,9 +35,10 @@ Stages, in order, with hard exits on failure:
    manifest as the data context. Same data, no marketing buzzwords, no
    user-visible upstream model-family strings.
 7. **HF push.** Upload weights, manifest, README, licenses, eval blobs
-   to ``elizaos/eliza-1/bundles/<tier>/`` via ``huggingface_hub``. Tag the
-   local training repo with ``eliza-1-<tier>-v<version>`` + the
-   training commit hash.
+   to ``elizaos/eliza-1/bundles/<tier>/`` via ``huggingface_hub``.
+8. **Live HF audit.** After upload and final evidence promotion, run the
+   release audit against the actual Hugging Face repo before tagging the
+   training commit as published with ``eliza-1-<tier>-v<version>``.
 
 Bypass rules: there is no ``--skip-eval``, no ``--skip-verify``, no
 ``--publish-anyway``. ``--dry-run`` performs every check but does not
@@ -87,6 +88,7 @@ from scripts.manifest.eliza1_manifest import (  # noqa: E402
     LineageEntry,
     build_manifest,
     canonical_source_repo_error,
+    read_gguf_architecture,
     required_voice_artifacts_for_tier,
     text_context_for_manifest,
 )
@@ -97,6 +99,7 @@ from scripts.manifest.eliza1_platform_plan import (  # noqa: E402
 from scripts.manifest.eliza1_licenses import (  # noqa: E402
     verify_bundle_licenses,
 )
+from scripts.manifest.audit_hf_eliza1_release import audit_hf_release  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Exit codes
@@ -111,6 +114,7 @@ EXIT_EVAL_GATE_FAIL = 13
 EXIT_MANIFEST_INVALID = 14
 EXIT_HF_PUSH_FAIL = 15
 EXIT_RELEASE_EVIDENCE_FAIL = 16
+EXIT_HF_AUDIT_FAIL = 17
 
 ELIZA_1_HF_ORG = "elizaos"
 
@@ -210,6 +214,7 @@ TIER_TAGLINES: Mapping[str, str] = {
     "4b": "flagship phones, small desktops",
     "9b": "workstations, tablets, and high-memory local hosts",
     "27b": "GPU workstations",
+    "27b-256k": "long-context GPU workstations",
 }
 
 DEFAULT_VOICE_CAPABILITIES: tuple[str, ...] = ("tts", "emotion-tags", "singing")
@@ -226,6 +231,7 @@ DEFAULT_RAM_BUDGET_MB: Mapping[str, tuple[int, int]] = {
     "4b": (10000, 12000),
     "9b": (12000, 16000),
     "27b": (32000, 48000),
+    "27b-256k": (48000, 64000),
 }
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -1178,6 +1184,7 @@ def _require_existing_json_report(
     require_runtime_ready: bool,
     model_sha256s: set[str] | None = None,
     required_cache_families: Sequence[str] = (),
+    expected_commit: str,
 ) -> Mapping[str, Any]:
     if not rel_path.startswith(("evals/", "evidence/")):
         raise OrchestratorError(
@@ -1229,9 +1236,15 @@ def _require_existing_json_report(
             data,
             model_sha256s=model_sha256s,
             required_cache_families=required_cache_families,
+            expected_commit=expected_commit,
         )
     else:
-        _validate_platform_report(rel_path, data, target=target)
+        _validate_platform_report(
+            rel_path,
+            data,
+            target=target,
+            expected_commit=expected_commit,
+        )
     return data
 
 
@@ -1308,6 +1321,7 @@ def _validate_runtime_dispatch_report(
     *,
     model_sha256s: set[str] | None = None,
     required_cache_families: Sequence[str] = (),
+    expected_commit: str,
 ) -> None:
     errors: list[str] = []
     if data.get("runtimeReady") is not True:
@@ -1315,6 +1329,10 @@ def _validate_runtime_dispatch_report(
     at_commit = data.get("atCommit") or data.get("at_commit")
     if not isinstance(at_commit, str) or not at_commit:
         errors.append("atCommit required")
+    elif not _commit_matches(at_commit, expected_commit):
+        errors.append(
+            f"atCommit {at_commit!r} must match current publish commit {expected_commit!r}"
+        )
     if not isinstance(data.get("report"), str) or not data.get("report"):
         errors.append("report required")
     model_sha = data.get("modelSha256")
@@ -1369,12 +1387,18 @@ def _validate_platform_report(
     data: Mapping[str, Any],
     *,
     target: str | None,
+    expected_commit: str,
 ) -> None:
     errors: list[str] = []
     if not isinstance(data.get("device"), (dict, str)) or data.get("device") == "":
         errors.append("device required")
-    if not isinstance(data.get("atCommit") or data.get("at_commit"), str):
+    at_commit = data.get("atCommit") or data.get("at_commit")
+    if not isinstance(at_commit, str):
         errors.append("atCommit required")
+    elif not _commit_matches(at_commit, expected_commit):
+        errors.append(
+            f"atCommit {at_commit!r} must match current publish commit {expected_commit!r}"
+        )
     if not isinstance(data.get("report"), str) or not data.get("report"):
         errors.append("report required")
     if data.get("skippedVoiceAbi") is True:
@@ -1550,6 +1574,7 @@ def validate_release_evidence(
         )
 
     text_model_sha256s = _text_model_sha256s(ctx, layout)
+    expected_commit = _git_short_sha(ctx.training_repo_root)
     for backend in supported:
         dispatch_path = kernel_reports.get(backend)
         if not isinstance(dispatch_path, str):
@@ -1567,6 +1592,7 @@ def validate_release_evidence(
             required_cache_families=_required_graph_cache_families_for_tier(
                 ctx.tier,
             ),
+            expected_commit=expected_commit,
         )
 
     for target in REQUIRED_PLATFORM_EVIDENCE_BY_TIER[ctx.tier]:
@@ -1582,6 +1608,7 @@ def validate_release_evidence(
             target=target,
             rel_path=platform_path,
             require_runtime_ready=False,
+            expected_commit=expected_commit,
         )
 
     if release_state == "final" or (
@@ -1668,7 +1695,20 @@ def _verify_dir(ctx: PublishContext) -> Path:
     return ctx.training_repo_root.parent / "inference" / "verify"
 
 
-def _read_recorded_report(path: Path, expected_backend: str) -> KernelVerification:
+def _bundle_text_sha256s(ctx: PublishContext) -> set[str]:
+    text_dir = ctx.bundle_dir / "text"
+    if not text_dir.is_dir():
+        return set()
+    return {_sha256_file(path) for path in text_dir.rglob("*.gguf") if path.is_file()}
+
+
+def _read_recorded_report(
+    path: Path,
+    expected_backend: str,
+    *,
+    expected_commit: str,
+    model_sha256s: set[str],
+) -> KernelVerification:
     if not path.is_file():
         raise OrchestratorError(
             f"verification report not found: {path}",
@@ -1691,12 +1731,36 @@ def _read_recorded_report(path: Path, expected_backend: str) -> KernelVerificati
         )
     at_commit = data.get("atCommit") or data.get("at_commit")
     report = data.get("report") or path.name
-    if not at_commit:
+    if not isinstance(at_commit, str) or not at_commit:
         raise OrchestratorError(
             f"verification report at {path} missing atCommit",
             EXIT_KERNEL_VERIFY_FAIL,
         )
-    return KernelVerification(status="pass", at_commit=at_commit, report=report)
+    if not _commit_matches(at_commit, expected_commit):
+        raise OrchestratorError(
+            f"verification report at {path} was recorded at commit "
+            f"{at_commit!r}, expected current publish commit {expected_commit!r}",
+            EXIT_KERNEL_VERIFY_FAIL,
+        )
+    model_sha = data.get("modelSha256")
+    if not isinstance(model_sha, str) or model_sha not in model_sha256s:
+        raise OrchestratorError(
+            f"verification report at {path} modelSha256 must match a shipped "
+            "text GGUF sha256",
+            EXIT_KERNEL_VERIFY_FAIL,
+        )
+    device = data.get("device") or data.get("deviceFingerprint")
+    if not isinstance(device, (dict, str)) or device == "":
+        raise OrchestratorError(
+            f"verification report at {path} missing device fingerprint",
+            EXIT_KERNEL_VERIFY_FAIL,
+        )
+    return KernelVerification(
+        status="pass",
+        at_commit=at_commit,
+        report=report,
+        device=str(device) if not isinstance(device, dict) else json.dumps(device, sort_keys=True),
+    )
 
 
 def _run_reference_test(verify_dir: Path) -> None:
@@ -1740,6 +1804,14 @@ def _git_short_sha(repo_root: Path) -> str:
     return "unknown"
 
 
+def _commit_matches(actual: str, expected: str) -> bool:
+    """Return True when two git ids name the same commit by prefix."""
+
+    if expected == "unknown":
+        return bool(actual)
+    return actual == expected or actual.startswith(expected) or expected.startswith(actual)
+
+
 def run_kernel_verification(
     ctx: PublishContext,
 ) -> dict[str, KernelVerification]:
@@ -1778,7 +1850,12 @@ def run_kernel_verification(
     # Vulkan — recorded report from the bundle if tier includes it.
     if "vulkan" in supported:
         recorded = ctx.bundle_dir / "evals" / "vulkan_verify.json"
-        out["vulkan"] = _read_recorded_report(recorded, "vulkan")
+        out["vulkan"] = _read_recorded_report(
+            recorded,
+            "vulkan",
+            expected_commit=sha,
+            model_sha256s=_bundle_text_sha256s(ctx),
+        )
 
     # Metal — hardware-only.
     if "metal" in supported:
@@ -1789,17 +1866,32 @@ def run_kernel_verification(
                 "on a verified host and pass --metal-verification PATH.",
                 EXIT_KERNEL_VERIFY_FAIL,
             )
-        out["metal"] = _read_recorded_report(ctx.metal_verification, "metal")
+        out["metal"] = _read_recorded_report(
+            ctx.metal_verification,
+            "metal",
+            expected_commit=sha,
+            model_sha256s=_bundle_text_sha256s(ctx),
+        )
 
     # CUDA — recorded report.
     if "cuda" in supported:
         recorded = ctx.bundle_dir / "evals" / "cuda_verify.json"
-        out["cuda"] = _read_recorded_report(recorded, "cuda")
+        out["cuda"] = _read_recorded_report(
+            recorded,
+            "cuda",
+            expected_commit=sha,
+            model_sha256s=_bundle_text_sha256s(ctx),
+        )
 
     # ROCm — recorded report.
     if "rocm" in supported:
         recorded = ctx.bundle_dir / "evals" / "rocm_verify.json"
-        out["rocm"] = _read_recorded_report(recorded, "rocm")
+        out["rocm"] = _read_recorded_report(
+            recorded,
+            "rocm",
+            expected_commit=sha,
+            model_sha256s=_bundle_text_sha256s(ctx),
+        )
 
     # Backends not supported by this tier are recorded as skipped, with
     # a stable report name. The manifest validator only enforces "pass"
@@ -1821,7 +1913,58 @@ def run_kernel_verification(
 # ---------------------------------------------------------------------------
 
 
-def run_eval_gates(ctx: PublishContext) -> tuple[GateReport, dict[str, Any]]:
+def _text_sha256s_from_layout(
+    ctx: PublishContext,
+    layout: Mapping[str, Sequence[Path]] | None,
+) -> set[str]:
+    if layout is not None:
+        return {_sha256_file(path) for path in layout.get("text", []) if path.is_file()}
+    return _bundle_text_sha256s(ctx)
+
+
+def _validate_eval_report_binding(
+    ctx: PublishContext,
+    eval_blob: Mapping[str, Any],
+    *,
+    layout: Mapping[str, Sequence[Path]] | None,
+) -> None:
+    expected_shas = _text_sha256s_from_layout(ctx, layout)
+    reported_shas = eval_blob.get("textModelSha256s")
+    if not isinstance(reported_shas, list) or not all(
+        isinstance(sha, str) for sha in reported_shas
+    ):
+        raise OrchestratorError(
+            "evals/aggregate.json textModelSha256s must list every shipped "
+            "text GGUF sha256",
+            EXIT_EVAL_GATE_FAIL,
+        )
+    if set(reported_shas) != expected_shas:
+        raise OrchestratorError(
+            "evals/aggregate.json textModelSha256s do not match shipped text "
+            f"GGUF bytes; expected {sorted(expected_shas)}, got "
+            f"{sorted(reported_shas)}",
+            EXIT_EVAL_GATE_FAIL,
+        )
+    at_commit = eval_blob.get("atCommit") or eval_blob.get("at_commit")
+    expected_commit = _git_short_sha(ctx.training_repo_root)
+    if not isinstance(at_commit, str) or not at_commit:
+        raise OrchestratorError(
+            "evals/aggregate.json atCommit is required",
+            EXIT_EVAL_GATE_FAIL,
+        )
+    if not _commit_matches(at_commit, expected_commit):
+        raise OrchestratorError(
+            "evals/aggregate.json atCommit "
+            f"{at_commit!r} does not match current publish commit "
+            f"{expected_commit!r}",
+            EXIT_EVAL_GATE_FAIL,
+        )
+
+
+def run_eval_gates(
+    ctx: PublishContext,
+    layout: Mapping[str, Sequence[Path]] | None = None,
+) -> tuple[GateReport, dict[str, Any]]:
     """Apply the tier gates to ``evals/aggregate.json``.
 
     The eval blob shape matches the docstring of ``eliza1_gates.py``.
@@ -1837,35 +1980,9 @@ def run_eval_gates(ctx: PublishContext) -> tuple[GateReport, dict[str, Any]]:
             f"not match --tier {ctx.tier!r}",
             EXIT_EVAL_GATE_FAIL,
         )
+    _validate_eval_report_binding(ctx, eval_blob, layout=layout)
 
-    # ``e2e_loop_ok`` and ``thirty_turn_ok`` are independent contract booleans
-    # (manifest ``evals.e2eLoopOk`` / ``evals.thirtyTurnOk``) and both are
-    # ``required: true`` gates. When the eval blob is missing ``e2e_loop_ok``
-    # the operator can opt in to a lower-fidelity publish that aliases it onto
-    # ``thirty_turn_ok`` (ELIZA_PUBLISH_ALLOW_GATE_ALIAS=1) — manifest
-    # assembly already does this via ``_read_independent_bool``; do the same
-    # for the gate report so the report and the manifest stay consistent.
     results = eval_blob.get("results")
-    if (
-        isinstance(results, dict)
-        and "e2e_loop_ok" not in results
-        and "thirty_turn_ok" in results
-        and os.environ.get(PUBLISH_ALLOW_GATE_ALIAS_ENV) == "1"
-        and isinstance(results["thirty_turn_ok"], bool)
-    ):
-        log.warning(
-            "[evals] aliasing results.%s ← results.%s "
-            "(opt-in via %s=1). Two independent manifest contract gates are "
-            "being sourced from one measurement; this is a lower-fidelity "
-            "publish.",
-            "e2e_loop_ok",
-            "thirty_turn_ok",
-            PUBLISH_ALLOW_GATE_ALIAS_ENV,
-        )
-        results = dict(results)
-        results["e2e_loop_ok"] = results["thirty_turn_ok"]
-        eval_blob = dict(eval_blob)
-        eval_blob["results"] = results
     if isinstance(results, dict):
         mtp_report = _mtp_report_eval(ctx)
         enriched_results = dict(results)
@@ -1985,6 +2102,9 @@ def _collect_files_for_manifest(
                 path=rel(p),
                 sha256=_sha256_file(p),
                 ctx=text_context_for_manifest(p) if kind_src == "text" else None,
+                architecture=(
+                    read_gguf_architecture(p) if kind_src == "text" else None
+                ),
             )
             files[kind_dst].append(entry)
 
@@ -2263,14 +2383,6 @@ def _gate_passed(report: GateReport, name: str) -> bool:
     return True
 
 
-# Operator opt-in for collapsing two independent contract booleans onto
-# a single observed measurement. Set to "1" to allow the orchestrator
-# to source ``e2e_loop_ok`` from the ``thirty_turn_ok`` measurement when
-# the eval blob doesn't carry an ``e2e_loop_ok`` key. Without the opt-in,
-# a missing key is publish-blocking.
-PUBLISH_ALLOW_GATE_ALIAS_ENV = "ELIZA_PUBLISH_ALLOW_GATE_ALIAS"
-
-
 def _read_independent_bool(
     results: Mapping[str, Any],
     key: str,
@@ -2279,14 +2391,9 @@ def _read_independent_bool(
 ) -> bool:
     """Read an independent contract boolean from the eval results blob.
 
-    When ``key`` is missing AND ``opt_in_alias_for`` is provided, the
-    orchestrator falls back to the alias key only if the operator has
-    set ``ELIZA_PUBLISH_ALLOW_GATE_ALIAS=1`` — and logs a clear warning
-    that two independent manifest fields are being sourced from one
-    measurement. Without the opt-in, the missing key raises
-    ``OrchestratorError`` so the publish surfaces the contract gap
-    instead of silently emitting a manifest with one half of the gate
-    inferred.
+    Missing independent measurements are publish-blocking. Older builds
+    allowed an environment-variable alias for e2e-loop data; release
+    integrity now requires each manifest contract gate to be measured.
     """
     if key in results:
         value = results[key]
@@ -2298,46 +2405,10 @@ def _read_independent_bool(
             )
         return value
 
-    if opt_in_alias_for is None:
-        raise OrchestratorError(
-            f"evals/aggregate.json missing required boolean results.{key!r}",
-            EXIT_EVAL_GATE_FAIL,
-        )
-
-    if os.environ.get(PUBLISH_ALLOW_GATE_ALIAS_ENV) != "1":
-        raise OrchestratorError(
-            f"evals/aggregate.json missing results.{key!r}; the manifest "
-            f"contract requires it as an independent measurement from "
-            f"{opt_in_alias_for!r}. To temporarily alias it to "
-            f"{opt_in_alias_for!r} (lower-fidelity publish), re-run with "
-            f"{PUBLISH_ALLOW_GATE_ALIAS_ENV}=1.",
-            EXIT_EVAL_GATE_FAIL,
-        )
-
-    if opt_in_alias_for not in results:
-        raise OrchestratorError(
-            f"evals/aggregate.json missing both results.{key!r} and the "
-            f"alias source results.{opt_in_alias_for!r}; nothing to alias.",
-            EXIT_EVAL_GATE_FAIL,
-        )
-
-    aliased = results[opt_in_alias_for]
-    if not isinstance(aliased, bool):
-        raise OrchestratorError(
-            f"evals/aggregate.json results.{opt_in_alias_for!r} must be "
-            f"a bool to be aliased to {key!r}, got {type(aliased).__name__}",
-            EXIT_EVAL_GATE_FAIL,
-        )
-    log.warning(
-        "[evals] aliasing results.%s ← results.%s "
-        "(opt-in via %s=1). Two independent manifest contract gates are "
-        "being sourced from one measurement; this is a lower-fidelity "
-        "publish.",
-        key,
-        opt_in_alias_for,
-        PUBLISH_ALLOW_GATE_ALIAS_ENV,
+    raise OrchestratorError(
+        f"evals/aggregate.json missing required boolean results.{key!r}",
+        EXIT_EVAL_GATE_FAIL,
     )
-    return aliased
 
 
 # ---------------------------------------------------------------------------
@@ -2776,6 +2847,17 @@ def tag_training_repo(ctx: PublishContext, version: str, dry_run: bool) -> str |
     return tag_name
 
 
+def run_hf_release_audit(ctx: PublishContext) -> None:
+    """Run the live Hub release audit after upload evidence is final."""
+
+    report = audit_hf_release(model_repo=ctx.repo_id)
+    if not report.ok:
+        raise OrchestratorError(
+            "post-upload HF release audit failed:\n" + report.render(),
+            EXIT_HF_AUDIT_FAIL,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Top-level driver
 # ---------------------------------------------------------------------------
@@ -2797,26 +2879,26 @@ def run(ctx: PublishContext) -> int:
     try:
         validate_destination_repo(ctx)
 
-        log.info("[stage 1/7] validate bundle layout (%s)", ctx.bundle_dir)
+        log.info("[stage 1/8] validate bundle layout (%s)", ctx.bundle_dir)
         layout = validate_bundle_layout(ctx)
 
-        log.info("[stage 2/7] validate release evidence")
+        log.info("[stage 2/8] validate release evidence")
         release_evidence = validate_release_evidence(ctx, layout)
 
-        log.info("[stage 3/7] kernel verification for tier %s", ctx.tier)
+        log.info("[stage 3/8] kernel verification for tier %s", ctx.tier)
         backends = run_kernel_verification(ctx)
         for b in SUPPORTED_BACKENDS_BY_TIER[ctx.tier]:
             log.info("  %s: %s (%s)", b, backends[b].status, backends[b].report)
 
-        log.info("[stage 4/7] eval gates")
-        gate_report, eval_blob = run_eval_gates(ctx)
+        log.info("[stage 4/8] eval gates")
+        gate_report, eval_blob = run_eval_gates(ctx, layout=layout)
         log.info(
             "  passed=%s, %d gates evaluated",
             gate_report.passed,
             len(gate_report.gates),
         )
 
-        log.info("[stage 5/7] build + validate manifest")
+        log.info("[stage 5/8] build + validate manifest")
         version = _read_version(ctx)
         manifest = assemble_manifest(
             ctx,
@@ -2833,7 +2915,7 @@ def run(ctx: PublishContext) -> int:
             "  defaultEligible=%s, version=%s", manifest["defaultEligible"], version
         )
 
-        log.info("[stage 6/7] render README")
+        log.info("[stage 6/8] render README")
         readme_text = render_readme(ctx, manifest)
         readme_path = ctx.bundle_dir / "README.md"
         readme_path.write_text(readme_text)
@@ -2842,18 +2924,20 @@ def run(ctx: PublishContext) -> int:
             log.info("\n--- manifest preview ---\n%s", json.dumps(manifest, indent=2))
 
         log.info(
-            "[stage 7/7] push to %s%s", ctx.repo_id, " (dry-run)" if ctx.dry_run else ""
+            "[stage 7/8] push to %s%s", ctx.repo_id, " (dry-run)" if ctx.dry_run else ""
         )
         upload_pairs = _build_upload_list(ctx, layout)
         upload_evidence = push_to_hf(ctx, manifest_path, readme_path, upload_pairs)
         if upload_evidence is not None:
-            log.info("[stage 7/7] finalize HF upload evidence")
+            log.info("[stage 7/8] finalize HF upload evidence")
             release_path, checksum_path = finalize_release_evidence(
                 ctx,
                 layout,
                 upload_evidence,
             )
             push_final_release_evidence(ctx, release_path, checksum_path)
+            log.info("[stage 8/8] live HF release audit")
+            run_hf_release_audit(ctx)
 
         tag_name = tag_training_repo(ctx, version, ctx.dry_run)
         log.info("done. tag=%s", tag_name)

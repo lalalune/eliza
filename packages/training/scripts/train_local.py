@@ -37,6 +37,16 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from format_for_training import format_record  # noqa: E402
 from lib.attn import select_attn_impl  # noqa: E402
+from training.numerics import (  # noqa: E402
+    LigerCompatibilityError,
+    TrainingNumericsError,
+    assert_apollo_lowrank_routing,
+    assert_finite_loss,
+    assert_liger_patch_markers,
+    resolve_train_dtype,
+    scan_checkpoint_tensors,
+    validate_liger_architecture,
+)
 
 
 def _split_named(
@@ -57,6 +67,7 @@ def _split_named(
         # Strip FSDP wrapper-prefixes so name matches what we classified
         # against the unwrapped HF model.
         clean = name.replace("_fsdp_wrapped_module.", "")
+        clean = clean.replace("module.", "")
         if clean in lowrank_names:
             lowrank.append(p)
         else:
@@ -257,6 +268,7 @@ def build_dataset(
 _TRACKED_DESTS = (
     "model", "batch_size", "grad_accum", "max_seq_len", "optimizer",
     "apollo_rank", "max_samples", "epochs", "memory_budget_gb",
+    "train_dtype", "max_grad_norm",
 )
 
 _FALLBACK_DEFAULTS: dict[str, Any] = {
@@ -268,6 +280,8 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
     "apollo_rank": 256,
     "max_samples": 0,
     "epochs": 3.0,
+    "train_dtype": "bf16",
+    "max_grad_norm": 1.0,
     # memory_budget_gb intentionally stays None — downstream treats None
     # as "no enforcement", matching the original behavior.
 }
@@ -346,6 +360,22 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--apollo-rank", type=int, default=None)
     ap.add_argument("--apollo-scale", type=float, default=1.0)
     ap.add_argument("--apollo-update-proj-gap", type=int, default=200)
+    ap.add_argument(
+        "--train-dtype",
+        choices=("bf16", "fp16", "fp32", "float32", "fp8"),
+        default=None,
+        help="Training precision. Default None falls back to the registry "
+             "entry's train_dtype, then bf16. fp16 requires CUDA and uses "
+             "Trainer's fp16/GradScaler path; fp8 requires the FP8 training "
+             "stack to be available.",
+    )
+    ap.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="Gradient clipping threshold. Default None falls back to the "
+             "registry entry's per-tier max_grad_norm, then 1.0.",
+    )
     ap.add_argument(
         "--max-chars", type=int, default=0,
         help="Drop training records whose rendered chat-template text is "
@@ -442,6 +472,10 @@ def apply_resolved_defaults(args: argparse.Namespace) -> None:
             args.apollo_rank = entry.optimizer_rank
         if not user_passed["memory_budget_gb"]:
             args.memory_budget_gb = entry.train_mem_gb_budget
+        if not user_passed["train_dtype"]:
+            args.train_dtype = entry.train_dtype
+        if not user_passed["max_grad_norm"]:
+            args.max_grad_norm = entry.max_grad_norm
         log.info("registry %s → model=%s batch=%d accum=%d seq=%d optimizer=%s budget=%.0fGB",
                  entry.short_name, args.model, args.batch_size, args.grad_accum,
                  args.max_seq_len, args.optimizer, args.memory_budget_gb or 0)
@@ -620,10 +654,13 @@ def main() -> int:
     # to its own GPU before FSDP shards, causing avoidable OOM risk.
     in_distributed = "RANK" in os.environ
     use_device_map = device == "cuda" and not in_distributed
-    # MPS supports bfloat16 on PyTorch 2.x; cpu falls back to float32
-    train_dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
+    try:
+        dtype_cfg = resolve_train_dtype(args.train_dtype, device, torch)
+    except TrainingNumericsError as exc:
+        log.error("%s", exc)
+        return 1
     model_kwargs = dict(
-        torch_dtype=train_dtype,
+        torch_dtype=dtype_cfg.torch_dtype,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
         attn_implementation=attn_impl,
@@ -663,6 +700,15 @@ def main() -> int:
         use_liger = False
     if use_liger and device == "cuda":
         try:
+            liger_model_type = validate_liger_architecture(model)
+        except LigerCompatibilityError as exc:
+            if args.use_liger == "on":
+                log.error("%s", exc)
+                return 1
+            log.warning("%s Liger disabled for --use-liger=auto.", exc)
+            use_liger = False
+    if use_liger and device == "cuda":
+        try:
             from liger_kernel.transformers import _apply_liger_kernel_to_instance
         except ImportError:
             if args.use_liger == "on":
@@ -674,8 +720,14 @@ def main() -> int:
                 "liger-kernel not installed — falling back to HF defaults. "
                 "Install with: uv add --extra train liger-kernel"
             )
+            use_liger = False
         else:
             _apply_liger_kernel_to_instance(model=model)
+            try:
+                assert_liger_patch_markers(model)
+            except LigerCompatibilityError as exc:
+                log.error("%s", exc)
+                return 1
             # FLCE chunk_size = 2^ceil(log2(B*T / (V/H))). For Gemma 4
             # H≈2048-5120 / V=248k → V/H≈48-120; B=1, T=16k -> chunk≈512.
             # Liger paper §5.3 reports +25% throughput + 20% lower peak mem
@@ -684,7 +736,7 @@ def main() -> int:
             if loss_fn is not None and hasattr(loss_fn, "chunk_size"):
                 loss_fn.chunk_size = 512
                 log.info("Liger FLCE chunk_size set to 512 for our (B,T,V,H) shape")
-            log.info("Liger kernel applied (fused CE + RMSNorm + SwiGLU + RoPE)")
+            log.info("Liger kernel applied for model_type=%s", liger_model_type)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         # Selective activation checkpointing: skip every Nth layer so we trade
@@ -752,7 +804,9 @@ def main() -> int:
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         weight_decay=0.0,
-        bf16=device == "cuda",
+        max_grad_norm=float(args.max_grad_norm),
+        bf16=dtype_cfg.bf16,
+        fp16=dtype_cfg.fp16,
         logging_steps=10,
         save_steps=500,
         save_total_limit=3,
@@ -770,9 +824,13 @@ def main() -> int:
         # override (skip Liger if you need strict completion masking).
         completion_only_loss=(
             os.environ.get("ELIZA_FORCE_COL", "0") == "1"
-            or args.use_liger == "off"
+            or not use_liger
         ),
-        report_to=os.environ.get("WANDB_PROJECT", "none") if os.environ.get("WANDB_PROJECT") else "none",
+        report_to=(
+            os.environ.get("WANDB_PROJECT", "none")
+            if os.environ.get("WANDB_PROJECT")
+            else "none"
+        ),
         run_name=args.run_name,
     )
 
@@ -807,6 +865,11 @@ def main() -> int:
         def apollo_builder(m):
             # Walk wrapped or unwrapped model, route by name suffix.
             lowrank, other = _split_named(m, lowrank_names)
+            assert_apollo_lowrank_routing(
+                expected_lowrank_names=lowrank_names,
+                observed_lowrank_count=len(lowrank),
+                target_name=type(m).__name__,
+            )
             return build_apollo_optimizer_from_groups(
                 lowrank, other,
                 lr=args.lr, weight_decay=sft_cfg.weight_decay,
@@ -816,6 +879,11 @@ def main() -> int:
     else:
         def apollo_builder(m):
             lowrank, other = _split_named(m, lowrank_names)
+            assert_apollo_lowrank_routing(
+                expected_lowrank_names=lowrank_names,
+                observed_lowrank_count=len(lowrank),
+                target_name=type(m).__name__,
+            )
             return build_apollo_mini_optimizer_from_groups(
                 lowrank, other,
                 lr=args.lr, weight_decay=sft_cfg.weight_decay,
@@ -833,6 +901,13 @@ def main() -> int:
             log.info("TE FP8 enabled — %d Linear modules swapped", fp8_handle.n_replaced)
         elif fp8_handle.reason_skipped:
             log.info("TE FP8 skipped: %s", fp8_handle.reason_skipped)
+        if dtype_cfg.name == "fp8" and not fp8_handle.enabled:
+            log.error("train_dtype=fp8 declared but TE FP8 was not enabled: %s",
+                      fp8_handle.reason_skipped or "unknown reason")
+            return 1
+    if dtype_cfg.name == "fp8" and (fp8_handle is None or not fp8_handle.enabled):
+        log.error("train_dtype=fp8 declared but TE FP8 was disabled")
+        return 1
 
     # SFTTrainer's compute_loss always slices `outputs.logits[..., :-1, :]`
     # which fails when Liger fused chunked-CE returns logits=None. When the
@@ -848,9 +923,15 @@ def main() -> int:
             outputs = model(**inputs)
             if outputs.loss is not None:
                 loss = outputs.loss
+                assert_finite_loss(loss, stage="SFT")
                 return (loss, outputs) if return_outputs else loss
-            return super().compute_loss(model, inputs, return_outputs=return_outputs,
-                                        num_items_in_batch=num_items_in_batch)
+            loss = super().compute_loss(
+                model, inputs, return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+            raw_loss = loss[0] if return_outputs else loss
+            assert_finite_loss(raw_loss, stage="SFT")
+            return loss
 
         def create_optimizer(self, model=None):
             # transformers 5.7 calls `create_optimizer(model)`; older releases
@@ -904,6 +985,8 @@ def main() -> int:
             "model": args.model, "optimizer": args.optimizer,
             "batch_size": args.batch_size, "grad_accum": args.grad_accum,
             "max_seq_len": args.max_seq_len, "lr": args.lr,
+            "train_dtype": dtype_cfg.name,
+            "max_grad_norm": args.max_grad_norm,
             "registry_key": args.registry_key,
         },
     )
@@ -924,6 +1007,20 @@ def main() -> int:
     )
     trainer.save_model(str(out_dir / "final"))
     tokenizer.save_pretrained(str(out_dir / "final"))
+    try:
+        scan_report = scan_checkpoint_tensors(out_dir / "final")
+    except TrainingNumericsError as exc:
+        log.error("%s", exc)
+        return 1
+    (out_dir / "final" / "numerics_scan.json").write_text(
+        json.dumps(scan_report.to_dict(), indent=2),
+        encoding="utf-8",
+    )
+    log.info(
+        "checkpoint numerics scan passed: %d floating tensors / %d elements",
+        scan_report.floating_tensors,
+        scan_report.floating_elements,
+    )
     log.info("done. full-parameter APOLLO checkpoint at %s", out_dir / "final")
     return 0
 

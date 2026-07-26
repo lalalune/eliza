@@ -32,6 +32,7 @@ def test_27b_256k_catalog_defaults_match_gemma_cutover() -> None:
             "base_model": "elizaos/eliza-1/bundles/27b-256k",
             "target_repo": "elizaos/eliza-1/bundles/27b-256k",
             "gguf": {"filename": "text/eliza-1-27b-256k.gguf"},
+            "tokenizer": {"family": "gemma4", "vocabSize": 262144},
             "runtime": {"args": []},
         }
     )

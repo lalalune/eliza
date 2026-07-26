@@ -61,6 +61,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from training.model_registry import get as registry_get  # noqa: E402
+from training.numerics import (  # noqa: E402
+    CheckpointNumericsError,
+    scan_checkpoint_tensors,
+)
 from benchmarks.eliza1_gates import apply_gates, normalize_tier  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -86,15 +90,16 @@ def _read_json(path: Path) -> dict | None:
 def _resolve_eliza1_llama_cpp() -> Path | None:
     """Locate the elizaOS/llama.cpp fork (Q4_POLAR / QJL1_256 / mtp GGML
     types). Order: $LLAMA_CPP_DIR → in-repo fork submodule
-    (packages/inference/llama.cpp) → ~/.cache/eliza-mtp/eliza-llama-cpp →
-    ~/src/eliza-llama.cpp. Returns None if none has a convert_hf_to_gguf.py."""
+    (plugins/plugin-local-inference/native/llama.cpp) →
+    ~/.cache/eliza-mtp/eliza-llama-cpp → ~/src/eliza-llama.cpp. Returns None
+    if none has a convert_hf_to_gguf.py."""
     import os
     cands: list[Path] = []
     env = os.environ.get("LLAMA_CPP_DIR")
     if env:
         cands.append(Path(env))
     for p in Path(__file__).resolve().parents:
-        cand = p / "packages" / "inference" / "llama.cpp"
+        cand = p / "plugins" / "plugin-local-inference" / "native" / "llama.cpp"
         if cand.is_dir():
             cands.append(cand)
             break
@@ -597,6 +602,27 @@ def main() -> int:
             log.error("finetune failed; aborting")
             (bench_dir / "pipeline-summary.json").write_text(json.dumps(summary, indent=2))
             return 1
+        try:
+            numerics_report = scan_checkpoint_tensors(finetuned_model)
+        except CheckpointNumericsError as exc:
+            summary["stages"]["checkpoint_numerics"] = {
+                "checkpoint": str(finetuned_model),
+                "passed": False,
+                "error": str(exc),
+            }
+            log.error("checkpoint numerics gate failed; aborting: %s", exc)
+            (bench_dir / "pipeline-summary.json").write_text(json.dumps(summary, indent=2))
+            return 1
+        numerics_path = ckpt_dir / "evals" / "checkpoint_numerics.json"
+        numerics_path.parent.mkdir(parents=True, exist_ok=True)
+        numerics_path.write_text(json.dumps(numerics_report.to_dict(), indent=2))
+        summary["stages"]["checkpoint_numerics"] = {
+            "path": str(numerics_path),
+            "passed": numerics_report.passed,
+            "floating_tensors": numerics_report.floating_tensors,
+            "floating_elements": numerics_report.floating_elements,
+        }
+        log.info("checkpoint numerics gate passed: %s", numerics_path)
 
     # ───────────── stage 3: fine-tuned benchmark ──────────────────────
     if not args.skip_bench:

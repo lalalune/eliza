@@ -20,13 +20,10 @@ the chosen mode:
   - ``--mode tier``      → ``scripts.publish.publish_eliza1_model_repo``
                           (per-tier ``elizaos/eliza-1/bundles/<tier>/`` upload
                           when the gate ran elsewhere)
-  - ``--mode optimized`` → ``scripts.publish_eliza1_model``
-                          (single fused-GGUF publish, legacy nightly path
-                          targeting ``elizaos/<base>-optimized``)
 
-Use ``--mode bundle`` for new work. The other modes exist for back-compat
-with the nightly CI publish (``.github/workflows/local-inference-bench.yml``)
-and with operator-driven staged uploads.
+Use ``--mode bundle`` for release work. ``--mode tier`` exists only for
+operator-driven staged uploads after the full gate has run elsewhere; the
+legacy single-GGUF publisher is intentionally not dispatched from here.
 """
 
 from __future__ import annotations
@@ -60,11 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--mode",
         required=True,
-        choices=("bundle", "tier", "optimized"),
+        choices=("bundle", "tier"),
         help=(
             "bundle = full gated publish (scripts.publish.orchestrator); "
-            "tier = per-tier bundle upload (publish_eliza1_model_repo); "
-            "optimized = legacy single-GGUF (publish_eliza1_model)."
+            "tier = per-tier bundle upload (publish_eliza1_model_repo)."
         ),
     )
     args, rest = ap.parse_known_args(argv)
@@ -75,8 +71,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run(
             [interpreter, "-m", "scripts.publish.publish_eliza1_model_repo", *rest]
         )
-    if args.mode == "optimized":
-        return _run([interpreter, "scripts/publish_eliza1_model.py", *rest])
     raise AssertionError(f"unhandled mode: {args.mode}")
 
 

@@ -109,6 +109,13 @@ class ModelEntry:
     train_dtype: str
     """bf16, fp16, or fp8. fp8 implies fp8 training (TE / torchao)."""
 
+    max_grad_norm: float
+    """Per-tier gradient clipping threshold forwarded to SFTConfig.
+
+    Larger tiers use tighter clipping because a single spike on the 12B/31B
+    runs can otherwise poison the checkpoint before APOLLO moments stabilize.
+    """
+
     use_liger: bool = True
     """Apply Liger fused chunked CE + RMSNorm/SwiGLU/RoPE kernels at training
     time. Enabled by default — required for the listed seq_len budgets."""
@@ -334,6 +341,7 @@ REGISTRY: dict[str, ModelEntry] = {
         grad_accum=16,
         train_mem_gb_budget=15.5,
         train_dtype="bf16",
+        max_grad_norm=1.0,
         infer_max_in=131072,
         infer_max_out=16384,
         # ~15 KV-bearing of 35 layers (7 global + non-shared SWA; 20 shared).
@@ -370,6 +378,7 @@ REGISTRY: dict[str, ModelEntry] = {
         grad_accum=16,
         train_mem_gb_budget=28.0,
         train_dtype="bf16",
+        max_grad_norm=1.0,
         infer_max_in=131072,
         infer_max_out=16384,
         # Proportionate to E2B's ~15/35; verify against gemma-4-E4B config.json.
@@ -403,6 +412,7 @@ REGISTRY: dict[str, ModelEntry] = {
         grad_accum=8,
         train_mem_gb_budget=80.0,
         train_dtype="bf16",
+        max_grad_norm=0.5,
         infer_max_in=262144,
         infer_max_out=16384,
         # Proportionate KV-bearing count; verify against gemma-4-12B config.json.
@@ -436,6 +446,7 @@ REGISTRY: dict[str, ModelEntry] = {
         grad_accum=8,
         train_mem_gb_budget=210.0,
         train_dtype="bf16",
+        max_grad_norm=0.3,
         infer_max_in=262144,
         infer_max_out=16384,
         # Proportionate KV-bearing count; verify against gemma-4-31B config.json.
