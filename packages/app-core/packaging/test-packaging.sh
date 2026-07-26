@@ -429,6 +429,20 @@ check "Uses trusted publishing" grep -q "id-token: write" "$WORKFLOW"
 check "Publishing pins Bun release" grep -q 'bun-version: "1.3.14"' "$WORKFLOW"
 check "Publishing uses Node 24 for Debian" grep -q 'setup_24.x' "$WORKFLOW"
 check "Publishing fails closed on packaged version" grep -Fq "test \"\$(elizaos-app --version)\" = \"\$EXPECTED_VERSION\"" "$WORKFLOW"
+check "UI tarball React peers match the root runtime" node -e '
+const root = require(process.argv[1]);
+const ui = require(process.argv[2]);
+for (const dependency of ["react", "react-dom"]) {
+  const expected = root.resolutions?.[dependency];
+  if (!expected) throw new Error(`Missing root resolution for ${dependency}`);
+  if (ui.peerDependencies?.[dependency] !== expected) {
+    throw new Error(`${dependency} peer must be ${expected}`);
+  }
+  if (ui.devDependencies?.[dependency] !== expected) {
+    throw new Error(`${dependency} development runtime must be ${expected}`);
+  }
+}
+' "$REPO_ROOT/package.json" "$REPO_ROOT/packages/ui/package.json"
 
 DEBIAN_WORKFLOW="$REPO_ROOT/.github/workflows/build-debian-package.yml"
 check_file "build-debian-package.yml" "$DEBIAN_WORKFLOW"

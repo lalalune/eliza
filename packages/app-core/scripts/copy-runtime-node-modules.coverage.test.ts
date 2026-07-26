@@ -18,10 +18,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  assertExactScanDependencyVersions,
   assertRequiredBundledPackagesLanded,
   assertTarSafeRuntimePaths,
   copyPackageDir,
   expandWorkspacePattern,
+  findNearestRuntimePackageManifest,
+  getInitialRuntimeDependencySpecs,
   getRuntimeDependencies,
   getRuntimeDependencyEntries,
   getWorkspacePackageRuntimeCopyEntries,
@@ -150,6 +153,18 @@ describe("shouldKeepPackageRelativePath", () => {
     ).toBe(false);
   });
 
+  it("fails closed when a Linux libc variant cannot be identified", () => {
+    expect(
+      matchesRuntimeVariant("linux-glibc-x64", "linux", "x64", "glibc"),
+    ).toBe(true);
+    expect(
+      matchesRuntimeVariant("linux-glibc-x64", "linux", "x64", "musl"),
+    ).toBe(false);
+    expect(() =>
+      matchesRuntimeVariant("linux-glibc-x64", "linux", "x64", null),
+    ).toThrow("without detecting the target Linux libc");
+  });
+
   it("drops build/report scratch dirs for @elizaos/app-core", () => {
     expect(
       shouldKeepPackageRelativePath(
@@ -191,6 +206,72 @@ describe("shouldKeepPackageRelativePath", () => {
         "prebuilds/darwin-arm64/x.node",
         "linux",
         "x64",
+      ),
+    ).toBe(false);
+  });
+
+  it("drops libc-incompatible files inside a matching Linux prebuild", () => {
+    expect(
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-x64/node.napi.musl.node",
+        "linux",
+        "x64",
+        "usb",
+        "glibc",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-x64/node.napi.glibc.node",
+        "linux",
+        "x64",
+        "usb",
+        "glibc",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-x64/node.napi.glibc.node",
+        "linux",
+        "x64",
+        "usb",
+        "musl",
+      ),
+    ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "dist/musl.js",
+        "linux",
+        "x64",
+        "portable-js-library",
+        "glibc",
+      ),
+    ).toBe(true);
+    expect(() =>
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-x64/node.napi.musl.node",
+        "linux",
+        "x64",
+        "usb",
+        null,
+      ),
+    ).toThrow("without detecting the target Linux libc");
+    expect(
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-musl-x64/addon.node",
+        "linux",
+        "x64",
+        undefined,
+        "musl",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "prebuilds/linux-musl-x64/addon.node",
+        "linux",
+        "x64",
+        undefined,
+        "glibc",
       ),
     ).toBe(false);
   });
@@ -250,13 +331,14 @@ describe("shouldKeepPackageRelativePath", () => {
     ).toBe(false);
   });
 
-  it("gates fb-dotslash embedded executables on the platform", () => {
+  it("gates fb-dotslash static executables on platform rather than libc", () => {
     expect(
       shouldKeepPackageRelativePath(
         "bin/linux-musl.aarch64/dotslash",
         "linux",
         "arm64",
         "fb-dotslash",
+        "musl",
       ),
     ).toBe(true);
     expect(
@@ -265,6 +347,7 @@ describe("shouldKeepPackageRelativePath", () => {
         "linux",
         "x64",
         "fb-dotslash",
+        "musl",
       ),
     ).toBe(true);
     expect(
@@ -273,8 +356,18 @@ describe("shouldKeepPackageRelativePath", () => {
         "linux",
         "arm64",
         "fb-dotslash",
+        "musl",
       ),
     ).toBe(false);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux-musl.x86_64/dotslash",
+        "linux",
+        "x64",
+        "fb-dotslash",
+        "glibc",
+      ),
+    ).toBe(true);
     expect(
       shouldKeepPackageRelativePath(
         "bin/macos/dotslash",
@@ -518,6 +611,38 @@ describe("isPackageCompatibleWithCurrentPlatform", () => {
     });
     expect(isPackageCompatibleWithCurrentPlatform(manifestPath)).toBe(false);
   });
+
+  it("fails closed when a package libc selector cannot be identified", () => {
+    const manifestPath = writeManifest("libc-locked", {
+      os: ["linux"],
+      cpu: ["x64"],
+      libc: ["glibc"],
+    });
+    expect(
+      isPackageCompatibleWithCurrentPlatform(
+        manifestPath,
+        "linux",
+        "x64",
+        "glibc",
+      ),
+    ).toBe(true);
+    expect(
+      isPackageCompatibleWithCurrentPlatform(
+        manifestPath,
+        "linux",
+        "x64",
+        "musl",
+      ),
+    ).toBe(false);
+    expect(() =>
+      isPackageCompatibleWithCurrentPlatform(
+        manifestPath,
+        "linux",
+        "x64",
+        null,
+      ),
+    ).toThrow("without detecting the target Linux libc");
+  });
 });
 
 describe("getRuntimeDependencyEntries", () => {
@@ -554,6 +679,85 @@ describe("getRuntimeDependencyEntries", () => {
       dependencies: { zeta: "1.0.0", alpha: "2.0.0" },
     });
     expect(getRuntimeDependencies(manifestPath)).toEqual(["alpha", "zeta"]);
+  });
+});
+
+describe("scan-owner dependency resolution", () => {
+  it("prefers the scanned package's declared version over an unrelated root version", () => {
+    const workspaceRoot = mkdtempSync(path.join(tmpDir, "workspace-"));
+    const rootManifest = path.join(workspaceRoot, "package.json");
+    const agentDir = path.join(workspaceRoot, "packages", "agent");
+    const scanDir = path.join(agentDir, "dist", "api");
+    mkdirSync(scanDir, { recursive: true });
+    writeFileSync(
+      rootManifest,
+      JSON.stringify({
+        dependencies: {
+          "@noble/curves": "1.2.0",
+          "root-only": "1.0.0",
+        },
+      }),
+    );
+    writeFileSync(
+      path.join(agentDir, "package.json"),
+      JSON.stringify({
+        dependencies: {
+          "@noble/curves": "2.2.0",
+          "agent-only": "3.0.0",
+        },
+      }),
+    );
+
+    expect(findNearestRuntimePackageManifest(scanDir, workspaceRoot)).toBe(
+      path.join(agentDir, "package.json"),
+    );
+    expect(getInitialRuntimeDependencySpecs(scanDir, rootManifest)).toEqual(
+      new Map([
+        ["@noble/curves", "2.2.0"],
+        ["agent-only", "3.0.0"],
+        ["root-only", "1.0.0"],
+      ]),
+    );
+  });
+
+  it("rejects a copied exact dependency whose export surface came from another version", () => {
+    const targetNodeModules = path.join(tmpDir, "runtime", "node_modules");
+    const packageDir = path.join(targetNodeModules, "@noble", "curves");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "@noble/curves", version: "1.2.0" }),
+    );
+    const discovered = new Set(["@noble/curves"]);
+    const dependencySpecs = new Map([["@noble/curves", "2.2.0"]]);
+
+    expect(() =>
+      assertExactScanDependencyVersions(
+        targetNodeModules,
+        discovered,
+        dependencySpecs,
+      ),
+    ).toThrow("@noble/curves: expected 2.2.0, copied 1.2.0");
+
+    writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "@noble/curves", version: "2.2.0" }),
+    );
+    expect(() =>
+      assertExactScanDependencyVersions(
+        targetNodeModules,
+        discovered,
+        dependencySpecs,
+      ),
+    ).not.toThrow();
+
+    expect(() =>
+      assertExactScanDependencyVersions(
+        targetNodeModules,
+        new Set(["missing-exact"]),
+        new Map([["missing-exact", "4.0.0"]]),
+      ),
+    ).toThrow("missing-exact: expected 4.0.0, copied missing");
   });
 });
 
@@ -849,6 +1053,63 @@ describe("copyPackageDir", () => {
     );
     expect(existsSync(landedManifest)).toBe(true);
     expect(existsSync(landedEntry)).toBe(true);
+  });
+
+  it("copies only the host libc variant from matching native prebuilds", () => {
+    const sourceDir = mkdtempSync(path.join(tmpDir, "copy-native-src-"));
+    const prebuildDir = path.join(
+      sourceDir,
+      "prebuilds",
+      `${process.platform}-${process.arch}`,
+    );
+    mkdirSync(prebuildDir, { recursive: true });
+    writeFileSync(
+      path.join(sourceDir, "package.json"),
+      JSON.stringify({ name: "example-native-copy", main: "./index.js" }),
+    );
+    writeFileSync(path.join(sourceDir, "index.js"), "module.exports={}");
+    writeFileSync(path.join(prebuildDir, "addon.glibc.node"), "glibc");
+    writeFileSync(path.join(prebuildDir, "addon.musl.node"), "musl");
+
+    const rootDestDir = mkdtempSync(path.join(tmpDir, "copy-native-dest-"));
+    const targetNodeModules = path.join(rootDestDir, "node_modules");
+    mkdirSync(targetNodeModules, { recursive: true });
+    expect(
+      copyPackageDir(
+        "example-native-copy",
+        sourceDir,
+        targetNodeModules,
+        rootDestDir,
+      ),
+    ).toBe(true);
+
+    const copiedPrebuildDir = path.join(
+      targetNodeModules,
+      "example-native-copy",
+      "prebuilds",
+      `${process.platform}-${process.arch}`,
+    );
+    const copiedGlibc = existsSync(
+      path.join(copiedPrebuildDir, "addon.glibc.node"),
+    );
+    const copiedMusl = existsSync(
+      path.join(copiedPrebuildDir, "addon.musl.node"),
+    );
+    if (process.platform !== "linux") {
+      expect({ copiedGlibc, copiedMusl }).toEqual({
+        copiedGlibc: false,
+        copiedMusl: false,
+      });
+      return;
+    }
+
+    const isGlibc = Boolean(
+      process.report.getReport().header?.glibcVersionRuntime,
+    );
+    expect({ copiedGlibc, copiedMusl }).toEqual({
+      copiedGlibc: isGlibc,
+      copiedMusl: !isGlibc,
+    });
   });
 });
 

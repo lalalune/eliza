@@ -1,5 +1,9 @@
 #!/usr/bin/env -S node --import tsx
-/** Supports app-core build, packaging, or development orchestration for copy runtime node modules ts. */
+/**
+ * Materializes the relocatable Node dependency tree used by packaged Eliza runtimes.
+ * Workspace packages and platform-specific third-party modules are copied as real files,
+ * with dependency versions kept at the locations from which the packaged code resolves them.
+ */
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -656,10 +660,40 @@ function getRuntimeVariantConstraints(variant: string): {
   return { os, libc, arch };
 }
 
+function matchesRuntimePathLibc(
+  relativePath: string,
+  targetOS: string,
+  targetLibc = detectCurrentLibc(),
+): boolean {
+  const normalizedPath = relativePath
+    .toLowerCase()
+    .replaceAll("linuxmusl", "linux-musl");
+  if (!normalizedPath.endsWith(".node")) {
+    return true;
+  }
+
+  const constraints = getRuntimeVariantConstraints(normalizedPath);
+  if (!constraints.libc) {
+    return true;
+  }
+  if (normalizeTargetOS(targetOS) !== "linux") {
+    return false;
+  }
+  if (!targetLibc) {
+    throw new Error(
+      `[runtime-copy] cannot select ${constraints.libc} payload without detecting the target Linux libc`,
+    );
+  }
+  return constraints.libc === targetLibc;
+}
+
 export function matchesRuntimeVariant(
   variant: string,
   targetOS = process.platform,
   targetArch = process.arch,
+  targetLibc = normalizeTargetOS(targetOS) === "linux"
+    ? detectCurrentLibc()
+    : null,
 ): boolean {
   const constraints = getRuntimeVariantConstraints(variant);
   if (!constraints.os && !constraints.libc && !constraints.arch) {
@@ -677,8 +711,12 @@ export function matchesRuntimeVariant(
     if (normalizedOS !== "linux") {
       return false;
     }
-    const currentLibc = detectCurrentLibc();
-    if (currentLibc && currentLibc !== constraints.libc) {
+    if (!targetLibc) {
+      throw new Error(
+        `[runtime-copy] cannot select ${constraints.libc} variant without detecting the target Linux libc`,
+      );
+    }
+    if (targetLibc !== constraints.libc) {
       return false;
     }
   }
@@ -698,6 +736,9 @@ function isPackageNameCompatibleWithCurrentPlatform(
   name: string,
   targetOS = process.platform,
   targetArch = process.arch,
+  targetLibc = normalizeTargetOS(targetOS) === "linux"
+    ? detectCurrentLibc()
+    : null,
 ): boolean {
   const runtimeVariantPackages = [
     /^@node-llama-cpp\/(.+)$/,
@@ -708,7 +749,7 @@ function isPackageNameCompatibleWithCurrentPlatform(
   for (const pattern of runtimeVariantPackages) {
     const match = name.match(pattern);
     if (match) {
-      return matchesRuntimeVariant(match[1], targetOS, targetArch);
+      return matchesRuntimeVariant(match[1], targetOS, targetArch, targetLibc);
     }
   }
 
@@ -720,10 +761,15 @@ export function shouldKeepPackageRelativePath(
   targetOS = process.platform,
   targetArch = process.arch,
   packageName?: string,
+  targetLibc = detectCurrentLibc(),
 ): boolean {
   const normalizedPath = relativePath.split(path.sep).join("/");
   if (!normalizedPath || normalizedPath === ".") {
     return true;
+  }
+
+  if (!matchesRuntimePathLibc(normalizedPath, targetOS, targetLibc)) {
+    return false;
   }
 
   if (packageName === "ffprobe-static") {
@@ -733,6 +779,7 @@ export function shouldKeepPackageRelativePath(
         `${ffprobeMatch[1]}-${ffprobeMatch[2]}`,
         targetOS,
         targetArch,
+        targetLibc,
       );
     }
   }
@@ -746,7 +793,7 @@ export function shouldKeepPackageRelativePath(
         .replace("windows-arm64", "win32-arm64")
         .replace("windows", "win32-x64")
         .replaceAll("_", "-");
-      return matchesRuntimeVariant(variant, targetOS, targetArch);
+      return matchesRuntimeVariant(variant, targetOS, targetArch, targetLibc);
     }
   }
 
@@ -762,6 +809,7 @@ export function shouldKeepPackageRelativePath(
         variants[hermesMatch[1]] ?? hermesMatch[1],
         targetOS,
         targetArch,
+        targetLibc,
       );
     }
   }
@@ -769,10 +817,7 @@ export function shouldKeepPackageRelativePath(
   if (packageName?.startsWith("@msgpackr-extract/msgpackr-extract-linux-")) {
     const libcMatch = normalizedPath.match(/\.(glibc|musl)\.node$/);
     if (libcMatch && normalizeTargetOS(targetOS) === "linux") {
-      const currentLibc = detectCurrentLibc();
-      if (currentLibc) {
-        return currentLibc === libcMatch[1];
-      }
+      return targetLibc === libcMatch[1];
     }
   }
 
@@ -823,7 +868,12 @@ export function shouldKeepPackageRelativePath(
     /(?:^|\/)prebuilds\/([^/]+)(?:\/|$)/,
   );
   if (prebuildMatch) {
-    return matchesRuntimeVariant(prebuildMatch[1], targetOS, targetArch);
+    return matchesRuntimeVariant(
+      prebuildMatch[1],
+      targetOS,
+      targetArch,
+      targetLibc,
+    );
   }
 
   const napiMatch = normalizedPath.match(
@@ -831,7 +881,7 @@ export function shouldKeepPackageRelativePath(
   );
   if (napiMatch) {
     const variant = [napiMatch[1], napiMatch[2]].filter(Boolean).join("-");
-    return matchesRuntimeVariant(variant, targetOS, targetArch);
+    return matchesRuntimeVariant(variant, targetOS, targetArch, targetLibc);
   }
 
   const koffiMatch = normalizedPath.match(
@@ -842,6 +892,7 @@ export function shouldKeepPackageRelativePath(
       koffiMatch[1].replaceAll("_", "-"),
       targetOS,
       targetArch,
+      targetLibc,
     );
   }
 
@@ -852,7 +903,7 @@ export function shouldKeepPackageRelativePath(
     if (!constraints.os && !constraints.libc && !constraints.arch) {
       return true;
     }
-    return matchesRuntimeVariant(variant, targetOS, targetArch);
+    return matchesRuntimeVariant(variant, targetOS, targetArch, targetLibc);
   }
 
   return true;
@@ -1918,6 +1969,11 @@ function detectCurrentLibc(): string | null {
 
 export function isPackageCompatibleWithCurrentPlatform(
   packageJsonPath: string,
+  targetOS = process.platform,
+  targetArch = process.arch,
+  targetLibc = normalizeTargetOS(targetOS) === "linux"
+    ? detectCurrentLibc()
+    : null,
 ): boolean {
   let manifest: PackagePlatformManifest;
   try {
@@ -1926,11 +1982,24 @@ export function isPackageCompatibleWithCurrentPlatform(
     return true;
   }
 
-  return (
-    matchesPlatformSelector(manifest.os, process.platform) &&
-    matchesPlatformSelector(manifest.cpu, process.arch) &&
-    matchesPlatformSelector(manifest.libc, detectCurrentLibc())
-  );
+  if (
+    !matchesPlatformSelector(manifest.os, targetOS) ||
+    !matchesPlatformSelector(manifest.cpu, targetArch)
+  ) {
+    return false;
+  }
+
+  if (
+    normalizeTargetOS(targetOS) === "linux" &&
+    manifest.libc?.length &&
+    !targetLibc
+  ) {
+    throw new Error(
+      `[runtime-copy] cannot select ${packageJsonPath} without detecting the target Linux libc`,
+    );
+  }
+
+  return matchesPlatformSelector(manifest.libc, targetLibc);
 }
 
 function hasRootPackageOverride(name: string): boolean {
@@ -2143,6 +2212,96 @@ export function getRuntimeDependencyEntries(
 
 export function getRuntimeDependencies(pkgPath: string): string[] {
   return getRuntimeDependencyEntries(pkgPath).map((entry) => entry.name);
+}
+
+export function findNearestRuntimePackageManifest(
+  scanDir: string,
+  workspaceRoot = ROOT,
+): string | null {
+  const boundary = path.resolve(workspaceRoot);
+  let currentDir = path.resolve(scanDir);
+
+  if (!isPathInsideOrEqual(currentDir, boundary)) {
+    return null;
+  }
+
+  while (true) {
+    const manifestPath = path.join(currentDir, "package.json");
+    if (fs.existsSync(manifestPath)) {
+      return manifestPath;
+    }
+    if (currentDir === boundary) {
+      return null;
+    }
+    currentDir = path.dirname(currentDir);
+  }
+}
+
+export function getInitialRuntimeDependencySpecs(
+  scanDir: string,
+  rootPackageJsonPath = PACKAGE_JSON_PATH,
+): Map<string, string | null> {
+  const specs = new Map(
+    getRuntimeDependencyEntries(rootPackageJsonPath).map((entry) => [
+      entry.name,
+      entry.spec,
+    ]),
+  );
+  const scanManifestPath = findNearestRuntimePackageManifest(
+    scanDir,
+    path.dirname(rootPackageJsonPath),
+  );
+
+  if (
+    scanManifestPath &&
+    path.resolve(scanManifestPath) !== path.resolve(rootPackageJsonPath)
+  ) {
+    // The copied source resolves bare imports from its own declared graph.
+    // Let those exact versions win over an unrelated root/Bun-store candidate.
+    for (const entry of getRuntimeDependencyEntries(scanManifestPath)) {
+      specs.set(entry.name, entry.spec);
+    }
+  }
+
+  return specs;
+}
+
+export function assertExactScanDependencyVersions(
+  targetNodeModules: string,
+  discoveredPackages: ReadonlySet<string>,
+  dependencySpecs: ReadonlyMap<string, string | null>,
+): void {
+  const mismatches: string[] = [];
+
+  for (const name of discoveredPackages) {
+    const expectedVersion = dependencySpecs.get(name);
+    if (!isExactVersionSpecifier(expectedVersion)) {
+      continue;
+    }
+    const manifestPath = path.join(
+      packagePath(name, targetNodeModules),
+      "package.json",
+    );
+    if (!fs.existsSync(manifestPath)) {
+      mismatches.push(`${name}: expected ${expectedVersion}, copied missing`);
+      continue;
+    }
+    const actualVersion = getPackageVersion(manifestPath);
+    if (actualVersion !== expectedVersion) {
+      mismatches.push(
+        `${name}: expected ${expectedVersion}, copied ${actualVersion ?? "unknown"}`,
+      );
+    }
+  }
+
+  if (mismatches.length > 0) {
+    throw new Error(
+      [
+        "[runtime-copy] packaged source resolved incompatible top-level dependency versions:",
+        ...mismatches.sort().map((entry) => `  ${entry}`),
+      ].join("\n"),
+    );
+  }
 }
 
 function shouldHoistRuntimePackage(name: string): boolean {
@@ -2609,12 +2768,7 @@ function main(): void {
         alwaysBundled.add(packageName);
       }
     }
-    const rootDependencySpecs = new Map(
-      getRuntimeDependencyEntries(PACKAGE_JSON_PATH).map((entry) => [
-        entry.name,
-        entry.spec,
-      ]),
-    );
+    const initialDependencySpecs = getInitialRuntimeDependencySpecs(scanDir);
     const filteredOptionalPlugins = new Set<string>();
     const discovered = new Set(
       discoverRuntimePackages(scanDir).filter((packageName) => {
@@ -2633,7 +2787,7 @@ function main(): void {
       .sort()
       .map((name) => ({
         name,
-        spec: rootDependencySpecs.get(name) ?? null,
+        spec: initialDependencySpecs.get(name) ?? null,
         requesterDir: ROOT,
         requesterDestDir: targetDist,
       }));
@@ -2744,6 +2898,11 @@ function main(): void {
     }
 
     copyPgliteCompatibilityAssets(targetDist);
+    assertExactScanDependencyVersions(
+      targetNodeModules,
+      discovered,
+      initialDependencySpecs,
+    );
     assertTarSafeRuntimePaths(targetDist);
     assertRequiredBundledPackagesLanded(targetNodeModules, alwaysBundled);
 
