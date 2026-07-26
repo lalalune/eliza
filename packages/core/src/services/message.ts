@@ -904,7 +904,15 @@ function isTextScoredBenchmarkTurn(message: Memory): boolean {
 	);
 }
 
-function isOwnerLifeManagementToolCandidate(actionName: string): boolean {
+// Mirrors the planner's life-management capability set: the OWNER_*/
+// SCHEDULED_TASKS surfaces registered by plugin-personal-assistant AND the
+// TRIGGER family the default agent exposes instead (promoted virtuals like
+// TRIGGER_CREATE). Stage-1 candidate hints name whichever family is deployed,
+// so this gate must accept both or benchmark turns lose tool enforcement for
+// reminders routed through TRIGGER.
+export function isOwnerLifeManagementToolCandidate(
+	actionName: string,
+): boolean {
 	return new Set(
 		[
 			"CALENDAR",
@@ -921,6 +929,8 @@ function isOwnerLifeManagementToolCandidate(actionName: string): boolean {
 			"OWNER_TODOS_CREATE",
 			"SCHEDULED_TASKS",
 			"SCHEDULED_TASKS_CREATE",
+			"TRIGGER",
+			"TRIGGER_CREATE",
 		].map(normalizeActionIdentifier),
 	).has(normalizeActionIdentifier(actionName));
 }
