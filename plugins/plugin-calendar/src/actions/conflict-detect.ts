@@ -499,9 +499,7 @@ function privateBusySources(
   }));
 }
 
-function requestedGuestCalendarCount(
-  proposal: ConflictDetectProposal,
-): number {
+function requestedGuestCalendarCount(proposal: ConflictDetectProposal): number {
   return new Set(
     (proposal.attendees ?? [])
       .filter((attendee): attendee is string => typeof attendee === "string")
@@ -789,8 +787,7 @@ export function createConflictDetectAction(
         ? requestedGuestCalendarCount(proposal)
         : 0;
       const requestedGuestAvailability =
-        subaction === "scan_event_proposal" &&
-        requestedGuestCalendars > 0;
+        subaction === "scan_event_proposal" && requestedGuestCalendars > 0;
       if (requestedGuestAvailability && proposal) {
         const loadFreeBusy =
           activeLoader.loadFreeBusy ?? deps.loader?.loadFreeBusy;
@@ -812,9 +809,7 @@ export function createConflictDetectAction(
                 visibility: "busy_only",
               }),
             );
-            sources.push(
-              ...guestSources,
-            );
+            sources.push(...guestSources);
             if (guestSources.length < requestedGuestCalendars) {
               sources.push({
                 id: "guest-freebusy-incomplete",

@@ -546,6 +546,88 @@ describe("calendar-owned CONFLICT_DETECT action", () => {
     expect(String(result.text)).not.toMatch(/no conflicts detected/i);
   });
 
+  it("recovers Apple all-day local dates from EventKit instants east of UTC", async () => {
+    const action = createConflictDetectAction({
+      authorize: async () => true,
+      resolveTimeZone: async () => "Asia/Tokyo",
+    });
+    const appleEvent: LifeOpsCalendarEvent = {
+      ...calendarFeedEvent({
+        id: "apple-school-closure",
+        title: "School closed",
+        startAt: "2026-05-10T15:00:00.000Z",
+        endAt: "2026-05-11T15:00:00.000Z",
+        grantId: "apple-calendar",
+        connectorAccountId: "apple-calendar",
+      }),
+      provider: "apple_calendar",
+      isAllDay: true,
+      timezone: "Asia/Tokyo",
+    };
+    const testRuntime = runtime({
+      getService: () => ({
+        getCalendarFeed: async () => ({
+          calendarId: "primary",
+          events: [appleEvent],
+          source: "synced",
+          state: "complete",
+          sources: [
+            {
+              key: {
+                provider: "apple_calendar",
+                side: "owner",
+                grantId: "apple-calendar",
+                connectorAccountId: "apple-calendar",
+                calendarId: "primary",
+              },
+              summary: "Family",
+              status: "fresh",
+              syncedAt: "2026-05-10T14:00:00.000Z",
+              error: null,
+            },
+          ],
+          timeMin: "2026-05-10T15:00:00.000Z",
+          timeMax: "2026-05-11T15:00:00.000Z",
+          syncedAt: "2026-05-10T14:00:00.000Z",
+        }),
+      }),
+    });
+
+    const result = await invoke(
+      action,
+      {
+        subaction: "scan_event_proposal",
+        range: {
+          start: "2026-05-10T15:00:00.000Z",
+          end: "2026-05-11T15:00:00.000Z",
+        },
+        proposal: {
+          startISO: "2026-05-11T00:00:00.000Z",
+          endISO: "2026-05-11T01:00:00.000Z",
+        },
+      },
+      testRuntime,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        completeness: "complete",
+        conflicts: [
+          {
+            severity: "warning",
+            reasons: ["time_overlap", "all_day"],
+            eventB: {
+              id: "apple-school-closure",
+              startISO: "2026-05-10T15:00:00.000Z",
+              endISO: "2026-05-11T15:00:00.000Z",
+            },
+          },
+        ],
+      },
+    });
+  });
+
   it("uses the real CalendarService loader and fails honestly when it is absent", async () => {
     const action = createConflictDetectAction({
       authorize: async () => true,
