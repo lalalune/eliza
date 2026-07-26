@@ -48,6 +48,7 @@ import {
 } from "../utils/cloud-agent-base";
 import { resolveAgentSessionRecovery } from "./agent-session-recovery";
 import { runAgentSessionRecovery } from "./agent-session-recovery-runner";
+import { clearStalePairCredentialsForAgent } from "./cloud-pair-token";
 import {
   asApiLikeError,
   deriveFirstRunResumeFieldsFromConfig,
@@ -572,6 +573,12 @@ export async function runPollingBackend(
       agentId: decision.agentId,
       cloudToken,
       consumeRedirectInProcess: isCapacitorNative(),
+      // This path fires only after the agent origin rejected the adopted pair
+      // bearer (`why` above), so when the mint ALSO refuses, purging that one
+      // agent's persisted credentials is proven safe — the next boot must not
+      // re-adopt the dead credential (#16666).
+      clearStalePairCredentials: () =>
+        clearStalePairCredentialsForAgent(decision.agentId),
       onPairedInProcess: (apiToken) => {
         client.setToken(apiToken);
       },
