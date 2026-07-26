@@ -9,6 +9,7 @@ import { Socket } from "node:net";
 import { SETTINGS_SECTION_META } from "@elizaos/ui/components/settings/settings-section-meta";
 import { TAB_PATHS } from "@elizaos/ui/navigation";
 import {
+  afterAll,
   afterEach,
   beforeAll,
   beforeEach,
@@ -62,6 +63,12 @@ vi.mock("./auth/sessions", async (importOriginal) => {
     findActiveSession: vi.fn(async () => null),
     parseSessionCookie: vi.fn(() => null),
   };
+});
+
+// The route import binds several package and auth overrides into a broad graph;
+// release that graph before another suite exercises the production modules.
+afterAll(() => {
+  vi.resetModules();
 });
 
 const STATE: CompatRuntimeState = {

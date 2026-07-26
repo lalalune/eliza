@@ -7,7 +7,15 @@
 
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 type CapturedServer = {
   handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
@@ -41,6 +49,12 @@ vi.mock("node:http", () => ({
 
 vi.mock("@elizaos/core", () => {
   throw new Error("force echo-mode fallback");
+});
+
+// The fallback test replaces the entire core namespace. App-core shares one
+// Vitest registry, so cached dependants must not inherit that failed import.
+afterAll(() => {
+  vi.resetModules();
 });
 
 type FakeResponse = ServerResponse & {

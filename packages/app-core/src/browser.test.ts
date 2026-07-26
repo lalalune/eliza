@@ -1,5 +1,5 @@
 /** Verifies the browser barrel links its local stubs and iOS smoke contract. */
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("@elizaos/shared", () => ({
   registerDetailExtension: vi.fn(),
@@ -53,6 +53,12 @@ vi.mock("./runtime/desktop/AppWindowRenderer", () => ({
 vi.mock("./services/task-host-capabilities", () => ({
   getHostExecutionCapabilities: vi.fn(),
 }));
+
+// This barrel test intentionally supplies narrow browser-only package mocks;
+// clear the shared registry before a later server suite imports real packages.
+afterAll(() => {
+  vi.resetModules();
+});
 
 describe("browser-safe app-core barrel", () => {
   it("exports the iOS smoke entrypoint, keys, and inert compatibility stubs", async () => {

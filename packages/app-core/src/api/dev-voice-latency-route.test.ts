@@ -6,6 +6,7 @@
  */
 import { Socket } from "node:net";
 import {
+  afterAll,
   afterEach,
   beforeAll,
   beforeEach,
@@ -67,6 +68,12 @@ let voiceLatencyTracer!: EndToEndLatencyTracer;
 beforeAll(async () => {
   const mod = await import("@elizaos/plugin-local-inference/services");
   voiceLatencyTracer = mod.voiceLatencyTracer;
+});
+
+// App-core intentionally shares one Vitest module registry; clear this mocked
+// route graph so later suites exercise the genuine shared routing readers.
+afterAll(() => {
+  vi.resetModules();
 });
 
 /** Minimal fake req/res that captures the JSON body and status. */
