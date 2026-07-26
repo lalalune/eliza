@@ -76,8 +76,22 @@ const timedGoogleEvent: GoogleCalendarEvent = {
   htmlLink: "https://www.google.com/calendar/event?eid=evt_abc123",
   meetLink: "https://meet.google.com/abc-defg-hij",
   attendees: [
-    { email: "owner@example.com", name: "Owner Person" },
-    { email: "guest@elsewhere.com", name: "Guest" },
+    {
+      email: "owner@example.com",
+      name: "Owner Person",
+      responseStatus: "accepted",
+      self: true,
+      organizer: true,
+      optional: false,
+    },
+    {
+      email: "guest@elsewhere.com",
+      name: "Guest",
+      responseStatus: "needsAction",
+      self: false,
+      organizer: false,
+      optional: false,
+    },
   ],
   location: "Room 4B",
   description: "Weekly design review",
@@ -127,7 +141,7 @@ describe("lifeOpsCalendarEventFromGoogle (Google -> LifeOps contract)", () => {
     });
 
     expect(result.id).toBe(
-      "agent-7:google:owner:calendar:owner@example.com:evt_abc123",
+      "agent-7:google:owner:grant:connector-account:acct-123:calendar:owner@example.com:evt_abc123",
     );
     expect(result.externalId).toBe("evt_abc123");
     expect(result.agentId).toBe(AGENT_ID);
@@ -153,21 +167,21 @@ describe("lifeOpsCalendarEventFromGoogle (Google -> LifeOps contract)", () => {
       self: true,
     });
 
-    // attendees mapped to the LifeOps attendee shape (response/self/organizer
-    // default false/null because Google's summary projection omits them).
+    // RSVP state and attendee roles must survive normalization because conflict
+    // policy distinguishes declined, optional, and organizer commitments.
     expect(result.attendees).toEqual([
       {
         email: "owner@example.com",
         displayName: "Owner Person",
-        responseStatus: null,
-        self: false,
-        organizer: false,
+        responseStatus: "accepted",
+        self: true,
+        organizer: true,
         optional: false,
       },
       {
         email: "guest@elsewhere.com",
         displayName: "Guest",
-        responseStatus: null,
+        responseStatus: "needsAction",
         self: false,
         organizer: false,
         optional: false,
@@ -224,7 +238,9 @@ describe("lifeOpsCalendarEventFromGoogle (Google -> LifeOps contract)", () => {
     // start falls back to syncedAt, end falls back to start when absent.
     expect(result.startAt).toBe("2026-06-16T08:00:00.000Z");
     expect(result.endAt).toBe("2026-06-16T08:00:00.000Z");
-    expect(result.id).toBe("agent-7:google:owner:calendar:primary:evt_min");
+    expect(result.id).toBe(
+      "agent-7:google:owner:grant:connector-account:acct-123:calendar:primary:evt_min",
+    );
   });
 });
 
@@ -251,6 +267,7 @@ describe("lifeOpsCalendarSummaryFromGoogle (calendar list contract)", () => {
       provider: "google",
       side: "owner",
       grantId: "connector-account:acct-123",
+      connectorAccountId: "acct-123",
       accountEmail: "owner@example.com",
       calendarId: "owner@example.com",
       summary: "Owner Person",

@@ -1,5 +1,6 @@
 /** Public entry point for `@elizaos/plugin-calendar`: the plugin definition, `CalendarService`, the `CALENDAR` action surface, and the calendar contract types host packages depend on. */
 export {
+  __resetConflictDetectLoaderForTests,
   CALENDAR_PLAN_INSTRUCTIONS,
   type CalendarActionDeps,
   type CalendarHandlerAction,
@@ -9,8 +10,23 @@ export {
   type CalendarTravelBufferDep,
   type CalendarTravelBufferResult,
   type CalendarTravelIntent,
+  type ConflictDetectActionDeps,
+  type ConflictDetectEvent,
+  type ConflictDetectLoadBatch,
+  type ConflictDetectLoader,
+  type ConflictDetectLoadResult,
+  type ConflictDetectLoadSnapshot,
+  type ConflictDetectPair,
+  type ConflictDetectProposal,
+  type ConflictDetectResult,
+  type ConflictRange,
+  type ConflictSeverity,
+  conflictDetectAction,
   createCalendarActionRunner,
+  createCalendarFeedConflictLoader,
+  createConflictDetectAction,
   extractCalendarPlanWithLlm,
+  setConflictDetectLoader,
 } from "./actions/index.js";
 export {
   APPLE_CALENDAR_ACCOUNT_LABEL,

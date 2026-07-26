@@ -41,6 +41,7 @@ import {
 } from "../lifeops/approval-queue.types.js";
 import { extractCommitmentLedgerRecords } from "../lifeops/commitments/index.js";
 import { LifeOpsRepository } from "../lifeops/repository.js";
+import { verifySchedulingApprovalContent } from "../lifeops/scheduling-approval.js";
 import { LifeOpsService } from "../lifeops/service.js";
 import { executeApprovedBookTravel } from "./book-travel.js";
 import { dispatchApprovedSignatureRequest } from "./document.js";
@@ -280,6 +281,51 @@ export async function executeApprovedRequest(args: {
   request: ApprovalRequest;
   callback?: HandlerCallback;
 }): Promise<ActionResult> {
+  const scheduling = verifySchedulingApprovalContent(args.request.payload);
+  if (scheduling && !scheduling.matches) {
+    logger.error(
+      `[OwnerResolveRequest] scheduling approval ${args.request.id} content hash mismatch; refusing dispatch`,
+    );
+    const text = `Approved scheduling draft ${args.request.id}, but its recipient or content no longer matches the approved SHA-256. Nothing was sent.`;
+    await args.callback?.({ text });
+    return {
+      text,
+      success: false,
+      data: {
+        error: "SCHEDULING_APPROVAL_CONTENT_MISMATCH",
+        requestId: args.request.id,
+        state: args.request.state,
+        sent: false,
+        expectedSha256: scheduling.correlation.contentSha256,
+        actualSha256: scheduling.actualSha256,
+        scheduling: scheduling.correlation,
+      },
+    };
+  }
+  if (scheduling) {
+    // The generic runtime queue has no durable execution-receipt field. Sending
+    // first and then failing to link a provider receipt would make retries
+    // duplicate messages, so scheduling drafts stop here until that shared
+    // receipt rail exists.
+    logger.error(
+      `[OwnerResolveRequest] scheduling approval ${args.request.id} is approved but durable provider-receipt execution is unavailable; refusing dispatch`,
+    );
+    const text = `Approved scheduling draft ${args.request.id}, but the approval rail cannot yet persist a provider delivery receipt. Nothing was sent; the request remains approved.`;
+    await args.callback?.({ text });
+    return {
+      text,
+      success: false,
+      data: {
+        error: "SCHEDULING_DELIVERY_RECEIPT_EXECUTOR_UNAVAILABLE",
+        requestId: args.request.id,
+        state: args.request.state,
+        sent: false,
+        contentSha256: scheduling.correlation.contentSha256,
+        scheduling: scheduling.correlation,
+      },
+    };
+  }
+
   if (args.request.action === "book_travel") {
     return executeApprovedBookTravel(args);
   }

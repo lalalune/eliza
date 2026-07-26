@@ -11,6 +11,7 @@ import {
   type IAgentRuntime,
 } from "@elizaos/core";
 import type {
+  GoogleCalendarAttendee,
   GoogleCalendarEvent,
   GoogleCalendarEventInput,
   GoogleCalendarEventPatchInput,
@@ -449,8 +450,9 @@ export function lifeOpsCalendarEventFromGoogle(args: {
   const externalId = event.id;
   const startAt = dateTimeValue(event.start, syncedAt);
   const endAt = dateTimeValue(event.end, startAt);
+  const connectorAccountId = accountIdForGrant(grant);
   return {
-    id: `${agentId}:google:${grant.side}:calendar:${event.calendarId}:${externalId}`,
+    id: `${agentId}:google:${grant.side}:grant:${grant.id}:calendar:${event.calendarId}:${externalId}`,
     externalId,
     agentId,
     provider: "google",
@@ -476,22 +478,22 @@ export function lifeOpsCalendarEventFromGoogle(args: {
     },
     syncedAt,
     updatedAt: syncedAt,
-    connectorAccountId: grant.connectorAccountId ?? undefined,
+    connectorAccountId,
     grantId: grant.id,
     accountEmail: grant.identityEmail ?? undefined,
   };
 }
 
 function lifeOpsCalendarAttendeeFromGoogle(
-  attendee: GoogleEmailAddress,
+  attendee: GoogleCalendarAttendee,
 ): LifeOpsCalendarEventAttendee {
   return {
     email: attendee.email,
     displayName: attendee.name ?? null,
-    responseStatus: null,
-    self: false,
-    organizer: false,
-    optional: false,
+    responseStatus: attendee.responseStatus,
+    self: attendee.self,
+    organizer: attendee.organizer,
+    optional: attendee.optional,
   };
 }
 
@@ -505,6 +507,7 @@ export function lifeOpsCalendarSummaryFromGoogle(args: {
     provider: "google",
     side: grant.side,
     grantId: grant.id,
+    connectorAccountId: accountIdForGrant(grant),
     accountEmail: grant.identityEmail ?? null,
     calendarId: entry.calendarId,
     summary: entry.summary,

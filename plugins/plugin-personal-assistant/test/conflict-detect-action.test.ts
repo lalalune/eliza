@@ -132,6 +132,10 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       });
       const result = await callConflict(makeRuntime(), makeMessage(), {
         subaction: "scan_today",
+        range: {
+          start: "2026-05-11T00:00:00.000Z",
+          end: "2026-05-12T00:00:00.000Z",
+        },
       });
       expect(result.success).toBe(true);
       const data = result.data as {
@@ -210,6 +214,10 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       });
       const result = await callConflict(makeRuntime(), makeMessage(), {
         subaction: "scan_week",
+        range: {
+          start: "2026-05-12T00:00:00.000Z",
+          end: "2026-05-13T00:00:00.000Z",
+        },
       });
       const data = result.data as { conflicts: { severity: string }[] };
       expect(data.conflicts).toHaveLength(1);
@@ -267,7 +275,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       expect(data.checkedEvents).toBe(1);
       expect(data.conflicts).toHaveLength(1);
       expect(data.conflicts[0]).toMatchObject({
-        eventB: { id: "freebusy-alice-1" },
+        eventB: { id: "private-busy-1", title: "Busy", attendees: [] },
         severity: "hard",
       });
     });
@@ -412,6 +420,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       endAt: string;
       isAllDay: boolean;
       attendees: { email: string | null }[];
+      metadata?: Record<string, unknown>;
     };
 
     function makeRuntimeWithFeed(
@@ -432,7 +441,14 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
             request: { timeMin?: string; timeMax?: string },
           ) => {
             calls.push(request);
-            return { events };
+            return {
+              events: events.map((event) => ({
+                ...event,
+                metadata: event.metadata ?? {},
+              })),
+              source: "synced",
+              syncedAt: "2026-05-20T00:00:00.000Z",
+            };
           },
         }),
       } as unknown as IAgentRuntime;
@@ -490,7 +506,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       expect(data.conflicts[0]?.severity).toBe("hard");
     });
 
-    it("excludes all-day events so they never fabricate conflicts", async () => {
+    it("ignores transparent all-day annotations without discarding opaque all-day commitments", async () => {
       const runtime = makeRuntimeWithFeed([
         {
           id: "evt-holiday",
@@ -499,6 +515,7 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
           endAt: "2026-05-21T00:00:00.000Z",
           isAllDay: true,
           attendees: [],
+          metadata: { transparency: "transparent" },
         },
         {
           id: "evt-call",
@@ -512,6 +529,10 @@ describe("CONFLICT_DETECT umbrella action — proactive calendar scans", () => {
       setConflictDetectLoader(createCalendarFeedConflictLoader());
       const result = await callConflict(runtime, makeMessage(), {
         subaction: "scan_today",
+        range: {
+          start: "2026-05-20T00:00:00.000Z",
+          end: "2026-05-21T00:00:00.000Z",
+        },
       });
       expect(result.success).toBe(true);
       const data = result.data as {

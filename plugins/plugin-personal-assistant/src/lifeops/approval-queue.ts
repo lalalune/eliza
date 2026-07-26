@@ -27,6 +27,7 @@ import {
 } from "./approval-queue.types.js";
 import { getChannelRegistry } from "./channels/index.js";
 import { buildApprovalChoiceText } from "./choice-markers.js";
+import { readSchedulingApprovalCorrelation } from "./scheduling-approval.js";
 import {
   executeRawSql,
   parseJsonRecord,
@@ -410,6 +411,12 @@ function assertApprovalPayload(
       requireStringField(record, "recipient", label);
       requireStringField(record, "body", label);
       requireNullableStringField(record, "replyToMessageId", label);
+      if (record.scheduling !== undefined) {
+        readSchedulingApprovalCorrelation(
+          record as ApprovalPayload,
+          `${label}.scheduling`,
+        );
+      }
       break;
     case "send_email":
       requireStringArrayField(record, "to", label);
@@ -419,6 +426,12 @@ function assertApprovalPayload(
       requireStringField(record, "body", label);
       requireNullableStringField(record, "threadId", label);
       requireOptionalNullableStringField(record, "replyToMessageId", label);
+      if (record.scheduling !== undefined) {
+        readSchedulingApprovalCorrelation(
+          record as ApprovalPayload,
+          `${label}.scheduling`,
+        );
+      }
       break;
     case "schedule_event":
       requireStringField(record, "calendarId", label);

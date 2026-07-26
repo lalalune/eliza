@@ -41,6 +41,55 @@ export interface LifeOpsCalendarEventAttendee {
 export type LifeOpsCalendarProvider = "google" | "apple_calendar";
 
 /**
+ * Stable identity for one authorized calendar source. `calendarId` alone is
+ * not unique: every connected Google account can expose a calendar named
+ * `primary`, and shared calendars can appear through more than one grant.
+ */
+export interface LifeOpsCalendarSourceKey {
+  provider: LifeOpsCalendarProvider;
+  side: LifeOpsConnectorSide;
+  grantId: string;
+  connectorAccountId: string;
+  calendarId: string;
+}
+
+export const LIFEOPS_CALENDAR_SOURCE_STATUSES = [
+  "fresh",
+  "stale",
+  "error",
+  "disconnected",
+] as const;
+export type LifeOpsCalendarSourceStatus =
+  (typeof LIFEOPS_CALENDAR_SOURCE_STATUSES)[number];
+
+export interface LifeOpsCalendarSourceError {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+/**
+ * Per-source truth exposed with every feed. Guest/free-busy consumers use this
+ * state to distinguish a genuinely empty calendar from an unreadable or stale
+ * source before claiming a person is available.
+ */
+export interface LifeOpsCalendarSourceHealth {
+  key: LifeOpsCalendarSourceKey;
+  summary: string;
+  status: LifeOpsCalendarSourceStatus;
+  syncedAt: string | null;
+  error: LifeOpsCalendarSourceError | null;
+}
+
+export const LIFEOPS_CALENDAR_FEED_STATES = [
+  "complete",
+  "partial",
+  "unavailable",
+] as const;
+export type LifeOpsCalendarFeedState =
+  (typeof LIFEOPS_CALENDAR_FEED_STATES)[number];
+
+/**
  * Which part of a recurring series a mutation targets: one flattened
  * occurrence (`instance`) or the series master (`series`).
  */
@@ -93,6 +142,14 @@ export interface LifeOpsCalendarFeed {
   calendarId: string;
   events: LifeOpsCalendarEvent[];
   source: "cache" | "synced";
+  /**
+   * `complete` means every requested source is fresh; `partial` means cached
+   * or stale data is present alongside a failed source; `unavailable` means no
+   * authoritative source could be read. Consumers must not infer availability
+   * from `events.length` without checking this field.
+   */
+  state: LifeOpsCalendarFeedState;
+  sources: LifeOpsCalendarSourceHealth[];
   timeMin: string;
   timeMax: string;
   syncedAt: string | null;
@@ -109,6 +166,7 @@ export interface LifeOpsCalendarSummary {
   provider: LifeOpsCalendarProvider;
   side: LifeOpsConnectorSide;
   grantId: string;
+  connectorAccountId: string;
   accountEmail: string | null;
   calendarId: string;
   summary: string;
@@ -199,6 +257,8 @@ export interface CreateLifeOpsCalendarEventRequest {
 
 export interface LifeOpsNextCalendarEventContext {
   event: LifeOpsCalendarEvent | null;
+  calendarFeedState: LifeOpsCalendarFeedState;
+  calendarSources: LifeOpsCalendarSourceHealth[];
   startsAt: string | null;
   startsInMinutes: number | null;
   attendeeCount: number;

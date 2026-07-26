@@ -1,9 +1,13 @@
 /**
  * Smoke test asserting the calendar plugin registers its data service, the
- * migration service, the schema, and the calendar view.
+ * migration service, deterministic conflict action, schema, and calendar view.
  */
 import { describe, expect, it } from "vitest";
-import { CalendarService, calendarPlugin } from "../src/index.js";
+import {
+  CalendarService,
+  calendarPlugin,
+  conflictDetectAction,
+} from "../src/index.js";
 import { CalendarMigrationService } from "../src/service/migration.js";
 
 describe("plugin-calendar surface", () => {
@@ -19,7 +23,10 @@ describe("plugin-calendar surface", () => {
     expect(calendarPlugin.views?.[0]?.modalities).toEqual(["gui"]);
   });
 
-  it("does not expose scaffold calendar actions directly", () => {
-    expect(calendarPlugin.actions ?? []).toEqual([]);
+  it("exposes the real calendar-owned conflict action without a scaffold", () => {
+    expect(calendarPlugin.actions).toEqual([conflictDetectAction]);
+    expect(conflictDetectAction.description).not.toMatch(
+      /scaffold_stub|not migrated|not yet implemented/i,
+    );
   });
 });

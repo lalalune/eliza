@@ -126,6 +126,7 @@ import type {
   ApprovalResolution,
 } from "../src/lifeops/approval-queue.types.js";
 import { LifeOpsRepository } from "../src/lifeops/repository.js";
+import { attachSchedulingApprovalCorrelation } from "../src/lifeops/scheduling-approval.js";
 import { LifeOpsService } from "../src/lifeops/service.js";
 
 function makeRuntime(): IAgentRuntime {
@@ -460,6 +461,101 @@ describe("executeApprovedRequest", () => {
     expect(runtime.reportError).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
     expect(texts.join(" ")).toContain("mira@example.com");
+  });
+
+  it("approved scheduling content remains unsent until a durable receipt executor exists", async () => {
+    const runtime = makeRuntime();
+    const payload = attachSchedulingApprovalCorrelation(
+      {
+        action: "send_email",
+        to: ["co-parent@example.com"],
+        cc: [],
+        bcc: [],
+        subject: "Scheduling: school conference",
+        body: "Would Tuesday at 4:00 PM work for the school conference?",
+        threadId: null,
+        replyToMessageId: null,
+      },
+      {
+        kind: "scheduling_message",
+        negotiationId: "negotiation-17",
+        proposalId: "proposal-41",
+        messageKind: "proposal",
+        transportChannel: "email",
+        sourceUpdatedAt: "2026-07-26T18:30:00.000Z",
+        draftVersion: 1,
+      },
+    );
+    const request = approvedRequest({ action: "send_email", payload });
+    const queue = new RecordingQueue(request);
+    const sendSpy = vi.spyOn(LifeOpsService.prototype, "sendGmailMessage");
+    const { texts, callback } = collectTexts();
+
+    const result = await executeApprovedRequest({
+      runtime,
+      queue,
+      request,
+      callback,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      data: {
+        error: "SCHEDULING_DELIVERY_RECEIPT_EXECUTOR_UNAVAILABLE",
+        requestId: request.id,
+        state: "approved",
+        sent: false,
+      },
+    });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(queue.transitions).toEqual([]);
+    expect(texts.join(" ")).toContain("Nothing was sent");
+  });
+
+  it("refuses altered scheduling content before any connector or queue transition", async () => {
+    const runtime = makeRuntime();
+    const payload = attachSchedulingApprovalCorrelation(
+      {
+        action: "send_message",
+        recipient: "+15555550123",
+        body: "Would Tuesday at 4:00 PM work?",
+        replyToMessageId: null,
+      },
+      {
+        kind: "scheduling_message",
+        negotiationId: "negotiation-17",
+        proposalId: "proposal-41",
+        messageKind: "proposal",
+        transportChannel: "sms",
+        sourceUpdatedAt: "2026-07-26T18:30:00.000Z",
+        draftVersion: 1,
+      },
+    );
+    payload.body = "The time is now Wednesday at 9:00 AM.";
+    const request = approvedRequest({ action: "send_message", payload });
+    const queue = new RecordingQueue(request);
+    const sendSpy = vi.spyOn(LifeOpsService.prototype, "sendIMessage");
+    const { texts, callback } = collectTexts();
+
+    const result = await executeApprovedRequest({
+      runtime,
+      queue,
+      request,
+      callback,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      data: {
+        error: "SCHEDULING_APPROVAL_CONTENT_MISMATCH",
+        requestId: request.id,
+        state: "approved",
+        sent: false,
+      },
+    });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(queue.transitions).toEqual([]);
+    expect(texts.join(" ")).toContain("Nothing was sent");
   });
 
   it("make_call approval without Twilio credentials fails honestly and stays retriable", async () => {

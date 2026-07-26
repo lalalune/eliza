@@ -2331,12 +2331,7 @@ export class LifeOpsService extends LifeOpsServiceBase {
 
   // `this` (a LifeOpsServiceBase subclass) satisfies LifeOpsContext.
   // Public (not private) to avoid TS4094 on the re-exported mixin class.
-  readonly schedulingDomain = new SchedulingDomain(this, {
-    sendGmailMessage: (...args) => this.sendGmailMessage(...args),
-    sendTelegramMessage: (...args) => this.sendTelegramMessage(...args),
-    sendWhatsAppMessage: (...args) => this.sendWhatsAppMessage(...args),
-    sendIMessage: (...args) => this.sendIMessage(...args),
-  });
+  readonly schedulingDomain = new SchedulingDomain(this);
 
   inspectSchedule(args: {
     timezone: string;
@@ -2358,16 +2353,34 @@ export class LifeOpsService extends LifeOpsServiceBase {
     return this.schedulingDomain.resolveCounterpartyTarget(negotiation);
   }
 
-  dispatchSchedulingMessage(
+  draftOpeningMessage(
     negotiation: LifeOpsSchedulingNegotiation,
-    body: string,
-    subject: string,
-  ): ReturnType<SchedulingDomain["dispatchSchedulingMessage"]> {
-    return this.schedulingDomain.dispatchSchedulingMessage(
+  ): ReturnType<SchedulingDomain["draftOpeningMessage"]> {
+    return this.schedulingDomain.draftOpeningMessage(negotiation);
+  }
+
+  draftProposalMessage(
+    negotiation: LifeOpsSchedulingNegotiation,
+    proposal: LifeOpsSchedulingProposal,
+  ): ReturnType<SchedulingDomain["draftProposalMessage"]> {
+    return this.schedulingDomain.draftProposalMessage(negotiation, proposal);
+  }
+
+  draftConfirmationMessage(
+    negotiation: LifeOpsSchedulingNegotiation,
+    proposal: LifeOpsSchedulingProposal,
+  ): ReturnType<SchedulingDomain["draftConfirmationMessage"]> {
+    return this.schedulingDomain.draftConfirmationMessage(
       negotiation,
-      body,
-      subject,
+      proposal,
     );
+  }
+
+  draftCancellationMessage(
+    negotiation: LifeOpsSchedulingNegotiation,
+    reason?: string,
+  ): ReturnType<SchedulingDomain["draftCancellationMessage"]> {
+    return this.schedulingDomain.draftCancellationMessage(negotiation, reason);
   }
 
   startNegotiation(input: {
@@ -2414,7 +2427,10 @@ export class LifeOpsService extends LifeOpsServiceBase {
     return this.schedulingDomain.finalizeNegotiation(id, acceptedProposalId);
   }
 
-  cancelNegotiation(id: string, reason?: string): Promise<void> {
+  cancelNegotiation(
+    id: string,
+    reason?: string,
+  ): Promise<LifeOpsSchedulingNegotiation> {
     return this.schedulingDomain.cancelNegotiation(id, reason);
   }
 

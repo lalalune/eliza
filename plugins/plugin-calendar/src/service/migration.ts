@@ -16,9 +16,9 @@
  *   3. Otherwise copy every source row that is not already present in the target
  *      (a doubly-safe NOT EXISTS guard on the primary key).
  *
- * The source table is NEVER dropped or altered. The source and target share the
- * exact column shape (PA's `app_lifeops` drizzle def and this plugin's
- * `app_calendar` def are column-identical), so the `SELECT s.*` copy is safe.
+ * The source table is NEVER dropped or altered. Copies name the shared columns
+ * explicitly so the calendar-owned target can add sync metadata without
+ * making older personal-assistant source tables unreadable.
  */
 
 import { type IAgentRuntime, logger, Service } from "@elizaos/core";
@@ -36,6 +36,54 @@ export const MIGRATED_CALENDAR_TABLES = [
 
 export type MigratedCalendarTable = (typeof MIGRATED_CALENDAR_TABLES)[number];
 
+const MIGRATED_CALENDAR_COLUMNS: Record<
+  MigratedCalendarTable,
+  readonly string[]
+> = {
+  life_calendar_events: [
+    "id",
+    "agent_id",
+    "provider",
+    "side",
+    "calendar_id",
+    "external_event_id",
+    "connector_account_id",
+    "purge_resync_required",
+    "purge_resync_reason",
+    "grant_id",
+    "title",
+    "description",
+    "location",
+    "status",
+    "start_at",
+    "end_at",
+    "is_all_day",
+    "timezone",
+    "html_link",
+    "conference_link",
+    "organizer_json",
+    "attendees_json",
+    "metadata_json",
+    "synced_at",
+    "updated_at",
+  ],
+  life_calendar_sync_states: [
+    "id",
+    "agent_id",
+    "provider",
+    "side",
+    "calendar_id",
+    "connector_account_id",
+    "grant_id",
+    "purge_resync_required",
+    "purge_resync_reason",
+    "window_start_at",
+    "window_end_at",
+    "synced_at",
+    "updated_at",
+  ],
+};
+
 export type SqlExecutor = (
   sql: string,
 ) => Promise<Array<Record<string, unknown>>>;
@@ -43,6 +91,125 @@ export type SqlExecutor = (
 export interface TableMigrationResult {
   table: MigratedCalendarTable;
   outcome: "copied" | "source-missing" | "target-non-empty";
+}
+
+/**
+ * Upgrades the original calendar-only uniqueness to full source identity.
+ * Every Google account exposes a `primary` calendar, so omitting the grant
+ * lets one account overwrite another even though both reads succeeded.
+ */
+export async function ensureCalendarSourceIdentity(
+  exec: SqlExecutor,
+): Promise<void> {
+  await exec(`
+    ALTER TABLE ${TARGET_SCHEMA}.life_calendar_sync_states
+      ADD COLUMN IF NOT EXISTS next_sync_token TEXT`);
+  await exec(`
+    UPDATE ${TARGET_SCHEMA}.life_calendar_events
+       SET grant_id = COALESCE(
+             grant_id,
+             connector_account_id,
+             CASE
+               WHEN provider = 'apple_calendar' THEN 'apple-calendar'
+               ELSE 'legacy:' || provider || ':' || side
+             END
+           ),
+           connector_account_id = COALESCE(
+             connector_account_id,
+             grant_id,
+             CASE
+               WHEN provider = 'apple_calendar' THEN 'apple-calendar'
+               ELSE 'legacy:' || provider || ':' || side
+             END
+           )
+     WHERE grant_id IS NULL OR connector_account_id IS NULL`);
+  await exec(`
+    UPDATE ${TARGET_SCHEMA}.life_calendar_sync_states
+       SET grant_id = COALESCE(
+             grant_id,
+             connector_account_id,
+             CASE
+               WHEN provider = 'apple_calendar' THEN 'apple-calendar'
+               ELSE 'legacy:' || provider || ':' || side
+             END
+           ),
+           connector_account_id = COALESCE(
+             connector_account_id,
+             grant_id,
+             CASE
+               WHEN provider = 'apple_calendar' THEN 'apple-calendar'
+               ELSE 'legacy:' || provider || ':' || side
+             END
+           )
+     WHERE grant_id IS NULL OR connector_account_id IS NULL`);
+  await exec(`
+    UPDATE ${TARGET_SCHEMA}.life_calendar_sync_states
+       SET id = agent_id || ':' || provider || ':' || side || ':grant:' ||
+                grant_id || ':calendar:' || calendar_id`);
+  await exec(`
+    DO $calendar_source_identity$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      FOR constraint_name IN
+        SELECT c.conname
+          FROM pg_constraint AS c
+         WHERE c.conrelid = '${TARGET_SCHEMA}.life_calendar_events'::regclass
+           AND c.contype = 'u'
+           AND pg_get_constraintdef(c.oid) LIKE
+             'UNIQUE (agent_id, provider, side, calendar_id, external_event_id)%'
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE ${TARGET_SCHEMA}.life_calendar_events DROP CONSTRAINT %I',
+          constraint_name
+        );
+      END LOOP;
+
+      IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid = '${TARGET_SCHEMA}.life_calendar_events'::regclass
+           AND conname = 'calendar_events_source_external_unique'
+      ) THEN
+        ALTER TABLE ${TARGET_SCHEMA}.life_calendar_events
+          ADD CONSTRAINT calendar_events_source_external_unique
+          UNIQUE (
+            agent_id, provider, side, grant_id, calendar_id, external_event_id
+          );
+      END IF;
+    END
+    $calendar_source_identity$`);
+  await exec(`
+    DO $calendar_sync_source_identity$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      FOR constraint_name IN
+        SELECT c.conname
+          FROM pg_constraint AS c
+         WHERE c.conrelid = '${TARGET_SCHEMA}.life_calendar_sync_states'::regclass
+           AND c.contype = 'u'
+           AND pg_get_constraintdef(c.oid) LIKE
+             'UNIQUE (agent_id, provider, side, calendar_id)%'
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE ${TARGET_SCHEMA}.life_calendar_sync_states DROP CONSTRAINT %I',
+          constraint_name
+        );
+      END LOOP;
+
+      IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid = '${TARGET_SCHEMA}.life_calendar_sync_states'::regclass
+           AND conname = 'calendar_sync_states_source_unique'
+      ) THEN
+        ALTER TABLE ${TARGET_SCHEMA}.life_calendar_sync_states
+          ADD CONSTRAINT calendar_sync_states_source_unique
+          UNIQUE (agent_id, provider, side, grant_id, calendar_id);
+      END IF;
+    END
+    $calendar_sync_source_identity$`);
 }
 
 function quoteIdent(name: string): string {
@@ -82,9 +249,14 @@ export async function migrateCalendarTable(
 
   const target = `${TARGET_SCHEMA}.${quoteIdent(table)}`;
   const source = `${SOURCE_SCHEMA}.${quoteIdent(table)}`;
+  const columns = MIGRATED_CALENDAR_COLUMNS[table];
+  const targetColumns = columns.map(quoteIdent).join(", ");
+  const sourceColumns = columns
+    .map((column) => `s.${quoteIdent(column)}`)
+    .join(", ");
   await exec(
-    `INSERT INTO ${target}
-       SELECT s.* FROM ${source} AS s
+    `INSERT INTO ${target} (${targetColumns})
+       SELECT ${sourceColumns} FROM ${source} AS s
        WHERE NOT EXISTS (
          SELECT 1 FROM ${target} AS t WHERE t.id = s.id
        )`,
@@ -100,6 +272,7 @@ export async function migrateCalendarTables(
   for (const table of MIGRATED_CALENDAR_TABLES) {
     results.push(await migrateCalendarTable(exec, table));
   }
+  await ensureCalendarSourceIdentity(exec);
   return results;
 }
 

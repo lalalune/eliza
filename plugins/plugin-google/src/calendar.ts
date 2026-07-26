@@ -1,42 +1,141 @@
 /**
- * `GoogleCalendarClient` — Calendar list and event CRUD behind the workspace
- * service. Maps Calendar API events into `GoogleCalendarEvent` DTOs, attaches a
- * Meet link on create when requested, and preserves recurrence/time-zone
- * context across patches. Also exports `readConferenceLink`, which extracts the
- * canonical join URL from an event (hangoutLink or the best conference entry
- * point) — the source of the calendar feed's `meetLink`.
+ * Account-scoped Google Calendar reads, availability queries, and mutations
+ * behind the workspace service. Page DTOs expose Google's continuation and
+ * incremental-sync tokens, while array-returning methods remain convenience
+ * adapters that exhaust every page. Availability responses deliberately omit
+ * event content so callers can coordinate with guest calendars without
+ * receiving private titles or descriptions.
  */
 import { randomUUID } from "node:crypto";
+import { ElizaError } from "@elizaos/core";
 import type { calendar_v3 } from "googleapis";
 import type { GoogleApiClientFactory } from "./client-factory.js";
 import type {
   GoogleAccountRef,
+  GoogleCalendarAttendee,
+  GoogleCalendarAttendeeInput,
+  GoogleCalendarAttendeeResponseStatus,
+  GoogleCalendarBusyInterval,
   GoogleCalendarEvent,
+  GoogleCalendarEventDeleteInput,
   GoogleCalendarEventInput,
+  GoogleCalendarEventListPage,
+  GoogleCalendarEventListPageInput,
   GoogleCalendarEventPatchInput,
+  GoogleCalendarFreeBusyCalendar,
+  GoogleCalendarFreeBusyInput,
+  GoogleCalendarFreeBusyResult,
   GoogleCalendarListEntry,
-  GoogleEmailAddress,
+  GoogleCalendarListPage,
+  GoogleCalendarListPageInput,
+  GoogleCalendarTransparency,
+  GoogleCalendarVisibility,
 } from "./types.js";
+
+const CALENDAR_LIST_PAGE_SIZE = 250;
+const EVENT_LIST_PAGE_SIZE = 2_500;
+
+export type GoogleCalendarSyncResource = "calendarList" | "events";
+
+export class GoogleCalendarSyncTokenExpiredError extends ElizaError {
+  override readonly name = "GoogleCalendarSyncTokenExpiredError";
+  readonly resource: GoogleCalendarSyncResource;
+
+  constructor(args: {
+    resource: GoogleCalendarSyncResource;
+    accountId: string;
+    calendarId?: string;
+    cause: unknown;
+  }) {
+    super("Google Calendar incremental sync token has expired; a full resync is required.", {
+      code: "GOOGLE_CALENDAR_SYNC_TOKEN_EXPIRED",
+      context: {
+        resource: args.resource,
+        accountId: args.accountId,
+        ...(args.calendarId ? { calendarId: args.calendarId } : {}),
+      },
+      cause: args.cause,
+      severity: "ephemeral",
+    });
+    this.resource = args.resource;
+  }
+}
 
 export class GoogleCalendarClient {
   constructor(private readonly clientFactory: GoogleApiClientFactory) {}
 
   async listCalendars(params: GoogleAccountRef): Promise<GoogleCalendarListEntry[]> {
+    const calendars: GoogleCalendarListEntry[] = [];
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | undefined;
+
+    do {
+      const page = await this.listCalendarPage({
+        ...params,
+        pageToken,
+        minAccessRole: "reader",
+        showDeleted: false,
+        showHidden: false,
+      });
+      calendars.push(
+        ...page.calendars.filter((entry) => entry.deleted !== true && entry.hidden !== true)
+      );
+      pageToken = nextPageToken(page.nextPageToken, seenPageTokens, "calendar list");
+    } while (pageToken);
+
+    return calendars;
+  }
+
+  async listCalendarPage(params: GoogleCalendarListPageInput): Promise<GoogleCalendarListPage> {
+    validatePageSize(params.maxResults, CALENDAR_LIST_PAGE_SIZE, "calendar list");
+    if (params.syncToken && params.minAccessRole) {
+      throw invalidCalendarRequest(
+        "Google Calendar list syncToken cannot be combined with minAccessRole.",
+        { accountId: params.accountId }
+      );
+    }
+
     const calendar = await this.clientFactory.calendar(
       params,
       ["calendar.read"],
       "calendar.listCalendars"
     );
-    const response = await calendar.calendarList.list({
-      minAccessRole: "reader",
-      showDeleted: false,
-      showHidden: false,
-    });
+    try {
+      const response = await calendar.calendarList.list({
+        ...(params.pageToken ? { pageToken: params.pageToken } : {}),
+        ...(params.syncToken ? { syncToken: params.syncToken } : {}),
+        ...(params.maxResults !== undefined ? { maxResults: params.maxResults } : {}),
+        ...(!params.syncToken && params.minAccessRole
+          ? { minAccessRole: params.minAccessRole }
+          : {}),
+        ...(params.syncToken
+          ? { showDeleted: true, showHidden: true }
+          : params.showDeleted !== undefined
+            ? { showDeleted: params.showDeleted }
+            : {}),
+        ...(!params.syncToken && params.showHidden !== undefined
+          ? { showHidden: params.showHidden }
+          : {}),
+      });
 
-    return (response.data.items ?? [])
-      .filter((entry) => !entry.deleted && !entry.hidden)
-      .map(mapCalendarListEntry)
-      .filter((entry): entry is GoogleCalendarListEntry => entry !== null);
+      return {
+        calendars: (response.data.items ?? [])
+          .map(mapCalendarListEntry)
+          .filter((entry): entry is GoogleCalendarListEntry => entry !== null),
+        nextPageToken: normalizedToken(response.data.nextPageToken),
+        nextSyncToken: normalizedToken(response.data.nextSyncToken),
+      };
+    } catch (error) {
+      // error-policy:J2 Translate Google's opaque 410 into a typed resync signal and retain cause.
+      if (params.syncToken && googleErrorStatus(error) === 410) {
+        throw new GoogleCalendarSyncTokenExpiredError({
+          resource: "calendarList",
+          accountId: params.accountId,
+          cause: error,
+        });
+      }
+      throw error;
+    }
   }
 
   async listEvents(
@@ -48,23 +147,158 @@ export class GoogleCalendarClient {
       timeZone?: string;
     }
   ): Promise<GoogleCalendarEvent[]> {
+    validatePageSize(params.limit, EVENT_LIST_PAGE_SIZE, "event list");
+    const events: GoogleCalendarEvent[] = [];
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | undefined;
+
+    do {
+      const page = await this.listEventPage({
+        accountId: params.accountId,
+        calendarId: params.calendarId,
+        timeMin: params.timeMin,
+        timeMax: params.timeMax,
+        timeZone: params.timeZone,
+        pageToken,
+        maxResults: params.limit,
+      });
+      events.push(...page.events);
+      pageToken = nextPageToken(page.nextPageToken, seenPageTokens, "event list");
+    } while (pageToken);
+
+    return events;
+  }
+
+  async listEventPage(
+    params: GoogleCalendarEventListPageInput
+  ): Promise<GoogleCalendarEventListPage> {
+    validatePageSize(params.maxResults, EVENT_LIST_PAGE_SIZE, "event list");
+    if (params.syncToken && (params.timeMin || params.timeMax)) {
+      throw invalidCalendarRequest(
+        "Google Calendar event syncToken cannot be combined with timeMin or timeMax.",
+        {
+          accountId: params.accountId,
+          calendarId: params.calendarId ?? "primary",
+        }
+      );
+    }
+
     const calendar = await this.clientFactory.calendar(
       params,
       ["calendar.read"],
       "calendar.listEvents"
     );
     const calendarId = params.calendarId ?? "primary";
-    const response = await calendar.events.list({
-      calendarId,
+    try {
+      const response = await calendar.events.list({
+        calendarId,
+        ...(!params.syncToken && params.timeMin ? { timeMin: params.timeMin } : {}),
+        ...(!params.syncToken && params.timeMax ? { timeMax: params.timeMax } : {}),
+        ...(params.maxResults !== undefined ? { maxResults: params.maxResults } : {}),
+        ...(params.pageToken ? { pageToken: params.pageToken } : {}),
+        ...(params.syncToken ? { syncToken: params.syncToken } : {}),
+        singleEvents: true,
+        ...(!params.syncToken ? { orderBy: "startTime" as const } : {}),
+        ...(params.syncToken
+          ? { showDeleted: true }
+          : params.showDeleted !== undefined
+            ? { showDeleted: params.showDeleted }
+            : {}),
+        ...(params.timeZone ? { timeZone: params.timeZone } : {}),
+      });
+
+      return {
+        events: (response.data.items ?? []).map((event) =>
+          mapEvent(event, calendarId, params.timeZone)
+        ),
+        nextPageToken: normalizedToken(response.data.nextPageToken),
+        nextSyncToken: normalizedToken(response.data.nextSyncToken),
+      };
+    } catch (error) {
+      // error-policy:J2 Translate Google's opaque 410 into a typed resync signal and retain cause.
+      if (params.syncToken && googleErrorStatus(error) === 410) {
+        throw new GoogleCalendarSyncTokenExpiredError({
+          resource: "events",
+          accountId: params.accountId,
+          calendarId,
+          cause: error,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async queryFreeBusy(params: GoogleCalendarFreeBusyInput): Promise<GoogleCalendarFreeBusyResult> {
+    if (params.calendarIds.length === 0) {
+      throw invalidCalendarRequest("Google Calendar free/busy requires at least one calendar id.", {
+        accountId: params.accountId,
+      });
+    }
+    if (params.calendarIds.some((calendarId) => !calendarId.trim())) {
+      throw invalidCalendarRequest("Google Calendar free/busy calendar ids cannot be empty.", {
+        accountId: params.accountId,
+      });
+    }
+    const timeMin = Date.parse(params.timeMin);
+    const timeMax = Date.parse(params.timeMax);
+    if (!Number.isFinite(timeMin) || !Number.isFinite(timeMax) || timeMax <= timeMin) {
+      throw invalidCalendarRequest(
+        "Google Calendar free/busy requires a valid, increasing time window.",
+        { accountId: params.accountId }
+      );
+    }
+    const calendar = await this.clientFactory.calendar(
+      params,
+      ["calendar.read"],
+      "calendar.queryFreeBusy"
+    );
+    const response = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: params.timeMin,
+        timeMax: params.timeMax,
+        timeZone: params.timeZone,
+        groupExpansionMax: params.groupExpansionMax,
+        calendarExpansionMax: params.calendarExpansionMax,
+        items: params.calendarIds.map((id) => ({ id })),
+      },
+    });
+    if (!response.data.calendars) {
+      throw new ElizaError("Google Calendar returned no calendar availability payload.", {
+        code: "GOOGLE_CALENDAR_INVALID_FREE_BUSY_RESPONSE",
+        context: {
+          accountId: params.accountId,
+          requestedCalendarCount: params.calendarIds.length,
+        },
+        severity: "fatal",
+      });
+    }
+
+    const calendars: Record<string, GoogleCalendarFreeBusyCalendar> = {};
+    for (const calendarId of params.calendarIds) {
+      const availability = response.data.calendars[calendarId];
+      if (!availability) {
+        throw new ElizaError("Google Calendar omitted a requested calendar from free/busy.", {
+          code: "GOOGLE_CALENDAR_INVALID_FREE_BUSY_RESPONSE",
+          context: { accountId: params.accountId, calendarId },
+          severity: "fatal",
+        });
+      }
+      calendars[calendarId] = {
+        busy: (availability.busy ?? []).map((interval) =>
+          mapBusyInterval(interval, params.accountId, calendarId)
+        ),
+        errors: (availability.errors ?? []).map((error) => ({
+          domain: error.domain?.trim() || null,
+          reason: error.reason?.trim() || null,
+        })),
+      };
+    }
+
+    return {
       timeMin: params.timeMin,
       timeMax: params.timeMax,
-      maxResults: params.limit ?? 25,
-      singleEvents: true,
-      orderBy: "startTime",
-      timeZone: params.timeZone,
-    });
-
-    return (response.data.items ?? []).map((event) => mapEvent(event, calendarId, params.timeZone));
+      calendars,
+    };
   }
 
   async getEvent(
@@ -93,6 +327,7 @@ export class GoogleCalendarClient {
     const response = await calendar.events.insert({
       calendarId,
       conferenceDataVersion: params.createMeetLink ? 1 : undefined,
+      sendUpdates: params.sendUpdates ?? "none",
       requestBody: {
         summary: params.title,
         description: params.description,
@@ -166,15 +401,14 @@ export class GoogleCalendarClient {
     const response = await calendar.events.patch({
       calendarId,
       eventId: params.eventId,
+      sendUpdates: params.sendUpdates ?? "none",
       requestBody,
     });
 
     return mapEvent(response.data, calendarId, effectiveTimeZone);
   }
 
-  async deleteEvent(
-    params: GoogleAccountRef & { calendarId?: string; eventId: string }
-  ): Promise<void> {
+  async deleteEvent(params: GoogleCalendarEventDeleteInput): Promise<void> {
     const calendar = await this.clientFactory.calendar(
       params,
       ["calendar.write"],
@@ -184,8 +418,10 @@ export class GoogleCalendarClient {
       await calendar.events.delete({
         calendarId: params.calendarId ?? "primary",
         eventId: params.eventId,
+        sendUpdates: params.sendUpdates ?? "none",
       });
     } catch (error) {
+      // error-policy:J1 DELETE is idempotent at this boundary; 410 proves the target is absent.
       if (googleErrorStatus(error) === 410) {
         return;
       }
@@ -211,6 +447,8 @@ function mapCalendarListEntry(
     foregroundColor: entry.foregroundColor?.trim() || null,
     timeZone: entry.timeZone?.trim() || null,
     selected: entry.selected !== false,
+    ...(entry.deleted ? { deleted: true } : {}),
+    ...(entry.hidden ? { hidden: true } : {}),
   };
 }
 
@@ -219,10 +457,18 @@ function mapEvent(
   calendarId: string,
   fallbackTimeZone?: string
 ): GoogleCalendarEvent {
+  const eventId = event.id?.trim();
+  if (!eventId) {
+    throw new ElizaError("Google Calendar returned an event without an id.", {
+      code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+      context: { calendarId },
+      severity: "fatal",
+    });
+  }
   const start = readEventInstant(event.start, fallbackTimeZone);
   const end = readEventInstant(event.end, start?.timeZone ?? fallbackTimeZone);
   return {
-    id: event.id ?? "",
+    id: eventId,
     calendarId,
     title: event.summary ?? undefined,
     status: event.status ?? undefined,
@@ -232,19 +478,12 @@ function mapEvent(
     timeZone: start?.timeZone ?? end?.timeZone ?? null,
     htmlLink: event.htmlLink ?? undefined,
     meetLink: readConferenceLink(event),
-    attendees: event.attendees?.map((attendee) => ({
-      email: attendee.email ?? "",
-      name: attendee.displayName ?? undefined,
-    })),
+    attendees: event.attendees?.map(mapCalendarAttendee),
     location: event.location ?? undefined,
     description: event.description ?? undefined,
-    organizer: event.organizer
-      ? {
-          email: event.organizer.email ?? "",
-          name: event.organizer.displayName ?? undefined,
-          self: Boolean(event.organizer.self),
-        }
-      : undefined,
+    organizer: event.organizer ? mapCalendarOrganizer(event.organizer, calendarId) : undefined,
+    transparency: readTransparency(event.transparency),
+    visibility: readVisibility(event.visibility),
     recurrence: event.recurrence ?? null,
     recurringEventId: event.recurringEventId ?? null,
     metadata: {
@@ -255,6 +494,158 @@ function mapEvent(
       updatedAt: event.updated ?? null,
     },
   };
+}
+
+function mapCalendarOrganizer(
+  organizer: NonNullable<calendar_v3.Schema$Event["organizer"]>,
+  calendarId: string
+): NonNullable<GoogleCalendarEvent["organizer"]> {
+  const email = organizer.email?.trim();
+  if (!email) {
+    throw new ElizaError("Google Calendar returned an organizer without an email address.", {
+      code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+      context: { calendarId },
+      severity: "fatal",
+    });
+  }
+  return {
+    email,
+    name: organizer.displayName?.trim() || undefined,
+    self: Boolean(organizer.self),
+  };
+}
+
+function mapCalendarAttendee(attendee: calendar_v3.Schema$EventAttendee): GoogleCalendarAttendee {
+  const email = attendee.email?.trim();
+  if (!email) {
+    throw new ElizaError("Google Calendar returned an attendee without an email address.", {
+      code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+      severity: "fatal",
+    });
+  }
+  return {
+    email,
+    name: attendee.displayName?.trim() || undefined,
+    responseStatus: readAttendeeResponseStatus(attendee.responseStatus),
+    self: Boolean(attendee.self),
+    organizer: Boolean(attendee.organizer),
+    optional: Boolean(attendee.optional),
+  };
+}
+
+function readAttendeeResponseStatus(
+  value: string | null | undefined
+): GoogleCalendarAttendeeResponseStatus | null {
+  switch (value) {
+    case "needsAction":
+    case "declined":
+    case "tentative":
+    case "accepted":
+      return value;
+    case undefined:
+    case null:
+    case "":
+      return null;
+    default:
+      throw new ElizaError("Google Calendar returned an unknown attendee response status.", {
+        code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+        context: { responseStatus: value },
+        severity: "fatal",
+      });
+  }
+}
+
+function readTransparency(value: string | null | undefined): GoogleCalendarTransparency {
+  if (!value || value === "opaque") {
+    return "opaque";
+  }
+  if (value === "transparent") {
+    return value;
+  }
+  throw new ElizaError("Google Calendar returned an unknown event transparency.", {
+    code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+    context: { transparency: value },
+    severity: "fatal",
+  });
+}
+
+function readVisibility(value: string | null | undefined): GoogleCalendarVisibility {
+  if (!value || value === "default") {
+    return "default";
+  }
+  switch (value) {
+    case "public":
+    case "private":
+    case "confidential":
+      return value;
+    default:
+      throw new ElizaError("Google Calendar returned an unknown event visibility.", {
+        code: "GOOGLE_CALENDAR_INVALID_EVENT_RESPONSE",
+        context: { visibility: value },
+        severity: "fatal",
+      });
+  }
+}
+
+function mapBusyInterval(
+  interval: calendar_v3.Schema$TimePeriod,
+  accountId: string,
+  calendarId: string
+): GoogleCalendarBusyInterval {
+  const startMs = interval.start ? Date.parse(interval.start) : Number.NaN;
+  const endMs = interval.end ? Date.parse(interval.end) : Number.NaN;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    throw new ElizaError("Google Calendar returned an invalid free/busy interval.", {
+      code: "GOOGLE_CALENDAR_INVALID_FREE_BUSY_RESPONSE",
+      context: { accountId, calendarId },
+      severity: "fatal",
+    });
+  }
+  return {
+    start: new Date(startMs).toISOString(),
+    end: new Date(endMs).toISOString(),
+  };
+}
+
+function validatePageSize(value: number | undefined, maximum: number, resource: string): void {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > maximum)) {
+    throw invalidCalendarRequest(
+      `Google Calendar ${resource} maxResults must be an integer from 1 to ${maximum}.`,
+      { maxResults: value }
+    );
+  }
+}
+
+function invalidCalendarRequest(message: string, context: Record<string, unknown>): ElizaError {
+  return new ElizaError(message, {
+    code: "GOOGLE_CALENDAR_INVALID_REQUEST",
+    context,
+    severity: "fatal",
+  });
+}
+
+function normalizedToken(value: string | null | undefined): string | null {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
+function nextPageToken(
+  value: string | null,
+  seen: Set<string>,
+  resource: string
+): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (seen.has(value)) {
+    throw new ElizaError(`Google Calendar repeated a ${resource} page token.`, {
+      code: "GOOGLE_CALENDAR_PAGINATION_LOOP",
+      context: { resource },
+      severity: "fatal",
+    });
+  }
+  seen.add(value);
+  return value;
 }
 
 /**
@@ -340,18 +731,36 @@ function toEventDateTime(
   return { dateTime: value, timeZone };
 }
 
-function toCalendarAttendee(address: GoogleEmailAddress): calendar_v3.Schema$EventAttendee {
+function toCalendarAttendee(
+  address: GoogleCalendarAttendeeInput
+): calendar_v3.Schema$EventAttendee {
   return {
     email: address.email,
     displayName: address.name,
+    responseStatus: address.responseStatus,
+    optional: address.optional,
   };
 }
 
 function googleErrorStatus(error: unknown): number | undefined {
-  const candidate = error as {
-    code?: number;
-    status?: number;
-    response?: { status?: number };
-  };
-  return candidate.response?.status ?? candidate.status ?? candidate.code;
+  if (!isRecord(error)) {
+    return undefined;
+  }
+  const response = isRecord(error.response) ? error.response : undefined;
+  return numericValue(response?.status) ?? numericValue(error.status) ?? numericValue(error.code);
+}
+
+function numericValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

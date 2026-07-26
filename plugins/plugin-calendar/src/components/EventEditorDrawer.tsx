@@ -493,6 +493,11 @@ export function EventEditorDrawer({
             : "google",
         side: form.side,
         grantId: form.grantId,
+        connectorAccountId:
+          form.grantId ||
+          (form.grantId === APPLE_CALENDAR_GRANT_ID
+            ? APPLE_CALENDAR_GRANT_ID
+            : "google-unresolved"),
         accountEmail: null,
         calendarId: form.calendarId || "primary",
         summary:

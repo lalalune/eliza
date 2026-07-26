@@ -48,7 +48,14 @@ export const calendarEvents = calendarPgSchema.table(
     updatedAt: text("updated_at").notNull(),
   },
   (t) => [
-    unique().on(t.agentId, t.provider, t.side, t.calendarId, t.externalEventId),
+    unique("calendar_events_source_external_unique").on(
+      t.agentId,
+      t.provider,
+      t.side,
+      t.grantId,
+      t.calendarId,
+      t.externalEventId,
+    ),
   ],
 );
 
@@ -68,10 +75,19 @@ export const calendarSyncStates = calendarPgSchema.table(
     purgeResyncReason: text("purge_resync_reason"),
     windowStartAt: text("window_start_at").notNull(),
     windowEndAt: text("window_end_at").notNull(),
+    nextSyncToken: text("next_sync_token"),
     syncedAt: text("synced_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
-  (t) => [unique().on(t.agentId, t.provider, t.side, t.calendarId)],
+  (t) => [
+    unique("calendar_sync_states_source_unique").on(
+      t.agentId,
+      t.provider,
+      t.side,
+      t.grantId,
+      t.calendarId,
+    ),
+  ],
 );
 
 export const calendarSchema = {

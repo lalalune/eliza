@@ -131,6 +131,7 @@ const CREATE_SYNC_TABLE = `CREATE TABLE app_calendar.life_calendar_sync_states (
   purge_resync_reason TEXT,
   window_start_at TEXT NOT NULL,
   window_end_at TEXT NOT NULL,
+  next_sync_token TEXT,
   synced_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (agent_id, provider, side, calendar_id)

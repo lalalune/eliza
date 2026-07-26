@@ -1,9 +1,10 @@
 /**
  * Plugin definition for `@elizaos/plugin-calendar`: registers `CalendarService`,
- * the non-destructive `CalendarMigrationService`, the `app_calendar` schema, and
- * the `/api/calendar/*` HTTP routes. Requires `@elizaos/plugin-sql` loaded first.
+ * the deterministic conflict action, the non-destructive migration service,
+ * the `app_calendar` schema, and calendar HTTP routes.
  */
 import type { Plugin } from "@elizaos/core";
+import { conflictDetectAction } from "./actions/conflict-detect.js";
 import { calendarHttpRoutes } from "./routes/plugin-routes.js";
 import { CalendarService } from "./service/CalendarService.js";
 import { CalendarMigrationService } from "./service/migration.js";
@@ -24,10 +25,9 @@ export const calendarPlugin: Plugin = {
     "Calendar feed and event management (Google + Apple) for Eliza agents.",
   schema: calendarSchema,
   services: [CalendarService, CalendarMigrationService],
-  // Host-adapted action factories live in ./actions. The standalone plugin
-  // should not register scaffold action handlers; PA registers the owner-gated
-  // CALENDAR / CONFLICT_DETECT actions after injecting its LifeOps adapters.
-  actions: [],
+  // CALENDAR still needs host model/reply adapters. Conflict evaluation is
+  // calendar-owned and deterministic, so the standalone plugin can expose it.
+  actions: [conflictDetectAction],
   providers: [],
   routes: calendarHttpRoutes,
   views: [

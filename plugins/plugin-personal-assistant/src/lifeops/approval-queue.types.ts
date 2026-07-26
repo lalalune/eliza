@@ -1,6 +1,43 @@
 /** Types for the owner-approval queue: request states, action kinds, and payload shapes. */
 import type { TravelBookingPayloadFields } from "./travel-booking.types.js";
 
+export const SCHEDULING_APPROVAL_MESSAGE_KINDS = [
+  "opening",
+  "proposal",
+  "confirmation",
+  "cancellation",
+] as const;
+export type SchedulingApprovalMessageKind =
+  (typeof SCHEDULING_APPROVAL_MESSAGE_KINDS)[number];
+
+export const SCHEDULING_APPROVAL_TRANSPORT_CHANNELS = [
+  "email",
+  "telegram",
+  "discord",
+  "signal",
+  "whatsapp",
+  "imessage",
+  "sms",
+] as const;
+export type SchedulingApprovalTransportChannel =
+  (typeof SCHEDULING_APPROVAL_TRANSPORT_CHANNELS)[number];
+
+/**
+ * Binds an approval row to one immutable scheduling draft. The hash covers
+ * the transport envelope and exact message bytes, so a later executor can
+ * refuse altered content rather than treating approval as open-ended consent.
+ */
+export interface SchedulingApprovalCorrelation {
+  readonly kind: "scheduling_message";
+  readonly negotiationId: string;
+  readonly proposalId: string | null;
+  readonly messageKind: SchedulingApprovalMessageKind;
+  readonly transportChannel: SchedulingApprovalTransportChannel;
+  readonly sourceUpdatedAt: string;
+  readonly draftVersion: 1;
+  readonly contentSha256: string;
+}
+
 export type ApprovalRequestState =
   | "pending"
   | "approved"
@@ -40,6 +77,7 @@ export type ApprovalPayload =
       recipient: string;
       body: string;
       replyToMessageId: string | null;
+      scheduling?: SchedulingApprovalCorrelation;
     }
   | {
       action: "send_email";
@@ -50,6 +88,7 @@ export type ApprovalPayload =
       body: string;
       threadId: string | null;
       replyToMessageId?: string | null;
+      scheduling?: SchedulingApprovalCorrelation;
     }
   | {
       action: "schedule_event";

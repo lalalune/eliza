@@ -79,6 +79,7 @@ const CREATE_SYNC_TABLE = `CREATE TABLE app_calendar.life_calendar_sync_states (
   purge_resync_reason TEXT,
   window_start_at TEXT NOT NULL,
   window_end_at TEXT NOT NULL,
+  next_sync_token TEXT,
   synced_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (agent_id, provider, side, calendar_id)
@@ -220,11 +221,15 @@ beforeAll(async () => {
     },
     getCache: async () => undefined,
     setCache: async () => undefined,
+    reportError: () => undefined,
     getService: (name: string) =>
       name === "google"
         ? {
-            listEvents: async (args: { accountId: string }) =>
-              GOOGLE_EVENTS_BY_ACCOUNT[args.accountId] ?? [],
+            listEventPage: async (args: { accountId: string }) => ({
+              events: GOOGLE_EVENTS_BY_ACCOUNT[args.accountId] ?? [],
+              nextPageToken: null,
+              nextSyncToken: null,
+            }),
           }
         : null,
   } as unknown as IAgentRuntime;

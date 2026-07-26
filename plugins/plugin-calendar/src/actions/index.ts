@@ -1,4 +1,4 @@
-/** Barrel for the calendar actions: the `CALENDAR` action runner factory, its LLM plan extractor, and the shared plan-instruction constant. */
+/** Barrel for the calendar actions: calendar CRUD/planning plus deterministic conflict detection. */
 export {
   CALENDAR_PLAN_INSTRUCTIONS,
   type CalendarHandlerAction,
@@ -6,6 +6,24 @@ export {
   createCalendarActionRunner,
   extractCalendarPlanWithLlm,
 } from "./calendar-handler.js";
+export {
+  __resetConflictDetectLoaderForTests,
+  type ConflictDetectActionDeps,
+  type ConflictDetectEvent,
+  type ConflictDetectLoadBatch,
+  type ConflictDetectLoader,
+  type ConflictDetectLoadResult,
+  type ConflictDetectLoadSnapshot,
+  type ConflictDetectPair,
+  type ConflictDetectProposal,
+  type ConflictDetectResult,
+  type ConflictRange,
+  type ConflictSeverity,
+  conflictDetectAction,
+  createCalendarFeedConflictLoader,
+  createConflictDetectAction,
+  setConflictDetectLoader,
+} from "./conflict-detect.js";
 export type {
   CalendarActionDeps,
   CalendarJsonModelResult,

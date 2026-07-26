@@ -63,11 +63,7 @@ import { MEETING_TRANSCRIPT_FINALIZED_EVENT } from "@elizaos/shared";
 import { blockAction } from "./actions/block.js";
 import { briefAction } from "./actions/brief.js";
 import { calendarAction } from "./actions/calendar.js";
-import {
-  conflictDetectAction,
-  createCalendarFeedConflictLoader,
-  setConflictDetectLoader,
-} from "./actions/conflict-detect.js";
+import { conflictDetectAction } from "./actions/conflict-detect.js";
 import { connectorAction } from "./actions/connector.js";
 import { creativeDraftAction } from "./actions/creative-draft.js";
 import { credentialsAction } from "./actions/credentials.js";
@@ -810,10 +806,6 @@ const rawPersonalAssistantPlugin: Plugin = {
     await ensureLifeOpsGooglePluginRegistered(runtime);
     await ensureLifeOpsCalendarPluginRegistered(runtime);
 
-    // CONFLICT_DETECT scans read the live calendar feed through this loader.
-    // Without it the action has no data source and honestly reports the
-    // calendar as unavailable instead of "No conflicts detected".
-    setConflictDetectLoader(createCalendarFeedConflictLoader());
     await ensureLifeOpsFinancesPluginRegistered(runtime);
     await ensureLifeOpsRemindersPluginRegistered(runtime);
     await ensureLifeOpsGoalsPluginRegistered(runtime);

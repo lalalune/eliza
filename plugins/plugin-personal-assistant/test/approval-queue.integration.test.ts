@@ -14,11 +14,13 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentRuntime } from "@elizaos/core";
+import { KnowledgeGraphService, knowledgeGraphSchema } from "@elizaos/agent";
+import type { AgentRuntime, Plugin } from "@elizaos/core";
 import { AgentEventService, parseInteractionBlocks } from "@elizaos/core";
 import { schedulingPlugin } from "@elizaos/plugin-scheduling";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createRealTestRuntime } from "../../../packages/test/helpers/real-runtime.ts";
+import { runSchedulingNegotiationHandler } from "../src/actions/lib/scheduling-handler.js";
 import { createApprovalQueue } from "../src/lifeops/approval-queue.js";
 import {
   type ApprovalEnqueueInput,
@@ -27,6 +29,12 @@ import {
   ApprovalStateTransitionError,
 } from "../src/lifeops/approval-queue.types.js";
 import { LifeOpsRepository } from "../src/lifeops/repository.js";
+import {
+  attachSchedulingApprovalCorrelation,
+  readSchedulingApprovalCorrelation,
+  verifySchedulingApprovalContent,
+} from "../src/lifeops/scheduling-approval.js";
+import { LifeOpsService } from "../src/lifeops/service.js";
 import { personalAssistantPlugin } from "../src/plugin.js";
 
 let runtime: AgentRuntime;
@@ -44,6 +52,13 @@ const isolatedEnvKeys = [
 ] as const;
 
 const previousEnv = new Map<string, string | undefined>();
+
+const knowledgeGraphPlugin: Plugin = {
+  name: "approval-queue-knowledge-graph",
+  description: "Contact graph required by scheduling draft resolution.",
+  schema: knowledgeGraphSchema,
+  services: [KnowledgeGraphService],
+};
 
 function setIsolatedEnv(): void {
   isolatedStateDir = mkdtempSync(join(tmpdir(), "approval-queue-state-"));
@@ -100,7 +115,7 @@ function messageInput(
 beforeAll(async () => {
   setIsolatedEnv();
   const result = await createRealTestRuntime({
-    plugins: [schedulingPlugin, personalAssistantPlugin],
+    plugins: [knowledgeGraphPlugin, schedulingPlugin, personalAssistantPlugin],
   });
   runtime = result.runtime;
   cleanup = result.cleanup;
@@ -153,6 +168,271 @@ describe("ApprovalQueue integration (real PGlite)", () => {
       limit: 10,
     });
     expect(pendingList.every((r) => r.id !== enqueued.id)).toBe(true);
+  }, 60_000);
+
+  it("round-trips an exact scheduling draft and typed content hash through the real queue", async () => {
+    const payload = attachSchedulingApprovalCorrelation(
+      {
+        action: "send_email",
+        to: ["co-parent@example.com"],
+        cc: [],
+        bcc: [],
+        subject: "Scheduling: school conference",
+        body: "Would Tuesday at 4:00 PM work for the school conference?",
+        threadId: null,
+        replyToMessageId: null,
+      },
+      {
+        kind: "scheduling_message",
+        negotiationId: "negotiation-17",
+        proposalId: "proposal-41",
+        messageKind: "proposal",
+        transportChannel: "email",
+        sourceUpdatedAt: "2026-07-26T18:30:00.000Z",
+        draftVersion: 1,
+      },
+    );
+    const enqueued = await queue.enqueue({
+      requestedBy: "PERSONAL_ASSISTANT",
+      subjectUserId: "owner-scheduling-integrity",
+      action: "send_email",
+      payload,
+      channel: "email",
+      reason: "Review exact scheduling proposal",
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+
+    const fetched = await queue.byId(enqueued.id);
+    if (!fetched) throw new Error("approval row disappeared after enqueue");
+    expect(fetched.payload).toEqual(payload);
+    expect(readSchedulingApprovalCorrelation(fetched.payload)).toMatchObject({
+      negotiationId: "negotiation-17",
+      proposalId: "proposal-41",
+      messageKind: "proposal",
+      transportChannel: "email",
+    });
+    expect(verifySchedulingApprovalContent(fetched.payload)).toMatchObject({
+      matches: true,
+      actualSha256: payload.scheduling.contentSha256,
+    });
+  }, 60_000);
+
+  it("scheduling start/propose/finalize/cancel queue exact drafts without connector delivery", async () => {
+    const service = new LifeOpsService(runtime);
+    const counterparty = await service.upsertRelationship({
+      name: "Taylor",
+      primaryChannel: "email",
+      primaryHandle: "co-parent@example.com",
+      email: "co-parent@example.com",
+      phone: null,
+      notes: "co-parent",
+      tags: ["family"],
+      relationshipType: "co_parent_of",
+      lastContactedAt: null,
+      metadata: {},
+    });
+    const sendEmail = vi.spyOn(LifeOpsService.prototype, "sendGmailMessage");
+    const message = {
+      id: runtime.agentId,
+      entityId: runtime.agentId,
+      roomId: runtime.agentId,
+      content: { text: "Coordinate the school conference with Taylor" },
+    } as never;
+
+    const result = await runSchedulingNegotiationHandler(
+      runtime,
+      message,
+      undefined,
+      {
+        parameters: {
+          subaction: "start",
+          subject: "School conference",
+          relationshipId: counterparty.id,
+          durationMinutes: 30,
+          timezone: "America/Los_Angeles",
+        },
+      } as never,
+      async () => [],
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        approvalState: "pending",
+        deliveryStatus: "awaiting_approval",
+        sent: false,
+        calendarEventCreated: false,
+      },
+    });
+    const data = result.data as {
+      negotiation: { id: string };
+      approvalRequestId: string;
+    };
+    const approval = await queue.byId(data.approvalRequestId);
+    if (!approval) throw new Error("scheduling handler queued no approval");
+    expect(approval.state).toBe("pending");
+    expect(approval.action).toBe("send_email");
+    expect(approval.payload).toMatchObject({
+      action: "send_email",
+      to: ["co-parent@example.com"],
+      subject: "Scheduling: School conference",
+    });
+    expect(readSchedulingApprovalCorrelation(approval.payload)).toMatchObject({
+      negotiationId: data.negotiation.id,
+      proposalId: null,
+      messageKind: "opening",
+      transportChannel: "email",
+    });
+    expect(verifySchedulingApprovalContent(approval.payload)?.matches).toBe(
+      true,
+    );
+
+    const proposed = await runSchedulingNegotiationHandler(
+      runtime,
+      message,
+      undefined,
+      {
+        parameters: {
+          subaction: "propose",
+          negotiationId: data.negotiation.id,
+          startAt: "2026-08-10T23:00:00.000Z",
+          endAt: "2026-08-10T23:30:00.000Z",
+          proposedBy: "owner",
+        },
+      } as never,
+      async () => [],
+    );
+    expect(proposed).toMatchObject({
+      success: true,
+      data: {
+        approvalState: "pending",
+        deliveryStatus: "awaiting_approval",
+        sent: false,
+        calendarEventCreated: false,
+      },
+    });
+    const proposedData = proposed.data as {
+      proposal: { id: string };
+      approvalRequestId: string;
+    };
+    const proposalApproval = await queue.byId(proposedData.approvalRequestId);
+    if (!proposalApproval) {
+      throw new Error("proposal handler queued no approval");
+    }
+    expect(
+      readSchedulingApprovalCorrelation(proposalApproval.payload),
+    ).toMatchObject({
+      negotiationId: data.negotiation.id,
+      proposalId: proposedData.proposal.id,
+      messageKind: "proposal",
+    });
+    expect(
+      verifySchedulingApprovalContent(proposalApproval.payload)?.matches,
+    ).toBe(true);
+
+    const responded = await runSchedulingNegotiationHandler(
+      runtime,
+      message,
+      undefined,
+      {
+        parameters: {
+          subaction: "respond",
+          proposalId: proposedData.proposal.id,
+          response: "accepted",
+        },
+      } as never,
+      async () => [],
+    );
+    expect(responded).toMatchObject({
+      success: true,
+      data: { proposal: { status: "accepted" } },
+    });
+
+    const finalized = await runSchedulingNegotiationHandler(
+      runtime,
+      message,
+      undefined,
+      {
+        parameters: {
+          subaction: "finalize",
+          negotiationId: data.negotiation.id,
+          proposalId: proposedData.proposal.id,
+        },
+      } as never,
+      async () => [],
+    );
+    expect(finalized).toMatchObject({
+      success: true,
+      data: {
+        negotiation: {
+          state: "confirmed",
+          acceptedProposalId: proposedData.proposal.id,
+        },
+        approvalState: "pending",
+        deliveryStatus: "awaiting_approval",
+        sent: false,
+        calendarEventCreated: false,
+      },
+    });
+    const finalizedData = finalized.data as { approvalRequestId: string };
+    const confirmationApproval = await queue.byId(
+      finalizedData.approvalRequestId,
+    );
+    if (!confirmationApproval) {
+      throw new Error("finalize handler queued no approval");
+    }
+    expect(
+      readSchedulingApprovalCorrelation(confirmationApproval.payload),
+    ).toMatchObject({
+      negotiationId: data.negotiation.id,
+      proposalId: proposedData.proposal.id,
+      messageKind: "confirmation",
+    });
+    expect(
+      verifySchedulingApprovalContent(confirmationApproval.payload)?.matches,
+    ).toBe(true);
+
+    const cancelled = await runSchedulingNegotiationHandler(
+      runtime,
+      message,
+      undefined,
+      {
+        parameters: {
+          subaction: "cancel",
+          negotiationId: data.negotiation.id,
+          reason: "Conference moved to a school-managed booking portal",
+        },
+      } as never,
+      async () => [],
+    );
+    expect(cancelled).toMatchObject({
+      success: true,
+      data: {
+        negotiation: { state: "cancelled" },
+        approvalState: "pending",
+        deliveryStatus: "awaiting_approval",
+        sent: false,
+        calendarEventChanged: false,
+      },
+    });
+    const cancelledData = cancelled.data as { approvalRequestId: string };
+    const cancellationApproval = await queue.byId(
+      cancelledData.approvalRequestId,
+    );
+    if (!cancellationApproval) {
+      throw new Error("cancel handler queued no approval");
+    }
+    expect(
+      readSchedulingApprovalCorrelation(cancellationApproval.payload),
+    ).toMatchObject({
+      negotiationId: data.negotiation.id,
+      proposalId: proposedData.proposal.id,
+      messageKind: "cancellation",
+    });
+    expect(
+      verifySchedulingApprovalContent(cancellationApproval.payload)?.matches,
+    ).toBe(true);
+    expect(sendEmail).not.toHaveBeenCalled();
   }, 60_000);
 
   it("enqueue posts the question into chat as an assistant event with approve/reject chips (#14733)", async () => {
