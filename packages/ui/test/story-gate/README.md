@@ -14,7 +14,8 @@ aliases and native/host stubs) — no parallel bundler config to drift.
 |-------|--------|:---:|
 | Story threw on render | Storybook `.sb-show-errordisplay` / `nopreview` | yes |
 | Story `play` interaction did not finish | Storybook preview render phase | yes |
-| Story tagged `play-fn` has no runtime `playFunction` | Storybook story store | yes |
+| Independent `parameters.interactionSurface` classification lacks play or a reasoned exemption | source AST contract | yes |
+| `interaction-required` tag and runtime `playFunction` disagree | Storybook index + story store | yes |
 | Uncaught `pageerror` | Playwright | yes |
 | Blank / one-color render | `sharp` (downscaled distinct-color count) | yes |
 | **New** console error (vs baseline) | Playwright `console` | yes |
@@ -49,6 +50,7 @@ bun run --cwd packages/ui build-storybook --output-dir storybook-static
 # 2. run the gate
 bun run --cwd packages/ui audit:stories                 # full catalog
 node test/story-gate/run-story-gate.mjs --section Primitives   # one section
+node test/story-gate/run-story-gate.mjs --tag interaction-required # play stories
 node test/story-gate/run-story-gate.mjs --shard 1/4            # CI shard
 node test/story-gate/run-story-gate.mjs --grep button --no-a11y
 ```

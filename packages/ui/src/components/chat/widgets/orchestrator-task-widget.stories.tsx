@@ -95,6 +95,8 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Populated: Story = {
+  parameters: { interactionSurface: true },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     openedTasks.length = 0;
     const widget = await waitForTestId(

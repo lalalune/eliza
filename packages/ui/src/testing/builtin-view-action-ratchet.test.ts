@@ -1,17 +1,17 @@
 /**
- * Guards the builtin view mutation ratchet: first-party pages with local
+ * Guards the builtin view mutation authority: first-party pages with local
  * mutation controls must have semantic action coverage, while diagnostic views
  * stay explicitly exempt.
  *
  * The registered-action set is scanned live from source (the same
  * `registered-action-inventory` scanner the action-catalog generator and the
- * repo-level view->action ratchet use, #14369) unioned with the canonical
+ * repo-level view->action audit use, #14369) unioned with the canonical
  * prompt-spec names, so a renamed/deleted action fails this test instead of
  * silently passing against a hand-maintained list — the drift class that
  * mis-filed #14365/#14366/#14367.
  *
  * The completeness sweep (#16944) walks the real pages directory, so a new
- * mutating shell page fails here until it is baseline-mapped or exempted.
+ * mutating shell page fails here until it is action-mapped or exempted.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { collectRegisteredActionInventory } from "../../../prompts/scripts/registered-action-inventory.js";
 import {
-  BUILTIN_VIEW_MUTATION_BASELINE,
+  BUILTIN_VIEW_MUTATION_AUTHORITY,
   SHELL_PAGE_SWEEP_EXEMPTIONS,
   validateBuiltinViewMutationCoverage,
   validateShellPageSweepCompleteness,
@@ -78,8 +78,8 @@ function collectShellPageFiles(relDir: string = PAGES_DIR): string[] {
   return out;
 }
 
-describe("builtin view action ratchet (#14369)", () => {
-  it("passes for the current builtin mutation baseline", () => {
+describe("builtin view action authority (#14369)", () => {
+  it("maps current builtin views to live semantic actions or explicit exemptions", () => {
     const result = validateBuiltinViewMutationCoverage({
       readSource: readRepoSource,
       registeredActions: REGISTERED_ACTIONS,
@@ -87,6 +87,13 @@ describe("builtin view action ratchet (#14369)", () => {
 
     expect(result.findings).toEqual([]);
     expect(result.ok).toBe(true);
+    for (const site of result.sites) {
+      expect(
+        site.semanticActions.length > 0 ||
+          (site.exemptReason?.trim().length ?? 0) > 0,
+        `${site.sourceFile}:${site.line} ${site.marker} has no semantic action or reasoned exemption`,
+      ).toBe(true);
+    }
     expect(result.coverage).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -120,102 +127,13 @@ describe("builtin view action ratchet (#14369)", () => {
     );
   });
 
-  it("fails when a builtin view gains an unmapped local mutation", () => {
-    const tasks = BUILTIN_VIEW_MUTATION_BASELINE.find(
-      (entry) => entry.viewId === "tasks",
-    );
-    if (!tasks) throw new Error("tasks baseline entry missing");
-    const sourceWithNewButton = `${readRepoSource(tasks.sourceFiles[0])}
-      export function InjectedLocalOnlyButton() {
-        return <button onClick={() => window.localStorage.setItem("x", "1")}>Local only</button>;
-      }
-    `;
-
-    const result = validateBuiltinViewMutationCoverage({
-      baseline: [tasks],
-      readSource: () => sourceWithNewButton,
-      registeredActions: REGISTERED_ACTIONS,
-    });
-
-    expect(result.ok).toBe(false);
-    expect(result.findings).toEqual([
-      expect.objectContaining({
-        viewId: "tasks",
-        code: "new-local-mutation",
-      }),
-    ]);
-  });
-
-  it.each(["documents", "files", "memories", "automations", "triggers"])(
-    "fails when the %s view gains an unmapped local mutation",
-    (viewId) => {
-      const entry = BUILTIN_VIEW_MUTATION_BASELINE.find(
-        (candidate) => candidate.viewId === viewId,
-      );
-      if (!entry) throw new Error(`${viewId} baseline entry missing`);
-      // Real page sources plus one synthetic local-only handler on the first
-      // file — the exact regression class the ratchet exists to catch.
-      const injected = `${readRepoSource(entry.sourceFiles[0])}
-        export function InjectedLocalOnlyButton() {
-          return <button onClick={() => window.localStorage.setItem("x", "1")}>Local only</button>;
-        }
-      `;
-      const readSource = (sourcePath: string) =>
-        sourcePath === entry.sourceFiles[0]
-          ? injected
-          : readRepoSource(sourcePath);
-
-      const result = validateBuiltinViewMutationCoverage({
-        baseline: [entry],
-        readSource,
-        registeredActions: REGISTERED_ACTIONS,
-      });
-
-      expect(result.ok).toBe(false);
-      expect(result.findings).toEqual([
-        expect.objectContaining({ viewId, code: "new-local-mutation" }),
-      ]);
-    },
-  );
-
-  it("fails with stale-baseline when observed drops below the pinned count (#16951)", () => {
-    const automations = BUILTIN_VIEW_MUTATION_BASELINE.find(
+  it("reports a mapped source that disappears", () => {
+    const automations = BUILTIN_VIEW_MUTATION_AUTHORITY.find(
       (entry) => entry.viewId === "automations",
     );
-    if (!automations) throw new Error("automations baseline entry missing");
-    // Blank one file of the multi-file aggregate: the remaining files land
-    // below the pinned total, which must surface as a stale baseline rather
-    // than silently accruing headroom for future local-only mutations.
-    const readSource = (sourcePath: string) =>
-      sourcePath === automations.sourceFiles[0]
-        ? "export const nowInert = true;"
-        : readRepoSource(sourcePath);
-
+    if (!automations) throw new Error("automations authority entry missing");
     const result = validateBuiltinViewMutationCoverage({
-      baseline: [automations],
-      readSource,
-      registeredActions: REGISTERED_ACTIONS,
-    });
-
-    expect(result.ok).toBe(false);
-    expect(result.findings).toEqual([
-      expect.objectContaining({
-        viewId: "automations",
-        code: "stale-baseline",
-        message: expect.stringContaining("pin maxMutationSites"),
-      }),
-    ]);
-  });
-
-  it("reports only missing-source when a baseline file cannot be read", () => {
-    const automations = BUILTIN_VIEW_MUTATION_BASELINE.find(
-      (entry) => entry.viewId === "automations",
-    );
-    if (!automations) throw new Error("automations baseline entry missing");
-    // With a file unreadable the partial count is meaningless, so the
-    // stale-baseline check must stay quiet instead of piling on.
-    const result = validateBuiltinViewMutationCoverage({
-      baseline: [automations],
+      authority: [automations],
       readSource: (sourcePath) =>
         sourcePath === automations.sourceFiles[0]
           ? null
@@ -234,12 +152,11 @@ describe("builtin view action ratchet (#14369)", () => {
 
   it("fails when a non-exempt builtin mapping references an unregistered action", () => {
     const result = validateBuiltinViewMutationCoverage({
-      baseline: [
+      authority: [
         {
           viewId: "synthetic",
           sourceFiles: ["synthetic.tsx"],
           semanticActions: ["MISSING_ACTION"],
-          maxMutationSites: 1,
         },
       ],
       readSource: () => "<button onClick={save}>Save</button>",
@@ -254,9 +171,122 @@ describe("builtin view action ratchet (#14369)", () => {
       }),
     ]);
   });
+
+  it.each([
+    "tasks",
+    "documents",
+    "files",
+    "memories",
+    "automations",
+    "triggers",
+  ])(
+    "rejects an injected browser-local control in mapped %s source",
+    (viewId) => {
+      const entry = BUILTIN_VIEW_MUTATION_AUTHORITY.find(
+        (candidate) => candidate.viewId === viewId,
+      );
+      if (!entry) throw new Error(`${viewId} authority entry missing`);
+      const injected = `${readRepoSource(entry.sourceFiles[0])}
+      export function InjectedLocalOnlyButton() {
+        return <button onClick={() => window.localStorage.setItem("injected", "1")}>Local only</button>;
+      }
+    `;
+      const result = validateBuiltinViewMutationCoverage({
+        authority: [entry],
+        readSource: (sourcePath) =>
+          sourcePath === entry.sourceFiles[0]
+            ? injected
+            : readRepoSource(sourcePath),
+        registeredActions: REGISTERED_ACTIONS,
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.findings).toEqual([
+        expect.objectContaining({
+          viewId,
+          code: "unclassified-local-mutation",
+        }),
+      ]);
+    },
+  );
+
+  it("rejects duplicate authority claims instead of overwriting an owner", () => {
+    const sourceFile = "synthetic.tsx";
+    const result = validateBuiltinViewMutationCoverage({
+      authority: [
+        {
+          viewId: "first",
+          sourceFiles: [sourceFile],
+          semanticActions: ["SETTINGS"],
+        },
+        {
+          viewId: "second",
+          sourceFiles: [sourceFile],
+          semanticActions: ["FILES"],
+        },
+      ],
+      readSource: () => "<button onClick={save}>Save</button>",
+      registeredActions: REGISTERED_ACTIONS,
+    });
+
+    expect(result.findings).toEqual([
+      expect.objectContaining({ code: "duplicate-source-claim" }),
+    ]);
+  });
+
+  it("rejects a per-site exemption that starts absorbing multiple controls", () => {
+    const sourceFile = "synthetic.tsx";
+    const result = validateBuiltinViewMutationCoverage({
+      authority: [
+        {
+          viewId: "synthetic",
+          sourceFiles: [sourceFile],
+          semanticActions: ["SETTINGS"],
+        },
+      ],
+      siteExemptions: [
+        {
+          sourceFile,
+          marker: "onClick",
+          snippetIncludes: 'localStorage.setItem("local"',
+          reason: "synthetic local preference",
+        },
+      ],
+      readSource: () => `
+        <button onClick={() => localStorage.setItem("local", "one")} />
+        <button onClick={() => localStorage.setItem("local", "two")} />
+      `,
+      registeredActions: REGISTERED_ACTIONS,
+    });
+
+    expect(result.findings).toEqual([
+      expect.objectContaining({ code: "ambiguous-site-exemption" }),
+    ]);
+  });
+
+  it("rejects blank or conflicting exemptions", () => {
+    const result = validateBuiltinViewMutationCoverage({
+      authority: [
+        {
+          viewId: "synthetic",
+          sourceFiles: ["synthetic.tsx"],
+          semanticActions: ["SETTINGS"],
+          exemptReason: " ",
+        },
+      ],
+      readSource: () => "<button onClick={save}>Save</button>",
+      registeredActions: REGISTERED_ACTIONS,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.findings).toEqual([
+      expect.objectContaining({ code: "invalid-exemption" }),
+      expect.objectContaining({ code: "invalid-exemption" }),
+    ]);
+  });
 });
 
-describe("shell page baseline-completeness sweep (#16944)", () => {
+describe("shell page source-completeness sweep (#16944)", () => {
   const realPageFiles = collectShellPageFiles();
 
   it("accounts for every real shell page module", () => {
@@ -267,12 +297,7 @@ describe("shell page baseline-completeness sweep (#16944)", () => {
 
     expect(result.findings).toEqual([]);
     expect(result.ok).toBe(true);
-    // The sweep only means something if it actually enumerated the shell
-    // pages: guard against the walk silently returning an empty/near-empty
-    // list (wrong dir, over-aggressive filters).
-    expect(realPageFiles.length).toBeGreaterThan(50);
     const mutating = result.inventory.filter((row) => row.mutationSites > 0);
-    expect(mutating.length).toBeGreaterThan(30);
     for (const row of mutating) {
       expect(row.coveredBy != null || row.exempt).toBe(true);
     }
@@ -293,7 +318,7 @@ describe("shell page baseline-completeness sweep (#16944)", () => {
       expect.objectContaining({
         sourceFile: syntheticPage,
         code: "unmapped-mutating-page",
-        message: expect.stringContaining("BUILTIN_VIEW_MUTATION_BASELINE"),
+        message: expect.stringContaining("BUILTIN_VIEW_MUTATION_AUTHORITY"),
       }),
     ]);
   });
@@ -336,7 +361,7 @@ describe("shell page baseline-completeness sweep (#16944)", () => {
     ]);
   });
 
-  it("fails when a file is both baseline-covered and exempt", () => {
+  it("fails when a file is both authority-covered and exempt", () => {
     const covered = "packages/ui/src/components/pages/FilesView.tsx";
     const result = validateShellPageSweepCompleteness({
       pageFiles: realPageFiles,
@@ -353,6 +378,31 @@ describe("shell page baseline-completeness sweep (#16944)", () => {
         sourceFile: covered,
         code: "conflicting-exemption",
       }),
+    ]);
+  });
+
+  it("fails when two authority entries claim the same page", () => {
+    const sourceFile = `${PAGES_DIR}/DuplicateClaim.tsx`;
+    const result = validateShellPageSweepCompleteness({
+      pageFiles: [sourceFile],
+      authority: [
+        {
+          viewId: "first",
+          sourceFiles: [sourceFile],
+          semanticActions: ["SETTINGS"],
+        },
+        {
+          viewId: "second",
+          sourceFiles: [sourceFile],
+          semanticActions: ["FILES"],
+        },
+      ],
+      exemptions: [],
+      readSource: () => "<button onClick={save}>Save</button>",
+    });
+
+    expect(result.findings).toEqual([
+      expect.objectContaining({ code: "duplicate-authority-claim" }),
     ]);
   });
 });

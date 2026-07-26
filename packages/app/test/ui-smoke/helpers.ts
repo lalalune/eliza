@@ -1955,6 +1955,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     },
   );
 
+  // external-api-mock: location-weather -- Provider-shaped location and weather
+  // fixtures stay visible to the validation authority even though they bypass a BFF.
   await page.route(/^https:\/\/ipapi\.co\/json\/?(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
@@ -2462,6 +2464,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: hyperliquid -- These DTO fixtures are checked against
+  // recorded provider responses and live-drift tests in plugin-hyperliquid.
   await page.route("**/api/hyperliquid/status", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -2557,6 +2561,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: polymarket -- These DTO fixtures are checked against
+  // recorded provider responses and live-drift tests in plugin-polymarket.
   await page.route("**/api/polymarket/status", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -2648,6 +2654,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: shopify -- The provider-shaped fixtures remain explicit
+  // while their recorded-response validation blocker is documented.
   await page.route("**/api/shopify/status", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -2761,6 +2769,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: wallet-rpc -- Wallet balance and NFT DTO fixtures model
+  // data aggregated from EVM, Solana, and token providers.
   await page.route("**/api/wallet/config", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -3108,6 +3118,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: google -- OAuth-gated Google connector DTOs require an
+  // explicit exemption until recorded provider fixtures are available.
   await page.route("**/api/connectors/google/accounts", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -4179,6 +4191,8 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  // external-api-mock: coingecko -- The market DTO is checked against a recorded
+  // CoinGecko response and the wallet plugin's live-drift harness.
   await page.route("**/api/wallet/market-overview", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();

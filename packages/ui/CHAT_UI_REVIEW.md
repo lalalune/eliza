@@ -123,7 +123,7 @@ covered. Full path:
   (4 tests), `startup-phase-hydrate.view-interact.test.ts` (WS→DOM).
 - E2E: `packages/app/test/ui-smoke/view-manager-actual-flow.spec.ts` (CRUD +
   switch + open + delete), `packages/app/test/view-interaction-coverage.test.ts`
-  (debt tracker, `MAX_INTERACTION_DEBT = 0`).
+  (source-derived owner/exemption authority).
 
 **Gaps:**
 - No single end-to-end test exercising the real WS→DOM→handler→render chain

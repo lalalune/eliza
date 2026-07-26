@@ -340,6 +340,7 @@ export default scenario({
       kind: "message",
       name: "TODO natural-language route creates a todo with strict JSON",
       text: "Add a todo to cover natural language routing",
+      expectedActions: ["TODO"],
       assertTurn: expectTodoTurn("create", (data) => {
         const todo = isRecord(data.todo) ? data.todo : null;
         if (todo?.content !== "Prove TODO natural language routing") {

@@ -74,6 +74,8 @@ export const SelectedCollapsed: Story = {
       { value: "cancel", label: "Cancel" },
     ],
   },
+  parameters: { interactionSurface: true },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const button = await waitForTestId(canvasElement, "choice-calendar");
     button.click();

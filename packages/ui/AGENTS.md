@@ -174,7 +174,12 @@ given class of bug; reach for the heavier ones when behaviour or pixels matter.
    `needs-runtime` (covered live by `audit:app`), not failed. Build the catalog
    first (`build-storybook --output-dir storybook-static`), then run the gate;
    the dedicated `.github/workflows/ui-story-gate.yml` does both on `packages/ui`
-   changes. Reusable helpers: `determinism-shim.mjs` and `log-capture.mjs`
+   changes. A behavioral story declares
+   `parameters: { interactionSurface: true }` independently from both `play`
+   and `tags: ["interaction-required"]`; the source contract rejects missing,
+   stale, conflicting, and unreasoned-exempt states, while the browser gate
+   proves the tagged play function is prepared and finishes. Reusable helpers:
+   `determinism-shim.mjs` and `log-capture.mjs`
    (durable frontend console/network artifact, wired per story into
    `output/frontend-logs.json`).
 
@@ -260,9 +265,10 @@ This package mostly reads config injected by the host, not raw env vars:
 - **Add a mutating control to a builtin view:** every on-screen mutation in
   `components/pages/`, `components/settings/`, or `components/character/` must
   have a registered agent-action twin ("views display, chat controls" — voice
-  has no DOM to click). The per-view handler baseline in
-  `src/testing/builtin-view-action-ratchet.ts` covers local handler growth per
-  view. Prefer adding or extending the semantic action; the generic
+  has no DOM to click). The source-derived authority map in
+  `src/testing/builtin-view-action-ratchet.ts` requires every mutating page
+  module to map to live semantic actions or a reasoned exemption. Prefer adding
+  or extending the semantic action; the generic
   `useAgentElement` bridge is for third-party plugin views only.
 - **Add a cloud-frontend component:** add under `cloud-ui/components/` and export
   from `cloud-ui/index.ts`; it ships under the `@elizaos/ui/cloud-ui` subpath.
@@ -299,14 +305,13 @@ This package mostly reads config injected by the host, not raw env vars:
   changes do not flash the app accent. Preserve its `motion-reduce` fallback
   when changing the status treatment.
 - **Builtin view mutations need semantic action twins.** First-party shell views
-  are covered by `src/testing/builtin-view-action-ratchet.ts`: every local
-  mutation site in the baseline either maps to a semantic action (`SETTINGS`,
-  `SCHEDULED_TASKS`, `BACKGROUND`, etc.) or is explicitly exempt as a diagnostic
-  view. When adding a button/filter/toggle/form handler to a builtin view, add or
-  reuse the action first, then update the ratchet baseline with the reason. The
-  per-site twin mapping (typed-client writes → action ids) is enforced by the
-  repo-level gate — see "Add a mutating control to a builtin view" in the
-  how-to list above.
+  are covered by `src/testing/builtin-view-action-ratchet.ts`: the live source
+  sweep discovers every mutation site and binds it to registered semantic
+  actions (`SETTINGS`, `SCHEDULED_TASKS`, `BACKGROUND`, etc.) or an explicit
+  reasoned exemption. Browser-local persistence needs a per-site exemption;
+  duplicate source owners and stale/conflicting exemptions fail the same gate.
+  When adding a button/filter/toggle/form handler, add or reuse the action
+  first, then map the source file to that action.
 - Type root `src/types/index.ts` re-exports from `@elizaos/shared/types`; keep
   shared transport/domain types there rather than redefining them here.
 - **Files / attachments.** The "Files" tab (`components/pages/FilesView.tsx`,

@@ -265,14 +265,15 @@ This was extended into broad, **enforced** interaction coverage:
   (`smokeViewDeclarations`) so their bundles load. `documents` is excluded: its
   `/documents` view path collides with the built-in `documents` tab
   (`/character/documents`) via `App.tsx` `findView`, so it stays tracked debt
-  (`MAX_INTERACTION_DEBT = 1`) until that path is disambiguated.
+  with an explicit reason until that path is disambiguated.
 
-**Enforcement:** `view-interaction-coverage.test.ts` now runs with
-`INTERACTION_DEBT = {}` and `MAX_INTERACTION_DEBT = 0` — every view-matrix entry
-must name an interaction-owner spec, so a new view without one fails CI. Combined
-with `route-coverage.test.ts` (every route needs a clicksafe entry) and
-`ui-smoke-coverage.test.ts` (every spec must be wired/classified), the three
-ratchets make page/view coverage a non-regressing invariant.
+**Enforcement:** `view-interaction-coverage.test.ts` derives the shipped view set
+from `plugin-view-cases.ts` and requires an exact, non-overlapping partition
+between interaction-owner evidence and reasoned exemptions. It also rejects
+stale owners/exemptions and missing owner artifacts. Combined with
+`route-coverage.test.ts` (every route needs a clicksafe entry) and
+`ui-smoke-coverage.test.ts` (every spec must be wired/classified), this keeps the
+authority tied to current source rather than a historical count.
 
 ### Control-level gaps with a real keyless blocker (the next layer)
 

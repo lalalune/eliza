@@ -112,6 +112,8 @@ type Story = StoryObj<typeof meta>;
  */
 export const FreshSetup: Story = {
   decorators: [withPlugins(telegram())],
+  parameters: { interactionSurface: true },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const chevron = await waitForTestId(
       canvasElement,
@@ -139,6 +141,8 @@ export const FreshSetup: Story = {
 /** Advanced disclosure open: the optional params are revealed below the fold. */
 export const AdvancedExpanded: Story = {
   decorators: [withPlugins(telegram())],
+  parameters: { interactionSurface: true },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     await waitForTestId(canvasElement, "inline-plugin-config-body");
     const advancedToggle = Array.from(
@@ -168,6 +172,8 @@ export const AdvancedExpanded: Story = {
  */
 export const ConnectedCollapsed: Story = {
   decorators: [withPlugins(telegram({ enabled: true, configured: true }))],
+  parameters: { interactionSurface: true },
+  tags: ["interaction-required"],
   play: async ({ canvasElement }) => {
     const summary = await waitForTestId(
       canvasElement,
