@@ -3,6 +3,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import baseConfig from "../../packages/test/vitest/default.config";
+import {
+  resolveOrchestratorTestDependency,
+  workspacePluginSourcePattern,
+} from "./vitest-dependency-aliases";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -13,13 +17,20 @@ const baseAliases = Array.isArray(baseConfig.resolve?.alias)
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const monorepoRoot = path.resolve(packageRoot, "../..");
 const srcRoot = path.join(packageRoot, "src");
-
 export default defineConfig({
   ...baseConfig,
   root: here,
   resolve: {
     ...baseConfig.resolve,
     alias: [
+      {
+        find: /^@octokit\/core$/,
+        replacement: resolveOrchestratorTestDependency("@octokit/core"),
+      },
+      {
+        find: /^@octokit\/rest$/,
+        replacement: resolveOrchestratorTestDependency("@octokit/rest"),
+      },
       {
         find: /^@elizaos\/agent$/,
         replacement: path.join(srcRoot, "index.ts"),
@@ -146,7 +157,7 @@ export default defineConfig({
     maxWorkers: 1,
     server: {
       deps: {
-        inline: [/@elizaos\//, /\/plugins\/plugin-/],
+        inline: [/@elizaos\//, workspacePluginSourcePattern],
       },
     },
     include: ["src/**/*.test.{ts,tsx}", "test/**/*.test.{ts,tsx}"],

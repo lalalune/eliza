@@ -118,9 +118,9 @@ function collectWorkspacePackageDirs(root: string, maxDepth = 4): string[] {
 
 /**
  * Build the full alias list for a harness consumer. Explicit entries
- * (`@elizaos/core/testing`, `@elizaos/core/node`, `@elizaos/plugin-sql`) are
- * placed first so they win over the generic per-package rules (Vite is
- * first-match).
+ * (`@elizaos/core/testing`, `@elizaos/core/node`, `@elizaos/core/roles`,
+ * `@elizaos/plugin-sql`) are placed first so they win over the generic
+ * per-package rules (Vite is first-match).
  */
 export function buildHarnessSourceAliases(
   repoRoot: string = harnessRepoRoot,
