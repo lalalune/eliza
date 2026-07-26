@@ -22,18 +22,18 @@ import {
   CLAUDE_AGENT_SDK_VERSION,
   ClaudeSdkCompletionRunner,
 } from "./claude-completion.js";
+import { parseGatewayContentContract } from "./content-attestation.js";
 import {
   type CredentialLeaseBroker,
   RotatingCredentialCompletionRunner,
 } from "./credential-rotation.js";
-import { parseGatewayContentContract } from "./content-attestation.js";
+import { ReplayJournal } from "./replay-journal.js";
 import {
   type ClaudeSubscriptionGatewayHandle,
-  type GatewayStorageGuard,
   GatewayStorageError,
+  type GatewayStorageGuard,
   startClaudeSubscriptionGateway,
 } from "./server.js";
-import { ReplayJournal } from "./replay-journal.js";
 import type { GatewayAuditRecord } from "./types.js";
 
 const PRIVATE_FILE_MODE = 0o600;
@@ -249,7 +249,9 @@ export function parseGatewayCliArguments(
   }
   if (
     contentContractFile !== null &&
-    [readyFile, auditFile, replayFile, hmacKeyFile].includes(contentContractFile)
+    [readyFile, auditFile, replayFile, hmacKeyFile].includes(
+      contentContractFile,
+    )
   ) {
     throw new GatewayCliError(
       "invalid_arguments",
@@ -319,7 +321,10 @@ function makeReadinessDocument(
 async function loadContentContract(target: string) {
   try {
     const fileStat = await stat(target);
-    if (!fileStat.isFile() || (Number(fileStat.mode) & 0o777) !== PRIVATE_FILE_MODE) {
+    if (
+      !fileStat.isFile() ||
+      (Number(fileStat.mode) & 0o777) !== PRIVATE_FILE_MODE
+    ) {
       throw new TypeError("content contract must be a private regular file");
     }
     const raw = await readFile(target, "utf8");
@@ -420,7 +425,10 @@ async function loadOrCreateHmacKey(target: string): Promise<Buffer> {
 
 async function loadHmacKey(target: string): Promise<Buffer> {
   const fileStat = await stat(target);
-  if (!fileStat.isFile() || (Number(fileStat.mode) & 0o777) !== PRIVATE_FILE_MODE) {
+  if (
+    !fileStat.isFile() ||
+    (Number(fileStat.mode) & 0o777) !== PRIVATE_FILE_MODE
+  ) {
     throw new GatewayCliError(
       "invalid_hmac_key_file",
       "The gateway HMAC key file must be a private regular file.",
