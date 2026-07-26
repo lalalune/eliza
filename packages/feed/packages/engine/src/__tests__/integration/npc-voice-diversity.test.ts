@@ -1,8 +1,8 @@
 /**
  * Integration test for NPC Voice Diversity
  *
- * Tests deterministic character configuration on every run and distinct live
- * model voices when the live integration lane and a provider key are enabled.
+ * Tests that NPCs generate posts with distinct voices and proper character traits.
+ * Requires GROQ_API_KEY to be set in environment.
  */
 
 import { resolve } from "node:path";
@@ -27,7 +27,9 @@ config({ path: resolve(projectRoot, ".env.test") });
 const hasApiKey = !!(process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY);
 const liveLlmConfig = resolveLiveLlmTestConfig();
 
-describe("NPC Voice Diversity Integration", () => {
+describe.skipIf(!liveLlmConfig.enabled || !hasApiKey)(
+  "NPC Voice Diversity Integration",
+  () => {
     let llmClient: FeedLLMClient;
 
     beforeAll(() => {
@@ -129,7 +131,7 @@ describe("NPC Voice Diversity Integration", () => {
       ).toBe(true);
     });
 
-    it.skipIf(!liveLlmConfig.enabled || !hasApiKey)(
+    it.skipIf(!hasApiKey)(
       "should generate a post for KanyAI with uppercase style",
       async () => {
         const actors = StaticDataRegistry.getAllActors();
@@ -196,7 +198,7 @@ ${templates
       30000,
     );
 
-    it.skipIf(!liveLlmConfig.enabled || !hasApiKey)(
+    it.skipIf(!hasApiKey)(
       "should generate a post for Dairiio with safety focus",
       async () => {
         const actors = StaticDataRegistry.getAllActors();
@@ -262,7 +264,7 @@ ${templates
       30000,
     );
 
-    it.skipIf(!liveLlmConfig.enabled || !hasApiKey)(
+    it.skipIf(!hasApiKey)(
       "should generate distinct posts for different NPCs on same topic",
       async () => {
         const allActors = StaticDataRegistry.getAllActors();
@@ -340,4 +342,5 @@ ${actor.description || ""}
       },
       60000,
     );
-});
+  },
+);

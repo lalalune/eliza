@@ -15,6 +15,14 @@ import { dirname, join } from "node:path";
 
 const root = new URL("../..", import.meta.url).pathname;
 const script = join(root, "scripts/security/coverage-changed-files.sh");
+const nonstandardLiveManifestPath = join(
+  root,
+  "scripts/security/coverage-nonstandard-live-tests.txt",
+);
+const nonstandardLiveEntries = readFileSync(nonstandardLiveManifestPath, "utf8")
+  .split("\n")
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith("#"));
 
 function git(cwd, ...args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -95,16 +103,11 @@ function assertCase(name, fn) {
 assertCase(
   "nonstandard live-test manifest is sorted, unique, and tracked",
   () => {
-    const manifestPath = join(
-      root,
-      "scripts/security/coverage-nonstandard-live-tests.txt",
+    assert.deepEqual(
+      nonstandardLiveEntries,
+      [...new Set(nonstandardLiveEntries)].sort(),
     );
-    const entries = readFileSync(manifestPath, "utf8")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"));
-    assert.deepEqual(entries, [...new Set(entries)].sort());
-    for (const entry of entries) {
+    for (const entry of nonstandardLiveEntries) {
       assert.match(entry, /\.(?:test|spec)\./);
       assert.ok(existsSync(join(root, entry)), `${entry} does not exist`);
       assert.equal(git(root, "ls-files", "--error-unmatch", entry), entry);
@@ -158,13 +161,20 @@ try {
     dir,
     "coverage-nonstandard-live-tests.txt",
     [
+      ...nonstandardLiveEntries,
       "packages/demo/src/calendar.live-llm.test.ts",
       "packages/demo/src/integration.macos.test.ts",
       "packages/demo/src/multilingual-action-routing.integration.test.ts",
       "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+      "packages/demo/src/stale-guard.integration.test.ts",
       "packages/demo/src/voice-kokoro-whisper-live.test.ts",
       "",
     ].join("\n"),
+  );
+  write(
+    dir,
+    "packages/demo/src/stale-guard.integration.test.ts",
+    "import { test } from 'vitest';\ntest.skip('guarded dependency', () => {});\n",
   );
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -179,6 +189,7 @@ try {
   // Feature branch forks from the merge-base and adds its own source + tests.
   git(dir, "checkout", "-q", "-b", "feature", mergeBase);
   rmSync(join(dir, "packages/demo/src/deleted.ts"));
+  rmSync(join(dir, "packages/demo/src/stale-guard.integration.test.ts"));
   write(
     dir,
     "packages/demo/src/runtime-equivalent.ts",
@@ -327,6 +338,37 @@ try {
     "packages/demo/src/voice-kokoro-whisper-live.test.ts",
     "import { test } from 'bun:test';\ntest('live voice', () => {});\n",
   );
+  for (const guardedSuite of nonstandardLiveEntries) {
+    const source = readFileSync(join(root, guardedSuite), "utf8");
+    const runner = /from ['"]vitest['"]|require\(['"]vitest['"]\)/.test(source)
+      ? "vitest"
+      : "bun:test";
+    write(
+      dir,
+      guardedSuite,
+      `import { test } from '${runner}';\ntest.skip('guarded suite', () => {});\n`,
+    );
+  }
+  write(
+    dir,
+    "packages/demo/src/manifest-bypass.test.ts",
+    "import { test } from 'vitest';\ntest('ordinary unit test', () => {});\n",
+  );
+  write(
+    dir,
+    "coverage-nonstandard-live-tests.txt",
+    [
+      ...nonstandardLiveEntries,
+      "packages/demo/src/calendar.live-llm.test.ts",
+      "packages/demo/src/integration.macos.test.ts",
+      "packages/demo/src/manifest-bypass.test.ts",
+      "packages/demo/src/multilingual-action-routing.integration.test.ts",
+      "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
+      "packages/demo/src/stale-guard.integration.test.ts",
+      "packages/demo/src/voice-kokoro-whisper-live.test.ts",
+      "",
+    ].join("\n"),
+  );
   write(
     dir,
     "packages/demo/src/real-live-suites.test.ts",
@@ -447,15 +489,17 @@ try {
   });
 
   assertCase(
-    "manifested nonstandard live suites stay in their dedicated lane",
+    "manifested nonstandard live suites surface as guarded failures",
     () => {
       for (const liveSuite of [
+        ...nonstandardLiveEntries,
         "packages/demo/src/calendar.live-llm.test.ts",
         "packages/demo/src/integration.macos.test.ts",
         "packages/demo/src/multilingual-action-routing.integration.test.ts",
         "packages/demo/src/orchestrator-grilling-live-gemma.test.ts",
         "packages/demo/src/voice-kokoro-whisper-live.test.ts",
       ]) {
+        assert.ok(out.guarded_tests.includes(liveSuite));
         assert.ok(!out.bun_tests.includes(liveSuite));
         assert.ok(!out.vitest_tests.includes(liveSuite));
       }
@@ -471,6 +515,30 @@ try {
       }
     },
   );
+
+  assertCase(
+    "a normal test cannot disappear through the guarded manifest",
+    () => {
+      const bypass = "packages/demo/src/manifest-bypass.test.ts";
+      assert.ok(out.guarded_tests.includes(bypass));
+      assert.ok(!out.bun_tests.includes(bypass));
+      assert.ok(!out.vitest_tests.includes(bypass));
+    },
+  );
+
+  assertCase("guarded manifest additions surface as contract changes", () => {
+    assert.deepEqual(out.guarded_manifest_changes, [
+      "coverage-nonstandard-live-tests.txt",
+    ]);
+  });
+
+  assertCase("a deleted stale guarded entry remains visible", () => {
+    const stale = "packages/demo/src/stale-guard.integration.test.ts";
+    assert.ok(!existsSync(join(dir, stale)));
+    assert.ok(out.guarded_tests.includes(stale));
+    assert.ok(!out.bun_tests.includes(stale));
+    assert.ok(!out.vitest_tests.includes(stale));
+  });
 
   assertCase("cloud Playwright specs stay in their dedicated lane", () => {
     const liveSpec = "packages/test/cloud-e2e/tests/live-deploy.spec.ts";
@@ -595,6 +663,112 @@ try {
         out.files.includes(`packages/demo/src/runtime.${extension}`),
         `${extension} runtime module missing: ${out.files.join(",")}`,
       );
+    }
+  });
+
+  git(dir, "checkout", "-q", "-B", "manifest-removal", mergeBase);
+  const removedManifestEntry =
+    "packages/demo/src/calendar.live-llm.test.ts";
+  write(
+    dir,
+    "coverage-nonstandard-live-tests.txt",
+    `${readFileSync(liveTestManifest, "utf8")
+      .split("\n")
+      .filter((line) => line !== removedManifestEntry)
+      .join("\n")}`,
+  );
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "remove guarded manifest entry");
+  const removalTip = git(dir, "rev-parse", "HEAD");
+  const removalOut = runScript(
+    dir,
+    developTip,
+    removalTip,
+    subprocessManifest,
+    liveTestManifest,
+  );
+
+  assertCase("a removal-only manifest edit surfaces as a contract change", () => {
+    assert.deepEqual(removalOut.guarded_manifest_changes, [
+      "coverage-nonstandard-live-tests.txt",
+    ]);
+    assert.deepEqual(removalOut.guarded_tests, []);
+  });
+
+  git(dir, "checkout", "-q", "-B", "guarded-rename", mergeBase);
+  const guardedOldPath =
+    "packages/demo/src/stale-guard.integration.test.ts";
+  const guardedNewPath = "packages/demo/src/stale-guard.live.test.ts";
+  git(dir, "mv", guardedOldPath, guardedNewPath);
+  write(
+    dir,
+    "coverage-nonstandard-live-tests.txt",
+    `${readFileSync(liveTestManifest, "utf8")
+      .split("\n")
+      .filter((line) => line !== guardedOldPath)
+      .join("\n")}`,
+  );
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "rename guarded suite to canonical live");
+  const renameTip = git(dir, "rev-parse", "HEAD");
+  const renameOut = runScript(
+    dir,
+    developTip,
+    renameTip,
+    subprocessManifest,
+    liveTestManifest,
+  );
+
+  assertCase("a guarded rename preserves the old path and fails closed", () => {
+    assert.deepEqual(renameOut.guarded_manifest_changes, [
+      "coverage-nonstandard-live-tests.txt",
+    ]);
+    assert.ok(renameOut.guarded_tests.includes(guardedOldPath));
+    for (const renamedPath of [guardedOldPath, guardedNewPath]) {
+      assert.ok(!renameOut.bun_tests.includes(renamedPath));
+      assert.ok(!renameOut.vitest_tests.includes(renamedPath));
+    }
+  });
+
+  assertCase("the first manifest commit is the only contract bootstrap", () => {
+    const bootstrapDir = mkdtempSync(
+      join(tmpdir(), "coverage-manifest-bootstrap-"),
+    );
+    try {
+      const bootstrapSubprocessManifest = join(
+        bootstrapDir,
+        "coverage-subprocess-sources.txt",
+      );
+      const bootstrapLiveManifest = join(
+        bootstrapDir,
+        "coverage-nonstandard-live-tests.txt",
+      );
+      git(bootstrapDir, "init", "-q");
+      git(bootstrapDir, "config", "user.email", "test@example.com");
+      git(bootstrapDir, "config", "user.name", "test");
+      write(bootstrapDir, "base.txt", "base\n");
+      write(bootstrapDir, "coverage-subprocess-sources.txt", "");
+      git(bootstrapDir, "add", "-A");
+      git(bootstrapDir, "commit", "-q", "-m", "base without manifest");
+      const bootstrapBase = git(bootstrapDir, "rev-parse", "HEAD");
+      write(
+        bootstrapDir,
+        "coverage-nonstandard-live-tests.txt",
+        "packages/demo/src/legacy.integration.test.ts\n",
+      );
+      git(bootstrapDir, "add", "-A");
+      git(bootstrapDir, "commit", "-q", "-m", "bootstrap manifest");
+      const bootstrapHead = git(bootstrapDir, "rev-parse", "HEAD");
+      const bootstrapOut = runScript(
+        bootstrapDir,
+        bootstrapBase,
+        bootstrapHead,
+        bootstrapSubprocessManifest,
+        bootstrapLiveManifest,
+      );
+      assert.deepEqual(bootstrapOut.guarded_manifest_changes, []);
+    } finally {
+      rmSync(bootstrapDir, { recursive: true, force: true });
     }
   });
 } finally {

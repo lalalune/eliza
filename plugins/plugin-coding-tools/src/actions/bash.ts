@@ -1260,9 +1260,14 @@ export const shellAction: Action = {
     callback?: HandlerCallback,
   ): Promise<ActionResult> => {
     const explicitSubaction = readStringParam(options, "action");
-    const inferredSubaction = inferShellSubactionFromText(
-      message.content?.text ?? "",
-    );
+    const explicitCommand = readStringParam(options, "command");
+    // A structured command is authoritative. Natural-language inference must
+    // not reinterpret path segments such as `clean-shell-worktree` as a
+    // request to read or clear command history.
+    const inferredSubaction =
+      explicitCommand !== undefined
+        ? null
+        : inferShellSubactionFromText(message.content?.text ?? "");
     const subaction = explicitSubaction
       ? normalizeShellSubaction(explicitSubaction)
       : (inferredSubaction ?? "run");
@@ -1480,7 +1485,7 @@ export const shellAction: Action = {
       }
     }
 
-    const rawCommand = readStringParam(options, "command");
+    const rawCommand = explicitCommand;
     if (!rawCommand || rawCommand.trim().length === 0) {
       return failureToActionResult({
         reason: "missing_param",

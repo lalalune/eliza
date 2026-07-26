@@ -520,7 +520,7 @@ describe("changed Vitest coverage grouping", () => {
     ).toEqual(["--max-old-space-size=4096"]);
   });
 
-  test("accepts duplicate file results when at least one assertion passes", () => {
+  test("rejects mixed pass-and-skip results across duplicate file records", () => {
     const root = fixture();
     const testPath = path.join(root, "root.test.ts");
     const resultsPath = writeFixtureFile(
@@ -544,7 +544,7 @@ describe("changed Vitest coverage grouping", () => {
 
     expect(() =>
       validateChangedTestResults(root, [testPath], resultsPath),
-    ).not.toThrow();
+    ).toThrow("did not pass every discovered test (skipped)");
   });
 
   test("serializes only module paths and terminal assertion states", () => {

@@ -125,7 +125,7 @@ const LANES = [
   {
     n: 1,
     pathId: "lifeops.permission-matrix",
-    env: { LIFEOPS_PERMISSION_MATRIX: "1" },
+    env: {},
     command: [
       "bunx",
       "vitest",
@@ -153,7 +153,7 @@ const LANES = [
   {
     n: 4,
     pathId: "lifeops.pa-background-real",
-    env: { ELIZA_LIVE_TEST: "1", LIFEOPS_PERMISSION_MATRIX: "1" },
+    env: { ELIZA_LIVE_TEST: "1" },
     command: [
       "bun",
       "run",

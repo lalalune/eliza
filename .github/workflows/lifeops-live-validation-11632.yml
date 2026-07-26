@@ -91,8 +91,6 @@ jobs:
 
       - name: Run OWNER/AGENT matrix
         if: ${{ inputs.run_keyless_matrix }}
-        env:
-          LIFEOPS_PERMISSION_MATRIX: "1"
         run: |
           set -euo pipefail
           bunx vitest run \

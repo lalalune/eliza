@@ -1,6 +1,7 @@
 # Credentialed or host-dependent tests whose historical names predate the
-# canonical *.live.test.* / *.real.test.* suffixes. The changed-file coverage
-# lane is keyless; these suites run only in their dedicated live lanes.
+# canonical *.live.test.* / *.real.test.* suffixes and lack verified develop-PR
+# owners. A touched entry is emitted as guarded_tests and fails coverage-gate;
+# this list never counts as execution proof.
 packages/agent/test/crash-restart-supervisor.test.ts
 packages/app-core/test/dev-stack/dev-stack-probe.test.ts
 packages/cloud/shared/src/lib/services/__tests__/payout-fork.integration.test.ts

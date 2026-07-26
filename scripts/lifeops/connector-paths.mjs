@@ -11,8 +11,7 @@
  * and never hide.
  *
  * Owner/agent identity follows the two coexisting repo conventions instead of
- * inventing a third: (A) runtime-role families (Google, X, the
- * LIFEOPS_PERMISSION_MATRIX suites) carry roles via OAuth
+ * inventing a third: (A) runtime-role families (Google and X) carry roles via OAuth
  * metadata.requestedRole or separate real accounts with NO dedicated env
  * names — doc of record plugins/plugin-personal-assistant/docs/
  * owner-agent-validation-matrix.md §3; (B) GitHub is the one family with

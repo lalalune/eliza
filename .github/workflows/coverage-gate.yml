@@ -19,6 +19,10 @@ name: coverage-gate
 # gating the run steps on changed *source* let such PRs go vacuously green with
 # the new test never running (#15849); the per-file floor simply has no source
 # to enforce against.
+# Historical guarded tests with noncanonical names are surfaced separately and
+# fail this keyless lane when changed. A path allowlist is not execution proof;
+# those suites must first move to a canonical live/real/e2e name and gain an
+# owning lane.
 #
 # The per-package coverage floors live in the shared base vitest config
 # (packages/test/vitest/default.config.ts, sourced from coverage-policy.mjs) and
@@ -72,6 +76,22 @@ jobs:
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
 
+      - name: Reject changed nonstandard guarded tests
+        if: steps.changed.outputs.guarded_tests != ''
+        run: |
+          echo "Changed nonstandard guarded tests have no execution proof in this keyless lane:"
+          printf '%s\n' "${{ steps.changed.outputs.guarded_tests }}"
+          echo "Rename each suite to a canonical *.live.test.*, *.real.test.*, or *.e2e.test.* path and register its owning lane before changing it."
+          exit 1
+
+      - name: Reject guarded-test manifest contract changes
+        if: steps.changed.outputs.guarded_manifest_changes != ''
+        run: |
+          echo "The guarded-test debt manifest is sealed after its bootstrap commit:"
+          printf '%s\n' "${{ steps.changed.outputs.guarded_manifest_changes }}"
+          echo "Migrate the guarded suite to a canonical suffix and add its verified owning lane before changing this contract."
+          exit 1
+
       - name: Require changed tests for changed source
         if: (steps.changed.outputs.files != '' || steps.changed.outputs.subprocess_files != '') && steps.changed.outputs.bun_tests == '' && steps.changed.outputs.vitest_tests == '' && steps.changed.outputs.node_tests == ''
         run: |
@@ -124,7 +144,12 @@ jobs:
           # changed file gets a fresh process. Their reports are union-merged
           # below so complementary line hits still count within the Bun lane.
           for index in "${!changed_tests[@]}"; do
-            ELIZA_PROCESS_ISOLATED_TEST=1 bun test --conditions=eliza-source "${changed_tests[$index]}" --coverage --coverage-reporter=lcov --coverage-dir="coverage/bun/isolated-$index"
+            report_dir="coverage/bun/isolated-$index"
+            junit_report="$report_dir/junit.xml"
+            mkdir -p "$report_dir"
+            rm -f "$junit_report"
+            ELIZA_PROCESS_ISOLATED_TEST=1 bun test --conditions=eliza-source "${changed_tests[$index]}" --coverage --coverage-reporter=lcov --coverage-dir="$report_dir" --reporter=junit --reporter-outfile="$junit_report"
+            node packages/scripts/validate-bun-test-results.mjs "${changed_tests[$index]}" "$junit_report"
           done
           mapfile -t isolated_lcov_files < <(find coverage/bun -name lcov.info -type f | sort)
           if [ "${#isolated_lcov_files[@]}" -gt 0 ]; then

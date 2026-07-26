@@ -12,9 +12,10 @@
 # `BASE..HEAD` diff would count develop-side files the branch never touched as
 # "changed" whenever the branch trails develop, dragging unrelated tests into the
 # gate (issue #15845). Test files are bucketed into a Bun-native lane and a
-# Vitest lane by which runner they import; e2e/live suites and Android specs are
-# excluded by both filename and directory so a `test/e2e/` path cannot slip into
-# the fast unit lane.
+# Vitest lane by which runner they import. Nonstandard guarded tests are emitted
+# separately so the workflow fails explicitly instead of treating a path
+# allowlist as proof that another lane ran them; canonical e2e/live suites and
+# Android specs remain outside this fast unit lane.
 set -euo pipefail
 
 BASE=$1
@@ -37,13 +38,48 @@ if [ -z "$MERGE_BASE" ]; then
   exit 1
 fi
 
-# Excluded from both unit lanes: e2e/live suites (by filename *and* by a
-# `test/e2e/` directory segment) and Android specs. These run in dedicated lanes
-# and pull in heavy harnesses that the changed-file coverage gate must not.
-is_excluded_test() {
-  if grep -Fxq "$1" "$NONSTANDARD_LIVE_TEST_MANIFEST"; then
+REPO_ROOT=$(git rev-parse --show-toplevel)
+NONSTANDARD_LIVE_TEST_REPO_PATH=$(
+  git -C "$REPO_ROOT" ls-files --full-name -- "$NONSTANDARD_LIVE_TEST_MANIFEST"
+)
+if [ -z "$NONSTANDARD_LIVE_TEST_REPO_PATH" ]; then
+  echo "coverage-changed-files: nonstandard live-test manifest must be tracked inside the repository" >&2
+  exit 1
+fi
+if ! git cat-file -e "$HEAD:$NONSTANDARD_LIVE_TEST_REPO_PATH" 2>/dev/null; then
+  echo "coverage-changed-files: nonstandard live-test manifest is absent from HEAD" >&2
+  exit 1
+fi
+
+HEAD_GUARDED_TESTS=$(git show "$HEAD:$NONSTANDARD_LIVE_TEST_REPO_PATH")
+if git cat-file -e "$MERGE_BASE:$NONSTANDARD_LIVE_TEST_REPO_PATH" 2>/dev/null; then
+  BASE_HAS_GUARDED_TEST_MANIFEST=1
+  BASE_GUARDED_TESTS=$(git show "$MERGE_BASE:$NONSTANDARD_LIVE_TEST_REPO_PATH")
+else
+  # The branch that introduces this contract has no predecessor to protect.
+  # Every later edit is sealed and emitted as a failing contract change.
+  BASE_HAS_GUARDED_TEST_MANIFEST=0
+  BASE_GUARDED_TESTS=
+fi
+
+# Historical guarded names cannot silently disappear from the unit lanes. The
+# union of the merge-base and HEAD manifests prevents a same-PR removal or
+# rename from erasing the old guarded path before classification.
+is_guarded_test() {
+  if printf '%s\n' "$HEAD_GUARDED_TESTS" | grep -Fxq -- "$1"; then
     return 0
   fi
+  if [ "$BASE_HAS_GUARDED_TEST_MANIFEST" -eq 1 ] && \
+    printf '%s\n' "$BASE_GUARDED_TESTS" | grep -Fxq -- "$1"; then
+    return 0
+  fi
+  return 1
+}
+
+# Excluded from both unit lanes: canonical e2e/live suites (by filename and by
+# a `test/e2e/` directory segment) and Android specs. These run in dedicated
+# lanes and pull in heavy harnesses that the changed-file coverage gate must not.
+is_excluded_test() {
   case "$1" in
     *.e2e.test.*|*.live.test.*|*.real.test.*|*.real.e2e.test.*|packages/app/test/android/*.android.spec.*) return 0 ;;
     packages/test/cloud-e2e/tests/*.spec.*) return 0 ;;
@@ -78,11 +114,25 @@ changed_subprocess_sources() {
 }
 
 changed_tests() {
-  git diff --name-only "$MERGE_BASE" "$HEAD" -- \
+  git diff --name-status -M -z "$MERGE_BASE" "$HEAD" -- \
     '*.test.ts' '*.test.tsx' '*.test.js' '*.test.jsx' '*.test.mjs' \
     '*.test.cjs' '*.test.mts' '*.test.cts' \
     '*.spec.ts' '*.spec.tsx' '*.spec.js' '*.spec.jsx' '*.spec.mjs' \
-    '*.spec.cjs' '*.spec.mts' '*.spec.cts'
+    '*.spec.cjs' '*.spec.mts' '*.spec.cts' \
+    | while IFS= read -r -d '' status; do
+        case "$status" in
+          R*|C*)
+            IFS= read -r -d '' old_path
+            IFS= read -r -d '' new_path
+            printf '%s\n%s\n' "$old_path" "$new_path"
+            ;;
+          *)
+            IFS= read -r -d '' changed_path
+            printf '%s\n' "$changed_path"
+            ;;
+        esac
+      done \
+    | LC_ALL=C sort -u
 }
 
 changed_node_self_tests() {
@@ -93,6 +143,25 @@ changed_node_self_tests() {
           echo "$file"
         fi
       done
+}
+
+changed_guarded_tests() {
+  changed_tests | while IFS= read -r file; do
+    # Keep deleted/renamed entries visible: a stale manifest entry is still a
+    # guarded-test contract change and must fail rather than vanish behind -f.
+    if is_guarded_test "$file"; then
+      echo "$file"
+    fi
+  done
+}
+
+changed_guarded_manifest() {
+  # Bootstrap is the sole exception: there is no merge-base contract to
+  # preserve when this manifest is first introduced.
+  if [ "$BASE_HAS_GUARDED_TEST_MANIFEST" -eq 1 ] && \
+    ! git diff --quiet "$MERGE_BASE" "$HEAD" -- "$NONSTANDARD_LIVE_TEST_REPO_PATH"; then
+    echo "$NONSTANDARD_LIVE_TEST_REPO_PATH"
+  fi
 }
 
 echo 'files<<EOF'
@@ -107,9 +176,18 @@ echo 'node_tests<<EOF'
 changed_node_self_tests
 echo 'EOF'
 
+echo 'guarded_tests<<EOF'
+changed_guarded_tests
+echo 'EOF'
+
+echo 'guarded_manifest_changes<<EOF'
+changed_guarded_manifest
+echo 'EOF'
+
 echo 'bun_tests<<EOF'
 changed_tests | while IFS= read -r file; do
   [ -f "$file" ] || continue
+  is_guarded_test "$file" && continue
   is_excluded_test "$file" && continue
   if grep -Eq "from ['\"]vitest['\"]|require\\(['\"]vitest['\"]\\)" "$file"; then
     continue
@@ -124,6 +202,7 @@ echo 'EOF'
 echo 'vitest_tests<<EOF'
 changed_tests | while IFS= read -r file; do
   [ -f "$file" ] || continue
+  is_guarded_test "$file" && continue
   is_excluded_test "$file" && continue
   if grep -Eq "from ['\"]@?playwright/test['\"]|require\\(['\"]@?playwright/test['\"]\\)" "$file"; then
     continue
