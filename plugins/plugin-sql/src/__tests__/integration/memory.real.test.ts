@@ -722,6 +722,50 @@ describe("Memory Integration Tests", () => {
       });
       expect(otherTable.length).toBe(0);
     });
+
+    it("does not let another memory type exhaust the KNN candidate pool", async () => {
+      const dimensions = 384;
+      const query = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0));
+      const targetEmbedding = Array.from({ length: dimensions }, (_, index) =>
+        index < 2 ? 1 : 0
+      );
+      const targetId = v4() as UUID;
+
+      await adapter.createMemory(
+        {
+          id: targetId,
+          content: { text: "target" },
+          createdAt: Date.now(),
+          embedding: targetEmbedding,
+          agentId: testAgentId,
+          roomId: testRoomId,
+          entityId: testEntityId,
+        } as Memory,
+        "target-type"
+      );
+
+      for (let index = 0; index < 257; index++) {
+        await adapter.createMemory(
+          {
+            id: v4() as UUID,
+            content: { text: `distractor-${index}` },
+            createdAt: Date.now(),
+            embedding: [...query],
+            agentId: testAgentId,
+            roomId: testRoomId,
+            entityId: testEntityId,
+          } as Memory,
+          "distractor-type"
+        );
+      }
+
+      const results = await adapter.searchMemoriesByEmbedding(query, {
+        tableName: "target-type",
+        count: 1,
+      });
+
+      expect(results.map((memory) => memory.id)).toEqual([targetId]);
+    });
   });
 
   describe("Document and Fragment Operations", () => {
