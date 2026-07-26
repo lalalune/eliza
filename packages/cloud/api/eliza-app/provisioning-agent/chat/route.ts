@@ -1,14 +1,22 @@
 /**
- * POST /api/eliza-app/provisioning-agent/chat
+ * Cache-only provisioning chat transport.
  *
- * Sends a message to the serverless provisioning agent (Cerebras).
- * Auth: eliza-app session Bearer token.
+ * The signed app JWT is verified locally, while cached authorization and
+ * provisioning projections keep database work out of the Cerebras hot path.
  */
 
 import { Hono } from "hono";
 import { z } from "zod";
-import { elizaAppSessionService } from "@/lib/services/eliza-app";
-import { provisioningAgentChat } from "@/lib/services/provisioning-agent-chat";
+import { InsufficientCreditsError } from "@/lib/services/credits";
+import {
+  ElizaAppInferenceRateLimitError,
+  ElizaAppInferenceWarmingError,
+} from "@/lib/services/eliza-app/inference-hot-path";
+import { resolveElizaAppInferenceSession } from "@/lib/services/eliza-app/inference-session-auth";
+import {
+  ProvisioningAgentChatWarmingError,
+  provisioningAgentChat,
+} from "@/lib/services/provisioning-agent-chat";
 import { logger } from "@/lib/utils/logger";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
@@ -20,19 +28,34 @@ const chatSchema = z.object({
 });
 
 app.post("/", async (c) => {
-  const authHeader = c.req.header("Authorization");
-  if (!authHeader) {
+  const auth = await resolveElizaAppInferenceSession(c.req.raw, c.executionCtx);
+  if (auth.kind === "not_app_session") {
     return c.json(
       { error: "Authorization required", code: "UNAUTHORIZED" },
       401,
     );
   }
-
-  const session = await elizaAppSessionService.validateAuthHeader(authHeader);
-  if (!session) {
+  if (auth.kind === "warming") {
     return c.json(
-      { error: "Invalid or expired session", code: "INVALID_SESSION" },
-      401,
+      {
+        error: "Authorization cache is warming. Retry shortly.",
+        code: "AUTH_CACHE_WARMING",
+        retryable: true,
+      },
+      503,
+      { "Retry-After": "1" },
+    );
+  }
+  if (auth.kind === "rejected") {
+    return c.json(
+      {
+        error:
+          auth.status === 403
+            ? "Account access is disabled"
+            : "Invalid or expired session",
+        code: auth.status === 403 ? "ACCESS_DISABLED" : "INVALID_SESSION",
+      },
+      auth.status,
     );
   }
 
@@ -52,12 +75,13 @@ app.post("/", async (c) => {
   }
 
   try {
-    const result = await provisioningAgentChat(
-      session.userId,
-      session.organizationId,
-      parsed.data.message,
-      parsed.data.agentId,
-    );
+    const result = await provisioningAgentChat({
+      identity: auth.identity,
+      userMessage: parsed.data.message,
+      agentId: parsed.data.agentId,
+      requestId: crypto.randomUUID(),
+      executionCtx: c.executionCtx,
+    });
 
     const bridgeUrl = result.bridgeUrl ?? undefined;
 
@@ -71,6 +95,43 @@ app.post("/", async (c) => {
       },
     });
   } catch (err) {
+    if (
+      err instanceof ElizaAppInferenceWarmingError ||
+      err instanceof ProvisioningAgentChatWarmingError
+    ) {
+      return c.json(
+        {
+          success: false,
+          error: "Inference state is warming. Retry shortly.",
+          code: "INFERENCE_CACHE_WARMING",
+          retryable: true,
+        },
+        503,
+        { "Retry-After": "1" },
+      );
+    }
+    if (err instanceof ElizaAppInferenceRateLimitError) {
+      return c.json(
+        {
+          success: false,
+          error: "Rate limit exceeded",
+          code: "RATE_LIMITED",
+          retryable: true,
+        },
+        429,
+        { "Retry-After": String(err.retryAfter) },
+      );
+    }
+    if (err instanceof InsufficientCreditsError) {
+      return c.json(
+        {
+          success: false,
+          error: "Insufficient balance",
+          code: "INSUFFICIENT_CREDITS",
+        },
+        402,
+      );
+    }
     logger.error("[eliza-app provisioning-agent/chat] Error", { error: err });
     return c.json({ success: false, error: "Chat failed" }, 500);
   }

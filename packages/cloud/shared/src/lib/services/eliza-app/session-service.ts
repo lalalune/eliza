@@ -1,8 +1,9 @@
 /**
- * Eliza App Session Service
+ * Stateless signed sessions for Eliza App authentication.
  *
- * JWT-based session management for Eliza App authentication.
- * Sessions are stateless JWTs with user and organization information.
+ * Validation returns the immutable issue and expiry times needed by the
+ * inference authorization boundary; no database lookup is part of JWT
+ * verification.
  */
 
 import { type JWTPayload, jwtVerify, SignJWT } from "jose";
@@ -26,6 +27,8 @@ export interface SessionResult {
 export interface ValidatedSession {
   userId: string;
   organizationId: string;
+  issuedAt: number;
+  expiresAt: number;
   telegramId?: string;
   discordId?: string;
   whatsappId?: string;
@@ -41,7 +44,9 @@ function isElizaAppSessionPayload(value: unknown): value is ElizaAppSessionPaylo
     typeof value === "object" &&
     value !== null &&
     typeof (value as { userId?: unknown }).userId === "string" &&
-    typeof (value as { organizationId?: unknown }).organizationId === "string"
+    typeof (value as { organizationId?: unknown }).organizationId === "string" &&
+    Number.isSafeInteger((value as { iat?: unknown }).iat) &&
+    Number.isSafeInteger((value as { exp?: unknown }).exp)
   );
 }
 
@@ -109,6 +114,8 @@ class ElizaAppSessionService {
       return {
         userId: payload.userId,
         organizationId: payload.organizationId,
+        issuedAt: payload.iat,
+        expiresAt: payload.exp * 1_000,
         telegramId: payload.telegramId,
         discordId: payload.discordId,
         whatsappId: payload.whatsappId,

@@ -1,5 +1,5 @@
 /**
- * Exercises the authoritative Steward refresh-token revocation request.
+ * Exercises Steward's serialized, authenticated user-session revocation.
  *
  * The fixture uses a real Request/Response boundary while isolating the
  * external Steward service and request-signing implementation.
@@ -18,7 +18,7 @@ const signStewardMutatingRequest = mock<
 >(async () => undefined);
 mock.module("@/lib/steward/sign", () => ({ signStewardMutatingRequest }));
 
-const { revokeStewardRefreshToken } = await import(
+const { revokeStewardUserSessions } = await import(
   "./steward-refresh-token-revocation"
 );
 
@@ -32,24 +32,27 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-describe("revokeStewardRefreshToken", () => {
-  test("signs and posts the refresh credential to Steward's revoke boundary", async () => {
+describe("revokeStewardUserSessions", () => {
+  test("signs a bodyless authenticated DELETE to Steward's locked session boundary", async () => {
     const fetchMock = mock(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        expect(String(input)).toBe("https://steward.example.test/auth/revoke");
-        expect(init?.method).toBe("POST");
-        expect(init?.body).toBe(
-          JSON.stringify({ refreshToken: "copied-refresh-token" }),
+        expect(String(input)).toBe(
+          "https://steward.example.test/auth/sessions",
         );
-        expect(new Headers(init?.headers).get("x-steward-tenant")).toBe(
-          "elizacloud",
+        expect(init?.method).toBe("DELETE");
+        expect(init?.body).toBeUndefined();
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toBe(
+          "Bearer current-access-token",
         );
+        expect(headers.get("content-type")).toBeNull();
+        expect(headers.get("x-steward-tenant")).toBe("elizacloud");
         return Response.json({ ok: true });
       },
     );
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    await revokeStewardRefreshToken("copied-refresh-token", {
+    await revokeStewardUserSessions("current-access-token", {
       STEWARD_API_URL: "https://steward.example.test/",
       STEWARD_REQUEST_SIGNING_SECRET: "signing-secret",
       STEWARD_TENANT_ID: "elizacloud",
@@ -58,9 +61,20 @@ describe("revokeStewardRefreshToken", () => {
     expect(signStewardMutatingRequest).toHaveBeenCalledTimes(1);
     expect(signStewardMutatingRequest.mock.calls[0]?.slice(0, 3)).toEqual([
       "signing-secret",
-      "POST",
-      "/auth/revoke",
+      "DELETE",
+      "/auth/sessions",
     ]);
+    expect(
+      new Headers(signStewardMutatingRequest.mock.calls[0]?.[3]).get(
+        "authorization",
+      ),
+    ).toBe("Bearer current-access-token");
+    const signedBody = signStewardMutatingRequest.mock.calls[0]?.[4];
+    expect(signedBody).toBeInstanceOf(Uint8Array);
+    if (!(signedBody instanceof Uint8Array)) {
+      throw new Error("Expected the signed request body to be a Uint8Array");
+    }
+    expect(signedBody.byteLength).toBe(0);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -70,11 +84,11 @@ describe("revokeStewardRefreshToken", () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      revokeStewardRefreshToken("copied-refresh-token", {
+      revokeStewardUserSessions("current-access-token", {
         STEWARD_API_URL: "https://steward.example.test",
       }),
     ).rejects.toMatchObject({
-      code: "STEWARD_REFRESH_REVOCATION_REJECTED",
+      code: "STEWARD_SESSION_REVOCATION_REJECTED",
     });
   });
 
@@ -84,19 +98,44 @@ describe("revokeStewardRefreshToken", () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      revokeStewardRefreshToken("copied-refresh-token", {
+      revokeStewardUserSessions("current-access-token", {
         STEWARD_API_URL: "https://steward.example.test",
       }),
     ).rejects.toMatchObject({
-      code: "STEWARD_REFRESH_REVOCATION_UNCONFIRMED",
+      code: "STEWARD_SESSION_REVOCATION_UNCONFIRMED",
     });
   });
 
+  test.each([
+    ["empty", new Response(null, { status: 200 })],
+    [
+      "malformed",
+      new Response("{not-json", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ],
+    ["ambiguous", Response.json({ success: true })],
+  ])(
+    "rejects an %s 2xx response without explicit ok true",
+    async (_name, response) => {
+      globalThis.fetch = mock(async () => response) as unknown as typeof fetch;
+
+      await expect(
+        revokeStewardUserSessions("current-access-token", {
+          STEWARD_API_URL: "https://steward.example.test",
+        }),
+      ).rejects.toMatchObject({
+        code: "STEWARD_SESSION_REVOCATION_UNCONFIRMED",
+      });
+    },
+  );
+
   test("fails closed when no authoritative upstream is configured", async () => {
     await expect(
-      revokeStewardRefreshToken("copied-refresh-token", {}),
+      revokeStewardUserSessions("current-access-token", {}),
     ).rejects.toMatchObject({
-      code: "STEWARD_REFRESH_REVOCATION_UPSTREAM_MISSING",
+      code: "STEWARD_SESSION_REVOCATION_UPSTREAM_MISSING",
     });
   });
 });

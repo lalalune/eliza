@@ -243,7 +243,7 @@ export class ApiKeysService {
    */
   async validateApiKey(key: string): Promise<ApiKey | null> {
     const hash = crypto.createHash("sha256").update(key).digest("hex");
-    const cacheKey = CacheKeys.apiKey.validation(hash.substring(0, 16));
+    const cacheKey = CacheKeys.apiKey.validation(hash);
 
     const cached = await cache.get<unknown>(cacheKey);
     if (cached) {
@@ -251,7 +251,7 @@ export class ApiKeysService {
         logger.debug("[ApiKeys] Cache hit for negative API key validation");
         return null;
       }
-      if (isCacheableApiKey(cached)) {
+      if (isCacheableApiKey(cached) && cached.key_hash === hash) {
         logger.debug("[ApiKeys] Cache hit for API key validation");
         return cached;
       }
@@ -318,14 +318,16 @@ export class ApiKeysService {
    */
   async invalidateCache(keyHash: string): Promise<void> {
     const shortHash = keyHash.substring(0, 16);
-    const [validationDeleted, inferenceDeleted] = await Promise.all([
-      cache.delConfirmed(CacheKeys.apiKey.validation(shortHash)),
+    const [validationDeleted, legacyValidationDeleted, inferenceDeleted] = await Promise.all([
+      cache.delConfirmed(CacheKeys.apiKey.validation(keyHash)),
+      cache.delConfirmed(CacheKeys.apiKey.legacyValidation(shortHash)),
       invalidateInferenceAuthContextByKeyHash(keyHash),
     ]);
 
-    if (!validationDeleted || !inferenceDeleted) {
+    if (!validationDeleted || !legacyValidationDeleted || !inferenceDeleted) {
       const unconfirmed = [
         validationDeleted ? null : "validation",
+        legacyValidationDeleted ? null : "legacy-validation",
         inferenceDeleted ? null : "inference-auth-context",
       ].filter((entry): entry is string => entry !== null);
       logger.error("[ApiKeys] API key cache invalidation not confirmed", {

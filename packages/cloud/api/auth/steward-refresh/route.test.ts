@@ -1,5 +1,5 @@
 // Exercises cloud API auth steward refresh route.test behavior with deterministic Worker route fixtures.
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 type VerifiedStewardClaims = {
   userId: string;
@@ -33,6 +33,7 @@ const mintStewardTokenFromClaims = mock<
 }));
 const getByStewardIdForWrite = mock(async (_stewardUserId: string) => ({
   id: "cloud-user-1",
+  steward_user_id: "steward-user-1",
   organization_id: "org-1",
   is_active: true,
   inference_session_not_before: 0,
@@ -71,6 +72,7 @@ const ENV = {
   STEWARD_JWT_SECRET: "secret",
   STEWARD_TENANT_ID: "elizacloud",
 };
+const originalFetch = globalThis.fetch;
 
 function post(headers: HeadersInit = {}) {
   return app.fetch(
@@ -88,6 +90,42 @@ function deletedCookieNames(res: Response): string[] {
     .filter((cookie) => /Max-Age=0/i.test(cookie))
     .map((cookie) => cookie.split("=")[0]);
 }
+
+function refreshedUser(inferenceSessionNotBefore = 0) {
+  return {
+    id: "cloud-user-1",
+    steward_user_id: "steward-user-1",
+    organization_id: "org-1",
+    is_active: true,
+    inference_session_not_before: inferenceSessionNotBefore,
+    organization: {
+      id: "org-1",
+      is_active: true,
+    },
+  };
+}
+
+function postCookieRefresh() {
+  return app.fetch(
+    new Request("https://api.elizacloud.ai/", {
+      method: "POST",
+      headers: {
+        host: "api.elizacloud.ai",
+        origin: "https://elizacloud.ai",
+        cookie: "steward-refresh-token=current-refresh-token",
+      },
+    }),
+    {
+      ...ENV,
+      ENVIRONMENT: "production",
+      STEWARD_API_URL: "https://steward.example.test",
+    },
+  );
+}
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
 
 describe("steward-refresh bearer rotation", () => {
   beforeEach(() => {
@@ -108,6 +146,7 @@ describe("steward-refresh bearer rotation", () => {
     });
     getByStewardIdForWrite.mockResolvedValue({
       id: "cloud-user-1",
+      steward_user_id: "steward-user-1",
       organization_id: "org-1",
       is_active: true,
       inference_session_not_before: 0,
@@ -168,6 +207,7 @@ describe("steward-refresh bearer rotation", () => {
     });
     getByStewardIdForWrite.mockResolvedValue({
       id: "cloud-user-1",
+      steward_user_id: "steward-user-1",
       organization_id: "org-1",
       is_active: true,
       inference_session_not_before: issuedAt + 1,
@@ -294,4 +334,127 @@ describe("steward-refresh browser cookie cleanup", () => {
       globalThis.fetch = originalFetch;
     }
   });
+});
+
+describe("steward-refresh browser authorization race", () => {
+  const issuedAt = 1_800_000_000;
+
+  beforeEach(() => {
+    verifyStewardTokenCached.mockClear();
+    getByStewardIdForWrite.mockClear();
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "steward-user-1",
+      email: "user@example.com",
+      tenantId: "elizacloud",
+      expiration: issuedAt + 3600,
+      issuedAt,
+    });
+    getByStewardIdForWrite.mockResolvedValue(refreshedUser());
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        ok: true,
+        token: "rotated-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresAt: issuedAt + 3600,
+        expiresIn: 3600,
+      }),
+    ) as unknown as typeof fetch;
+  });
+
+  test("primary-checks the returned identity before installing rotated cookies", async () => {
+    const response = await postCookieRefresh();
+
+    expect(response.status).toBe(200);
+    expect(getByStewardIdForWrite).toHaveBeenCalledWith("steward-user-1");
+    const cookies = response.headers.getSetCookie().join("\n");
+    expect(cookies).toContain("steward-token=rotated-access-token");
+    expect(cookies).toContain("steward-refresh-token=rotated-refresh-token");
+  });
+
+  test("does not reinstall a session when logout advances not-before during refresh", async () => {
+    let markLookupStarted: (() => void) | undefined;
+    const lookupStarted = new Promise<void>((resolve) => {
+      markLookupStarted = resolve;
+    });
+    let finishLookup:
+      | ((user: ReturnType<typeof refreshedUser>) => void)
+      | undefined;
+    const lookupResult = new Promise<ReturnType<typeof refreshedUser>>(
+      (resolve) => {
+        finishLookup = resolve;
+      },
+    );
+    getByStewardIdForWrite.mockImplementationOnce(async () => {
+      markLookupStarted?.();
+      return await lookupResult;
+    });
+
+    const responsePromise = postCookieRefresh();
+    await lookupStarted;
+    finishLookup?.(refreshedUser(issuedAt + 1));
+    const response = await responsePromise;
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid token",
+      code: "invalid_token",
+    });
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
+  test("fails closed when the primary authorization read is unavailable", async () => {
+    getByStewardIdForWrite.mockRejectedValueOnce(
+      new Error("primary unavailable"),
+    );
+
+    const response = await postCookieRefresh();
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Session authorization unavailable",
+      code: "internal_error",
+    });
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
+  test("rejects a returned identity that does not own the primary user", async () => {
+    getByStewardIdForWrite.mockResolvedValueOnce({
+      ...refreshedUser(),
+      steward_user_id: "different-steward-user",
+    });
+
+    const response = await postCookieRefresh();
+
+    expect(response.status).toBe(401);
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
+
+  test.each([
+    ["empty", () => new Response(null, { status: 200 })],
+    [
+      "malformed",
+      () =>
+        new Response("{not-json", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ],
+    [
+      "missing rotated refresh token",
+      () => Response.json({ ok: true, token: "access-only" }),
+    ],
+  ])(
+    "rejects an %s upstream success response",
+    async (_name, responseFactory) => {
+      globalThis.fetch = mock(async () =>
+        responseFactory(),
+      ) as unknown as typeof fetch;
+
+      const response = await postCookieRefresh();
+
+      expect(response.status).toBe(502);
+      expect(getByStewardIdForWrite).not.toHaveBeenCalled();
+      expect(response.headers.getSetCookie()).toEqual([]);
+    },
+  );
 });

@@ -9,6 +9,13 @@
 import { logger } from "../utils/logger";
 import { charactersService } from "./characters/characters";
 
+export class CharacterPromptCacheWarmingError extends Error {
+  constructor(readonly state: "warming" | "unavailable") {
+    super("Character prompt cache is warming");
+    this.name = "CharacterPromptCacheWarmingError";
+  }
+}
+
 /**
  * Fisher-Yates shuffle algorithm for unbiased random sampling.
  * Returns a new shuffled array without modifying the original.
@@ -39,6 +46,33 @@ export interface CharacterPromptContext {
   allStyle: string[];
 }
 
+function promptContextFromCharacter(
+  character: Awaited<ReturnType<typeof charactersService.getById>>,
+): CharacterPromptContext | null {
+  if (!character) return null;
+
+  const bio = Array.isArray(character.bio)
+    ? character.bio.join(" ")
+    : character.bio || "";
+  const style = character.style || {};
+  const postStyle = Array.isArray(style.post) ? style.post : [];
+  const allStyle = Array.isArray(style.all) ? style.all : [];
+
+  return {
+    name: character.name,
+    bio,
+    adjectives: Array.isArray(character.adjectives)
+      ? character.adjectives
+      : [],
+    topics: Array.isArray(character.topics) ? character.topics : [],
+    postExamples: Array.isArray(character.post_examples)
+      ? character.post_examples
+      : [],
+    postStyle,
+    allStyle,
+  };
+}
+
 /**
  * Get character personality context for social media post generation.
  * Returns null if character not found.
@@ -53,27 +87,10 @@ export async function getCharacterPromptContext(
     return null;
   }
 
-  const bio = Array.isArray(character.bio) ? character.bio.join(" ") : character.bio || "";
-
-  // Every list field below is caller-supplied jsonb stored verbatim (the
-  // character POST/PUT routes don't validate shapes), so any of them can be a
-  // non-array JSON value. buildCharacterSystemPrompt spreads them (`[...arr]`
-  // via getRandomSample and the style merge), which throws on truthy
-  // non-iterables — one malformed character must not 500 the social-automation
-  // routes that post in its voice (#13637 class).
-  const style = character.style || {};
-  const postStyle = Array.isArray(style.post) ? style.post : [];
-  const allStyle = Array.isArray(style.all) ? style.all : [];
-
-  const context = {
-    name: character.name,
-    bio,
-    adjectives: Array.isArray(character.adjectives) ? character.adjectives : [],
-    topics: Array.isArray(character.topics) ? character.topics : [],
-    postExamples: Array.isArray(character.post_examples) ? character.post_examples : [],
-    postStyle,
-    allStyle,
-  };
+  // Every list field is caller-supplied jsonb stored verbatim, so normalize
+  // malformed values before prompt sampling can attempt to spread them.
+  const context = promptContextFromCharacter(character);
+  if (!context) return null;
 
   // Log detailed character context for debugging
   logger.info("[CharacterPromptHelper] Loaded character context", {
@@ -86,6 +103,28 @@ export async function getCharacterPromptContext(
     styleCount: context.postStyle.length + context.allStyle.length,
   });
 
+  return context;
+}
+
+/**
+ * Resolve character prompt material for interactive generation without a
+ * database fallback. A miss retains one authoritative fill under `waitUntil`
+ * and tells the route to return a retryable warming response.
+ */
+export async function getCharacterPromptContextCacheOnly(
+  characterId: string,
+  executionCtx: { waitUntil(promise: Promise<unknown>): void },
+): Promise<CharacterPromptContext> {
+  const resolution = await charactersService.getByIdCacheOnly(characterId, {
+    executionCtx,
+  });
+  if (resolution.kind !== "ready") {
+    throw new CharacterPromptCacheWarmingError(resolution.kind);
+  }
+  const context = promptContextFromCharacter(resolution.character);
+  if (!context) {
+    throw new CharacterPromptCacheWarmingError("warming");
+  }
   return context;
 }
 

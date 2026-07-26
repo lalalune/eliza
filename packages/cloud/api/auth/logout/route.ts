@@ -9,7 +9,7 @@
 
 import { Hono } from "hono";
 import { deleteCookie, getCookie } from "hono/cookie";
-import { revokeStewardRefreshToken } from "@/api/auth/steward-refresh-token-revocation";
+import { revokeStewardUserSessions } from "@/api/auth/steward-refresh-token-revocation";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import { invalidateSessionCaches } from "@/lib/auth";
 import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
@@ -78,6 +78,7 @@ app.post("/", async (c) => {
     );
   }
 
+  const userSessionRevocations = new Map<string, string>();
   for (const token of accessTokens) {
     try {
       const revoked = await revokeInferenceStewardSession(token, {
@@ -90,6 +91,13 @@ app.post("/", async (c) => {
           { success: false, error: "Invalid Steward bearer token" },
           401,
         );
+      }
+      if (revoked) {
+        // One authenticated upstream call per user is sufficient. Prefer the
+        // environment-owned cookie credential when bearer and cookie identify
+        // the same user because that is the family containing the browser's
+        // refresh token.
+        userSessionRevocations.set(revoked.userId, token);
       }
     } catch (error) {
       // error-policy:J1 exact revocation is the logout security boundary. A
@@ -108,13 +116,24 @@ app.post("/", async (c) => {
     }
   }
 
-  if (refreshToken) {
+  if (refreshToken && userSessionRevocations.size === 0) {
+    return c.json(
+      {
+        success: false,
+        error:
+          "Authenticated Steward session required to revoke refresh sessions",
+      },
+      401,
+    );
+  }
+
+  for (const token of userSessionRevocations.values()) {
     try {
-      await revokeStewardRefreshToken(refreshToken, c.env);
+      await revokeStewardUserSessions(token, c.env);
     } catch (error) {
-      // error-policy:J1 a copied refresh token can mint a new access credential,
-      // so local cookie deletion must wait for authoritative upstream revoke.
-      logger.error("[Logout] Steward refresh revocation failed", {
+      // error-policy:J1 Steward serializes this user-wide mutation with refresh
+      // rotation. Cookie deletion must wait for its explicit confirmation.
+      logger.error("[Logout] Steward session-family revocation failed", {
         error: error instanceof Error ? error.message : String(error),
       });
       return c.json(

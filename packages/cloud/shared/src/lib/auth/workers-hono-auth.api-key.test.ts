@@ -80,7 +80,7 @@ mock.module("../utils/logger", () => ({
 }));
 
 const {
-  apiKeyScopeHashPrefix,
+  apiKeyScopeHash,
   getCurrentUser,
   requireAdmin,
   requireCronSecret,
@@ -495,40 +495,40 @@ describe("Workers API-key auth", () => {
   });
 });
 
-describe("apiKeyScopeHashPrefix (shared-agent scope cache key — COLDPATH-FIX-2026-07-21)", () => {
-  test("derives the 16-char sha256 prefix of the X-API-Key credential", async () => {
-    // Same sha256 + 16-char-prefix derivation the api-key validation cache uses,
+describe("apiKeyScopeHash (shared-agent scope cache key — COLDPATH-FIX-2026-07-21)", () => {
+  test("derives the full sha256 of the X-API-Key credential", async () => {
+    // Same full sha256 derivation the api-key validation cache uses,
     // so the scope cache is keyed by the exact same credential identity.
-    const prefix = await apiKeyScopeHashPrefix(
+    const hash = await apiKeyScopeHash(
       contextWithApiKey("eliza_test_key_abcdef0123456789") as never,
     );
-    expect(prefix).toBe("9b98f179eb88406b");
-    expect(prefix).toHaveLength(16);
+    expect(hash).toBe("9b98f179eb88406b2fcfdced9d1a0b5680d4f211798553d7b7fd2a7e9bc55b08");
+    expect(hash).toHaveLength(64);
   });
 
-  test("also keys off an eliza_ bearer token (same credential, same prefix)", async () => {
-    const prefix = await apiKeyScopeHashPrefix(
+  test("also keys off an eliza_ bearer token (same credential, same hash)", async () => {
+    const hash = await apiKeyScopeHash(
       contextWithHeaders({ authorization: "Bearer eliza_test_key_abcdef0123456789" }) as never,
     );
-    expect(prefix).toBe("9b98f179eb88406b");
+    expect(hash).toBe("9b98f179eb88406b2fcfdced9d1a0b5680d4f211798553d7b7fd2a7e9bc55b08");
   });
 
   test("returns null when the request is not API-key authenticated", async () => {
     // Session/JWT/cookie requests scope on the authoritative gate, never a hash
     // of an empty string.
-    expect(await apiKeyScopeHashPrefix(contextWithHeaders({}) as never)).toBeNull();
+    expect(await apiKeyScopeHash(contextWithHeaders({}) as never)).toBeNull();
     expect(
-      await apiKeyScopeHashPrefix(
+      await apiKeyScopeHash(
         contextWithHeaders({ authorization: "Bearer not-an-eliza-key" }) as never,
       ),
     ).toBeNull();
   });
 
   test("distinct keys yield distinct prefixes", async () => {
-    const a = await apiKeyScopeHashPrefix(contextWithApiKey("eliza_key_one") as never);
-    const b = await apiKeyScopeHashPrefix(contextWithApiKey("eliza_key_two") as never);
+    const a = await apiKeyScopeHash(contextWithApiKey("eliza_key_one") as never);
+    const b = await apiKeyScopeHash(contextWithApiKey("eliza_key_two") as never);
     expect(a).not.toBe(b);
-    expect(a).toHaveLength(16);
-    expect(b).toHaveLength(16);
+    expect(a).toHaveLength(64);
+    expect(b).toHaveLength(64);
   });
 });

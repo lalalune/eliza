@@ -73,6 +73,19 @@ export class AnonymousSessionsRepository {
   }
 
   /**
+   * Reads a session token from primary for a restrictive cache transition.
+   * A replica read could miss a newly-created session and skip revocation.
+   */
+  async getSessionTokenForTransition(sessionId: string): Promise<string | null> {
+    const [session] = await dbWrite
+      .select({ sessionToken: anonymousSessions.session_token })
+      .from(anonymousSessions)
+      .where(eq(anonymousSessions.id, sessionId))
+      .limit(1);
+    return session?.sessionToken ?? null;
+  }
+
+  /**
    * Reads the authoritative anonymous identity and quota snapshot from primary.
    * This is used only by off-response-path Durable Object hydration.
    */

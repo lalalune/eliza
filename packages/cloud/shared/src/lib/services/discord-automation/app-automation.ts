@@ -14,8 +14,16 @@ import {
 } from "../../utils/discord-helpers";
 import { logger } from "../../utils/logger";
 import { DISCORD_AUTOMATION_DEFAULTS, getDiscordConfigWithDefaults } from "../automation-constants";
-import { buildCharacterSystemPrompt, getCharacterPromptContext } from "../character-prompt-helper";
+import {
+  buildCharacterSystemPrompt,
+  getCharacterPromptContext,
+  getCharacterPromptContextCacheOnly,
+} from "../character-prompt-helper";
 import { creditsService } from "../credits";
+import {
+  type InteractiveGenerationIdentity,
+  runInteractiveTextGeneration,
+} from "../interactive-generation-admission";
 import { discordAutomationService } from "./index";
 import type { DiscordAutomationConfig, DiscordAutomationStatus, PostResult } from "./types";
 
@@ -172,7 +180,11 @@ class DiscordAppAutomationService {
     };
   }
 
-  async generateAnnouncement(organizationId: string, app: App): Promise<string> {
+  async generateAnnouncement(
+    organizationId: string,
+    app: App,
+    generation?: InteractiveGenerationIdentity,
+  ): Promise<string> {
     // All throwable prep (character-context DB fetch, prompt build) runs BEFORE
     // the deduction: nothing may throw between the charge and the refunding try,
     // or the user is charged for a generation that never ran (#11685).
@@ -181,7 +193,12 @@ class DiscordAppAutomationService {
 
     let characterPrompt = "";
     if (config?.agentCharacterId) {
-      const characterContext = await getCharacterPromptContext(config.agentCharacterId);
+      const characterContext = generation
+        ? await getCharacterPromptContextCacheOnly(
+            config.agentCharacterId,
+            generation.executionCtx,
+          )
+        : await getCharacterPromptContext(config.agentCharacterId);
       if (characterContext) {
         characterPrompt = buildCharacterSystemPrompt(characterContext);
         logger.info("[DiscordAppAutomation] Using character voice", {
@@ -227,21 +244,8 @@ Write in a ${vibeStyle} style. Keep it concise and engaging.
 Use appropriate emojis sparingly (1-2 max). Do not use excessive formatting.
 Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your response - it will be added automatically.`;
 
-    const deduction = await creditsService.deductCredits({
-      organizationId,
-      amount: DISCORD_POST_COST,
-      description: `Discord AI announcement: ${app.name}`,
-      metadata: { appId: app.id, type: "discord_announcement" },
-    });
-
-    if (!deduction.success) {
-      throw new Error(
-        `Insufficient credits for AI generation. Required: $${DISCORD_POST_COST.toFixed(4)}`,
-      );
-    }
-
-    try {
-      const result = await generateText({
+    const dispatch = () =>
+      generateText({
         model: openai("gpt-5-mini"),
         system: systemPrompt,
         prompt:
@@ -249,6 +253,36 @@ Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your re
         maxOutputTokens: 150,
       });
 
+    if (generation) {
+      const result = await runInteractiveTextGeneration(
+        {
+          identity: generation,
+          model: "openai/gpt-5-mini",
+          systemPrompt,
+          userPrompt:
+            "Create a compelling Discord announcement about this app that would engage a community. Focus on what makes it unique and valuable.",
+          maxOutputTokens: 150,
+          description: `Discord AI announcement: ${app.name}`,
+          metadata: { appId: app.id, type: "discord_announcement" },
+        },
+        dispatch,
+      );
+      return truncate(result.text, TRUNCATE_LENGTH);
+    }
+
+    const deduction = await creditsService.deductCredits({
+      organizationId,
+      amount: DISCORD_POST_COST,
+      description: `Discord AI announcement: ${app.name}`,
+      metadata: { appId: app.id, type: "discord_announcement" },
+    });
+    if (!deduction.success) {
+      throw new Error(
+        `Insufficient credits for AI generation. Required: $${DISCORD_POST_COST.toFixed(4)}`,
+      );
+    }
+    try {
+      const result = await dispatch();
       return truncate(result.text, TRUNCATE_LENGTH);
     } catch (error) {
       await creditsService.refundCredits({
@@ -292,6 +326,22 @@ Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your re
     text?: string,
   ): Promise<PostResult> {
     const app = await this.getAppForOrg(organizationId, appId);
+    return await this.postAnnouncementForApp(organizationId, app, text);
+  }
+
+  /**
+   * Post with a caller-supplied cached app. Interactive callers generate first,
+   * then perform connector lookups and defer the stats mutation.
+   */
+  async postAnnouncementForApp(
+    organizationId: string,
+    app: App,
+    text?: string,
+    generation?: InteractiveGenerationIdentity,
+  ): Promise<PostResult> {
+    if (app.organization_id !== organizationId) {
+      throw new Error("App not found");
+    }
     const config = app.discord_automation as DiscordAutomationConfig;
 
     if (!config?.enabled) {
@@ -302,7 +352,12 @@ Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your re
       return { success: false, error: "No channel configured" };
     }
 
-    // Verify channel still exists and is accessible
+    const messageText =
+      text ||
+      (await this.generateAnnouncement(organizationId, app, generation));
+
+    // Connector state is intentionally consulted after generation. A manual
+    // provider request never waits on Postgres to decide whether it may start.
     const channel = await discordChannelsRepository.findByChannelId(
       organizationId,
       config.channelId,
@@ -313,8 +368,6 @@ Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your re
         error: "Channel not found. Please reconfigure.",
       };
     }
-
-    const messageText = text || (await this.generateAnnouncement(organizationId, app));
 
     // Get promotional image if available
     const promotionalImageUrl = this.getPromotionalImage(app);
@@ -346,12 +399,17 @@ Maximum ${MAX_ANNOUNCEMENT_LENGTH} characters. Do not include the URL in your re
         totalMessages: (config.totalMessages || 0) + 1,
       };
 
-      await appsRepository.update(appId, {
+      const updateStats = appsRepository.update(app.id, {
         discord_automation: updatedConfig,
       });
+      if (generation) {
+        generation.executionCtx.waitUntil(updateStats);
+      } else {
+        await updateStats;
+      }
 
       logger.info("[DiscordAppAutomation] Announcement posted", {
-        appId,
+        appId: app.id,
         channelId: config.channelId,
         messageId: result.messageId,
         hasImage: !!promotionalImageUrl,

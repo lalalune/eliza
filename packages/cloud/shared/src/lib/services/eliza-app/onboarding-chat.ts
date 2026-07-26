@@ -6,11 +6,17 @@ import { CEREBRAS_DEFAULT_TEXT_MODEL } from "../../models";
 import { getCloudAwareEnv } from "../../runtime/cloud-bindings";
 import { logger } from "../../utils/logger";
 import { launchManagedElizaAgent } from "../eliza-managed-launch";
+import { ElizaAppProviderCallError, runElizaAppTextInference } from "./inference-hot-path";
+import type {
+  ElizaAppInferenceExecutionContext,
+  ElizaAppInferenceIdentity,
+} from "./inference-session-auth";
 import {
   type ElizaAppProvisioningStatus,
   ensureElizaAppProvisioning,
   getElizaAppProvisioningStatus,
 } from "./provisioning";
+import { resolveElizaAppProvisioningCache } from "./provisioning-cache";
 import { elizaAppUserService } from "./user-service";
 
 export type OnboardingChatRole = "user" | "assistant";
@@ -68,8 +74,22 @@ export interface OnboardingChatResult {
   handoffComplete: boolean;
 }
 
+export interface OnboardingChatHotPathOptions {
+  executionCtx: ElizaAppInferenceExecutionContext;
+  identity?: ElizaAppInferenceIdentity;
+  requestId: string;
+}
+
+export class OnboardingChatWarmingError extends Error {
+  constructor() {
+    super("Eliza App onboarding state is warming");
+    this.name = "OnboardingChatWarmingError";
+  }
+}
+
 const SESSION_TTL_SECONDS = 14 * 24 * 60 * 60;
 const MAX_HISTORY_MESSAGES = 200;
+const MAX_OUTPUT_TOKENS = 500;
 /**
  * Hard byte bound on a stored user message. The public route already caps
  * message length, but gateway services call runOnboardingChat directly with
@@ -441,6 +461,7 @@ async function generateOnboardingReply(args: {
   launchUrl: string | null;
   handoffComplete: boolean;
   preferredNameCaptured: boolean;
+  hotPath?: OnboardingChatHotPathOptions;
 }): Promise<string> {
   // Fallback replies go through the same ASCII/markdown sanitizer as
   // generated ones so the SMS-safety invariant holds on every reply path
@@ -456,13 +477,16 @@ async function generateOnboardingReply(args: {
     return sanitizeReplyText(fallbackReply(args));
   }
 
+  // Anonymous and trusted-connector onboarding remains deterministic until a
+  // strongly authorized app session can own rate, spend, and final dispatch.
+  if (args.hotPath && !args.hotPath.identity) {
+    return sanitizeReplyText(fallbackReply(args));
+  }
+
   const client = getCerebrasClient();
   if (!client) return sanitizeReplyText(fallbackReply(args));
 
-  try {
-    const { text } = await generateText({
-      model: client.chat(CEREBRAS_MODEL),
-      system: `You are the Eliza Cloud onboarding agent. Keep onboarding smooth and conversational.
+  const system = `You are the Eliza Cloud onboarding agent. Keep onboarding smooth and conversational.
 
 Goals:
 - Learn the user's preferred name.
@@ -480,16 +504,41 @@ State:
 - Logged in: ${args.requiresLogin ? "no" : "yes"}
 - Container status: ${args.provisioning.status}
 - Control panel: ${args.controlPanelUrl}
-- Agent launch URL: ${args.launchUrl ?? "not ready"}`,
-      messages: args.session.history.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-    });
+- Agent launch URL: ${args.launchUrl ?? "not ready"}`;
+  const messages = args.session.history.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+  try {
+    const generate = () =>
+      generateText({
+        model: client.chat(CEREBRAS_MODEL),
+        system,
+        messages,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+      });
+    const generated = args.hotPath?.identity
+      ? await runElizaAppTextInference({
+          identity: args.hotPath.identity,
+          model: CEREBRAS_MODEL,
+          requestId: args.hotPath.requestId,
+          promptText: `${system}\n${messages
+            .map((message) => `${message.role}: ${message.content}`)
+            .join("\n")}`,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          description: "Eliza App onboarding chat",
+          executionCtx: args.hotPath.executionCtx,
+          dispatch: generate,
+        })
+      : await generate();
+    const { text } = generated;
     const sanitized = sanitizeReplyText(text);
     if (!sanitized) return fallbackReply(args);
     return args.requiresLogin ? ensureExactLoginUrl(sanitized, args.loginUrl) : sanitized;
   } catch (error) {
+    if (args.hotPath && !(error instanceof ElizaAppProviderCallError)) {
+      throw error;
+    }
     // error-policy:J4 the model is a non-essential enhancement over the always-
     // valid deterministic fallbackReply; an LLM/transport failure degrades to
     // that designed reply instead of failing the onboarding turn.
@@ -600,7 +649,18 @@ function newSession(id: string, input: OnboardingChatInput): OnboardingSession {
   };
 }
 
-export async function runOnboardingChat(input: OnboardingChatInput): Promise<OnboardingChatResult> {
+export async function runOnboardingChat(
+  input: OnboardingChatInput,
+  hotPath?: OnboardingChatHotPathOptions,
+): Promise<OnboardingChatResult> {
+  if (
+    hotPath?.identity &&
+    (!input.authenticatedUser ||
+      hotPath.identity.userId !== input.authenticatedUser.userId ||
+      hotPath.identity.organizationId !== input.authenticatedUser.organizationId)
+  ) {
+    throw new Error("Eliza App onboarding identity does not match the verified session");
+  }
   let sessionId = sanitizeSessionId(input.sessionId, input);
   let session = await loadSession(sessionId);
 
@@ -665,7 +725,23 @@ export async function runOnboardingChat(input: OnboardingChatInput): Promise<Onb
     };
   }
 
-  session = await maybeLinkAuthenticatedPlatformIdentity(session, input);
+  if (hotPath) {
+    hotPath.executionCtx.waitUntil(
+      Promise.resolve()
+        .then(() => maybeLinkAuthenticatedPlatformIdentity(session, input))
+        .then(() => undefined)
+        .catch((error) => {
+          // error-policy:J7 phone linking is an observable control-plane tail;
+          // it never joins the provider request and retries on a later turn.
+          logger.error("[eliza-app onboarding] background phone link failed", {
+            sessionId: redactSessionIdForLog(session.id),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }),
+    );
+  } else {
+    session = await maybeLinkAuthenticatedPlatformIdentity(session, input);
+  }
 
   const userMessage = input.message?.trim().slice(0, MAX_MESSAGE_LENGTH);
   let preferredNameProvidedThisTurn = false;
@@ -698,22 +774,60 @@ export async function runOnboardingChat(input: OnboardingChatInput): Promise<Onb
   };
 
   if (!requiresLogin && session.userId && session.organizationId) {
-    provisioning = preferredNameCaptured
-      ? await ensureElizaAppProvisioning({
-          userId: session.userId,
-          organizationId: session.organizationId,
-        })
-      : await getElizaAppProvisioningStatus(session.organizationId);
+    if (hotPath) {
+      const resolution = await resolveElizaAppProvisioningCache({
+        userId: session.userId,
+        organizationId: session.organizationId,
+        ensure: preferredNameCaptured,
+        executionCtx: hotPath.executionCtx,
+      });
+      if (resolution.kind !== "ready") {
+        if (hotPath.identity) throw new OnboardingChatWarmingError();
+        provisioning = {
+          status: "warming",
+          agentId: null,
+          bridgeUrl: null,
+          sandbox: null,
+        };
+      } else {
+        provisioning = resolution.status;
+      }
+    } else {
+      provisioning = preferredNameCaptured
+        ? await ensureElizaAppProvisioning({
+            userId: session.userId,
+            organizationId: session.organizationId,
+          })
+        : await getElizaAppProvisioningStatus(session.organizationId);
+    }
     session.agentId = provisioning.agentId ?? session.agentId;
   }
 
   let launchUrl = session.launchUrl ?? null;
   let handoffComplete = !!session.handoffCopiedAt;
   if (provisioning.status === "running" && session.agentId && !handoffComplete) {
-    const copied = await copyTranscriptToManagedAgent(session);
-    session = copied.session;
-    launchUrl = copied.launchUrl;
-    handoffComplete = copied.copied;
+    if (hotPath) {
+      const handoffSession = session;
+      hotPath.executionCtx.waitUntil(
+        copyTranscriptToManagedAgent(handoffSession)
+          .then(async (copied) => {
+            if (copied.copied) await saveSession(copied.session);
+          })
+          .catch((error) => {
+            // error-policy:J7 handoff is already represented as incomplete in
+            // the response and retries on the next turn.
+            logger.error("[eliza-app onboarding] background handoff failed", {
+              agentId: handoffSession.agentId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }),
+      );
+    } else {
+      const copied = await copyTranscriptToManagedAgent(session);
+      session = copied.session;
+      launchUrl = copied.launchUrl;
+      handoffComplete = copied.copied;
+    }
   }
 
   const loginUrl = onboardingAppPath(
@@ -729,10 +843,25 @@ export async function runOnboardingChat(input: OnboardingChatInput): Promise<Onb
     launchUrl,
     handoffComplete,
     preferredNameCaptured,
+    hotPath,
   });
 
   session = appendMessage(session, "assistant", reply);
-  await saveSession(session);
+  if (hotPath) {
+    const persistedSession = session;
+    hotPath.executionCtx.waitUntil(
+      saveSession(persistedSession).catch((error) => {
+        // error-policy:J7 the returned transcript is complete; cache failure
+        // stays visible and a later request can start a fresh session.
+        logger.error("[eliza-app onboarding] session persistence failed", {
+          sessionId: redactSessionIdForLog(persistedSession.id),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }),
+    );
+  } else {
+    await saveSession(session);
+  }
 
   return {
     session,

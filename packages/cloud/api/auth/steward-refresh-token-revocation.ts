@@ -1,9 +1,9 @@
 /**
- * Revokes a Steward refresh token at its authoritative upstream boundary.
+ * Revokes every Steward session for an authenticated user.
  *
- * Browser cookie deletion is only local hygiene: logout callers use this
- * helper before clearing an environment-owned refresh cookie so a copied token
- * cannot rotate into a fresh access credential after local inference revocation.
+ * Steward serializes `DELETE /auth/sessions` with refresh rotation under the
+ * same per-user lock. Logout callers use this boundary before clearing browser
+ * credentials so a concurrent rotation cannot leave a usable token family.
  */
 
 import { ElizaError } from "@elizaos/core";
@@ -42,34 +42,54 @@ function resolveStewardBaseUrl(
   return null;
 }
 
-/** Revoke one refresh token before its browser cookie is destroyed. */
-export async function revokeStewardRefreshToken(
-  refreshToken: string,
+function confirmedSuccessPayload(responseText: string): boolean {
+  if (responseText.trim().length === 0) return false;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    return false;
+  }
+  return (
+    payload !== null &&
+    typeof payload === "object" &&
+    (payload as Record<string, unknown>).ok === true
+  );
+}
+
+/**
+ * Revoke all refresh tokens and the access-token epoch for one Steward user.
+ *
+ * The upstream contract is deliberately bodyless. `Authorization` is added
+ * before request signing because Steward includes its hash in the canonical
+ * signature. Success requires the documented `{ ok: true }` response; an
+ * empty or ambiguous 2xx must never authorize local cookie deletion.
+ */
+export async function revokeStewardUserSessions(
+  accessToken: string,
   env: StewardRefreshRevocationEnv,
 ): Promise<void> {
-  if (refreshToken.length === 0) {
-    throw new ElizaError("Steward refresh token is missing", {
-      code: "STEWARD_REFRESH_REVOCATION_TOKEN_MISSING",
+  if (accessToken.trim().length === 0) {
+    throw new ElizaError("Steward access token is missing", {
+      code: "STEWARD_SESSION_REVOCATION_TOKEN_MISSING",
       severity: "fatal",
     });
   }
   const baseUrl = resolveStewardBaseUrl(env);
   if (!baseUrl) {
     throw new ElizaError(
-      "Steward refresh revocation upstream is not configured",
+      "Steward session revocation upstream is not configured",
       {
-        code: "STEWARD_REFRESH_REVOCATION_UPSTREAM_MISSING",
+        code: "STEWARD_SESSION_REVOCATION_UPSTREAM_MISSING",
         severity: "ephemeral",
       },
     );
   }
 
-  const bodyText = JSON.stringify({ refreshToken });
-  const bodyBytes = new TextEncoder().encode(bodyText);
-  const revokeUrl = new URL(`${baseUrl}/auth/revoke`);
+  const revokeUrl = new URL(`${baseUrl}/auth/sessions`);
   const headers = new Headers({
     Accept: "application/json",
-    "Content-Type": "application/json",
+    Authorization: `Bearer ${accessToken}`,
   });
   if (
     typeof env.STEWARD_TENANT_ID === "string" &&
@@ -83,59 +103,42 @@ export async function revokeStewardRefreshToken(
   ) {
     await signStewardMutatingRequest(
       env.STEWARD_REQUEST_SIGNING_SECRET,
-      "POST",
+      "DELETE",
       `${revokeUrl.pathname}${revokeUrl.search}`,
       headers,
-      bodyBytes,
+      new Uint8Array(),
     );
   }
 
   let response: Response;
   try {
     response = await fetch(revokeUrl, {
-      method: "POST",
+      method: "DELETE",
       headers,
-      body: bodyText,
       signal: AbortSignal.timeout(STEWARD_AUTH_UPSTREAM_TIMEOUT_MS),
     });
   } catch (cause) {
     // error-policy:J2 preserve timeout/transport detail for the logout boundary.
-    throw new ElizaError("Steward refresh revocation transport failed", {
-      code: "STEWARD_REFRESH_REVOCATION_UNAVAILABLE",
+    throw new ElizaError("Steward session revocation transport failed", {
+      code: "STEWARD_SESSION_REVOCATION_UNAVAILABLE",
       cause,
       severity: "ephemeral",
     });
   }
   if (!response.ok) {
-    throw new ElizaError("Steward refresh revocation was rejected", {
-      code: "STEWARD_REFRESH_REVOCATION_REJECTED",
+    throw new ElizaError("Steward session revocation was rejected", {
+      code: "STEWARD_SESSION_REVOCATION_REJECTED",
       context: { status: response.status },
       severity: response.status >= 500 ? "ephemeral" : "fatal",
     });
   }
   const responseText = await response.text();
-  if (responseText.length > 0) {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(responseText);
-    } catch (cause) {
-      // error-policy:J3 an ambiguous success body cannot confirm that the
-      // authoritative refresh credential was actually revoked.
-      throw new ElizaError("Steward refresh revocation response is malformed", {
-        code: "STEWARD_REFRESH_REVOCATION_RESPONSE_INVALID",
-        cause,
-        severity: "fatal",
-      });
-    }
-    if (
-      payload !== null &&
-      typeof payload === "object" &&
-      (payload as Record<string, unknown>).ok === false
-    ) {
-      throw new ElizaError("Steward refresh revocation was not confirmed", {
-        code: "STEWARD_REFRESH_REVOCATION_UNCONFIRMED",
-        severity: "fatal",
-      });
-    }
+  if (!confirmedSuccessPayload(responseText)) {
+    // error-policy:J3 a 2xx without explicit confirmation cannot prove the
+    // serialized family revocation completed.
+    throw new ElizaError("Steward session revocation was not confirmed", {
+      code: "STEWARD_SESSION_REVOCATION_UNCONFIRMED",
+      severity: "fatal",
+    });
   }
 }

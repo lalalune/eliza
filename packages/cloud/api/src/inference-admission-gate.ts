@@ -221,7 +221,8 @@ function validAuthorizationState(
   return (
     state.kind === "credential" &&
     (state.credentialKind === "api_key" ||
-      state.credentialKind === "steward_session") &&
+      state.credentialKind === "steward_session" ||
+      state.credentialKind === "app_session") &&
     typeof state.fingerprint === "string" &&
     SHA256_HEX.test(state.fingerprint) &&
     validTrimmedId(state.userId) &&
@@ -237,7 +238,7 @@ function authorizationStateStorageKey(
     | {
         kind: "organization" | "user" | "moderation" | "session" | "credential";
         id: string;
-        credentialKind?: "api_key" | "steward_session";
+        credentialKind?: "api_key" | "steward_session" | "app_session";
       },
 ): string {
   if (state.kind === "organization") {
@@ -954,7 +955,7 @@ export class InferenceAdmissionGate {
           id: proof.userId,
         }),
       ),
-      proof.credential.kind === "steward_session"
+      proof.credential.kind !== "api_key"
         ? this.state.storage.get<unknown>(
             authorizationStateStorageKey({
               kind: "session",
@@ -1034,7 +1035,7 @@ export class InferenceAdmissionGate {
         (credentialAuthorizationState?.state.kind !== "credential" ||
           credentialAuthorizationState.state.credentialKind !== "api_key" ||
           credentialAuthorizationState.state.id !== proof.credential.id)) ||
-      (proof.credential.kind === "steward_session" &&
+      (proof.credential.kind !== "api_key" &&
         (sessionAuthorizationState?.state.kind !== "session" ||
           sessionAuthorizationState.state.id !== proof.userId))
     ) {

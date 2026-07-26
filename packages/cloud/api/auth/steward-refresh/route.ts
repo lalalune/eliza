@@ -190,6 +190,49 @@ interface StewardRefreshErr {
   code?: string;
 }
 
+function isStewardRefreshOk(value: unknown): value is StewardRefreshOk {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.ok !== true ||
+    typeof candidate.token !== "string" ||
+    candidate.token.trim().length === 0 ||
+    typeof candidate.refreshToken !== "string" ||
+    candidate.refreshToken.trim().length === 0
+  ) {
+    return false;
+  }
+  for (const field of ["expiresIn", "expiresAt"] as const) {
+    const optionalNumber = candidate[field];
+    if (
+      optionalNumber !== undefined &&
+      (typeof optionalNumber !== "number" ||
+        !Number.isFinite(optionalNumber) ||
+        optionalNumber < 0)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function stewardRefreshError(
+  value: unknown,
+  fallback: string,
+): StewardRefreshErr {
+  if (value === null || typeof value !== "object") {
+    return { ok: false, error: fallback };
+  }
+  const candidate = value as Record<string, unknown>;
+  return {
+    ok: false,
+    ...(typeof candidate.error === "string"
+      ? { error: candidate.error }
+      : { error: fallback }),
+    ...(typeof candidate.code === "string" ? { code: candidate.code } : {}),
+  };
+}
+
 async function callStewardRefresh(
   baseUrl: string,
   refreshToken: string,
@@ -243,23 +286,18 @@ async function callStewardRefresh(
   }
 
   const text = await response.text();
-  let parsed: StewardRefreshOk | StewardRefreshErr | null = null;
+  let parsed: unknown = null;
   try {
-    parsed = text
-      ? (JSON.parse(text) as StewardRefreshOk | StewardRefreshErr)
-      : null;
+    parsed = text ? JSON.parse(text) : null;
   } catch {
     parsed = null;
   }
 
-  if (!response.ok || !parsed || parsed.ok !== true) {
+  if (!response.ok || !isStewardRefreshOk(parsed)) {
     return {
       kind: "error",
       status: response.status,
-      data: (parsed as StewardRefreshErr) ?? {
-        ok: false,
-        error: text || "Steward refresh failed",
-      },
+      data: stewardRefreshError(parsed, text || "Steward refresh failed"),
     };
   }
   return { kind: "ok", data: parsed };
@@ -434,6 +472,34 @@ app.post("/", async (c) => {
   if (!claims) {
     logRefresh("invalid-token-after-refresh");
     return c.json(errorBody("Invalid token", "invalid_token"), 401);
+  }
+
+  try {
+    const user = await usersService.getByStewardIdForWrite(claims.userId);
+    if (
+      !user ||
+      user.steward_user_id !== claims.userId ||
+      !user.organization_id ||
+      !user.organization ||
+      user.organization.id !== user.organization_id ||
+      !user.is_active ||
+      !user.organization.is_active ||
+      claims.issuedAt < user.inference_session_not_before
+    ) {
+      logRefresh("revoked-token-after-refresh");
+      return c.json(errorBody("Invalid token", "invalid_token"), 401);
+    }
+  } catch (error) {
+    // error-policy:J1 cookie installation is an auth boundary. A primary read
+    // failure must not reinstall credentials while logout may be committing.
+    logRefresh("authorization-unavailable-after-refresh");
+    logger.error("[steward-refresh] refreshed authorization lookup failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return c.json(
+      errorBody("Session authorization unavailable", "internal_error"),
+      503,
+    );
   }
 
   const ttl = claims.expiration

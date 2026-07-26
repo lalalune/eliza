@@ -454,7 +454,9 @@ export async function refreshAnonymousChatModeration(
 
 export async function invalidateAnonymousChatGateByToken(sessionToken: string): Promise<void> {
   const namespace = gateNamespace();
-  if (!namespace) return;
+  if (!namespace) {
+    throw new Error("Anonymous chat gate binding is unavailable");
+  }
   const response = await postGate(gateStub(namespace, sessionToken), "/invalidate", {});
   if (!response.ok) {
     throw new Error(`Anonymous chat gate invalidation failed with status ${response.status}`);

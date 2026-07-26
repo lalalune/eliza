@@ -7,6 +7,7 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import type { ApiKey } from "../../db/repositories";
 import { apiKeysRepository } from "../../db/repositories";
 import { cache } from "../cache/client";
@@ -15,7 +16,8 @@ import { apiKeysService } from "./api-keys";
 
 const KEY_HASH = "a".repeat(64);
 const SHORT_HASH = KEY_HASH.substring(0, 16);
-const VALIDATION_KEY = CacheKeys.apiKey.validation(SHORT_HASH);
+const VALIDATION_KEY = CacheKeys.apiKey.validation(KEY_HASH);
+const LEGACY_VALIDATION_KEY = CacheKeys.apiKey.legacyValidation(SHORT_HASH);
 
 function fakeKey(): ApiKey {
   return {
@@ -44,7 +46,8 @@ describe("apiKeysService.invalidateCache fails closed (#13417)", () => {
     await expect(apiKeysService.invalidateCache(KEY_HASH)).resolves.toBeUndefined();
     // clears both the validation entry and the inference auth-context entry
     expect(del).toHaveBeenCalledWith(VALIDATION_KEY);
-    expect(del.mock.calls.length).toBe(2);
+    expect(del).toHaveBeenCalledWith(LEGACY_VALIDATION_KEY);
+    expect(del.mock.calls.length).toBe(3);
   });
 
   test("validation-cache delete unconfirmed -> throws (revoked key would keep authenticating)", async () => {
@@ -61,7 +64,7 @@ describe("apiKeysService.invalidateCache fails closed (#13417)", () => {
     track(
       spyOn(cache, "delConfirmed").mockImplementation(
         // inference entry (not the validation key) fails
-        async (key: string) => key === VALIDATION_KEY,
+        async (key: string) => key === VALIDATION_KEY || key === LEGACY_VALIDATION_KEY,
       ),
     );
     await expect(apiKeysService.invalidateCache(KEY_HASH)).rejects.toThrow(/not confirmed/i);
@@ -91,5 +94,51 @@ describe("apiKeysService.invalidateCache fails closed (#13417)", () => {
     await expect(
       apiKeysService.invalidateInferenceContextForUser("user-1"),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("apiKeysService.validateApiKey exact credential cache identity", () => {
+  const spies: Array<{ mockRestore: () => void }> = [];
+
+  afterEach(() => {
+    for (const spy of spies.splice(0)) spy.mockRestore();
+  });
+
+  function track<T extends { mockRestore: () => void }>(spy: T): T {
+    spies.push(spy);
+    return spy;
+  }
+
+  test("uses the full SHA-256 key and accepts only a matching cached row", async () => {
+    const rawKey = "eliza_full_hash_cache_test";
+    const fullHash = createHash("sha256").update(rawKey).digest("hex");
+    const cached = { ...fakeKey(), key_hash: fullHash };
+    const get = track(spyOn(cache, "get").mockResolvedValue(cached));
+    const replica = track(
+      spyOn(apiKeysRepository, "findActiveByHash").mockResolvedValue(undefined),
+    );
+
+    await expect(apiKeysService.validateApiKey(rawKey)).resolves.toEqual(cached);
+    expect(get).toHaveBeenCalledWith(CacheKeys.apiKey.validation(fullHash));
+    expect(replica).not.toHaveBeenCalled();
+  });
+
+  test("rejects a cache row whose embedded full hash names another credential", async () => {
+    const rawKey = "eliza_corrupt_cache_test";
+    const fullHash = createHash("sha256").update(rawKey).digest("hex");
+    const get = track(
+      spyOn(cache, "get").mockResolvedValue({
+        ...fakeKey(),
+        key_hash: `${fullHash.slice(0, 16)}${"f".repeat(48)}`,
+      }),
+    );
+    const del = track(spyOn(cache, "del").mockResolvedValue(undefined));
+    track(spyOn(cache, "set").mockResolvedValue(undefined));
+    track(spyOn(apiKeysRepository, "findActiveByHash").mockResolvedValue(undefined));
+    track(spyOn(apiKeysRepository, "findActiveByHashConsistent").mockResolvedValue(undefined));
+
+    await expect(apiKeysService.validateApiKey(rawKey)).resolves.toBeNull();
+    expect(get).toHaveBeenCalledWith(CacheKeys.apiKey.validation(fullHash));
+    expect(del).toHaveBeenCalledWith(CacheKeys.apiKey.validation(fullHash));
   });
 });

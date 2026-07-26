@@ -14,10 +14,10 @@ import type { AgentSandbox } from "../../../db/repositories/agent-sandboxes";
 import type { AppEnv, RuntimeDurableObjectNamespace } from "../../../types/cloud-worker-env";
 import { ApiError } from "../../api/cloud-worker-errors";
 import {
-  apiKeyScopeHashPrefix,
+  apiKeyScopeHash,
   requireUserOrApiKeyWithOrgLookup,
   revalidateSessionScope,
-  sessionScopeHashPrefix,
+  sessionScopeHash,
 } from "../../auth/workers-hono-auth";
 import { cache } from "../../cache/client";
 import { CacheKeys, CacheTTL } from "../../cache/keys";
@@ -195,20 +195,25 @@ async function revalidateCachedScope(
       : null) ||
     null;
   if (!apiKey) return false;
+  const keyHash = createHash("sha256").update(apiKey).digest("hex");
   const validated = cacheOnly
     ? await cache.get<{
         is_active?: boolean;
         organization_id?: string;
         expires_at?: Date | string | null;
-      }>(
-        CacheKeys.apiKey.validation(
-          createHash("sha256").update(apiKey).digest("hex").substring(0, 16),
-        ),
-      )
+        key_hash?: string;
+      }>(CacheKeys.apiKey.validation(keyHash))
     : await import("../../services/api-keys").then(({ apiKeysService }) =>
         apiKeysService.validateApiKey(apiKey),
       );
-  if (!validated || !validated.is_active) return false;
+  if (
+    !validated ||
+    !validated.is_active ||
+    !("key_hash" in validated) ||
+    validated.key_hash !== keyHash
+  ) {
+    return false;
+  }
   if (validated.expires_at && new Date(validated.expires_at) < new Date()) return false;
   // The key must still be scoped to the org the cached agent belongs to. A
   // detach/re-scope changes organization_id, so a stale cross-org read fails here.
@@ -346,7 +351,7 @@ export async function resolveSharedAgent(
   // cold-session hit (or a composer-mount prewarm) skip both waves. Miss → the
   // authoritative gate below runs unchanged, so this only removes latency.
   // Strong auth uses the full credential fingerprint from the validated IAC
-  // proof. The flag-off compatibility lane retains its prior hash prefixes;
+  // proof. The flag-off compatibility lane derives the same full hashes;
   // session entries stay under a distinct `s:` namespace so credential kinds
   // cannot collide. Requests carrying neither credential fail closed.
   const strongCredential = authorization?.credential;
@@ -355,13 +360,13 @@ export async function resolveSharedAgent(
       ? strongCredential.fingerprint
       : strongCredential
         ? null
-        : await apiKeyScopeHashPrefix(c);
+        : await apiKeyScopeHash(c);
   const sessionPrefix =
     strongCredential?.kind === "steward_session"
       ? strongCredential.fingerprint
       : apiKeyPrefix
         ? null
-        : await sessionScopeHashPrefix(c);
+        : await sessionScopeHash(c);
   const isSessionScope = apiKeyPrefix == null && sessionPrefix != null;
   const scopeKeyPrefix = apiKeyPrefix ?? (sessionPrefix ? `s:${sessionPrefix}` : null);
   const scopeCacheKey = scopeKeyPrefix

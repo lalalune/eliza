@@ -1,7 +1,7 @@
 // Coordinates cloud service anonymous sessions behavior behind route handlers.
 import { anonymousSessionsRepository } from "../../db/repositories";
 import type { AnonymousSession } from "../../db/schemas";
-import { invalidateAnonymousChatGateByToken } from "./anonymous-chat-admission";
+import { persistAnonymousSessionRestriction } from "./anonymous-session-lifecycle";
 
 /**
  * Anonymous Sessions Service
@@ -56,17 +56,19 @@ class AnonymousSessionsService {
   }
 
   async markConverted(sessionId: string) {
-    const sessionToken = await anonymousSessionsRepository.markConverted(sessionId);
-    if (sessionToken) {
-      await invalidateAnonymousChatGateByToken(sessionToken);
-    }
+    const sessionToken = await anonymousSessionsRepository.getSessionTokenForTransition(sessionId);
+    if (!sessionToken) return;
+    await persistAnonymousSessionRestriction(sessionToken, () =>
+      anonymousSessionsRepository.markConverted(sessionId),
+    );
   }
 
   async deactivate(sessionId: string) {
-    const sessionToken = await anonymousSessionsRepository.deactivate(sessionId);
-    if (sessionToken) {
-      await invalidateAnonymousChatGateByToken(sessionToken);
-    }
+    const sessionToken = await anonymousSessionsRepository.getSessionTokenForTransition(sessionId);
+    if (!sessionToken) return;
+    await persistAnonymousSessionRestriction(sessionToken, () =>
+      anonymousSessionsRepository.deactivate(sessionId),
+    );
   }
 
   async deleteExpired() {

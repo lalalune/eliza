@@ -309,21 +309,21 @@ function readApiKeyCredential(c: AppContext): string | null {
 }
 
 /**
- * The 16-char key-hash prefix that identifies the CURRENT request's API-key
+ * The full key hash that identifies the CURRENT request's API-key
  * credential for the shared-agent scope cache (COLDPATH-FIX-2026-07-21), or
  * null when the request is not API-key authenticated (session/JWT/cookie).
  *
- * Same sha256 + 16-char-prefix derivation the api-key validation cache uses, so
+ * Same full sha256 derivation the api-key validation cache uses, so
  * the scope cache is keyed by the exact same credential identity. Returns null
  * (never a hash of an empty string) when there is no API key, so callers scope
  * their cache ONLY on the API-key path and fall back to the authoritative gate
  * everywhere else. Import kept local (crypto) so this stays a pure derivation.
  */
-export async function apiKeyScopeHashPrefix(c: AppContext): Promise<string | null> {
+export async function apiKeyScopeHash(c: AppContext): Promise<string | null> {
   const apiKey = readApiKeyCredential(c);
   if (!apiKey) return null;
   const { createHash } = await import("node:crypto");
-  return createHash("sha256").update(apiKey).digest("hex").substring(0, 16);
+  return createHash("sha256").update(apiKey).digest("hex");
 }
 
 /**
@@ -333,7 +333,7 @@ export async function apiKeyScopeHashPrefix(c: AppContext): Promise<string | nul
  * keyed by the exact credential that will be re-verified on a hit.
  * (#SHADOW-ACCOUNT-DEBUG: the API-key-only scope cache left session/JWT chats
  * — Shadow's own account path — paying the cold user/org+agent Hyperdrive waves
- * on EVERY turn, warm or cold, because `apiKeyScopeHashPrefix` returned null.)
+ * on EVERY turn, warm or cold, because `apiKeyScopeHash` returned null.)
  */
 export function readSessionCredential(c: AppContext): string | null {
   const bearer = readBearer(c);
@@ -343,17 +343,17 @@ export function readSessionCredential(c: AppContext): string | null {
 }
 
 /**
- * 16-char hash prefix identifying the CURRENT request's SESSION credential for
- * the shared-agent scope cache, or null when there is no session token. Never a
- * hash of an empty string. Distinct namespace from the API-key prefix (callers
- * pass a `"s:"`-prefixed cache key) so a session hash can never collide with an
- * API-key hash.
+ * Full hash identifying the CURRENT request's SESSION credential for the
+ * shared-agent scope cache, or null when there is no session token. Never a
+ * hash of an empty string. Distinct namespace from the API-key hash (callers
+ * pass an `"s:"`-prefixed cache key) so a session hash can never collide with
+ * an API-key hash.
  */
-export async function sessionScopeHashPrefix(c: AppContext): Promise<string | null> {
+export async function sessionScopeHash(c: AppContext): Promise<string | null> {
   const token = readSessionCredential(c);
   if (!token) return null;
   const { createHash } = await import("node:crypto");
-  return createHash("sha256").update(token).digest("hex").substring(0, 16);
+  return createHash("sha256").update(token).digest("hex");
 }
 
 /**

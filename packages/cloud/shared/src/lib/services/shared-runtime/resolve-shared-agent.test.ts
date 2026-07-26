@@ -14,6 +14,8 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { createHash } from "node:crypto";
 
+const TEST_API_KEY_HASH = createHash("sha256").update("eliza_testkey").digest("hex");
+
 const requireUserOrApiKeyWithOrgLookup = mock(
   async <T>(_: unknown, lookup: (organizationId: string) => Promise<T>) => ({
     user: { organization_id: "org-1", steward_id: "steward-user-1" },
@@ -25,12 +27,12 @@ const findByIdAndOrg = mock(async () => null);
 // Scope-cache key derivation for the CURRENT request. Default: an API-key
 // request whose hash-prefix is stable, so hit/miss can be exercised.
 let scopeHashPrefixBehavior: () => Promise<string | null> = async () => "keyhashpref0000";
-const apiKeyScopeHashPrefix = mock(() => scopeHashPrefixBehavior());
+const apiKeyScopeHash = mock(() => scopeHashPrefixBehavior());
 
 // Session-path derivation (#SHADOW-ACCOUNT-DEBUG). Default null => API-key path
 // unless a test opts into the session shape.
-let sessionHashPrefixBehavior: () => Promise<string | null> = async () => null;
-const sessionScopeHashPrefix = mock(() => sessionHashPrefixBehavior());
+let sessionHashBehavior: () => Promise<string | null> = async () => null;
+const sessionScopeHash = mock(() => sessionHashBehavior());
 let sessionRevalidateBehavior: (cachedStewardUserId: string) => Promise<boolean> = async () => true;
 const revalidateSessionScope = mock((_: unknown, cachedStewardUserId: string) =>
   sessionRevalidateBehavior(cachedStewardUserId),
@@ -38,8 +40,8 @@ const revalidateSessionScope = mock((_: unknown, cachedStewardUserId: string) =>
 
 mock.module("../../auth/workers-hono-auth", () => ({
   requireUserOrApiKeyWithOrgLookup,
-  apiKeyScopeHashPrefix,
-  sessionScopeHashPrefix,
+  apiKeyScopeHash,
+  sessionScopeHash,
   revalidateSessionScope,
 }));
 
@@ -203,12 +205,17 @@ beforeEach(() => {
   isInferenceAuthCacheEnabled.mockClear();
   resolveInferenceAuthContext.mockClear();
   cacheStore.clear();
-  sessionScopeHashPrefix.mockClear();
+  sessionScopeHash.mockClear();
   revalidateSessionScope.mockClear();
   scopeHashPrefixBehavior = async () => "keyhashpref0000";
-  sessionHashPrefixBehavior = async () => null;
+  sessionHashBehavior = async () => null;
   sessionRevalidateBehavior = async () => true;
-  validateBehavior = async () => ({ is_active: true, organization_id: "org-1", expires_at: null });
+  validateBehavior = async () => ({
+    is_active: true,
+    organization_id: "org-1",
+    expires_at: null,
+    key_hash: TEST_API_KEY_HASH,
+  });
   strongAuthEnabled = false;
   inferenceAuthResolution = {
     kind: "authorized",
@@ -262,10 +269,13 @@ describe("resolveSharedAgent", () => {
     await waited[0];
     expect(findByIdAndOrg).toHaveBeenCalledTimes(1);
     cacheStore.set(
-      CacheKeys.apiKey.validation(
-        createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
-      ),
-      { is_active: true, organization_id: "org-1", expires_at: null },
+      CacheKeys.apiKey.validation(createHash("sha256").update("eliza_testkey").digest("hex")),
+      {
+        is_active: true,
+        organization_id: "org-1",
+        expires_at: null,
+        key_hash: createHash("sha256").update("eliza_testkey").digest("hex"),
+      },
     );
 
     await expect(
@@ -368,10 +378,13 @@ describe("resolveSharedAgent", () => {
     ).resolves.toMatchObject({ status: 503 });
     await Promise.all(waited);
     cacheStore.set(
-      CacheKeys.apiKey.validation(
-        createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
-      ),
-      { is_active: true, organization_id: "org-1", expires_at: null },
+      CacheKeys.apiKey.validation(createHash("sha256").update("eliza_testkey").digest("hex")),
+      {
+        is_active: true,
+        organization_id: "org-1",
+        expires_at: null,
+        key_hash: createHash("sha256").update("eliza_testkey").digest("hex"),
+      },
     );
 
     await expect(
@@ -446,7 +459,7 @@ describe("resolveSharedAgent", () => {
 
   test("cache-only rejects unsupported credential identity without repository work", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => null;
+    sessionHashBehavior = async () => null;
     const background: Promise<unknown>[] = [];
 
     await expect(
@@ -522,6 +535,7 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
       is_active: false,
       organization_id: "org-1",
       expires_at: null,
+      key_hash: TEST_API_KEY_HASH,
     });
 
     await resolveSharedAgent(apiKeyContext("agent-1") as never);
@@ -539,6 +553,7 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
       is_active: true,
       organization_id: "org-2",
       expires_at: null,
+      key_hash: TEST_API_KEY_HASH,
     });
 
     await resolveSharedAgent(apiKeyContext("agent-1") as never);
@@ -560,7 +575,7 @@ describe("resolveSharedAgent scope cache (COLDPATH-FIX-2026-07-21)", () => {
 
   test("a request carrying NEITHER an api key nor a session never touches the scope cache", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => null;
+    sessionHashBehavior = async () => null;
     findByIdAndOrg.mockResolvedValue(agent());
 
     await resolveSharedAgent(contextWithAgentId("agent-1") as never);
@@ -587,10 +602,13 @@ describe("resolveSharedAgent sliding TTL (COLDPATH-FIX-2026-07-22)", () => {
     findByIdAndOrg.mockClear();
 
     cacheStore.set(
-      CacheKeys.apiKey.validation(
-        createHash("sha256").update("eliza_testkey").digest("hex").substring(0, 16),
-      ),
-      { is_active: true, organization_id: "org-1", expires_at: null },
+      CacheKeys.apiKey.validation(createHash("sha256").update("eliza_testkey").digest("hex")),
+      {
+        is_active: true,
+        organization_id: "org-1",
+        expires_at: null,
+        key_hash: createHash("sha256").update("eliza_testkey").digest("hex"),
+      },
     );
     const background: Promise<unknown>[] = [];
     // Second hit within the cap: served from cache AND refreshes the TTL under
@@ -644,6 +662,7 @@ describe("resolveSharedAgent sliding TTL (COLDPATH-FIX-2026-07-22)", () => {
       is_active: false,
       organization_id: "org-1",
       expires_at: null,
+      key_hash: TEST_API_KEY_HASH,
     });
 
     await resolveSharedAgent(apiKeyContext("agent-1") as never);
@@ -721,7 +740,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("first cold session hit runs the full gate and caches with the steward user id", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -740,7 +759,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("second session hit skips the cold DB waves after re-verifying the JWT", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -765,7 +784,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("a session hit whose token no longer verifies falls back to the full gate", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -781,7 +800,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("a session hit after the user's lifecycle entry is evicted (ban/deactivate) is NOT served from cache", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -798,7 +817,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("a session hit for a deactivated user is NOT served from cache", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -812,7 +831,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("a session hit whose user moved to a different org is NOT served the cached agent", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -826,7 +845,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
 
   test("a session hit whose user's organization is deactivated is NOT served from cache", async () => {
     scopeHashPrefixBehavior = async () => null;
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     seedSessionUserState();
     findByIdAndOrg.mockResolvedValue(agent());
 
@@ -841,7 +860,7 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
   test("the api-key path is preferred over session when both are present", async () => {
     // Both derivations available; api-key wins, session cache is not consulted.
     scopeHashPrefixBehavior = async () => "keyhashpref0000";
-    sessionHashPrefixBehavior = async () => "sesshashpref0000";
+    sessionHashBehavior = async () => "sesshashpref0000";
     findByIdAndOrg.mockResolvedValue(agent());
 
     await resolveSharedAgent(apiKeyContext("agent-1") as never);
@@ -877,6 +896,12 @@ describe("resolveSharedAgent SESSION scope cache (SHADOW-ACCOUNT-DEBUG)", () => 
       };
       // Store the DESERIALIZED shape a real cache.get would return.
       cacheStore.set(key, jsonRoundTrip(liveEntry));
+      cacheStore.set(CacheKeys.apiKey.validation(TEST_API_KEY_HASH), {
+        is_active: true,
+        organization_id: "org-1",
+        expires_at: null,
+        key_hash: TEST_API_KEY_HASH,
+      });
     }
 
     test("a JSON-round-tripped cache hit carries created_at as a string (bug precondition)", () => {

@@ -21,6 +21,7 @@ import {
 import { participantTable } from "../../db/schemas/eliza";
 import { organizationConfig } from "../../db/schemas/organization-config";
 import { userIdentities } from "../../db/schemas/user-identities";
+import { persistAnonymousSessionRestriction } from "../services/anonymous-session-lifecycle";
 import { anonymousSessionsService } from "../services/anonymous-sessions";
 import type { UserWithOrganization } from "../types";
 import { logger } from "../utils/logger";
@@ -357,13 +358,15 @@ export async function migrateAnonymousSession(
     }
 
     if (anonSession) {
-      await tx
-        .update(anonymousSessions)
-        .set({
-          converted_at: new Date(),
-          is_active: false,
-        })
-        .where(eq(anonymousSessions.id, anonSession.id));
+      await persistAnonymousSessionRestriction(anonSession.session_token, async () => {
+        await tx
+          .update(anonymousSessions)
+          .set({
+            converted_at: new Date(),
+            is_active: false,
+          })
+          .where(eq(anonymousSessions.id, anonSession.id));
+      });
     }
   });
 

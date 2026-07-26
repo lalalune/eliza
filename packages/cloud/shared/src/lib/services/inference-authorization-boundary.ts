@@ -17,7 +17,7 @@ import { isInferenceAuthCacheEnabled } from "./inference-hot-path-caches";
 
 export const INFERENCE_AUTHORIZATION_BOUNDARY_VERSION = 1 as const;
 
-export type InferenceCredentialKind = "api_key" | "steward_session";
+export type InferenceCredentialKind = "api_key" | "steward_session" | "app_session";
 
 export interface InferenceAuthorizationProof {
   readonly v: typeof INFERENCE_AUTHORIZATION_BOUNDARY_VERSION;
@@ -27,7 +27,7 @@ export interface InferenceAuthorizationProof {
   readonly userRevision: string;
   readonly credential: {
     readonly kind: InferenceCredentialKind;
-    /** Database row ID for API keys; full token hash for Steward sessions. */
+    /** Database row ID for API keys; full token hash for signed sessions. */
     readonly id: string;
     /** Full SHA-256 identity, so rotations cannot reuse a stale grant. */
     readonly fingerprint: string;
@@ -106,7 +106,9 @@ export function isInferenceAuthorizationProof(
   }
   const credential = proof.credential as Record<string, unknown>;
   return (
-    (credential.kind === "api_key" || credential.kind === "steward_session") &&
+    (credential.kind === "api_key" ||
+      credential.kind === "steward_session" ||
+      credential.kind === "app_session") &&
     validId(credential.id) &&
     typeof credential.fingerprint === "string" &&
     SHA256_HEX.test(credential.fingerprint) &&

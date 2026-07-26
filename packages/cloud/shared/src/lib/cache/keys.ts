@@ -28,7 +28,8 @@ export const CacheKeys = {
     pattern: (orgId: string) => `analytics:*:${orgId}:*`,
   },
   apiKey: {
-    validation: (keyHash: string) => `apikey:validation:${keyHash}:v1`,
+    validation: (fullKeyHash: string) => `apikey:validation:${fullKeyHash}:v2`,
+    legacyValidation: (keyHashPrefix: string) => `apikey:validation:${keyHashPrefix}:v1`,
     /** Cache app lookup by API key ID */
     appMapping: (apiKeyId: string) => `apikey:app:${apiKeyId}:v1`,
     pattern: () => `apikey:*`,
@@ -38,19 +39,19 @@ export const CacheKeys = {
    *
    * Collapses the whole cold pre-inference gate for a shared-agent chat turn —
    * API-key validation + user/org hydration + org-scoped agent lookup — into a
-   * SINGLE read, keyed by (16-char key-hash prefix, agentId). The individual
+   * SINGLE read, keyed by (full key hash, agentId). The individual
    * entity caches (apiKey.validation, user.withOrg) are each warm-fast but on a
    * FRESH browser session they are ALL cold, so the resolver pays 2 serial
    * Hyperdrive waves (~1–4.4s measured). This entry lets the SECOND cold-session
-   * hit (or a composer-mount prewarm) skip both waves. Keyed on the same
-   * key-hash prefix the validation cache uses so a credential revoke that
+   * hit (or a composer-mount prewarm) skip both waves. Keyed on the same full
+   * key hash the validation cache uses so a credential revoke that
    * invalidates `apiKey.validation` reasons about the same identity; TTL is
    * deliberately short (see CacheTTL.sharedAgentScope) so a stale membership
    * self-heals fast, and the authoritative slow path still runs on a miss.
    */
   sharedAgentScope: {
-    resolve: (keyHashPrefix: string, agentId: string) =>
-      `shared-agent-scope:${keyHashPrefix}:${agentId}:v1`,
+    resolve: (fullKeyHash: string, agentId: string) =>
+      `shared-agent-scope:${fullKeyHash}:${agentId}:v2`,
     voice: (organizationId: string, userId: string, agentId: string) =>
       `shared-agent-scope:voice:${organizationId}:${userId}:${agentId}:v1`,
   },
@@ -59,8 +60,8 @@ export const CacheKeys = {
    * moderation into a single read for API-key dedicated-agent inference; the
    * org-balance entry is the Tier-2 optimistic-billing gate hint.
    *
-   * IAC is keyed by the FULL sha256(key) (NOT the 16-char prefix the validation
-   * cache uses) so revoke/ban invalidation by `key_hash` is exact.
+   * Every credential cache is keyed by the full sha256(key), so revoke/ban
+   * invalidation by `key_hash` is exact.
    */
   inference: {
     authContext: (fullKeyHash: string) => `iac:auth:${fullKeyHash}:v2`,

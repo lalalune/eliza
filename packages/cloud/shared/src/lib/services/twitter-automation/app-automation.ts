@@ -8,8 +8,16 @@ import { getLanguageModel } from "../../providers/language-model";
 import { logger } from "../../utils/logger";
 // Note: When ANTHROPIC_COT_BUDGET is set and model is Anthropic, temperature is silently dropped
 // per @ai-sdk/anthropic behavior. This service uses temperature for creative tweet generation.
-import { buildCharacterSystemPrompt, getCharacterPromptContext } from "../character-prompt-helper";
+import {
+  buildCharacterSystemPrompt,
+  getCharacterPromptContext,
+  getCharacterPromptContextCacheOnly,
+} from "../character-prompt-helper";
 import { creditsService } from "../credits";
+import {
+  type InteractiveGenerationIdentity,
+  runInteractiveTextGeneration,
+} from "../interactive-generation-admission";
 import { secretsService } from "../secrets";
 
 const TWITTER_API_KEY = process.env.TWITTER_API_KEY;
@@ -142,6 +150,7 @@ class TwitterAppAutomationService {
     organizationId: string,
     app: App,
     type: "promotional" | "engagement" | "educational" | "announcement" = "promotional",
+    generation?: InteractiveGenerationIdentity,
   ): Promise<GeneratedTweet> {
     // All throwable prep (character-context DB fetch, prompt build) runs BEFORE
     // the deduction: nothing may throw between the charge and the refunding try,
@@ -152,7 +161,12 @@ class TwitterAppAutomationService {
 
     let characterPrompt = "";
     if (config?.agentCharacterId) {
-      const characterContext = await getCharacterPromptContext(config.agentCharacterId);
+      const characterContext = generation
+        ? await getCharacterPromptContextCacheOnly(
+            config.agentCharacterId,
+            generation.executionCtx,
+          )
+        : await getCharacterPromptContext(config.agentCharacterId);
       if (characterContext) {
         characterPrompt = buildCharacterSystemPrompt(characterContext);
         logger.info("[TwitterAppAutomation] Using character voice", {
@@ -222,6 +236,34 @@ Requirements:
 
 Return ONLY the tweet text, nothing else.`;
 
+    const twModel = "anthropic/claude-sonnet-4.6";
+    const dispatch = () =>
+      generateText({
+        model: getLanguageModel(twModel),
+        ...mergeAnthropicCotProviderOptions(twModel, process.env, 0),
+        temperature: 0.8,
+        prompt,
+        maxOutputTokens: 300,
+      });
+
+    if (generation) {
+      const result = await runInteractiveTextGeneration(
+        {
+          identity: generation,
+          model: twModel,
+          userPrompt: prompt,
+          maxOutputTokens: 300,
+          description: `Twitter AI tweet: ${app.name}`,
+          metadata: { appId: app.id, type: "twitter_tweet" },
+        },
+        dispatch,
+      );
+      return {
+        text: result.text.trim().slice(0, 280),
+        type,
+      };
+    }
+
     const deduction = await creditsService.deductCredits({
       organizationId,
       amount: TWITTER_POST_COST,
@@ -236,17 +278,11 @@ Return ONLY the tweet text, nothing else.`;
     }
 
     try {
-      const twModel = "anthropic/claude-sonnet-4.6";
       // Note: Explicitly disable extended thinking (pass 0) for tweet generation.
       // This is a background service that requires temperature control for creative output,
       // and enabling CoT would silently drop temperature per @ai-sdk/anthropic behavior.
       // Temperature 0.8 for varied, creative tweet content.
-      const { text } = await generateText({
-        model: getLanguageModel(twModel),
-        ...mergeAnthropicCotProviderOptions(twModel, process.env, 0),
-        temperature: 0.8,
-        prompt,
-      });
+      const { text } = await dispatch();
 
       return {
         text: text.trim().slice(0, 280),
@@ -277,16 +313,39 @@ Return ONLY the tweet text, nothing else.`;
     if (!app || app.organization_id !== organizationId) {
       return { success: false, error: "App not found" };
     }
+    return await this.postAppTweetForApp(organizationId, app, tweetText);
+  }
 
-    const client = await this.getTwitterClient(organizationId);
-    if (!client) {
-      return { success: false, error: "Twitter not connected" };
+  async postAppTweetForApp(
+    organizationId: string,
+    app: App,
+    tweetText?: string,
+    generation?: InteractiveGenerationIdentity,
+  ): Promise<{
+    success: boolean;
+    tweetId?: string;
+    tweetUrl?: string;
+    error?: string;
+  }> {
+    if (app.organization_id !== organizationId) {
+      return { success: false, error: "App not found" };
     }
 
     let text = tweetText;
     if (!text) {
-      const generated = await this.generateAppTweet(organizationId, app, "promotional");
+      const generated = await this.generateAppTweet(
+        organizationId,
+        app,
+        "promotional",
+        generation,
+      );
       text = generated.text;
+    }
+
+    // Connector credentials are fetched only after admitted generation returns.
+    const client = await this.getTwitterClient(organizationId);
+    if (!client) {
+      return { success: false, error: "Twitter not connected" };
     }
 
     let tweetResult;
@@ -303,7 +362,7 @@ Return ONLY the tweet text, nothing else.`;
       // send failure distinctly and never fabricates a delivered/success result.
     } catch (error) {
       logger.error("[TwitterAppAutomation] Failed to post tweet", {
-        appId,
+        appId: app.id,
         error: error instanceof Error ? error.message : String(error),
       });
       return {
@@ -313,16 +372,21 @@ Return ONLY the tweet text, nothing else.`;
     }
 
     const config = (app.twitter_automation || {}) as TwitterAutomationConfig;
-    await appsRepository.update(appId, {
+    const updateStats = appsRepository.update(app.id, {
       twitter_automation: {
         ...config,
         lastPostAt: new Date().toISOString(),
         totalPosts: (config.totalPosts ?? 0) + 1,
       },
     });
+    if (generation) {
+      generation.executionCtx.waitUntil(updateStats);
+    } else {
+      await updateStats;
+    }
 
     logger.info("[TwitterAppAutomation] Posted tweet for app", {
-      appId,
+      appId: app.id,
       tweetId: tweetResult.data.id,
     });
 

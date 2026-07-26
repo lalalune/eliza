@@ -57,8 +57,8 @@ import * as realWorkersAuth from "@/lib/auth/workers-hono-auth";
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
   ...realWorkersAuth,
-  apiKeyScopeHashPrefix: mock(async () => null),
-  sessionScopeHashPrefix: mock(async () => null),
+  apiKeyScopeHash: mock(async () => null),
+  sessionScopeHash: mock(async () => null),
   requireUserOrApiKeyWithOrgLookup: mock(
     async (
       _c: unknown,

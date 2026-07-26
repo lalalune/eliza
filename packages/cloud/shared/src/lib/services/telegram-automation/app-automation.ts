@@ -15,8 +15,16 @@ import {
   getTelegramConfigWithDefaults,
   TELEGRAM_AUTOMATION_DEFAULTS,
 } from "../automation-constants";
-import { buildCharacterSystemPrompt, getCharacterPromptContext } from "../character-prompt-helper";
+import {
+  buildCharacterSystemPrompt,
+  getCharacterPromptContext,
+  getCharacterPromptContextCacheOnly,
+} from "../character-prompt-helper";
 import { creditsService } from "../credits";
+import {
+  type InteractiveGenerationIdentity,
+  runInteractiveTextGeneration,
+} from "../interactive-generation-admission";
 import { telegramAutomationService } from "./index";
 
 export interface TelegramAutomationConfig {
@@ -172,7 +180,11 @@ class TelegramAppAutomationService {
     };
   }
 
-  async generateAnnouncement(organizationId: string, app: App): Promise<string> {
+  async generateAnnouncement(
+    organizationId: string,
+    app: App,
+    generation?: InteractiveGenerationIdentity,
+  ): Promise<string> {
     // All throwable prep (character-context DB fetch, prompt build) runs BEFORE
     // the deduction: nothing may throw between the charge and the refunding try,
     // or the user is charged for a generation that never ran (#11685).
@@ -181,7 +193,12 @@ class TelegramAppAutomationService {
 
     let characterPrompt = "";
     if (config?.agentCharacterId) {
-      const characterContext = await getCharacterPromptContext(config.agentCharacterId);
+      const characterContext = generation
+        ? await getCharacterPromptContextCacheOnly(
+            config.agentCharacterId,
+            generation.executionCtx,
+          )
+        : await getCharacterPromptContext(config.agentCharacterId);
       if (characterContext) {
         characterPrompt = buildCharacterSystemPrompt(characterContext);
         logger.info("[TelegramAppAutomation] Using character voice", {
@@ -226,6 +243,32 @@ Write in a ${vibeStyle} style. Keep it concise and engaging.
 Use appropriate emojis sparingly. Do not use hashtags excessively.
 Maximum 500 characters.`;
 
+    const userPrompt =
+      "Create a compelling announcement about this app that would engage a Telegram community. Focus on what makes it unique and valuable.";
+    const dispatch = () =>
+      generateText({
+        model: openai("gpt-5-mini"),
+        system: systemPrompt,
+        prompt: userPrompt,
+        maxOutputTokens: 200,
+      });
+
+    if (generation) {
+      const result = await runInteractiveTextGeneration(
+        {
+          identity: generation,
+          model: "openai/gpt-5-mini",
+          systemPrompt,
+          userPrompt,
+          maxOutputTokens: 200,
+          description: `Telegram AI announcement: ${app.name}`,
+          metadata: { appId: app.id, type: "telegram_announcement" },
+        },
+        dispatch,
+      );
+      return result.text;
+    }
+
     const deduction = await creditsService.deductCredits({
       organizationId,
       amount: TELEGRAM_POST_COST,
@@ -240,14 +283,7 @@ Maximum 500 characters.`;
     }
 
     try {
-      const result = await generateText({
-        model: openai("gpt-5-mini"),
-        system: systemPrompt,
-        prompt:
-          "Create a compelling announcement about this app that would engage a Telegram community. Focus on what makes it unique and valuable.",
-        maxOutputTokens: 200,
-      });
-
+      const result = await dispatch();
       return result.text;
     } catch (error) {
       await creditsService.refundCredits({
@@ -265,6 +301,7 @@ Maximum 500 characters.`;
     app: App,
     userMessage: string,
     userName?: string,
+    generation?: InteractiveGenerationIdentity,
   ): Promise<string> {
     // Throwable prep stays ahead of the deduction — see generateAnnouncement (#11685).
     const config = app.telegram_automation as TelegramAutomationConfig;
@@ -272,7 +309,12 @@ Maximum 500 characters.`;
 
     let characterPrompt = "";
     if (config?.agentCharacterId) {
-      const characterContext = await getCharacterPromptContext(config.agentCharacterId);
+      const characterContext = generation
+        ? await getCharacterPromptContextCacheOnly(
+            config.agentCharacterId,
+            generation.executionCtx,
+          )
+        : await getCharacterPromptContext(config.agentCharacterId);
       if (characterContext) {
         characterPrompt = buildCharacterSystemPrompt(characterContext);
       }
@@ -303,6 +345,33 @@ Respond in a ${vibeStyle} style. Be helpful and concise.
 If asked about features not related to the app, politely redirect to the app's purpose.
 Maximum 300 characters.`;
 
+    const userPrompt = userName
+      ? `User ${userName} says: "${userMessage}"`
+      : `User says: "${userMessage}"`;
+    const dispatch = () =>
+      generateText({
+        model: openai("gpt-5-mini"),
+        system: systemPrompt,
+        prompt: userPrompt,
+        maxOutputTokens: 150,
+      });
+
+    if (generation) {
+      const result = await runInteractiveTextGeneration(
+        {
+          identity: generation,
+          model: "openai/gpt-5-mini",
+          systemPrompt,
+          userPrompt,
+          maxOutputTokens: 150,
+          description: `Telegram AI reply: ${app.name}`,
+          metadata: { appId: app.id, type: "telegram_reply" },
+        },
+        dispatch,
+      );
+      return result.text;
+    }
+
     const deduction = await creditsService.deductCredits({
       organizationId,
       amount: TELEGRAM_POST_COST,
@@ -317,15 +386,7 @@ Maximum 300 characters.`;
     }
 
     try {
-      const result = await generateText({
-        model: openai("gpt-5-mini"),
-        system: systemPrompt,
-        prompt: userName
-          ? `User ${userName} says: "${userMessage}"`
-          : `User says: "${userMessage}"`,
-        maxOutputTokens: 150,
-      });
-
+      const result = await dispatch();
       return result.text;
     } catch (error) {
       await creditsService.refundCredits({
@@ -371,6 +432,24 @@ Maximum 300 characters.`;
     chatIdOverride?: string,
   ): Promise<PostResult> {
     const app = await this.getAppForOrg(organizationId, appId);
+    return await this.postAnnouncementForApp(
+      organizationId,
+      app,
+      text,
+      chatIdOverride,
+    );
+  }
+
+  async postAnnouncementForApp(
+    organizationId: string,
+    app: App,
+    text?: string,
+    chatIdOverride?: string,
+    generation?: InteractiveGenerationIdentity,
+  ): Promise<PostResult> {
+    if (app.organization_id !== organizationId) {
+      throw new Error("App not found");
+    }
     const config = app.telegram_automation;
 
     if (!config?.enabled) {
@@ -382,8 +461,12 @@ Maximum 300 characters.`;
       return { success: false, error: "No channel or group configured" };
     }
 
-    const messageText = text || (await this.generateAnnouncement(organizationId, app));
+    const messageText =
+      text ||
+      (await this.generateAnnouncement(organizationId, app, generation));
 
+    // Bot credentials are connector state, not generation authorization. Read
+    // them only after the provider has returned for generated announcements.
     const botToken = await telegramAutomationService.getBotToken(organizationId);
     if (!botToken) {
       return { success: false, error: "Bot not connected" };
@@ -423,7 +506,7 @@ Maximum 300 characters.`;
         lastMessageId = result.message_id;
 
         logger.info("[TelegramAppAutomation] Photo announcement posted", {
-          appId,
+          appId: app.id,
           chatId,
           messageId: lastMessageId,
           imageUrl: promotionalImageUrl,
@@ -456,7 +539,7 @@ Maximum 300 characters.`;
       // error-policy:J1 Telegram send transport boundary -> typed PostResult failure the callers surface as success:false
       lastError = error instanceof Error ? error.message : "Failed to send message";
       logger.error("[TelegramAppAutomation] Failed to post announcement", {
-        appId,
+        appId: app.id,
         chatId,
         error: lastError,
         hasImage: !!promotionalImageUrl,
@@ -472,16 +555,21 @@ Maximum 300 characters.`;
         announceIntervalMax: 240,
       };
 
-      await appsRepository.update(appId, {
+      const updateStats = appsRepository.update(app.id, {
         telegram_automation: {
           ...currentConfig,
           lastAnnouncementAt: new Date().toISOString(),
           totalMessages: (currentConfig.totalMessages || 0) + 1,
         },
       });
+      if (generation) {
+        generation.executionCtx.waitUntil(updateStats);
+      } else {
+        await updateStats;
+      }
 
       logger.info("[TelegramAppAutomation] Announcement posted", {
-        appId,
+        appId: app.id,
         chatId,
         messageId: lastMessageId,
         hasImage: !!promotionalImageUrl,

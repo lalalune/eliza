@@ -1,22 +1,25 @@
 /**
- * Provisioning agent chat service.
+ * Cache-admitted provisioning agent chat.
  *
- * Runs entirely on Cloudflare Workers via Cerebras (ultra-fast inference).
- * Converses with the user while their dedicated container is provisioning.
- * Conversation history is stored in Redis, keyed per user, capped at 20
- * messages (10 turns), TTL 7 days.
+ * Conversation state and the sandbox-status projection come from cache; exact
+ * organization rate, spend, and app-session authorization are serialized by
+ * the inference Durable Object before Cerebras. Authoritative provisioning
+ * refresh and history persistence continue under waitUntil.
  */
 
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
-import {
-  type AgentSandboxStatus,
-  agentSandboxesRepository,
-} from "../../db/repositories/agent-sandboxes";
+import type { AgentSandboxStatus } from "../../db/repositories/agent-sandboxes";
 import { cache } from "../cache/client";
 import { CEREBRAS_DEFAULT_TEXT_MODEL } from "../models";
 import { getCloudAwareEnv } from "../runtime/cloud-bindings";
 import { logger } from "../utils/logger";
+import { runElizaAppTextInference } from "./eliza-app/inference-hot-path";
+import type {
+  ElizaAppInferenceExecutionContext,
+  ElizaAppInferenceIdentity,
+} from "./eliza-app/inference-session-auth";
+import { resolveElizaAppProvisioningCache } from "./eliza-app/provisioning-cache";
 
 const HISTORY_CACHE_KEY = (userId: string) => `prov-chat:${userId}`;
 const HISTORY_TTL_SECONDS = 604800; // 7 days
@@ -24,6 +27,14 @@ const MAX_HISTORY_MESSAGES = 20; // 10 turns (user + assistant)
 
 const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
 const CEREBRAS_MODEL = CEREBRAS_DEFAULT_TEXT_MODEL;
+const MAX_OUTPUT_TOKENS = 500;
+
+export class ProvisioningAgentChatWarmingError extends Error {
+  constructor() {
+    super("Eliza App provisioning status cache is warming");
+    this.name = "ProvisioningAgentChatWarmingError";
+  }
+}
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -87,7 +98,6 @@ async function loadHistory(userId: string): Promise<ChatMessage[]> {
 }
 
 async function saveHistory(userId: string, history: ChatMessage[]): Promise<void> {
-  // Cap at MAX_HISTORY_MESSAGES, keeping the most recent
   const capped =
     history.length > MAX_HISTORY_MESSAGES
       ? history.slice(history.length - MAX_HISTORY_MESSAGES)
@@ -95,69 +105,74 @@ async function saveHistory(userId: string, history: ChatMessage[]): Promise<void
   await cache.set(HISTORY_CACHE_KEY(userId), capped, HISTORY_TTL_SECONDS);
 }
 
-export async function provisioningAgentChat(
-  userId: string,
-  organizationId: string,
-  userMessage: string,
-  agentId?: string,
-): Promise<ProvisioningChatResult> {
-  // Resolve container status
-  let containerStatus: AgentSandboxStatus | "none" = "none";
-  let bridgeUrl: string | null = null;
-  let resolvedAgentId: string | null = agentId ?? null;
+function isContainerStatus(value: string): value is AgentSandboxStatus {
+  return (
+    value === "pending" ||
+    value === "provisioning" ||
+    value === "running" ||
+    value === "stopped" ||
+    value === "sleeping" ||
+    value === "disconnected" ||
+    value === "error"
+  );
+}
 
-  try {
-    let sandbox = agentId
-      ? await agentSandboxesRepository.findByIdAndOrg(agentId, organizationId)
-      : undefined;
-
-    if (!sandbox) {
-      const sandboxes = await agentSandboxesRepository.listByOrganization(organizationId);
-      sandbox = sandboxes[0];
-    }
-
-    if (sandbox) {
-      containerStatus = sandbox.status;
-      resolvedAgentId = sandbox.id;
-      bridgeUrl = sandbox.status === "running" ? (sandbox.bridge_url ?? null) : null;
-    }
-  } catch (err) {
-    logger.warn("[ProvisioningAgentChat] Failed to resolve sandbox status", {
-      userId,
-      organizationId,
-      error: err instanceof Error ? err.message : String(err),
-    });
+export async function provisioningAgentChat(params: {
+  identity: ElizaAppInferenceIdentity;
+  userMessage: string;
+  agentId?: string;
+  requestId: string;
+  executionCtx: ElizaAppInferenceExecutionContext;
+}): Promise<ProvisioningChatResult> {
+  const statusResolution = await resolveElizaAppProvisioningCache({
+    organizationId: params.identity.organizationId,
+    userId: params.identity.userId,
+    ensure: false,
+    executionCtx: params.executionCtx,
+  });
+  if (statusResolution.kind !== "ready") {
+    throw new ProvisioningAgentChatWarmingError();
   }
-
-  // Load history and append new user message
-  const history = await loadHistory(userId);
-  const updatedHistory: ChatMessage[] = [...history, { role: "user", content: userMessage }];
-
-  // Generate response
-  let reply = "";
-  try {
-    const cerebras = getCerebrasClient();
-    const systemPrompt = buildSystemPrompt(containerStatus);
-
-    const { text } = await generateText({
-      model: cerebras.chat(CEREBRAS_MODEL),
-      system: systemPrompt,
-      messages: updatedHistory,
-    });
-
-    reply = text;
-  } catch (err) {
-    logger.error("[ProvisioningAgentChat] generateText failed", {
-      userId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    reply =
-      "I'm having a brief moment of difficulty — please try again in a second. Your container is still being set up in the background.";
+  const projected = statusResolution.status;
+  if (projected.status !== "none" && !isContainerStatus(projected.status)) {
+    throw new Error(`Invalid provisioning status projection: ${projected.status}`);
   }
-
-  // Persist updated history with assistant reply
+  const containerStatus = projected.status;
+  const bridgeUrl = projected.bridgeUrl;
+  const resolvedAgentId = params.agentId ?? projected.agentId;
+  const history = await loadHistory(params.identity.userId);
+  const updatedHistory: ChatMessage[] = [...history, { role: "user", content: params.userMessage }];
+  const systemPrompt = buildSystemPrompt(containerStatus);
+  const result = await runElizaAppTextInference({
+    identity: params.identity,
+    model: CEREBRAS_MODEL,
+    requestId: params.requestId,
+    promptText: `${systemPrompt}\n${updatedHistory
+      .map((message) => `${message.role}: ${message.content}`)
+      .join("\n")}`,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
+    description: "Eliza App provisioning chat",
+    executionCtx: params.executionCtx,
+    dispatch: () =>
+      generateText({
+        model: getCerebrasClient().chat(CEREBRAS_MODEL),
+        system: systemPrompt,
+        messages: updatedHistory,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+      }),
+  });
+  const reply = result.text;
   const finalHistory: ChatMessage[] = [...updatedHistory, { role: "assistant", content: reply }];
-  await saveHistory(userId, finalHistory);
+  params.executionCtx.waitUntil(
+    saveHistory(params.identity.userId, finalHistory).catch((error) => {
+      // error-policy:J7 the response is already generated; history persistence
+      // failure is visible and the next turn remains a valid new cache turn.
+      logger.error("[ProvisioningAgentChat] History persistence failed", {
+        userId: params.identity.userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }),
+  );
 
   return {
     reply,

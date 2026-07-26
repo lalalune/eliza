@@ -824,6 +824,49 @@ describe("InferenceAdmissionGate", () => {
     ).toBe(200);
   });
 
+  test("applies the same exact session floor to local eliza-app credentials", async () => {
+    const gate = createGate(new TestStorage(), true);
+    await hydrateGate(gate, 5);
+    const appSession = authorizationProof({
+      credential: {
+        kind: "app_session",
+        id: "d".repeat(64),
+        fingerprint: "d".repeat(64),
+        revision: "101",
+        expiresAt: Date.now() + 60_000,
+      },
+    });
+    await hydrateAuthorizationBoundary(gate, appSession, "101");
+    expect(
+      (
+        await post(gate, "/lease", {
+          requestId: "app-session-before-revoke",
+          balanceUsd: 5,
+          balanceRevision: "1",
+          estimatedCostUsd: 1,
+          authorization: appSession,
+        })
+      ).status,
+    ).toBe(200);
+
+    await post(gate, "/authorization/apply", {
+      organizationId: "org-a",
+      state: {
+        kind: "session",
+        id: "user-a",
+        revision: "102",
+        denied: false,
+      },
+    });
+    expect(
+      (
+        await post(gate, "/dispatch", {
+          requestId: "app-session-before-revoke",
+        })
+      ).status,
+    ).toBe(403);
+  });
+
   test("requires a versioned dispatch acknowledgement during mixed-version rollout", async () => {
     const gate = createGate(new TestStorage(), true);
     await hydrateGate(gate, 5);

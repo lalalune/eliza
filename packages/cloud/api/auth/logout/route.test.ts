@@ -8,8 +8,8 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 const getCurrentUserMock = mock(async () => null);
 const endAllUserSessionsMock = mock(async () => undefined);
 const invalidateSessionCachesMock = mock(async (_token: string) => undefined);
-const revokeStewardRefreshTokenMock = mock(
-  async (_refreshToken: string, _env: unknown) => undefined,
+const revokeStewardUserSessionsMock = mock(
+  async (_accessToken: string, _env: unknown) => undefined,
 );
 const revokeInferenceStewardSessionMock = mock<
   (
@@ -26,7 +26,7 @@ mock.module("@/lib/auth", () => ({
 }));
 
 mock.module("@/api/auth/steward-refresh-token-revocation", () => ({
-  revokeStewardRefreshToken: revokeStewardRefreshTokenMock,
+  revokeStewardUserSessions: revokeStewardUserSessionsMock,
 }));
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
@@ -68,7 +68,7 @@ beforeEach(() => {
   getCurrentUserMock.mockClear();
   endAllUserSessionsMock.mockClear();
   invalidateSessionCachesMock.mockClear();
-  revokeStewardRefreshTokenMock.mockClear();
+  revokeStewardUserSessionsMock.mockClear();
   revokeInferenceStewardSessionMock.mockClear();
   revokeInferenceStewardSessionMock.mockImplementation(
     async (_token: string, _env: unknown) => ({
@@ -148,8 +148,8 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(revokeInferenceStewardSessionMock.mock.calls[0]?.[0]).toBe(
       "staging-token",
     );
-    expect(revokeStewardRefreshTokenMock).toHaveBeenCalledWith(
-      "staging-refresh",
+    expect(revokeStewardUserSessionsMock).toHaveBeenCalledWith(
+      "staging-token",
       expect.anything(),
     );
   });
@@ -181,8 +181,8 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(revokeInferenceStewardSessionMock.mock.calls[0]?.[0]).toBe(
       "prod-token",
     );
-    expect(revokeStewardRefreshTokenMock).toHaveBeenCalledWith(
-      "prod-refresh",
+    expect(revokeStewardUserSessionsMock).toHaveBeenCalledWith(
+      "prod-token",
       expect.anything(),
     );
   });
@@ -209,6 +209,10 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(revokeInferenceStewardSessionMock).toHaveBeenCalledTimes(1);
     expect(revokeInferenceStewardSessionMock.mock.calls[0]?.[0]).toBe(
       bearerToken,
+    );
+    expect(revokeStewardUserSessionsMock).toHaveBeenCalledWith(
+      bearerToken,
+      expect.anything(),
     );
     expect(invalidateSessionCachesMock).toHaveBeenCalledWith(bearerToken);
     expect(getCurrentUserMock).toHaveBeenCalledTimes(1);
@@ -241,6 +245,11 @@ describe("POST /api/auth/logout cookie clearing", () => {
     ).toEqual([bearerToken, cookieToken]);
     expect(invalidateSessionCachesMock).toHaveBeenCalledWith(bearerToken);
     expect(invalidateSessionCachesMock).toHaveBeenCalledWith(cookieToken);
+    expect(revokeStewardUserSessionsMock).toHaveBeenCalledTimes(1);
+    expect(revokeStewardUserSessionsMock).toHaveBeenCalledWith(
+      cookieToken,
+      expect.anything(),
+    );
   });
 
   test("an invalid explicit bearer preserves a valid cookie session", async () => {
@@ -266,7 +275,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(res.status).toBe(401);
     expect(deletedCookieNames(res)).toEqual([]);
     expect(revokeInferenceStewardSessionMock).toHaveBeenCalledTimes(1);
-    expect(revokeStewardRefreshTokenMock).not.toHaveBeenCalled();
+    expect(revokeStewardUserSessionsMock).not.toHaveBeenCalled();
   });
 
   test("eliza API-key bearer is never treated as a Steward session", async () => {
@@ -325,8 +334,8 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(getCurrentUserMock).not.toHaveBeenCalled();
   });
 
-  test("refresh-token revocation failure preserves every browser cookie", async () => {
-    revokeStewardRefreshTokenMock.mockRejectedValueOnce(
+  test("session-family revocation failure preserves every browser cookie", async () => {
+    revokeStewardUserSessionsMock.mockRejectedValueOnce(
       new Error("Steward unavailable"),
     );
     const res = await app.request(
@@ -353,5 +362,32 @@ describe("POST /api/auth/logout cookie clearing", () => {
       error: "Refresh-session revocation did not complete; retry logout",
     });
     expect(invalidateSessionCachesMock).not.toHaveBeenCalled();
+  });
+
+  test("a refresh cookie without an authenticated access token is preserved", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          cookie: "steward-refresh-token=refresh-token",
+          host: "api.elizacloud.ai",
+        },
+      },
+      {
+        ENVIRONMENT: "production",
+        NODE_ENV: "production",
+        STEWARD_JWT_SECRET: "test-secret",
+      },
+    );
+
+    expect(res.status).toBe(401);
+    expect(deletedCookieNames(res)).toEqual([]);
+    expect(revokeStewardUserSessionsMock).not.toHaveBeenCalled();
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      error:
+        "Authenticated Steward session required to revoke refresh sessions",
+    });
   });
 });

@@ -27,8 +27,8 @@ const syncUserFromSteward = mock(async () => ({
   welcomeBonusWithheldMessage: undefined,
 }));
 const invalidateSessionCaches = mock(async (_token: string) => undefined);
-const revokeStewardRefreshToken = mock(
-  async (_refreshToken: string, _env: unknown) => undefined,
+const revokeStewardUserSessions = mock(
+  async (_accessToken: string, _env: unknown) => undefined,
 );
 const revokeInferenceStewardSession = mock(
   async (_token: string, _env: unknown) => ({
@@ -64,7 +64,7 @@ mock.module("@/lib/auth", () => ({
 }));
 
 mock.module("@/api/auth/steward-refresh-token-revocation", () => ({
-  revokeStewardRefreshToken,
+  revokeStewardUserSessions,
 }));
 
 mock.module("@/lib/auth/steward-client", () => ({
@@ -151,7 +151,7 @@ beforeEach(() => {
   verifyStewardTokenCached.mockClear();
   syncUserFromSteward.mockClear();
   invalidateSessionCaches.mockClear();
-  revokeStewardRefreshToken.mockClear();
+  revokeStewardUserSessions.mockClear();
   revokeInferenceStewardSession.mockClear();
   revokeInferenceStewardSession.mockImplementation(
     async (_token: string, _env: unknown) => ({
@@ -228,6 +228,10 @@ describe("DELETE /api/auth/steward-session — durable revocation ordering", () 
     expect(revokeInferenceStewardSession.mock.calls[0]?.[0]).toBe(
       "cookie.payload.signature",
     );
+    expect(revokeStewardUserSessions).toHaveBeenCalledWith(
+      "cookie.payload.signature",
+      expect.anything(),
+    );
     expect(invalidateSessionCaches).toHaveBeenCalledWith(
       "cookie.payload.signature",
     );
@@ -254,21 +258,21 @@ describe("DELETE /api/auth/steward-session — durable revocation ordering", () 
     expect(invalidateSessionCaches).not.toHaveBeenCalled();
   });
 
-  test("revokes the environment-owned refresh token before deleting cookies", async () => {
+  test("uses the environment-owned access token to revoke its whole session family", async () => {
     const res = await deleteStewardSession(
       "steward-token-staging=cookie.payload.signature; steward-refresh-token-staging=refresh-token",
     );
 
     expect(res.status).toBe(200);
-    expect(revokeStewardRefreshToken).toHaveBeenCalledWith(
-      "refresh-token",
+    expect(revokeStewardUserSessions).toHaveBeenCalledWith(
+      "cookie.payload.signature",
       expect.anything(),
     );
     expect(deletedCookieNames(res)).toContain("steward-refresh-token-staging");
   });
 
-  test("refresh revocation failure preserves the access and refresh cookies", async () => {
-    revokeStewardRefreshToken.mockRejectedValueOnce(
+  test("session-family revocation failure preserves the access and refresh cookies", async () => {
+    revokeStewardUserSessions.mockRejectedValueOnce(
       new Error("Steward unavailable"),
     );
     const res = await deleteStewardSession(
@@ -281,5 +285,19 @@ describe("DELETE /api/auth/steward-session — durable revocation ordering", () 
       error: "Refresh-session revocation did not complete; retry logout",
     });
     expect(invalidateSessionCaches).not.toHaveBeenCalled();
+  });
+
+  test("preserves a refresh cookie when no access token can authorize family revocation", async () => {
+    const res = await deleteStewardSession(
+      "steward-refresh-token-staging=refresh-token",
+    );
+
+    expect(res.status).toBe(401);
+    expect(deletedCookieNames(res)).toEqual([]);
+    expect(revokeStewardUserSessions).not.toHaveBeenCalled();
+    await expect(res.json()).resolves.toEqual({
+      error:
+        "Authenticated Steward session required to revoke refresh sessions",
+    });
   });
 });

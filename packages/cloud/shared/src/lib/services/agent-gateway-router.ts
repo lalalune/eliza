@@ -931,13 +931,21 @@ export class AgentGatewayRouterService {
         to: args.to,
         error: error instanceof Error ? error.message : String(error),
       });
-      const onboarding = await this.runOnboardingChat({
-        message: args.body,
-        platform: args.provider,
-        platformUserId: args.from,
-        sessionId: `platform:${args.provider}:${args.from}`,
-        trustedPlatformIdentity: true,
-      });
+      const onboarding = await this.runOnboardingChat(
+        {
+          message: args.body,
+          platform: args.provider,
+          platformUserId: args.from,
+          sessionId: `platform:${args.provider}:${args.from}`,
+          trustedPlatformIdentity: true,
+        },
+        args.executionCtx
+          ? {
+              executionCtx: args.executionCtx,
+              requestId: randomUUID(),
+            }
+          : undefined,
+      );
 
       return {
         handled: true,
@@ -951,13 +959,21 @@ export class AgentGatewayRouterService {
 
     if (!resolved.target) {
       if (resolved.reason === "unknown_owner") {
-        const onboarding = await this.runOnboardingChat({
-          message: args.body,
-          platform: args.provider,
-          platformUserId: args.from,
-          sessionId: `platform:${args.provider}:${args.from}`,
-          trustedPlatformIdentity: true,
-        });
+        const onboarding = await this.runOnboardingChat(
+          {
+            message: args.body,
+            platform: args.provider,
+            platformUserId: args.from,
+            sessionId: `platform:${args.provider}:${args.from}`,
+            trustedPlatformIdentity: true,
+          },
+          args.executionCtx
+            ? {
+                executionCtx: args.executionCtx,
+                requestId: randomUUID(),
+              }
+            : undefined,
+        );
 
         return {
           handled: true,
@@ -975,16 +991,24 @@ export class AgentGatewayRouterService {
         resolved.organizationId &&
         !resolved.agentId
       ) {
-        const onboarding = await this.runOnboardingChat({
-          message: args.body,
-          platform: args.provider,
-          platformUserId: args.from,
-          sessionId: `platform:${args.provider}:${args.from}`,
-          authenticatedUser: {
-            userId: resolved.userId,
-            organizationId: resolved.organizationId,
+        const onboarding = await this.runOnboardingChat(
+          {
+            message: args.body,
+            platform: args.provider,
+            platformUserId: args.from,
+            sessionId: `platform:${args.provider}:${args.from}`,
+            authenticatedUser: {
+              userId: resolved.userId,
+              organizationId: resolved.organizationId,
+            },
           },
-        });
+          args.executionCtx
+            ? {
+                executionCtx: args.executionCtx,
+                requestId: randomUUID(),
+              }
+            : undefined,
+        );
 
         return {
           handled: true,
@@ -1079,16 +1103,24 @@ export class AgentGatewayRouterService {
       resolved.userId &&
       resolved.organizationId
     ) {
-      const onboarding = await this.runOnboardingChat({
-        message: args.body,
-        platform: args.provider,
-        platformUserId: args.from,
-        sessionId: `platform:${args.provider}:${args.from}`,
-        authenticatedUser: {
-          userId: resolved.userId,
-          organizationId: resolved.organizationId,
+      const onboarding = await this.runOnboardingChat(
+        {
+          message: args.body,
+          platform: args.provider,
+          platformUserId: args.from,
+          sessionId: `platform:${args.provider}:${args.from}`,
+          authenticatedUser: {
+            userId: resolved.userId,
+            organizationId: resolved.organizationId,
+          },
         },
-      });
+        args.executionCtx
+          ? {
+              executionCtx: args.executionCtx,
+              requestId: randomUUID(),
+            }
+          : undefined,
+      );
 
       return {
         handled: true,

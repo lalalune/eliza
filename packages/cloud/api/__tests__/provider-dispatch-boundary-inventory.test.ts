@@ -97,12 +97,22 @@ describe("provider dispatch architecture inventory", () => {
 
     for (const [path] of cacheAdmitted) {
       const source = readFileSync(resolve(REPO_ROOT, path), "utf8");
-      expect(source).toContain("resolveInferenceAuthContext");
+      const delegatesToElizaAppBoundary = source.includes(
+        "runElizaAppTextInference",
+      );
+      expect(
+        source.includes("resolveInferenceAuthContext") ||
+          delegatesToElizaAppBoundary,
+      ).toBe(true);
       expect(
         source.includes("admitOrganizationInference") ||
-          source.includes("admitAppInferenceCacheOnly"),
+          source.includes("admitAppInferenceCacheOnly") ||
+          delegatesToElizaAppBoundary,
       ).toBe(true);
-      expect(source).toContain("markProviderDispatched");
+      expect(
+        source.includes("markProviderDispatched") ||
+          delegatesToElizaAppBoundary,
+      ).toBe(true);
       expect(source).not.toContain("creditsService.reserve(");
     }
   });
@@ -127,8 +137,6 @@ describe("provider dispatch architecture inventory", () => {
       "packages/cloud/shared/src/lib/services/app-promotion-assets.ts",
       "packages/cloud/shared/src/lib/services/app-promotion.ts",
       "packages/cloud/shared/src/lib/services/discord-automation/app-automation.ts",
-      "packages/cloud/shared/src/lib/services/eliza-app/onboarding-chat.ts",
-      "packages/cloud/shared/src/lib/services/provisioning-agent-chat.ts",
       "packages/cloud/shared/src/lib/services/seo.ts",
       "packages/cloud/shared/src/lib/services/telegram-automation/app-automation.ts",
       "packages/cloud/shared/src/lib/services/twitter-automation/app-automation.ts",

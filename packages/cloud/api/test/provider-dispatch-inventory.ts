@@ -358,10 +358,10 @@ export const PROVIDER_DISPATCH_INVENTORY = {
         "Connection nudges are internal lifecycle work rather than caller-selected inference.",
     },
   "packages/cloud/shared/src/lib/services/eliza-app/onboarding-chat.ts": {
-    boundary: "user_request_synchronous",
+    boundary: "cache_admission",
     entrypoints: ["/api/eliza-app/onboarding/chat"],
     rationale:
-      "Public onboarding chat invokes a platform model after database-backed session work.",
+      "Authenticated onboarding uses app-session cache authorization and the shared DO dispatch wrapper; anonymous turns are deterministic.",
   },
   "packages/cloud/shared/src/lib/services/memory.ts": {
     boundary: "internal_background",
@@ -369,10 +369,10 @@ export const PROVIDER_DISPATCH_INVENTORY = {
     rationale: "Memory summarization is internal agent-runtime maintenance.",
   },
   "packages/cloud/shared/src/lib/services/provisioning-agent-chat.ts": {
-    boundary: "user_request_synchronous",
+    boundary: "cache_admission",
     entrypoints: ["/api/eliza-app/provisioning-agent/chat"],
     rationale:
-      "Provisioning chat invokes a platform model after database-backed session validation.",
+      "Provisioning chat consumes cached app-session and sandbox projections before shared DO admission.",
   },
   "packages/cloud/shared/src/lib/services/room-title.ts": {
     boundary: "internal_background",
