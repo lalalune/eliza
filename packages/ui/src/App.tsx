@@ -138,12 +138,11 @@ import { confirmDesktopAction } from "./utils/desktop-dialogs";
 import { VoiceSelfTestShell } from "./voice/voice-selftest/VoiceSelfTestShell";
 import { VoiceWorkbenchShell } from "./voice/voice-selftest/VoiceWorkbenchShell";
 
-// NOTE (#view-padding-normalize): the full floating-composer + bottom-nav +
-// safe-area bottom clearance is owned EXACTLY ONCE by the scroll region a view
-// mounts into (`TabScrollView` / `TabContentView` inner scroller, complemented
-// by `AppWorkspaceChrome`'s safe-area floor). The routed `<main>`
-// (`routedShellMainClass`) deliberately does NOT re-apply that clearance —
-// doing so double-counted it and left an oversized empty band under every view.
+// NOTE (#view-padding-normalize): the floating composer clearance is owned
+// EXACTLY ONCE by the view region (`TabScrollView` / `TabContentView`). The
+// region's scrollport ends above the composer, then keeps a small internal pad
+// for comfortable scroll-to-bottom; the routed `<main>` deliberately does not
+// re-apply that clearance because it is a non-scrolling layout box.
 type ExtractComponent<TValue> =
   TValue extends ComponentType<infer Props> ? ComponentType<Props> : never;
 
@@ -573,7 +572,7 @@ function TabScrollView({
       main={
         <div
           data-shell-scroll-region="true"
-          className={`eliza-continuous-chat-scroll flex-1 min-h-0 min-w-0 w-full overflow-y-auto pb-[var(--eliza-continuous-chat-clearance,5.25rem)] pe-[var(--eliza-continuous-chat-side-clearance,0px)] ${className}`}
+          className={`eliza-continuous-chat-scroll flex-1 min-h-0 min-w-0 w-full overflow-y-auto mb-[calc(var(--eliza-continuous-chat-clearance,5.25rem)+0.75rem)] pb-3 pe-[var(--eliza-continuous-chat-side-clearance,0px)] ${className}`}
         >
           {children}
         </div>
@@ -599,7 +598,7 @@ function TabContentView({
       main={
         <div
           data-shell-content-region="true"
-          className="eliza-continuous-chat-scroll flex flex-col flex-1 min-h-0 min-w-0 w-full overflow-hidden pb-[var(--eliza-continuous-chat-clearance,5.25rem)] pe-[var(--eliza-continuous-chat-side-clearance,0px)]"
+          className="eliza-continuous-chat-scroll flex flex-col flex-1 min-h-0 min-w-0 w-full overflow-hidden mb-[calc(var(--eliza-continuous-chat-clearance,5.25rem)+0.75rem)] pb-3 pe-[var(--eliza-continuous-chat-side-clearance,0px)]"
         >
           {children}
         </div>

@@ -15,9 +15,10 @@ export function BackgroundView() {
     <ShellViewAgentSurface viewId="background">
       {/* This view renders WITHOUT a shell scroll wrapper (the `background` tab
           is full-bleed on the transparent shell), so it owns its own bottom
-          clearance: the floating-composer + bottom-nav + safe-area stack, plus
-          the standard `--view-pad-top` gutter. No magic `pb-28`. */}
-      <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-4 pt-[var(--view-pad-top)] pb-[calc(var(--eliza-mobile-nav-offset,0px)+max(var(--safe-area-bottom,0px),var(--android-gesture-inset-bottom,0px))+var(--eliza-continuous-chat-clearance,5.25rem)+1rem)]">
+          clearance. The scrollport ends above the floating composer so the
+          lower swatches remain tappable while the wallpaper still bleeds behind
+          the native home/gesture area. */}
+      <div className="eliza-continuous-chat-scroll relative mb-[calc(var(--eliza-continuous-chat-clearance,5.25rem)+0.75rem)] flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4 pt-[var(--view-pad-top)] pb-4">
         <h1 className="sr-only">Background</h1>
         <BackgroundSettingsControls />
       </div>

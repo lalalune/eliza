@@ -580,7 +580,7 @@ describe("App navigate-view event wiring", () => {
     expect(
       container
         .querySelector('[data-shell-content-region="true"]')
-        ?.className.includes("pb-[var(--eliza-continuous-chat-clearance"),
+        ?.className.includes("mb-[calc(var(--eliza-continuous-chat-clearance"),
     ).toBe(true);
     expect(
       container
