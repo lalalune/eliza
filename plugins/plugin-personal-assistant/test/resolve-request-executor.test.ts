@@ -860,6 +860,89 @@ describe("RESOLVE_REQUEST reject path", () => {
   });
 });
 
+describe("RESOLVE_REQUEST scheduling approval path", () => {
+  it("records owner approval but fails before send when receipt persistence is unavailable", async () => {
+    const runtime = makeRuntime();
+    const payload = attachSchedulingApprovalCorrelation(
+      {
+        action: "send_email",
+        to: ["co-parent@example.com"],
+        cc: [],
+        bcc: [],
+        subject: "Scheduling: school conference",
+        body: "Would Tuesday at 4:00 PM work?",
+        threadId: null,
+        replyToMessageId: null,
+      },
+      {
+        kind: "scheduling_message",
+        negotiationId: "negotiation-17",
+        proposalId: "proposal-41",
+        messageKind: "proposal",
+        transportChannel: "email",
+        sourceUpdatedAt: "2026-07-26T18:30:00.000Z",
+        draftVersion: 1,
+      },
+    );
+    const pending = approvedRequest({
+      action: "send_email",
+      state: "pending",
+      resolvedAt: null,
+      resolvedBy: null,
+      resolutionReason: null,
+      payload,
+    });
+    const approved = {
+      ...pending,
+      state: "approved" as const,
+      resolvedAt: new Date(),
+      resolvedBy: "owner-1",
+      resolutionReason: "reviewed exact draft",
+    };
+    docMocks.list.mockResolvedValue([pending]);
+    docMocks.approve.mockResolvedValue(approved);
+    const sendSpy = vi.spyOn(LifeOpsService.prototype, "sendGmailMessage");
+    const { texts, callback } = collectTexts();
+
+    const result = await resolveRequestAction.handler(
+      runtime,
+      {
+        id: randomUUID() as UUID,
+        entityId: "owner-1" as UUID,
+        roomId: randomUUID() as UUID,
+        content: { text: `approve ${pending.id}` },
+      } as Memory,
+      undefined,
+      {
+        parameters: {
+          action: "approve",
+          requestId: pending.id,
+          reason: "reviewed exact draft",
+        },
+      } as unknown as HandlerOptions,
+      callback,
+    );
+
+    expect(docMocks.approve).toHaveBeenCalledWith(pending.id, {
+      resolvedBy: "owner-1",
+      resolutionReason: "reviewed exact draft",
+    });
+    expect(result).toMatchObject({
+      success: false,
+      data: {
+        error: "SCHEDULING_DELIVERY_RECEIPT_EXECUTOR_UNAVAILABLE",
+        requestId: pending.id,
+        state: "approved",
+        sent: false,
+      },
+    });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(docMocks.markExecuting).not.toHaveBeenCalled();
+    expect(docMocks.markDone).not.toHaveBeenCalled();
+    expect(texts.join(" ")).toContain("Nothing was sent");
+  });
+});
+
 describe("RESOLVE_REQUEST ambiguous-target chips (#14733)", () => {
   function pendingPair(): [ApprovalRequest, ApprovalRequest] {
     const base = {
