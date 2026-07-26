@@ -1,8 +1,8 @@
-# Giraffe agentic parent suite: capability audit and implementation plan
+# Agentic parent suite: capability audit and implementation plan
 
-**Status:** research and implementation proposal  
+**Status:** implementation contract; delivery status is tracked below  
 **Date:** 2026-07-26  
-**Input reviewed:** `Giraffe_Design_Brief_v2.pdf`, all nine pages, including a
+**Input reviewed:** the nine-page parent-assistant design brief, all nine pages, including a
 rendered visual review  
 **Product boundary:** extend LifeOps through the existing elizaOS runtime,
 calendar, scheduling, approval, entity, connector, and scenario infrastructure.
@@ -11,7 +11,7 @@ runtime rails, or behavior inferred from prompt text.
 
 ## Executive conclusion
 
-The Giraffe brief is directionally right, but it describes a product that is
+The design brief is directionally right, but it describes a product that is
 much more than an LLM with calendar access. The LLM can already do a meaningful
 part of the work:
 
@@ -31,7 +31,7 @@ properties require deterministic platform primitives.
 
 The recommended product contract is:
 
-> Giraffe owns Conception and Planning wherever it has reliable evidence. It
+> the suite owns Conception and Planning wherever it has reliable evidence. It
 > executes reversible, low-risk work within an explicit policy, and hands
 > consequential decisions, sends, purchases, custody changes, medical matters,
 > and financial commitments to the correct human for approval.
@@ -59,7 +59,7 @@ elizaOS already has much of the orchestration substrate:
 - bidirectional voice infrastructure; and
 - a serious scenario runner with live-model trajectories and artifact checks.
 
-However, the existing product is not yet Giraffe. The major gaps are
+However, the existing product is not yet the suite. The major gaps are
 authoritative household ingestion, guest free/busy, family roles and scoped
 access, schedule proposals versus agreements, dependency-aware conflict
 detection, append-only shared records, school and community sources, meal/cart
@@ -77,6 +77,38 @@ should be one trusted loop for a world-traveling co-parent:
 5. monitor source changes;
 6. recompute and re-approve material changes; and
 7. verify closure.
+
+## Delivery ledger
+
+This ledger is the source of truth for implementation and evidence. A work
+package is complete only when its production path, failure modes, real-provider
+or sandbox-provider round trip, live-model trajectory, and human-reviewed
+artifacts all pass. Unit tests or deterministic fixtures alone do not advance a
+row to complete.
+
+| Work package | Production implementation | Real E2E | Evidence reviewed | Status |
+| --- | --- | --- | --- | --- |
+| Calendar source registry and health | Not started | Not started | Not started | Planned |
+| Guest free/busy and deterministic availability | Not started | Not started | Not started | Planned |
+| Scheduling drafts, approvals, and materialization | Not started | Not started | Not started | Planned |
+| Household roles and scoped access grants | Not started | Not started | Not started | Planned |
+| Schedule proposals and agreements | Not started | Not started | Not started | Planned |
+| Append-only household audit and scoped export | Not started | Not started | Not started | Planned |
+| Microsoft and ICS/webcal calendar sources | Not started | Not started | Not started | Planned |
+| School and activity-source ingestion | Not started | Not started | Not started | Planned |
+| Action bundles, responsibility ownership, and weekly brief | Not started | Not started | Not started | Planned |
+| Weather, maps, and local-activity sources | Not started | Not started | Not started | Planned |
+| Household items, vendors, and seasonal almanac | Not started | Not started | Not started | Planned |
+| Food constraints, inventory, cart, and order recovery | Not started | Not started | Not started | Planned |
+| Childcare/work scenario model | Not started | Not started | Not started | Planned |
+| Source-grounded parenting guidance and handoff | Not started | Not started | Not started | Planned |
+| World-traveling co-parent persona and G1-G48 corpus | Not started | Not started | Not started | Planned |
+| Existing Jordan J1 live verification | Authored | Not started | Not started | Incomplete |
+
+Every incomplete row is a release blocker for the complete suite. Individual
+pull requests may land dependency-ordered slices, but no document, issue, or
+project card should represent the overall suite as complete while a row remains
+planned, partial, mocked, skipped, or unreviewed.
 
 That loop proves the difficult shared primitives that every later category
 needs.
@@ -99,7 +131,7 @@ The strongest ideas in the brief should become acceptance criteria:
 4. **A reminder must lead to action.** A due date needs the responsible person,
    contact, source, link, location, prerequisites, and next safe action.
 5. **Cross-household communication stays factual and approved.** Observation -
-   Need - Request is a useful draft structure. Giraffe must not invent a
+   Need - Request is a useful draft structure. the suite must not invent a
    feeling, motive, diagnosis, legal conclusion, or concession.
 6. **Shared records survive scrutiny.** Proposed and confirmed schedule changes
    must be distinguishable, versioned, exportable, and scoped to the people who
@@ -169,8 +201,8 @@ across platforms and provides:
 - REST routes and task-state logs; and
 - structural behavior that never pattern-matches `promptInstructions`.
 
-Giraffe must contribute new task definitions, gates, completion checks, event
-families, anchors, and pipelines to this runner. It must not add a “Giraffe
+the suite must contribute new task definitions, gates, completion checks, event
+families, anchors, and pipelines to this runner. It must not add a “the suite
 scheduler.”
 
 ### 3.2 Calendar: substantial, but not yet a family scheduling engine
@@ -217,7 +249,7 @@ Google exposes pagination, incremental sync tokens, controlled full resync after
 token invalidation, and push notifications
 ([incremental synchronization](https://developers.google.com/workspace/calendar/api/guides/sync),
 [push notifications](https://developers.google.com/workspace/calendar/api/guides/push)).
-Those mechanisms are required for Giraffe’s promise to notice school, travel,
+Those mechanisms are required for the suite’s promise to notice school, travel,
 and co-parent changes.
 
 Apple support is materially narrower than Google in the current bridge. The
@@ -246,11 +278,11 @@ not truly against a co-parent, caregiver, guest, room, or resource calendar.
 There is also a second `CONFLICT_DETECT` action in
 `plugins/plugin-calendar/src/actions/conflict-detect.ts` that explicitly
 returns scaffold failures. The capability should have one canonical owner.
-Before Giraffe builds on it, consolidate the implementation in the calendar
+Before the suite builds on it, consolidate the implementation in the calendar
 domain and remove or replace the scaffold registration.
 
 Current conflict semantics are also too shallow for families. They are based on
-time overlap and shared attendees. Giraffe needs conflict kinds for custody,
+time overlap and shared attendees. the suite needs conflict kinds for custody,
 caregiver coverage, school pickup, travel time, vehicle/car seat, child age,
 sibling incompatibility, preparation deadlines, recovery/rest, accessibility,
 and private-busy constraints.
@@ -267,7 +299,7 @@ LifeOps already stores scheduling negotiations and proposals:
 This is valuable substrate, but
 `plugins/plugin-personal-assistant/src/lifeops/domains/scheduling-service.ts`
 currently dispatches messages during `startNegotiation`, `proposeTime`,
-`finalizeNegotiation`, and `cancelNegotiation`. That violates the Giraffe
+`finalizeNegotiation`, and `cancelNegotiation`. That violates the the suite
 brief’s mandatory human-approved-send rule for co-parents and schools.
 
 The scheduling domain should produce a typed outbound draft or approval task.
@@ -411,17 +443,17 @@ Required behavior:
 ### 5.2 “Looking at a guest calendar”
 
 There is no ethical or technical shortcut for reading a guest’s calendar.
-Giraffe should support four explicit paths:
+the suite should support four explicit paths:
 
 1. **Shared calendar grant.** The guest shares a Google, Microsoft, Apple, or
-   CalDAV calendar with the connected account. Giraffe reads only the granted
+   CalDAV calendar with the connected account. the suite reads only the granted
    visibility.
-2. **Free/busy grant.** The guest authorizes free/busy only. Giraffe receives
+2. **Free/busy grant.** The guest authorizes free/busy only. the suite receives
    busy intervals without titles or descriptions. Google supports a
    `freeBusy.query` operation and a `freeBusyReader` ACL role
    ([Google free/busy](https://developers.google.com/workspace/calendar/api/v3/reference/freebusy/query),
    [Google sharing roles](https://developers.google.com/workspace/calendar/api/concepts/sharing)).
-3. **Availability request.** Giraffe sends an owner-approved request or
+3. **Availability request.** the suite sends an owner-approved request or
    scheduling link. The guest selects acceptable slots without connecting a
    calendar.
 4. **Published ICS/webcal.** The guest or organization supplies a read-only
@@ -739,7 +771,7 @@ The travel-impact pipeline should:
 
 International child travel is legally sensitive. Passport, consent-letter,
 visa, and custody requirements vary by destination and family circumstances.
-Giraffe may build an official-source checklist but must not claim the child is
+the suite may build an official-source checklist but must not claim the child is
 “cleared to travel”
 ([U.S. State Department minors guidance](https://travel.state.gov/en/international-travel/planning/personal-needs/minors.html),
 [passport guidance for children under 16](https://travel.state.gov/en/passports/apply/child/under-16.html)).
@@ -860,7 +892,7 @@ Order execution needs:
 
 ### 6.6 Parenting guidance must remain informational and human-connected
 
-Giraffe can retrieve and explain a user-selected parenting framework, suggest
+the suite can retrieve and explain a user-selected parenting framework, suggest
 low-risk options, and prepare reflection prompts. It must not diagnose, imitate
 a clinician, surveil a child’s emotions, or optimize emotional dependence.
 The American Academy of Pediatrics warns that conversational fluency is not
@@ -1086,7 +1118,7 @@ branch.
 
 ### 9.3 Trust contract
 
-Giraffe must:
+the suite must:
 
 - show source, freshness, and proposed-versus-confirmed state;
 - ask before sends, purchases, signatures, custody-impacting changes, and
@@ -1275,7 +1307,7 @@ replanned, and closed without leaking private calendar details.
 
 ### Phase 2 - school, external oracle, household, and seasonal domains
 
-**Goal:** Giraffe owns Conception for recurring family logistics.
+**Goal:** the suite owns Conception for recurring family logistics.
 
 1. Add school email/document/ICS ingestion pipeline with versioning.
 2. Add configurable school/SIS and team/activity adapters.
@@ -1392,32 +1424,32 @@ the assistant, or emotional engagement.
 
 ## 15. Recommended first issues
 
-1. **[Giraffe P0] Consolidate conflict detection and wire Google free/busy.**
-2. **[Giraffe P0] Route scheduling negotiation sends through approval policy.**
-3. **[Giraffe P0] Ratify calendar-source health and partial-failure contract.**
-4. **[Giraffe P0] Author Maya world-traveling co-parent persona and composite
+1. **[Parent suite P0] Consolidate conflict detection and wire Google free/busy.**
+2. **[Parent suite P0] Route scheduling negotiation sends through approval policy.**
+3. **[Parent suite P0] Ratify calendar-source health and partial-failure contract.**
+4. **[Parent suite P0] Author Maya world-traveling co-parent persona and composite
    capability catalog.**
-5. **[Giraffe P0] Live-verify J1 ten of ten with real/sandbox connectors.**
-6. **[Giraffe P1] Household roles, scoped/expiring caregiver access, and
+5. **[Parent suite P0] Live-verify J1 ten of ten with real/sandbox connectors.**
+6. **[Parent suite P1] Household roles, scoped/expiring caregiver access, and
    private-busy.**
-7. **[Giraffe P1] Schedule-change proposal/agreement/materiality state machine.**
-8. **[Giraffe P1] Append-only household audit and scoped export.**
-9. **[Giraffe P1] Microsoft Graph calendar and free/busy connector.**
-10. **[Giraffe P1] Hardened ICS/webcal school-calendar ingestion.**
-11. **[Giraffe P1] World-traveling co-parent journey G1-G24 with real evidence.**
-12. **[Giraffe P2] School notice ingestion and correction monitoring.**
-13. **[Giraffe P2] Action bundle, CPEM ownership, and household weekly brief.**
-14. **[Giraffe P2] Typed weather/maps/local-activity oracle pipeline.**
-15. **[Giraffe P2] Household item/vendor/almanac primitives.**
-16. **[Giraffe P3] Food constraints, inventory confidence, and Instacart cart
+7. **[Parent suite P1] Schedule-change proposal/agreement/materiality state machine.**
+8. **[Parent suite P1] Append-only household audit and scoped export.**
+9. **[Parent suite P1] Microsoft Graph calendar and free/busy connector.**
+10. **[Parent suite P1] Hardened ICS/webcal school-calendar ingestion.**
+11. **[Parent suite P1] World-traveling co-parent journey G1-G24 with real evidence.**
+12. **[Parent suite P2] School notice ingestion and correction monitoring.**
+13. **[Parent suite P2] Action bundle, CPEM ownership, and household weekly brief.**
+14. **[Parent suite P2] Typed weather/maps/local-activity oracle pipeline.**
+15. **[Parent suite P2] Household item/vendor/almanac primitives.**
+16. **[Parent suite P3] Food constraints, inventory confidence, and Instacart cart
     handoff.**
-17. **[Giraffe P3] Idempotent grocery order and delivery recovery.**
-18. **[Giraffe P4] Childcare/work deterministic scenario model.**
-19. **[Giraffe P4] Source-grounded parenting guidance and human handoff policy.**
+17. **[Parent suite P3] Idempotent grocery order and delivery recovery.**
+18. **[Parent suite P4] Childcare/work deterministic scenario model.**
+19. **[Parent suite P4] Source-grounded parenting guidance and human handoff policy.**
 
 ## 16. Decision summary
 
-Build Giraffe as one LifeOps assistant with composable capabilities, not a staff
+Build the suite as one LifeOps assistant with composable capabilities, not a staff
 of named agents the parent must administer. Specialists may exist internally
 as bounded services or views, but the user should have one relationship, one
 source/permission model, one approval queue, one scheduler, and one audit
@@ -1432,5 +1464,5 @@ The world-traveling co-parent persona is the right integration test because it
 forces nearly every hard issue to become concrete: multiple calendars, privacy,
 time zones, custody, caregivers, travel changes, children’s routines, outbound
 approval, and closure. If that loop works honestly at L4, the rest of the
-Giraffe taxonomy becomes a sequence of domain additions rather than a collection
+suite taxonomy becomes a sequence of domain additions rather than a collection
 of disconnected demos.
