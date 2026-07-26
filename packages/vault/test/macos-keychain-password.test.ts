@@ -10,6 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  computeKeychainPromptBudget,
+  KEYCHAIN_EXPECT_WAIT_STAGES,
+  KEYCHAIN_HARD_DEADLINE_GRACE_MS,
   MacOSKeychainPasswordWriteError,
   writeMacOSKeychainPassword,
 } from "../src/macos-keychain-password.js";
@@ -20,6 +23,39 @@ const STTY_PATH = "/bin/stty";
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
+
+describe("computeKeychainPromptBudget", () => {
+  it("splits the total budget across the three expect wait stages", () => {
+    const budget = computeKeychainPromptBudget(10_000);
+    expect(budget.stageTimeoutMs).toBe(3_334);
+    // Expect rounds 3334ms up to 4 whole seconds per stage; the hard deadline
+    // must cover all three rounded stages plus the grace window.
+    expect(budget.hardDeadlineMs).toBe(
+      3 * 4_000 + KEYCHAIN_HARD_DEADLINE_GRACE_MS,
+    );
+  });
+
+  it("keeps sub-stage budgets at least one millisecond", () => {
+    expect(computeKeychainPromptBudget(1).stageTimeoutMs).toBe(1);
+    expect(computeKeychainPromptBudget(2).stageTimeoutMs).toBe(1);
+  });
+
+  it("never lets the Node hard deadline preempt expect's own stage timeouts", () => {
+    // The expect script rounds its per-stage timeout up to whole seconds, so
+    // a run can legitimately occupy stages × roundedStageSeconds before expect
+    // reports its own structured timeout. The SIGKILL deadline must sit beyond
+    // that worst case for every budget, or slow-but-legitimate interactions
+    // die mid-stage without diagnostics.
+    for (const timeoutMs of [1, 100, 750, 1_000, 2_500, 10_000, 60_000]) {
+      const budget = computeKeychainPromptBudget(timeoutMs);
+      const expectWorstCaseMs =
+        KEYCHAIN_EXPECT_WAIT_STAGES *
+        Math.ceil(budget.stageTimeoutMs / 1000) *
+        1000;
+      expect(budget.hardDeadlineMs).toBeGreaterThan(expectWorstCaseMs);
+    }
+  });
+});
 
 describe("writeMacOSKeychainPassword input validation", () => {
   it("rejects empty and multiline passwords before spawning", () => {
@@ -39,6 +75,53 @@ describe("writeMacOSKeychainPassword input validation", () => {
     ).rejects.toThrow(/failed to start macOS Keychain prompt helper/);
   });
 });
+
+describe.runIf(process.platform !== "win32")(
+  "writeMacOSKeychainPassword expect budget wiring",
+  () => {
+    let testDir = "";
+
+    beforeEach(async () => {
+      testDir = await mkdtemp(join(tmpdir(), "eliza-keychain-budget-test-"));
+    });
+
+    afterEach(async () => {
+      await rm(testDir, { recursive: true, force: true });
+    });
+
+    it("hands expect the per-stage share of the total budget", async () => {
+      const reportPath = join(testDir, "env-report.json");
+      const fakeExpect = join(testDir, "fake-expect.mjs");
+      await writeFile(
+        fakeExpect,
+        `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(
+  ${JSON.stringify(reportPath)},
+  JSON.stringify({ timeoutMs: process.env.ELIZA_KEYCHAIN_EXPECT_TIMEOUT_MS }),
+);
+process.exit(0);
+`,
+        "utf8",
+      );
+      await chmod(fakeExpect, 0o700);
+
+      await writeMacOSKeychainPassword(
+        "unit-test-service",
+        "unit-test-account",
+        "stdin-only-secret",
+        { expectExecutable: fakeExpect, timeoutMs: 10_000 },
+      );
+
+      const report = JSON.parse(await readFile(reportPath, "utf8")) as {
+        timeoutMs: string;
+      };
+      expect(report.timeoutMs).toBe(
+        String(computeKeychainPromptBudget(10_000).stageTimeoutMs),
+      );
+    });
+  },
+);
 
 describe.runIf(process.platform === "darwin")(
   "writeMacOSKeychainPassword PTY protocol",

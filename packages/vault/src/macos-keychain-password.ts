@@ -116,12 +116,52 @@ expect {
 `;
 
 export interface MacOSKeychainPasswordWriteOptions {
-  /** Total prompt deadline before expect terminates the security command. */
+  /**
+   * Total prompt deadline, split evenly across the expect script's three wait
+   * stages (password prompt, retype prompt, command completion).
+   */
   readonly timeoutMs?: number;
   /** Test seam for exercising the protocol without the host Keychain. */
   readonly securityExecutable?: string;
   /** Test seam for deterministic process-boundary tests. */
   readonly expectExecutable?: string;
+}
+
+/** Wait stages in the expect script that each consume its `timeout` setting. */
+export const KEYCHAIN_EXPECT_WAIT_STAGES = 3;
+
+/** Slack after expect's own worst case before Node force-kills the helper. */
+export const KEYCHAIN_HARD_DEADLINE_GRACE_MS = 1_500;
+
+export interface KeychainPromptBudget {
+  /** Per-stage deadline handed to expect via the timeout env variable. */
+  readonly stageTimeoutMs: number;
+  /** Node-side SIGKILL deadline covering all stages at second granularity. */
+  readonly hardDeadlineMs: number;
+}
+
+/**
+ * Splits the caller's total budget across the expect script's wait stages and
+ * derives the Node-side hard deadline from the stages' real worst case. Expect
+ * timeouts have whole-second granularity (the script rounds the env value up),
+ * so the hard deadline is computed from the rounded per-stage seconds — never
+ * from `timeoutMs` directly — ensuring Node cannot SIGKILL the helper while
+ * expect is still legitimately waiting inside one of its stages.
+ */
+export function computeKeychainPromptBudget(
+  timeoutMs: number,
+): KeychainPromptBudget {
+  const stageTimeoutMs = Math.max(
+    1,
+    Math.ceil(timeoutMs / KEYCHAIN_EXPECT_WAIT_STAGES),
+  );
+  const stageSeconds = Math.ceil(stageTimeoutMs / 1000);
+  return {
+    stageTimeoutMs,
+    hardDeadlineMs:
+      KEYCHAIN_EXPECT_WAIT_STAGES * stageSeconds * 1000 +
+      KEYCHAIN_HARD_DEADLINE_GRACE_MS,
+  };
 }
 
 export class MacOSKeychainPasswordWriteError extends Error {
@@ -182,6 +222,7 @@ export function writeMacOSKeychainPassword(
 
   const expectExecutable = options.expectExecutable ?? "/usr/bin/expect";
   const securityExecutable = options.securityExecutable ?? "/usr/bin/security";
+  const budget = computeKeychainPromptBudget(timeoutMs);
 
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -190,7 +231,7 @@ export function writeMacOSKeychainPassword(
       {
         env: {
           ...process.env,
-          [EXPECT_TIMEOUT_ENV]: String(timeoutMs),
+          [EXPECT_TIMEOUT_ENV]: String(budget.stageTimeoutMs),
           [EXPECT_SECURITY_ENV]: securityExecutable,
           [EXPECT_SERVICE_ENV]: service,
           [EXPECT_ACCOUNT_ENV]: account,
@@ -213,7 +254,7 @@ export function writeMacOSKeychainPassword(
 
     const hardDeadline = setTimeout(() => {
       child.kill("SIGKILL");
-    }, timeoutMs + 1_500);
+    }, budget.hardDeadlineMs);
     hardDeadline.unref();
 
     child.once("error", (cause) => {
