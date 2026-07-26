@@ -435,8 +435,20 @@ export function accountIdForGrant(grant: LifeOpsConnectorGrant): string {
   );
 }
 
-function dateTimeValue(value: string | undefined, fallback: string): string {
-  return value?.trim() ? value : fallback;
+function requireEventDateTime(
+  value: string | undefined,
+  field: "start" | "end",
+  eventId: string,
+): string {
+  const normalized = value?.trim();
+  if (normalized) {
+    return normalized;
+  }
+  fail(
+    502,
+    `Google Calendar event ${eventId} is missing its ${field} time.`,
+    "GOOGLE_CALENDAR_INVALID_EVENT_TIME",
+  );
 }
 
 export function lifeOpsCalendarEventFromGoogle(args: {
@@ -448,8 +460,8 @@ export function lifeOpsCalendarEventFromGoogle(args: {
   const { event, grant, agentId } = args;
   const syncedAt = args.syncedAt ?? new Date().toISOString();
   const externalId = event.id;
-  const startAt = dateTimeValue(event.start, syncedAt);
-  const endAt = dateTimeValue(event.end, startAt);
+  const startAt = requireEventDateTime(event.start, "start", externalId);
+  const endAt = requireEventDateTime(event.end, "end", externalId);
   const connectorAccountId = accountIdForGrant(grant);
   return {
     id: `${agentId}:google:${grant.side}:grant:${grant.id}:calendar:${event.calendarId}:${externalId}`,
@@ -473,8 +485,10 @@ export function lifeOpsCalendarEventFromGoogle(args: {
     recurrence: event.recurrence ?? null,
     recurringEventId: event.recurringEventId ?? null,
     metadata: {
-      googlePlugin: true,
       ...(event.metadata ?? {}),
+      googlePlugin: true,
+      transparency: event.transparency ?? "opaque",
+      visibility: event.visibility ?? "default",
     },
     syncedAt,
     updatedAt: syncedAt,
