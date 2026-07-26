@@ -120,6 +120,12 @@ function ensureSimulatorBooted() {
   if (process.platform !== "darwin") {
     throw new Error("iOS cloud onboarding requires macOS with xcrun simctl.");
   }
+  const explicitUdid = val("--udid");
+  if (explicitUdid) {
+    tryRun("xcrun", ["simctl", "boot", explicitUdid]);
+    simctl(["bootstatus", explicitUdid, "-b"], { stdio: "inherit" });
+    return explicitUdid;
+  }
   const existing = bootedUdid();
   if (existing) {
     log(`reusing booted simulator ${existing}`);
