@@ -45,9 +45,9 @@ vi.mock("@elizaos/core", async (importOriginal) => {
 
 import type { IAgentRuntime } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createGitHubPatProvider } from "../services/workspace-github.js";
 import {
   CodingWorkspaceService,
-  createGitHubPatProvider,
   DiffGateBlockedError,
 } from "../services/workspace-service.js";
 
@@ -126,7 +126,7 @@ describe("GitHub workspace provider repository boundary", () => {
         expiresAt: new Date("2030-01-01T00:00:00.000Z"),
         provider: "github",
       }),
-    ).rejects.toThrow("Invalid GitHub repository format");
+    ).rejects.toThrow("Cannot parse owner/repo");
     expect(createClient).not.toHaveBeenCalled();
   });
 });

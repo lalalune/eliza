@@ -21,10 +21,7 @@ import { Octokit } from "@octokit/rest";
 import type {
   CreateIssueOptions,
   CredentialService as CredentialServiceInstance,
-  GitCredential,
-  GitCredentialRequest,
   GitHubPatClient as GitHubPatClientInstance,
-  GitProviderAdapter,
   IssueComment,
   IssueInfo,
   IssueState,
@@ -56,25 +53,11 @@ type WorkspaceServiceWithCloneOverride = {
   ) => Promise<void>;
 };
 
-type GitHubPatProviderClient = Pick<
-  GitHubPatClientInstance,
-  "branchExists" | "createPullRequest"
->;
-
-interface GitHubRepoParts {
-  owner: string;
-  repo: string;
-}
-
-interface GitHubPatProviderOptions {
-  createClient?: (token: string) => GitHubPatProviderClient;
-  createRequest?: (token: string) => GitHubRequest;
-}
-
 import type { RemotePullRequest } from "./ground-truth-verifier.js";
 import type { ParsedPullRequestLink } from "./pull-request-link.js";
 import type { AuthPromptCallback, GitHubRequest } from "./workspace-github.js";
 import {
+  createGitHubPatProvider,
   type GitHubContext,
   addComment as ghAddComment,
   addLabels as ghAddLabels,
@@ -279,80 +262,6 @@ function isGitHubRepository(repo: string): boolean {
   return false;
 }
 
-function parseGitHubRepository(repo: string): GitHubRepoParts {
-  const normalized = repo.trim().replace(/\.git$/i, "");
-  const match =
-    normalized.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/i) ??
-    normalized.match(/^[^@\s]+@github\.com:([^/]+)\/([^/]+)$/i) ??
-    normalized.match(/^github:([^/]+)\/([^/]+)$/i) ??
-    normalized.match(/^([^/]+)\/([^/]+)$/);
-  if (!match) {
-    throw new Error(`Invalid GitHub repository format: ${repo}`);
-  }
-  return { owner: match[1], repo: match[2] };
-}
-
-export function createGitHubPatProvider(
-  options: GitHubPatProviderOptions = {},
-): GitProviderAdapter {
-  const createClient =
-    options.createClient ?? ((token) => new GitHubPatClient({ token }));
-  const createRequest =
-    options.createRequest ??
-    ((token) => {
-      const octokit = new Octokit({ auth: token });
-      return octokit.request.bind(octokit) as GitHubRequest;
-    });
-
-  return {
-    name: "github",
-    getCredentials(_request: GitCredentialRequest): Promise<GitCredential> {
-      return Promise.reject(
-        new Error(
-          "GitHub workspace credentials must be supplied by the workspace request",
-        ),
-      );
-    },
-    revokeCredential(_credentialId: string): Promise<void> {
-      return Promise.resolve();
-    },
-    async createPullRequest(prOptions): Promise<PullRequestInfo> {
-      const { owner, repo } = parseGitHubRepository(prOptions.repo);
-      const client = createClient(prOptions.credential.token);
-      return client.createPullRequest(owner, repo, {
-        title: prOptions.title,
-        body: prOptions.body,
-        head: prOptions.sourceBranch,
-        base: prOptions.targetBranch,
-        draft: prOptions.draft,
-        labels: prOptions.labels,
-        reviewers: prOptions.reviewers,
-      });
-    },
-    async branchExists(
-      repo: string,
-      branch: string,
-      credential: GitCredential,
-    ): Promise<boolean> {
-      const parts = parseGitHubRepository(repo);
-      const client = createClient(credential.token);
-      return client.branchExists(parts.owner, parts.repo, branch);
-    },
-    async getDefaultBranch(
-      repo: string,
-      credential: GitCredential,
-    ): Promise<string> {
-      const parts = parseGitHubRepository(repo);
-      const request = createRequest(credential.token);
-      const response = await request<{ default_branch: string }>(
-        "GET /repos/{owner}/{repo}",
-        { owner: parts.owner, repo: parts.repo },
-      );
-      return response.data.default_branch;
-    },
-  };
-}
-
 // Restrict which transports git may use for these spawns. Blocks `ext`
 // (arbitrary command execution), `file` (local repo disclosure), and the git://
 // daemon (unauthenticated / MITM-able), while keeping the transports real
@@ -450,7 +359,7 @@ export class CodingWorkspaceService {
   // has no other GC on the cap), unlike accounting-only ACP scratch dirs.
   private readonly workspaceRegistry: WorkspaceRegistry;
   private workspaces: Map<string, WorkspaceResult> = new Map();
-  private ambientCredentialWorkspaceIds = new Set<string>();
+  private ambientCredentialIdsByWorkspace = new Map<string, string>();
   private labels: Map<string, string> = new Map(); // label -> workspaceId
   private scratchBySession: Map<string, ScratchWorkspaceRecord> = new Map();
   private scratchCleanupTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -542,10 +451,36 @@ export class CodingWorkspaceService {
   }
 
   private async initialize(): Promise<void> {
+    const credentialTtlSeconds = Math.max(
+      1,
+      Math.ceil((this.serviceConfig.workspaceTtlMs ?? 1) / 1000),
+    );
     this.credentialService = new CredentialService({
       tokenStore: new MemoryTokenStore(),
+      defaultTtlSeconds: credentialTtlSeconds,
+      maxTtlSeconds: credentialTtlSeconds,
     });
-    this.credentialService.registerProvider(createGitHubPatProvider());
+    this.credentialService.registerProvider(
+      createGitHubPatProvider({
+        resolveToken: (credential) => {
+          let isAmbient = false;
+          for (const credentialId of this.ambientCredentialIdsByWorkspace.values()) {
+            if (credentialId === credential.id) {
+              isAmbient = true;
+              break;
+            }
+          }
+          if (!isAmbient) return credential.token;
+          const current = this.resolveUserCredentials(
+            credential.repo,
+            undefined,
+          );
+          return current?.type === "pat" || current?.type === "oauth"
+            ? current.token
+            : undefined;
+        },
+      }),
+    );
 
     this.workspaceService = new WorkspaceService({
       config: {
@@ -665,6 +600,7 @@ export class CodingWorkspaceService {
       }
     }
     this.workspaces.clear();
+    this.ambientCredentialIdsByWorkspace.clear();
     this.workspaceService = null;
     this.credentialService = null;
     this.githubClient = null;
@@ -748,8 +684,21 @@ export class CodingWorkspaceService {
 
     const workspace = await this.workspaceService.provision(workspaceConfig);
     if (usesAmbientGitHubToken) {
+      if (!workspace.credential) {
+        throw new ElizaError(
+          "Workspace credential service omitted the ambient GitHub grant",
+          {
+            code: "GITHUB_WORKSPACE_CREDENTIAL_MISSING",
+            context: { workspaceId: workspace.id, repo: workspace.repo },
+            severity: "ephemeral",
+          },
+        );
+      }
       await this.removeAmbientCredentialHelper(workspace.path);
-      this.ambientCredentialWorkspaceIds.add(workspace.id);
+      this.ambientCredentialIdsByWorkspace.set(
+        workspace.id,
+        workspace.credential.id,
+      );
     }
     const result: WorkspaceResult = {
       id: workspace.id,
@@ -885,7 +834,7 @@ export class CodingWorkspaceService {
     if (!workspace) {
       throw new Error(`Workspace ${workspaceId} not found`);
     }
-    const ambientCredentials = this.ambientCredentialWorkspaceIds.has(
+    const ambientCredentials = this.ambientCredentialIdsByWorkspace.has(
       workspaceId,
     )
       ? this.resolveUserCredentials(workspace.repo, undefined)
@@ -1230,6 +1179,7 @@ export class CodingWorkspaceService {
       this.workspaceRegistry.unregister(workspace.path);
     }
     this.workspaces.delete(workspaceId);
+    this.ambientCredentialIdsByWorkspace.delete(workspaceId);
     this.log(`Removed workspace ${workspaceId}`);
   }
 

@@ -13,10 +13,14 @@ import { ElizaError } from "@elizaos/core";
 import { Octokit } from "@octokit/rest";
 import type {
   CreateIssueOptions,
+  GitCredential,
+  GitCredentialRequest,
   GitHubPatClient as GitHubPatClientInstance,
+  GitProviderAdapter,
   IssueComment,
   IssueInfo,
   IssueState,
+  PullRequestInfo,
 } from "git-workspace-service";
 import type {
   RemoteCheck,
@@ -56,19 +60,35 @@ export interface GitHubContext {
   log: (msg: string) => void;
 }
 
+type GitHubPatProviderClient = Pick<
+  GitHubPatClientInstance,
+  "createPullRequest"
+>;
+
+export interface GitHubPatProviderOptions {
+  createClient?: (token: string) => GitHubPatProviderClient;
+  createRequest?: (token: string) => GitHubRequest;
+  resolveToken?: (
+    credential: GitCredential,
+  ) => string | undefined | Promise<string | undefined>;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 export function parseOwnerRepo(repo: string): {
   owner: string;
   repo: string;
 } {
-  // Handle URLs like https://github.com/owner/repo or owner/repo. GitHub
-  // repository names may contain dots, so do not use a dot as a delimiter.
+  // These are the GitHub remote spellings accepted by the workspace clone
+  // boundary. Keeping one strict parser prevents credential scope checks and
+  // issue operations from disagreeing about which repository a string names.
   const normalized = repo
     .trim()
     .replace(/^https?:\/\/github\.com\//i, "")
-    .replace(/[?#].*$/, "")
-    .replace(/\.git$/, "");
+    .replace(/^ssh:\/\/(?:[^@\s]+@)?github\.com(?::\d+)?\//i, "")
+    .replace(/^[^@\s]+@github\.com:/i, "")
+    .replace(/^github:/i, "")
+    .replace(/\.git$/i, "");
   const parts = normalized.split("/");
   if (
     parts.length !== 2 ||
@@ -77,7 +97,10 @@ export function parseOwnerRepo(repo: string): {
     !/^[a-zA-Z0-9_-]+$/.test(parts[0]) ||
     !/^[a-zA-Z0-9_.-]+$/.test(parts[1])
   ) {
-    throw new Error(`Cannot parse owner/repo from: ${repo}`);
+    throw new ElizaError("Cannot parse owner/repo from supplied repository", {
+      code: "GITHUB_REPOSITORY_INVALID",
+      severity: "ephemeral",
+    });
   }
   return { owner: parts[0], repo: parts[1] };
 }
@@ -91,6 +114,188 @@ export type GitHubRequest = <T>(
 function createGitHubRequest(token: string): GitHubRequest {
   const octokit = new Octokit({ auth: token });
   return octokit.request.bind(octokit) as GitHubRequest;
+}
+
+function credentialError(
+  message: string,
+  credential: GitCredential,
+): ElizaError {
+  return new ElizaError(message, {
+    code: "GITHUB_WORKSPACE_CREDENTIAL_INVALID",
+    context: {
+      credentialId: credential.id,
+      credentialProvider: credential.provider,
+    },
+    severity: "ephemeral",
+  });
+}
+
+function assertCredentialScope(
+  credential: GitCredential,
+  repo: string,
+  permission: "contents:read" | "pull_requests:write",
+): void {
+  if (credential.provider !== "github") {
+    throw credentialError(
+      "GitHub workspace operation requires a GitHub credential",
+      credential,
+    );
+  }
+
+  if (
+    !(credential.expiresAt instanceof Date) ||
+    !Number.isFinite(credential.expiresAt.getTime()) ||
+    credential.expiresAt.getTime() <= Date.now()
+  ) {
+    throw credentialError("GitHub workspace credential has expired", credential);
+  }
+
+  const requested = parseOwnerRepo(repo);
+  const scoped = parseOwnerRepo(credential.repo);
+  if (
+    requested.owner.toLowerCase() !== scoped.owner.toLowerCase() ||
+    requested.repo.toLowerCase() !== scoped.repo.toLowerCase()
+  ) {
+    throw credentialError(
+      "GitHub workspace credential is scoped to a different repository",
+      credential,
+    );
+  }
+  if (!credential.permissions.includes(permission)) {
+    throw credentialError(
+      `GitHub workspace credential lacks ${permission}`,
+      credential,
+    );
+  }
+}
+
+async function resolveProviderToken(
+  options: GitHubPatProviderOptions,
+  credential: GitCredential,
+  repo: string,
+): Promise<string> {
+  const token = options.resolveToken
+    ? await options.resolveToken(credential)
+    : credential.token;
+  if (!token?.trim()) {
+    throw credentialError(
+      "GitHub workspace credential is unavailable",
+      credential,
+    );
+  }
+  return token.trim();
+}
+
+function responseStatus(error: unknown): number | undefined {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    typeof error.status === "number"
+  ) {
+    return error.status;
+  }
+  return undefined;
+}
+
+/**
+ * Provider adapter used by git-workspace-service when it finalizes a workspace.
+ * Credential scope remains authoritative here because this is the last boundary
+ * before an authenticated GitHub API call. Ambient tokens may be resolved again
+ * at act time so a rotated or removed host credential is never silently reused.
+ */
+export function createGitHubPatProvider(
+  options: GitHubPatProviderOptions = {},
+): GitProviderAdapter {
+  const createClient =
+    options.createClient ?? ((token) => new GitHubPatClient({ token }));
+  const requestFor = options.createRequest ?? createGitHubRequest;
+
+  return {
+    name: "github",
+    async getCredentials(
+      _request: GitCredentialRequest,
+    ): Promise<GitCredential> {
+      throw new ElizaError(
+        "GitHub workspace credentials must be supplied by the workspace request",
+        {
+          code: "GITHUB_WORKSPACE_CREDENTIAL_REQUIRED",
+          severity: "ephemeral",
+        },
+      );
+    },
+    revokeCredential(_credentialId: string): Promise<void> {
+      // The adapter consumes user-owned grants but never persists or issues
+      // them, so revocation belongs to the authority that supplied the token.
+      return Promise.resolve();
+    },
+    async createPullRequest(prOptions): Promise<PullRequestInfo> {
+      assertCredentialScope(
+        prOptions.credential,
+        prOptions.repo,
+        "pull_requests:write",
+      );
+      const { owner, repo } = parseOwnerRepo(prOptions.repo);
+      const token = await resolveProviderToken(
+        options,
+        prOptions.credential,
+        prOptions.repo,
+      );
+      const client = createClient(token);
+      return client.createPullRequest(owner, repo, {
+        title: prOptions.title,
+        body: prOptions.body,
+        head: prOptions.sourceBranch,
+        base: prOptions.targetBranch,
+        draft: prOptions.draft,
+        labels: prOptions.labels,
+        reviewers: prOptions.reviewers,
+      });
+    },
+    async branchExists(repo, branch, credential): Promise<boolean> {
+      assertCredentialScope(credential, repo, "contents:read");
+      const parts = parseOwnerRepo(repo);
+      const token = await resolveProviderToken(options, credential, repo);
+      const request = requestFor(token);
+      try {
+        await request("GET /repos/{owner}/{repo}/branches/{branch}", {
+          owner: parts.owner,
+          repo: parts.repo,
+          branch,
+        });
+        return true;
+      } catch (error) {
+        // error-policy:J1 A GitHub 404 is the adapter's explicit negative
+        // result; authentication, transport, and rate-limit failures propagate.
+        if (responseStatus(error) === 404) return false;
+        throw error;
+      }
+    },
+    async getDefaultBranch(repo, credential): Promise<string> {
+      assertCredentialScope(credential, repo, "contents:read");
+      const parts = parseOwnerRepo(repo);
+      const token = await resolveProviderToken(options, credential, repo);
+      const request = requestFor(token);
+      const response = await request<{ default_branch: unknown }>(
+        "GET /repos/{owner}/{repo}",
+        { owner: parts.owner, repo: parts.repo },
+      );
+      if (
+        typeof response.data.default_branch !== "string" ||
+        !response.data.default_branch.trim()
+      ) {
+        throw new ElizaError(
+          "GitHub repository response omitted its default branch",
+          {
+            code: "GITHUB_DEFAULT_BRANCH_INVALID",
+            context: { owner: parts.owner, repo: parts.repo },
+            severity: "ephemeral",
+          },
+        );
+      }
+      return response.data.default_branch;
+    },
+  };
 }
 
 // ── Auth ───────────────────────────────────────────────────────────

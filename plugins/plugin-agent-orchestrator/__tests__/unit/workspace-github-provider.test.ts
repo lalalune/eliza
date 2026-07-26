@@ -14,10 +14,8 @@ import type {
   PullRequestInfo,
 } from "git-workspace-service";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  CodingWorkspaceService,
-  createGitHubPatProvider,
-} from "../../src/services/workspace-service.js";
+import { createGitHubPatProvider } from "../../src/services/workspace-github.js";
+import { CodingWorkspaceService } from "../../src/services/workspace-service.js";
 import { runtimeWith } from "../../src/test-utils/action-test-utils.js";
 
 const { CredentialService, MemoryTokenStore } = createRequire(import.meta.url)(
@@ -114,7 +112,6 @@ describe("CodingWorkspaceService GitHub provider registration", () => {
         tokens.push(token);
         return {
           createPullRequest,
-          branchExists: vi.fn(async () => true),
         };
       },
     });
@@ -142,5 +139,127 @@ describe("CodingWorkspaceService GitHub provider registration", () => {
       reviewers: ["reviewer"],
     });
     expect(result.number).toBe(12);
+  });
+
+  it("uses an act-time token resolver and fails closed when it is removed", async () => {
+    let currentToken: string | undefined = "rotated-token";
+    const tokens: string[] = [];
+    const provider = createGitHubPatProvider({
+      resolveToken: () => currentToken,
+      createClient: (token) => {
+        tokens.push(token);
+        return {
+          createPullRequest: vi.fn(
+            async (): Promise<PullRequestInfo> => ({
+              number: 13,
+              url: "https://github.com/elizaOS/eliza/pull/13",
+              state: "open",
+              sourceBranch: "fix/rotation",
+              targetBranch: "develop",
+              title: "fix: rotation",
+              executionId: "",
+              createdAt: new Date("2026-07-18T00:00:00.000Z"),
+            }),
+          ),
+        };
+      },
+    });
+    const request = {
+      repo: "git@github.com:elizaOS/eliza.git",
+      sourceBranch: "fix/rotation",
+      targetBranch: "develop",
+      title: "fix: rotation",
+      body: "Uses the current host credential.",
+      credential: workspaceCredential,
+    };
+
+    await expect(provider.createPullRequest(request)).resolves.toMatchObject({
+      number: 13,
+    });
+    expect(tokens).toEqual(["rotated-token"]);
+
+    currentToken = undefined;
+    await expect(provider.createPullRequest(request)).rejects.toMatchObject({
+      code: "GITHUB_WORKSPACE_CREDENTIAL_INVALID",
+    });
+    expect(tokens).toEqual(["rotated-token"]);
+  });
+
+  it("rejects cross-repository and under-scoped credentials", async () => {
+    const createClient = vi.fn();
+    const provider = createGitHubPatProvider({ createClient });
+
+    await expect(
+      provider.createPullRequest({
+        repo: "elizaOS/other",
+        sourceBranch: "fix/scope",
+        targetBranch: "develop",
+        title: "fix: scope",
+        body: "Must not cross repositories.",
+        credential: workspaceCredential,
+      }),
+    ).rejects.toMatchObject({
+      code: "GITHUB_WORKSPACE_CREDENTIAL_INVALID",
+    });
+    await expect(
+      provider.createPullRequest({
+        repo: workspaceCredential.repo,
+        sourceBranch: "fix/scope",
+        targetBranch: "develop",
+        title: "fix: scope",
+        body: "Must require PR write permission.",
+        credential: {
+          ...workspaceCredential,
+          permissions: ["contents:read"],
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "GITHUB_WORKSPACE_CREDENTIAL_INVALID",
+    });
+    await expect(
+      provider.createPullRequest({
+        repo: workspaceCredential.repo,
+        sourceBranch: "fix/scope",
+        targetBranch: "develop",
+        title: "fix: scope",
+        body: "Must reject expired grants.",
+        credential: {
+          ...workspaceCredential,
+          expiresAt: new Date("2020-01-01T00:00:00.000Z"),
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "GITHUB_WORKSPACE_CREDENTIAL_INVALID",
+    });
+    expect(createClient).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a missing branch from GitHub API failures", async () => {
+    const notFound = Object.assign(new Error("not found"), { status: 404 });
+    const unauthorized = Object.assign(new Error("unauthorized"), {
+      status: 401,
+    });
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(notFound)
+      .mockRejectedValueOnce(unauthorized);
+    const provider = createGitHubPatProvider({
+      createRequest: () => request,
+    });
+
+    await expect(
+      provider.branchExists(
+        "ssh://git@github.com/elizaOS/eliza.git",
+        "missing",
+        workspaceCredential,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      provider.branchExists(
+        "github:elizaOS/eliza",
+        "private",
+        workspaceCredential,
+      ),
+    ).rejects.toBe(unauthorized);
   });
 });
