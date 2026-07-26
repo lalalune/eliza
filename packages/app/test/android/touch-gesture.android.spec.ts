@@ -5,7 +5,8 @@
 // long-press-in-place), never Playwright mouse. Every gesture asserts two
 // things: (1) the WebView received real touch events (touch* / pointerType
 // "touch", zero mouse pointers) — proving the native touch pipeline fired — and
-// (2) the app's own gesture semantics (sheet detents, home↔launcher rail page,
+// (2) the app's own gesture semantics (sheet detents, combined-home inert
+// horizontal swipes + embedded launcher grid (#16764 — no home↔launcher rail),
 // push-to-talk arming, keyboard avoidance, attachment intake). Agent- or
 // mic-dependent legs skip HONESTLY when the backend/model is not up, exactly
 // like the iOS GestureSemanticsUITests suite — they never fake a pass.
@@ -424,19 +425,11 @@ async function ensureCollapsedHome(page: Page, adb: string, serial: string) {
       timeout: 15_000,
     });
   }
-  if ((await surface.getAttribute("data-page")) !== "home") {
-    await androidTouchDrag(
-      page,
-      adb,
-      serial,
-      '[data-testid="chat-sheet-grabber"]',
-      180,
-      6,
-    );
-    await expect(surface).toHaveAttribute("data-page", "home", {
-      timeout: 15_000,
-    });
-  }
+  // #16764: home and launcher share ONE combined surface — data-page is static
+  // route intent, there is no rail to re-park. Just assert it reads home.
+  await expect(surface).toHaveAttribute("data-page", "home", {
+    timeout: 15_000,
+  });
 }
 
 /** Idempotent shell prep so each serial test starts from collapsed/home. */
@@ -579,7 +572,7 @@ test.describe
       });
     });
 
-    test("horizontal rail swipe pages home↔launcher and back", async ({
+    test("horizontal swipes on the combined home are navigation-inert; the embedded grid stays reachable", async ({
       page,
       device,
     }, testInfo) => {
@@ -587,10 +580,22 @@ test.describe
       const adb = resolveAdb();
       const serial = device.serial();
       const surface = page.getByTestId("home-launcher-surface");
+      const overlay = page.getByTestId("continuous-chat-overlay");
       await expect(surface).toHaveAttribute("data-page", "home", {
         timeout: 30_000,
       });
 
+      // #16764: the launcher grid is embedded in the home column — reveal it
+      // by scrolling a known tile into view, the way a user reaches apps now.
+      const appsRegion = page.getByTestId("home-apps-scroll");
+      await expect(appsRegion).toBeVisible({ timeout: 30_000 });
+      const settingsTile = appsRegion.getByTestId("launcher-tile-settings");
+      await settingsTile.scrollIntoViewIfNeeded();
+      await expect(settingsTile).toBeVisible({ timeout: 15_000 });
+
+      // Full-length LEFT swipe across the grid: real touch must arrive, and
+      // the gesture must be a navigation no-op (there is no rail) with no
+      // ghost tile launch under the finger and no chat sheet opening.
       await installTouchRecorder(page);
       let delivered = false;
       for (let attempt = 1; attempt <= 3 && !delivered; attempt++) {
@@ -598,9 +603,9 @@ test.describe
           page,
           adb,
           serial,
-          '[data-testid="chat-sheet-grabber"]',
-          -150,
-          -6,
+          '[data-testid="home-apps-scroll"]',
+          -220,
+          4,
         );
         delivered = await page
           .waitForFunction(
@@ -613,50 +618,61 @@ test.describe
         if (!delivered)
           await waitForResponsiveMainThread(page, { timeoutMs: 30_000 });
       }
-      await expect(surface).toHaveAttribute("data-page", "launcher", {
-        timeout: 15_000,
-      });
-      await expect(
-        page.getByTestId("home-launcher-launcher-page"),
-      ).toBeVisible();
-      const forwardTouch = await assertRealTouch(page, "rail-home-to-launcher");
+      const leftTouch = await assertRealTouch(page, "combined-home-swipe-left");
+      await page.waitForTimeout(500);
+      await expect(surface).toHaveAttribute("data-page", "home");
+      await expect(page.getByTestId("home-launcher-page-probe")).toHaveText(
+        "home-launcher-page:home",
+      );
+      await expect(page.getByTestId("settings-shell")).toHaveCount(0);
+      await expect(overlay).not.toHaveAttribute("data-open", "true");
       captureAndroidScreenshot({
         adb,
         serial,
         artifactDir: ARTIFACT_DIR,
-        filename: "gesture-20-launcher.png",
+        filename: "gesture-20-combined-home-left-swipe.png",
       });
 
-      // Back-swipe launcher → home (rail-owned, symmetric 50% distance rule).
+      // The paired RIGHT swipe is equally inert.
       await installTouchRecorder(page);
       await androidTouchDrag(
         page,
         adb,
         serial,
-        '[data-testid="chat-sheet-grabber"]',
-        150,
-        -6,
+        '[data-testid="home-apps-scroll"]',
+        220,
+        4,
       );
-      await expect(surface).toHaveAttribute("data-page", "home", {
-        timeout: 15_000,
-      });
-      const backTouch = await assertRealTouch(page, "rail-launcher-to-home");
+      await page.waitForTimeout(500);
+      const rightTouch = await assertRealTouch(
+        page,
+        "combined-home-swipe-right",
+      );
+      await expect(surface).toHaveAttribute("data-page", "home");
+      await expect(page.getByTestId("settings-shell")).toHaveCount(0);
+      await expect(overlay).not.toHaveAttribute("data-open", "true");
       captureAndroidScreenshot({
         adb,
         serial,
         artifactDir: ARTIFACT_DIR,
-        filename: "gesture-21-back-home.png",
+        filename: "gesture-21-combined-home-right-swipe.png",
       });
 
       matrixLog.push({
-        leg: "rail-pager",
-        forwardTouchEvents:
-          forwardTouch.touchEventCount + forwardTouch.pointerTouchCount,
-        backTouchEvents:
-          backTouch.touchEventCount + backTouch.pointerTouchCount,
+        leg: "combined-home-inert-swipe",
+        leftTouchEvents:
+          leftTouch.touchEventCount + leftTouch.pointerTouchCount,
+        rightTouchEvents:
+          rightTouch.touchEventCount + rightTouch.pointerTouchCount,
+        dataPageAfter: "home",
+        ghostLaunch: false,
       });
-      await testInfo.attach("rail pager leg", {
-        body: JSON.stringify({ forward: "launcher", back: "home" }, null, 2),
+      await testInfo.attach("combined home inert swipe leg", {
+        body: JSON.stringify(
+          { left: "inert", right: "inert", dataPage: "home" },
+          null,
+          2,
+        ),
         contentType: "application/json",
       });
     });

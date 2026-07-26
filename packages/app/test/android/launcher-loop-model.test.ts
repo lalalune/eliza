@@ -1,7 +1,8 @@
 // Unit coverage for the seeded launcher-loop model that drives both mobile-native
 // lanes (#12377). Deterministic and jsdom-free: proves a seed reproduces the
 // exact action stream (the ELIZA_LOOP_SEED reproduction contract) and that the
-// pure page transitions match the launcher's real single-page rail semantics.
+// pure page transition is the identity — on the combined home surface (#16764)
+// no gesture moves `data-page`; every action is a navigation-inert fuzz action.
 import { describe, expect, it } from "vitest";
 import {
   generateLauncherLoop,
@@ -48,24 +49,16 @@ describe("SeededRandom", () => {
 });
 
 describe("nextPage", () => {
-  it("commits toward the launcher on a full left swipe from either page", () => {
-    expect(nextPage("swipe-left", "home")).toBe("launcher");
-    expect(nextPage("swipe-left", "launcher")).toBe("launcher");
-  });
-
-  it("commits toward home on a full right swipe from either page", () => {
-    expect(nextPage("swipe-right", "home")).toBe("home");
-    expect(nextPage("swipe-right", "launcher")).toBe("home");
-  });
-
-  it("leaves the page unchanged for non-committing actions", () => {
-    const nonCommitting: LauncherLoopActionKind[] = [
+  it("leaves the page unchanged for EVERY action — the combined surface has no rail", () => {
+    const allKinds: LauncherLoopActionKind[] = [
+      "swipe-left",
+      "swipe-right",
       "sub-threshold-swipe-left",
       "sub-threshold-swipe-right",
       "vertical-scroll",
       "tap-center",
     ];
-    for (const kind of nonCommitting) {
+    for (const kind of allKinds) {
       expect(nextPage(kind, "home")).toBe("home");
       expect(nextPage(kind, "launcher")).toBe("launcher");
     }
@@ -114,9 +107,9 @@ describe("generateLauncherLoop", () => {
   });
 
   it("honors the start page", () => {
-    // A loop whose first action is a right-swipe from home leaves the rail on
-    // home; from launcher the same first action still lands home. Seed 3's first
-    // pick is deterministic, so assert the transition, not a fixed value.
+    // Every action is inert, so the modelled page stays wherever the loop
+    // started. Seed 3's first pick is deterministic, so assert the transition,
+    // not a fixed value.
     const fromHome = generateLauncherLoop(3, 1, "home");
     const fromLauncher = generateLauncherLoop(3, 1, "launcher");
     expect(fromHome[0].kind).toBe(fromLauncher[0].kind);

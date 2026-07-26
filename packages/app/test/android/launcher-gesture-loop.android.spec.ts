@@ -1,11 +1,17 @@
-// Long seeded launcher gesture loop on the REAL on-device Android WebView
-// (#12377, WI-8 of #12179). Where touch-gesture.android.spec.ts proves ONE
-// home→launcher rail swipe delivers real touch input, this spec runs ≥200 real
-// device actions — `adb shell input swipe`/`tap` gestures, not synthesized DOM
-// events — from a seeded, replayable action stream and checks the launcher's rail
-// invariants after every action. It is the device-lane counterpart to the web
-// fast-check loop (#12373/#12375), scoped to the state observable through the
-// WebView: `data-page`, the sr-only AX probe, page-half inertness, and focus.
+// Long seeded gesture loop on the REAL on-device Android WebView (#12377, WI-8
+// of #12179), migrated to the combined home surface (#16764: HomeScreen with
+// the embedded LauncherSurface grid — no home↔launcher rail). Where
+// touch-gesture.android.spec.ts proves single gestures deliver real touch
+// input, this spec runs ≥200 real device actions — `adb shell input
+// swipe`/`tap` gestures, not synthesized DOM events — from a seeded, replayable
+// action stream and checks the combined-surface invariants after every action:
+// `data-page` stays the static route intent ("home"), the sr-only AX probe
+// mirrors it, no gesture ghost-launches a tile (which would unmount the
+// surface), focus never lands in an [inert] region (the apps region goes inert
+// when the notification shade displaces it), and zero page errors. The legacy
+// two-half inertness check is vacuous here — the combined surface renders no
+// halves — but stays armed in case the halves ever return. It is the
+// device-lane counterpart to the web fast-check loop (#12373/#12375).
 //
 // Recording: `adb screenrecord` caps a single file at 180s, so the loop rotates
 // screenrecord segments (android-launcher-loop-01.mp4, -02.mp4, …) and attaches
@@ -140,7 +146,9 @@ async function completeFirstRunIfNeeded(page: Page) {
   });
 }
 
-/** Collapse the chat sheet and park the rail on home before the loop starts. */
+/** Collapse the chat sheet and confirm the combined home surface is showing.
+ *  #16764: `data-page` is static route intent — there is no rail to re-park,
+ *  so this only needs the chat overlay closed and the surface reading home. */
 async function normalizeToHome(page: Page, adb: string, serial: string) {
   const overlay = page.getByTestId("continuous-chat-overlay");
   const surface = page.getByTestId("home-launcher-surface");
@@ -156,39 +164,9 @@ async function normalizeToHome(page: Page, adb: string, serial: string) {
     await page.waitForTimeout(600);
   }
 
-  if ((await surface.getAttribute("data-page")) !== "home") {
-    const box = await surface.boundingBox();
-    if (box) {
-      const metrics = await page.evaluate(() => ({
-        dpr: window.devicePixelRatio || 1,
-        offsetLeft: window.visualViewport?.offsetLeft ?? 0,
-        offsetTop: window.visualViewport?.offsetTop ?? 0,
-      }));
-      // Swipe right (toward home) across most of the surface width.
-      const y = Math.round(
-        (box.y + box.height * 0.5 + metrics.offsetTop) * metrics.dpr,
-      );
-      const x0 = Math.round(
-        (box.x + box.width * 0.2 + metrics.offsetLeft) * metrics.dpr,
-      );
-      const x1 = Math.round(
-        (box.x + box.width * 0.85 + metrics.offsetLeft) * metrics.dpr,
-      );
-      adbDevice(adb, serial, [
-        "shell",
-        "input",
-        "swipe",
-        String(x0),
-        String(y),
-        String(x1),
-        String(y),
-        "220",
-      ]);
-    }
-    await expect(surface).toHaveAttribute("data-page", "home", {
-      timeout: 15_000,
-    });
-  }
+  await expect(surface).toHaveAttribute("data-page", "home", {
+    timeout: 15_000,
+  });
 }
 
 interface DeviceMetrics {
@@ -245,7 +223,9 @@ function adbTap(adb: string, serial: string, at: { x: number; y: number }) {
   adbDevice(adb, serial, ["shell", "input", "tap", String(at.x), String(at.y)]);
 }
 
-/** Drive one loop action as a real device gesture on the launcher surface. */
+/** Drive one loop action as a real device gesture on the combined home
+ *  surface. Every gesture is navigation-inert (#16764) — the geometry is kept
+ *  from the rail era so an old seed replays the same physical stream. */
 async function performAction(
   page: Page,
   adb: string,
@@ -254,12 +234,19 @@ async function performAction(
 ) {
   const surface = page.getByTestId("home-launcher-surface");
   const box = await surface.boundingBox();
-  if (!box) throw new Error("home-launcher-surface has no bounding box");
+  if (!box) {
+    throw new Error(
+      "home-launcher-surface has no bounding box — a prior gesture likely " +
+        "ghost-launched a view and unmounted the combined home surface",
+    );
+  }
   const metrics = await readMetrics(page);
   const midY = 0.55;
 
   switch (action.kind) {
     case "swipe-left":
+      // Full-length horizontal drag — the ex-rail commit gesture. Must be a
+      // navigation no-op and must not ghost-launch the tile under the finger.
       adbSwipe(
         adb,
         serial,
@@ -278,7 +265,8 @@ async function performAction(
       );
       break;
     case "sub-threshold-swipe-left":
-      // Short, well under the 50% commit distance → must snap back.
+      // Short horizontal drag — historically the snap-back probe; now just a
+      // smaller inert drag.
       adbSwipe(
         adb,
         serial,
@@ -297,7 +285,8 @@ async function performAction(
       );
       break;
     case "vertical-scroll":
-      // Vertical drag on the active page — axis-locks to scroll, must not flip.
+      // Vertical drag — scrolls the home column / embedded apps grid; must not
+      // navigate or wedge the surface.
       adbSwipe(
         adb,
         serial,
@@ -307,8 +296,8 @@ async function performAction(
       );
       break;
     case "tap-center":
-      // Tap a neutral region (upper area, away from tiles/composer) — a bare tap
-      // must never move the rail.
+      // Tap a neutral region (upper area, away from tiles/composer) — a bare
+      // tap must never navigate.
       adbTap(adb, serial, toDevice(box, metrics, 0.5, 0.2));
       break;
     default: {
@@ -321,12 +310,18 @@ async function performAction(
 interface InvariantResult {
   page: string | null;
   probe: string | null;
+  /** Whether the legacy two-half layout is rendering. The combined surface
+   *  (#16764) renders no halves — the half-inert check is vacuous when false,
+   *  mirroring the shared engine's `LauncherObservation.hasHalves`. */
+  hasHalves: boolean;
   homeInert: boolean;
   launcherInert: boolean;
   activeElementInInert: boolean;
+  /** Home grid presence — the embedded launcher grid must stay mounted. */
+  hasAppsGrid: boolean;
 }
 
-/** Read the launcher's post-action state for the per-action invariant checks. */
+/** Read the surface's post-action state for the per-action invariant checks. */
 async function readInvariants(page: Page): Promise<InvariantResult> {
   return page.evaluate(() => {
     const surface = document.querySelector<HTMLElement>(
@@ -341,18 +336,26 @@ async function readInvariants(page: Page): Promise<InvariantResult> {
     const probeEl = document.querySelector<HTMLElement>(
       '[data-testid="home-launcher-page-probe"]',
     );
+    const appsGrid = document.querySelector<HTMLElement>(
+      '[data-testid="home-apps-scroll"]',
+    );
     const active = document.activeElement;
     return {
       page: surface?.getAttribute("data-page") ?? null,
       probe: probeEl?.textContent?.trim() ?? null,
+      hasHalves: Boolean(home || launcher),
       homeInert: home?.hasAttribute("inert") ?? false,
       launcherInert: launcher?.hasAttribute("inert") ?? false,
       activeElementInInert:
         active instanceof Element ? Boolean(active.closest("[inert]")) : false,
+      hasAppsGrid: Boolean(appsGrid),
     };
   });
 }
 
+/** `data-page` is static route intent on the combined surface, so this poll
+ *  is a stability check: it fails when a gesture navigated away (the surface
+ *  unmounts → attribute reads null) rather than when a rail lagged. */
 async function waitForExpectedPage(
   page: Page,
   expectedPage: LauncherPage,
@@ -366,7 +369,7 @@ async function waitForExpectedPage(
 
 test.describe
   .serial("android launcher gesture loop (real WebView)", () => {
-    test("seeded ≥200-action loop keeps the rail invariant on real device input", async ({
+    test("seeded ≥200-action loop keeps the combined home surface invariant on real device input", async ({
       page,
       device,
     }, testInfo) => {
@@ -447,8 +450,9 @@ test.describe
           await performAction(page, adb, serial, action);
           modelPage = action.expectedPageAfter;
 
-          // The rail must converge to the modelled page. A committing swipe
-          // flips it; a sub-threshold/scroll/tap must leave it where it was.
+          // Every gesture is navigation-inert on the combined surface: the
+          // static data-page must still read the modelled (start) page. A
+          // ghost tile launch unmounts the surface and reads null here.
           const landed = await waitForExpectedPage(page, modelPage).catch(
             () => null,
           );
@@ -457,7 +461,8 @@ test.describe
           const problems: string[] = [];
           if (landed !== modelPage) {
             problems.push(
-              `data-page=${landed} expected=${modelPage} after ${action.kind}`,
+              `data-page=${landed} expected=${modelPage} after ${action.kind} ` +
+                "(a gesture must never navigate the combined home surface)",
             );
           }
           if (state.probe !== `home-launcher-page:${modelPage}`) {
@@ -465,22 +470,32 @@ test.describe
               `AX probe=${state.probe} expected=home-launcher-page:${modelPage}`,
             );
           }
-          // Exactly one page-half is inert (the offscreen one).
-          if (state.homeInert === state.launcherInert) {
+          if (!state.hasAppsGrid) {
             problems.push(
-              `inert invariant broken: homeInert=${state.homeInert} launcherInert=${state.launcherInert}`,
+              "embedded apps grid (home-apps-scroll) unmounted mid-loop",
             );
-          } else {
-            const inertIsOffscreen =
-              modelPage === "home" ? state.launcherInert : state.homeInert;
-            if (!inertIsOffscreen) {
+          }
+          // Legacy two-half layout: vacuous on the combined surface (no halves
+          // render), but stays armed — if the halves ever return, exactly one
+          // (the offscreen one) must be inert. Mirrors the shared engine's
+          // hasHalves-gated invariant.
+          if (state.hasHalves) {
+            if (state.homeInert === state.launcherInert) {
               problems.push(
-                `wrong half inert for page=${modelPage} (home=${state.homeInert} launcher=${state.launcherInert})`,
+                `inert invariant broken: homeInert=${state.homeInert} launcherInert=${state.launcherInert}`,
               );
+            } else {
+              const inertIsOffscreen =
+                modelPage === "home" ? state.launcherInert : state.homeInert;
+              if (!inertIsOffscreen) {
+                problems.push(
+                  `wrong half inert for page=${modelPage} (home=${state.homeInert} launcher=${state.launcherInert})`,
+                );
+              }
             }
           }
           if (state.activeElementInInert) {
-            problems.push("focus escaped into an [inert] offscreen half");
+            problems.push("focus escaped into an [inert] region");
           }
           // A page error at any point fails the run, but record each new one
           // once rather than re-reporting the accumulated list every action.
@@ -510,6 +525,7 @@ test.describe
 
         writeJsonArtifact("android-launcher-loop-summary.json", {
           issue: 12377,
+          surface: "combined-home (#16764 — no home↔launcher rail)",
           serial,
           seed,
           reproduce: `ELIZA_LOOP_SEED=${seed}`,
@@ -532,7 +548,7 @@ test.describe
 
         expect(
           failures,
-          `launcher loop invariants held across ${actions.length} real device ` +
+          `combined-home loop invariants held across ${actions.length} real device ` +
             `actions (seed=${seed}); first failures: ${failures
               .slice(0, 5)
               .map((f) => `#${f.index}: ${f.reason}`)

@@ -113,6 +113,26 @@ export function viteRendererBuildNeeded(appDir, repoRoot) {
     return true;
   }
 
+  // The renderer bundles @elizaos/shared straight from src (vite.config.ts
+  // imports ../shared/src/* at config load and aliases the package to source)
+  // and prefers @elizaos/core's workspace source browser entry when present.
+  // Missing these dirs let a shared/core edit ship a stale dist.
+  const sharedSrcCandidates = [
+    path.join(repoRoot, "packages", "shared", "src"),
+    path.join(repoRoot, "eliza", "packages", "shared", "src"),
+  ];
+  if (maxMtimeAcrossDirs(sharedSrcCandidates) > distMtime) {
+    return true;
+  }
+
+  const coreSrcCandidates = [
+    path.join(repoRoot, "packages", "core", "src"),
+    path.join(repoRoot, "eliza", "packages", "core", "src"),
+  ];
+  if (maxMtimeAcrossDirs(coreSrcCandidates) > distMtime) {
+    return true;
+  }
+
   const appCoreSrcCandidates = [
     path.join(repoRoot, "packages", "app-core", "src"),
     path.join(repoRoot, "eliza", "packages", "app-core", "src"),

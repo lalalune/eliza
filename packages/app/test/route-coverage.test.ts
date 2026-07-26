@@ -140,30 +140,37 @@ const NOT_APP_BOOT_LOADED_VIEW_MANIFESTS: Readonly<Record<string, string>> = {
     "Todos is a decomposed personal-assistant domain view; it is discoverable through the View Manager but not yet a boot-loaded renderer module.",
 };
 
+// Keys are the boot loader cache keys: manifest-scanned `register`-mode
+// modules carry a `/register` suffix (see vite/app-side-effect-modules.ts);
+// bare package keys come from main.tsx's cachedDynamicImport prewarm handles.
 const BOOT_PLUGIN_VIEW_MANIFEST_BY_MODULE: Record<string, string | null> = {
-  "@elizaos/plugin-contacts": "plugins/plugin-contacts/src/plugin.ts",
-  "@elizaos/plugin-native-settings": null,
+  "@elizaos/plugin-contacts/register": "plugins/plugin-contacts/src/plugin.ts",
+  "@elizaos/plugin-native-settings/register": null,
   // Facewear no longer declares plugin views; the boot module remains for the
   // Settings wearables section.
-  "@elizaos/plugin-facewear": null,
-  "@elizaos/plugin-feed": "plugins/plugin-feed/src/index.ts",
-  "@elizaos/plugin-hyperliquid": "plugins/plugin-hyperliquid/src/plugin.ts",
+  "@elizaos/plugin-facewear/register": null,
+  "@elizaos/plugin-feed/register": "plugins/plugin-feed/src/index.ts",
+  "@elizaos/plugin-hyperliquid/register":
+    "plugins/plugin-hyperliquid/src/plugin.ts",
   // PA no longer declares a view (the LifeOps overview was removed); it is a
   // boot plugin with no renderer module.
   "@elizaos/plugin-personal-assistant": null,
   "@elizaos/plugin-phone": "plugins/plugin-phone/src/plugin.ts",
-  "@elizaos/plugin-polymarket": "plugins/plugin-polymarket/src/plugin.ts",
+  "@elizaos/plugin-phone/register": "plugins/plugin-phone/src/plugin.ts",
+  "@elizaos/plugin-polymarket/register":
+    "plugins/plugin-polymarket/src/plugin.ts",
   "@elizaos/plugin-task-coordinator":
     "plugins/plugin-task-coordinator/src/index.ts",
   "@elizaos/plugin-task-coordinator/register":
     "plugins/plugin-task-coordinator/src/index.ts",
   "@elizaos/plugin-training": "plugins/plugin-training/src/setup-routes.ts",
-  "@elizaos/plugin-trajectory-logger":
+  "@elizaos/plugin-trajectory-logger/register":
     "plugins/plugin-trajectory-logger/src/plugin.ts",
-  "@elizaos/plugin-vector-browser":
+  "@elizaos/plugin-vector-browser/register":
     "plugins/plugin-vector-browser/src/plugin.ts",
-  "@elizaos/plugin-wallet-ui": "plugins/plugin-wallet-ui/src/plugin.ts",
-  "@elizaos/plugin-wifi": null,
+  "@elizaos/plugin-wallet-ui/register":
+    "plugins/plugin-wallet-ui/src/plugin.ts",
+  "@elizaos/plugin-wifi/register": null,
   "@elizaos/app-model-tester": "plugins/app-model-tester/src/plugin.ts",
 };
 

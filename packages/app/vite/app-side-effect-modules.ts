@@ -21,7 +21,16 @@ import path from "node:path";
 export type AppRegisterMode = "register" | "ui";
 
 export type SideEffectAppModule = {
-  /** Canonical package name — used as the dedupe key + load log label. */
+  /**
+   * Cache key for the shared dynamic-import cache + load log label. `"ui"`
+   * mode uses the canonical package name (the entry IS the package's browser
+   * module, so deduping against a bare-specifier import of the same package is
+   * correct). `"register"` mode appends `/register` because `src/register.ts`
+   * is a DIFFERENT module from the package's browser entry: a bare
+   * `import("<pkg>")` cached under the same key would permanently shadow the
+   * side-effect registration (the /phone-companion deep-link bug), and the
+   * register module winning the race would shadow the component barrel.
+   */
   key: string;
   /** Absolute path to the renderer registration entry imported at boot. */
   entry: string;
@@ -87,7 +96,10 @@ export function discoverSideEffectAppModules(
         );
       }
       seen.add(name);
-      discovered.push({ key: name, entry });
+      discovered.push({
+        key: mode === "register" ? `${name}/register` : name,
+        entry,
+      });
     }
   }
 

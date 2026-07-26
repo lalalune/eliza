@@ -22,20 +22,23 @@ const SCAN_ROOTS = [
   resolve(REPO_ROOT, "packages"),
 ];
 
-// Canonical package names expected to self-declare renderer registration.
+// Loader cache keys expected from the manifest scan. `register`-mode plugins
+// carry a `/register` suffix so the side-effect module can never collide in
+// the shared dynamic-import cache with a bare import of the same package
+// (which resolves to the package's browser/ui entry, a different module).
 const EXPECTED_SIDE_EFFECT_PACKAGES = [
   "@elizaos/app-model-tester",
-  "@elizaos/plugin-contacts",
-  "@elizaos/plugin-facewear",
-  "@elizaos/plugin-feed",
-  "@elizaos/plugin-hyperliquid",
-  "@elizaos/plugin-native-settings",
-  "@elizaos/plugin-phone",
-  "@elizaos/plugin-polymarket",
-  "@elizaos/plugin-trajectory-logger",
-  "@elizaos/plugin-vector-browser",
-  "@elizaos/plugin-wallet-ui",
-  "@elizaos/plugin-wifi",
+  "@elizaos/plugin-contacts/register",
+  "@elizaos/plugin-facewear/register",
+  "@elizaos/plugin-feed/register",
+  "@elizaos/plugin-hyperliquid/register",
+  "@elizaos/plugin-native-settings/register",
+  "@elizaos/plugin-phone/register",
+  "@elizaos/plugin-polymarket/register",
+  "@elizaos/plugin-trajectory-logger/register",
+  "@elizaos/plugin-vector-browser/register",
+  "@elizaos/plugin-wallet-ui/register",
+  "@elizaos/plugin-wifi/register",
 ] as const;
 
 // Imported directly by the app shell (main.tsx), not via the manifest scan.
@@ -63,7 +66,8 @@ describe("side-effect app module registration (manifest-driven)", () => {
     ) as { dependencies?: Record<string, string> };
 
     for (const module of discoverSideEffectAppModules(SCAN_ROOTS)) {
-      expect(packageJson.dependencies?.[module.key]).toBe("workspace:*");
+      const packageName = module.key.replace(/\/register$/, "");
+      expect(packageJson.dependencies?.[packageName]).toBe("workspace:*");
     }
   });
 

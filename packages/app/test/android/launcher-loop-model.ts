@@ -2,34 +2,39 @@
 // of #12179). The full web loop engine (WI-5, #12373) lives in packages/ui and
 // runs a fast-check `fc.commands` model through CDP touch; that machinery is not
 // reachable on a real device, where gestures are real OS `adb shell input`
-// swipes/taps and the only readable state is the launcher's `data-page` +
+// swipes/taps and the only readable state is the surface's `data-page` +
 // sr-only AX probe. This module is the device-lane counterpart: a dependency-free
 // seeded PRNG, the reachable slice of the §D [L] action alphabet, and a pure
-// model that predicts the expected rail page after each action. The same LCG and
-// alphabet are mirrored in the iOS LauncherGestureLoopUITests Swift harness so a
-// printed ELIZA_LOOP_SEED reproduces the same action sequence on both platforms.
+// model that predicts the expected `data-page` after each action. The same LCG
+// and alphabet are mirrored in the iOS LauncherGestureLoopUITests Swift harness
+// so a printed ELIZA_LOOP_SEED reproduces the same action sequence on both
+// platforms.
 //
-// Only rail-page transitions are modelled — that is the one launcher invariant
-// observable through the native accessibility tree (the XCUITest lane) and the
-// WebView `data-page` (the Android lane). Notification-pull and grid-scroll
-// actions are exercised for robustness (they must not throw or wedge the rail)
-// but do not move the page, so the model leaves `page` unchanged for them.
+// #16764 replaced the two-page home/launcher rail with ONE combined home
+// surface (HomeScreen + the embedded LauncherSurface grid). `data-page` is now
+// static route intent — no gesture moves it — so the model's transition
+// function is the identity: every action in the alphabet is a robustness fuzz
+// action (it must not navigate, throw, wedge the surface, or ghost-launch a
+// tile). The alphabet and weights are kept byte-identical to the rail era so an
+// old ELIZA_LOOP_SEED still reproduces the same physical gesture stream.
 
-/** Rail page — the launcher's single binary state, mirrored to `data-page`. */
+/** Surface page — static route intent, mirrored to `data-page` ("/" = home). */
 export type LauncherPage = "home" | "launcher";
 
-/** Kinds of action in the reachable device-lane alphabet. */
+/** Kinds of action in the reachable device-lane alphabet. All are
+ *  navigation-inert on the combined surface; the names describe the physical
+ *  gesture, kept from the rail era for seed-stream compatibility. */
 export type LauncherLoopActionKind =
-  | "swipe-left" // horizontal drag toward the launcher (commits home→launcher)
-  | "swipe-right" // horizontal drag toward home (commits launcher→home)
-  | "sub-threshold-swipe-left" // short left drag that must snap back
-  | "sub-threshold-swipe-right" // short right drag that must snap back
-  | "vertical-scroll" // vertical drag on the active page — never flips the rail
-  | "tap-center"; // a plain tap on the active page — never flips the rail
+  | "swipe-left" // full-length horizontal drag left — must NOT navigate
+  | "swipe-right" // full-length horizontal drag right — must NOT navigate
+  | "sub-threshold-swipe-left" // short left drag — must NOT navigate
+  | "sub-threshold-swipe-right" // short right drag — must NOT navigate
+  | "vertical-scroll" // vertical drag — scrolls the home column, never navigates
+  | "tap-center"; // a plain tap on a neutral region — never navigates
 
 export interface LauncherLoopAction {
   readonly kind: LauncherLoopActionKind;
-  /** The rail page expected AFTER this action, given the page before it. */
+  /** The `data-page` expected AFTER this action, given the page before it. */
   readonly expectedPageAfter: LauncherPage;
 }
 
@@ -77,10 +82,11 @@ export function resolveLoopSeed(env: NodeJS.ProcessEnv = process.env): number {
   return (Math.floor(Math.random() * 0x7fff_ffff) + 1) >>> 0;
 }
 
-// Weighted alphabet: rail swipes dominate (the launcher's core interaction),
-// with sub-threshold snap-backs, scrolls, and taps mixed in to keep the rail
-// honest under non-committing input. Weights are integers so the pick is a plain
-// cumulative walk that the Swift lane mirrors exactly.
+// Weighted alphabet: horizontal drags dominate (they are the gestures that
+// used to navigate, so they are the highest-risk regressions), with short
+// drags, scrolls, and taps mixed in. Weights are integers so the pick is a
+// plain cumulative walk that the Swift lane mirrors exactly; do not reorder or
+// reweigh without updating the Swift mirror — it breaks seed reproduction.
 const ACTION_WEIGHTS: ReadonlyArray<readonly [LauncherLoopActionKind, number]> =
   [
     ["swipe-left", 5],
@@ -105,29 +111,22 @@ function pickKind(rng: SeededRandom): LauncherLoopActionKind {
 }
 
 /**
- * Pure transition: the rail page a committing swipe lands on, given the page it
- * started from. A commit toward the launcher parks on `launcher`; toward home,
- * `home`; a swipe in the direction the rail is already parked is a no-op edge
- * rubber-band that settles back to the same page. Sub-threshold swipes, scrolls,
- * and taps never move the page.
+ * Pure transition: on the combined home surface (#16764) NO gesture moves the
+ * page — `data-page` is static route intent, and horizontal swipes are
+ * navigation-inert. The identity transition is kept as the single model seam
+ * so the device lanes assert "no action ever changes the page" explicitly
+ * (a ghost tile launch unmounts the surface and diverges from this model).
  */
 export function nextPage(
-  kind: LauncherLoopActionKind,
+  _kind: LauncherLoopActionKind,
   before: LauncherPage,
 ): LauncherPage {
-  switch (kind) {
-    case "swipe-left":
-      return "launcher";
-    case "swipe-right":
-      return "home";
-    default:
-      return before;
-  }
+  return before;
 }
 
 /**
  * Generate `count` actions from `seed`, threading the modelled page through the
- * sequence so each action carries the page it must leave the rail on. The
+ * sequence so each action carries the page it must leave the surface on. The
  * returned page state at the end is `actions.at(-1)?.expectedPageAfter`.
  */
 export function generateLauncherLoop(
