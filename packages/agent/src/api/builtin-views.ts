@@ -15,27 +15,12 @@ export const BUILTIN_VIEWS: ViewDeclaration[] = [
     viewKind: "system",
     label: "Tutorial",
     description:
-      "Interactive guided tour — learn the chat, switching views, and Settings in 90 seconds",
+      "Conversational walkthrough of the basics — runs right in the chat",
     icon: "GraduationCap",
     heroImagePath: "assets/view-heroes/tutorial.png",
     path: "/tutorial",
     order: 0,
     tags: ["tutorial", "onboarding", "learn", "guide", "help"],
-    visibleInManager: true,
-    desktopTabEnabled: true,
-    platforms: ["web", "desktop", "ios", "android"],
-  },
-  {
-    id: "help",
-    viewKind: "system",
-    label: "Help",
-    description:
-      "Searchable FAQ and knowledge base — what Eliza is and how everything works",
-    icon: "LifeBuoy",
-    heroImagePath: "assets/view-heroes/help.png",
-    path: "/help",
-    order: 2,
-    tags: ["help", "faq", "knowledge", "support", "questions"],
     visibleInManager: true,
     desktopTabEnabled: true,
     platforms: ["web", "desktop", "ios", "android"],
@@ -85,6 +70,76 @@ export const BUILTIN_VIEWS: ViewDeclaration[] = [
     tags: ["identity", "personality", "character"],
     anticipatoryIntent:
       "Offer to refine the agent's identity, personality, or style from the current character state, and point out the highest-leverage next edit.",
+    // The scoped actions below expand into mutating `agent-fill`/`agent-click`
+    // interactions, which the route/dispatch gate denies unless the view opts
+    // into agent control via the `agent-surface` grant (read-only introspection
+    // stays open without it). This is the only built-in view driving the agent
+    // surface, so it is the only one that declares the grant.
+    surface: { capabilities: ["agent-surface"] },
+    // Named actions the agent can invoke ONLY while the Character view is the
+    // foreground view (#14155, deferred step 8 of #13591/#14123). Each targets
+    // a `useAgentElement` id in the Character editor (`CharacterEditor` /
+    // `CharacterEditorPanels`) and expands into the same `agent-fill`/
+    // `agent-click` interact sequence the element-level protocol drives — no
+    // parallel DOM path. Only ids that are ALWAYS mounted are targeted: the
+    // editor renders all three panels (personality/style/examples) up front and
+    // toggles visibility with CSS (`hidden`/`display:none`), so `identity-bio`,
+    // `style-add-input-all`/`style-add-all`, `example-add-conversation`, and
+    // `post-example-add` are registered regardless of the active tab. Row-level
+    // ids (`style-rule-remove-<section>-<index>`, `example-message-<c>-<m>`) are
+    // index-dependent and only mounted when that row exists, so they are NOT
+    // declared here — a blind declaration against them would target an unmounted
+    // element and fail loudly (`VIEW_SCOPED_ACTION_ELEMENT_MISSING`).
+    scopedActions: [
+      {
+        name: "VIEW_CHARACTER_FILL_BIO",
+        description:
+          "Set the agent's bio / about-me text on the Character view's Personality section. Autosaves.",
+        similes: [
+          "set bio",
+          "edit bio",
+          "update about me",
+          "write the agent's bio",
+          "rewrite the character bio",
+        ],
+        parameters: ["bio"],
+        steps: [
+          { kind: "agent-fill", target: "identity-bio", value: "{{bio}}" },
+        ],
+      },
+      {
+        name: "VIEW_CHARACTER_ADD_STYLE_RULE",
+        description:
+          "Add a style rule to the agent's writing style on the Character view's Style section. Autosaves.",
+        similes: [
+          "add style rule",
+          "add a writing style rule",
+          "add style guideline",
+          "append a style rule",
+        ],
+        parameters: ["rule"],
+        steps: [
+          {
+            kind: "agent-fill",
+            target: "style-add-input-all",
+            value: "{{rule}}",
+          },
+          { kind: "agent-click", target: "style-add-all" },
+        ],
+      },
+      {
+        name: "VIEW_CHARACTER_ADD_MESSAGE_EXAMPLE",
+        description:
+          "Add a new chat-example conversation on the Character view's Examples section, ready for turns to be filled in. Autosaves.",
+        similes: [
+          "add message example",
+          "add a chat example",
+          "add conversation example",
+          "create a new example conversation",
+        ],
+        steps: [{ kind: "agent-click", target: "example-add-conversation" }],
+      },
+    ],
     visibleInManager: true,
     desktopTabEnabled: true,
   },
@@ -92,12 +147,25 @@ export const BUILTIN_VIEWS: ViewDeclaration[] = [
     id: "documents",
     viewKind: "system",
     label: "Knowledge",
-    description: "Agent knowledge documents, uploads, and retrieval sources",
+    description:
+      "The multimedia knowledge hub — documents, images, audio, video, and transcripts, filtered by media type and scope, with a unified reader",
     icon: "FileText",
     heroImagePath: "assets/view-heroes/character.png",
     path: "/character/documents",
     order: 51,
-    tags: ["documents", "knowledge", "files", "uploads", "retrieval"],
+    tags: [
+      "documents",
+      "knowledge",
+      "files",
+      "uploads",
+      "retrieval",
+      "transcripts",
+      "audio",
+      "video",
+      "images",
+      "media",
+      "attachments",
+    ],
     relatedActions: ["OWNER_DOCUMENTS"],
     anticipatoryIntent:
       "Offer to triage the newest ingested attachments/documents — summarize, tag, or file them — grounded in the recent-attachment counts.",
@@ -155,19 +223,23 @@ export const BUILTIN_VIEWS: ViewDeclaration[] = [
     visibleInManager: true,
   },
   {
+    // Folded into the Knowledge hub (#13594): transcript records read in the hub
+    // under its Transcripts media-format facet + word-synced reader. This entry
+    // stays only as the chrome-minimal LIVE-meeting affordance (#11856) — a
+    // deep-link surface, not a separate manager view or launcher tile.
     id: "transcripts",
     viewKind: "system",
-    label: "Transcripts",
+    label: "Live meeting",
     description:
-      "Recorded voice transcripts — play, scrub, and read with word sync",
+      "Join a live meeting and capture its transcript; recorded transcripts read in the Knowledge hub",
     icon: "AudioLines",
     heroImagePath: "assets/view-heroes/transcripts.png",
     path: "/apps/transcripts",
     order: 71,
-    tags: ["transcript", "voice", "recording", "audio"],
+    tags: ["transcript", "voice", "recording", "audio", "meeting"],
     anticipatoryIntent:
       "Offer to summarize or extract action items from the most recent voice transcripts, grounded in the recent-transcript count.",
-    visibleInManager: true,
+    visibleInManager: false,
   },
   {
     id: "memories",

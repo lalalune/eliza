@@ -31,6 +31,7 @@ import {
   invokeDesktopBridgeRequestWithTimeout,
   isElectrobunRuntime,
 } from "../bridge";
+import { clearStaleStewardSession } from "../cloud/shell/StewardProviderShared";
 import { getBootConfig, setBootConfig } from "../config/boot-config";
 import { dispatchElizaCloudStatusUpdated } from "../events";
 import { isElizaCloudRuntimeLocked } from "../first-run/mobile-runtime-mode";
@@ -1032,6 +1033,59 @@ export function useCloudState({
     [disconnectLocked, elizaCloudConnected, pollCloudCredits, setActionNotice],
   );
 
+  const handleCloudSignOut = useCallback(async (): Promise<void> => {
+    // On a backend-backed session (local app-core / agent runtime) the Cloud
+    // account is also persisted server-side and re-reported by
+    // /api/cloud/status. Clearing only the renderer/Steward token there leaves
+    // the backend connected, so a reload or fresh poll would resurface the same
+    // account. Delegate to the real disconnect path (which clears the server
+    // session) unless the runtime is locked. The account-only clear below is
+    // reserved for the locked mobile runtime, where handleCloudDisconnect
+    // refuses (Cloud is required in cloud mode) and only the account session
+    // can be dropped.
+    if (!(disconnectLocked || isElizaCloudRuntimeLocked())) {
+      await handleCloudDisconnect({ skipConfirmation: true });
+      return;
+    }
+
+    elizaCloudDisconnectInFlightRef.current = true;
+    setElizaCloudDisconnecting(true);
+
+    try {
+      clearStaleStewardSession();
+      setElizaCloudEnabled(false);
+      setElizaCloudConnected(false);
+      publishElizaCloudVoiceSnapshot(setElizaCloudHasPersistedKey, {
+        apiConnected: false,
+        enabled: false,
+        cloudVoiceProxyAvailable: false,
+        hasPersistedApiKey: false,
+      });
+      setElizaCloudVoiceProxyAvailable(false);
+      setElizaCloudCredits(null);
+      setElizaCloudCreditsLow(false);
+      setElizaCloudCreditsCritical(false);
+      setElizaCloudAuthRejected(false);
+      setElizaCloudCreditsError(null);
+      setElizaCloudUserId(null);
+      setElizaCloudStatusReason(null);
+      setElizaCloudLoginError(null);
+      setElizaCloudLoginFallbackUrl(null);
+      lastElizaCloudPollConnectedRef.current = false;
+      elizaCloudPreferDisconnectedUntilLoginRef.current = true;
+      setActionNotice("Signed out of Eliza Cloud.", "success", 5000);
+    } finally {
+      elizaCloudDisconnectInFlightRef.current = false;
+      setElizaCloudDisconnecting(false);
+      void pollCloudCredits();
+    }
+  }, [
+    disconnectLocked,
+    handleCloudDisconnect,
+    pollCloudCredits,
+    setActionNotice,
+  ]);
+
   // ── Effects ────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -1155,5 +1209,6 @@ export function useCloudState({
     pollCloudCredits,
     handleCloudLogin,
     handleCloudDisconnect,
+    handleCloudSignOut,
   };
 }

@@ -13,15 +13,23 @@
  * This mirrors `workspace-folder-config.ts` in shape and atomic-write style.
  *
  * `localPath` is the identity key for a project (realpath-compared against a
- * task's resolved workdir to bind it). `cloudAppId` is reserved but never
- * auto-populated here — that relation is an owner decision (epic #13766 WS4).
- * The VFS `projectId` (`virtual-filesystem.ts`) is a separate workbench-sandbox
- * namespace and is intentionally unrelated to a ProjectRecord id.
+ * task's resolved workdir to bind it). `cloudAppId` binds the project to an
+ * Eliza Cloud app: the orchestrator broker writes it here on an `apps.create`
+ * success for a task on this project (#14119), and a later task reads it back to
+ * update that app instead of minting a duplicate. The VFS `projectId`
+ * (`virtual-filesystem.ts`) is a separate workbench-sandbox namespace and is
+ * intentionally unrelated to a ProjectRecord id.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { resolveStateDir } from "./state-dir.ts";
 import { readWorkspaceFolderConfig } from "./workspace-folder-config.ts";
 
@@ -32,13 +40,38 @@ export interface ProjectRecord {
 	localPath: string;
 	repoUrl?: string;
 	defaultBranch?: string;
+	/**
+	 * elizaOS world this project's memory/knowledge is partitioned into, so a
+	 * subagent working project B never sees project A's injected context (#13776
+	 * design D3): a free partition in the existing memory schema, no column
+	 * change. Derived per-agent via core's `projectWorldId(agentId, id)` — the
+	 * single source of truth (#14171) — as `stringToUuid("project:<id>:<agentId>")`;
+	 * Worlds are agent-scoped (`World.agentId`), so two agents on the same project
+	 * get distinct worlds. Persisted so future project CRUD/UI can read it without
+	 * re-deriving; the orchestrator task bind seam stamps the same core derivation
+	 * onto each task.
+	 */
+	worldId?: string;
 	/** macOS security-scoped bookmark for the picked folder, when present. */
 	bookmark?: string | null;
-	/** Reserved for the task↔Cloud-app relation; never auto-populated (#13766 WS4). */
+	/** The Eliza Cloud app this project owns, if any. Written back by the
+	 * orchestrator broker on an `apps.create` success for a task bound to this
+	 * project (#14119); read to update the existing app rather than duplicate it. */
 	cloudAppId?: string;
 	createdAt: string;
 	lastOpenedAt: string;
 }
+
+/**
+ * `stringToUuid` seed prefix for a project's memory world, mirroring
+ * `PROJECT_WORLD_PREFIX` in `project-memory-scope.ts` where the canonical
+ * derivation lives. Kept next to the record it stamps for documentation, but
+ * the world itself is derived ONLY through core's per-agent
+ * `projectWorldId(agentId, id)` (#14171) — `stringToUuid("project:<id>:<agentId>")`
+ * — never `stringToUuid(prefix + id)` alone, which would drop the agent scope
+ * and reintroduce the cross-agent collision #14171 fixed.
+ */
+export const PROJECT_WORLD_ID_PREFIX = "project:";
 
 export interface ProjectRegistry {
 	version: 1;
@@ -56,6 +89,8 @@ function isProjectRecord(value: unknown): value is ProjectRecord {
 	if (obj.repoUrl !== undefined && typeof obj.repoUrl !== "string")
 		return false;
 	if (obj.defaultBranch !== undefined && typeof obj.defaultBranch !== "string")
+		return false;
+	if (obj.worldId !== undefined && typeof obj.worldId !== "string")
 		return false;
 	if (
 		obj.bookmark !== undefined &&
@@ -119,6 +154,22 @@ export function readProjectRegistry(
 	return synthesizeFromLegacyWorkspaceFolder(env);
 }
 
+/**
+ * Deterministic id for the project synthesized from the legacy
+ * workspace-folder.json. The synthesized registry is re-minted on every read
+ * (reads never write), so a random id would differ between reads: a task bound
+ * during the migration window would persist a projectId that no later
+ * `getProjectById` could ever resolve, silently disabling the bound-workdir
+ * lock (#13776). Hashing the localPath keeps the id stable across reads, and
+ * because `upsertProject` keys by localPath and preserves an existing id, the
+ * first real write to projects.json persists this same id — so migration-window
+ * task bindings survive the switch off the legacy config.
+ */
+function legacyProjectId(localPath: string): string {
+	const digest = createHash("sha256").update(localPath).digest("hex");
+	return `legacy-${digest.slice(0, 16)}`;
+}
+
 function synthesizeFromLegacyWorkspaceFolder(
 	env: NodeJS.ProcessEnv,
 ): ProjectRegistry | null {
@@ -126,7 +177,7 @@ function synthesizeFromLegacyWorkspaceFolder(
 	if (!legacy?.path?.trim()) return null;
 	const now = legacy.updatedAt ?? new Date().toISOString();
 	const project: ProjectRecord = {
-		id: randomUUID(),
+		id: legacyProjectId(legacy.path),
 		name: basename(legacy.path),
 		localPath: legacy.path,
 		bookmark: legacy.bookmark,
@@ -141,11 +192,77 @@ function basename(p: string): string {
 	return parts[parts.length - 1] || p;
 }
 
-/** Atomic write: same tmp-file-then-rename pattern as workspace-folder-config. */
+/**
+ * Realpath-canonicalize a localPath for identity: matches `project-binding.ts`,
+ * which realpaths at compare time, so writing the canonical form here stops
+ * `/tmp/x` and `/private/tmp/x` (macOS) from registering as two projects for the
+ * same directory. Falls back to a resolved absolute path when the dir does not
+ * exist yet — a project can be registered before its checkout is cloned.
+ */
+function canonicalizeLocalPath(localPath: string): string {
+	const abs = resolve(localPath);
+	try {
+		return realpathSync(abs);
+	} catch {
+		// error-policy:J3 path may not exist yet (project registered pre-clone);
+		// the resolved absolute form is still a stable identity key.
+		return abs;
+	}
+}
+
+/**
+ * The on-disk registry's `version` when the file is present and parses to a JSON
+ * object, else `null` (absent/unreadable/non-object). Lets writers distinguish a
+ * genuinely-absent registry from a FUTURE-version one they must not clobber:
+ * `isProjectRegistry` rejects both as `null`, but only the latter holds a user's
+ * projects a downgrade would silently drop.
+ */
+function readRegistryVersionOnDisk(env: NodeJS.ProcessEnv): number | null {
+	const filePath = projectRegistryPath(env);
+	let raw: string;
+	try {
+		raw = readFileSync(filePath, "utf8");
+	} catch {
+		// error-policy:J4 absent registry — no version to guard against.
+		return null;
+	}
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (parsed !== null && typeof parsed === "object") {
+			const version = (parsed as Record<string, unknown>).version;
+			return typeof version === "number" ? version : null;
+		}
+	} catch {
+		// error-policy:J3 corrupt JSON — no readable version; treat as unversioned.
+	}
+	return null;
+}
+
+/**
+ * Atomic write: same tmp-file-then-rename pattern as workspace-folder-config.
+ *
+ * Cross-process read-modify-write of `projects.json` is unlocked — atomic rename
+ * prevents torn writes, not interleaved updates from the agent runtime and the
+ * desktop picker racing. This is the accepted precedent from
+ * `workspace-folder-config.ts`: the registry is low-write (a folder pick, a task
+ * bind) and last-writer-wins is tolerable for a per-user config.
+ *
+ * Refuses to overwrite a present, newer-schema file: when `projects.json`
+ * carries a `version` greater than the one being written, the on-disk data
+ * belongs to a build the current process cannot represent, so replacing it with
+ * a downgraded `version: 1` snapshot would silently drop the user's projects.
+ * Throwing surfaces the mismatch instead of clobbering forward-compat state.
+ */
 export function writeProjectRegistry(
 	registry: ProjectRegistry,
 	env: NodeJS.ProcessEnv = process.env,
 ): ProjectRegistry {
+	const onDiskVersion = readRegistryVersionOnDisk(env);
+	if (onDiskVersion !== null && onDiskVersion > registry.version) {
+		throw new Error(
+			`[project-registry] refusing to overwrite projects.json version ${onDiskVersion} with version ${registry.version} (newer schema on disk; a downgrade would drop the user's projects)`,
+		);
+	}
 	const filePath = projectRegistryPath(env);
 	mkdirSync(dirname(filePath), { recursive: true });
 	const tmpPath = `${filePath}.${process.pid}.tmp`;
@@ -171,15 +288,22 @@ export function upsertProject(
 ): ProjectRecord {
 	const registry = readProjectRegistry(env) ?? emptyRegistry();
 	const now = new Date().toISOString();
+	// Canonicalize before matching AND storing so the same directory reached by
+	// different path spellings (symlink, `/tmp` vs `/private/tmp`) upserts one
+	// project, not a duplicate per spelling.
+	const localPath = canonicalizeLocalPath(input.localPath);
 	const existing = registry.projects.find(
-		(p) => p.localPath === input.localPath || (input.id && p.id === input.id),
+		(p) =>
+			canonicalizeLocalPath(p.localPath) === localPath ||
+			(input.id && p.id === input.id),
 	);
 	const record: ProjectRecord = {
 		id: existing?.id ?? input.id ?? randomUUID(),
 		name: input.name,
-		localPath: input.localPath,
+		localPath,
 		repoUrl: input.repoUrl,
 		defaultBranch: input.defaultBranch,
+		worldId: input.worldId ?? existing?.worldId,
 		bookmark: input.bookmark,
 		cloudAppId: input.cloudAppId,
 		createdAt: existing?.createdAt ?? input.createdAt ?? now,
@@ -208,7 +332,10 @@ export function setActiveProject(
 	const projects = registry.projects.map((p) =>
 		p.id === projectId ? { ...p, lastOpenedAt: now } : p,
 	);
-	writeProjectRegistry({ ...registry, activeProjectId: projectId, projects }, env);
+	writeProjectRegistry(
+		{ ...registry, activeProjectId: projectId, projects },
+		env,
+	);
 	return { ...target, lastOpenedAt: now };
 }
 

@@ -2,7 +2,12 @@
  * Shared helpers for launching and inspecting packaged Electrobun app builds
  * in tests.
  */
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  execFile,
+  spawn,
+  spawnSync,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -69,11 +74,28 @@ export interface DesktopTestBridgeState {
   };
 }
 
+export interface DesktopNotificationDiagnostic {
+  id: string;
+  title: string;
+  body?: string;
+  silent?: boolean;
+  shownAt: number;
+}
+
 export interface DesktopWindowBounds {
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+export interface DesktopNotificationRecord {
+  id: string;
+  title: string;
+  body: string | undefined;
+  subtitle: string | undefined;
+  silent: boolean | undefined;
+  recordedAt: string;
 }
 
 interface PackagedStartOptions {
@@ -148,6 +170,55 @@ async function findFiles(
     await walk(root);
   }
   return found;
+}
+
+function runPackagedAutoBuildStep(
+  label: string,
+  args: string[],
+  timeoutMs: number,
+): void {
+  const result = spawnSync("bun", args, {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: timeoutMs,
+  });
+
+  if (result.error) {
+    throw new Error(
+      `Packaged Electrobun launcher was missing and auto-build step "${label}" failed: ${result.error.message}.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Packaged Electrobun launcher was missing and auto-build step "${label}" exited ${
+        result.status ?? 1
+      }.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+  }
+}
+
+function buildPackagedLauncherIfMissing(): void {
+  const autoBuild = process.env.ELIZA_TEST_PACKAGED_AUTO_BUILD;
+  if (autoBuild === "0" || autoBuild === "false") {
+    return;
+  }
+
+  // The desktop build compiles @elizaos/core declarations, which import the
+  // workspace cloud-routing package. Build that lightweight dependency first so
+  // a clean checkout can produce a packaged launcher instead of failing with a
+  // missing @elizaos/cloud-routing dist.
+  runPackagedAutoBuildStep(
+    "cloud-routing build",
+    ["run", "--cwd", "packages/cloud/routing", "build"],
+    2 * 60 * 1000,
+  );
+  runPackagedAutoBuildStep(
+    "electrobun build",
+    ["run", "--cwd", "packages/app-core/platforms/electrobun", "build"],
+    15 * 60 * 1000,
+  );
 }
 
 async function findMacLauncher(): Promise<string | null> {
@@ -295,12 +366,18 @@ export async function resolvePackagedLauncher(
   tempExtractDir: string,
 ): Promise<string | null> {
   if (process.platform === "darwin") {
+    const existing = await findMacLauncher();
+    if (existing) return existing;
+    buildPackagedLauncherIfMissing();
     return await findMacLauncher();
   }
   if (process.platform === "win32") {
     return await resolveWindowsLauncher(tempExtractDir);
   }
   if (process.platform === "linux") {
+    const existing = await findLinuxLauncher();
+    if (existing) return existing;
+    buildPackagedLauncherIfMissing();
     return await findLinuxLauncher();
   }
   return null;
@@ -823,6 +900,25 @@ export class PackagedDesktopHarness {
     });
   }
 
+  async getNotifications(): Promise<DesktopNotificationRecord[]> {
+    const response = await fetchJson<{
+      notifications: DesktopNotificationRecord[];
+    }>(`${this.bridgeUrl}/notifications`, {
+      headers: { Authorization: `Bearer ${this.bridgeToken}` },
+    });
+    return response.notifications;
+  }
+
+  async clearNotifications(): Promise<void> {
+    await fetchJson<{ ok: boolean }>(`${this.bridgeUrl}/notifications`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${this.bridgeToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+  }
+
   async setMainWindowBounds(
     bounds: Partial<DesktopWindowBounds>,
   ): Promise<DesktopWindowBounds> {
@@ -862,6 +958,16 @@ export class PackagedDesktopHarness {
 
   async focusMainWindow(): Promise<void> {
     await fetchJson<{ ok: boolean }>(`${this.bridgeUrl}/main-window/focus`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.bridgeToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+  }
+
+  async minimizeMainWindow(): Promise<void> {
+    await fetchJson<{ ok: boolean }>(`${this.bridgeUrl}/main-window/minimize`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.bridgeToken}`,
@@ -1002,6 +1108,25 @@ export class PackagedDesktopHarness {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ id }),
+    });
+  }
+
+  async readNotifications(): Promise<DesktopNotificationDiagnostic[]> {
+    const response = await fetchJson<{
+      notifications: DesktopNotificationDiagnostic[];
+    }>(`${this.bridgeUrl}/notifications`, {
+      headers: { Authorization: `Bearer ${this.bridgeToken}` },
+    });
+    return response.notifications;
+  }
+
+  async clearNotifications(): Promise<void> {
+    await fetchJson<{ ok: boolean }>(`${this.bridgeUrl}/notifications`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${this.bridgeToken}`,
+        "Content-Type": "application/json",
+      },
     });
   }
 }

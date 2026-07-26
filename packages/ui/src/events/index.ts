@@ -133,16 +133,6 @@ export interface CloudHandoffRetryDetail {
   agentId: string;
 }
 
-// ── Tutorial ─────────────────────────────────────────────────────────────
-/**
- * The interactive tour drives the floating chat into a known state at the start
- * of each frame (and pre-fills the composer for the guided "ask to navigate"
- * demo) via this event; {@link ContinuousChatOverlay} applies it. Keeps the tour
- * decoupled from the overlay's internal detent state (same pattern as the slash
- * navigation events).
- */
-export const TUTORIAL_CHAT_CONTROL_EVENT =
-  "eliza:tutorial:chat-control" as const;
 export const CHAT_PREFILL_EVENT = "eliza:chat:prefill" as const;
 /**
  * Open (expand) the floating chat from anywhere — fired when the launcher's
@@ -164,34 +154,10 @@ export const CHAT_MESSAGE_SEARCH_EVENT = "eliza:chat:message-search" as const;
 export const OPEN_NOTIFICATION_CENTER_EVENT =
   "eliza:notifications:open" as const;
 
-export interface TutorialChatControlDetail {
-  /**
-   * `pill` collapses the chat to the floating pill; `rest` opens it to the peek
-   * detent (grabber + composer visible, history hidden); `expand` opens it
-   * full-screen; `prefill` opens to rest and sets the composer draft to `text`.
-   * `reset` restores the chat to a normal interactive state when the tour ends
-   * (un-pill so the composer is not `inert`, clear any prefilled draft, rest the
-   * sheet) — without it, cancelling the tour while it had collapsed the chat to
-   * the pill leaves the composer visible-but-inert and the user can't type.
-   */
-  action: "pill" | "rest" | "expand" | "prefill" | "reset";
-  text?: string;
-}
-
 export interface ChatPrefillEventDetail {
   text: string;
   /** Select the inserted draft after focusing the composer. Defaults to false. */
   select?: boolean;
-}
-
-/** Dispatch a tutorial chat-control instruction to the overlay. */
-export function dispatchTutorialChatControl(
-  detail: TutorialChatControlDetail,
-): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    new CustomEvent(TUTORIAL_CHAT_CONTROL_EVENT, { detail }),
-  );
 }
 
 /** Dispatch a request to open the floating chat and prefill its composer. */
@@ -261,7 +227,6 @@ export type ElizaDocumentEventName =
 export type ElizaWindowEventName =
   | SharedWindowEventName
   | typeof VOICE_CONTROL_EVENT
-  | typeof TUTORIAL_CHAT_CONTROL_EVENT
   | typeof CHAT_PREFILL_EVENT
   | typeof CLOUD_HANDOFF_PHASE_EVENT
   | typeof CLOUD_HANDOFF_RETRY_EVENT

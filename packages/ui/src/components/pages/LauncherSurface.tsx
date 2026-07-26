@@ -22,6 +22,7 @@ import {
   saveLauncherFavorites,
 } from "../../state/persistence";
 import { useEnabledViewKinds } from "../../state/useViewKinds";
+import { startTutorial } from "../../tutorial/tutorial-service";
 import { Launcher } from "./Launcher";
 import {
   canonicalLauncherId,
@@ -29,7 +30,6 @@ import {
   curateLauncherZones,
   LAUNCHER_RECENTS_ZONE_LIMIT,
 } from "./launcher-curation";
-import { startTutorial } from "./tutorial/tutorial-controller";
 
 export const LauncherSurface = React.memo(
   function LauncherSurface(): React.JSX.Element {
@@ -95,8 +95,9 @@ export const LauncherSurface = React.memo(
 
     const handleLaunch = React.useCallback((entry: ViewEntry) => {
       setRecentIds(recordLauncherRecent(canonicalLauncherId(entry.id)));
-      // The Tutorial tile skips the TutorialView splash: start the interactive
-      // tour directly and land on the chat home so it overlays the real chat.
+      // The Tutorial tile starts the chat-native tour directly (a restart
+      // after a completed/stopped run) and lands on the chat home with the
+      // chat open, where the tour's conversational turns appear.
       const isTutorial = entry.id === "tutorial";
       const path = isTutorial ? "/chat" : (entry.path ?? `/apps/${entry.id}`);
       try {
@@ -109,6 +110,7 @@ export const LauncherSurface = React.memo(
         }
         if (isTutorial) {
           startTutorial();
+          dispatchChatOpen();
         } else if (entry.id === "chat") {
           // The Messages tile lands on `/chat` (the ambient home). Open the chat
           // so the user arrives in a conversation, not on a collapsed pill.

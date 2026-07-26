@@ -122,6 +122,10 @@ bun run --cwd packages/app install:android:adb
 Agent-drivable pipeline for physical-device work (codifies the proven #11030
 device-boot recipe in `.github/issue-evidence/11030-ios-boot-fix/device-boot-README.md`).
 Device id comes from `--device <devicectl-id|udid|name>` or `ELIZA_IOS_DEVICE_ID`.
+Lane phones must stay on power with Settings > Display & Brightness > Auto-Lock
+set to Never. The device scripts probe `devicectl device info lockState` before
+deploy/log/capture work and wait up to `ELIZA_IOS_DEVICE_UNLOCK_WAIT_SECONDS`
+(default 120 s), but the durable lane prerequisite is preventing idle lock.
 
 ```bash
 # Build (unsigned, run-mobile-build ios-local lane) → auto-discover a matching
@@ -147,6 +151,10 @@ bun run --cwd packages/app ios:device:logs -- --device <id> --no-console --pull-
 # Pass --only-testing AppUITests/<Class>[/test] for a single narrow shard.
 bun run --cwd packages/app capture:ios-sim:boot                  # simulator (booted sim auto-detected)
 bun run --cwd packages/app ios:device:capture -- --device <id> --app-path <signed App.app>  # physical device
+
+# Strict simulator boot/chat health gate: same harness, but error-card,
+# no-reply, all-skipped, and zero-passed summaries are hard failures.
+bun run --cwd packages/app test:e2e:ios:boot-gate
 ```
 
 Produced artifacts: deploy stages into `ios/build/device-deploy-stage/`; logs
@@ -159,7 +167,7 @@ aggregate `test-summary.json` naming each shard/container reset) unless
 target/scheme in the template Xcode project) and is
 materialized into the gitignored `packages/app/ios` by cap sync. Pure decision
 logic (profile matching/selection, entitlement derivation, plist/xctestrun
-handling) is in `scripts/ios-device-lib.mjs`, unit-tested by
+handling, lock-state polling decisions) is in `scripts/ios-device-lib.mjs`, unit-tested by
 `scripts/ios-device-lib.test.mjs` in the package vitest suite. Boot-trace pull
 path defaults to `Documents/eliza-boot-trace.jsonl` (+ best-effort rotated
 `eliza-boot-trace.prev.jsonl` sibling; the renderer appends into the same

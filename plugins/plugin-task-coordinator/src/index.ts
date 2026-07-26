@@ -333,3 +333,4 @@ export {
   orchestratorStatusCommandAction,
   registerOrchestratorCommands,
 } from "./orchestrator-command";
+export { ProjectSwitcher } from "./ProjectSwitcher";

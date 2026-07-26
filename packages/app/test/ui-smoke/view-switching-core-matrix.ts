@@ -17,7 +17,6 @@ export type ViewSwitchPair = {
 
 export const REQUIRED_CORE_VIEW_IDS = [
   "tutorial",
-  "help",
   "knowledge",
   "character",
   "settings",
@@ -63,13 +62,6 @@ export const CORE_VIEW_SWITCH_TARGETS: readonly CoreViewSwitchTarget[] = [
     path: "/tutorial",
     kind: "core-view",
     readySelector: '[data-testid="tutorial-launcher"]',
-  },
-  {
-    id: "help",
-    label: "Help",
-    path: "/help",
-    kind: "core-view",
-    readySelector: '[data-testid="help-view"]',
   },
   {
     id: "knowledge",

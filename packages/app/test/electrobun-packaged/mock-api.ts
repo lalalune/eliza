@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 export interface MockApiServerOptions {
   port?: number;
@@ -29,6 +29,11 @@ export interface MockApiServerOptions {
 export interface MockApiServer {
   baseUrl: string;
   requests: string[];
+  broadcastAgentEvent: (payload: JsonObject) => void;
+  waitForWebSocketClients: (
+    count?: number,
+    timeoutMs?: number,
+  ) => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -1768,6 +1773,39 @@ export async function startMockApiServer(
     ws.send(JSON.stringify({ type: "status", ...statusPayload() }));
   });
 
+  const broadcastAgentEvent = (payload: JsonObject): void => {
+    const message = JSON.stringify({ type: "agent_event", ...payload });
+    for (const client of wsServer.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
+    }
+  };
+
+  const waitForWebSocketClients = async (
+    count = 1,
+    timeoutMs = 30_000,
+  ): Promise<void> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      let openClients = 0;
+      for (const client of wsServer.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          openClients += 1;
+        }
+      }
+      if (openClients >= count) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(
+      `Timed out waiting for ${count} mock API WebSocket client(s); open=${
+        [...wsServer.clients].filter(
+          (client) => client.readyState === WebSocket.OPEN,
+        ).length
+      }`,
+    );
+  };
+
   await new Promise<void>((resolve) => {
     server.listen(options.port ?? 2138, "127.0.0.1", resolve);
   });
@@ -1778,6 +1816,8 @@ export async function startMockApiServer(
   return {
     baseUrl,
     requests,
+    broadcastAgentEvent,
+    waitForWebSocketClients,
     close: async () => {
       for (const client of wsServer.clients) {
         client.close();

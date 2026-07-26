@@ -160,7 +160,11 @@ describe("runLane", () => {
 
   it("passes when role+IME applied and the assist session lands in MainActivity", async () => {
     const exec = routeAwareExec();
-    const result = await runLane({ serial: "emulator-5554", exec });
+    const result = await runLane({
+      serial: "emulator-5554",
+      exec,
+      settleMs: 0,
+    });
     expect(result.ok).toBe(true);
     expect(result.failures).toEqual([]);
     expect(result.voiceinteractionLanded).toBe(true);
@@ -185,14 +189,14 @@ describe("runLane", () => {
       "shell settings get secure default_input_method": DEFAULT_IME_ID,
       "logcat -d": allRoutesLog,
     });
-    const result = await runLane({ serial: "s", exec });
+    const result = await runLane({ serial: "s", exec, settleMs: 0 });
     expect(result.ok).toBe(false);
     expect(result.failures.join("\n")).toMatch(/assistant role not applied/);
   });
 
   it("fails when cmd voiceinteraction does not route into MainActivity", async () => {
     const exec = routeAwareExec({ voiceinteraction: "no eliza session here" });
-    const result = await runLane({ serial: "s", exec });
+    const result = await runLane({ serial: "s", exec, settleMs: 0 });
     expect(result.ok).toBe(false);
     expect(result.assistKeyLanded).toBe(true);
     expect(result.failures.join("\n")).toMatch(/cmd voiceinteraction/);
@@ -200,7 +204,7 @@ describe("runLane", () => {
 
   it("fails when KEYCODE_ASSIST does not route into MainActivity", async () => {
     const exec = routeAwareExec({ assistKey: "no eliza session here" });
-    const result = await runLane({ serial: "s", exec });
+    const result = await runLane({ serial: "s", exec, settleMs: 0 });
     expect(result.ok).toBe(false);
     expect(result.voiceinteractionLanded).toBe(true);
     expect(result.failures.join("\n")).toMatch(/KEYCODE_ASSIST/);
@@ -208,8 +212,31 @@ describe("runLane", () => {
 
   it("fails when the IME open-app path does not route into MainActivity", async () => {
     const exec = routeAwareExec({ ime: assistRouteLog });
-    const result = await runLane({ serial: "s", exec });
+    const result = await runLane({ serial: "s", exec, settleMs: 0 });
     expect(result.ok).toBe(false);
     expect(result.failures.join("\n")).toMatch(/IME open-app path/);
+  });
+
+  it("waits after each assistant route before reading logs", async () => {
+    const exec = routeAwareExec();
+    const waits = [];
+    await runLane({
+      serial: "s",
+      exec,
+      settleMs: 2_500,
+      sleepFn: async (ms) => {
+        waits.push(ms);
+      },
+    });
+
+    const cmds = exec.calls.map((a) => a.slice(2).join(" "));
+    const voiceIndex = cmds.indexOf("shell cmd voiceinteraction show");
+    const keyIndex = cmds.indexOf("shell input keyevent KEYCODE_ASSIST");
+    const imeIndex = cmds.findIndex((cmd) => cmd.startsWith("shell am start "));
+
+    expect(cmds[voiceIndex + 1]).toBe("logcat -d");
+    expect(cmds[keyIndex + 1]).toBe("logcat -d");
+    expect(cmds[imeIndex + 1]).toBe("logcat -d");
+    expect(waits).toEqual([2_500, 2_500, 2_500]);
   });
 });

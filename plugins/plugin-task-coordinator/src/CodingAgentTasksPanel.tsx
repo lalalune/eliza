@@ -12,11 +12,13 @@ import { useAgentElement } from "@elizaos/ui/agent-surface";
 import { Archive, Bot, ListChecks, Terminal } from "lucide-react";
 import {
   type ReactNode,
+  useCallback,
   useDeferredValue,
   useEffect,
   useMemo,
   useState,
 } from "react";
+import { ProjectSwitcher } from "./ProjectSwitcher";
 import {
   BackChip,
   SparseWatermark,
@@ -609,6 +611,12 @@ export function CodingAgentTasksPanel({
     useState<CodingAgentTaskThreadDetail | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [search, setSearch] = useState("");
+  // Active project drives the task list's projectId filter (#13776 item 5).
+  // undefined = switcher has not loaded the registry yet; null = show tasks
+  // across all projects (today's behavior).
+  const [activeProjectId, setActiveProjectId] = useState<
+    string | null | undefined
+  >(undefined);
   const [loading, setLoading] = useState(true);
   const [mutating, setMutating] = useState(false);
   // The coding-agent endpoint is owned by the Node-only orchestrator plugin and
@@ -646,8 +654,12 @@ export function CodingAgentTasksPanel({
       description: "Toggle showing archived tasks",
       onActivate: () => setShowArchived((value) => !value),
     });
+  const handleActiveProjectChange = useCallback((projectId: string | null) => {
+    setActiveProjectId(projectId);
+  }, []);
 
   useEffect(() => {
+    if (activeProjectId === undefined) return;
     let cancelled = false;
 
     const refreshThreads = async (silent = false) => {
@@ -658,6 +670,7 @@ export function CodingAgentTasksPanel({
         const nextThreads = await client.listCodingAgentTaskThreads({
           includeArchived: showArchived,
           search: deferredSearch || undefined,
+          projectId: activeProjectId ?? undefined,
           limit: 30,
         });
         if (cancelled) return;
@@ -718,7 +731,7 @@ export function CodingAgentTasksPanel({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [deferredSearch, showArchived, t]);
+  }, [deferredSearch, showArchived, activeProjectId, t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -775,6 +788,7 @@ export function CodingAgentTasksPanel({
       const nextThreads = await client.listCodingAgentTaskThreads({
         includeArchived: showArchived,
         search: deferredSearch || undefined,
+        projectId: activeProjectId ?? undefined,
         limit: 30,
       });
       setLoadError(null);
@@ -806,6 +820,7 @@ export function CodingAgentTasksPanel({
       const nextThreads = await client.listCodingAgentTaskThreads({
         includeArchived: false,
         search: deferredSearch || undefined,
+        projectId: activeProjectId ?? undefined,
         limit: 30,
       });
       setLoadError(null);
@@ -876,20 +891,29 @@ export function CodingAgentTasksPanel({
         // second heading (#13565). The counts survive as a lightweight,
         // left-aligned meta strip that mirrors the SectionNav secondary-row
         // geometry beneath the uniform header.
-        threads.length > 0 ? (
-          <div
-            className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1"
-            data-testid="task-count-strip"
-          >
-            <TaskCountChip value={threads.length} label="total" />
-            {activeCount > 0 ? (
-              <TaskCountChip value={activeCount} label="active" tone="active" />
-            ) : null}
-            {doneCount > 0 ? (
-              <TaskCountChip value={doneCount} label="done" tone="accent" />
-            ) : null}
-          </div>
-        ) : null
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-1">
+          {threads.length > 0 ? (
+            <div
+              className="flex flex-wrap items-center gap-x-3 gap-y-1"
+              data-testid="task-count-strip"
+            >
+              <TaskCountChip value={threads.length} label="total" />
+              {activeCount > 0 ? (
+                <TaskCountChip
+                  value={activeCount}
+                  label="active"
+                  tone="active"
+                />
+              ) : null}
+              {doneCount > 0 ? (
+                <TaskCountChip value={doneCount} label="done" tone="accent" />
+              ) : null}
+            </div>
+          ) : (
+            <span aria-hidden="true" />
+          )}
+          <ProjectSwitcher onActiveProjectChange={handleActiveProjectChange} />
+        </div>
       ) : (
         <TaskListHeader
           icon={<ListChecks className="h-5 w-5" />}
@@ -910,6 +934,11 @@ export function CodingAgentTasksPanel({
                 ) : null}
               </>
             ) : null
+          }
+          action={
+            <ProjectSwitcher
+              onActiveProjectChange={handleActiveProjectChange}
+            />
           }
         />
       )}

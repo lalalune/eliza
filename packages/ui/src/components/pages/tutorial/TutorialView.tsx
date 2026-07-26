@@ -1,18 +1,24 @@
 /**
- * The tour launcher — the view the home "Tutorial" tile opens. Pressing Start
- * activates the global TutorialOverlay (the interactive tour) and drops the user
- * back on the home base so the tour can spotlight the real chat. Eliza narrates
- * each frame aloud; the tour can be muted from its card.
+ * The /tutorial route — a thin launcher for the chat-native tour, kept so the
+ * launcher tile, deep links, and agent navigation still have a view to land
+ * on. Opening it starts the tour immediately (a no-op when one is already
+ * running; a restart after a completed/stopped run) and pops the floating
+ * chat, where the tour actually happens. The panel itself just says so and
+ * offers a start/restart affordance for chat- and voice-driven activation.
  */
 
 import { Sparkles } from "lucide-react";
 import * as React from "react";
 
 import { useAgentElement } from "../../../agent-surface";
-import { useAppSelector } from "../../../state";
+import { dispatchChatOpen } from "../../../events";
+import {
+  restartTutorial,
+  startTutorial,
+  useTutorial,
+} from "../../../tutorial/tutorial-service";
 import { Button } from "../../ui/button";
 import { ShellViewAgentSurface } from "../../views/ShellViewAgentSurface";
-import { startTutorial } from "./tutorial-controller";
 
 export function TutorialView(): React.ReactElement {
   return (
@@ -23,18 +29,29 @@ export function TutorialView(): React.ReactElement {
 }
 
 function TutorialViewBody(): React.ReactElement {
-  const setTab = useAppSelector((s) => s.setTab);
+  const { status } = useTutorial();
+
+  // Arriving here IS the start signal (the tile/deep-link already expressed
+  // intent), so the tour begins without another tap. The floating chat overlay
+  // renders over this view too, so the seeded tour turns are visible in place.
+  React.useEffect(() => {
+    startTutorial();
+    dispatchChatOpen();
+  }, []);
 
   const begin = React.useCallback(() => {
-    startTutorial();
-    setTab("chat"); // return home so the tour overlays the real chat
-  }, [setTab]);
+    // The button is the explicit re-run affordance: restart a finished or
+    // stopped tour from the top; just re-open the chat when one is running.
+    if (status === "active") startTutorial();
+    else restartTutorial();
+    dispatchChatOpen();
+  }, [status]);
 
   const start = useAgentElement<HTMLButtonElement>({
     id: "tutorial-start",
     role: "button",
-    label: "Start quick tour",
-    description: "Launch the interactive walkthrough of the basics",
+    label: status === "active" ? "Reopen the tour chat" : "Start the tour",
+    description: "Run the conversational walkthrough of the basics, in chat",
     onActivate: begin,
   });
 
@@ -45,7 +62,12 @@ function TutorialViewBody(): React.ReactElement {
     >
       <div className="flex max-w-xs flex-col items-center">
         <Sparkles className="mb-3 h-7 w-7 text-accent" aria-hidden />
-        <p className="text-xs text-txt/60">About a minute</p>
+        <p className="text-sm text-txt-strong">
+          The tour runs in the chat — it's open below.
+        </p>
+        <p className="mt-1 text-xs text-txt/60">
+          Reply Next to step through, or type "stop tutorial" anytime.
+        </p>
 
         <Button
           ref={start.ref}
@@ -55,7 +77,7 @@ function TutorialViewBody(): React.ReactElement {
           size="lg"
           className="mt-4 text-[15px] font-semibold"
         >
-          Start
+          {status === "active" ? "Reopen the tour" : "Start the tour"}
         </Button>
       </div>
     </div>

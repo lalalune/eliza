@@ -45,8 +45,6 @@ import {
   CHAT_PREFILL_EVENT,
   type ChatPrefillEventDetail,
   ELIZA_BACK_INTENT_EVENT,
-  TUTORIAL_CHAT_CONTROL_EVENT,
-  type TutorialChatControlDetail,
 } from "../../events";
 import {
   TOUCH_TAP_MOVE_SLOP as OUTSIDE_SHEET_TAP_SLOP,
@@ -71,6 +69,7 @@ import {
 import { useConversationMessages } from "../../state/ConversationMessagesContext.hooks";
 import { goHome, goLauncher } from "../../state/shell-surface-store";
 import { useViewChatBinding } from "../../state/view-chat-binding";
+import { tryHandleTutorialText } from "../../tutorial/tutorial-action-channel";
 import { copyTextToClipboard } from "../../utils/clipboard";
 import {
   CHAT_UPLOAD_ACCEPT,
@@ -96,6 +95,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
 import {
+  isShortLandscapeViewport,
   measureSafeAreaInsetTop,
   resolveChatPanelLayout,
 } from "./chat-panel-layout";
@@ -630,6 +630,120 @@ function TurnStatusIndicator({
   );
 }
 
+<<<<<<< HEAD
+=======
+// After this long WITHOUT OBSERVED PROGRESS still booting, the banner escalates
+// to a "taking longer than usual" state with a settings escape, so a truly
+// stuck boot never reads as a silent hang — but a slow-yet-progressing boot
+// does NOT trip it (#14040 sub-defect 3): the escalation keys off
+// absence-of-progress, not raw elapsed wall-clock. Exported for the unit test
+// (see the __-seam note below).
+export const BOOT_SLOW_AFTER_MS = 90_000;
+
+// Grace before the banner appears: a warm agent leaves the "booting" phase
+// within a frame, so only a real cold boot outlasts this and shows the banner
+// — no flash on a first paint / warm reconnect.
+const BOOT_BANNER_GRACE_MS = 600;
+
+/**
+ * Cold-start boot feedback (resting, pre-send): an indeterminate spinner + live
+ * "Waking …" label, escalating after {@link BOOT_SLOW_AFTER_MS} to a "taking
+ * longer than usual" state with an Open-settings escape. The parent gates
+ * mounting on {@link BOOT_BANNER_GRACE_MS} (see the render site).
+ *
+ * Exported (with BOOT_SLOW_AFTER_MS) only as a unit-test seam — not part of the
+ * public overlay API; cf. `__renderThreadLineForParity`.
+ */
+export function BootStatusIndicator({
+  agentName,
+  onOpenSettings,
+  reduce,
+  progressSignal,
+}: {
+  agentName: string;
+  onOpenSettings?: () => void;
+  reduce?: boolean;
+  /**
+   * A token that changes whenever fresh boot progress is observed (#14040
+   * sub-defect 3). The slow-boot escalation restarts its timer on each change,
+   * so a slow-but-progressing boot never trips "taking longer than usual" while
+   * a genuinely stalled boot still escalates. When `undefined` (no progress
+   * channel available) the timer falls back to raw-elapsed escalation — the
+   * prior behaviour — by keying off a stable token.
+   */
+  progressSignal?: string;
+}): React.JSX.Element {
+  // Escalate on ABSENCE of progress, not raw elapsed time (#14040 sub-defect
+  // 3): the timer is (re)armed on mount AND whenever `progressSignal` changes,
+  // so each fresh progress observation pushes the "taking longer than usual"
+  // threshold out by another window. A boot that keeps reporting progress never
+  // trips it; a stalled boot (token stable for BOOT_SLOW_AFTER_MS) still does.
+  // The parent unmounts this the instant readiness flips, so the timer never
+  // outlives the boot.
+  const [slow, setSlow] = React.useState(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: progressSignal is the RESET trigger, not read in the body — re-running the effect on each change restarts the escalation window (that IS the fix for #14040 sub-defect 3). Removing it would revert to raw-elapsed escalation.
+  React.useEffect(() => {
+    // Fresh progress clears any prior escalation and restarts the window.
+    setSlow(false);
+    const id = window.setTimeout(() => setSlow(true), BOOT_SLOW_AFTER_MS);
+    return () => window.clearTimeout(id);
+  }, [progressSignal]);
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      data-testid="chat-boot-status"
+      data-aesthetic-audit-ignore-text-density="true"
+      data-slow={slow ? "true" : undefined}
+      className="pointer-events-none relative mb-2 flex w-full justify-center"
+    >
+      <span
+        className={cn(
+          "inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1.5 text-sm font-medium text-txt",
+          FLOAT_SHADOW,
+        )}
+      >
+        {slow ? (
+          <>
+            <RotateCcw
+              className={cn(
+                "h-3.5 w-3.5 text-accent",
+                reduce ? "" : "animate-spin [animation-duration:2.4s]",
+              )}
+              aria-hidden="true"
+            />
+            <span>{agentName} is taking longer than usual to wake…</span>
+            {onOpenSettings ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onOpenSettings}
+                data-testid="chat-boot-open-settings"
+                className="pointer-events-auto ml-1 h-auto rounded-full border border-border-strong bg-surface px-2 py-0.5 text-xs text-txt transition-colors hover:border-border-hover hover:bg-bg-hover"
+              >
+                Open settings
+              </Button>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <Loader2
+              className={cn(
+                "h-3.5 w-3.5 text-accent",
+                reduce ? "" : "animate-spin",
+              )}
+              aria-hidden="true"
+            />
+            <span>Waking {agentName}…</span>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+>>>>>>> origin/develop
 /**
  * Render a user turn's text, bolding a leading slash command so a sent
  * `/command` reads as a command in the transcript (mirroring the composer's
@@ -835,6 +949,7 @@ export function ContinuousChatOverlay({
   const {
     messages,
     phase,
+    bootProgressSignal,
     responding,
     turnStatus,
     send,
@@ -1081,6 +1196,12 @@ export function ContinuousChatOverlay({
   // Invariant: only true while at FULL (sheetOpen && expanded && !pilled); every
   // leave-full transition resets it.
   const [maximized, setMaximized] = React.useState(false);
+  // Reactive composer-focus flag. Only the short-landscape compact resting
+  // affordance reads it (#14173): focusing the field lifts the compact treatment
+  // so the composer widens to full BEFORE the first keystroke, and blurring an
+  // empty composer settles it back to compact. Elsewhere focus is tracked via
+  // refs (composerFocusedAtPressRef) that must not trigger a re-render.
+  const [composerFocused, setComposerFocused] = React.useState(false);
   // Whether the sheet was collapsed when the composer last gained focus — so
   // dismissing the keyboard (tap the handle, tap the scrim, tap outside) returns
   // to the prior resting state (collapsed → input) instead of leaving the sheet
@@ -1452,14 +1573,30 @@ export function ContinuousChatOverlay({
       const trimmed = text.trim();
       // An image-only turn is valid; only bail when there's nothing to send.
       if (!trimmed && images.length === 0) return;
-      // During onboarding the composer is unlocked (#12178) but free text is
-      // answered locally by the in-chat conductor and NEVER reaches the server.
-      // Route it through the shared action funnel (classify → "conductor" →
-      // conductor text handler) — `controller.send` is never called here, so
-      // "no server send pre-completion" holds. Attach is disabled during
-      // onboarding, so any images are dropped (text-only echo).
+      // During onboarding the composer is unlocked (#12178). Route free text
+      // through the shared action funnel: before a runtime is chosen it is
+      // answered locally by the in-chat conductor (classify → "conductor") and
+      // does not reach the server; once a Cloud agent is provisioning behind a
+      // ready bootstrap bridge the funnel classifies it as "send" so the first
+      // real message reaches the bootstrap-bridge agent (#14103). Either way
+      // `controller.send` is never called here — the funnel owns the decision.
+      // Attach is disabled during onboarding, so any images are dropped.
       if (firstRunOpen) {
         if (trimmed) void sendActionMessage(trimmed);
+        setDraft("");
+        setSlashDismissed(false);
+        setPendingImages([]);
+        setImageError(null);
+        inputRef.current?.focus();
+        return;
+      }
+      // Explicit tutorial commands ("start/stop/restart tutorial") drive the
+      // chat-native tour locally — never an agent turn. Text-only: a turn
+      // carrying images is a real message, not a command. Sits BEFORE the
+      // canSend gate because the tour is fully client-side and must work with
+      // the agent stopped.
+      if (trimmed && images.length === 0 && tryHandleTutorialText(trimmed)) {
+        clearChatDraft(activeConversationIdRef.current);
         setDraft("");
         setSlashDismissed(false);
         setPendingImages([]);
@@ -1632,7 +1769,12 @@ export function ContinuousChatOverlay({
   // reserved when bounding the panel height.
   const readViewport = React.useCallback(() => {
     if (typeof window === "undefined")
-      return { height: 800, keyboardInset: 0, innerHeight: 800 };
+      return {
+        height: 800,
+        keyboardInset: 0,
+        innerHeight: 800,
+        innerWidth: 1280,
+      };
     const vv = window.visualViewport;
     const innerHeight = window.innerHeight;
     const height = vv?.height ?? innerHeight;
@@ -1641,8 +1783,15 @@ export function ContinuousChatOverlay({
       : 0;
     // innerHeight is the LAYOUT viewport: on Android it shrinks (adjustResize)
     // when the keyboard opens, on iOS (`resize: "body"`) it does not. The lift
-    // math below uses that to avoid double-counting the keyboard.
-    return { height, keyboardInset, innerHeight };
+    // math below uses that to avoid double-counting the keyboard. innerWidth +
+    // innerHeight also drive the short-landscape compact treatment (#14173) —
+    // the LAYOUT viewport so a raised keyboard never flips the orientation read.
+    return {
+      height,
+      keyboardInset,
+      innerHeight,
+      innerWidth: window.innerWidth,
+    };
   }, []);
   const [viewport, setViewport] = React.useState(readViewport);
   const [bottomPad, setBottomPad] = React.useState(0);
@@ -1673,7 +1822,8 @@ export function ContinuousChatOverlay({
       const next = readViewport();
       return prev.height === next.height &&
         prev.keyboardInset === next.keyboardInset &&
-        prev.innerHeight === next.innerHeight
+        prev.innerHeight === next.innerHeight &&
+        prev.innerWidth === next.innerWidth
         ? prev
         : next;
     });
@@ -1791,6 +1941,29 @@ export function ContinuousChatOverlay({
   // a stale flag can never leak into half/collapsed/pill. Drives the edge-to-edge
   // panel styles + a zero top margin.
   const fullBleed = maximized && expanded && sheetOpen && !pilled;
+
+  // #14173: on a wide-but-short landscape viewport the bottom-anchored composer
+  // spans nearly the full width (max-w-3xl, centered) as a ~full-width band, and
+  // in the short height that band sits on top of the view's own controls (the
+  // audit's `overlayClearanceIssues`, e.g. builtin-browser). Shrink the RESTING
+  // overlay to a compact bottom-corner affordance so it clears them; the moment
+  // it is opened, focused, composing, or working, the normal centered composer
+  // returns (so the reading/typing surface is never cramped). Portrait phones
+  // and desktop/tablet never satisfy `shortLandscape`, so they are untouched.
+  const shortLandscape = isShortLandscapeViewport(
+    viewport.innerWidth,
+    viewport.innerHeight,
+  );
+  const compactLanding =
+    shortLandscape &&
+    !sheetOpen &&
+    !fullBleed &&
+    !composerFocused &&
+    !hasDraft &&
+    !hasImages &&
+    !recording &&
+    !responding &&
+    !firstRunOpen;
 
   // Top clearance + max height come from the pure, unit-tested layout solver.
   // It reserves the real measured notch inset (`safeAreaTop`) above the panel,
@@ -2304,59 +2477,6 @@ export function ContinuousChatOverlay({
     expand();
   }, [hasRevealableThread, expand]);
 
-  // Interactive tour control: the tutorial drives the chat into a clean, known
-  // state at the start of each frame (so the spotlight always lands on the right
-  // control) and pre-fills the composer for the guided "ask to navigate" demo.
-  // Decoupled via a window event so the tour never reaches into these internals.
-  React.useEffect(() => {
-    if (typeof window === "undefined") return undefined;
-    const onControl = (event: Event) => {
-      const detail = (event as CustomEvent<TutorialChatControlDetail>).detail;
-      if (!detail) return;
-      // Defense-in-depth for the onboarding lock: while first-run pins the sheet
-      // at FULL, a stray/adversarial tutorial-control event (rest/reset →
-      // collapse, prefill → un-pill) must not move it. The tour only starts
-      // AFTER completeFirstRun, so this never fires in the real flow — it just
-      // closes the one collapse seam outside the gated funnel.
-      if (firstRunOpen) return;
-      switch (detail.action) {
-        case "pill":
-          setMode("pill");
-          // Leaving FULL without goToDetent: drop full-bleed with it, or the
-          // stale `maximized` re-applies on the NEXT return to full (surprise
-          // edge-to-edge). Only the FULL detent may be maximized.
-          setMaximized(false);
-          inputRef.current?.blur();
-          break;
-        case "rest":
-          // goToDetent("collapsed") → input mode, which un-pills.
-          goToDetent("collapsed");
-          break;
-        case "expand":
-          goToDetent("full");
-          break;
-        case "prefill":
-          setMode((m) => (m === "pill" ? "input" : m));
-          setDraft(detail.text ?? "");
-          requestAnimationFrame(() => inputRef.current?.focus());
-          break;
-        case "reset":
-          // Tour ended (cancel / complete): restore a normal interactive chat.
-          // A frame may have collapsed it to the pill, where the composer is
-          // `inert` — clear inert imperatively (React clears it only on the next
-          // render, too late for the stranded input), drop the tour's prefilled
-          // draft, and goToDetent("collapsed") un-pills back to the input bar.
-          contentRef.current?.removeAttribute("inert");
-          setDraft("");
-          goToDetent("collapsed");
-          break;
-      }
-    };
-    window.addEventListener(TUTORIAL_CHAT_CONTROL_EVENT, onControl);
-    return () =>
-      window.removeEventListener(TUTORIAL_CHAT_CONTROL_EVENT, onControl);
-  }, [goToDetent, firstRunOpen, setDraft]);
-
   React.useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const onPrefill = (event: Event) => {
@@ -2781,10 +2901,10 @@ export function ContinuousChatOverlay({
       return undefined;
     }
 
-    // Surfaces painted ABOVE the chat glass (tutorial at Z_TUTORIAL, any open
-    // Radix dialog) must win the tap — the swallower otherwise eats their first
-    // tap AND collapses the chat under them. "Tap outside collapses" is only
-    // for the background view.
+    // Surfaces painted ABOVE the chat glass (notification sheet/panel at
+    // Z_NOTIFICATION_OVERLAY, any open Radix dialog) must win the tap — the
+    // swallower otherwise eats their first tap AND collapses the chat under
+    // them. "Tap outside collapses" is only for the background view.
     const isAboveShellOverlay = (target: EventTarget | null): boolean =>
       target instanceof Element &&
       !!target.closest('[data-above-shell-overlay], [role="dialog"]');
@@ -3323,7 +3443,13 @@ export function ContinuousChatOverlay({
     <div
       ref={overlayRef}
       className={cn(
-        "pointer-events-none fixed inset-x-0 bottom-0 flex w-full min-w-0 flex-col items-center",
+        "pointer-events-none fixed inset-x-0 bottom-0 flex w-full min-w-0 flex-col",
+        // Resting on a landscape phone, the compact composer hugs the trailing
+        // (inline-end) bottom corner — the conventional compose slot views leave
+        // free — instead of centering a wide band over their controls (#14173).
+        // Direction-aware: `items-end` is inline-end, so it lands bottom-left in
+        // RTL. Full-width children (banners) are unaffected (they stay `w-full`).
+        compactLanding ? "items-end" : "items-center",
         // Full-bleed (maximized) removes the side inset so the chat is edge-to-edge.
         fullBleed ? "px-0" : "px-3 sm:px-4",
       )}
@@ -3342,45 +3468,38 @@ export function ContinuousChatOverlay({
         // input still sits above the home-gesture bar. Non-full-bleed anchors
         // the composer LOW, lock-screen style. The OS reports a ~34px bottom
         // safe-area on a home-indicator phone, but the indicator itself is a
-        // thin (~5px) bar seated ~8px off the true bottom — clearing the WHOLE
-        // safe-area floats the pill ~34px up over a dead band. So clear only
-        // what the indicator needs: 60% of the reported inset (clears the bar +
-        // its own margin; the 44px min tap target and the OS bar stay
-        // untouched) with a 0.5rem floor so a device with NO inset still keeps
-        // a hair of breathing room. This seats the pill just above the home
-        // indicator instead of hovering. The floor layer below paints the
-        // reclaimed strip with the home surface so it reads continuous, not as
-        // a black bar.
+        // thin (~5px) bar whose TOP edge sits only ~13px off the true bottom
+        // (5px bar + ~8px own margin) — clearing the WHOLE safe-area floats
+        // the pill ~34px up over a dead band, and 60% (device round: still
+        // reads too high) leaves it hovering ~20px up. So clear exactly what
+        // the indicator occupies: 40% of the reported inset (34px * 0.4 ≈
+        // 13.6px — the pill seats right on the indicator's top edge without
+        // ever overlapping the bar or the OS gesture zone), with a 0.5rem
+        // floor so a device with NO inset still keeps a hair of breathing
+        // room. The same factor holds for Android gesture pills (their inset
+        // reports similarly padded). Everything below the composer is the
+        // full-bleed wallpaper / app floor — no cosmetic strip repaints it.
         paddingBottom: fullBleed
           ? 0
           : keyboardLiftActive
             ? "0.75rem"
-            : "calc(var(--eliza-mobile-nav-offset, 0px) + max(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) * 0.6, 0.5rem))",
+            : "calc(var(--eliza-mobile-nav-offset, 0px) + max(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) * 0.4, 0.5rem))",
       }}
       data-testid="continuous-chat-overlay"
       data-open={sheetOpen ? "true" : undefined}
     >
-      {/* RECLAIMED BOTTOM FLOOR: the composer is lifted off the home-gesture
-          inset, so the strip between the composer and the true screen bottom
-          used to be an unpainted, transparent zone that read as a DEAD BLACK
-          BAR under the composer. This layer fills the reclaimed zone (and a
-          hair above, so it seats behind the composer with no seam) with the
-          same warm home-surface tone (--launch-bg). Purely cosmetic
-          (pointer-events-none, aria-hidden), back of the overlay stack, only
-          needed at rest. Soft top fade blends it into the field. */}
-      {!fullBleed && !keyboardLiftActive ? (
-        <div
-          aria-hidden="true"
-          data-testid="continuous-chat-bottom-floor"
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-0"
-          style={{
-            height:
-              "calc(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) + 1.5rem)",
-            backgroundImage:
-              "linear-gradient(to bottom, transparent 0%, var(--launch-bg) 55%)",
-          }}
-        />
-      ) : null}
+      {/* NO reclaimed-bottom-floor element here (removed): it used to paint a
+          transparent→var(--launch-bg) gradient over the strip below the
+          composer, from when that strip was an UNPAINTED void that read as a
+          dead black bar. The app shell now guarantees that zone is always
+          painted underneath this overlay — the full-bleed wallpaper on
+          shared-background routes (the transparent app-safe-area-floor lets it
+          own the screen to the true bottom edge) and the dark `bg-bg` floor on
+          opaque routes. Repainting it here with --launch-bg (a HOST-seeded
+          launch color, orange on web) drew a visible tinted band over the
+          wallpaper under the floating composer — the residual "gap" on the
+          standalone home view. Everything below the composer must simply show
+          whatever the shell paints: wallpaper, lockscreen-style. */}
       {/* Visual dimming scrim behind the open chat. It fades in WITH the reveal
           but never captures pointer events; outside taps are handled by the
           document-level detector above, and outside drags pass through to the
@@ -3472,10 +3591,66 @@ export function ContinuousChatOverlay({
       {/* Local model download/load status renders as the home-grid
           model-download widget only — no floating pill above the composer (the
           double status read as clutter). Send stays ungated; the server holds
+<<<<<<< HEAD
           the turn until the model is ready. Boot status likewise has NO
           floating surface: a stalled boot speaks in the transcript via the
           boot-recovery conductor (use-boot-recovery-conductor.ts), and the
           in-transcript no-provider gate covers the unconfigured state. */}
+=======
+          the turn until the model is ready. */}
+
+      {/* Cold-start boot feedback — sibling of the model-download banner above.
+          See BootStatusIndicator; `showBootBanner` is the grace-gated flag.
+          Suppressed once we know no provider is configured: the agent will NEVER
+          become ready, so "Waking …" would spin forever — the in-transcript
+          no-provider gate is the honest error surface instead. Also suppressed
+          for the whole of onboarding (#13377): the conductor owns every word on
+          that screen, and a floating "Waking …" chip above the sign-in chat
+          read as clutter. */}
+      {showBootBanner && !noProviderConfigured && !firstRunOpen ? (
+        <BootStatusIndicator
+          agentName={agentName}
+          onOpenSettings={openSettings}
+          reduce={reduce}
+          progressSignal={bootProgressSignal}
+        />
+      ) : null}
+
+      {/* Three tailored prompt suggestions — a keyboard-style strip shown in the
+          resting (closed) state when nothing is typed. Tapping one sends it
+          immediately, which also pulls the chat sheet up. `order: -1` floats the
+          strip ABOVE the chat sheet (sheet-below-bubbles layout); the strip fades
+          out as the sheet is dragged up so the unmount on open never pops. */}
+      {suggestionsVisible ? (
+        <motion.fieldset
+          aria-label="Suggested prompts"
+          className={cn(
+            "pointer-events-auto relative m-0 mb-2 flex w-full max-w-3xl flex-wrap items-center justify-center gap-2 border-0 p-0",
+          )}
+          style={{ order: -1, opacity: suggestionsOpacity }}
+          data-testid="chat-suggestions"
+        >
+          {suggestions.map((s, i) => (
+            <Button
+              key={s}
+              variant="ghost"
+              size="sm"
+              data-testid={`chat-suggestion-${i}`}
+              aria-label={s}
+              onClick={() => pickSuggestion(s)}
+              className={cn(
+                "h-auto max-w-full truncate rounded-full border border-white/15 bg-black/40 px-3 py-1.5",
+                "text-[12px] text-white/80 transition-colors",
+                "hover:border-white/30 hover:bg-white/15 hover:text-white",
+                "  ",
+              )}
+            >
+              {s}
+            </Button>
+          ))}
+        </motion.fieldset>
+      ) : null}
+>>>>>>> origin/develop
 
       {/* THE chat — one connected object. Its base is the always-present input;
           the conversation grows UP out of it on a pull, inside this same panel.
@@ -3486,7 +3661,15 @@ export function ContinuousChatOverlay({
       <div
         className={cn(
           "pointer-events-none relative flex w-full flex-col items-center",
-          fullBleed ? "max-w-none" : "max-w-3xl",
+          // Compact resting affordance on a landscape phone (#14173): a narrow
+          // 13rem composer whose overlap with view controls stays under the
+          // audit's clearance threshold. The grabber + pill are positioned
+          // relative to THIS wrapper, so they shrink and re-corner with it.
+          fullBleed
+            ? "max-w-none"
+            : compactLanding
+              ? "max-w-[13rem]"
+              : "max-w-3xl",
         )}
       >
         {!fullBleed ? (
@@ -4087,6 +4270,9 @@ export function ContinuousChatOverlay({
                   if (e.target.value.trim().length > 0) expand();
                 }}
                 onFocus={() => {
+                  // Widen out of the short-landscape compact affordance (#14173)
+                  // on focus, before the first keystroke.
+                  setComposerFocused(true);
                   // A pill-open focus only raises the keyboard; it must not
                   // expand a history thread (see suppressExpandOnFocusRef).
                   if (suppressExpandOnFocusRef.current) {
@@ -4095,6 +4281,7 @@ export function ContinuousChatOverlay({
                     expand();
                   }
                 }}
+                onBlur={() => setComposerFocused(false)}
                 onPaste={handleComposerPaste}
                 onKeyDown={handleComposerKeyDown}
                 // The composer is unlocked during onboarding (#12178): typing is

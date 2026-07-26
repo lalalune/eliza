@@ -728,6 +728,23 @@ describe("DesktopManager notifications", () => {
       subtitle: undefined,
       silent: true,
     });
+    expect(manager.getNotificationDiagnostics()).toEqual([
+      expect.objectContaining({
+        id: "notification_1",
+        title: "Build finished",
+        body: "Desktop build completed.",
+        silent: false,
+      }),
+      expect.objectContaining({
+        id: "notification_2",
+        title: "Quiet sync",
+        body: "Background sync completed.",
+        silent: true,
+      }),
+    ]);
+
+    manager.clearNotificationDiagnostics();
+    expect(manager.getNotificationDiagnostics()).toEqual([]);
   });
 
   it("documents closeNotification as an Electrobun no-op", async () => {

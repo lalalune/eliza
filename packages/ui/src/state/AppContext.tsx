@@ -43,6 +43,10 @@ import {
 } from "../navigation";
 import { getFrontendPlatform } from "../platform/platform-guards";
 import { applyThemeToDocument } from "../themes/apply-theme";
+import {
+  tryHandleTutorialAction,
+  tryHandleTutorialText,
+} from "../tutorial/tutorial-action-channel";
 import { copyTextToClipboard } from "../utils";
 import { RESYNC_EVENT, type ResyncEventDetail } from "./AppContext.hooks";
 import {
@@ -923,6 +927,7 @@ function AppProviderInner({
     pollCloudCredits,
     handleCloudLogin,
     handleCloudDisconnect,
+    handleCloudSignOut,
   } = cloudHook;
 
   // ── Clipboard ──────────────────────────────────────────────────────
@@ -1163,10 +1168,10 @@ function AppProviderInner({
   // onboarding widget in the transcript is dropped here instead of sending the
   // literal sentinel to the agent as a chat message. While onboarding is
   // ACTIVE (firstRunComplete false) free text is routed to the conductor's
-  // in-chat reply persona (`tryHandleFirstRunText`) and never reaches the
-  // server — the #12178 composer unlock keeps chat interactive without
-  // breaking the "no server send pre-completion" property, which is enforced
-  // HERE (the `"conductor"` case never calls `rawSendActionMessage`). Once
+  // in-chat reply persona (`tryHandleFirstRunText`) until a Cloud-provisioned
+  // bootstrap bridge exists. That preserves the pre-choice "no server send"
+  // invariant while letting the user's first real post-provisioning message
+  // reach the dedicated agent instead of being swallowed by setup copy. Once
   // onboarding completes, every non-first-run value falls through to the real
   // send funnel unchanged. Widgets stay 100% display-only — both
   // InlineWidgetText and MessageContent route picks through this single
@@ -1177,10 +1182,24 @@ function AppProviderInner({
       // to cloud / retry / download) are consumed by the model-status conductor
       // and NEVER reach the server — regardless of onboarding state.
       if (tryHandleModelAction(text)) return Promise.resolve();
+<<<<<<< HEAD
       // Same contract for the in-chat boot-recovery card's `__boot_recovery__:`
       // controls (re-log in / try again / retry setup).
       if (tryHandleBootRecoveryAction(text)) return Promise.resolve();
       switch (classifyActionMessage(text, firstRunComplete === true)) {
+=======
+      // Tutorial choice picks (`__tutorial__:` prefix) are likewise consumed
+      // unconditionally — a tap on a leftover tour widget in an old transcript
+      // must never become a literal chat message to the agent.
+      if (tryHandleTutorialAction(text)) return Promise.resolve();
+      const firstRunIsComplete = firstRunComplete === true;
+      switch (
+        classifyActionMessage(text, firstRunIsComplete, {
+          allowFirstRunTextSend:
+            !firstRunIsComplete && firstRunCloudProvisionedContainer,
+        })
+      ) {
+>>>>>>> origin/develop
         case "first-run": {
           const handled = tryHandleFirstRunAction(text);
           const fallbackPath = handled
@@ -1198,10 +1217,13 @@ function AppProviderInner({
           tryHandleFirstRunText(text);
           return Promise.resolve();
         case "send":
+          // Explicit "start/stop/restart tutorial" commands drive the tour
+          // locally; every other message flows to the real send untouched.
+          if (tryHandleTutorialText(text)) return Promise.resolve();
           return rawSendActionMessage(text);
       }
     },
-    [firstRunComplete, rawSendActionMessage],
+    [firstRunCloudProvisionedContainer, firstRunComplete, rawSendActionMessage],
   );
 
   useEffect(() => {
@@ -2098,6 +2120,7 @@ function AppProviderInner({
       completeFirstRun,
       handleCloudLogin,
       handleCloudDisconnect,
+      handleCloudSignOut,
       switchAgentProfile,
       loadUpdateStatus,
       handleChannelChange,
@@ -2474,6 +2497,7 @@ function AppProviderInner({
       completeFirstRun,
       handleCloudLogin,
       handleCloudDisconnect,
+      handleCloudSignOut,
       switchAgentProfile,
       loadUpdateStatus,
       handleChannelChange,

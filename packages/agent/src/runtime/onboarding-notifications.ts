@@ -34,15 +34,17 @@ function isNotifier(value: unknown): value is NotifierLike {
 
 /**
  * The seed set. Deep links are plain root-relative paths so they pass the
- * client's `isSafeDeepLink` allowlist: `/tutorial` (guided tour), `/help`
- * (help center), `/connectors` (Settings → Connectors, where calendar linking
- * lives). Stable groupKeys make re-seeding idempotent even if the guard flag
- * is ever lost — a duplicate collapses onto the existing row.
+ * client's `isSafeDeepLink` allowlist: `/tutorial` (the chat-native tour),
+ * `/chat` (help lives in the conversation — the agent answers questions from
+ * its bundled help knowledge), `/connectors` (Settings → Connectors, where
+ * calendar linking lives). Stable groupKeys make re-seeding idempotent even
+ * if the guard flag is ever lost — a duplicate collapses onto the existing
+ * row.
  */
 export const ONBOARDING_NOTIFICATIONS: readonly NotificationInput[] = [
   {
     title: "Take the tour",
-    body: "New here? A two-minute guided tour shows you chat, the launcher, and your home screen.",
+    body: "New here? A one-minute tour runs right in the chat — it walks you through messaging, voice, and navigating by asking.",
     category: "general",
     priority: "normal",
     source: "system",
@@ -51,11 +53,11 @@ export const ONBOARDING_NOTIFICATIONS: readonly NotificationInput[] = [
   },
   {
     title: "Get help any time",
-    body: "Stuck or curious? The help center answers common questions and can restart the tour.",
+    body: "Stuck or curious? Just ask in the chat — your agent answers questions about the app and can restart the tour.",
     category: "general",
     priority: "low",
     source: "system",
-    deepLink: "/help",
+    deepLink: "/chat",
     groupKey: "onboarding:help",
   },
   {

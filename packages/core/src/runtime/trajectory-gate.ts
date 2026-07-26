@@ -18,18 +18,24 @@ const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
 /**
  * Coerce a raw env value to a boolean. Returns undefined when the var is unset
- * (so the caller can fall through to the next precedence tier); a set-but-not-
- * truthy value coerces to false (an explicit opt-out).
+ * or blank/whitespace-only — a set-but-empty entry (an empty `.env` line,
+ * `ELIZA_TRAJECTORY_LOGGING=`) is treated as unset so the caller falls through
+ * to the next precedence tier rather than reading as an explicit opt-out, per
+ * the repo's blank-is-unset env contract (`presentEnvValue`, boot-env.ts;
+ * #13802). A set, non-blank, non-truthy value ("0"/"false"/…) is an explicit
+ * opt-out and coerces to false.
  */
 function coerceFlag(raw: string | undefined): boolean | undefined {
-	if (raw === undefined) return undefined;
-	return TRUTHY.has(raw.trim().toLowerCase());
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+  return TRUTHY.has(trimmed.toLowerCase());
 }
 
 export interface TrajectoryGateDecision {
-	enabled: boolean;
-	/** Which precedence tier decided, for diagnostics/logging. */
-	reason: string;
+  enabled: boolean;
+  /** Which precedence tier decided, for diagnostics/logging. */
+  reason: string;
 }
 
 /**
@@ -44,29 +50,29 @@ export interface TrajectoryGateDecision {
  *   6. otherwise (dev / unset NODE_ENV) — on, for local debugging.
  */
 export function resolveTrajectoryGate(
-	env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): TrajectoryGateDecision {
-	if (env.ELIZA_DISABLE_TRAJECTORY_LOGGING === "1") {
-		return { enabled: false, reason: "disable-flag" };
-	}
+  if (env.ELIZA_DISABLE_TRAJECTORY_LOGGING === "1") {
+    return { enabled: false, reason: "disable-flag" };
+  }
 
-	const explicit = coerceFlag(env.ELIZA_TRAJECTORY_LOGGING);
-	if (explicit !== undefined) {
-		return { enabled: explicit, reason: "explicit-logging" };
-	}
+  const explicit = coerceFlag(env.ELIZA_TRAJECTORY_LOGGING);
+  if (explicit !== undefined) {
+    return { enabled: explicit, reason: "explicit-logging" };
+  }
 
-	const legacy = coerceFlag(env.ELIZA_TRAJECTORY_RECORDING);
-	if (legacy !== undefined) {
-		return { enabled: legacy, reason: "explicit-recording-legacy" };
-	}
+  const legacy = coerceFlag(env.ELIZA_TRAJECTORY_RECORDING);
+  if (legacy !== undefined) {
+    return { enabled: legacy, reason: "explicit-recording-legacy" };
+  }
 
-	if (env.NODE_ENV === "test") {
-		return { enabled: false, reason: "test-default-off" };
-	}
+  if (env.NODE_ENV === "test") {
+    return { enabled: false, reason: "test-default-off" };
+  }
 
-	if (env.NODE_ENV === "production") {
-		return { enabled: false, reason: "production-opt-in" };
-	}
+  if (env.NODE_ENV === "production") {
+    return { enabled: false, reason: "production-opt-in" };
+  }
 
-	return { enabled: true, reason: "dev-default-on" };
+  return { enabled: true, reason: "dev-default-on" };
 }

@@ -53,7 +53,6 @@ export const DESKTOP_VIEW_WINDOWS: readonly DesktopViewWindow[] = [
     labelKey: "desktop.views.tutorial",
     path: "/tutorial",
   },
-  { id: "help", label: "Help", labelKey: "desktop.views.help", path: "/help" },
   {
     id: "chat",
     label: "Messages",

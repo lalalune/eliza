@@ -147,6 +147,9 @@ async function launchHarness(args: {
     tempRoot,
     launcherPath: launcherPath as string,
     apiBase: args.apiBase,
+    extraEnv: {
+      ELIZA_DESKTOP_TEST_ENABLE_RUNTIME_CHOOSER: "1",
+    },
   });
 
   await harness.start({

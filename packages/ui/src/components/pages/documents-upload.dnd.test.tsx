@@ -24,6 +24,7 @@ const clientMock = vi.hoisted(() => ({
   listDocuments: vi.fn(),
   uploadDocumentsBulk: vi.fn(),
   searchDocuments: vi.fn(),
+  getDocumentFacetCounts: vi.fn(),
 }));
 
 vi.mock("../../state", () => ({
@@ -84,9 +85,16 @@ beforeEach(() => {
   clientMock.listDocuments.mockReset();
   clientMock.uploadDocumentsBulk.mockReset();
   clientMock.searchDocuments.mockReset();
+  clientMock.getDocumentFacetCounts.mockReset();
   clientMock.listDocuments.mockResolvedValue({ documents: [] });
   clientMock.uploadDocumentsBulk.mockResolvedValue({
     results: [{ index: 0, ok: true, filename: "notes.txt" }],
+  });
+  // The hub loads whole-store facet counts alongside the first page (#13594);
+  // the drop tests only exercise upload, so a quiet zero-count response keeps
+  // mount side-effect-free (an unmocked call would surface a load-error notice).
+  clientMock.getDocumentFacetCounts.mockResolvedValue({
+    counts: { all: 0, doc: 0, image: 0, audio: 0, video: 0, transcript: 0 },
   });
 });
 

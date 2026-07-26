@@ -14,7 +14,7 @@
  * that call this same harness in-app.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ElizaClient } from "../../api/client-base";
 import {
   classifyErrorFallbackReply,
@@ -159,5 +159,52 @@ describe("runVoiceSelfTest SEND honesty (#10726)", () => {
     const { sendStage } = await runSendStage({ text: "", completed: false });
     expect(sendStage.status).toBe("fail");
     expect(sendStage.error).toContain("no reply");
+  });
+
+  it("fails TTS playback when AudioContext stays suspended", async () => {
+    const originalFetch = globalThis.fetch;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "Content-Type": "audio/wav" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const report = await runVoiceSelfTest({
+        platform: "ios",
+        mode: "inject-transcript",
+        injectedTranscript: "hello eliza how are you",
+        fixtureUrl: "unused-in-inject-mode",
+        expectedPhrase: "hello eliza how are you",
+        ttsRoute: "/api/tts/local-inference",
+        client: clientReturning({
+          text: "Doing great - how can I help?",
+          completed: true,
+        }),
+        audioCtx: {
+          state: "suspended",
+          resume: async () => {
+            throw new Error("resume blocked");
+          },
+          decodeAudioData: async () =>
+            ({
+              duration: 1,
+              numberOfChannels: 1,
+              getChannelData: () => new Float32Array([0.1, -0.1, 0.05]),
+            }) as AudioBuffer,
+        } as AudioContext,
+      });
+
+      const ttsStage = report.stages.find((stage) => stage.stage === "tts");
+      expect(ttsStage?.status).toBe("fail");
+      expect(ttsStage?.detail.played).toBe(false);
+      expect(ttsStage?.error).toContain("playback graph did not start");
+      expect(report.overall).toBe("fail");
+    } finally {
+      globalThis.fetch = originalFetch;
+      warn.mockRestore();
+    }
   });
 });

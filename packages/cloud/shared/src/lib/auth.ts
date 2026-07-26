@@ -12,6 +12,7 @@ import {
   type StewardVerifyEnv,
   verifyStewardTokenCached,
 } from "./auth/steward-client";
+import { readStewardAccessCookieFromHeader } from "./auth/steward-cookies";
 import { verifyWalletSignature } from "./auth/wallet-auth";
 import { cache as redisCache } from "./cache/client";
 import { CacheKeys, CacheTTL } from "./cache/keys";
@@ -118,7 +119,10 @@ export async function getCurrentUserFromRequest(
     const playwrightTestUser = await getPlaywrightTestUserFromHeader(cookieHeader);
     if (playwrightTestUser) return playwrightTestUser;
 
-    const stewardToken = getCookieValueFromHeader(cookieHeader, "steward-token");
+    const stewardToken = readStewardAccessCookieFromHeader(
+      cookieHeader,
+      getCloudAwareEnv().ENVIRONMENT,
+    );
     if (!stewardToken) return null;
 
     const tokenHash = hashToken(stewardToken);
@@ -405,7 +409,10 @@ export async function requireAuthOrApiKey(request: Request): Promise<AuthResult>
 
   // Fall back to session authentication (cookie-based)
   const user = await requireAuth(request);
-  const sessionToken = getCookieValueFromHeader(request.headers.get("cookie"), "steward-token");
+  const sessionToken = readStewardAccessCookieFromHeader(
+    request.headers.get("cookie"),
+    getCloudAwareEnv().ENVIRONMENT,
+  );
 
   return {
     user,

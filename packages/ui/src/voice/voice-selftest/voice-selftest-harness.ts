@@ -36,7 +36,7 @@ export type VoiceSelfTestMode =
   | "wav-direct"
   | "mic-capture"
   | "inject-transcript";
-export type VoiceSelfTestPlatform = "web" | "android" | "desktop";
+export type VoiceSelfTestPlatform = "web" | "android" | "desktop" | "ios";
 
 export interface VoiceSelfTestStage {
   stage: "asr" | "send" | "tts";
@@ -155,7 +155,17 @@ async function playThroughDestination(
     if (ctx.state === "suspended") {
       // error-policy:J4 a stuck-suspended context surfaces as started:false /
       // outputObserved:false in the returned playback result
-      await ctx.resume().catch(() => {});
+      await ctx.resume().catch((error) => {
+        console.warn(
+          "[voice-selftest] AudioContext resume failed before playback probe",
+          error,
+        );
+      });
+      if (ctx.state === "suspended") {
+        throw new Error(
+          "AudioContext remained suspended before playback probe",
+        );
+      }
     }
     const source = ctx.createBufferSource();
     source.buffer = buffer;

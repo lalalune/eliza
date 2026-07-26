@@ -23,8 +23,8 @@ colliding with section headings. Those are fixed and reviewed in
 | 01 cold-launch | desktop | ✅ good | clean |
 | 02 onboarding-runtime | desktop | ✅ good | clean |
 | 03 provisioning-ready | desktop | ✅ good | clean |
-| 04 tutorial | desktop | ✅ good | clean |
-| 05 help | desktop | ✅ good | clean |
+| 04 tutorial (chat-native) | desktop | (re-capture pending) | superseded by the chat-native tour |
+| 05 tutorial-commands | desktop | (re-capture pending) | replaces the removed Help view |
 | 06 settings-open | desktop | ✅ good | clean |
 | 07 wallet | desktop | ✅ good | clean |
 | 08 chat-round-trip | desktop | ✅ good | clean |
@@ -48,8 +48,8 @@ colliding with section headings. Those are fixed and reviewed in
 | 01 cold-launch | mobile | ✅ good | clean |
 | 02 onboarding-runtime | mobile | ✅ good | clean |
 | 03 provisioning-ready | mobile | ✅ good | clean |
-| 04 tutorial | mobile | ✅ good | clean |
-| 05 help | mobile | ✅ good | clean |
+| 04 tutorial (chat-native) | mobile | (re-capture pending) | superseded by the chat-native tour |
+| 05 tutorial-commands | mobile | (re-capture pending) | replaces the removed Help view |
 | 06 settings-open | mobile | ✅ good | clean |
 | 07 wallet | mobile | ✅ good | clean |
 | 08 chat-round-trip | mobile | ✅ good | clean |

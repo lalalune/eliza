@@ -24,6 +24,11 @@ final class BootCaptureUITests: XCTestCase {
         case terminated
     }
 
+    private struct StrictGateFailure: Error, CustomStringConvertible {
+        let message: String
+        var description: String { message }
+    }
+
     override func setUpWithError() throws {
         // Keep capturing after a failed poll — the filmstrip is the point.
         continueAfterFailure = true
@@ -33,6 +38,7 @@ final class BootCaptureUITests: XCTestCase {
         let env = ProcessInfo.processInfo.environment
         let timeoutSeconds = Double(env["ELIZA_BOOT_TIMEOUT_SECONDS"] ?? "") ?? 180
         let intervalSeconds = max(1, Double(env["ELIZA_BOOT_SCREENSHOT_INTERVAL_SECONDS"] ?? "") ?? 15)
+        let requireHome = envFlag("ELIZA_REQUIRE_HOME", env: env)
 
         let app = XCUIApplication()
         launchWithRetry(app)
@@ -69,12 +75,22 @@ final class BootCaptureUITests: XCTestCase {
         }
 
         let elapsed = Int(Date().timeIntervalSince(start).rounded())
-        XCTAssertTrue(
-            outcome == .home || outcome == .errorCard,
-            "Boot ended in state '\(outcome.rawValue)' after \(elapsed)s " +
-            "(budget \(Int(timeoutSeconds))s) — expected home or the startup-failure card. " +
-            "See the boot-*.png attachments for the filmstrip."
-        )
+        if requireHome {
+            XCTAssertEqual(
+                outcome,
+                .home,
+                "Strict boot gate ended in state '\(outcome.rawValue)' after \(elapsed)s " +
+                    "(budget \(Int(timeoutSeconds))s) — expected home, not an error card/timeout. " +
+                    "See the boot-*.png attachments for the filmstrip."
+            )
+        } else {
+            XCTAssertTrue(
+                outcome == .home || outcome == .errorCard,
+                "Boot ended in state '\(outcome.rawValue)' after \(elapsed)s " +
+                    "(budget \(Int(timeoutSeconds))s) — expected home or the startup-failure card. " +
+                    "See the boot-*.png attachments for the filmstrip."
+            )
+        }
     }
 
     /// One watchable interaction beyond boot: tap the chat composer, type
@@ -103,7 +119,7 @@ final class BootCaptureUITests: XCTestCase {
         }
         attachScreenshot(named: "interaction-000-home")
         guard reachedHome else {
-            throw XCTSkip("boot did not reach home — composer interaction not attempted")
+            try skipOrFail("boot did not reach home — composer interaction not attempted", env: env)
         }
 
         // The composer is a web <textarea> — surfaces as a textView (or
@@ -121,14 +137,16 @@ final class BootCaptureUITests: XCTestCase {
             })
         else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("no hittable composer text element in the AX tree — see ax-hierarchy attachment")
+            try skipOrFail(
+                "no hittable composer text element in the AX tree — see ax-hierarchy attachment",
+                env: env)
         }
 
         composer.tap()
         attachScreenshot(named: "interaction-010-composer-tapped")
         guard app.keyboards.firstMatch.waitForExistence(timeout: 10) else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("keyboard never appeared after tapping the composer")
+            try skipOrFail("keyboard never appeared after tapping the composer", env: env)
         }
 
         composer.typeText("hello")
@@ -168,6 +186,7 @@ final class BootCaptureUITests: XCTestCase {
         let prompt = env["ELIZA_SEND_PROMPT"] ?? "Hello, introduce yourself briefly."
         let replyTimeout = Double(env["ELIZA_REPLY_TIMEOUT_SECONDS"] ?? "") ?? 300
         let shotInterval = max(1, Double(env["ELIZA_REPLY_SCREENSHOT_INTERVAL_SECONDS"] ?? "") ?? 15)
+        let requireReply = envFlag("ELIZA_REQUIRE_REPLY", env: env)
 
         let app = XCUIApplication()
         launchWithRetry(app)
@@ -184,7 +203,7 @@ final class BootCaptureUITests: XCTestCase {
         }
         attachScreenshot(named: "send-000-home")
         guard reachedHome else {
-            throw XCTSkip("boot did not reach home — send not attempted")
+            try skipOrFail("boot did not reach home — send not attempted", env: env)
         }
 
         // Wait out the local model warm-up (the "Loading Eliza…" chip) so the
@@ -217,7 +236,7 @@ final class BootCaptureUITests: XCTestCase {
             })
         else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("no hittable composer text element in the AX tree")
+            try skipOrFail("no hittable composer text element in the AX tree", env: env)
         }
 
         // Baseline of visible static-text labels BEFORE the send, so the
@@ -230,7 +249,7 @@ final class BootCaptureUITests: XCTestCase {
         composer.tap()
         guard app.keyboards.firstMatch.waitForExistence(timeout: 10) else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("keyboard never appeared after tapping the composer")
+            try skipOrFail("keyboard never appeared after tapping the composer", env: env)
         }
         composer.typeText(prompt)
         attachScreenshot(named: "send-010-typed-prompt")
@@ -246,7 +265,7 @@ final class BootCaptureUITests: XCTestCase {
         guard sendButton.waitForExistence(timeout: 5), sendButton.isHittable else {
             attachScreenshot(named: "send-015-no-send-button")
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("no hittable send control after typing the prompt")
+            try skipOrFail("no hittable send control after typing the prompt", env: env)
         }
         sendButton.tap()
         Thread.sleep(forTimeInterval: 2.0)
@@ -302,6 +321,14 @@ final class BootCaptureUITests: XCTestCase {
             outcome, "app-terminated",
             "the app died while waiting for the reply — see the send-wait filmstrip."
         )
+        if requireReply {
+            XCTAssertEqual(
+                outcome,
+                "reply",
+                "Strict boot gate did not observe an assistant reply within \(Int(replyTimeout))s — " +
+                    "outcome was \(outcome). See the send-wait filmstrip."
+            )
+        }
     }
 
     // MARK: - Full onboarding → chat → voice (cloud + local)
@@ -349,7 +376,7 @@ final class BootCaptureUITests: XCTestCase {
         attachScreenshot(named: "\(tag)-000-greeting")
         guard live else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("boot never reached a live renderer — onboarding not attempted")
+            try skipOrFail("boot never reached a live renderer — onboarding not attempted", env: env)
         }
 
         // 2. Placement choice. The conductor seeds the greeting + choice ONLY
@@ -362,10 +389,11 @@ final class BootCaptureUITests: XCTestCase {
         if !tapWebChoice(app, label: placement, timeout: min(agentReady, 300)) {
             attachScreenshot(named: "\(tag)-010-no-placement-choice")
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip(
+            try skipOrFail(
                 "first-run placement choice '\(placement)' never surfaced within "
                     + "\(Int(min(agentReady, 300)))s (greeting is gated behind the "
-                    + "agent-wake + listLocalAgentBackups). See \(tag)-010.")
+                    + "agent-wake + listLocalAgentBackups). See \(tag)-010.",
+                env: env)
         }
         attachScreenshot(named: "\(tag)-010-after-placement")
 
@@ -406,11 +434,11 @@ final class BootCaptureUITests: XCTestCase {
         attachScreenshot(named: "\(tag)-040-onboarding-\(unlocked ? "complete" : "stalled")")
         guard unlocked else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip(
+            try skipOrFail(
                 "onboarding (\(tag)) did not complete — composer stayed locked "
                     + "(cloud OAuth needs a device session, or the local model is "
-                    + "still warming). See the \(tag)-*.png filmstrip."
-            )
+                    + "still warming). See the \(tag)-*.png filmstrip.",
+                env: env)
         }
 
         // 5b. Local path only: hold the app foregrounded so the fire-and-forget
@@ -473,7 +501,8 @@ final class BootCaptureUITests: XCTestCase {
         let composer = firstHittableComposer(app)
         guard let composer else {
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("no hittable composer after onboarding")
+            let env = ProcessInfo.processInfo.environment
+            try skipOrFail("no hittable composer after onboarding", env: env)
         }
         let replyMarker = "IOS_CHAT_OK"
         let prompt =
@@ -663,7 +692,8 @@ final class BootCaptureUITests: XCTestCase {
         guard mic.waitForExistence(timeout: 8), mic.isHittable else {
             attachScreenshot(named: "\(tag)-080-no-mic")
             attachAccessibilitySnapshot(of: app)
-            throw XCTSkip("mic control ('talk') not hittable — voice not attempted")
+            let env = ProcessInfo.processInfo.environment
+            try skipOrFail("mic control ('talk') not hittable — voice not attempted", env: env)
         }
         mic.tap()
         // First voice use raises the SpringBoard microphone-permission alert;
@@ -773,6 +803,27 @@ final class BootCaptureUITests: XCTestCase {
             app.textFields.firstMatch,
         ]
         return candidates.first { $0.waitForExistence(timeout: 10) && $0.isHittable }
+    }
+
+    private func envFlag(_ name: String, env: [String: String]) -> Bool {
+        let value = (env[name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return value == "1" || value == "true" || value == "yes" || value == "on"
+    }
+
+    private func strictNoSkips(_ env: [String: String]) -> Bool {
+        envFlag("ELIZA_REQUIRE_NO_SKIPS", env: env)
+            || envFlag("ELIZA_FAIL_ON_SKIP", env: env)
+            || envFlag("ELIZA_REQUIRE_HOME", env: env)
+            || envFlag("ELIZA_REQUIRE_REPLY", env: env)
+    }
+
+    private func skipOrFail(_ message: String, env: [String: String]) throws -> Never {
+        if strictNoSkips(env) {
+            XCTFail("Strict iOS boot gate precondition failed: \(message)")
+            throw StrictGateFailure(message: message)
+        }
+        throw XCTSkip(message)
     }
 
     /// `XCUIApplication.launch()` can race an in-flight app (re)install —

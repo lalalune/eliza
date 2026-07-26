@@ -2,10 +2,11 @@
  * Pure decision logic for the one-command iOS device automation scripts
  * (ios-device-deploy.mjs / ios-device-logs.mjs / ios-device-capture.mjs).
  *
- * Everything exported here is deterministic and side-effect free so it can be
- * unit-tested (see ios-device-lib.test.mjs, run by `bun run --cwd packages/app
- * test`, i.e. the root test:client lane). The scripts own the impure edges
- * (spawning `security` / `xcodebuild` / `devicectl`, reading files).
+ * Everything exported here is deterministic, or takes impure edges as injected
+ * dependencies, so it can be unit-tested (see ios-device-lib.test.mjs, run by
+ * `bun run --cwd packages/app test`, i.e. the root test:client lane). The
+ * scripts own the actual impure edges (spawning `security` / `xcodebuild` /
+ * `devicectl`, reading files).
  */
 import crypto from "node:crypto";
 
@@ -708,6 +709,104 @@ export function extractXctestrunAppPaths(xctestrun, testRoot) {
   return [...new Set(paths)];
 }
 
+function numberFromSummaryValue(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (value && typeof value === "object") {
+    return numberFromSummaryValue(value._value ?? value.value ?? value.count);
+  }
+  return null;
+}
+
+function collectXcresultSummaryStats(value, stats = null) {
+  const current = stats ?? {
+    passed: null,
+    failed: null,
+    skipped: null,
+    total: null,
+    resultValues: [],
+  };
+  if (Array.isArray(value)) {
+    for (const item of value) collectXcresultSummaryStats(item, current, "");
+    return current;
+  }
+  if (!value || typeof value !== "object") return current;
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const lowerKey = rawKey.toLowerCase();
+    if (
+      (lowerKey === "result" || lowerKey.endsWith("result")) &&
+      typeof rawValue === "string"
+    ) {
+      current.resultValues.push(rawValue.toLowerCase());
+    }
+    const numeric = numberFromSummaryValue(rawValue);
+    if (numeric !== null) {
+      if (/passedtests|passcount|passedcount|testspassed/.test(lowerKey)) {
+        current.passed = Math.max(current.passed ?? 0, numeric);
+      } else if (
+        /failedtests|failurecount|failedcount|testsfailed/.test(lowerKey)
+      ) {
+        current.failed = Math.max(current.failed ?? 0, numeric);
+      } else if (
+        /skippedtests|skipcount|skippedcount|testsskipped/.test(lowerKey)
+      ) {
+        current.skipped = Math.max(current.skipped ?? 0, numeric);
+      } else if (/testscount|testcount|totaltests|tests/.test(lowerKey)) {
+        current.total = Math.max(current.total ?? 0, numeric);
+      }
+    }
+    collectXcresultSummaryStats(rawValue, current);
+  }
+  return current;
+}
+
+/**
+ * Classify `xcrun xcresulttool get test-results summary --path <bundle>` JSON
+ * for health-gate purposes. Xcode has changed this payload shape across
+ * versions, so this consumes both explicit count fields and recursive result
+ * strings. The strict rule is intentionally small: an all-skipped run or a run
+ * with an explicit zero passed-tests count is not a useful health signal.
+ *
+ * @param {unknown} summary parsed xcresulttool summary JSON
+ * @returns {{ ok: boolean, reason: string | null, stats: { passed: number | null, failed: number | null, skipped: number | null, total: number | null, resultValues: string[] } }}
+ */
+export function classifyXcresultSummaryForGate(summary) {
+  const stats = collectXcresultSummaryStats(summary);
+  const hasPassedResult = stats.resultValues.includes("passed");
+  const hasFailedResult = stats.resultValues.includes("failed");
+  const hasSkippedResult = stats.resultValues.includes("skipped");
+  if (stats.passed === 0) {
+    return {
+      ok: false,
+      reason: "test-summary reports passedTests=0",
+      stats,
+    };
+  }
+  if (
+    stats.skipped !== null &&
+    stats.skipped > 0 &&
+    (stats.passed ?? 0) === 0 &&
+    (stats.failed ?? 0) === 0
+  ) {
+    return {
+      ok: false,
+      reason: "test-summary reports an all-skipped run",
+      stats,
+    };
+  }
+  if (hasSkippedResult && !hasPassedResult && !hasFailedResult) {
+    return {
+      ok: false,
+      reason: "test-summary result is Skipped with no passed tests",
+      stats,
+    };
+  }
+  return { ok: true, reason: null, stats };
+}
+
 /**
  * Recursively replace the __TESTROOT__ placeholder in every string value of a
  * parsed .xctestrun. Required whenever the .xctestrun file is written
@@ -822,7 +921,12 @@ export function findUncoveredIosXcuitestEntries({ entries, shards }) {
 }
 
 export function isBenignIosAppAbsence(output) {
-  return /not installed|not found|no such app|unknown application|does not exist|could not find/i.test(
+  // simctl reports an absent app differently per verb: uninstall/get-container
+  // say "not installed"/"could not find", while `terminate` against an app that
+  // is not currently running exits non-zero with "found nothing to terminate".
+  // For a fresh-container reset all of these mean the same benign thing — there
+  // was nothing to clean up — so the reset must not treat them as failures.
+  return /not installed|not found|no such app|unknown application|does not exist|could not find|found nothing to terminate|no matching processes|not currently running/i.test(
     String(output ?? ""),
   );
 }
@@ -885,6 +989,121 @@ export function findDeviceRecord(payload, deviceId) {
     }
   }
   return null;
+}
+
+/**
+ * Normalize the shape emitted by `devicectl device info lockState`.
+ * The useful fields have appeared both at top level and under result payloads
+ * across Xcode toolchains, so consume either without guessing at unknown data.
+ *
+ * @param {Record<string, unknown>} payload
+ * @returns {{ passcodeRequired: boolean | null, unlockedSinceBoot: boolean | null, locked: boolean, reason: string | null }}
+ */
+export function normalizeDeviceLockState(payload) {
+  const candidate =
+    payload?.result?.lockState && typeof payload.result.lockState === "object"
+      ? payload.result.lockState
+      : payload?.result && typeof payload.result === "object"
+        ? payload.result
+        : payload;
+  const passcodeRequired =
+    typeof candidate?.passcodeRequired === "boolean"
+      ? candidate.passcodeRequired
+      : null;
+  const unlockedSinceBoot =
+    typeof candidate?.unlockedSinceBoot === "boolean"
+      ? candidate.unlockedSinceBoot
+      : null;
+  if (passcodeRequired === true) {
+    return {
+      passcodeRequired,
+      unlockedSinceBoot,
+      locked: true,
+      reason: "passcode required",
+    };
+  }
+  if (unlockedSinceBoot === false) {
+    return {
+      passcodeRequired,
+      unlockedSinceBoot,
+      locked: true,
+      reason: "not unlocked since boot",
+    };
+  }
+  return {
+    passcodeRequired,
+    unlockedSinceBoot,
+    locked: false,
+    reason: null,
+  };
+}
+
+export function formatDeviceUnlockWaitMessage({
+  device,
+  timeoutSeconds,
+  reason,
+}) {
+  const name = device?.name || "iOS device";
+  const identifier = device?.identifier || "unknown identifier";
+  const suffix = reason ? ` (${reason})` : "";
+  return `${name} (${identifier}) is locked${suffix}; unlock the phone and keep it awake. Waiting up to ${timeoutSeconds}s.`;
+}
+
+/**
+ * Wait until a physical iOS device is unlocked.
+ *
+ * The impure edges are injected so the polling behavior stays unit-testable.
+ *
+ * @param {{
+ *   device: { identifier: string, name?: string },
+ *   probeLockState: () => Record<string, unknown> | Promise<Record<string, unknown>>,
+ *   sleep: (ms: number) => Promise<void>,
+ *   notify?: (message: string) => void,
+ *   waitSeconds?: number,
+ *   pollIntervalSeconds?: number,
+ *   now?: () => number,
+ * }} options
+ * @returns {Promise<ReturnType<typeof normalizeDeviceLockState>>}
+ */
+export async function assertDeviceUnlocked({
+  device,
+  probeLockState,
+  sleep,
+  notify = () => {},
+  waitSeconds = 120,
+  pollIntervalSeconds = 5,
+  now = Date.now,
+}) {
+  const timeoutMs = Math.max(0, Number(waitSeconds) || 0) * 1000;
+  const pollMs = Math.max(1, Number(pollIntervalSeconds) || 1) * 1000;
+  const deadline = now() + timeoutMs;
+  let notified = false;
+  let lastState = null;
+
+  while (true) {
+    lastState = normalizeDeviceLockState(await probeLockState());
+    if (!lastState.locked) return lastState;
+    if (!notified) {
+      notify(
+        formatDeviceUnlockWaitMessage({
+          device,
+          timeoutSeconds: Math.ceil(timeoutMs / 1000),
+          reason: lastState.reason,
+        }),
+      );
+      notified = true;
+    }
+    if (now() >= deadline) {
+      throw new Error(
+        `${formatDeviceUnlockWaitMessage({
+          device,
+          timeoutSeconds: Math.ceil(timeoutMs / 1000),
+          reason: lastState.reason,
+        })} Timed out before the device became usable.`,
+      );
+    }
+    await sleep(Math.min(pollMs, Math.max(1, deadline - now())));
+  }
 }
 
 /**

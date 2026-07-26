@@ -255,3 +255,90 @@ describe("orchestrator admission queue — N tasks vs maxSessions (#13778)", () 
     await acp.stop();
   });
 });
+
+describe("orchestrator keepAlive reclaim — post-restart session→task fallback (#14106)", () => {
+  it("reclaims a pre-restart idle keepAlive session whose owning task is terminal even when the in-memory index is empty", async () => {
+    // Reproduces the #14106 starvation: after a parent restart the in-memory
+    // `sessionTaskIndex` is empty, but pre-restart keepAlive sessions are still
+    // live in the ACP and their session→task mapping survives only in the
+    // durable store. The starvation guard must resolve that mapping via the
+    // store (like `resolveTaskId`) — reading the index alone reclaims nothing
+    // and queued tasks starve behind zombie sessions of already-terminal tasks.
+    const CAP = 1;
+
+    const acp = new AcpService(
+      acpRuntime({
+        ELIZA_ACP_MAX_SESSIONS: String(CAP),
+        ELIZA_ACP_ADMISSION_POLL_MS: "5",
+      }),
+    );
+    await acp.start();
+
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const service = new OrchestratorTaskService(orchestratorRuntime(acp), {
+      store,
+    });
+    await service.start();
+
+    // A task that occupied the only worker slot with a keepAlive session, then
+    // finished — the durable store retains its session→task mapping.
+    const finished = await service.createTask({
+      title: "pre-restart",
+      goal: "Implement and verify",
+    });
+    await service.spawnAgentForTask(finished.id);
+    await poll(async () => (await acp.listSessions()).length === 1);
+    const zombie = (await acp.listSessions())[0];
+    expect(zombie).toBeDefined();
+    if (!zombie) throw new Error("expected a live session");
+    // The session's task is now terminal; the live session is dead-weight
+    // holding the only slot.
+    await store.updateTask(finished.id, { status: "done" });
+    expect((await store.findSession(zombie.id))?.taskId).toBe(finished.id);
+
+    // Simulate the parent restart: drop the in-memory index so the ONLY
+    // session→task mapping is the durable store, exactly as after a cold boot
+    // that reattached the live keepAlive session.
+    (
+      service as unknown as { sessionTaskIndex: Map<string, string> }
+    ).sessionTaskIndex.clear();
+
+    // A newly queued task hits the full worker cap and parks. Its drain must
+    // reclaim the zombie session — which is only possible via the store
+    // fallback, since the in-memory index no longer knows the session.
+    const queued = await service.createTask({
+      title: "post-restart-queued",
+      goal: "Implement and verify",
+    });
+    const detail = await service.spawnAgentForTask(queued.id);
+    expect(detail?.admission).toBeTruthy();
+
+    // The guard stops the pre-restart zombie session, freeing the slot, the
+    // queued task drains out of the queue, and its fresh session becomes the
+    // sole active worker — all only reachable because the store fallback mapped
+    // the zombie session to its terminal task.
+    await poll(async () => {
+      const sessions = await acp.listSessions();
+      const zombieStopped = !sessions.some(
+        (s) => s.id === zombie.id && isActive(s),
+      );
+      const queuedAdmitted =
+        (await service.getAdmissionSnapshot()).queueDepth === 0;
+      const oneActiveWorker = sessions.filter(isActive).length === CAP;
+      return zombieStopped && queuedAdmitted && oneActiveWorker;
+    });
+
+    const sessionsAfter = await acp.listSessions();
+    expect(sessionsAfter.some((s) => s.id === zombie.id && isActive(s))).toBe(
+      false,
+    );
+    expect((await service.getAdmissionSnapshot()).queueDepth).toBe(0);
+    expect(sessionsAfter.filter(isActive).length).toBe(CAP);
+    // The one live worker is the queued task's fresh session, not the zombie.
+    const liveWorker = sessionsAfter.find(isActive);
+    expect(liveWorker?.id).not.toBe(zombie.id);
+
+    await service.stop();
+    await acp.stop();
+  });
+});

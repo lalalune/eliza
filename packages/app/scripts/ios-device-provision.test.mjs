@@ -6,13 +6,17 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createAscJwt,
+  developmentProfileName,
   discoverAppBundleIds,
   ensureBundleId,
   ensureDeviceRegistered,
   makeAscClient,
   mintDevelopmentProfile,
+  profileCoversRequest,
+  profileIsUsable,
   provision,
   resolveAscCredentials,
+  validateBundleIds,
   writeProfile,
 } from "./ios-device-provision.mjs";
 
@@ -202,10 +206,116 @@ describe("ensureDeviceRegistered / ensureBundleId — idempotent", () => {
 });
 
 describe("mintDevelopmentProfile", () => {
-  it("deletes a same-named profile then recreates it", async () => {
+  it("reuses a valid same-named profile without destructive refresh", async () => {
     const fetchImpl = mockFetch({
-      "GET /v1/profiles": { body: { data: [{ id: "OLD" }] } },
-      "DELETE /v1/profiles/OLD": { body: {} },
+      "GET /v1/profiles": {
+        body: {
+          data: [
+            {
+              id: "EXISTING",
+              attributes: { name: "n", uuid: "U", profileContent: "AA==" },
+              relationships: {
+                bundleId: { data: { type: "bundleIds", id: "B1" } },
+                devices: { data: [{ type: "devices", id: "DEV1" }] },
+                certificates: {
+                  data: [{ type: "certificates", id: "C1" }],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    const asc = makeAscClient({ jwt: "t", fetchImpl });
+    const p = await mintDevelopmentProfile(asc, {
+      name: "n",
+      bundleIdRef: "B1",
+      deviceIds: ["DEV1"],
+      certificateIds: ["C1"],
+    });
+    expect(p.id).toBe("EXISTING");
+    expect(fetchImpl.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "GET /v1/profiles",
+    ]);
+  });
+
+  it("fails closed when a same-named profile does not cover the request", async () => {
+    const fetchImpl = mockFetch({
+      "GET /v1/profiles": {
+        body: {
+          data: [
+            {
+              id: "OLD",
+              attributes: { name: "n", uuid: "U", profileContent: "AA==" },
+              relationships: {
+                bundleId: { data: { type: "bundleIds", id: "B1" } },
+                devices: { data: [{ type: "devices", id: "OTHER-DEVICE" }] },
+                certificates: {
+                  data: [{ type: "certificates", id: "C1" }],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    const asc = makeAscClient({ jwt: "t", fetchImpl });
+    await expect(
+      mintDevelopmentProfile(asc, {
+        name: "n",
+        bundleIdRef: "B1",
+        deviceIds: ["DEV1"],
+        certificateIds: ["C1"],
+      }),
+    ).rejects.toThrow(/Refusing to delete/);
+    expect(fetchImpl.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "GET /v1/profiles",
+    ]);
+  });
+
+  it("fails closed when a same-named profile is expired even if it covers the request", async () => {
+    const fetchImpl = mockFetch({
+      "GET /v1/profiles": {
+        body: {
+          data: [
+            {
+              id: "OLD",
+              attributes: {
+                name: "n",
+                uuid: "U",
+                profileContent: "AA==",
+                profileState: "EXPIRED",
+                expirationDate: "2026-01-01T00:00:00.000Z",
+              },
+              relationships: {
+                bundleId: { data: { type: "bundleIds", id: "B1" } },
+                devices: { data: [{ type: "devices", id: "DEV1" }] },
+                certificates: {
+                  data: [{ type: "certificates", id: "C1" }],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    const asc = makeAscClient({ jwt: "t", fetchImpl });
+    await expect(
+      mintDevelopmentProfile(asc, {
+        name: "n",
+        bundleIdRef: "B1",
+        deviceIds: ["DEV1"],
+        certificateIds: ["C1"],
+      }),
+    ).rejects.toThrow(/expired or inactive/);
+    expect(fetchImpl.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "GET /v1/profiles",
+    ]);
+  });
+
+  it("mints a new development profile when no same-named profile exists", async () => {
+    const fetchImpl = mockFetch({
+      "GET /v1/profiles": { body: { data: [] } },
       "POST /v1/profiles": {
         status: 201,
         body: {
@@ -226,7 +336,6 @@ describe("mintDevelopmentProfile", () => {
     expect(p.id).toBe("NEW");
     expect(fetchImpl.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       "GET /v1/profiles",
-      "DELETE /v1/profiles/OLD",
       "POST /v1/profiles",
     ]);
     const post = fetchImpl.calls.find((c) => c.method === "POST");
@@ -234,6 +343,85 @@ describe("mintDevelopmentProfile", () => {
     expect(post.body.data.relationships.devices.data).toEqual([
       { type: "devices", id: "DEV1" },
     ]);
+  });
+});
+
+describe("profileCoversRequest", () => {
+  it("requires bundle, requested device, and every requested certificate", () => {
+    const profile = {
+      relationships: {
+        bundleId: { data: { id: "B1" } },
+        devices: { data: [{ id: "DEV1" }, { id: "DEV2" }] },
+        certificates: { data: [{ id: "C1" }, { id: "C2" }] },
+      },
+    };
+
+    expect(
+      profileCoversRequest(profile, {
+        bundleIdRef: "B1",
+        deviceIds: ["DEV1"],
+        certificateIds: ["C1", "C2"],
+      }),
+    ).toBe(true);
+    expect(
+      profileCoversRequest(profile, {
+        bundleIdRef: "B2",
+        deviceIds: ["DEV1"],
+        certificateIds: ["C1", "C2"],
+      }),
+    ).toBe(false);
+    expect(
+      profileCoversRequest(profile, {
+        bundleIdRef: "B1",
+        deviceIds: ["DEV3"],
+        certificateIds: ["C1", "C2"],
+      }),
+    ).toBe(false);
+    expect(
+      profileCoversRequest(profile, {
+        bundleIdRef: "B1",
+        deviceIds: ["DEV1"],
+        certificateIds: ["C1", "C3"],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("profileIsUsable", () => {
+  it("accepts active unexpired profiles and rejects inactive or expired ones", () => {
+    const now = new Date("2026-07-05T00:00:00.000Z");
+    expect(
+      profileIsUsable(
+        {
+          attributes: {
+            profileState: "ACTIVE",
+            expirationDate: "2026-07-06T00:00:00.000Z",
+          },
+        },
+        now,
+      ),
+    ).toBe(true);
+    expect(
+      profileIsUsable({ attributes: { profileState: "EXPIRED" } }, now),
+    ).toBe(false);
+    expect(
+      profileIsUsable(
+        { attributes: { expirationDate: "2026-07-04T00:00:00.000Z" } },
+        now,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("developmentProfileName", () => {
+  it("scopes profile refresh names by device so one device cannot delete another", () => {
+    const first = developmentProfileName("ai.elizaos.app", "DEVICE-A");
+    const second = developmentProfileName("ai.elizaos.app", "DEVICE-B");
+
+    expect(first).toMatch(/^Eliza Dev - ai\.elizaos\.app - [a-f0-9]{12}$/);
+    expect(second).toMatch(/^Eliza Dev - ai\.elizaos\.app - [a-f0-9]{12}$/);
+    expect(first).not.toBe(second);
+    expect(developmentProfileName("ai.elizaos.app", "DEVICE-A")).toBe(first);
   });
 });
 
@@ -286,10 +474,25 @@ describe("discoverAppBundleIds", () => {
   });
 });
 
+describe("validateBundleIds", () => {
+  it("fails the non-mutating proof when no bundle ids resolve", () => {
+    expect(() => validateBundleIds([], "ios:device:provision")).toThrow(
+      /ios:device:provision: no bundle ids resolved/,
+    );
+  });
+
+  it("rejects empty bundle identifiers", () => {
+    expect(() =>
+      validateBundleIds([{ identifier: "   " }], "ios:device:provision"),
+    ).toThrow(/empty bundle identifier/);
+  });
+});
+
 describe("provision — full idempotent flow", () => {
   it("registers device, ensures bundles, mints + writes a profile per bundle id", async () => {
     const dir = tmpDir();
     const content = Buffer.from("profile-bytes").toString("base64");
+    const expectedProfileName = developmentProfileName("ai.elizaos.app", "DEV");
     const fetchImpl = mockFetch({
       "GET /v1/devices": { body: { data: [] } },
       "POST /v1/devices": { status: 201, body: { data: { id: "DEV" } } },
@@ -303,7 +506,7 @@ describe("provision — full idempotent flow", () => {
           data: {
             id: "PROF",
             attributes: {
-              name: "Eliza Dev - ai.elizaos.app",
+              name: expectedProfileName,
               uuid: "UUID",
               profileContent: content,
             },
@@ -325,13 +528,17 @@ describe("provision — full idempotent flow", () => {
       {
         identifier: "ai.elizaos.app",
         bundleCreated: true,
-        profile: "Eliza Dev - ai.elizaos.app",
+        profile: expectedProfileName,
         file: path.join(dir, "UUID.mobileprovision"),
       },
     ]);
     expect(
       fs.readFileSync(path.join(dir, "UUID.mobileprovision"), "utf8"),
     ).toBe("profile-bytes");
+    const profilePost = fetchImpl.calls.find(
+      (c) => c.method === "POST" && c.path === "/v1/profiles",
+    );
+    expect(profilePost.body.data.attributes.name).toBe(expectedProfileName);
     // Every request carried the bearer JWT.
     expect(fetchImpl.calls.every((c) => c.auth?.startsWith("Bearer "))).toBe(
       true,

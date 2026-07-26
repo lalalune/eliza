@@ -450,6 +450,7 @@ export type DocumentScope =
   | "agent-private";
 
 export type DocumentProvenanceKind =
+  | "import"
   | "upload"
   | "learned"
   | "character"
@@ -499,6 +500,22 @@ export interface DocumentsResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+/**
+ * Whole-store per-facet counts for the Knowledge hub segmented control
+ * (#13594). Keyed by the coarse hub facet; `all` is the readable total under
+ * the current scope/room/search narrowing.
+ */
+export interface DocumentFacetCountsResponse {
+  counts: {
+    all: number;
+    doc: number;
+    image: number;
+    audio: number;
+    video: number;
+    transcript: number;
+  };
 }
 
 export interface DocumentFragmentRecord {

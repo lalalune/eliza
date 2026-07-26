@@ -35,7 +35,6 @@ import {
 
 const LAUNCHER_ICON_IDS: ReadonlySet<string> = new Set<DesktopLauncherIconId>([
   "tutorial",
-  "help",
   "chat",
   "character",
   "documents",

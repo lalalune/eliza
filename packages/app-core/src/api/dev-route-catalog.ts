@@ -147,16 +147,6 @@ const ROUTES: DevRouteEntry[] = [
     platformGate: null,
   },
   {
-    tabId: "help",
-    path: "/help",
-    label: "Help",
-    group: "Hidden",
-    visibility: "all",
-    featureFlag: null,
-    requiresAuth: true,
-    platformGate: null,
-  },
-  {
     tabId: "apps",
     path: "/apps",
     label: "Apps",

@@ -30,13 +30,6 @@ const CORE_SURFACE_OWNERS: Readonly<Record<string, CoreSurfaceOwner>> = {
     minAgentElements: 1,
     requiredSnippets: ["tutorial-start"],
   },
-  help: {
-    viewId: "help",
-    provider: "shell",
-    files: ["packages/ui/src/components/pages/help/HelpView.tsx"],
-    minAgentElements: 2,
-    requiredSnippets: ["help-entry-", "help-link-"],
-  },
   knowledge: {
     viewId: "documents",
     provider: "shell",

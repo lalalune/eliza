@@ -394,6 +394,7 @@ describe("trajectory export bundle", () => {
       exportBundle: true,
       includeRaw: true,
       runId: "run-1",
+      traceId: "trace-1",
       outputDir,
       tasks: ["response"],
     });
@@ -403,6 +404,7 @@ describe("trajectory export bundle", () => {
       limit: 100,
       offset: 0,
       runId: "run-1",
+      traceId: "trace-1",
     });
     expect(trainingService.getTrajectoryById).toHaveBeenCalledTimes(2);
 
@@ -425,6 +427,7 @@ describe("trajectory export bundle", () => {
       metadata: {
         requestedLimit: 100,
         requestedRunId: "run-1",
+        requestedTraceId: "trace-1",
         selectedTrajectoryIds: 2,
         loadedTrajectories: 2,
         bundledTrajectories: 1,

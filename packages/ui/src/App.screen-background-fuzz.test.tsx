@@ -446,7 +446,6 @@ const BUILTIN_TABS: { tab: BuiltinTab; path: string }[] = [
   { tab: "desktop", path: "/desktop" },
   { tab: "settings", path: "/settings" },
   { tab: "tutorial", path: "/tutorial" },
-  { tab: "help", path: "/help" },
   { tab: "logs", path: "/logs" },
   { tab: "background", path: "/background" },
 ];

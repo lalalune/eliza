@@ -910,6 +910,30 @@ export async function dismissPermissionPrimingIfShown(
   });
 }
 
+/**
+ * The post-completion chat state depends on the tutorial pick: "skip" lands on
+ * the auto-collapsed sheet (home revealed), while "start" launches the
+ * chat-native tour, which re-opens the chat to show its seeded welcome turn.
+ * Either way the composer must be unlocked.
+ */
+async function expectPostOnboardingChat(
+  page: Page,
+  tutorial: "start" | "skip",
+): Promise<void> {
+  if (tutorial === "skip") {
+    await expectOnboardingAutoCollapse(page);
+    return;
+  }
+  await expect(page.getByTestId("continuous-chat-overlay")).toHaveAttribute(
+    "data-open",
+    "true",
+    { timeout: 30_000 },
+  );
+  await expect(page.getByTestId("chat-composer-textarea")).toBeEnabled({
+    timeout: 15_000,
+  });
+}
+
 /** Assert the seeded per-plugin home widgets render with their attention data. */
 async function expectPopulatedHome(page: Page): Promise<Locator> {
   const host = page.getByTestId("widget-host-home");
@@ -988,6 +1012,7 @@ export async function completeOnboardingToHome(
   // 3) Provisioning posts first-run, then the conductor offers the tutorial.
   await pickTutorial(page, click, tutorial);
 
+<<<<<<< HEAD
   // 4) Landing is the HOME: the sheet settles to the HALF detent on the
   // completion edge (revealing the home behind the top half) and the floating
   // chat overlay stays present with a now-unlocked composer; the home widget
@@ -996,6 +1021,15 @@ export async function completeOnboardingToHome(
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
   await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
+=======
+  // 4) Landing is the HOME: with "skip" the sheet auto-collapses on the
+  // completion edge (revealing the home); with "start" the chat-native tour
+  // re-opens it over the home. The composer unlocks either way and the home
+  // widget host renders its seeded cards.
+  const chatOverlay = page.getByTestId("continuous-chat-overlay");
+  await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
+  await expectPostOnboardingChat(page, tutorial);
+>>>>>>> origin/develop
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
   });
@@ -1050,8 +1084,12 @@ export async function completeCloudOnboardingToHome(
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
+<<<<<<< HEAD
   await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
+=======
+  await expectPostOnboardingChat(page, tutorial);
+>>>>>>> origin/develop
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
   });
@@ -1144,11 +1182,20 @@ export async function completeCloudOnlyOnboardingToHome(
   await expectCloudOnlySignInOnboarding(page);
 
   // The session token lands as the login flow the tap launches completes
+<<<<<<< HEAD
   // (mocked at the storage boundary — same token the poll mock returns).
   // Seeding it also arms the conductor's 500ms token poll, which can win the
   // race and complete onboarding BEFORE the tap lands — the button then sits
   // in a settling sheet and never reads "stable". Bound the click and let the
   // completion assertions carry the contract either way.
+=======
+  // (mocked at the storage boundary — same token the poll mock returns). This
+  // deliberately RACES the conductor's 500ms session poll, exactly like a real
+  // login landing while the user reaches for the button: whichever side wins,
+  // onboarding must complete. The click therefore tolerates the button
+  // collapsing/unmounting under it (poll won) instead of chasing a detached
+  // element until the test times out.
+>>>>>>> origin/develop
   await setStewardSession(page, { token: CLOUD_AUTH_TOKEN });
   try {
     await page
@@ -1156,7 +1203,12 @@ export async function completeCloudOnlyOnboardingToHome(
       .first()
       .click({ timeout: 8_000 });
   } catch {
+<<<<<<< HEAD
     // The token poll already completed onboarding — nothing left to tap.
+=======
+    // Button gone/unstable because the session poll already completed
+    // onboarding — the completion assertions below are the real contract.
+>>>>>>> origin/develop
   }
 
   return expectCloudOnlyCompletion(page, opts.state);
@@ -1209,8 +1261,12 @@ export async function completeCloudInferenceOnboardingToHome(
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
+<<<<<<< HEAD
   await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
+=======
+  await expectPostOnboardingChat(page, tutorial);
+>>>>>>> origin/develop
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
   });
@@ -1258,8 +1314,12 @@ export async function completeOtherProviderSettingsHandoff(
 
   const chatOverlay = page.getByTestId("continuous-chat-overlay");
   await expect(chatOverlay).toBeVisible({ timeout: 60_000 });
+<<<<<<< HEAD
   await expectOnboardingSettleToHalf(page);
   await dismissPermissionPrimingIfShown(page);
+=======
+  await expectPostOnboardingChat(page, tutorial);
+>>>>>>> origin/develop
   await expect(page.getByTestId("chat-composer-textarea")).toBeVisible({
     timeout: 30_000,
   });

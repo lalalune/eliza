@@ -15,7 +15,6 @@ import {
   useState,
 } from "react";
 import { pathForTab, shouldUseHashNavigation, type Tab } from "../navigation";
-import { isNavAllowed } from "../navigation/nav-lock";
 import {
   loadLastNativeTab,
   type ShellView,
@@ -73,9 +72,6 @@ export function useNavigationState(deps: NavigationStateDeps) {
 
   const setTab = useCallback(
     (newTab: Tab) => {
-      // A guided flow (the tour) can restrict navigation to the tabs the current
-      // step expects, so nothing drifts the app into a state it doesn't expect.
-      if (!isNavAllowed(newTab)) return;
       setTabRaw(newTab);
       if (newTab === "apps") {
         setAppsSubTab(hasActiveGameRun ? "games" : "browse");

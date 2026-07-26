@@ -15,6 +15,10 @@ import {
   openSettingsSection,
   seedAppStorage,
 } from "./helpers";
+import {
+  assertSharedViewHeaderContract,
+  clickViewHeaderBack,
+} from "./helpers/view-header";
 
 type ReadyCheck =
   | { selector: string; text?: never }
@@ -27,6 +31,23 @@ type RouteProbe = {
   readyChecks: readonly ReadyCheck[];
   mode?: "any" | "all";
   timeoutMs?: number;
+  /**
+   * When set, the route is a `normal` view that MUST render the shared
+   * ViewHeader (#13586) — the probe asserts the icon-only-back contract via
+   * `assertSharedViewHeaderContract`. Chat / launcher-catalog / onboarding
+   * surfaces render no shared header (they own their chrome), so they leave
+   * this unset and are not asserted — matching `assertSharedViewHeader`'s
+   * no-op-for-exempt-views semantics.
+   */
+  requireViewHeader?: boolean;
+  /**
+   * Scope for the ViewHeader assertion: the routed view's shell selector
+   * (`viewHeaderWithin`) or the header's own title text (`viewHeaderTitle`).
+   * Without one, the helper could bind to an AMBIENT header floating under
+   * the routed view and mask a view that lost its own header (#14152).
+   */
+  viewHeaderWithin?: string;
+  viewHeaderTitle?: string;
 };
 
 type ViewportProbe = {
@@ -156,7 +177,9 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     name: "automations",
     path: "/automations",
     readyChecks: [{ selector: '[data-testid="automations-shell"]' }],
+    viewHeaderWithin: '[data-testid="automations-shell"]',
     timeoutMs: 60_000,
+    requireViewHeader: true,
   },
   {
     name: "browser",
@@ -183,7 +206,9 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     name: "wallet",
     path: "/wallet",
     readyChecks: [{ selector: '[data-testid="wallet-shell"]' }],
+    viewHeaderWithin: '[data-testid="wallet-shell"]',
     timeoutMs: 60_000,
+    requireViewHeader: true,
   },
   {
     name: "stream",
@@ -203,7 +228,9 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     name: "settings",
     path: "/settings",
     readyChecks: [{ selector: '[data-testid="settings-shell"]' }],
+    viewHeaderWithin: '[data-testid="settings-shell"]',
     timeoutMs: 60_000,
+    requireViewHeader: true,
   },
   // Phone / Messages / Contacts are `androidOnly: true` overlay apps. Their
   // side-effect registrations only fire when `isElizaOS()` is true (an AOSP
@@ -263,9 +290,14 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     // plus the view title.
     name: "character skills deep link",
     path: "/character/skills",
-    readyChecks: [{ selector: '[data-testid="view-header"]' }, { text: "Skills" }],
+    readyChecks: [
+      { selector: '[data-testid="view-header"]' },
+      { text: "Skills" },
+    ],
     mode: "all",
     timeoutMs: 60_000,
+    requireViewHeader: true,
+    viewHeaderTitle: "Skills",
   },
   {
     name: "character experience deep link",
@@ -276,6 +308,8 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     ],
     mode: "all",
     timeoutMs: 60_000,
+    requireViewHeader: true,
+    viewHeaderTitle: "Experience",
   },
   {
     name: "automation node catalog deep link",
@@ -317,12 +351,6 @@ const CORE_ROUTE_PROBES: readonly RouteProbe[] = [
     name: "tutorial",
     path: "/tutorial",
     readyChecks: [{ selector: '[data-testid="tutorial-launcher"]' }],
-    timeoutMs: 60_000,
-  },
-  {
-    name: "help",
-    path: "/help",
-    readyChecks: [{ selector: '[data-testid="help-view"]' }],
     timeoutMs: 60_000,
   },
 ];
@@ -1468,6 +1496,17 @@ async function probeRoute(page: Page, route: RouteProbe): Promise<void> {
     route.timeoutMs,
   );
   await expectMainShell(page, route);
+  // A normal view must uphold the shared ViewHeader icon-only-back contract
+  // (#13586). On the mobile viewport, also enforce the ≥44px tap target.
+  if (route.requireViewHeader) {
+    const viewport = page.viewportSize();
+    const isMobileViewport = Boolean(viewport && viewport.width <= 500);
+    await assertSharedViewHeaderContract(page, {
+      requireTapTarget: isMobileViewport,
+      within: route.viewHeaderWithin,
+      title: route.viewHeaderTitle,
+    });
+  }
 }
 
 async function openRouteAndExpectUrl(
@@ -1612,7 +1651,11 @@ async function clickSafeAllowlist(
 
 test.beforeEach(async ({ page }) => {
   await installDesktopPermissionsBridge(page);
-  await seedAppStorage(page);
+  // Mark permissions already primed so the soft-ask "Set up Eliza" overlay never
+  // pops over a routed view mid-sweep (it renders above the shell and its buttons
+  // would otherwise be the first ones a header probe reaches). first-run is
+  // already complete via DEFAULT_APP_STORAGE; this closes the other gate.
+  await seedAppStorage(page, { "eliza:permissions-primed": "1" });
   await installSupplementalSafeRoutes(page);
   await installDefaultAppRoutes(page);
 });
@@ -1660,4 +1703,22 @@ test("visible safe app tiles and allowlisted buttons are click-safe", async ({
   }
 
   await clickSafeAllowlist(page, issues);
+});
+
+test("shared ViewHeader back control navigates away without crashing (#13586)", async ({
+  page,
+}) => {
+  const issues = installPageIssueGuards(page);
+  await page.setViewportSize(DESKTOP_PROBE.size);
+
+  // Settings is a canonical `normal` view with the shared ViewHeader. Open it,
+  // assert the icon-only-back contract on the SETTINGS shell's header (the route
+  // floats over the ambient home, which can carry its own header), then click
+  // back and assert the shell survives the navigation (no crash, no 404) and
+  // leaves the view.
+  const SETTINGS_SHELL = '[data-testid="settings-shell"]';
+  await probeRoute(page, coreRouteProbe("settings"));
+  await assertSharedViewHeaderContract(page, { within: SETTINGS_SHELL });
+  await clickViewHeaderBack(page, { within: SETTINGS_SHELL });
+  await expectNoPageIssues(issues, "settings view-header back");
 });

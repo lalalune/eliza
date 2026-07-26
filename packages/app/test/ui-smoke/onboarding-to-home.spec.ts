@@ -6,7 +6,7 @@ import { rm } from "node:fs/promises";
 import path from "node:path";
 import { expect, type Locator, test } from "@playwright/test";
 import {
-  expectNoPageDiagnostics,
+  expectOnlyAllowedPageDiagnostics,
   installPageDiagnosticsGuard,
   seedAppStorage,
 } from "./helpers";
@@ -58,7 +58,13 @@ test.describe("in-chat onboarding → home → launcher", () => {
   });
 
   test.afterEach(async ({ page }, testInfo) => {
-    await expectNoPageDiagnostics(page, testInfo.title);
+    // The chat-native tour narrates through the real voice engine the moment
+    // "Take the tutorial" completes onboarding; the keyless harness's stubbed
+    // TTS audio can't be decoded, and useVoiceChat's designed fail-closed path
+    // logs exactly that one error. Everything else must stay clean.
+    await expectOnlyAllowedPageDiagnostics(page, testInfo.title, [
+      /\[useVoiceChat\] .* TTS failed; failing closed/,
+    ]);
   });
 
   test("Local onboarding lands on the home and swipe-left opens the launcher", async ({
@@ -101,6 +107,15 @@ test.describe("in-chat onboarding → home → launcher", () => {
       page.getByTestId("continuous-chat-overlay"),
     ).not.toHaveAttribute("data-open", "true");
     await expect(page.getByTestId("chat-composer-textarea")).toBeEnabled();
+
+    // Post-login permission priming (#12331) opens over the home right after
+    // onboarding completes on the desktop platform (the injected electrobun
+    // host). Drive its soft-ask dismissal for real — it must appear, and
+    // skipping it must clear the way for the swipe below.
+    const primingSkip = page.getByRole("button", { name: "Skip for now" });
+    await expect(primingSkip).toBeVisible({ timeout: 15_000 });
+    await primingSkip.click();
+    await expect(primingSkip).toBeHidden({ timeout: 10_000 });
 
     // Capture the populated home.
     await settleHomeEntrance(page);
@@ -227,18 +242,18 @@ test.describe("in-chat onboarding → home → launcher", () => {
     await page.goto("/", { waitUntil: "domcontentloaded" });
 
     // Same Local path, but pick "Take the tutorial" at the final CHOICE — it
-    // still flips firstRunComplete and lands on the home, AND launches the
-    // interactive tutorial spotlight overlay.
+    // still flips firstRunComplete and lands on the home, AND starts the
+    // chat-native tour: the welcome turn (with its Next choice) lands in the
+    // same live transcript onboarding just used. No overlay engine remains.
     await completeOnboardingToHome(page, desktopClick, {
       state,
       tutorial: "start",
     });
 
-    // The interactive tutorial overlay is now active (startTutorial fired):
-    // its spotlight renders over the shell.
-    await expect(page.getByTestId("tutorial-spotlight")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(
+      page.getByTestId("choice-__tutorial__:next:welcome"),
+    ).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("tutorial-spotlight")).toHaveCount(0);
     await settleHomeEntrance(page);
     await screenshot(page, "tutorial-start");
   });

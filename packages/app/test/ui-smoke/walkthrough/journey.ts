@@ -6,9 +6,10 @@
  * stays a thin orchestrator:
  *
  *  1. `JOURNEY_STEPS` — the ordered step list. It extends JOURNEY.md's 22 states
- *     with the asked-for tutorial / help / settings / wallet / settings-edit
- *     rows so the narrative is cold-launch → onboarding → tutorial → help →
- *     settings → wallet → real chat → view-switch → settings-edit → dashboard.
+ *     with the asked-for tutorial / settings / wallet / settings-edit rows so
+ *     the narrative is cold-launch → onboarding → chat-native tutorial →
+ *     typed tutorial commands → settings → wallet → real chat → view-switch →
+ *     settings-edit → dashboard.
  *     Each step drives the REAL surface (reusing the stable testids the isolated
  *     smoke specs already drive) and asserts a meaningful invariant — no step is
  *     a screenshot-only no-op.
@@ -650,138 +651,51 @@ async function reachChatReady(ctx: StepContext): Promise<void> {
 
 // --- tutorial driving -------------------------------------------------------
 
-/** The interactive tour's eight frames, in order (tutorial-steps.ts). */
-const TUTORIAL_FRAME_ORDER = [
+/** The chat-native tour's six steps, in order (tutorial-script.ts). */
+const TUTORIAL_STEP_ORDER = [
   "welcome",
-  "open-chat",
-  "resize-chat",
-  "ask-to-navigate",
-  "use-voice",
+  "send-message",
+  "voice",
+  "navigate",
   "new-chat",
-  "swipe-between-chats",
   "done",
 ] as const;
 
-/** The active tour frame id, stamped on the spotlight card (data-tutorial-step-id),
- * or null when the tour is not showing a card. */
-async function currentTutorialStepId(page: Page): Promise<string | null> {
-  const card = page.getByTestId("tutorial-card");
-  if (!(await card.isVisible().catch(() => false))) return null;
-  return card.getAttribute("data-tutorial-step-id").catch(() => null);
-}
-
-/** Resolve true once the active frame id differs from `fromStepId` (advanced)
- * or the tour has ended (card gone), within `timeoutMs`. */
-async function pollTutorialAdvance(
-  page: Page,
-  fromStepId: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  try {
-    await expect
-      .poll(async () => (await currentTutorialStepId(page)) ?? "__ended__", {
-        timeout: timeoutMs,
-        intervals: [250],
-      })
-      .not.toBe(fromStepId);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Perform the real per-frame action. Manual frames (welcome/done) click the
- * spotlight's continue button; interactive frames drive the actual chat control
- * the frame points at so the tour auto-advances on its own success signal. */
-async function performTutorialAction(
-  page: Page,
-  stepId: string,
-): Promise<void> {
-  const clickIfVisible = async (testId: string) => {
-    const el = page.getByTestId(testId).first();
-    if (await el.isVisible().catch(() => false))
-      await el.click().catch(() => undefined);
-  };
-  switch (stepId) {
-    case "welcome":
-    case "done":
-      // manualContinue frames — the spotlight's primary button advances.
-      await clickIfVisible("tutorial-continue");
-      return;
-    case "open-chat":
-      await clickIfVisible("chat-pill");
-      return;
-    case "resize-chat": {
-      const grabber = page.getByTestId("chat-sheet-grabber");
-      if (await grabber.isVisible().catch(() => false)) {
-        await grabber.focus().catch(() => undefined);
-        await page.keyboard.press("ArrowUp").catch(() => undefined); // expand (beat 1)
-        await page.keyboard.press("ArrowDown").catch(() => undefined); // shrink (beat 2)
-        await page.keyboard.press("ArrowDown").catch(() => undefined);
-      }
-      return;
-    }
-    case "ask-to-navigate":
-      // The frame pre-fills "open settings"; sending it satisfies the frame and
-      // navigates to Settings for real (navigateOnDone).
-      await clickIfVisible("chat-composer-action");
-      return;
-    case "use-voice":
-      // No real microphone in headless Chromium — engage the mic, then let the
-      // tour's stalled-frame skip affordance advance the frame.
-      await clickIfVisible("chat-composer-mic");
-      return;
-    case "new-chat":
-      await clickIfVisible("shell-new-chat");
-      return;
-    case "swipe-between-chats": {
-      // Best-effort horizontal swipe across the chat sheet; the stalled-frame
-      // skip advances if a single conversation makes the swipe a no-op.
-      const sheet = page.getByTestId("chat-sheet");
-      const box = await sheet.boundingBox().catch(() => null);
-      if (box) {
-        const y = box.y + box.height / 2;
-        await page.mouse.move(box.x + box.width * 0.8, y);
-        await page.mouse.down();
-        await page.mouse.move(box.x + box.width * 0.2, y, { steps: 12 });
-        await page.mouse.up();
-      }
-      return;
-    }
-  }
+/** Choice-button locator for a tour step's `__tutorial__:` action value. */
+function tutorialChoice(page: Page, verb: string, stepId: string) {
+  return page.getByTestId(`choice-__tutorial__:${verb}:${stepId}`);
 }
 
 /**
- * Drive the interactive tour through every frame and return the ordered frame
- * ids actually walked (read from data-tutorial-step-id). Each frame: perform its
- * real action; if the tour does not auto-advance (a frame that needs a real
- * mic/swipe signal headless can't produce), use the tour's own stalled-frame
- * "continue/skip" control to advance. Forward progress is always bounded, so the
- * loop terminates whether or not every frame can be satisfied headless.
+ * Drive the chat-native tour through every step and return the ordered step
+ * ids actually walked (read from the seeded turns' choice widgets). The
+ * send-message step performs its REAL action (an ordinary composer send) so
+ * the auto-advance path is exercised; every other step advances through its
+ * Next choice — the universal fallback the tour guarantees.
  */
 async function driveTutorial(page: Page): Promise<string[]> {
-  await expect(page.getByTestId("tutorial-card")).toBeVisible({
-    timeout: 15_000,
-  });
   const seen: string[] = [];
-  for (let i = 0; i < TUTORIAL_FRAME_ORDER.length + 4; i++) {
-    const stepId = await currentTutorialStepId(page);
-    if (!stepId) break;
-    if (seen[seen.length - 1] !== stepId) seen.push(stepId);
-    await performTutorialAction(page, stepId);
-    if (await pollTutorialAdvance(page, stepId, 6_000)) continue;
-    // Frame stalled (a real mic/swipe signal isn't available headless): wait for
-    // the late "continue/skip" control to surface, then advance through it.
-    const cont = page.getByTestId("tutorial-continue");
-    await cont
-      .waitFor({ state: "visible", timeout: 16_000 })
-      .catch(() => undefined);
-    if (await cont.isVisible().catch(() => false)) {
-      await cont.click().catch(() => undefined);
-      await pollTutorialAdvance(page, stepId, 6_000);
-    } else {
-      break;
+  for (const [index, stepId] of TUTORIAL_STEP_ORDER.entries()) {
+    const next = tutorialChoice(page, "next", stepId).last();
+    await expect(next).toBeVisible({ timeout: 15_000 });
+    seen.push(stepId);
+    if (stepId === "send-message") {
+      // The step's real action: sending any message auto-advances it.
+      const box = composer(page);
+      await box.click();
+      await box.fill("walkthrough tour message");
+      await page.getByTestId("chat-composer-action").click();
+      const following = TUTORIAL_STEP_ORDER[index + 1];
+      const advanced = await tutorialChoice(page, "next", following)
+        .last()
+        .waitFor({ state: "visible", timeout: 8_000 })
+        .then(
+          () => true,
+          () => false,
+        );
+      if (advanced) continue;
     }
+    await next.click();
   }
   return seen;
 }
@@ -906,43 +820,33 @@ export const JOURNEY_STEPS: readonly JourneyStep[] = [
   {
     n: "04",
     id: "tutorial",
-    title: "Interactive tutorial (all 8 frames)",
+    title: "Chat-native tutorial (all 6 steps)",
     expectation:
-      "The /tutorial launcher starts the interactive tour ('Meet Eliza'), and the tour is driven frame-by-frame through every step via the stamped data-tutorial-step-id until it completes.",
+      "The /tutorial launcher starts the chat-native tour: one conversational turn per step lands in the live transcript, the send-message step auto-advances on a real composer send, and Done completes the run.",
     async run({ page }) {
       await openAppPath(page, "/tutorial");
       await expect(page.getByTestId("tutorial-launcher")).toBeVisible({
         timeout: 20_000,
       });
-      await page.getByTestId("tutorial-start").click();
-      await expect(page.getByTestId("tutorial-card")).toBeVisible({
+      await expect(page.getByTestId("tutorial-start")).toBeVisible();
+      // No overlay engine: the tour is turns in the transcript, nothing dims
+      // or locks the shell.
+      await expect(page.getByTestId("tutorial-card")).toHaveCount(0);
+      await expect(page.getByText(/Want a quick tour\?/i)).toBeVisible({
         timeout: 15_000,
       });
-      await expect(page.getByText(/Meet Eliza/i)).toBeVisible({
-        timeout: 10_000,
-      });
-      // The first frame must expose its id via data-tutorial-step-id — this is
-      // what lets the journey drive the tour frame-by-frame (#10198 / #10204).
-      const firstFrame = await currentTutorialStepId(page);
-      expect(firstFrame).toBe("welcome");
 
       const walked = await driveTutorial(page);
-      // Forward progress through the stamped frames is guaranteed; assert the
-      // tour advanced past the opening frame and stayed within the known order.
-      expect(walked[0]).toBe("welcome");
-      expect(walked.length).toBeGreaterThan(1);
-      const knownFrames: readonly string[] = TUTORIAL_FRAME_ORDER;
-      const unknown = walked.filter((id) => !knownFrames.includes(id));
-      expect(unknown).toEqual([]);
+      expect(walked).toEqual([...TUTORIAL_STEP_ORDER]);
 
       return {
         assertions: [
-          "/tutorial launcher started the tour ('Meet Eliza')",
-          "first frame exposes data-tutorial-step-id=welcome",
-          `tour driven frame-by-frame: ${walked.join(" → ")}`,
+          "/tutorial started the chat-native tour (welcome turn in transcript)",
+          "no spotlight card / overlay engine present",
+          `tour driven step-by-step: ${walked.join(" → ")}`,
         ],
         dom: {
-          framesWalked: walked,
+          stepsWalked: walked,
           reachedDone: walked.includes("done"),
         },
       };
@@ -950,30 +854,33 @@ export const JOURNEY_STEPS: readonly JourneyStep[] = [
   },
   {
     n: "05",
-    id: "help",
-    title: "Help search",
+    id: "tutorial-commands",
+    title: "Typed tutorial commands",
     expectation:
-      "The Help view searches the knowledge base: typing 'change the model' surfaces the 'AI Model' help entry with an action button.",
+      "Typing 'restart tutorial' in the composer starts a fresh run (new welcome turn) and 'stop tutorial' ends it with a stopped acknowledgment — neither reaches the agent as a chat message.",
     async run({ page }) {
-      await openAppPath(page, "/help");
-      await expect(page.getByTestId("help-view")).toBeVisible({
-        timeout: 20_000,
+      const box = composer(page);
+      await expect(box).toBeVisible({ timeout: 15_000 });
+      await box.click();
+      await box.fill("restart tutorial");
+      await page.getByTestId("chat-composer-action").click();
+      await expect(tutorialChoice(page, "stop", "welcome").last()).toBeVisible({
+        timeout: 15_000,
       });
-      const search = composer(page);
-      await expect(search).toBeVisible({ timeout: 15_000 });
-      await search.fill("how do I change the model");
-      const entry = page.getByTestId("help-entry-change-model");
-      await expect(entry).toBeVisible({ timeout: 15_000 });
-      await expect(entry).toContainText(/AI Model/i);
+
+      await box.click();
+      await box.fill("stop tutorial");
+      await page.getByTestId("chat-composer-action").click();
+      await expect(page.getByText(/Tutorial stopped/i).last()).toBeVisible({
+        timeout: 15_000,
+      });
       return {
         assertions: [
-          "help-view visible",
-          "search 'change the model' surfaced help-entry-change-model",
-          "entry references AI Model settings",
+          "'restart tutorial' seeded a fresh welcome turn",
+          "'stop tutorial' ended the run with the stopped acknowledgment",
         ],
         dom: await domMarkers(page, {
-          helpView: '[data-testid="help-view"]',
-          changeModelEntry: '[data-testid="help-entry-change-model"]',
+          stopChoice: '[data-testid="choice-__tutorial__:stop:welcome"]',
         }),
       };
     },

@@ -19,6 +19,7 @@ import { useThreadAutoScroll } from "../../hooks/useThreadAutoScroll";
 import { cn } from "../../lib/utils";
 import { useChatComposerOrLocal } from "../../state/ChatComposerContext.hooks";
 import { useTranslation } from "../../state/TranslationContext.hooks";
+import { InlineWidgetText } from "../chat/InlineWidgetText";
 import { ChatBubble } from "../composites/chat/chat-bubble";
 import { TypingIndicator } from "../composites/chat/chat-typing-indicator";
 import { Input } from "../ui/input";
@@ -146,7 +147,11 @@ export function ChatSurface({
                         tone={isUser ? "user" : "assistant"}
                         className="text-sm"
                       >
-                        {message.content}
+                        {isUser ? (
+                          message.content
+                        ) : (
+                          <InlineWidgetText content={message.content} />
+                        )}
                       </ChatBubble>
                     )}
                   </li>

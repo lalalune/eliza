@@ -72,7 +72,6 @@ export type BuiltinTab =
   | "desktop"
   | "settings"
   | "tutorial"
-  | "help"
   | "logs"
   | "background";
 
@@ -371,7 +370,6 @@ export const TAB_PATHS: Record<BuiltinTab, string> = {
   desktop: "/desktop",
   settings: "/settings",
   tutorial: "/tutorial",
-  help: "/help",
   logs: "/apps/logs",
   background: "/background",
 };

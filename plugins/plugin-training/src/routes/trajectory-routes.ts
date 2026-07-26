@@ -69,6 +69,7 @@ type TrajectoryZipExportOptions = {
   startDate?: string;
   endDate?: string;
   scenarioId?: string;
+  traceId?: string;
   batchId?: string;
 };
 
@@ -1653,6 +1654,7 @@ async function handleGetTrajectories(
     endDate: url.searchParams.get("endDate") || undefined,
     search: url.searchParams.get("search") || undefined,
     scenarioId: url.searchParams.get("scenarioId") || undefined,
+    traceId: url.searchParams.get("traceId") || undefined,
     batchId: url.searchParams.get("batchId") || undefined,
     isTrainingData: url.searchParams.has("isTrainingData")
       ? url.searchParams.get("isTrainingData") === "true"
@@ -1778,6 +1780,7 @@ async function handleExportTrajectories(
     startDate?: string;
     endDate?: string;
     scenarioId?: string;
+    traceId?: string;
     batchId?: string;
     jsonShape?: string;
   }>(req, res);
@@ -1799,6 +1802,7 @@ async function handleExportTrajectories(
       startDate: body.startDate,
       endDate: body.endDate,
       scenarioId: body.scenarioId,
+      traceId: body.traceId,
       batchId: body.batchId,
     };
     const zipResult = await logger.exportTrajectoriesZip(zipOptions);
@@ -1844,6 +1848,7 @@ async function handleExportTrajectories(
     startDate: body.startDate,
     endDate: body.endDate,
     scenarioId: body.scenarioId,
+    traceId: body.traceId,
     batchId: body.batchId,
     ...((body.format === "json" || body.format === "jsonl") && jsonShape
       ? { jsonShape }

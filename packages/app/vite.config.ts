@@ -38,6 +38,11 @@ import {
   syncElizaEnvAliases,
 } from "../shared/src/utils/env.ts";
 import appConfig from "./app.config";
+import {
+  removeEmittedBuildStamp,
+  removePublicBuildStamp,
+  shouldSkipBuildStamp,
+} from "./scripts/build-stamp.mjs";
 import { CAPACITOR_PLUGIN_NAMES } from "./scripts/capacitor-plugin-names.mjs";
 import { normalizeEnvPrefix } from "./src/env-prefix.js";
 import { appSideEffectModulesPlugin } from "./vite/app-side-effect-modules.ts";
@@ -1033,6 +1038,28 @@ function appShellMetadataPlugin(): Plugin {
   };
 }
 
+function productionBuildStampGuardPlugin(): Plugin {
+  let viteProductionBuild = false;
+  const shouldRemoveStamp = () =>
+    shouldSkipBuildStamp(process.env, { viteProductionBuild });
+
+  return {
+    name: "eliza-production-build-stamp-guard",
+    configResolved(config) {
+      viteProductionBuild =
+        config.command === "build" && config.mode === "production";
+    },
+    buildStart() {
+      if (!shouldRemoveStamp()) return;
+      removePublicBuildStamp(here);
+    },
+    generateBundle(_options, bundle) {
+      if (!shouldRemoveStamp()) return;
+      removeEmittedBuildStamp(bundle);
+    },
+  };
+}
+
 /**
  * Pinned @elizaos/core from the repo root (must match the agent/runtime lock).
  */
@@ -1989,6 +2016,7 @@ export default defineConfig({
     ),
   },
   plugins: [
+    productionBuildStampGuardPlugin(),
     bufferEsmShimPlugin(),
     // Manifest-driven renderer side-effect plugin registration (#9178): resolves
     // the `virtual:eliza-side-effect-app-modules` import in plugin-registrations.ts

@@ -47,7 +47,6 @@ export const VIEW_ROUTES: readonly ViewRoute[] = [
   { id: "desktop", path: "/desktop" },
   { id: "settings", path: "/settings" },
   { id: "tutorial", path: "/tutorial" },
-  { id: "help", path: "/help" },
   { id: "logs", path: "/apps/logs" },
   { id: "background", path: "/background" },
 ] as const;

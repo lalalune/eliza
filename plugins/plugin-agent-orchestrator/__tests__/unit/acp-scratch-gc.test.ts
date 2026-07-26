@@ -214,10 +214,24 @@ describe("teardown reclaims the owned scratch dir", () => {
   });
 });
 
+// Since #13950 the startup GC only ever considers dirs matching the FULL
+// `task-<randomUUID()>` shape (spawnSession's id = randomUUID() is the only
+// production creator), so a human-named `task-*` repo under a workspace root
+// can never be reclaimed. These fixtures therefore use UUID-shaped session
+// ids — the pre-#13950 human-readable ids (`term-1`) made the dirs invisible
+// to the sweep and asserted a reclaim that must NOT happen anymore (#14153).
+const UUID_TERM = "11111111-1111-4111-8111-111111111111";
+const UUID_LIVE = "22222222-2222-4222-8222-222222222222";
+const UUID_DEAD = "33333333-3333-4333-8333-333333333333";
+const UUID_STALE = "44444444-4444-4444-8444-444444444444";
+const UUID_FRESH = "55555555-5555-4555-8555-555555555555";
+const UUID_CONFIG = "66666666-6666-4666-8666-666666666666";
+const UUID_KILL = "77777777-7777-4777-8777-777777777777";
+
 describe("startup GC reclaims orphaned scratch dirs", () => {
   it("reclaims a dir whose session is terminal in the store", async () => {
     const store = new InMemorySessionStore();
-    const id = "term-1";
+    const id = UUID_TERM;
     const workdir = join(ROOT, `task-${id}`);
     await makeDir(workdir);
     await store.create(session(id, workdir, "errored"));
@@ -230,12 +244,12 @@ describe("startup GC reclaims orphaned scratch dirs", () => {
 
   it("keeps a dir with a live (non-terminal) session", async () => {
     const store = new InMemorySessionStore();
-    const liveId = "live-1";
+    const liveId = UUID_LIVE;
     const liveDir = join(ROOT, `task-${liveId}`);
     await makeDir(liveDir);
     await store.create(session(liveId, liveDir, "running"));
 
-    const deadId = "dead-1";
+    const deadId = UUID_DEAD;
     const deadDir = join(ROOT, `task-${deadId}`);
     await makeDir(deadDir);
     await store.create(session(deadId, deadDir, "stopped"));
@@ -251,11 +265,11 @@ describe("startup GC reclaims orphaned scratch dirs", () => {
     const store = new InMemorySessionStore();
     // No sessions at all: both dirs are untracked (crashed before store.create,
     // or a co-tenant's). Age-gate: only the stale one is reclaimed.
-    const staleDir = join(ROOT, "task-orphan-stale");
+    const staleDir = join(ROOT, `task-${UUID_STALE}`);
     await makeDir(staleDir);
     await backdate(staleDir, 25 * 60 * 60_000); // 25h — past the 24h floor
 
-    const freshDir = join(ROOT, "task-orphan-fresh");
+    const freshDir = join(ROOT, `task-${UUID_FRESH}`);
     await makeDir(freshDir);
 
     const service = makeService(store);
@@ -265,9 +279,24 @@ describe("startup GC reclaims orphaned scratch dirs", () => {
     expect(await exists(freshDir)).toBe(true);
   });
 
+  it("never reclaims a human-named task-* dir, even untracked and stale (#13950)", async () => {
+    const store = new InMemorySessionStore();
+    // Not UUID-shaped → not a scratch dir the service could have created.
+    // #13950's data-loss guard: a user repo like `task-master` under a scratch
+    // root must survive the sweep regardless of age.
+    const humanDir = join(ROOT, "task-master");
+    await makeDir(humanDir);
+    await backdate(humanDir, 48 * 60 * 60_000); // 48h — well past any floor
+
+    const service = makeService(store);
+    await gc(service);
+
+    expect(await exists(humanDir)).toBe(true);
+  });
+
   it("honors ELIZA_ACP_SCRATCH_GC_MAX_AGE_MS for the untracked age gate", async () => {
     const store = new InMemorySessionStore();
-    const dir = join(ROOT, "task-orphan-config");
+    const dir = join(ROOT, `task-${UUID_CONFIG}`);
     await makeDir(dir);
     await backdate(dir, 5_000); // 5s old
     const service = makeService(store, {
@@ -284,7 +313,7 @@ describe("startup GC reclaims orphaned scratch dirs", () => {
     // dir on disk and no live subprocess. On restart, reconcile marks it
     // terminal and the startup GC reclaims the dir.
     const store = new InMemorySessionStore();
-    const id = "kill-1";
+    const id = UUID_KILL;
     const workdir = join(ROOT, `task-${id}`);
     await makeDir(workdir);
     await store.create(session(id, workdir, "running"));

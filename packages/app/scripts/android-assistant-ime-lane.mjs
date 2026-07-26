@@ -42,6 +42,8 @@ function defaultExec(bin, args) {
   };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** An adb runner bound to a serial. `exec(bin, args) => {status, stdout, stderr}` is injectable. */
 export function makeAdb(serial, exec = defaultExec, bin = "adb") {
   if (!serial) throw new Error("makeAdb: a device serial is required.");
@@ -91,6 +93,8 @@ export async function runLane({
   exec,
   pkg = DEFAULT_PACKAGE,
   imeId = DEFAULT_IME_ID,
+  settleMs = 2_500,
+  sleepFn = sleep,
 }) {
   const adb = makeAdb(serial, exec);
   const cmds = reapplyCommands(pkg, imeId);
@@ -108,6 +112,7 @@ export async function runLane({
   // point cannot hide another broken one.
   adb(["logcat", "-c"]);
   adb(["shell", "cmd", "voiceinteraction", "show"]);
+  await sleepFn(settleMs);
   const assistCaptured =
     (adb(["logcat", "-d"]).stdout || "") +
     "\n" +
@@ -119,6 +124,7 @@ export async function runLane({
 
   adb(["logcat", "-c"]);
   adb(["shell", "input", "keyevent", "KEYCODE_ASSIST"]);
+  await sleepFn(settleMs);
   const keyCaptured =
     (adb(["logcat", "-d"]).stdout || "") +
     "\n" +
@@ -138,6 +144,7 @@ export async function runLane({
     `${IME_SESSION_DEEPLINK}&action=voice&voice=1`,
     `${pkg}/.MainActivity`,
   ]);
+  await sleepFn(settleMs);
   const imeCaptured =
     (adb(["logcat", "-d"]).stdout || "") +
     "\n" +

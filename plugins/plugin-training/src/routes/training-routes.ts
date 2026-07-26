@@ -1698,6 +1698,7 @@ export async function handleTrainingRoutes(
       includeRawJsonl?: boolean;
       tasks?: string[];
       runId?: string;
+      traceId?: string;
     }>(req, res);
     if (!body) return true;
 
@@ -1705,6 +1706,7 @@ export async function handleTrainingRoutes(
       error(res, "runId must be a non-empty string", 400);
       return true;
     }
+    const requestedTraceId = resolveStringSetting(body.traceId);
 
     const outputPath =
       body.outputPath ?? `.tmp/training-trajectory-export-${Date.now()}.jsonl`;
@@ -1720,6 +1722,7 @@ export async function handleTrainingRoutes(
               limit: body.limit ?? 100,
               offset: 0,
               runId: normalizeRunId(body.runId),
+              traceId: requestedTraceId,
             });
       const trajectoryIds =
         explicitIds.length > 0
@@ -1759,6 +1762,7 @@ export async function handleTrainingRoutes(
             metadata: {
               requestedLimit: body.limit ?? 100,
               requestedRunId: requestedRunId ?? null,
+              requestedTraceId: requestedTraceId ?? null,
               explicitTrajectoryIds: explicitIds.length,
               selectedTrajectoryIds: trajectoryIds.length,
               loadedTrajectories: details.length,

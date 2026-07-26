@@ -10,12 +10,22 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { IAgentRuntime } from "@elizaos/core";
+import {
+  type IAgentRuntime,
+  projectWorldId,
+  stringToUuid,
+  type UUID,
+  upsertProject,
+} from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AcpService } from "../services/acp-service.js";
 import { OrchestratorTaskService } from "../services/orchestrator-task-service.js";
 import { OrchestratorTaskStore } from "../services/orchestrator-task-store.js";
 import type { SpawnOptions, SpawnResult } from "../services/types.js";
+
+/** The agentId the test runtime carries; the stamped project world is derived
+ * per-agent from it (#14171), so the assertions below reuse this exact value. */
+const BINDER_AGENT_ID: UUID = "00000000-0000-4000-8000-000000000abc";
 
 /** ACP stand-in that records the workdir each spawn was handed and echoes it
  * back as the session's landed workdir (what AcpService does when the caller
@@ -54,7 +64,7 @@ function makeWorkdirCapturingAcp() {
 
 function makeRuntime(acpService: unknown): IAgentRuntime {
   return {
-    agentId: "00000000-0000-4000-8000-000000000abc",
+    agentId: BINDER_AGENT_ID,
     character: { name: "Binder" },
     logger: {
       debug: () => undefined,
@@ -375,6 +385,61 @@ describe("durable task→workdir binding (#13776)", () => {
     }
   });
 
+  it("a project-bound task spawns in the project localPath even when the service caller passes an explicit workdir (#14108)", async () => {
+    // The direct-service path (`spawnAgentForTask`, e.g. the /agents API route)
+    // previously ignored `task.projectId` entirely, so a project-bound task
+    // could land in an explicit caller workdir — diverging from the action
+    // path, which forces the project localPath. Both must now agree: project
+    // localPath > explicit caller workdir.
+    const stateDir = realpathSync(
+      mkdtempSync(path.join(os.tmpdir(), "task-workdir-binding-state-")),
+    );
+    const savedStateDir = process.env.ELIZA_STATE_DIR;
+    process.env.ELIZA_STATE_DIR = stateDir;
+    try {
+      // Register a real project whose localPath is firstDir.
+      const project = upsertProject(
+        { name: "bound-proj", localPath: firstDir },
+        process.env,
+      );
+
+      const store = new OrchestratorTaskStore({ backend: "memory" });
+      const acp = makeWorkdirCapturingAcp();
+      const service = new OrchestratorTaskService(makeRuntime(acp.service), {
+        store,
+      });
+      await service.start();
+      try {
+        const detail = await store.createTask({
+          title: "Project-bound task",
+          goal: "always spawn in the bound project",
+          acceptanceCriteria: [],
+          roomId: "binding-room",
+          worldId: "binding-world",
+          projectId: project.id,
+        });
+        const taskId = detail.task.id;
+        expect((await store.getTask(taskId))?.task.projectId).toBe(project.id);
+
+        // Caller passes an explicit workdir that CONFLICTS with the project
+        // binding. The project localPath (firstDir) must win, not overrideDir.
+        await service.spawnAgentForTask(taskId, { workdir: overrideDir });
+        expect(acp.spawns.at(0)?.workdir).toBe(firstDir);
+
+        // The ignored explicit workdir must NOT re-pin the binding away from
+        // the project localPath.
+        const record = await store.getTask(taskId);
+        expect(record?.task.boundWorkdir).toBe(firstDir);
+      } finally {
+        await service.stop().catch(() => undefined);
+      }
+    } finally {
+      if (savedStateDir === undefined) delete process.env.ELIZA_STATE_DIR;
+      else process.env.ELIZA_STATE_DIR = savedStateDir;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("binds from attachSession for chat-action-spawned first sessions", async () => {
     const store = new OrchestratorTaskStore({ backend: "memory" });
     const acp = makeWorkdirCapturingAcp();
@@ -399,6 +464,95 @@ describe("durable task→workdir binding (#13776)", () => {
       // A follow-up spawn with no workdir reuses the attach-pinned binding.
       await service.spawnAgentForTask(taskId, { task: "continue" });
       expect(acp.spawns.at(0)?.workdir).toBe(firstDir);
+    } finally {
+      await service.stop().catch(() => undefined);
+    }
+  });
+});
+
+// #13776 D3: creating a task bound to a project must stamp the project's memory
+// world onto the record, so the task's subagents are partitioned to that
+// project. Drives the REAL OrchestratorTaskService.createTask (which calls the
+// private bindProject) over a real projects.json under an isolated state dir.
+describe("project memory-world stamping at bind time (#13776 D3)", () => {
+  let stateDir: string;
+  let savedStateDir: string | undefined;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(path.join(os.tmpdir(), "project-world-"));
+    savedStateDir = process.env.ELIZA_STATE_DIR;
+    process.env.ELIZA_STATE_DIR = stateDir;
+  });
+
+  afterEach(() => {
+    if (savedStateDir === undefined) delete process.env.ELIZA_STATE_DIR;
+    else process.env.ELIZA_STATE_DIR = savedStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("stamps the bound project's derived worldId onto a workdir-bound task", async () => {
+    const project = upsertProject({ name: "repo-a", localPath: firstDir });
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const acp = makeWorkdirCapturingAcp();
+    const service = new OrchestratorTaskService(makeRuntime(acp.service), {
+      store,
+    });
+    await service.start();
+    try {
+      // No explicit projectId/worldId: bind by realpath-matching the workdir.
+      const detail = await service.createTask({
+        title: "bound task",
+        goal: "work in project A",
+        acceptanceCriteria: [],
+        workdir: firstDir,
+      });
+      // Cross-package equality guard (#14171): the world the real service path
+      // stamps must be EXACTLY core's per-agent `projectWorldId(agentId, id)` —
+      // a single source of truth, never the plugin re-deriving its own.
+      const expectedWorld = projectWorldId(BINDER_AGENT_ID, project.id);
+      expect(detail.projectId).toBe(project.id);
+      expect(detail.worldId).toBe(expectedWorld);
+      // Mutation guard: it must NOT be the old agentId-less global form; if the
+      // plugin ever reverts to `stringToUuid("project:" + id)` this fails.
+      expect(detail.worldId).not.toBe(stringToUuid(`project:${project.id}`));
+      // Persisted, not just returned.
+      const record = await store.getTask(detail.id);
+      expect(record?.task.projectId).toBe(project.id);
+      expect(record?.task.worldId).toBe(expectedWorld);
+    } finally {
+      await service.stop().catch(() => undefined);
+    }
+  });
+
+  it("leaves an unbound task's worldId untouched and lets an explicit worldId win", async () => {
+    const project = upsertProject({ name: "repo-a", localPath: firstDir });
+    const store = new OrchestratorTaskStore({ backend: "memory" });
+    const acp = makeWorkdirCapturingAcp();
+    const service = new OrchestratorTaskService(makeRuntime(acp.service), {
+      store,
+    });
+    await service.start();
+    try {
+      // Unbound (no matching project): worldId stays null, not fabricated.
+      const unbound = await service.createTask({
+        title: "unbound",
+        goal: "no project match",
+        acceptanceCriteria: [],
+        workdir: overrideDir,
+      });
+      expect(unbound.projectId).toBeNull();
+      expect(unbound.worldId).toBeNull();
+
+      // A caller-supplied worldId is authoritative even when a project binds.
+      const explicit = await service.createTask({
+        title: "explicit world",
+        goal: "work in project A",
+        acceptanceCriteria: [],
+        workdir: firstDir,
+        worldId: "caller-world",
+      });
+      expect(explicit.projectId).toBe(project.id);
+      expect(explicit.worldId).toBe("caller-world");
     } finally {
       await service.stop().catch(() => undefined);
     }

@@ -7,6 +7,7 @@
  * Reference: eliza-cloud/backend/services/node-manager.ts
  */
 
+import crypto from "node:crypto";
 import { dockerNodesRepository } from "../../db/repositories/docker-nodes";
 import type { DockerNode, DockerNodeStatus } from "../../db/schemas/docker-nodes";
 import { containersEnv } from "../config/containers-env";
@@ -22,6 +23,53 @@ import {
 } from "./docker-sandbox-utils";
 import { DockerSSHClient } from "./docker-ssh";
 import { type DiskHealthVerdict, diskHealthVerdict, probeNodeDiskUsage } from "./node-disk-manager";
+
+// ---------------------------------------------------------------------------
+// Pre-pull self-heal bookkeeping (see recoverAfterTimedOutPrePull)
+// ---------------------------------------------------------------------------
+
+/** Per-node consecutive pre-pull failures + last auto-heal timestamp. Cleared
+ * on the first successful pull. In-memory: the provisioning worker is a single
+ * long-lived process, and a restart is itself a clean slate. */
+const prePullFailureState = new Map<
+  string,
+  { consecutiveFailures: number; lastSelfHealMs: number }
+>();
+/** Consecutive failed pre-pulls on a node before an auto docker restart. */
+const PREPULL_SELF_HEAL_FAILURE_THRESHOLD = 2;
+/** Minimum gap between auto docker restarts on the same node (anti-restart-loop). */
+const PREPULL_SELF_HEAL_COOLDOWN_MS = 30 * 60 * 1000;
+const PREPULL_PID_DIR = "/tmp";
+
+// ---------------------------------------------------------------------------
+// Health-check failure tracking (auto-disable a dead node)
+// ---------------------------------------------------------------------------
+
+/**
+ * Consecutive failed health checks (across cycles) before a node is auto-disabled.
+ *
+ * Derived IN-MEMORY rather than via a new schema column: the provisioning
+ * worker is a single long-lived process that owns the health loop, a restart is
+ * a legitimate clean slate (the node gets re-probed and either re-fails toward
+ * the threshold again or recovers), and this avoids a schema migration on the
+ * hot health-check write path. Cleared on the first successful check.
+ *
+ * Overridable via `CONTAINERS_NODE_HEALTH_FAILURE_THRESHOLD` for ops tuning;
+ * default 3 (≈ three full retry-exhausted cycles) balances not flapping on a
+ * transient SSH hiccup against not stranding a genuinely dead node in rotation.
+ */
+const NODE_HEALTH_FAILURE_THRESHOLD = (() => {
+  const raw = process.env.CONTAINERS_NODE_HEALTH_FAILURE_THRESHOLD;
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : 3;
+})();
+
+/** Per-node consecutive failed health checks. In-memory (see threshold docs). */
+const nodeHealthFailureState = new Map<string, number>();
+
+export function __resetNodeHealthFailureStateForTests(): void {
+  nodeHealthFailureState.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +123,68 @@ function isAutoscaledNode(node: DockerNode): boolean {
   const meta = node.metadata as Record<string, unknown> | null | undefined;
   if (!meta || typeof meta !== "object") return false;
   return meta.provider === "hetzner-cloud" && meta.autoscaled === true;
+}
+
+function prePullPidFile(marker: string): string {
+  return `${PREPULL_PID_DIR}/eliza-prepull-${marker}.pid`;
+}
+
+export function isPrePullTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Command timed out after");
+}
+
+export function buildTrackedPrePullCommand(
+  image: string,
+  platform: string | null | undefined,
+  marker = crypto.randomUUID(),
+): { command: string; pidFile: string } {
+  const pidFile = prePullPidFile(marker);
+  const pullCommand = ["docker pull", ...dockerPlatformFlag(platform), shellQuote(image)].join(" ");
+  const script = [
+    `pidfile=${shellQuote(pidFile)}`,
+    'rm -f "$pidfile"',
+    `(${pullCommand}) &`,
+    "pid=$!",
+    'printf "%s\\n" "$pid" > "$pidfile"',
+    'wait "$pid"',
+    "status=$?",
+    'rm -f "$pidfile"',
+    'exit "$status"',
+  ].join("; ");
+  return { command: `sh -c ${shellQuote(script)}`, pidFile };
+}
+
+export function buildPrePullReapCommand(pidFile: string, image: string): string {
+  const quotedImage = shellQuote(image);
+  const script = [
+    `pidfile=${shellQuote(pidFile)}`,
+    'if [ -s "$pidfile" ]; then',
+    'pid="$(cat "$pidfile" 2>/dev/null || true)"',
+    'case "$pid" in ""|*[!0-9]*) rm -f "$pidfile"; exit 0 ;; esac',
+    'cmdline="$(tr "\\0" " " < "/proc/$pid/cmdline" 2>/dev/null || true)"',
+    `if printf "%s\\n" "$cmdline" | grep -F "docker pull" >/dev/null && printf "%s\\n" "$cmdline" | grep -F -- ${quotedImage} >/dev/null; then`,
+    'kill -9 "$pid" 2>/dev/null || true',
+    "fi",
+    'rm -f "$pidfile"',
+    "fi",
+  ].join("; ");
+  return `sh -c ${shellQuote(script)}`;
+}
+
+export function buildPrePullSelfHealRecoverCommand(): string {
+  return [
+    "systemctl kill -s SIGKILL docker.service docker.socket 2>/dev/null",
+    "sleep 2",
+    "systemctl restart containerd 2>/dev/null",
+    "sleep 4",
+    "systemctl reset-failed docker.service 2>/dev/null",
+    "systemctl start docker.service",
+  ].join("; ");
+}
+
+export function __resetPrePullFailureStateForTests(): void {
+  prePullFailureState.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +257,33 @@ export class DockerNodeManager {
     return dockerNodesRepository.findByNodeId(nodeId);
   }
 
+  // ---- SSH client construction ------------------------------------------
+
+  /**
+   * Build a pooled SSH client for a node, wiring the Trust-On-First-Use
+   * persist callback: when the node's `host_key_fingerprint` is NULL, the
+   * client accepts the presented key on first connect and this callback pins it
+   * to `docker_nodes` (idempotent, NULL-guarded in the repo) so every later
+   * connect verifies against a real fingerprint. Passing `host_key_fingerprint`
+   * from the row keeps strict verification once a pin exists.
+   */
+  private sshClientForNode(node: DockerNode): DockerSSHClient {
+    return DockerSSHClient.getClient(
+      node.hostname,
+      node.ssh_port ?? undefined,
+      node.host_key_fingerprint ?? undefined,
+      node.ssh_user ?? undefined,
+      node.host_key_fingerprint
+        ? undefined
+        : async (hostname, fingerprint) => {
+            await dockerNodesRepository.setHostKeyFingerprint(node.node_id, fingerprint);
+            logger.warn(
+              `[docker-node-manager] TOFU-pinned host key for node ${node.node_id} (${hostname}): SHA256:${fingerprint}`,
+            );
+          },
+    );
+  }
+
   // ---- Health Checks ----------------------------------------------------
 
   /**
@@ -179,12 +316,7 @@ export class DockerNodeManager {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const ssh = DockerSSHClient.getClient(
-          node.hostname,
-          node.ssh_port ?? undefined,
-          node.host_key_fingerprint ?? undefined,
-          node.ssh_user ?? undefined,
-        );
+        const ssh = this.sshClientForNode(node);
         await ssh.connect();
         const dockerId = await ssh.exec("docker info --format '{{.ID}}'", 10_000);
 
@@ -218,6 +350,9 @@ export class DockerNodeManager {
               `[docker-node-manager] Canonical node ${node.node_id} (${node.hostname}) is reachable but disk is critically full; leaving healthy so the disk-clean cycle can reclaim space (canonical nodes are not autoscaler-replaced). Operators: free space or set enabled=false.`,
             );
           }
+          // A reachable node clears any accumulated consecutive-failure count so
+          // one recovered cycle undoes prior transient failures.
+          nodeHealthFailureState.delete(node.node_id);
           await dockerNodesRepository.updateStatus(node.node_id, "healthy");
           return "healthy";
         } else {
@@ -240,23 +375,50 @@ export class DockerNodeManager {
     );
     const status: DockerNodeStatus = lastError.includes("empty ID") ? "degraded" : "offline";
 
-    // Canonical (operator-managed) nodes are never marked offline from
-    // health-check failures. The autoscaler-provisioned hetzner-cloud nodes
-    // are ephemeral and OK to flap; manually-provisioned cores host long-lived
-    // production sandboxes, where a transient ssh hiccup should not pull the
-    // node out of rotation. Operators retain explicit `enabled=false` to
-    // disable nodes; status flapping is reserved for autoscaler-managed nodes.
-    if (!isAutoscaledNode(node)) {
-      logger.warn(
-        `[docker-node-manager] Suppressed ${status} status for canonical node ${node.node_id} (${node.hostname}); leaving prior status (${node.status}) intact. Set enabled=false to remove from rotation.`,
-      );
-      // Return the prior in-DB status so callers (e.g. /api/v1/cron/agent-hot-pool)
-      // see the unchanged state, not a phantom "offline" that was never persisted.
-      return node.status;
+    // A `degraded` verdict means the daemon ANSWERED but returned no ID — the
+    // node is reachable, just unhealthy. Persist it and let the disk-clean /
+    // autoscaler paths handle it; it is not a "dead node" for auto-disable
+    // purposes, so it never accrues toward the disable threshold. Because the
+    // node WAS reachable this cycle, clear the consecutive-offline counter so a
+    // reachable-but-degraded cycle breaks the "N consecutive UNREACHABLE checks"
+    // streak (otherwise offline, offline, degraded, offline would wrongly disable).
+    if (status === "degraded") {
+      nodeHealthFailureState.delete(node.node_id);
+      await dockerNodesRepository.updateStatus(node.node_id, "degraded");
+      return "degraded";
     }
 
-    await dockerNodesRepository.updateStatus(node.node_id, status);
-    return status;
+    // `offline` = unreachable. Previously we SUPPRESSED offline for canonical
+    // (operator-managed) nodes to avoid flapping on a transient SSH hiccup —
+    // but that let a genuinely-dead node keep reporting `healthy` forever, so
+    // the scheduler kept routing agents onto a black hole. Replace that mask
+    // with consecutive-failure tracking: persist `offline` every cycle, and
+    // once a node has failed the reachability probe N cycles in a row (default
+    // 3), auto-disable it (enabled=false) so it leaves rotation, with a loud
+    // ERROR so operators are paged. A dead node must NEVER report healthy.
+    const consecutive = (nodeHealthFailureState.get(node.node_id) ?? 0) + 1;
+    nodeHealthFailureState.set(node.node_id, consecutive);
+
+    if (consecutive >= NODE_HEALTH_FAILURE_THRESHOLD) {
+      logger.error(
+        `[docker-node-manager] Node ${node.node_id} (${node.hostname}) unreachable for ${consecutive} consecutive health checks (threshold ${NODE_HEALTH_FAILURE_THRESHOLD}); auto-disabling (enabled=false, status=offline) and routing it out of the pool. Last error: ${lastError}. Operator action required to re-enable.`,
+        {
+          nodeId: node.node_id,
+          hostname: node.hostname,
+          consecutiveFailures: consecutive,
+          threshold: NODE_HEALTH_FAILURE_THRESHOLD,
+        },
+      );
+      await dockerNodesRepository.markOfflineAndDisable(node.node_id);
+      nodeHealthFailureState.delete(node.node_id);
+      return "offline";
+    }
+
+    logger.warn(
+      `[docker-node-manager] Node ${node.node_id} (${node.hostname}) unreachable (${consecutive}/${NODE_HEALTH_FAILURE_THRESHOLD} consecutive failures); marking offline. Will auto-disable if it keeps failing.`,
+    );
+    await dockerNodesRepository.updateStatus(node.node_id, "offline");
+    return "offline";
   }
 
   /**
@@ -287,12 +449,7 @@ export class DockerNodeManager {
    */
   async ensureNodeReady(node: DockerNode, options: NodeSelectionOptions = {}): Promise<boolean> {
     try {
-      const ssh = DockerSSHClient.getClient(
-        node.hostname,
-        node.ssh_port ?? undefined,
-        node.host_key_fingerprint ?? undefined,
-        node.ssh_user ?? undefined,
-      );
+      const ssh = this.sshClientForNode(node);
       await ssh.connect();
       const dockerInfo = await ssh.exec("docker info --format '{{.ID}}|{{.Architecture}}'", 10_000);
       const { dockerId, architecture } = parseDockerInfoProbe(dockerInfo);
@@ -471,18 +628,13 @@ export class DockerNodeManager {
           };
         }
 
+        const ssh = this.sshClientForNode(node);
+        const prePull = buildTrackedPrePullCommand(image, platform);
         try {
-          const ssh = DockerSSHClient.getClient(
-            node.hostname,
-            node.ssh_port ?? undefined,
-            node.host_key_fingerprint ?? undefined,
-            node.ssh_user ?? undefined,
-          );
           await ssh.connect();
-          await ssh.exec(
-            ["docker pull", ...dockerPlatformFlag(platform), shellQuote(image)].join(" "),
-            5 * 60 * 1000,
-          );
+          await ssh.exec(prePull.command, 5 * 60 * 1000);
+          // Success: clear any prior wedge / self-heal bookkeeping for this node.
+          prePullFailureState.delete(node.node_id);
           return {
             nodeId: node.node_id,
             hostname: node.hostname,
@@ -496,6 +648,16 @@ export class DockerNodeManager {
             image,
             error: message,
           });
+          if (isPrePullTimeoutError(error)) {
+            // A timed-out `docker pull` is NOT stopped by DockerSSHClient's
+            // channel-close (that only sends SIGHUP, which a detached `docker
+            // pull` ignores), so it can keep running. The tracked wrapper leaves
+            // a PID file only for this pre-pull, so recovery does not kill
+            // unrelated deployment pulls on the same node.
+            await this.recoverAfterTimedOutPrePull(ssh, node, prePull.pidFile, image);
+          } else {
+            prePullFailureState.delete(node.node_id);
+          }
           return {
             nodeId: node.node_id,
             hostname: node.hostname,
@@ -508,6 +670,76 @@ export class DockerNodeManager {
     );
   }
 
+  /**
+   * Cleanup + optional self-heal after a pre-pull times out on a node.
+   *
+   * (a) SIGKILL only the PID recorded by the timed-out pre-pull wrapper, after
+   *     verifying the process is still a `docker pull` for the same image.
+   * (b) If a node keeps failing (its daemon is already wedged) and self-heal
+   *     is enabled, restart docker once per cooldown to recover automatically
+   *     instead of paging an operator. `live-restore` (node bootstrap
+   *     daemon.json) keeps running agent containers alive across the restart.
+   */
+  private async recoverAfterTimedOutPrePull(
+    ssh: DockerSSHClient,
+    node: DockerNode,
+    pidFile: string,
+    image: string,
+  ): Promise<void> {
+    try {
+      await ssh.exec(buildPrePullReapCommand(pidFile, image), 20_000);
+    } catch (killError) {
+      // error-policy:J6 best-effort timeout orphan cleanup; the pre-pull has
+      // already failed and the next cycle can retry the scoped PID reap.
+      logger.warn(
+        "[docker-node-manager] Failed to reap orphaned docker pull after pre-pull failure",
+        {
+          nodeId: node.node_id,
+          error: killError instanceof Error ? killError.message : String(killError),
+        },
+      );
+    }
+
+    // (b) Track consecutive failures; auto-recover a wedged daemon when enabled.
+    const state = prePullFailureState.get(node.node_id) ?? {
+      consecutiveFailures: 0,
+      lastSelfHealMs: 0,
+    };
+    state.consecutiveFailures += 1;
+    prePullFailureState.set(node.node_id, state);
+
+    if (!containersEnv.prePullSelfHealRestartEnabled()) return;
+    if (state.consecutiveFailures < PREPULL_SELF_HEAL_FAILURE_THRESHOLD) return;
+    if (Date.now() - state.lastSelfHealMs < PREPULL_SELF_HEAL_COOLDOWN_MS) return;
+
+    logger.error(
+      "[docker-node-manager] Pre-pull wedged repeatedly; auto-restarting docker to self-heal",
+      {
+        nodeId: node.node_id,
+        hostname: node.hostname,
+        consecutiveFailures: state.consecutiveFailures,
+      },
+    );
+    try {
+      // Live staging showed graceful `systemctl restart docker` can hang when
+      // dockerd/containerd content ingest is already wedged. Stamp the cooldown
+      // before attempting the shared-host recovery, then force-kill dockerd and
+      // bounce containerd; live-restore plus container shims keep agents alive.
+      state.lastSelfHealMs = Date.now();
+      prePullFailureState.set(node.node_id, state);
+      await ssh.exec(buildPrePullSelfHealRecoverCommand(), 120_000);
+      state.consecutiveFailures = 0;
+      prePullFailureState.set(node.node_id, state);
+    } catch (restartError) {
+      // error-policy:J6 best-effort node self-heal; failure is visible in logs
+      // and the cooldown/threshold state lets a later cycle retry.
+      logger.error("[docker-node-manager] Self-heal docker restart failed", {
+        nodeId: node.node_id,
+        error: restartError instanceof Error ? restartError.message : String(restartError),
+      });
+    }
+  }
+
   // ---- Runtime Container Inspection -------------------------------------
 
   /**
@@ -518,12 +750,7 @@ export class DockerNodeManager {
     node: DockerNode,
   ): Promise<{ name: string; id: string; state: string; status: string }[] | null> {
     try {
-      const ssh = DockerSSHClient.getClient(
-        node.hostname,
-        node.ssh_port ?? undefined,
-        node.host_key_fingerprint ?? undefined,
-        node.ssh_user ?? undefined,
-      );
+      const ssh = this.sshClientForNode(node);
       await ssh.connect();
 
       const output = await ssh.exec(

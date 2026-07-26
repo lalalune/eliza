@@ -215,6 +215,117 @@ describe("GET /api/documents — roomId + mediaFormat filters (#13593)", () => {
   });
 });
 
+async function requestDocuments(params: {
+  pathname: string;
+  query: string;
+  actorEntityId?: UUID;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { runtime } = makeRuntimeAndService(seedDocuments());
+  const url = new URL(`http://local${params.pathname}?${params.query}`);
+  let captured: { status: number; body: unknown } = { status: 0, body: null };
+  const headers: Record<string, string> = {};
+  if (params.actorEntityId) headers["x-eliza-entity-id"] = params.actorEntityId;
+  const ctx = {
+    req: { headers } as DocumentRouteContext["req"],
+    res: { setHeader: vi.fn() } as unknown as DocumentRouteContext["res"],
+    method: "GET",
+    pathname: params.pathname,
+    url,
+    runtime: runtime as never,
+    json: (_res: unknown, data: unknown, status = 200) => {
+      captured = { status, body: data };
+    },
+    error: (_res: unknown, message: string, status = 400) => {
+      captured = { status, body: { error: message } };
+    },
+    readJsonBody: async () => null,
+  } as unknown as DocumentRouteContext;
+  const handled = await handleDocumentsRoutes(ctx);
+  expect(handled).toBe(true);
+  return {
+    status: captured.status,
+    body: captured.body as Record<string, unknown>,
+  };
+}
+
+describe("GET /api/documents — knowledgeFacet hub grouping (#13594)", () => {
+  it("groups pdf/text/file into the `doc` facet", async () => {
+    // The USER's readable pdf is pdf-a; the `doc` facet must catch it via the
+    // pdf->doc grouping (owner-secret is owner-private, excluded).
+    const { body } = await requestDocuments({
+      pathname: "/api/documents",
+      query: "knowledgeFacet=doc",
+      actorEntityId: USER_ENTITY,
+    });
+    expect(docIds(body)).toEqual(["pdf-a"]);
+  });
+
+  it("passes image/audio/video/transcript through unchanged", async () => {
+    const { body } = await requestDocuments({
+      pathname: "/api/documents",
+      query: "knowledgeFacet=image",
+      actorEntityId: USER_ENTITY,
+    });
+    expect(docIds(body)).toEqual(["img-a", "img-b"]);
+  });
+
+  it("treats `all` as a no-op (whole readable store)", async () => {
+    const { body } = await requestDocuments({
+      pathname: "/api/documents",
+      query: "knowledgeFacet=all",
+      actorEntityId: USER_ENTITY,
+    });
+    expect(docIds(body)).toEqual(["img-a", "img-b", "pdf-a"]);
+  });
+});
+
+describe("GET /api/documents/facets — whole-store hub counts (#13594)", () => {
+  it("returns coarse facet counts over the whole readable store", async () => {
+    // As the USER: img-a, img-b (image) + pdf-a (doc) are readable; owner-secret
+    // is owner-private and excluded. Counts must describe the whole store, not a
+    // page slice — the review blocker.
+    const { body } = await requestDocuments({
+      pathname: "/api/documents/facets",
+      query: "",
+      actorEntityId: USER_ENTITY,
+    });
+    const counts = body.counts as Record<string, number>;
+    expect(counts).toMatchObject({
+      all: 3,
+      doc: 1,
+      image: 2,
+      audio: 0,
+      video: 0,
+      transcript: 0,
+    });
+  });
+
+  it("honors the scope/room narrowing but ignores the facet itself", async () => {
+    // Narrow to ROOM_A: img-a (image) + pdf-a (doc) for the USER. The facet
+    // param is dropped inside the count so every bucket is still counted.
+    const { body } = await requestDocuments({
+      pathname: "/api/documents/facets",
+      query: `roomId=${ROOM_A}&knowledgeFacet=image`,
+      actorEntityId: USER_ENTITY,
+    });
+    const counts = body.counts as Record<string, number>;
+    expect(counts).toMatchObject({ all: 2, doc: 1, image: 1 });
+  });
+
+  it("lets the owner count owner-private items", async () => {
+    // Owner reads global + owner-private; owner-secret (owner-private pdf) is
+    // counted as a `doc`. The USER's user-private items are scoped to the USER,
+    // so the owner does not see them by default.
+    const { body } = await requestDocuments({
+      pathname: "/api/documents/facets",
+      query: "",
+      actorEntityId: OWNER_ENTITY,
+    });
+    const counts = body.counts as Record<string, number>;
+    expect(counts.doc).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe("GET /api/documents/search — roomId pushed into service scope (#13593)", () => {
   it("passes roomId to searchDocuments BEFORE ranking/capping", async () => {
     const searchDocuments = vi.fn(async () => []);

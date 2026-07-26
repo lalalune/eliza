@@ -18,16 +18,28 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   getTrajectoryContext,
   type IAgentRuntime,
+  projectWorldId,
+  type RecordedTrajectory,
   resolveStateDir,
   resolveTrajectoryGate,
+  rollUpTrajectoryUsage,
   Service,
   TRACE_ENV,
+  type TrajectoryUsageRollup,
 } from "@elizaos/core";
 import {
   detectTaskType,
@@ -107,6 +119,7 @@ import {
   type CreateTaskInput,
   MAX_ATTEMPT_REFLECTIONS,
   MAX_SESSION_RETRY_ATTEMPTS,
+  nextTaskStatus,
   type OrchestratorAccountAssignment,
   type OrchestratorAccountOverview,
   type OrchestratorRoomParticipant,
@@ -118,7 +131,11 @@ import {
   type OrchestratorTaskSession,
   type OrchestratorTaskStatus,
   type OrchestratorTaskUsage,
+  RETRY_BUDGET_EPOCH_METADATA_KEY,
+  readRetryBudgetEpoch,
+  resolveStateLostRespawnCap,
   resolveTaskTransition,
+  stateLostRespawnUnderCap,
   type TaskLifecycleTrigger,
   type TaskListFilter,
   type TaskMessageDirection,
@@ -132,7 +149,11 @@ import {
   isParentAgentBrokerWired,
   PARENT_AGENT_BROKER_MANIFEST_ENTRY,
 } from "./parent-agent-broker.js";
-import { resolveTaskProjectId } from "./project-binding.js";
+import {
+  resolveBoundProjectCloudAppId,
+  resolveTaskProjectId,
+  resolveTaskSpawnWorkdir,
+} from "./project-binding.js";
 import { buildSkillsManifest } from "./skill-manifest.js";
 import {
   configureSpendLedger,
@@ -182,6 +203,20 @@ type RuntimeLike = IAgentRuntime & {
   getSetting?: (key: string) => string | undefined | null;
 };
 
+export interface TraceUsageArtifactError {
+  path: string;
+  reason: "read_failed" | "invalid_trajectory";
+  message: string;
+}
+
+export interface TaskTraceUsageRollup extends TrajectoryUsageRollup {
+  readState: "complete" | "partial";
+  artifactCount: number;
+  readableArtifactCount: number;
+  unreadableArtifactCount: number;
+  artifactErrors: TraceUsageArtifactError[];
+}
+
 /**
  * The deployment's configured default coding agent type, if any
  * (`ELIZA_ACP_DEFAULT_AGENT` or its alias `ELIZA_DEFAULT_AGENT_TYPE` — e.g.
@@ -217,6 +252,17 @@ const INDEPENDENT_ACP_VERIFIER_NAME = "independent-acp-verifier";
 /** Cap on child trajectories ingested per task_complete (#13775) so a runaway
  *  sub-agent can't flood the task doc; the store's MAX_ARTIFACTS also clamps. */
 const MAX_CHILD_TRAJECTORY_ARTIFACTS = 20;
+
+/** Default retention window for per-task child-trajectory dirs under the state
+ *  dir (#14109). A per-task `<stateDir>/orchestrator/child-trajectories/<taskId>`
+ *  dir is attach-by-reference (ingest never deletes its files), so without an
+ *  aged reclaim it grows unbounded — the same disk-leak class as the 3.6TB
+ *  worktree-farm incident (#13773), just relocated into the state dir. Reclaimed
+ *  only once the owning task is terminal (or absent) AND the dir has been idle
+ *  past this window, so an in-flight or not-yet-ingested trajectory is never
+ *  deleted. 24h mirrors ACP_SCRATCH_GC_MAX_AGE_MS. Overridable via
+ *  `ELIZA_ORCHESTRATOR_CHILD_TRAJECTORY_GC_MAX_AGE_MS`. */
+const CHILD_TRAJECTORY_GC_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /** Default upper bound on how long the independent verifier session may run
  *  before its await is abandoned (treated as inconclusive). Overridable via
@@ -268,6 +314,14 @@ export interface SpawnAgentForTaskOptions {
    * the max-nesting-depth cap so self-spawning can't run away.
    */
   nestingDepth?: number;
+  /**
+   * Internal: the admission-queue drain sets this false so a cap race during a
+   * replayed dispatch RETHROWS SessionCapError instead of self-parking. The
+   * drain then re-parks the task at the head with its ORIGINAL admission record
+   * (seniority + aging preserved); self-parking here would mint a fresh
+   * enqueuedAt and push the task to the back of its band.
+   */
+  parkOnCap?: boolean;
 }
 
 /**
@@ -384,6 +438,54 @@ const SESSION_ERROR_STATUSES: ReadonlySet<string> = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+const ADMISSION_PRIORITIES: readonly OrchestratorTaskPriority[] = [
+  "low",
+  "normal",
+  "high",
+  "urgent",
+];
+
+function isAdmissionPriority(
+  value: unknown,
+): value is OrchestratorTaskPriority {
+  return ADMISSION_PRIORITIES.includes(value as OrchestratorTaskPriority);
+}
+
+// Every SerializableSpawnOpts field is an optional string, so a persisted value
+// is a valid spawn-opts payload iff each present key is a string.
+function isSerializableSpawnOpts(
+  value: unknown,
+): value is SerializableSpawnOpts {
+  if (!isRecord(value)) return false;
+  for (const key of [
+    "framework",
+    "model",
+    "workdir",
+    "repo",
+    "label",
+    "task",
+    "approvalPreset",
+    "providerSource",
+  ] as const) {
+    const field = value[key];
+    if (field !== undefined && typeof field !== "string") return false;
+  }
+  return true;
+}
+
+/** Structural guard for a durable admission record read back off task metadata,
+ * replacing the former `as unknown as AdmissionRecord` double cast with a real
+ * narrowing so a malformed persisted payload is rejected instead of trusted. */
+function isAdmissionRecord(value: unknown): value is AdmissionRecord {
+  return (
+    isRecord(value) &&
+    value.state === "queued" &&
+    typeof value.enqueuedAt === "string" &&
+    isAdmissionPriority(value.priorityAtEnqueue) &&
+    isSerializableSpawnOpts(value.spawnOpts)
+  );
 }
 
 function nowIso(): string {
@@ -738,6 +840,20 @@ export class OrchestratorTaskService extends Service {
     // Persist self-spend durably so a configured ELIZA_AGENT_SPEND_CAP_USD
     // survives a restart instead of resetting to zero (#8924).
     configureSpendLedger(createTaskStoreSpendLedger(this.store));
+    // Reclaim aged per-task child-trajectory dirs under the state dir (#14109).
+    // Ingest attaches by reference and never deletes, and no workspace-GC path
+    // reaches the state dir, so without this the dir grows without bound. Runs
+    // once at start, after the store is wired; best-effort so a sweep hiccup
+    // never blocks service start (below).
+    void this.gcChildTrajectoryDirs().catch((err) => {
+      // error-policy:J7 startup GC is a disk-hygiene convenience; a failure is
+      // reported (the leak stays observable) but must not abort service start.
+      this.runtime.reportError?.(
+        "OrchestratorTask.gcChildTrajectoryDirs",
+        err,
+        {},
+      );
+    });
     // Resume any tasks parked before a restart, then arm the reconcile tick that
     // drains the queue even when no terminal session event fires (a sweptStale
     // session frees a slot silently). Best-effort: a store hiccup here must not
@@ -1005,10 +1121,6 @@ export class OrchestratorTaskService extends Service {
         break;
       }
       case "error": {
-        await this.store.updateSession(sessionId, {
-          status: "errored",
-          stoppedAt: Date.now(),
-        });
         const failureKind = str(record.failureKind);
         const message = str(record.message) ?? "";
         if (
@@ -1026,6 +1138,21 @@ export class OrchestratorTaskService extends Service {
             message,
           );
         }
+        // A late error for a session that already delivered its result is a
+        // teardown race (the process dropped its state AFTER task_complete
+        // posted), not a work failure — the router suppresses its respawn for
+        // exactly this case (router-loop-guard `state_lost` completion claim).
+        // It must not overwrite the `completed` session record with `errored`,
+        // inflate the crash-retry budget, or knock a `validating` task back to
+        // `active` mid-verification (that aborts validateTask — status is no
+        // longer `validating` — and wedges the task with no live worker). The
+        // raw event is already on the task timeline via recordSessionEvent.
+        const prior = (await this.store.findSession(sessionId))?.session;
+        if (prior?.status === "completed") break;
+        await this.store.updateSession(sessionId, {
+          status: "errored",
+          stoppedAt: Date.now(),
+        });
         await this.advanceTaskOnSessionError(taskId, sessionId, {
           failureKind,
           message,
@@ -1128,17 +1255,167 @@ export class OrchestratorTaskService extends Service {
   }
 
   /**
+   * Root under the state dir holding every task's child-trajectory dir (#13775),
+   * i.e. `<stateDir>/orchestrator/child-trajectories`. Swept by
+   * {@link gcChildTrajectoryDirs} on start (#14109).
+   */
+  private childTrajectoriesRoot(): string {
+    return join(resolveStateDir(), "orchestrator", "child-trajectories");
+  }
+
+  /**
    * Per-task directory a spawned sub-agent's file recorder writes its own
-   * trajectories into (#13775), scanned on task_complete. Under the shared state
-   * dir so #13773's workspace-GC registry can reclaim it with the task.
+   * trajectories into (#13775), scanned on task_complete.
+   *
+   * NOTE (#14109): this lives under the state dir, NOT a workspace scratch root,
+   * so `AcpService.gcOrphanedScratchDirs` (which only scans configured workspace
+   * roots) never reclaims it, and ingest is attach-by-reference (the JSON files
+   * are never deleted after being attached). Reclamation is therefore explicit,
+   * via {@link gcChildTrajectoryDirs}, an age-gated startup sweep of
+   * {@link childTrajectoriesRoot}.
    */
   private childTrajectoryDir(taskId: string): string {
-    return join(
-      resolveStateDir(),
-      "orchestrator",
-      "child-trajectories",
-      taskId,
+    return join(this.childTrajectoriesRoot(), taskId);
+  }
+
+  /**
+   * Bounded retention for the child-trajectory state dir (#14109). A per-task
+   * `<stateDir>/orchestrator/child-trajectories/<taskId>` dir is written by a
+   * sub-agent's recorder and attached by reference on task_complete — the files
+   * are never deleted after ingest, and no workspace-GC path reaches the state
+   * dir. Left unchecked it grows without bound (the disk-leak class #13773
+   * exists to prevent, relocated into the state dir).
+   *
+   * Runs once at startup (mirroring `AcpService.cleanOrphanedScratchWorkdirs`).
+   * For each per-task dir it reclaims ONLY when BOTH hold:
+   *  - the owning task is terminal in this store, OR has no task doc at all
+   *    (an orphan left by a crashed/purged task) — a live task keeps its dir; and
+   *  - the dir has been idle (newest entry's mtime) past the retention window.
+   *
+   * The age gate is the load-bearing safety: a not-yet-ingested or in-flight
+   * trajectory is recent by construction, so it is never deleted even if its
+   * task doc looks terminal (e.g. a respawned session still writing). Deletes
+   * are best-effort; a locked/vanished dir is skipped and retried next boot.
+   */
+  private async gcChildTrajectoryDirs(): Promise<void> {
+    const root = this.childTrajectoriesRoot();
+    let entries: string[];
+    try {
+      entries = await readdir(root);
+    } catch (err) {
+      // error-policy:J3 an absent root is the expected empty shape (no task has
+      // ever recorded a child trajectory) — explicit zero-work result, never a
+      // masked read failure.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.runtime.reportError?.(
+        "OrchestratorTaskService.gcChildTrajectoryDirs",
+        err,
+        { phase: "readdir", root },
+      );
+      return;
+    }
+
+    const maxAgeMs = parsePositiveIntSetting(
+      this.readSetting("ELIZA_ORCHESTRATOR_CHILD_TRAJECTORY_GC_MAX_AGE_MS"),
+      CHILD_TRAJECTORY_GC_MAX_AGE_MS,
     );
+    const now = Date.now();
+    let reclaimed = 0;
+    let kept = 0;
+
+    await Promise.allSettled(
+      entries.map(async (taskId) => {
+        const path = join(root, taskId);
+        try {
+          const st = await stat(path);
+          if (!st.isDirectory()) {
+            kept++;
+            return;
+          }
+        } catch {
+          // error-policy:J6 vanished mid-scan — nothing left to reclaim.
+          return;
+        }
+
+        // A live (non-terminal) task is still producing trajectories under this
+        // dir — never reclaim it. An absent task doc is an orphan (its task was
+        // purged/never persisted): reclaimable, but still age-gated below so a
+        // dir a brand-new task is actively writing isn't yanked out from under
+        // it before its doc lands.
+        let taskIsReclaimable: boolean;
+        try {
+          const doc = await this.store.getTask(taskId);
+          taskIsReclaimable =
+            !doc || TERMINAL_TASK_STATUSES.has(doc.task.status);
+        } catch (err) {
+          // error-policy:J7 DATA-LOSS GUARD. A store read failure must not be
+          // read as "no task" — that would treat a live task's dir as an orphan
+          // and delete work. Keep the dir; the next boot retries with real data.
+          this.runtime.reportError?.(
+            "OrchestratorTaskService.gcChildTrajectoryDirs",
+            err,
+            { phase: "store.getTask", taskId },
+          );
+          kept++;
+          return;
+        }
+        if (!taskIsReclaimable) {
+          kept++;
+          return;
+        }
+
+        // Age gate: newest mtime across the dir tree (the recorder nests files
+        // under an <agentId>/ subdir). A trajectory written since the retention
+        // window — i.e. possibly not yet ingested, or from a respawned session
+        // still running — keeps the whole dir. Fall back to the dir's own mtime
+        // for an empty dir.
+        let newestMtimeMs = 0;
+        try {
+          const rel = await readdir(path, { recursive: true });
+          const stats = await Promise.all(
+            rel.map((p) =>
+              stat(join(path, p)).then(
+                (s) => s.mtimeMs,
+                () => 0,
+              ),
+            ),
+          );
+          newestMtimeMs = stats.reduce((max, m) => Math.max(max, m), 0);
+          if (newestMtimeMs === 0) {
+            newestMtimeMs = (await stat(path)).mtimeMs;
+          }
+        } catch {
+          // error-policy:J6 vanished mid-scan — nothing left to reclaim.
+          return;
+        }
+        if (now - newestMtimeMs <= maxAgeMs) {
+          kept++;
+          return;
+        }
+
+        try {
+          await rm(path, { recursive: true, force: true });
+          reclaimed++;
+        } catch (err) {
+          // error-policy:J6 best-effort GC; a locked/vanished dir is skipped so
+          // the sweep continues and retries next boot.
+          this.log("warn", "child-trajectory GC: failed to remove dir", {
+            taskId,
+            path,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }),
+    );
+
+    if (reclaimed > 0 || kept > 0) {
+      this.log("info", "reclaimed aged child-trajectory dirs", {
+        reclaimed,
+        kept,
+        root,
+        olderThanMs: maxAgeMs,
+      });
+    }
   }
 
   /**
@@ -1198,10 +1475,30 @@ export class OrchestratorTaskService extends Service {
     }
     if (files.length === 0) return [];
 
+    // Dedupe against files this task already recorded (#14110). The trajectory
+    // dir is per-TASK but `task_complete` fires per-SESSION-completion, so a
+    // re-completion of the same session or a respawned second session re-scans
+    // the same files. Without this guard each pass re-attaches them as brand-new
+    // artifacts (fresh `randomUUID()` ids) and re-stamps the *current* session's
+    // correlation onto files an *earlier* session actually recorded — corrupting
+    // the file↔DB trace join #13871 exists to provide. The already-recorded
+    // artifact paths are the persistent dedupe key: they survive restart with
+    // the task document, and skipping them preserves the original ingesting
+    // session's correlation (we never touch an already-attached artifact).
+    const existingArtifactPaths = new Set(
+      ((await this.store.getTask(taskId))?.artifacts ?? [])
+        .filter((a) => a.artifactType === "trajectory" && a.path)
+        .map((a) => a.path as string),
+    );
+    const freshFiles = files.filter((path) => !existingArtifactPaths.has(path));
+    if (freshFiles.length === 0) return [];
+
     // Newest first, capped so a runaway child can't flood the task doc; the
-    // store's MAX_ARTIFACTS also clamps.
+    // store's MAX_ARTIFACTS also clamps. Cap applies to genuinely-new files only
+    // so a large already-ingested backlog can't starve fresh trajectories out of
+    // the window.
     const withMtime = await Promise.all(
-      files.map(async (path) => ({
+      freshFiles.map(async (path) => ({
         path,
         mtimeMs: (await stat(path)).mtimeMs,
       })),
@@ -1237,10 +1534,16 @@ export class OrchestratorTaskService extends Service {
     }
 
     if (ingested.length > 0) {
+      // Union-dedupe the id list too: even though path-dedupe above prevents
+      // re-ingesting a file, two distinct files sharing a `<trajectoryId>.json`
+      // basename (or a legacy pre-fix duplicate row) must not append a repeat id.
       const existing = session?.childTrajectoryIds ?? [];
-      await this.store.updateSession(sessionId, {
-        childTrajectoryIds: [...existing, ...ingested],
-      });
+      const merged = [...new Set([...existing, ...ingested])];
+      if (merged.length !== existing.length) {
+        await this.store.updateSession(sessionId, {
+          childTrajectoryIds: merged,
+        });
+      }
     }
     return ingested;
   }
@@ -1668,9 +1971,17 @@ export class OrchestratorTaskService extends Service {
     if (doc.task.paused) return;
     if (TERMINAL_TASK_STATUSES.has(doc.task.status)) return;
 
+    // Scope the budget to the current run: an operator `restartTask` stamps a
+    // budget epoch, and sessions spawned before it (a prior failed run's dead
+    // lineage) must not count, or a restarted task re-fails on its first blip
+    // (#14104). Absent epoch → every session counts (pre-restart lifetime).
+    const budgetEpoch = readRetryBudgetEpoch(doc.task.metadata);
     const erroredSessionIds = new Set(
       doc.sessions
-        .filter((s) => SESSION_ERROR_STATUSES.has(s.status))
+        .filter(
+          (s) =>
+            SESSION_ERROR_STATUSES.has(s.status) && s.spawnedAt >= budgetEpoch,
+        )
         .map((s) => s.sessionId),
     );
     erroredSessionIds.add(sessionId);
@@ -1683,11 +1994,19 @@ export class OrchestratorTaskService extends Service {
     const respawnable = this.routerWillRespawn(
       doc.sessions.find((s) => s.sessionId === sessionId),
       failure,
+      erroredSessions,
     );
-    const budgetSpent = erroredSessions >= MAX_SESSION_RETRY_ATTEMPTS;
-    // Terminal unless the router will respawn this crash class AND the lineage
-    // budget still has room. An un-respawnable crash fails on its first
-    // occurrence — nothing will re-drive it, so a non-terminal verdict wedges.
+    // `routerWillRespawn` already folds the state-lost respawn cap into its
+    // verdict via the SAME gate + effective cap the router's loop-guard uses
+    // (#14104), so a state-lost lineage goes terminal on exactly the error the
+    // router refuses to respawn — including when an operator raises or lowers
+    // ACPX_STATE_LOST_RESPAWN_CAP. The account-failover class carries no
+    // per-lineage router cap, so the shared errored-session budget still bounds
+    // it here. An un-respawnable crash fails on its first occurrence — nothing
+    // will re-drive it, so a non-terminal verdict wedges.
+    const stateLost = failure.failureKind === "session_state_lost";
+    const budgetSpent =
+      !stateLost && erroredSessions >= MAX_SESSION_RETRY_ATTEMPTS;
     const terminal = !respawnable || budgetSpent;
     await this.store.addEvent({
       id: randomUUID(),
@@ -1718,7 +2037,13 @@ export class OrchestratorTaskService extends Service {
    * Whether `sub-agent-router.ts` will deterministically respawn this crash —
    * the same gate the router itself uses, mirrored here so status termination
    * and respawn agree. Only these two classes get a successor session:
-   *   - `session_state_lost` (unconditional respawn under the lineage cap), and
+   *   - `session_state_lost`, respawned by the router only while the lineage's
+   *     errored count stays under the effective respawn cap. `erroredSessions`
+   *     is the 1-based lineage position of the just-errored session, which the
+   *     router tracks as its own per-lineage state-lost count; consulting the
+   *     SAME cap + gate here means the task goes terminal on exactly the error
+   *     the router refuses to respawn, so no 4th orphan worker spawns against a
+   *     `failed` task (#14104).
    *   - a pooled-account failure whose message classifies as rate-limit /
    *     needs-reauth, while the session carried a pooled account and a healthy
    *     sibling remains for failover.
@@ -1727,8 +2052,14 @@ export class OrchestratorTaskService extends Service {
   private routerWillRespawn(
     session: OrchestratorTaskSession | undefined,
     failure: { failureKind?: string; message: string },
+    erroredSessions: number,
   ): boolean {
-    if (failure.failureKind === "session_state_lost") return true;
+    if (failure.failureKind === "session_state_lost") {
+      return stateLostRespawnUnderCap(
+        erroredSessions,
+        resolveStateLostRespawnCap(this.runtime),
+      );
+    }
     if (classifyAccountFailure(failure.message) === null) return false;
     if (!session?.accountProviderId || !session.accountId) return false;
     return hasHealthyPooledAccount(session.framework);
@@ -1902,11 +2233,22 @@ export class OrchestratorTaskService extends Service {
    * a registered project. The `workdir` hint is stripped so it is never
    * persisted on the record — only the resolved `projectId` is. No match leaves
    * the task unbound, preserving per-session workdir re-resolution.
+   *
+   * A bound task is also stamped with the project's memory world (#13776 D3),
+   * derived per-agent via core's `projectWorldId(agentId, projectId)` — the
+   * single source of truth (#14171); Worlds are agent-scoped, so the runtime's
+   * agentId is part of the derivation. Its subagents are thus partitioned to the
+   * project and never see another project's injected context. A caller-supplied
+   * `worldId` is authoritative and wins — only an unset one is filled from the
+   * binding.
    */
   private bindProject(input: CreateTaskInput): CreateTaskInput {
     const projectId = resolveTaskProjectId(input);
     const { workdir: _workdir, ...rest } = input;
-    return { ...rest, projectId };
+    const worldId =
+      rest.worldId ??
+      (projectId ? projectWorldId(this.runtime.agentId, projectId) : undefined);
+    return { ...rest, projectId, worldId };
   }
 
   /**
@@ -2126,9 +2468,16 @@ export class OrchestratorTaskService extends Service {
     if (!doc) return null;
     await this.dequeueAdmission(taskId);
     await this.stopActiveSessions(doc);
+    // Re-read after stopActiveSessions, which may have advanced the status, and
+    // resolve the archive target through the transition table rather than
+    // writing `"archived"` literally: the `archived` trigger is legal from every
+    // state, so this is total, but going through the table keeps that table row
+    // live (a legality regression there now fails this write) instead of dead
+    // documentation the operator path silently bypasses.
+    const current = (await this.store.getTask(taskId)) ?? doc;
     await this.store.updateTask(taskId, {
       archived: true,
-      status: "archived",
+      status: nextTaskStatus(current.task.status, "archived"),
       archivedAt: nowIso(),
       closedAt: doc.task.closedAt ?? nowIso(),
     });
@@ -2561,7 +2910,10 @@ export class OrchestratorTaskService extends Service {
         correction,
         "validation_failed",
       );
-      await this.store.updateTask(taskId, { status: "active" });
+      // Route the validating→active retry through the transition table so an
+      // operator archive/pause that landed while the judge was running is not
+      // stomped by a direct status write (illegal moves drop as no-ops).
+      await this.advanceTaskStatus(taskId, "validation_failed");
     } catch (sendErr) {
       // error-policy:J1 boundary — a failed corrective send becomes a structured
       // escalation (event + waiting_on_user), never a silent stall.
@@ -3027,6 +3379,17 @@ export class OrchestratorTaskService extends Service {
         "Restart this task from the current durable context. Reinspect the task timeline, then continue until the goal is met or you are blocked.",
       planRevision,
     );
+    // Open a fresh budget epoch BEFORE the first spawn of the new run so the
+    // prior (failed) run's dead errored sessions no longer count toward the
+    // crash-retry budget — otherwise a restarted task re-fails on its first
+    // recoverable blip while the router respawns anyway (#14104). Merge into the
+    // existing bag: `updateTask` replaces `metadata` wholesale.
+    await this.store.updateTask(taskId, {
+      metadata: {
+        ...doc.task.metadata,
+        [RETRY_BUDGET_EPOCH_METADATA_KEY]: Date.now(),
+      },
+    });
     await this.spawnAgentForTask(taskId, {
       ...input.agent,
       task: instruction,
@@ -3120,6 +3483,93 @@ export class OrchestratorTaskService extends Service {
     return doc ? summarizeUsage(doc) : null;
   }
 
+  /**
+   * Per-trace token/cost roll-up across this task's INGESTED SUB-AGENT
+   * TRAJECTORY FILES (#13775 item 5). Distinct from {@link getUsage}: that sums
+   * the ACP terminal `OrchestratorTaskUsage` frames (the spend a sub-agent's
+   * ACP surface reported for the whole session); this reads the file-recorder
+   * `trajectory` artifacts item 2 attached and sums their inner per-model-call
+   * metrics, grouped by the shared `traceId`. The two count different things
+   * (ACP-reported session spend vs. file-recorded inner-call spend) and are
+   * deliberately kept apart so nothing is double-summed. For an eliza-backend
+   * sub-agent whose ACP frame is coarse/absent, this is the only surface that
+   * attributes the real inner spend to the logical run.
+   *
+   * Attach-by-reference means the files live where the child wrote them. A
+   * missing/unreadable/parse-failed file keeps the endpoint partial: readable
+   * files still contribute to totals, and failed files are returned as
+   * `artifactErrors` so operators never mistake partial spend for a complete
+   * clean roll-up.
+   */
+  async getTraceUsage(taskId: string): Promise<TaskTraceUsageRollup | null> {
+    const doc = await this.store.getTask(taskId);
+    if (!doc) return null;
+    // Dedupe by path: `ingestChildTrajectories` rescans the task-wide child
+    // dir on every task_complete, so a multi-session / retried task can hold
+    // more than one artifact row pointing at the SAME trajectory file. Summing
+    // each row would double-count that file's tokens/cost, so read each
+    // distinct path once.
+    const paths = [
+      ...new Set(
+        doc.artifacts
+          .filter(
+            (artifact) =>
+              artifact.artifactType === "trajectory" && Boolean(artifact.path),
+          )
+          .map((artifact) => artifact.path as string),
+      ),
+    ];
+    const trajectories: RecordedTrajectory[] = [];
+    const artifactErrors: TraceUsageArtifactError[] = [];
+    for (const path of paths) {
+      try {
+        const raw = await readFile(path, "utf8");
+        const parsed = JSON.parse(raw) as unknown;
+        // A well-formed trajectory carries a metrics block; anything else is a
+        // mislabeled artifact and is surfaced as partial rather than trusted.
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          "metrics" in parsed &&
+          parsed.metrics &&
+          typeof parsed.metrics === "object"
+        ) {
+          trajectories.push(parsed as RecordedTrajectory);
+        } else {
+          artifactErrors.push({
+            path,
+            reason: "invalid_trajectory",
+            message: "Trajectory artifact does not contain metrics.",
+          });
+        }
+      } catch (err) {
+        // error-policy:J4 trace usage is a user-facing accounting surface; keep
+        // readable totals available, but return artifactErrors/readState so a
+        // corrupt or missing file cannot look like complete zero spend.
+        const message = err instanceof Error ? err.message : String(err);
+        artifactErrors.push({
+          path,
+          reason: "read_failed",
+          message,
+        });
+        this.log("warn", "partial trace usage due to unreadable artifact", {
+          taskId,
+          path,
+          error: message,
+        });
+      }
+    }
+    const rollup = rollUpTrajectoryUsage(trajectories);
+    return {
+      ...rollup,
+      readState: artifactErrors.length > 0 ? "partial" : "complete",
+      artifactCount: paths.length,
+      readableArtifactCount: trajectories.length,
+      unreadableArtifactCount: artifactErrors.length,
+      artifactErrors,
+    };
+  }
+
   // ---- sub-agent control -------------------------------------------------
 
   async spawnAgentForTask(
@@ -3142,15 +3592,34 @@ export class OrchestratorTaskService extends Service {
     }
     const acp = this.acp();
     if (!acp) throw new Error("ACP service unavailable");
-    // An explicit caller workdir wins and re-pins the binding; otherwise a
-    // follow-up spawn reuses the workdir pinned at the task's first spawn so it
-    // can't silently migrate repos when routing env changes between sessions
-    // (#13776). `boundWorkdir` was validated when first pinned, so reuse skips
-    // the allow-list probe — it may point at a configured project root the
-    // probe would otherwise reject once env drifts.
-    const workdir = opts.workdir
-      ? await resolveAllowedWorkdir(opts.workdir)
-      : doc.task.boundWorkdir;
+    // Resolve the spawn workdir through the SHARED precedence resolver so this
+    // direct-service path and the SPAWN_AGENT action path can never diverge on
+    // the same task+input (#14108): project localPath > explicit caller workdir
+    // > first-spawn `boundWorkdir`.
+    //
+    // - A project-bound task ALWAYS spawns in its project's localPath, even via
+    //   this API/service entry point (previously this path ignored `projectId`
+    //   entirely, so a bound task could land in `boundWorkdir` or an explicit
+    //   workdir — the divergence #14108 reports). When an explicit workdir loses
+    //   to the binding the resolver logs loudly instead of silently swapping.
+    // - An explicit caller workdir otherwise wins and re-pins the binding.
+    // - Else a follow-up spawn reuses the workdir pinned at first spawn so it
+    //   can't silently migrate repos when routing env drifts between sessions
+    //   (#13776).
+    //
+    // A project localPath / `boundWorkdir` was validated when first bound, so
+    // reuse of those skips the allow-list probe — they may point at a configured
+    // project root the probe would otherwise reject once env drifts. Only a
+    // freshly-supplied explicit workdir is re-probed.
+    const resolvedWorkdir = resolveTaskSpawnWorkdir({
+      projectId: doc.task.projectId,
+      boundWorkdir: doc.task.boundWorkdir,
+      explicitWorkdir: opts.workdir,
+    });
+    const workdir =
+      resolvedWorkdir.source === "explicit" && resolvedWorkdir.workdir
+        ? await resolveAllowedWorkdir(resolvedWorkdir.workdir)
+        : resolvedWorkdir.workdir;
 
     const policy = doc.task.providerPolicy ?? {};
     // Give every sub-agent a distinct person-name. An explicit caller label
@@ -3169,6 +3638,11 @@ export class OrchestratorTaskService extends Service {
       doc.task.metadata?.capabilityProfile,
     );
     const brokerWired = isParentAgentBrokerWired(this.runtime);
+    // A task bound to a Project that already owns a Cloud app carries that app's
+    // id into the prompt so the worker updates it rather than minting a duplicate
+    // (#14119). Null for unbound tasks or projects with no Cloud app.
+    const cloudAppId =
+      resolveBoundProjectCloudAppId(doc.task.projectId) ?? undefined;
     const goalPrompt = buildGoalPrompt({
       agentName,
       goal: doc.task.goal,
@@ -3177,6 +3651,7 @@ export class OrchestratorTaskService extends Service {
       taskRoomId: doc.task.taskRoomId ?? doc.task.roomId,
       workdir,
       repo: opts.repo,
+      ...(cloudAppId ? { cloudAppId } : {}),
       // Replay prior failed-verification post-mortems so a re-spawn of this task
       // doesn't repeat them (#8899).
       attemptReflections: readAttemptReflections(doc.task.metadata),
@@ -3281,6 +3756,7 @@ export class OrchestratorTaskService extends Service {
         err instanceof SessionCapError &&
         err.slotClass === "worker" &&
         nestingDepth === 0 &&
+        opts.parkOnCap !== false &&
         this.admissionQueueEnabled()
       ) {
         return this.enqueueAdmission(taskId, doc.task.priority, {
@@ -3359,12 +3835,23 @@ export class OrchestratorTaskService extends Service {
     // session's events even if the durable write below degrades.
     this.sessionTaskIndex.set(result.sessionId, taskId);
     try {
+      // A task can be spawned directly (API/action) while it is still parked in
+      // the admission queue — e.g. a slot freed silently and the user beat the
+      // reconcile tick. Clear the parked state now the spawn succeeded, or the
+      // next drain would replay the stale admission record and dispatch a
+      // DUPLICATE agent for the same goal. No-op for non-parked tasks.
+      await this.dequeueAdmission(taskId);
       await this.store.addSession(session);
       // Pin (or re-pin, on explicit override) the durable workdir/repo binding
       // from the workdir the session actually landed in, so subsequent
       // follow-up spawns of this task reuse it deterministically (#13776).
       await this.bindTaskWorkdir(taskId, doc.task, result.workdir, opts.repo, {
+        // Only an explicit caller workdir that actually WON (source=explicit)
+        // may re-pin the binding. A project-bound task's localPath won here, so
+        // an ignored explicit `opts.workdir` must NOT be treated as a rebind
+        // request (#14108) — the project binding, not the pin, is authoritative.
         allowRebind:
+          resolvedWorkdir.source === "explicit" &&
           Boolean(opts.workdir) &&
           Boolean(doc.task.boundWorkdir) &&
           doc.task.boundWorkdir !== result.workdir,
@@ -3596,7 +4083,12 @@ export class OrchestratorTaskService extends Service {
     const acp = this.acp();
     if (!acp) {
       await this.store.updateSession(sessionId, { status: "stop_failed" });
-      await this.store.updateTask(taskId, { status: "interrupted" });
+      // Route through the transition table: a task that already reached a
+      // terminal state (done/failed/archived) but still holds a live keepAlive
+      // session whose stop we can't attempt must NOT be stomped to `interrupted`
+      // — `done → interrupted` has no table edge, so this is a legal no-op there
+      // and only interrupts a genuinely non-terminal task.
+      await this.advanceTaskStatus(taskId, "interrupted");
       throw new Error("ACP service unavailable; cannot stop active session");
     }
     try {
@@ -3834,7 +4326,7 @@ export class OrchestratorTaskService extends Service {
           }),
         ),
       );
-      await this.store.updateTask(doc.task.id, { status: "interrupted" });
+      await this.advanceTaskStatus(doc.task.id, "interrupted");
       throw new RecoveryConflictError(
         "ACP service unavailable; cannot stop active sessions",
       );
@@ -3861,7 +4353,10 @@ export class OrchestratorTaskService extends Service {
       }),
     );
     if (failures.length > 0) {
-      await this.store.updateTask(doc.task.id, { status: "interrupted" });
+      // A terminal task holding a live keepAlive session whose ACP stop fails
+      // must not regress to `interrupted`; the table makes that a legal no-op
+      // while still interrupting a non-terminal one.
+      await this.advanceTaskStatus(doc.task.id, "interrupted");
       throw new RecoveryConflictError(
         `Failed to stop ${failures.length} active session${
           failures.length === 1 ? "" : "s"
@@ -3910,13 +4405,8 @@ export class OrchestratorTaskService extends Service {
     task: OrchestratorTaskRecord,
   ): AdmissionRecord | null {
     const admission = task.metadata?.admission;
-    if (
-      isRecord(admission) &&
-      admission.state === "queued" &&
-      typeof admission.enqueuedAt === "string" &&
-      isRecord(admission.spawnOpts)
-    ) {
-      return admission as unknown as AdmissionRecord;
+    if (isAdmissionRecord(admission)) {
+      return admission;
     }
     return null;
   }
@@ -4001,6 +4491,10 @@ export class OrchestratorTaskService extends Service {
     for (const task of open) {
       const admission = OrchestratorTaskService.admissionOf(task);
       if (!admission) continue;
+      // A paused task keeps its durable admission record (pauseTask passes
+      // clearMetadata=false so resume can replay the original spawn) but must
+      // NOT re-enter the dispatch order — resumeTask re-seeds it explicitly.
+      if (task.paused) continue;
       entries.push({
         taskId: task.id,
         enqueuedAt: admission.enqueuedAt,
@@ -4101,10 +4595,12 @@ export class OrchestratorTaskService extends Service {
    * Dispatch parked tasks into freed worker slots, most-eligible first.
    * Serialized via a promise-chain lock so a terminal-event drain and the
    * reconcile tick never double-dispatch. For each free slot it re-reads the
-   * head task's live state (dropping terminal/paused entries — starvation guard
-   * #2 is covered by idle-reclaim below), clears the admission record, and
-   * replays the saved spawn. A fresh SessionCapError re-parks the head and stops
-   * the pass (another spawn raced us). When no slot is free but the queue is
+   * head task's live state (terminal entries are dropped with their record;
+   * paused entries are dropped from the order but KEEP the record for resume),
+   * clears the admission record, and replays the saved spawn with
+   * `parkOnCap: false`. A fresh SessionCapError re-parks the head with its
+   * original record and stops the pass (another spawn raced us). When no slot
+   * is free but the queue is
    * non-empty, one idle keepAlive session whose task is already terminal is
    * reclaimed to unblock the queue.
    */
@@ -4148,10 +4644,14 @@ export class OrchestratorTaskService extends Service {
       const doc = await this.store.getTask(head.taskId);
       const admission = doc && OrchestratorTaskService.admissionOf(doc.task);
       if (!doc || !admission) continue;
-      if (TERMINAL_TASK_STATUSES.has(doc.task.status) || doc.task.paused) {
+      if (TERMINAL_TASK_STATUSES.has(doc.task.status)) {
         await this.writeAdmission(head.taskId, null);
         continue;
       }
+      // A pause that raced this pass: drop the task from the dispatch order but
+      // KEEP the durable record — pauseTask retained it so resume can replay
+      // the original spawn (clearing it here would make resume a silent no-op).
+      if (doc.task.paused) continue;
       await this.writeAdmission(head.taskId, null);
       try {
         await this.spawnAgentForTask(head.taskId, {
@@ -4159,6 +4659,9 @@ export class OrchestratorTaskService extends Service {
           approvalPreset: admission.spawnOpts.approvalPreset as
             | ApprovalPreset
             | undefined,
+          // A cap race must RETHROW so the catch below re-parks with the
+          // original record; the spawn's own self-park would reset seniority.
+          parkOnCap: false,
         });
       } catch (err) {
         if (err instanceof SessionCapError) {
@@ -4208,7 +4711,13 @@ export class OrchestratorTaskService extends Service {
     const candidates: Array<{ id: string; createdAt: number }> = [];
     for (const session of sessions) {
       if (TERMINAL_SESSION_STATUSES.has(session.status)) continue;
-      const taskId = this.sessionTaskIndex.get(session.id);
+      // Resolve via `resolveTaskId`, not the in-memory `sessionTaskIndex`
+      // directly: after a parent restart the index is empty but pre-restart
+      // keepAlive sessions are still live, so the session→task mapping only
+      // exists in the durable store. Reading the index alone leaves this guard
+      // unable to reclaim any pre-restart session, starving queued tasks behind
+      // zombie sessions whose owning tasks are already terminal (#14106).
+      const taskId = await this.resolveTaskId(session.id);
       if (!taskId) continue;
       const doc = await this.store.getTask(taskId);
       if (!doc || !TERMINAL_TASK_STATUSES.has(doc.task.status)) continue;
