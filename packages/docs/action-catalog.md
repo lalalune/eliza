@@ -15,7 +15,7 @@ This catalog is generated from `packages/prompts/specs/**` by `bun run --cwd pac
 - **Plugin overlay actions:** 11
 - **Canonical providers:** 23
 - **Core providers:** 23
-- **Registered runtime actions:** 187
+- **Registered runtime actions:** 188
 
 ## Actions
 
@@ -378,6 +378,7 @@ list. Regenerate this document after changing the registered action surface.
 - `COMPACT_CONVERSATION` — `packages/agent/src/actions/compact-conversation.ts`
 - `COMPUTER_USE` — `plugins/plugin-computeruse/src/actions/use-computer.ts`
 - `COMPUTER_USE_AGENT` — `plugins/plugin-computeruse/src/actions/use-computer-agent.ts`
+- `CONFLICT_DETECT` — `plugins/plugin-calendar/src/actions/conflict-detect.ts`, `plugins/plugin-personal-assistant/src/actions/conflict-detect.ts`
 - `CONNECT_ACCOUNT` — `packages/agent/src/actions/connect-account.ts`
 - `CONNECTOR` — `plugins/plugin-personal-assistant/src/actions/connector.ts`
 - `CONTACT` — `packages/agent/src/actions/contact.ts`
