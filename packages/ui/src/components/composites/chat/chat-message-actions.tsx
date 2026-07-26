@@ -11,7 +11,6 @@ import type * as React from "react";
 
 import { cn } from "../../../lib/utils";
 import {
-  LIQUID_GLASS_BLUR,
   LIQUID_GLASS_EDGE_SHADOW,
   LIQUID_GLASS_SHEEN,
 } from "../../shell/liquid-glass";
@@ -62,8 +61,6 @@ export function ChatMessageActionSurface({
           : {
               backgroundImage: LIQUID_GLASS_SHEEN,
               boxShadow: LIQUID_GLASS_EDGE_SHADOW,
-              WebkitBackdropFilter: LIQUID_GLASS_BLUR,
-              backdropFilter: LIQUID_GLASS_BLUR,
               ...style,
             }
       }
