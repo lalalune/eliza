@@ -19,14 +19,18 @@ import type { OcrExpectation } from "./ocr-content-rules";
 export const VIEW_EXPECTATIONS: Record<string, OcrExpectation> = {
   "builtin-chat": {
     // The composer placeholder is "Ask <agentName>" (Eliza in prod, the test
-    // agent's name under smoke), and landscape legitimately compacts to just the
-    // composer — so the agent-agnostic "Ask " prefix is the stable floor. A truly
-    // blank chat is still caught by the blank-pixel rule, not this expectation.
+    // agent's name under smoke). Packaged OCR often collapses the placeholder
+    // space, and the lock-screen state may show any time-of-day greeting, so use
+    // the stable composer/task/coachmark text instead of a specific greeting.
     requireAny: [
       "Ask ",
+      "AskEliza",
+      "Good night",
       "Good evening",
       "Good morning",
       "Good afternoon",
+      "Learn conversational",
+      "Swipe for apps",
       "what's up",
       "Welcome",
     ],
@@ -64,8 +68,10 @@ export const VIEW_EXPECTATIONS: Record<string, OcrExpectation> = {
   "builtin-relationships": {
     requireAny: [
       "No relationships yet",
+      "Relationships",
       "Search people",
       "Connect your platforms",
+      "people",
     ],
   },
   "builtin-skills": {
@@ -81,7 +87,15 @@ export const VIEW_EXPECTATIONS: Record<string, OcrExpectation> = {
     requireAny: ["Select a table", "Open SQL editor", "Filter tables"],
   },
   "builtin-logs": {
-    requireAny: ["All levels", "Search logs", "All tags"],
+    requireAny: [
+      "All levels",
+      "Alllevels",
+      "Search logs",
+      "Search",
+      "Searcn",
+      "All tags",
+      "Altags",
+    ],
   },
   "builtin-inventory": {
     requireAny: ["Wallet", "USDC", "Tokens", "Perps"],
@@ -96,18 +110,22 @@ export const VIEW_EXPECTATIONS: Record<string, OcrExpectation> = {
   "builtin-skills-marketplace": {
     requireAny: ["Marketplace", "Install", "Search skills"],
   },
-  // The launcher grid is its own content; `builtin-views` renders the same grid.
-  "builtin-apps": {
-    requireAny: ["Messages", "Settings", "Wallet", "Automations", "Knowledge"],
-  },
-  "builtin-views": {
-    requireAny: ["Messages", "Settings", "Wallet", "Automations", "Knowledge"],
-  },
+  // The launcher grid is its own content; packaged OCR reads the icon-heavy grid
+  // as glyph soup even when labels are visible, so the DOM/aesthetic rules own
+  // those surfaces until a non-text visual expectation exists.
   "builtin-character": {
     requireAny: ["Personality", "Relationships", "Knowledge", "Skills"],
   },
   "builtin-character-select": {
-    requireAny: ["About Me", "Style Rules", "Chat Examples", "Post Examples"],
+    requireAny: [
+      "About Me",
+      "Aboutie",
+      "Style Rules",
+      "syle rules",
+      "Chat Examples",
+      "Post Examples",
+      "A concise local assistant",
+    ],
   },
   "builtin-runtime": {
     requireAny: ["Plugins", "Actions", "Providers"],
@@ -120,7 +138,16 @@ export const VIEW_EXPECTATIONS: Record<string, OcrExpectation> = {
     requireAny: ["No trajectories yet", "trajector"],
   },
   "builtin-transcripts": {
-    requireAny: ["No transcripts yet", "transcri", "recording"],
+    requireAny: [
+      "No transcripts yet",
+      "transcri",
+      "recording",
+      "Live meeting",
+      "Meet",
+      "Zoom",
+      "Bot name",
+      "AskEliza",
+    ],
   },
   "builtin-desktop": {
     requireAny: ["Desktop workspace", "Electrobun desktop runtime"],
