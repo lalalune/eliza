@@ -186,4 +186,38 @@ describe("scheduling approval integrity", () => {
       "expected lowercase SHA-256",
     );
   });
+
+  it("rejects structurally inconsistent scheduling correlation", () => {
+    const wrongTransport = correlatedMessage();
+    if (!wrongTransport.scheduling) throw new Error("missing scheduling");
+    wrongTransport.scheduling = {
+      ...wrongTransport.scheduling,
+      transportChannel: "email",
+    };
+    expect(() => readSchedulingApprovalCorrelation(wrongTransport)).toThrow(
+      "send_message does not match email",
+    );
+
+    const proposalWithoutId = correlatedMessage();
+    if (!proposalWithoutId.scheduling) throw new Error("missing scheduling");
+    proposalWithoutId.scheduling = {
+      ...proposalWithoutId.scheduling,
+      proposalId: null,
+    };
+    expect(() => readSchedulingApprovalCorrelation(proposalWithoutId)).toThrow(
+      "proposal drafts require a proposal",
+    );
+
+    const nonCanonicalTimestamp = correlatedMessage();
+    if (!nonCanonicalTimestamp.scheduling) {
+      throw new Error("missing scheduling");
+    }
+    nonCanonicalTimestamp.scheduling = {
+      ...nonCanonicalTimestamp.scheduling,
+      sourceUpdatedAt: "2026-07-26",
+    };
+    expect(() =>
+      readSchedulingApprovalCorrelation(nonCanonicalTimestamp),
+    ).toThrow("expected canonical UTC ISO-8601 timestamp");
+  });
 });

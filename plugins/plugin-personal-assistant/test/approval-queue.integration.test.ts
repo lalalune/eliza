@@ -277,6 +277,10 @@ describe("ApprovalQueue integration (real PGlite)", () => {
       to: ["co-parent@example.com"],
       subject: "Scheduling: School conference",
     });
+    expect(approval.reason).toContain("To: Taylor (co-parent@example.com)");
+    expect(approval.reason).toContain("Subject: Scheduling: School conference");
+    expect(approval.reason).toContain("Message:\nHi,");
+    expect(approval.reason).toContain("Content SHA-256:");
     expect(readSchedulingApprovalCorrelation(approval.payload)).toMatchObject({
       negotiationId: data.negotiation.id,
       proposalId: null,

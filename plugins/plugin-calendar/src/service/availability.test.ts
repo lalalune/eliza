@@ -100,6 +100,7 @@ describe("evaluateCalendarAvailability", () => {
       evaluation.conflicts[0]?.eventA.id,
       evaluation.conflicts[0]?.eventB.id,
     ]).toEqual(["active-a", "active-b"]);
+    expect(evaluation.conflicts[0]?.severity).toBe("hard");
   });
 
   it("blocks tentative events as warnings by default and can explicitly ignore them", () => {
@@ -133,6 +134,62 @@ describe("evaluateCalendarAvailability", () => {
     expect(ignored.conflicts).toHaveLength(0);
     expect(ignored.checkedEvents).toBe(0);
     expect(ignored.ignoredEvents).toBe(1);
+  });
+
+  it("always blocks provider busy-only intervals regardless of retained event metadata or owner policy", () => {
+    const evaluation = evaluateCalendarAvailability({
+      range: UTC_DAY,
+      timeZone: "UTC",
+      sources: [
+        source([]),
+        source(
+          [
+            event(
+              "provider-busy",
+              "2026-05-11T09:00:00.000Z",
+              "2026-05-11T10:00:00.000Z",
+              {
+                status: "cancelled",
+                transparency: "transparent",
+                attendees: [
+                  {
+                    email: "private-guest@example.com",
+                    self: true,
+                    responseStatus: "declined",
+                  },
+                ],
+              },
+            ),
+          ],
+          { id: "private-guest", visibility: "busy_only" },
+        ),
+      ],
+      proposal: {
+        startISO: "2026-05-11T09:15:00.000Z",
+        endISO: "2026-05-11T09:45:00.000Z",
+      },
+      policy: { tentative: "ignore", allDay: "ignore" },
+    });
+
+    expect(evaluation).toMatchObject({
+      checkedEvents: 1,
+      ignoredEvents: 0,
+      conflicts: [
+        {
+          severity: "hard",
+          reasons: ["time_overlap", "guest_busy"],
+          eventB: {
+            id: "private-busy-1",
+            title: "Busy",
+            status: "busy",
+            attendees: [],
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(evaluation.conflicts)).not.toContain(
+      "private-guest@example.com",
+    );
   });
 
   it("reserves opaque all-day local dates across a 23-hour DST day", () => {
@@ -265,6 +322,20 @@ describe("evaluateCalendarAvailability", () => {
         ],
       }),
     ).toThrow(/explicit offset/i);
+  });
+
+  it("rejects a proposal outside the evaluated range", () => {
+    expect(() =>
+      evaluateCalendarAvailability({
+        range: UTC_DAY,
+        timeZone: "UTC",
+        sources: [source([])],
+        proposal: {
+          startISO: "2026-05-12T09:00:00.000Z",
+          endISO: "2026-05-12T10:00:00.000Z",
+        },
+      }),
+    ).toThrow(/entirely inside the availability range/i);
   });
 
   it("reports stale or failed source coverage without claiming the window is free", () => {

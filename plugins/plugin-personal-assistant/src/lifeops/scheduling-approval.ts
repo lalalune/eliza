@@ -78,9 +78,13 @@ function parseSchedulingCorrelation(
     "sourceUpdatedAt",
     label,
   );
-  if (!Number.isFinite(Date.parse(sourceUpdatedAt))) {
+  const sourceUpdatedAtMs = Date.parse(sourceUpdatedAt);
+  if (
+    !Number.isFinite(sourceUpdatedAtMs) ||
+    new Date(sourceUpdatedAtMs).toISOString() !== sourceUpdatedAt
+  ) {
     throw new Error(
-      `[SchedulingApproval] invalid ${label}.sourceUpdatedAt: expected ISO-8601 timestamp`,
+      `[SchedulingApproval] invalid ${label}.sourceUpdatedAt: expected canonical UTC ISO-8601 timestamp`,
     );
   }
   if (record.draftVersion !== 1) {
@@ -92,6 +96,20 @@ function parseSchedulingCorrelation(
   if (!/^[a-f0-9]{64}$/u.test(contentSha256)) {
     throw new Error(
       `[SchedulingApproval] invalid ${label}.contentSha256: expected lowercase SHA-256`,
+    );
+  }
+  if (record.messageKind === "opening" && proposalId !== null) {
+    throw new Error(
+      `[SchedulingApproval] invalid ${label}.proposalId: opening drafts cannot reference a proposal`,
+    );
+  }
+  if (
+    (record.messageKind === "proposal" ||
+      record.messageKind === "confirmation") &&
+    proposalId === null
+  ) {
+    throw new Error(
+      `[SchedulingApproval] invalid ${label}.proposalId: ${record.messageKind} drafts require a proposal`,
     );
   }
   return {
@@ -118,7 +136,16 @@ export function readSchedulingApprovalCorrelation(
   if (payload.scheduling === undefined) {
     return null;
   }
-  return parseSchedulingCorrelation(payload.scheduling, label);
+  const correlation = parseSchedulingCorrelation(payload.scheduling, label);
+  if (
+    (payload.action === "send_email") !==
+    (correlation.transportChannel === "email")
+  ) {
+    throw new Error(
+      `[SchedulingApproval] invalid ${label}.transportChannel: ${payload.action} does not match ${correlation.transportChannel}`,
+    );
+  }
+  return correlation;
 }
 
 function canonicalSchedulingEnvelope(

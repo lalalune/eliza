@@ -891,13 +891,22 @@ async function enqueueSchedulingDraft(args: {
     return { request: reusable, reused: true };
   }
 
+  const reason = [
+    `Review exact ${args.draft.messageKind} scheduling draft before sending.`,
+    `Channel: ${args.draft.transportChannel}`,
+    `To: ${args.draft.recipientName} (${args.draft.recipient})`,
+    ...(payload.action === "send_email" ? [`Subject: ${payload.subject}`] : []),
+    "Message:",
+    args.draft.body,
+    `Content SHA-256: ${scheduling.contentSha256}`,
+  ].join("\n");
   const request = await queue.enqueue({
     requestedBy: "PERSONAL_ASSISTANT",
     subjectUserId,
     action: payload.action,
     payload,
     channel: approvalChannelForDraft(args.draft),
-    reason: `Review ${args.draft.messageKind} scheduling draft to ${args.draft.recipientName} via ${args.draft.transportChannel}`,
+    reason,
     expiresAt: new Date(Date.now() + SCHEDULING_APPROVAL_EXPIRY_MS),
   });
   return { request, reused: false };

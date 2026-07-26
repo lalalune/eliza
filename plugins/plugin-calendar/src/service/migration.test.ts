@@ -58,6 +58,14 @@ describe("CalendarMigration", () => {
         /INSERT INTO .*app_calendar.*life_calendar_events/s.test(s),
       ),
     ).toBe(true);
+    expect(log.some((s) => s.includes("SELECT s.*"))).toBe(false);
+    expect(
+      log.some(
+        (s) =>
+          s.includes('"external_event_id"') &&
+          s.includes('s."external_event_id"'),
+      ),
+    ).toBe(true);
     // never touches the source
     expect(log.some((s) => /DROP|ALTER .*app_lifeops/.test(s))).toBe(false);
   });
@@ -93,6 +101,9 @@ describe("CalendarMigration", () => {
         statement.includes("calendar_sync_states_source_unique"),
       ),
     ).toBe(true);
+    expect(log.some((statement) => statement.includes("next_sync_token"))).toBe(
+      true,
+    );
     expect(
       log.some((statement) =>
         statement.includes(

@@ -237,6 +237,7 @@ function validateTimeZone(timeZone: string): void {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date(0));
   } catch (error) {
+    // error-policy:J2 preserve the Intl failure while adding calendar context.
     throw new ElizaError(`Invalid IANA timezone: ${timeZone}`, {
       code: "CALENDAR_AVAILABILITY_INVALID_TIMEZONE",
       context: { timeZone },
@@ -404,15 +405,19 @@ function normalizeSourceEvents(args: {
   const blockers: NormalizedAvailabilityEvent[] = [];
   let ignored = 0;
   for (const event of args.source.events) {
-    const status = normalizeStatus(event.status);
-    const attendees = normalizeAttendees(event.attendees);
-    const tentative = status === "tentative";
+    const privateBusy = args.source.visibility === "busy_only";
+    const status = privateBusy ? "busy" : normalizeStatus(event.status);
+    const attendees = privateBusy
+      ? { emails: [] as string[], selfDeclined: false }
+      : normalizeAttendees(event.attendees);
+    const tentative = !privateBusy && status === "tentative";
     if (
-      status === "cancelled" ||
-      attendees.selfDeclined ||
-      isTransparent(event.transparency) ||
-      (tentative && args.policy.tentative === "ignore") ||
-      (event.isAllDay === true && args.policy.allDay === "ignore")
+      !privateBusy &&
+      (status === "cancelled" ||
+        attendees.selfDeclined ||
+        isTransparent(event.transparency) ||
+        (tentative && args.policy.tentative === "ignore") ||
+        (event.isAllDay === true && args.policy.allDay === "ignore"))
     ) {
       ignored += 1;
       continue;
@@ -548,11 +553,16 @@ function conflictReasons(
 function severityFor(
   reasons: readonly CalendarConflictReason[],
 ): CalendarConflictSeverity {
-  return reasons.some((reason) =>
-    ["guest_busy", "travel", "shared_attendee"].includes(reason),
-  )
-    ? "hard"
-    : "warning";
+  if (
+    reasons.some((reason) =>
+      ["guest_busy", "travel", "shared_attendee"].includes(reason),
+    )
+  ) {
+    return "hard";
+  }
+  return reasons.includes("tentative") || reasons.includes("all_day")
+    ? "warning"
+    : "hard";
 }
 
 function suggestionFor(
@@ -687,6 +697,22 @@ export function evaluateCalendarAvailability(
   const range = normalizeRange(input.range);
   const policy = { ...DEFAULT_POLICY, ...input.policy };
   const completeness = evaluateCompleteness(input.sources);
+  const proposal = input.proposal ? proposalEvent(input.proposal) : null;
+  if (
+    proposal &&
+    (proposal.startMs < range.startMs || proposal.endMs > range.endMs)
+  ) {
+    return invalidAvailabilityInput(
+      "Proposal must fall entirely inside the availability range.",
+      {
+        range: range.normalized,
+        proposal: {
+          startISO: proposal.startISO,
+          endISO: proposal.endISO,
+        },
+      },
+    );
+  }
 
   const blockers: NormalizedAvailabilityEvent[] = [];
   let ignoredEvents = 0;
@@ -705,8 +731,7 @@ export function evaluateCalendarAvailability(
   const privateIds = privateEventIds(blockers);
 
   const conflicts: CalendarAvailabilityConflict[] = [];
-  if (input.proposal) {
-    const proposal = proposalEvent(input.proposal);
+  if (proposal) {
     for (const blocker of blockers) {
       if (intervalsOverlap(proposal, blocker)) {
         conflicts.push(buildConflict(proposal, blocker, privateIds));
