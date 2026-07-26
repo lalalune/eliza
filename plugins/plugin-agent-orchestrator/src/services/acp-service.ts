@@ -94,13 +94,13 @@ import {
   type SessionStoreBackend,
 } from "./session-store.js";
 import { buildSkillsManifest } from "./skill-manifest.js";
-import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
-  canonicalForwardedEnvKey,
   forwardableSubAgentEnv as applySubAgentEnvPolicy,
+  canonicalForwardedEnvKey,
   isCloudKeyForwardingOptIn,
   isDeniedSubAgentEnvKey,
 } from "./sub-agent-env-policy.js";
+import { writeWorkspaceIdentity } from "./sub-agent-identity.js";
 import {
   appendSubagentStdout,
   isSubagentStdoutLoggingEnabled,
@@ -4459,7 +4459,8 @@ export class AcpService extends Service {
     data?: unknown,
   ): void {
     const loggerFn = this.logger[level] as
-      ((message: string, data?: unknown) => void) | undefined;
+      | ((message: string, data?: unknown) => void)
+      | undefined;
     loggerFn?.call(this.logger, `[AcpService] ${message}`, data);
   }
 
