@@ -759,27 +759,29 @@ function collectBaseFindingsForChangedFiles(repoRoot, base, files) {
 function diffScopedCheck(result, repoRoot) {
   const baseRef = resolveBaseRef(repoRoot);
   if (!baseRef) {
+    const reason = "no base ref found";
     return {
       skipped: true,
-      reason: "no base ref found",
+      reason,
       baseRef: null,
       base: null,
       changedFiles: [],
       regressions: [],
-      failures: [],
+      failures: [`diff-scoped ratchet unavailable: ${reason}`],
     };
   }
 
   const base = mergeBaseWith(repoRoot, baseRef);
   if (!base) {
+    const reason = `could not compute merge-base with ${baseRef}`;
     return {
       skipped: true,
-      reason: `could not compute merge-base with ${baseRef}`,
+      reason,
       baseRef,
       base: null,
       changedFiles: [],
       regressions: [],
-      failures: [],
+      failures: [`diff-scoped ratchet unavailable: ${reason}`],
     };
   }
 

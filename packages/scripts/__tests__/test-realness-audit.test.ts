@@ -272,4 +272,29 @@ describe("test-realness-audit", () => {
     const stdout = new TextDecoder().decode(result.stdout);
     expect(JSON.parse(stdout).thresholds.focusedOnly).toBe(0);
   });
+
+  test("--check fails when the diff-scoped base ref is unavailable", () => {
+    const root = makeRepo();
+    write(
+      root,
+      "packages/sample/plain.test.ts",
+      "import { test } from 'vitest';\ntest('plain', () => {});\n",
+    );
+
+    const result = Bun.spawnSync([
+      "node",
+      SCRIPT_PATH,
+      "--repo-root",
+      root,
+      "--check",
+    ]);
+
+    expect(result.exitCode).toBe(1);
+    const stdout = new TextDecoder().decode(result.stdout);
+    const stderr = new TextDecoder().decode(result.stderr);
+    expect(stdout).toContain("diffScoped=skipped reason=no base ref found");
+    expect(stderr).toContain(
+      "FAIL diff-scoped ratchet unavailable: no base ref found",
+    );
+  });
 });
