@@ -1,3 +1,0 @@
-environment           = "production"
-cloudflare_account_id = "<cloudflare-account-id>"
-cloudflare_zone_id    = "<zone-id-for-elizacloud.ai>"

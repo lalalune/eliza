@@ -1,9 +1,0 @@
-// Handles webhook cloud API eliza app webhook telegram route traffic with signature or internal auth checks.
-import { Hono } from "hono";
-import type { AppEnv } from "@/types/cloud-worker-env";
-import { forwardToWebhookGateway } from "../_forward";
-
-const app = new Hono<AppEnv>();
-app.all("/", (c) => forwardToWebhookGateway(c, "telegram"));
-app.all("/*", (c) => forwardToWebhookGateway(c, "telegram"));
-export default app;
