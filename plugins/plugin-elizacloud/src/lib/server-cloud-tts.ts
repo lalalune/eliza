@@ -275,6 +275,7 @@ export async function handleCloudTtsPreviewRoute(
         lastStatus === 401 ||
         lastStatus === 402 ||
         lastStatus === 403 ||
+        lastStatus === 409 ||
         lastStatus === 429
       ) {
         forwardCloudTtsUpstreamError(res, lastStatus, lastDetails);

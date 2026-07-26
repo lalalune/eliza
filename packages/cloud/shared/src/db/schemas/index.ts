@@ -107,5 +107,6 @@ export * from "./vertex-model-assignments";
 export * from "./vertex-tuned-models";
 export * from "./vertex-tuning-jobs";
 export * from "./voice-imprints";
+export * from "./voice-tts-operations";
 export * from "./web-push-subscriptions";
 export * from "./webhook-events";

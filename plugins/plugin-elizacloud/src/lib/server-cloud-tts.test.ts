@@ -101,14 +101,14 @@ describe("handleCloudTtsPreviewRoute (/api/tts/cloud proxy)", () => {
     const { res, state } = fakeRes();
     await handleCloudTtsPreviewRoute(
       fakeReq(JSON.stringify({ text: "bill me once" }), {
-        "idempotency-key": "utt-abc",
+        "idempotency-key": "utterance-abc",
       }),
       res,
     );
 
     expect(state.statusCode).toBe(200);
     expect(upstream.length).toBeGreaterThanOrEqual(1);
-    expect(upstream[0].headers["Idempotency-Key"]).toBe("utt-abc");
+    expect(upstream[0].headers["Idempotency-Key"]).toBe("utterance-abc");
     expect(upstream[0].body).toMatchObject({ text: "bill me once" });
   });
 
@@ -164,6 +164,29 @@ describe("handleCloudTtsPreviewRoute (/api/tts/cloud proxy)", () => {
     expect(state.statusCode).toBe(402);
     expect(JSON.parse(String(state.body))).toMatchObject({
       error: "Insufficient credits",
+    });
+  });
+
+  test("preserves the cloud operation's in-progress status for client retry", async () => {
+    upstreamResponse = () =>
+      new Response(
+        JSON.stringify({
+          error: "TTS request is still processing",
+          code: "idempotency_in_progress",
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    const { res, state } = fakeRes();
+    await handleCloudTtsPreviewRoute(
+      fakeReq(JSON.stringify({ text: "hi" }), {
+        "idempotency-key": "utterance-abc",
+      }),
+      res,
+    );
+
+    expect(state.statusCode).toBe(409);
+    expect(JSON.parse(String(state.body))).toMatchObject({
+      code: "idempotency_in_progress",
     });
   });
 });

@@ -1621,11 +1621,10 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
          * path, so chat fell back to browser (Edge) TTS. If cloud rejects
          * (no key), fall back to the upstream ElevenLabs proxy.
          */
-        // #16425: ONE key per logical utterance across BOTH proxy legs (the
-        // cloud proxy and its direct-ElevenLabs-proxy retry below re-POST the
-        // same utterance), so upstream billing can replay the committed
-        // reservation instead of charging the retry as a new operation.
-        const proxyUtteranceKey = crypto.randomUUID();
+        const proxyUtteranceKey = task.operationIdempotencyKey;
+        if (!proxyUtteranceKey) {
+          throw new Error("Queued TTS task is missing its operation key");
+        }
         const makeProxyRequestInit = (): RequestInit => {
           const dbg = task.debugUtteranceContext;
           return {
@@ -1956,12 +1955,10 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
                   ),
                 }
               : {};
-          // #16425: ONE key per logical utterance, sent on BOTH the direct
-          // request and the proxy fallback. The cloud route keys its credit
-          // reservation on it, so a fallback retry after an ambiguous network
-          // outcome replays the committed reservation instead of billing the
-          // same utterance twice. (Header is in CORS_ALLOW_HEADER_NAMES.)
-          const ttsUtteranceKey = crypto.randomUUID();
+          const ttsUtteranceKey = task.operationIdempotencyKey;
+          if (!ttsUtteranceKey) {
+            throw new Error("Queued TTS task is missing its operation key");
+          }
           const fetchViaProxy = (url: string, bearer: string | null) =>
             fetchWithCsrf(
               url,
@@ -2821,6 +2818,8 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       queueRef.current.push({
         ...task,
         text: speakable,
+        operationIdempotencyKey:
+          task.operationIdempotencyKey ?? crypto.randomUUID(),
         telemetry: task.telemetry
           ? {
               ...task.telemetry,

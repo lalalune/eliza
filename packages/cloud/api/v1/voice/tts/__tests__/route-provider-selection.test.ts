@@ -21,6 +21,7 @@ const requireAuthOrApiKeyWithOrg = mock(async () => ({
 }));
 const assertSafeForPublicUse = mock(async () => undefined);
 const reserveCredits = mock(async () => ({
+  reservationTransactionId: "reservation-1",
   reconcile: async () => undefined,
 }));
 const billUsage = mock(async (..._args: unknown[]) => ({
@@ -28,7 +29,46 @@ const billUsage = mock(async (..._args: unknown[]) => ({
   baseTotalCost: 0.001,
   platformMarkup: 0,
 }));
-const createUsage = mock(async (..._args: unknown[]) => undefined);
+const createUsage = mock(async (..._args: unknown[]) => ({ id: "usage-1" }));
+type TestTtsClaim =
+  | {
+      kind: "claimed" | "conflict" | "pending";
+      operation: { id: string };
+      keyHashPrefix: string;
+    }
+  | {
+      kind: "completed";
+      operation: { id: string };
+      keyHashPrefix: string;
+      result: {
+        bytes: Uint8Array;
+        contentType: string;
+        headers: Record<string, string>;
+      };
+    }
+  | {
+      kind: "failed";
+      operation: { id: string };
+      keyHashPrefix: string;
+      status: number;
+      body: Record<string, unknown>;
+    };
+let ttsClaimResult: TestTtsClaim = {
+  kind: "claimed" as const,
+  operation: { id: "tts-operation-1" },
+  keyHashPrefix: "0123456789ab",
+};
+let ttsWaitResult: TestTtsClaim = {
+  kind: "pending" as const,
+  operation: { id: "tts-operation-1" },
+  keyHashPrefix: "0123456789ab",
+};
+const claimTtsOperation = mock(async () => ttsClaimResult);
+const waitForTtsOperation = mock(async () => ttsWaitResult);
+const attachTtsReservation = mock(async () => undefined);
+const stageTtsResult = mock(async () => undefined);
+const completeTtsOperation = mock(async () => undefined);
+const failTtsOperation = mock(async () => undefined);
 const elevenLabsTextToSpeech = mock(
   async () =>
     new ReadableStream<Uint8Array>({
@@ -178,6 +218,23 @@ mock.module("@/lib/services/usage", () => ({
   usageService: { create: createUsage },
 }));
 
+mock.module("@/lib/services/voice-tts-operations", () => {
+  class InvalidVoiceTtsIdempotencyKeyError extends Error {}
+  return {
+    InvalidVoiceTtsIdempotencyKeyError,
+    normalizeVoiceTtsIdempotencyKey: (value: string | null) => value,
+    buildCanonicalVoiceTtsRequestHash: async () => "request-hash",
+    voiceTtsOperationsService: {
+      claim: claimTtsOperation,
+      waitForTerminal: waitForTtsOperation,
+      attachReservation: attachTtsReservation,
+      stageResult: stageTtsResult,
+      complete: completeTtsOperation,
+      fail: failTtsOperation,
+    },
+  };
+});
+
 mock.module("@/lib/pricing-constants", () => ({
   CUSTOM_VOICE_TTS_MARKUP: 1.2,
 }));
@@ -206,6 +263,16 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  ttsClaimResult = {
+    kind: "claimed",
+    operation: { id: "tts-operation-1" },
+    keyHashPrefix: "0123456789ab",
+  };
+  ttsWaitResult = {
+    kind: "pending",
+    operation: { id: "tts-operation-1" },
+    keyHashPrefix: "0123456789ab",
+  };
   allowKokoroFetch = false;
   cartesiaStatus = 200;
   cachedVoiceResponse = null;
@@ -214,6 +281,12 @@ beforeEach(() => {
   reserveCredits.mockClear();
   billUsage.mockClear();
   createUsage.mockClear();
+  claimTtsOperation.mockClear();
+  waitForTtsOperation.mockClear();
+  attachTtsReservation.mockClear();
+  stageTtsResult.mockClear();
+  completeTtsOperation.mockClear();
+  failTtsOperation.mockClear();
   elevenLabsTextToSpeech.mockClear();
 });
 
@@ -454,24 +527,114 @@ describe("POST /api/v1/voice/tts provider selection", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  // #16425: the client mints one Idempotency-Key per logical utterance (sent
-  // on both the direct request and the proxy fallback); the paid path must
-  // thread it into the credit reservation so a fallback retry REPLAYS the
-  // committed reservation instead of charging the utterance twice.
-  test("threads the Idempotency-Key header into the credit reservation", async () => {
+  test("claims before synthesis and reserves with the server operation id", async () => {
     const response = await postTts(
       { text: "Bill me once.", voiceId: "custom-elevenlabs-voice" },
-      {},
-      { "Idempotency-Key": "utt-abc" },
+      { BLOB: {} },
+      { "Idempotency-Key": "utterance-abc" },
     );
     expect(response.status).toBe(200);
+    expect(claimTtsOperation).toHaveBeenCalledTimes(1);
     expect(reserveCredits).toHaveBeenCalledTimes(1);
     const keyedArgs = reserveCredits.mock.calls[0] as unknown as
       | [Record<string, unknown>]
       | undefined;
     expect(keyedArgs?.[0]).toMatchObject({
-      idempotencyKey: "utt-abc",
+      idempotencyKey: "tts-operation-1",
     });
+    expect(attachTtsReservation).toHaveBeenCalledWith(
+      "tts-operation-1",
+      "reservation-1",
+    );
+    expect(stageTtsResult).toHaveBeenCalledTimes(1);
+    expect(completeTtsOperation).toHaveBeenCalledWith({
+      operationId: "tts-operation-1",
+      usageRecordId: "usage-1",
+    });
+  });
+
+  test("replays completed audio without safety, provider, or billing work", async () => {
+    ttsClaimResult = {
+      kind: "completed",
+      operation: { id: "tts-operation-1" },
+      keyHashPrefix: "0123456789ab",
+      result: {
+        bytes: new Uint8Array([82, 69, 80, 76, 65, 89]),
+        contentType: "audio/mpeg",
+        headers: { "X-Eliza-TTS-Provider": "elevenlabs" },
+      },
+    };
+
+    const response = await postTts(
+      { text: "Bill me once.", voiceId: "custom-elevenlabs-voice" },
+      { BLOB: {} },
+      { "Idempotency-Key": "utterance-abc" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-TTS-Idempotent-Replay")).toBe("true");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+      new Uint8Array([82, 69, 80, 76, 65, 89]),
+    );
+    expect(assertSafeForPublicUse).not.toHaveBeenCalled();
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(elevenLabsTextToSpeech).not.toHaveBeenCalled();
+    expect(billUsage).not.toHaveBeenCalled();
+    expect(createUsage).not.toHaveBeenCalled();
+  });
+
+  test("rejects a key bound to another payload before external work", async () => {
+    ttsClaimResult = {
+      kind: "conflict",
+      operation: { id: "tts-operation-1" },
+      keyHashPrefix: "0123456789ab",
+    };
+
+    const response = await postTts(
+      { text: "Different text.", voiceId: "custom-elevenlabs-voice" },
+      { BLOB: {} },
+      { "Idempotency-Key": "utterance-abc" },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "idempotency_key_conflict",
+    });
+    expect(assertSafeForPublicUse).not.toHaveBeenCalled();
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(elevenLabsTextToSpeech).not.toHaveBeenCalled();
+  });
+
+  test("waits for an in-flight duplicate and returns the winner's audio", async () => {
+    ttsClaimResult = {
+      kind: "pending",
+      operation: { id: "tts-operation-1" },
+      keyHashPrefix: "0123456789ab",
+    };
+    ttsWaitResult = {
+      kind: "completed",
+      operation: { id: "tts-operation-1" },
+      keyHashPrefix: "0123456789ab",
+      result: {
+        bytes: new Uint8Array([87, 73, 78]),
+        contentType: "audio/mpeg",
+        headers: {},
+      },
+    };
+
+    const response = await postTts(
+      { text: "Bill me once.", voiceId: "custom-elevenlabs-voice" },
+      { BLOB: {} },
+      { "Idempotency-Key": "utterance-abc" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(waitForTtsOperation).toHaveBeenCalledTimes(1);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+      new Uint8Array([87, 73, 78]),
+    );
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(elevenLabsTextToSpeech).not.toHaveBeenCalled();
   });
 
   test("without the header the reservation stays unkeyed (behavior unchanged)", async () => {
