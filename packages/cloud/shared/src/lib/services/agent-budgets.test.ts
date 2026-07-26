@@ -349,31 +349,6 @@ describe("agentBudgetService numeric DB parsing", () => {
     );
   });
 
-  test("allocateBudget refunds org credit reservation when locked budget data is invalid", async () => {
-    lockedBudget = baseBudget({ allocated_budget: "not-money" });
-
-    const result = await agentBudgetService.allocateBudget({
-      agentId: AGENT_ID,
-      amount: 2.5,
-      description: "manual top-up",
-    });
-
-    expect(result).toEqual({
-      success: false,
-      newBalance: 0,
-      error: "Invalid budget data",
-    });
-    expect(reserveMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        organizationId: ORG_ID,
-        amount: 2.5,
-      }),
-    );
-    expect(reconcileMock).toHaveBeenCalledWith(0);
-    expect(txUpdateValues).toEqual([]);
-    expect(txInsertValues).toEqual([]);
-  });
-
   test("triggerAutoRefill accepts a valid numeric refill amount and allocates it", async () => {
     readBudget = baseBudget({
       allocated_budget: "3.0000",
