@@ -1,15 +1,22 @@
 // @vitest-environment jsdom
 /**
  * Renders PermissionCard in jsdom against a stub permissions registry to cover
- * each permission state (not-determined/granted/denied/restricted) and its CTA:
- * request, open-settings, coming-soon, unavailable, and auto-collapse on grant.
+ * each permission state (including OS-private choices) and its CTA, plus the
+ * visible retry contract for failed initial probes, requests, and rechecks.
  */
 import type {
   IPermissionsRegistry,
   PermissionId,
   PermissionState,
 } from "@elizaos/shared";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PermissionCard } from "./permission-card";
@@ -97,7 +104,10 @@ describe("PermissionCard", () => {
       />,
     );
 
-    const btn = screen.getByTestId("permission-card-primary");
+    const btn = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
     fireEvent.click(btn);
     // findByTestId waits for the granted confirmation to appear after the
     // async request resolves and the component re-renders.
@@ -153,6 +163,156 @@ describe("PermissionCard", () => {
     expect(onOpenSettings).toHaveBeenCalledWith("screentime");
   });
 
+  it("renders a retryable settings error when native settings reports opened false", async () => {
+    const onOpenSettings = vi.fn(async () => ({
+      opened: false,
+      reason: "No settings route is available.",
+    }));
+    render(
+      <PermissionCard
+        {...baseProps}
+        permission="screentime"
+        initialState={{
+          id: "screentime",
+          status: "denied",
+          lastChecked: 0,
+          canRequest: false,
+          platform: "ios",
+        }}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("permission-card-primary"));
+
+    expect(
+      (await screen.findByTestId("permission-card-error")).textContent,
+    ).toContain("could not be opened");
+    expect(screen.getByTestId("permission-card-primary").textContent).toContain(
+      "Open System Settings",
+    );
+  });
+
+  it("serializes settings navigation so rapid clicks cannot open two native sheets", async () => {
+    let finishOpen: ((result: { opened: boolean }) => void) | undefined;
+    const onOpenSettings = vi.fn(
+      () =>
+        new Promise<{ opened: boolean }>((resolve) => {
+          finishOpen = resolve;
+        }),
+    );
+    render(
+      <PermissionCard
+        {...baseProps}
+        initialState={{
+          id: "reminders",
+          status: "denied",
+          lastChecked: 0,
+          canRequest: false,
+          platform: "ios",
+        }}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+
+    const primary = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    fireEvent.click(primary);
+    fireEvent.click(primary);
+
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    expect(primary.disabled).toBe(true);
+    await act(async () => {
+      finishOpen?.({ opened: true });
+    });
+    expect(primary.disabled).toBe(false);
+  });
+
+  it("does not admit Grant while a deferred permission check owns the card", async () => {
+    const notDetermined = state({
+      id: "reminders",
+      status: "not-determined",
+      lastChecked: 0,
+      canRequest: true,
+    });
+    const granted = state({
+      id: "reminders",
+      status: "granted",
+      lastChecked: 1,
+      canRequest: false,
+    });
+    let finishCheck: ((next: PermissionState) => void) | undefined;
+    const check = vi
+      .fn<IPermissionsRegistry["check"]>()
+      .mockResolvedValueOnce(notDetermined)
+      .mockImplementationOnce(
+        () =>
+          new Promise<PermissionState>((resolve) => {
+            finishCheck = resolve;
+          }),
+      );
+    const request = vi.fn(async () => granted);
+    const registry = makeRegistry(notDetermined, { check, request });
+    render(<PermissionCard {...baseProps} registry={registry} />);
+
+    const primary = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(primary.disabled).toBe(false));
+    fireEvent.click(screen.getByTestId("permission-card-check-again"));
+    expect(primary.disabled).toBe(true);
+
+    fireEvent.click(primary);
+    expect(request).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finishCheck?.(notDetermined);
+    });
+    await waitFor(() => expect(primary.disabled).toBe(false));
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+  });
+
+  it("renders private Health choices as settings-managed and never requests again", async () => {
+    const opaqueState: PermissionState = state({
+      id: "health",
+      status: "opaque",
+      lastChecked: 1,
+      canRequest: true,
+      platform: "ios",
+    });
+    const request = vi.fn(async () => opaqueState);
+    const registry = makeRegistry(opaqueState, { request });
+    const onOpenSettings = vi.fn();
+
+    render(
+      <PermissionCard
+        {...baseProps}
+        permission="health"
+        registry={registry}
+        initialState={opaqueState}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+
+    expect(screen.getByText("Choices set")).toBeTruthy();
+    expect(
+      screen.getByText(/iOS keeps individual HealthKit read choices private/),
+    ).toBeTruthy();
+    const button = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    expect(button.textContent).toContain("Manage access");
+    await waitFor(() => expect(button.disabled).toBe(false));
+
+    fireEvent.click(button);
+
+    await waitFor(() => expect(onOpenSettings).toHaveBeenCalledWith("health"));
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("renders disabled 'Coming soon' when restricted by entitlement", () => {
     render(
       <PermissionCard
@@ -173,6 +333,9 @@ describe("PermissionCard", () => {
     ) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.textContent).toContain("Coming soon");
+    expect(
+      screen.getByText(/requires an app entitlement that is not available/),
+    ).toBeTruthy();
   });
 
   it("renders unavailable for platform-unsupported restricted permissions", () => {
@@ -195,6 +358,39 @@ describe("PermissionCard", () => {
     ) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.textContent).toContain("Unavailable on this platform");
+    expect(
+      screen.getByText("Apple Health is not available on this platform."),
+    ).toBeTruthy();
+  });
+
+  it("renders an OS-policy restriction as settings-managed, not unavailable", () => {
+    const onOpenSettings = vi.fn();
+    render(
+      <PermissionCard
+        {...baseProps}
+        permission="health"
+        initialState={{
+          id: "health",
+          status: "restricted",
+          restrictedReason: "os_policy",
+          lastChecked: 0,
+          canRequest: false,
+          platform: "ios",
+        }}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+
+    const button = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toContain("Open System Settings");
+    expect(
+      screen.getByText(/controlled by the current OS or administrator policy/),
+    ).toBeTruthy();
+    fireEvent.click(button);
+    expect(onOpenSettings).toHaveBeenCalledWith("health");
   });
 
   it("auto-collapses to 'Access granted' when initial state is granted", () => {
@@ -231,6 +427,48 @@ describe("PermissionCard", () => {
     );
     fireEvent.click(screen.getByTestId("permission-card-dismiss"));
     expect(onDismiss).toHaveBeenCalled();
+    expect(screen.queryByTestId("permission-card")).toBeNull();
+  });
+
+  it("does not report a late grant after the user dismisses the card", async () => {
+    const notDetermined = state({
+      id: "reminders",
+      status: "not-determined",
+      lastChecked: 0,
+      canRequest: true,
+    });
+    const granted = state({
+      id: "reminders",
+      status: "granted",
+      lastChecked: 1,
+      canRequest: false,
+    });
+    let finishRequest: ((result: PermissionState) => void) | undefined;
+    const request = vi.fn(
+      () =>
+        new Promise<PermissionState>((resolve) => {
+          finishRequest = resolve;
+        }),
+    );
+    const registry = makeRegistry(notDetermined, { request });
+    const onGranted = vi.fn();
+    render(
+      <PermissionCard
+        {...baseProps}
+        registry={registry}
+        onGranted={onGranted}
+      />,
+    );
+    await waitFor(() => expect(registry.check).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByTestId("permission-card-primary"));
+    await waitFor(() => expect(request).toHaveBeenCalled());
+    fireEvent.click(screen.getByTestId("permission-card-dismiss"));
+    await act(async () => {
+      finishRequest?.(granted);
+    });
+
+    expect(onGranted).not.toHaveBeenCalled();
     expect(screen.queryByTestId("permission-card")).toBeNull();
   });
 
@@ -295,5 +533,99 @@ describe("PermissionCard", () => {
       />,
     );
     expect(screen.queryByTestId("permission-card-fallback")).toBeNull();
+  });
+
+  it("surfaces an initial probe failure and clears it after a successful retry", async () => {
+    const notDetermined = state({
+      id: "reminders",
+      status: "not-determined",
+      lastChecked: 0,
+      canRequest: true,
+    });
+    const check = vi
+      .fn<IPermissionsRegistry["check"]>()
+      .mockRejectedValueOnce(new Error("native probe failed"))
+      .mockResolvedValue(notDetermined);
+    const registry = makeRegistry(notDetermined, { check });
+
+    render(<PermissionCard {...baseProps} registry={registry} />);
+
+    expect(
+      (await screen.findByTestId("permission-card-error")).textContent,
+    ).toContain("could not be read");
+    expect(screen.getByTestId("permission-card-primary").textContent).toContain(
+      "Retry check",
+    );
+    fireEvent.click(screen.getByTestId("permission-card-primary"));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("permission-card-error")).toBeNull(),
+    );
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a failed request and lets the user retry the request", async () => {
+    const notDetermined = state({
+      id: "reminders",
+      status: "not-determined",
+      lastChecked: 0,
+      canRequest: true,
+    });
+    const granted = state({
+      id: "reminders",
+      status: "granted",
+      lastChecked: 2,
+      canRequest: false,
+    });
+    const request = vi
+      .fn<IPermissionsRegistry["request"]>()
+      .mockRejectedValueOnce(new Error("request transport failed"))
+      .mockResolvedValue(granted);
+    const registry = makeRegistry(notDetermined, { request });
+
+    render(<PermissionCard {...baseProps} registry={registry} />);
+
+    const primary = screen.getByTestId(
+      "permission-card-primary",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(primary.disabled).toBe(false));
+    fireEvent.click(primary);
+    expect(
+      (await screen.findByTestId("permission-card-error")).textContent,
+    ).toContain("request failed");
+    await waitFor(() => expect(primary.disabled).toBe(false));
+    fireEvent.click(primary);
+
+    await screen.findByTestId("permission-card-granted");
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a failed recheck and preserves the same retry control", async () => {
+    const notDetermined = state({
+      id: "reminders",
+      status: "not-determined",
+      lastChecked: 0,
+      canRequest: true,
+    });
+    const check = vi
+      .fn<IPermissionsRegistry["check"]>()
+      .mockResolvedValueOnce(notDetermined)
+      .mockRejectedValueOnce(new Error("recheck failed"))
+      .mockResolvedValue(notDetermined);
+    const registry = makeRegistry(notDetermined, { check });
+
+    render(<PermissionCard {...baseProps} registry={registry} />);
+    await waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId("permission-card-check-again"));
+    expect(
+      (await screen.findByTestId("permission-card-error")).textContent,
+    ).toContain("could not be read");
+    fireEvent.click(screen.getByTestId("permission-card-primary"));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("permission-card-error")).toBeNull(),
+    );
+    expect(check).toHaveBeenCalledTimes(3);
   });
 });

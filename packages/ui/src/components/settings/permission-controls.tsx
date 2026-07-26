@@ -88,6 +88,7 @@ export function PermissionRow({
   canRequest,
   onRequest,
   onOpenSettings,
+  disabled = false,
   isShell,
   shellEnabled,
   onToggleShell,
@@ -99,6 +100,7 @@ export function PermissionRow({
   canRequest: boolean;
   onRequest: () => void;
   onOpenSettings: () => void;
+  disabled?: boolean;
   isShell: boolean;
   shellEnabled: boolean;
   onToggleShell?: (enabled: boolean) => void;
@@ -124,9 +126,10 @@ export function PermissionRow({
       group: "permissions",
       status: shellEnabled ? "on" : "off",
       getValue: () => shellEnabled,
-      onActivate: onToggleShell
-        ? () => onToggleShell(!shellEnabled)
-        : undefined,
+      onActivate:
+        onToggleShell && !disabled
+          ? () => onToggleShell(!shellEnabled)
+          : undefined,
     });
   const { ref: actionRef, agentProps: actionAgentProps } =
     useAgentElement<HTMLButtonElement>({
@@ -134,18 +137,20 @@ export function PermissionRow({
       role: "button",
       label: action ? `${action.ariaLabelPrefix} ${name}` : `Grant ${name}`,
       group: "permissions",
-      onActivate: action
-        ? action.type === "request"
-          ? onRequest
-          : onOpenSettings
-        : undefined,
+      onActivate:
+        action && !disabled
+          ? action.type === "request"
+            ? onRequest
+            : onOpenSettings
+          : undefined,
     });
 
   const control = showShellToggle ? (
     <Switch
       ref={shellRef}
       checked={shellEnabled}
-      onCheckedChange={onToggleShell}
+      onCheckedChange={disabled ? undefined : onToggleShell}
+      disabled={disabled}
       title={
         shellEnabled
           ? translateWithFallback(
@@ -168,6 +173,7 @@ export function PermissionRow({
       size="sm"
       className="min-h-11 rounded-sm px-3 text-xs font-semibold"
       onClick={action.type === "request" ? onRequest : onOpenSettings}
+      disabled={disabled}
       aria-label={`${action.ariaLabelPrefix} ${name}`}
       {...actionAgentProps}
     >

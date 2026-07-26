@@ -8,6 +8,7 @@ import type {
   AppleCalendarPermissionStatus,
   AppleCalendarPluginLike,
   ContactsPluginLike,
+  MobileSignalsOpenSettingsResult,
   MobileSignalsPermissionStatus,
   MobileSignalsPluginLike,
   PushNotificationPermissionStatus,
@@ -15,8 +16,11 @@ import type {
   SystemPluginLike,
 } from "../bridge/native-plugins";
 import {
+  checkMobileSignalsPermissions,
   createMobileSignalsPermissionsRegistry,
   openMobilePermissionSettings,
+  openMobileSignalsSettings,
+  requestMobileSignalsPermissions,
 } from "./mobile-permissions-client";
 
 function permissions(
@@ -132,6 +136,10 @@ function pushNotificationsPlugin(
   };
 }
 
+function deferred<T>() {
+  return Promise.withResolvers<T>();
+}
+
 describe("createMobileSignalsPermissionsRegistry", () => {
   it("maps HealthKit/Health Connect status into canonical health permission", async () => {
     const native = plugin(
@@ -151,6 +159,81 @@ describe("createMobileSignalsPermissionsRegistry", () => {
       canRequest: false,
     });
     expect(native.checkPermissions).toHaveBeenCalled();
+  });
+
+  it("does not claim iOS HealthKit read access after the consent sheet is determined", async () => {
+    const native = plugin(
+      permissions({
+        status: "determined",
+        canRequest: false,
+        permissions: { sleep: false, biometrics: false },
+        reason:
+          "HealthKit read choices are private; data availability confirms access.",
+      }),
+    );
+    const registry = createMobileSignalsPermissionsRegistry(native);
+
+    const state = await registry.check("health");
+
+    expect(state).toMatchObject({
+      id: "health",
+      status: "opaque",
+      canRequest: false,
+      reason:
+        "HealthKit read choices are private; data availability confirms access.",
+    });
+    expect(state).not.toHaveProperty("restrictedReason");
+  });
+
+  it("opens Health settings instead of re-prompting after choices are opaque", async () => {
+    const native = plugin(
+      permissions({
+        status: "determined",
+        canRequest: false,
+        permissions: { sleep: false, biometrics: false },
+      }),
+    );
+    const registry = createMobileSignalsPermissionsRegistry(native);
+
+    const state = await registry.request("health", {
+      reason: "Review sleep access.",
+      feature: { app: "lifeops", action: "sleep.read" },
+    });
+
+    expect(native.requestPermissions).not.toHaveBeenCalled();
+    expect(native.openSettings).toHaveBeenCalledWith({ target: "health" });
+    expect(state).toMatchObject({
+      status: "opaque",
+      canRequest: false,
+    });
+  });
+
+  it("rejects a fulfilled settings result that did not open", async () => {
+    const native = plugin(
+      permissions({
+        status: "determined",
+        canRequest: false,
+      }),
+    );
+    const notOpened: MobileSignalsOpenSettingsResult = {
+      opened: false,
+      target: "health",
+      actualTarget: "app",
+      reason: "iOS declined to open Settings.",
+    };
+    native.openSettings = vi.fn(async () => notOpened);
+    const registry = createMobileSignalsPermissionsRegistry(native);
+
+    await expect(
+      registry.request("health", {
+        reason: "Review sleep access.",
+        feature: { app: "lifeops", action: "sleep.read" },
+      }),
+    ).rejects.toMatchObject({
+      code: "MOBILE_PERMISSION_SETTINGS_OPEN_FAILED",
+      message: "iOS declined to open Settings.",
+    });
+    expect(native.requestPermissions).not.toHaveBeenCalled();
   });
 
   it("requests only mobile health when the health card primary button is used", async () => {
@@ -415,6 +498,69 @@ describe("createMobileSignalsPermissionsRegistry", () => {
       status: "not-determined",
       canRequest: true,
     });
+  });
+
+  it("serializes OS mutations across independently constructed registries", async () => {
+    const native = plugin();
+    const requestResult = deferred<MobileSignalsPermissionStatus>();
+    native.requestPermissions = vi.fn(() => requestResult.promise);
+    const firstRegistry = createMobileSignalsPermissionsRegistry(native);
+    const secondRegistry = createMobileSignalsPermissionsRegistry(native);
+    const options = {
+      reason: "Read sleep data.",
+      feature: { app: "lifeops", action: "sleep.read" },
+    };
+
+    const first = firstRegistry.request("health", options);
+    await vi.waitFor(() =>
+      expect(native.requestPermissions).toHaveBeenCalledTimes(1),
+    );
+
+    await expect(
+      secondRegistry.request("health", options),
+    ).rejects.toMatchObject({
+      code: "MOBILE_PERMISSION_OPERATION_IN_PROGRESS",
+      context: {
+        permissionId: "health",
+        operation: "request",
+        activePermissionId: "health",
+        activeOperation: "request",
+      },
+    });
+    await expect(
+      requestMobileSignalsPermissions("health", "health", native),
+    ).rejects.toMatchObject({
+      code: "MOBILE_PERMISSION_OPERATION_IN_PROGRESS",
+    });
+    await expect(
+      openMobileSignalsSettings("health", "health", native),
+    ).rejects.toMatchObject({
+      code: "MOBILE_PERMISSION_OPERATION_IN_PROGRESS",
+    });
+    let queuedCheckSettled = false;
+    const queuedCheck = checkMobileSignalsPermissions(native).then((state) => {
+      queuedCheckSettled = true;
+      return state;
+    });
+    await Promise.resolve();
+    expect(queuedCheckSettled).toBe(false);
+    expect(native.checkPermissions).toHaveBeenCalledTimes(1);
+    expect(native.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(native.openSettings).not.toHaveBeenCalled();
+
+    requestResult.resolve(
+      permissions({
+        status: "granted",
+        canRequest: false,
+        permissions: { sleep: true, biometrics: true },
+      }),
+    );
+    await first;
+    await queuedCheck;
+    expect(native.checkPermissions).toHaveBeenCalledTimes(3);
+    await expect(
+      openMobilePermissionSettings("health", native),
+    ).resolves.toMatchObject({ opened: true });
   });
 });
 

@@ -2,7 +2,7 @@
  * Storybook states for the post-login PermissionPrimingModal, driven by injected
  * controller stubs: the per-permission soft-ask cards (microphone / location /
  * notifications), the requesting state, the two denied variants (retryable vs
- * settings-only), and the initial loading state.
+ * settings-only), explicit probe failure, and the initial loading state.
  */
 import type { PermissionId } from "@elizaos/shared/contracts/permissions";
 import type { Meta, StoryObj } from "@storybook/react";
@@ -11,6 +11,7 @@ import { PermissionPrimingModal } from "./PermissionPrimingModal";
 import type {
   PermissionPrimingController,
   PrimingItem,
+  PrimingItemOperation,
   PrimingItemStatus,
 } from "./use-permission-priming";
 
@@ -34,8 +35,16 @@ function item(
   id: PermissionId,
   status: PrimingItemStatus,
   canRequest = false,
+  error?: PrimingItemOperation,
 ): PrimingItem {
-  return { id, status, canRequest, requesting: false, resolved: false };
+  return {
+    id,
+    status,
+    canRequest,
+    requesting: false,
+    resolved: false,
+    ...(error ? { error: { operation: error } } : {}),
+  };
 }
 
 function controller(
@@ -128,6 +137,15 @@ export const DeniedSettingsOnly: Story = {
     open: true,
     onComplete: noop,
     controllerOverride: controller(item("microphone", "denied", false)),
+  },
+};
+
+export const ProbeError: Story = {
+  args: {
+    ids: ["microphone"],
+    open: true,
+    onComplete: noop,
+    controllerOverride: controller(item("microphone", null, false, "check")),
   },
 };
 

@@ -280,7 +280,16 @@ export interface AgentPluginLike extends NativePlugin {
 }
 
 export interface MobileSignalsPermissionStatus {
-  status: "granted" | "denied" | "not-determined" | "not-applicable";
+  /**
+   * iOS reports `determined` when the HealthKit sheet no longer needs to be
+   * shown because individual read grants are deliberately hidden from apps.
+   */
+  status:
+    | "granted"
+    | "denied"
+    | "determined"
+    | "not-determined"
+    | "not-applicable";
   canRequest: boolean;
   reason?: string;
   screenTime: MobileSignalsScreenTimeStatus;
@@ -615,6 +624,7 @@ export interface MobileSignalsPluginLike extends NativePlugin {
     healthSnapshot: MobileSignalsHealthSnapshot | null;
   }>;
   stopMonitoring(): Promise<{ stopped: boolean }>;
+  releaseSignalListeners(): Promise<{ removed: boolean }>;
   getSnapshot(): Promise<{
     supported: boolean;
     snapshot: MobileSignalsSnapshot | null;

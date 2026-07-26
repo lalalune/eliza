@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
 //
 // PermissionPrimingModal rendering: the active card's rationale + Enable/Not now,
-// the recovery callout for a denied card, the loading state, single onComplete
-// firing, and Skip-for-now. Drives the modal through an injected
+// the recovery and explicit operation-error states, the loading state, single
+// onComplete firing, and Skip-for-now. Drives the modal through an injected
 // `controllerOverride` stub (the live hook is covered by use-permission-priming.test).
 import type { PermissionId } from "@elizaos/shared/contracts/permissions";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { installJsdomUiPolyfills } from "../../../test/portable-stories";
@@ -14,6 +20,7 @@ import { PermissionPrimingModal } from "./PermissionPrimingModal";
 import type {
   PermissionPrimingController,
   PrimingItem,
+  PrimingItemOperation,
   PrimingItemStatus,
 } from "./use-permission-priming";
 
@@ -27,15 +34,25 @@ afterEach(() => {
 });
 
 function renderModal(node: ReactElement) {
-  return render(<MockAppProvider>{node}</MockAppProvider>);
+  return render(node, {
+    wrapper: ({ children }) => <MockAppProvider>{children}</MockAppProvider>,
+  });
 }
 
 function item(
   id: PermissionId,
   status: PrimingItemStatus,
   canRequest = false,
+  error?: PrimingItemOperation,
 ): PrimingItem {
-  return { id, status, canRequest, requesting: false, resolved: false };
+  return {
+    id,
+    status,
+    canRequest,
+    requesting: false,
+    resolved: false,
+    ...(error ? { error: { operation: error } } : {}),
+  };
 }
 
 function makeController(
@@ -104,7 +121,7 @@ describe("PermissionPrimingModal", () => {
     expect(controller.skip).toHaveBeenCalledWith("microphone");
   });
 
-  it("shows the recovery callout for a denied card; retry re-checks when it can't re-prompt", () => {
+  it("shows the recovery callout for a denied card; retry re-checks when it can't re-prompt", async () => {
     const controller = makeController({
       items: [item("microphone", "denied", false)],
       active: item("microphone", "denied", false),
@@ -121,11 +138,18 @@ describe("PermissionPrimingModal", () => {
     expect(screen.getByTestId("priming-recovery-microphone")).toBeTruthy();
     // canRequest === false → the retry action re-checks status (post-Settings).
     fireEvent.click(screen.getByTestId("priming-recovery-microphone-retry"));
-    expect(controller.recheck).toHaveBeenCalledWith("microphone");
+    await waitFor(() =>
+      expect(controller.recheck).toHaveBeenCalledWith("microphone"),
+    );
     expect(controller.request).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("priming-recovery-microphone-settings"));
+    await waitFor(() =>
+      expect(controller.openSettings).toHaveBeenCalledWith("microphone"),
+    );
   });
 
-  it("a denied card that can still re-prompt retries via request()", () => {
+  it("a denied card that can still re-prompt retries via request()", async () => {
     const controller = makeController({
       items: [item("location", "denied", true)],
       active: item("location", "denied", true),
@@ -139,7 +163,9 @@ describe("PermissionPrimingModal", () => {
       />,
     );
     fireEvent.click(screen.getByTestId("priming-recovery-location-retry"));
-    expect(controller.request).toHaveBeenCalledWith("location");
+    await waitFor(() =>
+      expect(controller.request).toHaveBeenCalledWith("location"),
+    );
   });
 
   it("renders a loading state until the initial check completes", () => {
@@ -155,14 +181,61 @@ describe("PermissionPrimingModal", () => {
     expect(screen.getByTestId("permission-priming-loading")).toBeTruthy();
   });
 
-  it("calls onComplete exactly once when the sequence is done", () => {
+  it("renders an initial probe failure without an Enable action and retries the check", () => {
+    const failed = item("microphone", null, false, "check");
+    const controller = makeController({
+      items: [failed],
+      active: failed,
+    });
+    renderModal(
+      <PermissionPrimingModal
+        ids={["microphone"]}
+        open
+        onComplete={vi.fn()}
+        controllerOverride={controller}
+      />,
+    );
+
+    expect(screen.getByTestId("priming-error-microphone")).toBeTruthy();
+    expect(
+      screen.getByText("Permission status could not be checked"),
+    ).toBeTruthy();
+    expect(screen.queryByTestId("priming-enable-microphone")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("priming-error-retry-microphone"));
+    expect(controller.recheck).toHaveBeenCalledWith("microphone");
+    expect(controller.request).not.toHaveBeenCalled();
+  });
+
+  it("retries a settings-navigation failure through openSettings", () => {
+    const failed = item("microphone", "denied", false, "settings");
+    const controller = makeController({
+      items: [failed],
+      active: failed,
+    });
+    renderModal(
+      <PermissionPrimingModal
+        ids={["microphone"]}
+        open
+        onComplete={vi.fn()}
+        controllerOverride={controller}
+      />,
+    );
+
+    expect(screen.getByText("Settings could not be opened")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("priming-error-retry-microphone"));
+    expect(controller.openSettings).toHaveBeenCalledWith("microphone");
+    expect(controller.recheck).not.toHaveBeenCalled();
+  });
+
+  it("calls onComplete exactly once when the sequence is done", async () => {
     const onComplete = vi.fn();
     const controller = makeController({
       ready: true,
       done: true,
       active: null,
     });
-    const { rerender } = renderModal(
+    renderModal(
       <PermissionPrimingModal
         ids={["microphone"]}
         open
@@ -170,16 +243,8 @@ describe("PermissionPrimingModal", () => {
         controllerOverride={controller}
       />,
     );
-    rerender(
-      <MockAppProvider>
-        <PermissionPrimingModal
-          ids={["microphone"]}
-          open
-          onComplete={onComplete}
-          controllerOverride={controller}
-        />
-      </MockAppProvider>,
-    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
 

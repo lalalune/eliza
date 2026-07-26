@@ -2,6 +2,7 @@
  * Mobile permission client: maps the shared permission registry to the Capacitor
  * permission plugins and reports normalized states.
  */
+import { ElizaError } from "@elizaos/core";
 import type {
   IPermissionsRegistry,
   PermissionFeatureRef,
@@ -36,6 +37,7 @@ import {
   type MessagesPluginLike,
   type MobileSignalsOpenSettingsResult,
   type MobileSignalsPermissionStatus,
+  type MobileSignalsPermissionTarget,
   type MobileSignalsPluginLike,
   type MobileSignalsScreenTimeStatus,
   type MobileSignalsSettingsTarget,
@@ -284,6 +286,9 @@ function stateFromWriteSettings(
 function normalizeMobileSignalsStatus(
   status: MobileSignalsPermissionStatus["status"],
 ): PermissionStatus {
+  // HealthKit hides individual read grants after the consent sheet is resolved.
+  // `opaque` preserves that uncertainty without lying or prompting again.
+  if (status === "determined") return "opaque";
   return status;
 }
 
@@ -363,14 +368,11 @@ function stateFromScreenTime(
 function stateFromHealth(
   permissions: MobileSignalsPermissionStatus,
 ): PermissionState {
-  return defaultMobileState(
-    "health",
-    normalizeMobileSignalsStatus(permissions.status),
-    {
-      canRequest: permissions.canRequest,
-      reason: permissions.reason,
-    },
-  );
+  const status = normalizeMobileSignalsStatus(permissions.status);
+  return defaultMobileState("health", status, {
+    canRequest: status === "opaque" ? false : permissions.canRequest,
+    reason: permissions.reason,
+  });
 }
 
 function stateFromNotifications(
@@ -487,7 +489,119 @@ function isMobilePermissionId(id: PermissionId): id is MobilePermissionId {
   return MOBILE_PERMISSION_IDS.has(id);
 }
 
-export async function openMobilePermissionSettings(
+type MobilePermissionMutationKind = "request" | "settings";
+
+interface MobilePermissionMutation {
+  id: PermissionId;
+  kind: MobilePermissionMutationKind;
+  settled: Promise<void>;
+  settle: () => void;
+  token: symbol;
+}
+
+let activeMobilePermissionMutation: MobilePermissionMutation | null = null;
+const activeMobilePermissionReads = new Set<Promise<void>>();
+
+async function runMobilePermissionRead<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  while (activeMobilePermissionMutation) {
+    await activeMobilePermissionMutation.settled;
+  }
+
+  const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+  activeMobilePermissionReads.add(settled);
+  try {
+    return await operation();
+  } finally {
+    activeMobilePermissionReads.delete(settled);
+    settle();
+  }
+}
+
+async function runMobilePermissionMutation<T>(
+  kind: MobilePermissionMutationKind,
+  id: PermissionId,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (activeMobilePermissionMutation) {
+    throw new ElizaError(
+      `Cannot start ${kind} for "${id}" while another mobile permission operation is active`,
+      {
+        code: "MOBILE_PERMISSION_OPERATION_IN_PROGRESS",
+        context: {
+          permissionId: id,
+          operation: kind,
+          activePermissionId: activeMobilePermissionMutation.id,
+          activeOperation: activeMobilePermissionMutation.kind,
+        },
+        severity: "ephemeral",
+      },
+    );
+  }
+
+  const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+  const mutation: MobilePermissionMutation = {
+    id,
+    kind,
+    settled,
+    settle,
+    token: Symbol(`${kind}:${id}`),
+  };
+  activeMobilePermissionMutation = mutation;
+  try {
+    await Promise.all(Array.from(activeMobilePermissionReads));
+    return await operation();
+  } finally {
+    if (activeMobilePermissionMutation?.token === mutation.token) {
+      activeMobilePermissionMutation = null;
+      mutation.settle();
+    }
+  }
+}
+
+export async function checkMobileSignalsPermissions(
+  plugin: MobileSignalsPluginLike = getMobileSignalsPlugin(),
+): Promise<MobileSignalsPermissionStatus | undefined> {
+  const checkPermissions = plugin.checkPermissions?.bind(plugin);
+  if (!checkPermissions) return;
+  return runMobilePermissionRead(checkPermissions);
+}
+
+export async function requestMobileSignalsPermissions(
+  id: PermissionId,
+  target: MobileSignalsPermissionTarget,
+  plugin: MobileSignalsPluginLike = getMobileSignalsPlugin(),
+): Promise<MobileSignalsPermissionStatus> {
+  const requestPermissions = plugin.requestPermissions?.bind(plugin);
+  if (!requestPermissions) {
+    throw new ElizaError(
+      `The native mobile-signals permission request is unavailable for "${id}"`,
+      {
+        code: "MOBILE_PERMISSION_REQUEST_UNAVAILABLE",
+        context: { permissionId: id, target },
+        severity: "ephemeral",
+      },
+    );
+  }
+  return runMobilePermissionMutation("request", id, () =>
+    requestPermissions({ target }),
+  );
+}
+
+export async function openMobileSignalsSettings(
+  id: PermissionId,
+  target: MobileSignalsSettingsTarget,
+  plugin: MobileSignalsPluginLike = getMobileSignalsPlugin(),
+): Promise<MobileSignalsOpenSettingsResult | undefined> {
+  const openSettings = plugin.openSettings?.bind(plugin);
+  if (!openSettings) return;
+  return runMobilePermissionMutation("settings", id, () =>
+    openSettings({ target }),
+  );
+}
+
+async function openMobilePermissionSettingsUncoordinated(
   id: PermissionId,
   plugin: MobileSignalsPluginLike = getMobileSignalsPlugin(),
   systemPlugin: SystemPluginLike = getSystemPlugin(),
@@ -506,6 +620,41 @@ export async function openMobilePermissionSettings(
   }
   if (typeof plugin.openSettings !== "function") return;
   return plugin.openSettings({ target: mobileSettingsTargetFor(id) });
+}
+
+export async function openMobilePermissionSettings(
+  id: PermissionId,
+  plugin: MobileSignalsPluginLike = getMobileSignalsPlugin(),
+  systemPlugin: SystemPluginLike = getSystemPlugin(),
+): Promise<MobileSignalsOpenSettingsResult | undefined> {
+  return runMobilePermissionMutation("settings", id, () =>
+    openMobilePermissionSettingsUncoordinated(id, plugin, systemPlugin),
+  );
+}
+
+async function requireMobilePermissionSettings(
+  id: PermissionId,
+  plugin: MobileSignalsPluginLike,
+  systemPlugin: SystemPluginLike = getSystemPlugin(),
+): Promise<MobileSignalsOpenSettingsResult> {
+  const result = await openMobilePermissionSettingsUncoordinated(
+    id,
+    plugin,
+    systemPlugin,
+  );
+  if (result?.opened === true) return result;
+  throw new ElizaError(
+    result?.reason ?? `Could not open settings for the "${id}" permission`,
+    {
+      code: "MOBILE_PERMISSION_SETTINGS_OPEN_FAILED",
+      context: {
+        permissionId: id,
+        target: result?.target,
+        actualTarget: result?.actualTarget,
+      },
+      severity: "ephemeral",
+    },
+  );
 }
 
 export function createMobileSignalsPermissionsRegistry(
@@ -687,214 +836,226 @@ export function createMobileSignalsPermissionsRegistry(
       );
     },
     async check(id) {
-      if (isMobilePermissionId(id)) return checkMobilePermission(id);
-      return checkFallback(id);
+      return runMobilePermissionRead(() => {
+        if (isMobilePermissionId(id)) return checkMobilePermission(id);
+        return checkFallback(id);
+      });
     },
     async request(id, opts) {
-      const lastRequested = Date.now();
+      return runMobilePermissionMutation("request", id, async () => {
+        const lastRequested = Date.now();
 
-      if (!isMobilePermissionId(id)) {
-        if (fallbackClient) {
-          const next = await fallbackClient.requestPermission(id);
-          return commit({
-            ...next,
-            lastRequested,
-            lastBlockedFeature: next.lastBlockedFeature ?? {
-              ...opts.feature,
-              at: lastRequested,
-            },
-          });
+        if (!isMobilePermissionId(id)) {
+          if (fallbackClient) {
+            const next = await fallbackClient.requestPermission(id);
+            return commit({
+              ...next,
+              lastRequested,
+              lastBlockedFeature: next.lastBlockedFeature ?? {
+                ...opts.feature,
+                at: lastRequested,
+              },
+            });
+          }
+          return commit(defaultMobileState(id, "not-applicable"));
         }
-        return commit(defaultMobileState(id, "not-applicable"));
-      }
 
-      let requestedState: PermissionState | null = null;
-      if (id === "calendar") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof appleCalendarPlugin.requestPermissions === "function"
-        ) {
-          await appleCalendarPlugin.requestPermissions();
-        } else {
-          await openMobilePermissionSettings(id, plugin);
-        }
-      } else if (id === "contacts") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.contacts.requestPermissions === "function"
-        ) {
-          requestedState = stateFromContacts(
-            await native.contacts.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "phone") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.phone.requestPermissions === "function"
-        ) {
-          requestedState = stateFromPhone(
-            await native.phone.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "messages") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.messages.requestPermissions === "function"
-        ) {
-          requestedState = stateFromMessages(
-            await native.messages.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "camera" || id === "photos") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.camera.requestPermissions === "function"
-        ) {
-          requestedState = stateFromCamera(
-            id,
-            await native.camera.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "microphone") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.talkMode.requestPermissions === "function"
-        ) {
-          requestedState = stateFromTalkMode(
-            "microphone",
-            await native.talkMode.requestPermissions(),
-          );
+        let requestedState: PermissionState | null = null;
+        if (id === "calendar") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof appleCalendarPlugin.requestPermissions === "function"
+          ) {
+            await appleCalendarPlugin.requestPermissions();
+          } else {
+            await requireMobilePermissionSettings(id, plugin);
+          }
+        } else if (id === "contacts") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.contacts.requestPermissions === "function"
+          ) {
+            requestedState = stateFromContacts(
+              await native.contacts.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "phone") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.phone.requestPermissions === "function"
+          ) {
+            requestedState = stateFromPhone(
+              await native.phone.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "messages") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.messages.requestPermissions === "function"
+          ) {
+            requestedState = stateFromMessages(
+              await native.messages.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "camera" || id === "photos") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.camera.requestPermissions === "function"
+          ) {
+            requestedState = stateFromCamera(
+              id,
+              await native.camera.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "microphone") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.talkMode.requestPermissions === "function"
+          ) {
+            requestedState = stateFromTalkMode(
+              "microphone",
+              await native.talkMode.requestPermissions(),
+            );
+          } else if (
+            current.canRequest &&
+            typeof native.camera.requestPermissions === "function"
+          ) {
+            requestedState = stateFromCamera(
+              "microphone",
+              await native.camera.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "speech-recognition") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.talkMode.requestPermissions === "function"
+          ) {
+            requestedState = stateFromTalkMode(
+              "speech-recognition",
+              await native.talkMode.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "location" || id === "wifi") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.location.requestPermissions === "function"
+          ) {
+            requestedState = stateFromLocation(
+              id,
+              await native.location.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "screen-recording") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.screenCapture.requestPermissions === "function"
+          ) {
+            requestedState = stateFromScreenCapture(
+              await native.screenCapture.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "notifications") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof pushNotificationsPlugin.requestPermissions === "function"
+          ) {
+            requestedState = stateFromPushNotifications(
+              await pushNotificationsPlugin.requestPermissions(),
+            );
+          } else if (
+            current.canRequest &&
+            typeof plugin.requestPermissions === "function"
+          ) {
+            await plugin.requestPermissions({ target: "notifications" });
+          } else {
+            await requireMobilePermissionSettings(id, plugin);
+          }
+        } else if (id === "screentime") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof plugin.requestPermissions === "function"
+          ) {
+            await plugin.requestPermissions({ target: "screenTime" });
+          } else {
+            await requireMobilePermissionSettings(id, plugin);
+          }
         } else if (
-          current.canRequest &&
-          typeof native.camera.requestPermissions === "function"
+          id === "usage-access" ||
+          id === "battery-optimization" ||
+          id === "local-network" ||
+          id === "bluetooth"
         ) {
-          requestedState = stateFromCamera(
-            "microphone",
-            await native.camera.requestPermissions(),
-          );
+          await requireMobilePermissionSettings(id, plugin, native.system);
+        } else if (id === "app-blocking" || id === "overlay") {
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof native.appBlocker.requestPermissions === "function"
+          ) {
+            requestedState = stateFromAppBlocker(
+              id,
+              await native.appBlocker.requestPermissions(),
+            );
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
+        } else if (id === "write-settings") {
+          if (typeof native.system.openWriteSettings === "function") {
+            await native.system.openWriteSettings();
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
         } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
+          const current = await checkMobilePermission(id);
+          if (
+            current.canRequest &&
+            typeof plugin.requestPermissions === "function"
+          ) {
+            await plugin.requestPermissions({ target: "health" });
+          } else {
+            await requireMobilePermissionSettings(id, plugin, native.system);
+          }
         }
-      } else if (id === "speech-recognition") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.talkMode.requestPermissions === "function"
-        ) {
-          requestedState = stateFromTalkMode(
-            "speech-recognition",
-            await native.talkMode.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "location" || id === "wifi") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.location.requestPermissions === "function"
-        ) {
-          requestedState = stateFromLocation(
-            id,
-            await native.location.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "screen-recording") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.screenCapture.requestPermissions === "function"
-        ) {
-          requestedState = stateFromScreenCapture(
-            await native.screenCapture.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "notifications") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof pushNotificationsPlugin.requestPermissions === "function"
-        ) {
-          requestedState = stateFromPushNotifications(
-            await pushNotificationsPlugin.requestPermissions(),
-          );
-        } else if (
-          current.canRequest &&
-          typeof plugin.requestPermissions === "function"
-        ) {
-          await plugin.requestPermissions({ target: "notifications" });
-        } else {
-          await openMobilePermissionSettings(id, plugin);
-        }
-      } else if (id === "screentime") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof plugin.requestPermissions === "function"
-        ) {
-          await plugin.requestPermissions({ target: "screenTime" });
-        } else {
-          await openMobilePermissionSettings(id, plugin);
-        }
-      } else if (
-        id === "usage-access" ||
-        id === "battery-optimization" ||
-        id === "local-network" ||
-        id === "bluetooth"
-      ) {
-        await openMobilePermissionSettings(id, plugin, native.system);
-      } else if (id === "app-blocking" || id === "overlay") {
-        const current = await checkMobilePermission(id);
-        if (
-          current.canRequest &&
-          typeof native.appBlocker.requestPermissions === "function"
-        ) {
-          requestedState = stateFromAppBlocker(
-            id,
-            await native.appBlocker.requestPermissions(),
-          );
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (id === "write-settings") {
-        if (typeof native.system.openWriteSettings === "function") {
-          await native.system.openWriteSettings();
-        } else {
-          await openMobilePermissionSettings(id, plugin, native.system);
-        }
-      } else if (typeof plugin.requestPermissions === "function") {
-        await plugin.requestPermissions({ target: "health" });
-      }
 
-      const next = requestedState ?? (await checkMobilePermission(id));
-      if (id === "notifications" && next.status === "granted") {
-        await initPushRegistrationAfterGrant();
-      }
-      return commit({
-        ...next,
-        lastRequested,
-        lastBlockedFeature: next.lastBlockedFeature ?? {
-          ...opts.feature,
-          at: lastRequested,
-        },
+        const next = requestedState ?? (await checkMobilePermission(id));
+        if (id === "notifications" && next.status === "granted") {
+          await initPushRegistrationAfterGrant();
+        }
+        return commit({
+          ...next,
+          lastRequested,
+          lastBlockedFeature: next.lastBlockedFeature ?? {
+            ...opts.feature,
+            at: lastRequested,
+          },
+        });
       });
     },
     async openSettings(id) {

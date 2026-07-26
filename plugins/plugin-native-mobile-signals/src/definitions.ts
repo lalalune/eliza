@@ -1,3 +1,7 @@
+/**
+ * Cross-platform contract for device, health, monitoring, and release calls
+ * shared by the Capacitor native bridges and browser fallback.
+ */
 import type { PluginListenerHandle } from "@capacitor/core";
 
 export type MobileSignalsPlatform = "android" | "ios" | "web";
@@ -208,7 +212,19 @@ export interface MobileSignalsStartResult {
 }
 
 export interface MobileSignalsStopResult {
+  /**
+   * True when no monitoring observer, event source, or monitoring-owned native
+   * query remains. A snapshot begun during monitoring joins that generation.
+   */
   stopped: boolean;
+}
+
+export interface MobileSignalsReleaseSignalListenersResult {
+  /**
+   * True when the native event registry and Capacitor bridge keep-alive
+   * callback table no longer own this plugin's signal listeners.
+   */
+  removed: boolean;
 }
 
 export interface MobileSignalsSnapshotResult {
@@ -225,6 +241,11 @@ export interface MobileSignalsBackgroundRefreshResult {
 }
 
 export interface MobileSignalsCancelBackgroundRefreshResult {
+  /**
+   * True when no refresh job scheduled through this plugin remains. App-lifetime
+   * OS delivery registrations, such as HealthKit background delivery, are outside
+   * this job-scoped contract.
+   */
   cancelled: boolean;
   reason?: string;
 }
@@ -241,6 +262,7 @@ export interface MobileSignalsPlugin {
     options?: MobileSignalsStartOptions,
   ): Promise<MobileSignalsStartResult>;
   stopMonitoring(): Promise<MobileSignalsStopResult>;
+  releaseSignalListeners(): Promise<MobileSignalsReleaseSignalListenersResult>;
   getSnapshot(): Promise<MobileSignalsSnapshotResult>;
   scheduleBackgroundRefresh(): Promise<MobileSignalsBackgroundRefreshResult>;
   cancelBackgroundRefresh(): Promise<MobileSignalsCancelBackgroundRefreshResult>;
@@ -252,7 +274,16 @@ export interface MobileSignalsPlugin {
 }
 
 export interface MobileSignalsPermissionStatus {
-  status: "granted" | "denied" | "not-determined" | "not-applicable";
+  /**
+   * `determined` means iOS no longer needs to present its HealthKit read
+   * consent sheet; it does not mean any individual read type was granted.
+   */
+  status:
+    | "granted"
+    | "denied"
+    | "determined"
+    | "not-determined"
+    | "not-applicable";
   canRequest: boolean;
   canOpenSettings: boolean;
   settingsTarget: MobileSignalsSettingsTarget | null;
@@ -262,7 +293,9 @@ export interface MobileSignalsPermissionStatus {
   screenTime: MobileSignalsScreenTimeStatus;
   setupActions: MobileSignalsSetupAction[];
   permissions: {
+    /** Always false on iOS because HealthKit read grants are intentionally private. */
     sleep: boolean;
+    /** Always false on iOS because HealthKit read grants are intentionally private. */
     biometrics: boolean;
   };
 }

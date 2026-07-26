@@ -380,6 +380,11 @@ export const PERMISSION_BADGE_LABELS: Record<
     labelKey: "permissionssection.badge.notDetermined",
     defaultLabel: "Not Set",
   },
+  opaque: {
+    tone: "muted",
+    labelKey: "permissionssection.badge.opaque",
+    defaultLabel: "Choices set",
+  },
   restricted: {
     tone: "muted",
     labelKey: "permissionssection.badge.restricted",
@@ -423,6 +428,19 @@ export function getPermissionAction(
 } | null {
   if (status === "not-applicable") {
     return null;
+  }
+
+  if (status === "opaque") {
+    const label = translateWithFallback(
+      t,
+      "permissionssection.Manage",
+      "Manage",
+    );
+    return {
+      ariaLabelPrefix: label,
+      label,
+      type: "settings",
+    };
   }
 
   if (status === "granted" && id !== "shell") {

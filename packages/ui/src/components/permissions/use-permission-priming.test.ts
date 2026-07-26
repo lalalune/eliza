@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 //
 // usePermissionPriming sequencing: mount-time status check skips already-granted
-// items, "Enable" fires exactly one OS request (soft-ask), denial keeps the card
-// active for recovery, and the sequence advances/completes correctly. The
+// items, "Enable" fires exactly one OS request (soft-ask), failures remain
+// separate from OS status with retry paths, and the sequence completes. The
 // permissions client (`getPermission`/`requestPermission`) is mocked; the hook is real.
 import type {
   PermissionId,
@@ -86,6 +86,43 @@ describe("usePermissionPriming", () => {
     expect(result.current.done).toBe(true);
   });
 
+  it("skips a privacy-opaque permission without re-prompting", async () => {
+    seedStatuses({ health: "opaque" });
+
+    const { result } = renderHook(() => usePermissionPriming(["health"]));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    expect(result.current.items).toHaveLength(0);
+    expect(result.current.done).toBe(true);
+    expect(mocks.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("renders a failed initial probe without fabricating a promptable status", async () => {
+    mocks.getPermission.mockImplementation(async (id: PermissionId) => {
+      if (id === "microphone") throw new Error("bridge unavailable");
+      return state(id, "granted", false);
+    });
+
+    const { result } = renderHook(() => usePermissionPriming(IDS));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    expect(result.current.active).toMatchObject({
+      id: "microphone",
+      status: null,
+      canRequest: false,
+      error: { operation: "check" },
+    });
+    expect(mocks.requestPermission).not.toHaveBeenCalled();
+
+    mocks.getPermission.mockResolvedValue(
+      state("microphone", "granted", false),
+    );
+    await act(async () => {
+      await result.current.recheck("microphone");
+    });
+    expect(result.current.done).toBe(true);
+  });
+
   it("fires the OS request only on request(), resolves + advances on grant", async () => {
     seedStatuses({
       microphone: "not-determined",
@@ -108,6 +145,28 @@ describe("usePermissionPriming", () => {
     // Granted → resolved → advance to the next card.
     expect(result.current.active?.id).toBe("location");
     expect(result.current.currentStep).toBe(2);
+  });
+
+  it("resolves when an OS request returns a privacy-opaque decision", async () => {
+    seedStatuses({ health: "not-determined" });
+    mocks.requestPermission.mockResolvedValueOnce(
+      state("health", "opaque", false),
+    );
+
+    const { result } = renderHook(() => usePermissionPriming(["health"]));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    await act(async () => {
+      await result.current.request("health");
+    });
+
+    expect(result.current.items[0]).toMatchObject({
+      id: "health",
+      status: "opaque",
+      canRequest: false,
+      resolved: true,
+    });
+    expect(result.current.done).toBe(true);
   });
 
   it("keeps a denied card active with a recovery path, then skip advances", async () => {
@@ -137,7 +196,7 @@ describe("usePermissionPriming", () => {
     expect(result.current.done).toBe(true);
   });
 
-  it("surfaces a thrown request as denied instead of a dead card", async () => {
+  it("surfaces a thrown request separately and retries without fabricating denial", async () => {
     seedStatuses({ microphone: "not-determined" });
     mocks.getPermission.mockImplementation(async (id: PermissionId) =>
       state(id, id === "microphone" ? "not-determined" : "granted"),
@@ -151,8 +210,20 @@ describe("usePermissionPriming", () => {
       await result.current.request("microphone");
     });
 
-    expect(result.current.active?.status).toBe("denied");
-    expect(result.current.active?.requesting).toBe(false);
+    expect(result.current.active).toMatchObject({
+      status: "not-determined",
+      canRequest: true,
+      requesting: false,
+      error: { operation: "request" },
+    });
+
+    mocks.requestPermission.mockResolvedValueOnce(
+      state("microphone", "granted", false),
+    );
+    await act(async () => {
+      await result.current.request("microphone");
+    });
+    expect(result.current.done).toBe(true);
   });
 
   it("skipAll resolves everything at once", async () => {
@@ -169,6 +240,39 @@ describe("usePermissionPriming", () => {
     expect(result.current.done).toBe(true);
     expect(result.current.active).toBeNull();
     expect(mocks.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("keeps the sequence complete when an in-flight request settles after skipAll", async () => {
+    seedStatuses({ microphone: "not-determined" });
+    let finishRequest:
+      | ((value: PermissionState | PromiseLike<PermissionState>) => void)
+      | undefined;
+    mocks.requestPermission.mockImplementationOnce(
+      () =>
+        new Promise<PermissionState>((resolve) => {
+          finishRequest = resolve;
+        }),
+    );
+    const { result } = renderHook(() => usePermissionPriming(["microphone"]));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    let pendingRequest: Promise<void> | undefined;
+    act(() => {
+      pendingRequest = result.current.request("microphone");
+    });
+    await waitFor(() => expect(mocks.requestPermission).toHaveBeenCalled());
+    act(() => result.current.skipAll());
+    await act(async () => {
+      finishRequest?.(state("microphone", "granted", false));
+      await pendingRequest;
+    });
+
+    expect(result.current.done).toBe(true);
+    expect(result.current.active).toBeNull();
+    expect(result.current.items[0]).toMatchObject({
+      status: "not-determined",
+      resolved: true,
+    });
   });
 
   it("recheck reflects a permission granted out-of-band (e.g. via Settings)", async () => {
@@ -189,5 +293,94 @@ describe("usePermissionPriming", () => {
       await result.current.recheck("microphone");
     });
     expect(result.current.done).toBe(true);
+  });
+
+  it("keeps a failed recheck distinct from the last known denied state", async () => {
+    seedStatuses({ microphone: "denied" });
+    const { result } = renderHook(() => usePermissionPriming(["microphone"]));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    mocks.getPermission.mockRejectedValueOnce(new Error("probe timed out"));
+    await act(async () => {
+      await result.current.recheck("microphone");
+    });
+
+    expect(result.current.active).toMatchObject({
+      status: "denied",
+      error: { operation: "recheck" },
+      resolved: false,
+    });
+
+    mocks.getPermission.mockResolvedValueOnce(
+      state("microphone", "granted", false),
+    );
+    await act(async () => {
+      await result.current.recheck("microphone");
+    });
+    expect(result.current.done).toBe(true);
+  });
+
+  it("renders and retries settings-navigation failures without changing status", async () => {
+    seedStatuses({ microphone: "denied" });
+    const { result } = renderHook(() => usePermissionPriming(["microphone"]));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    mocks.openPermissionSettings.mockRejectedValueOnce(
+      new Error("settings bridge failed"),
+    );
+    await act(async () => {
+      await result.current.openSettings("microphone");
+    });
+    expect(result.current.active).toMatchObject({
+      status: "denied",
+      error: { operation: "settings" },
+      resolved: false,
+    });
+
+    await act(async () => {
+      await result.current.openSettings("microphone");
+    });
+    expect(result.current.active?.status).toBe("denied");
+    expect(result.current.active?.error).toBeUndefined();
+  });
+
+  it("ignores an operation result from an earlier id-list generation", async () => {
+    seedStatuses({
+      microphone: "not-determined",
+      location: "not-determined",
+    });
+    let resolveOldRequest:
+      | ((value: PermissionState | PromiseLike<PermissionState>) => void)
+      | undefined;
+    mocks.requestPermission.mockImplementationOnce(
+      () =>
+        new Promise<PermissionState>((resolve) => {
+          resolveOldRequest = resolve;
+        }),
+    );
+    const { result, rerender } = renderHook(
+      ({ ids }: { ids: readonly PermissionId[] }) => usePermissionPriming(ids),
+      { initialProps: { ids: ["microphone"] } },
+    );
+    await waitFor(() => expect(result.current.active?.id).toBe("microphone"));
+
+    let oldRequest: Promise<void> | undefined;
+    act(() => {
+      oldRequest = result.current.request("microphone");
+    });
+    rerender({ ids: ["location"] });
+    await waitFor(() => expect(result.current.active?.id).toBe("location"));
+
+    await act(async () => {
+      resolveOldRequest?.(state("microphone", "granted", false));
+      await oldRequest;
+    });
+
+    expect(result.current.items).toHaveLength(1);
+    expect(result.current.active).toMatchObject({
+      id: "location",
+      status: "not-determined",
+      resolved: false,
+    });
   });
 });

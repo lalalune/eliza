@@ -1,3 +1,10 @@
+/**
+ * Capacitor bridge for iOS device-state and HealthKit snapshots.
+ *
+ * Monitoring callbacks carry an ownership generation so HealthKit completions
+ * from a stopped renderer cannot publish into its successor. Listener teardown
+ * closes and drains publication before releasing Capacitor callback ownership.
+ */
 import Foundation
 import Capacitor
 import HealthKit
@@ -14,6 +21,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "openSettings", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startMonitoring", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopMonitoring", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "releaseSignalListeners", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getSnapshot", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "scheduleBackgroundRefresh", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancelBackgroundRefresh", returnType: CAPPluginReturnPromise),
@@ -36,6 +44,10 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private var monitoring = false
+    private let monitoringGeneration = MonitoringGeneration()
+    private let monitoringHealthQueries = MonitoringResourceRegistry<HKQuery>()
+    private let listenerCalls = RetryableReleaseRegistry<CAPPluginCall>()
+    private let signalListenerLifecycle = SignalListenerLifecycleGate()
     private var observers: [NSObjectProtocol] = []
     private let healthStore = HKHealthStore()
     private let healthQueue = DispatchQueue(label: "ai.eliza.mobile-signals.health", qos: .utility)
@@ -59,8 +71,8 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func cancelBackgroundRefresh(_ call: CAPPluginCall) {
         call.resolve([
-            "cancelled": false,
-            "reason": "iOS mobile signals do not register a BGTaskScheduler background refresh task.",
+            "cancelled": true,
+            "reason": "iOS mobile signals have no refresh job scheduled through this plugin remaining; app-lifetime HealthKit delivery is outside this job-scoped contract.",
         ])
     }
 
@@ -75,13 +87,15 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
+        let generation = monitoringGeneration.begin()
+        monitoringHealthQueries.activate(generation: generation)
         monitoring = true
-        registerObservers()
+        registerObservers(generation: generation)
         call.resolve(buildStartResult())
 
         if call.getBool("emitInitial") ?? true {
-            emitSignal(reason: "start")
-            emitHealthSignal(reason: "start")
+            emitSignal(reason: "start", generation: generation)
+            emitHealthSignal(reason: "start", generation: generation)
         }
     }
 
@@ -90,9 +104,77 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(["stopped": true])
     }
 
+    @objc public override func addListener(_ call: CAPPluginCall) {
+        signalListenerLifecycle.closeAndDrain()
+        guard signalListenerLifecycle.canAcquireListeners else {
+            call.reject(
+                "Signal listeners are quarantined until native release succeeds.",
+                "MOBILE_SIGNALS_LISTENER_RELEASE_PENDING"
+            )
+            return
+        }
+        super.addListener(call)
+        listenerCalls.track(call)
+        signalListenerLifecycle.resume(hasListeners: hasListeners("signal"))
+    }
+
+    @objc public override func removeListener(_ call: CAPPluginCall) {
+        signalListenerLifecycle.closeAndDrain()
+        let storedCall = call.getString("callbackId").flatMap {
+            bridge?.savedCall(withID: $0)
+        }
+        super.removeListener(call)
+        if let storedCall {
+            listenerCalls.confirmReleased(storedCall)
+        }
+        signalListenerLifecycle.resume(hasListeners: hasListeners("signal"))
+    }
+
+    @objc public override func removeAllListeners(_ call: CAPPluginCall) {
+        let removed = releaseAllSignalListenerOwnership()
+        if removed {
+            call.resolve()
+        } else {
+            call.reject(
+                "Native signal listener ownership could not be released.",
+                "MOBILE_SIGNALS_LISTENER_RELEASE_FAILED"
+            )
+        }
+    }
+
+    @objc func releaseSignalListeners(_ call: CAPPluginCall) {
+        call.resolve(["removed": releaseAllSignalListenerOwnership()])
+    }
+
+    private func releaseAllSignalListenerOwnership() -> Bool {
+        signalListenerLifecycle.closeAndDrain()
+        let currentListenerCalls = (eventListeners?.allValues ?? []).flatMap { group in
+            (group as? [CAPPluginCall]) ?? []
+        }
+        currentListenerCalls.forEach(listenerCalls.track)
+        do {
+            guard try listenerCalls.releaseAll(
+                using: bridge.map { activeBridge in
+                    { listenerCall in activeBridge.releaseCall(listenerCall) }
+                }
+            ) else {
+                signalListenerLifecycle.finishRelease(succeeded: false)
+                return false
+            }
+            eventListeners?.removeAllObjects()
+            signalListenerLifecycle.finishRelease(succeeded: true)
+            return true
+        } catch {
+            // error-policy:J1 Capacitor bridge boundary — retain every
+            // unconfirmed callback so renderer cleanup can retry.
+            signalListenerLifecycle.finishRelease(succeeded: false)
+            return false
+        }
+    }
+
     @objc public override func checkPermissions(_ call: CAPPluginCall) {
         buildPermissionResult { result in
-            call.resolve(result)
+            self.settlePermissionCall(call, result: result)
         }
     }
 
@@ -123,15 +205,17 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         healthStore.requestAuthorization(toShare: nil, read: Set(types)) { [weak self] success, error in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                let healthReason = !success
-                    ? "HealthKit permission request failed: \(error?.localizedDescription ?? "unknown error")"
-                    : nil
-                if success {
-                    self.enableHealthBackgroundDelivery()
+                guard success else {
+                    call.reject(
+                        "HealthKit permission request failed.",
+                        "MOBILE_SIGNALS_HEALTH_AUTHORIZATION_FAILED",
+                        error
+                    )
+                    return
                 }
+                self.enableHealthBackgroundDelivery()
                 self.resolvePermissionResult(
                     call,
-                    reason: healthReason,
                     requestScreenTime: shouldRequestScreenTime
                 )
             }
@@ -238,7 +322,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             guard let self = self else { return }
             guard notification.canRequest else {
                 self.buildPermissionResult(reason: notification.reason) { result in
-                    call.resolve(result)
+                    self.settlePermissionCall(call, result: result)
                 }
                 return
             }
@@ -246,8 +330,16 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] _, error in
                 DispatchQueue.main.async {
                     guard let self = self else { return }
-                    self.buildPermissionResult(reason: error?.localizedDescription) { result in
-                        call.resolve(result)
+                    if let error {
+                        call.reject(
+                            "Notification permission request failed.",
+                            "MOBILE_SIGNALS_NOTIFICATION_AUTHORIZATION_FAILED",
+                            error
+                        )
+                        return
+                    }
+                    self.buildPermissionResult { result in
+                        self.settlePermissionCall(call, result: result)
                     }
                 }
             }
@@ -306,7 +398,13 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func getSnapshot(_ call: CAPPluginCall) {
         let device = buildSnapshot(reason: "snapshot")
-        buildHealthSnapshot(reason: "snapshot") { health in
+        // Renderer health polls belong to the active monitor generation. A
+        // concurrent stop can then cancel their native queries and settle this
+        // bridge call instead of leaving renderer teardown pinned indefinitely.
+        buildHealthSnapshot(
+            reason: "snapshot",
+            monitoringGeneration: monitoringHealthQueries.currentGeneration
+        ) { health in
             call.resolve([
                 "supported": true,
                 "snapshot": device,
@@ -315,7 +413,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    private func registerObservers() {
+    private func registerObservers(generation: UInt64) {
         let center = NotificationCenter.default
         let names: [Notification.Name] = [
             UIApplication.didBecomeActiveNotification,
@@ -334,11 +432,17 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.emitSignal(reason: name.rawValue)
+                self?.emitSignal(
+                    reason: name.rawValue,
+                    generation: generation
+                )
                 if name == UIApplication.didBecomeActiveNotification ||
                     name == UIApplication.willEnterForegroundNotification ||
                     name == UIApplication.protectedDataDidBecomeAvailableNotification {
-                    self?.emitHealthSignal(reason: name.rawValue)
+                    self?.emitHealthSignal(
+                        reason: name.rawValue,
+                        generation: generation
+                    )
                 }
             }
             observers.append(observer)
@@ -352,6 +456,12 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         observers.removeAll()
         monitoring = false
+        monitoringGeneration.invalidate()
+        let ownedQueries = monitoringHealthQueries.invalidate()
+        for entry in ownedQueries {
+            healthStore.stop(entry.resource)
+            entry.cancelCompletion()
+        }
     }
 
     private func buildStartResult() -> [String: Any] {
@@ -396,6 +506,61 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         let reason: String?
     }
 
+    private func readHealthConsentDecision(
+        completion: @escaping (Result<HealthReadConsentDecision, Error>) -> Void
+    ) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            completion(.success(HealthReadConsentDecision(
+                status: "not-applicable",
+                canRequest: false,
+                reason: "HealthKit is not available on this device."
+            )))
+            return
+        }
+
+        let types = requestedHealthTypes()
+        guard !types.isEmpty else {
+            completion(.success(HealthReadConsentDecision(
+                status: "not-applicable",
+                canRequest: false,
+                reason: "HealthKit sleep and biometric types are unavailable on this device."
+            )))
+            return
+        }
+
+        healthStore.getRequestStatusForAuthorization(
+            toShare: Set<HKSampleType>(),
+            read: Set(types)
+        ) { requestStatus, error in
+            let requestState: HealthReadAuthorizationRequestState
+            let failureReason: String?
+            if let error {
+                requestState = .unknown
+                failureReason = "HealthKit request-status lookup failed: \(error.localizedDescription)"
+            } else {
+                failureReason = nil
+                switch requestStatus {
+                case .shouldRequest:
+                    requestState = .shouldRequest
+                case .unnecessary:
+                    requestState = .unnecessary
+                case .unknown:
+                    requestState = .unknown
+                @unknown default:
+                    requestState = .unknown
+                }
+            }
+            DispatchQueue.main.async {
+                completion(Result {
+                    try HealthReadConsentPolicy.decide(
+                        requestState: requestState,
+                        failureReason: failureReason
+                    )
+                })
+            }
+        }
+    }
+
     private func readNotificationPermission(
         completion: @escaping (NotificationPermissionCapture) -> Void
     ) {
@@ -437,16 +602,37 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         status overrideStatus: String? = nil,
         canRequest overrideCanRequest: Bool? = nil,
         reason overrideReason: String? = nil,
-        completion: @escaping ([String: Any]) -> Void
+        completion: @escaping (Result<[String: Any], Error>) -> Void
     ) {
         readNotificationPermission { [weak self] notification in
             guard let self = self else { return }
-            completion(self.buildPermissionResultPayload(
-                status: overrideStatus,
-                canRequest: overrideCanRequest,
-                reason: overrideReason,
-                notification: notification
-            ))
+            self.readHealthConsentDecision { decision in
+                completion(decision.map { healthConsent in
+                    self.buildPermissionResultPayload(
+                        status: overrideStatus,
+                        canRequest: overrideCanRequest,
+                        reason: overrideReason,
+                        notification: notification,
+                        healthConsent: healthConsent
+                    )
+                })
+            }
+        }
+    }
+
+    private func settlePermissionCall(
+        _ call: CAPPluginCall,
+        result: Result<[String: Any], Error>
+    ) {
+        switch result {
+        case .success(let payload):
+            call.resolve(payload)
+        case .failure(let error):
+            call.reject(
+                "Failed to read mobile signal permissions.",
+                "MOBILE_SIGNALS_PERMISSION_CHECK_FAILED",
+                error
+            )
         }
     }
 
@@ -454,7 +640,8 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         status overrideStatus: String? = nil,
         canRequest overrideCanRequest: Bool? = nil,
         reason overrideReason: String? = nil,
-        notification: NotificationPermissionCapture
+        notification: NotificationPermissionCapture,
+        healthConsent: HealthReadConsentDecision
     ) -> [String: Any] {
         let screenTimeStatus = ScreenTimeSupport.buildStatus()
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -480,52 +667,35 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             ]
         }
 
-        let sleepType = sleepHealthType()
-        let biometricTypes = biometricHealthTypes()
-        let sleepGranted = sleepType.map { healthStore.authorizationStatus(for: $0) == .sharingAuthorized } ?? false
-        let biometricGranted = biometricTypes.isEmpty
-            ? false
-            : biometricTypes.allSatisfy { healthStore.authorizationStatus(for: $0) == .sharingAuthorized }
-        let hasRequestedTypes = sleepType != nil || !biometricTypes.isEmpty
-        let hasDenied = (sleepType.map { healthStore.authorizationStatus(for: $0) == .sharingDenied } ?? false) ||
-            biometricTypes.contains { healthStore.authorizationStatus(for: $0) == .sharingDenied }
-        let hasPending = (sleepType.map { healthStore.authorizationStatus(for: $0) == .notDetermined } ?? false) ||
-            biometricTypes.contains { healthStore.authorizationStatus(for: $0) == .notDetermined }
-        let status = overrideStatus ?? {
-            if !hasRequestedTypes {
-                return "not-applicable"
-            }
-            if sleepGranted || biometricGranted {
-                return "granted"
-            }
-            if hasDenied {
-                return "denied"
-            }
-            if hasPending {
-                return "not-determined"
-            }
-            return "not-determined"
-        }()
-        let settingsTarget: Any = status == "granted" ? NSNull() : "health"
+        let status = overrideStatus ?? healthConsent.status
+        let canRequest = overrideCanRequest ?? healthConsent.canRequest
+        let settingsTarget: Any = status == "not-applicable" ? NSNull() : "health"
+        let reason: Any
+        if let permissionReason = overrideReason ?? healthConsent.reason {
+            reason = permissionReason
+        } else {
+            reason = NSNull()
+        }
 
         return [
             "status": status,
-            "canRequest": overrideCanRequest ?? (status != "granted" && hasRequestedTypes),
+            "canRequest": canRequest,
             "canOpenSettings": true,
             "settingsTarget": settingsTarget,
             "engine": "healthkit-screen-time",
             "capabilities": mobileSignalsCapabilities(),
-            "reason": overrideReason ?? NSNull(),
+            "reason": reason,
             "screenTime": screenTimeStatus,
             "setupActions": buildSetupActions(
                 healthStatus: status,
-                healthCanRequest: overrideCanRequest ?? (status != "granted" && hasRequestedTypes),
+                healthCanRequest: canRequest,
                 screenTimeStatus: screenTimeStatus,
                 notification: notification
             ),
             "permissions": [
-                "sleep": sleepGranted,
-                "biometrics": biometricGranted,
+                // HealthKit intentionally withholds read authorization status.
+                "sleep": false,
+                "biometrics": false,
             ],
         ]
     }
@@ -552,15 +722,18 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                 canRequest: canRequest,
                 reason: reason
             ) { result in
-                var next = result
-                if let screenTimeReason {
-                    if let existingReason = next["reason"] as? String, !existingReason.isEmpty {
-                        next["reason"] = "\(existingReason) \(screenTimeReason)"
-                    } else {
-                        next["reason"] = screenTimeReason
+                let enriched = result.map { payload in
+                    var next = payload
+                    if let screenTimeReason {
+                        if let existingReason = next["reason"] as? String, !existingReason.isEmpty {
+                            next["reason"] = "\(existingReason) \(screenTimeReason)"
+                        } else {
+                            next["reason"] = screenTimeReason
+                        }
                     }
+                    return next
                 }
-                call.resolve(next)
+                self.settlePermissionCall(call, result: enriched)
             }
         }
     }
@@ -587,7 +760,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             canRequest: canRequest,
             reason: reason
         ) { result in
-            call.resolve(result)
+            self.settlePermissionCall(call, result: result)
         }
     }
 
@@ -597,7 +770,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         screenTimeStatus: [String: Any],
         notification: NotificationPermissionCapture
     ) -> [[String: Any]] {
-        let healthReady = healthStatus == "granted"
+        let healthReady = healthStatus == "determined"
         let authorization = screenTimeStatus["authorization"] as? [String: Any] ?? [:]
         let screenTimeAuthStatus = authorization["status"] as? String ?? "unavailable"
         let screenTimeCanRequest = authorization["canRequest"] as? Bool ?? false
@@ -617,7 +790,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                 "canOpenSettings": true,
                 "settingsTarget": "health",
                 "reason": healthReady
-                    ? NSNull()
+                    ? "iOS keeps individual HealthKit read grants private; monitoring queries return only authorized data."
                     : "Grant Health read access for sleep, heart rate, HRV, respiratory rate, and oxygen saturation.",
             ],
             [
@@ -717,21 +890,71 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         ]
     }
 
-    private func emitSignal(reason: String) {
-        guard monitoring else { return }
-        notifyListeners("signal", data: buildSnapshot(reason: reason))
+    private func isMonitoringGenerationActive(_ generation: UInt64) -> Bool {
+        monitoringGeneration.isCurrent(generation) &&
+            monitoringHealthQueries.isActive(generation: generation)
     }
 
-    private func emitHealthSignal(reason: String) {
-        guard monitoring else { return }
-        buildHealthSnapshot(reason: reason) { [weak self] healthSnapshot in
-            guard let self = self, self.monitoring else { return }
-            self.notifyListeners("signal", data: healthSnapshot)
+    private func emitSignal(reason: String, generation: UInt64) {
+        guard isMonitoringGenerationActive(generation) else { return }
+        publishSignal(buildSnapshot(reason: reason))
+    }
+
+    private func emitHealthSignal(reason: String, generation: UInt64) {
+        guard isMonitoringGenerationActive(generation) else { return }
+        buildHealthSnapshot(
+            reason: reason,
+            monitoringGeneration: generation
+        ) { [weak self] healthSnapshot in
+            guard let self = self,
+                  self.isMonitoringGenerationActive(generation) else { return }
+            self.publishSignal(healthSnapshot)
         }
+    }
+
+    private func publishSignal(_ data: [String: Any]) {
+        signalListenerLifecycle.publish {
+            notifyListeners("signal", data: data)
+        }
+    }
+
+    private func executeHealthQuery(
+        _ query: HKQuery,
+        monitoringGeneration generation: UInt64?,
+        cancelCompletion: @escaping () -> Void
+    ) {
+        guard let generation else {
+            healthStore.execute(query)
+            return
+        }
+        guard monitoringHealthQueries.register(
+            query,
+            generation: generation,
+            cancelCompletion: cancelCompletion
+        ) else {
+            cancelCompletion()
+            return
+        }
+
+        healthStore.execute(query)
+        // stopMonitoring can invalidate ownership between registration and
+        // execution. Stopping again after execution closes that narrow race.
+        if !monitoringHealthQueries.contains(query, generation: generation) {
+            healthStore.stop(query)
+        }
+    }
+
+    private func completeHealthQuery(
+        _ query: HKQuery,
+        monitoringGeneration generation: UInt64?
+    ) {
+        guard generation != nil else { return }
+        monitoringHealthQueries.complete(query)
     }
 
     private func buildHealthSnapshot(
         reason: String,
+        monitoringGeneration generation: UInt64? = nil,
         completion: @escaping ([String: Any]) -> Void
     ) {
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -770,7 +993,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             var warnings: [String] = []
 
             group.enter()
-            self.fetchSleepSummary { capture, fetchWarning in
+            self.fetchSleepSummary(monitoringGeneration: generation) { capture, fetchWarning in
                 sleepSummary = capture
                 if let fetchWarning {
                     warnings.append(fetchWarning)
@@ -779,7 +1002,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             group.enter()
-            self.fetchBiometrics { capture, fetchWarning in
+            self.fetchBiometrics(monitoringGeneration: generation) { capture, fetchWarning in
                 biometricsSummary = capture
                 if let fetchWarning {
                     warnings.append(fetchWarning)
@@ -864,6 +1087,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func fetchSleepSummary(
+        monitoringGeneration generation: UInt64?,
         completion: @escaping (HealthCapture?, String?) -> Void
     ) {
         guard let sampleType = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) else {
@@ -880,31 +1104,80 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         let sortDescriptors = [
             NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         ]
-
+        let callbackQueue = healthQueue
+        let completionGate = OneShotCompletionGate()
         let query = HKSampleQuery(
             sampleType: sampleType,
             predicate: predicate,
             limit: HKObjectQueryNoLimit,
             sortDescriptors: sortDescriptors
-        ) { _, samples, error in
-            guard error == nil else {
-                completion(nil, "Sleep analysis query failed")
-                return
-            }
-            let categories = (samples as? [HKCategorySample]) ?? []
-            guard !categories.isEmpty else {
+        ) { [weak self] completedQuery, samples, error in
+            self?.completeHealthQuery(
+                completedQuery,
+                monitoringGeneration: generation
+            )
+            guard completionGate.claim() else { return }
+            callbackQueue.async {
+                guard error == nil else {
+                    completion(nil, "Sleep analysis query failed")
+                    return
+                }
+                let categories = (samples as? [HKCategorySample]) ?? []
+                guard !categories.isEmpty else {
+                    completion(
+                        HealthCapture(
+                            source: "healthkit",
+                            screenTime: ScreenTimeSupport.buildStatus(),
+                            permissions: ["sleep": false, "biometrics": false],
+                            sleep: [
+                                "available": false,
+                                "isSleeping": false,
+                                "asleepAt": NSNull(),
+                                "awakeAt": NSNull(),
+                                "durationMinutes": NSNull(),
+                                "stage": NSNull(),
+                            ],
+                            biometrics: [
+                                "sampleAt": NSNull(),
+                                "heartRateBpm": NSNull(),
+                                "restingHeartRateBpm": NSNull(),
+                                "heartRateVariabilityMs": NSNull(),
+                                "respiratoryRate": NSNull(),
+                                "bloodOxygenPercent": NSNull(),
+                            ],
+                            warnings: []
+                        ),
+                        nil
+                    )
+                    return
+                }
+
+                let latestEpisode = Self.latestSleepEpisode(from: categories)
+                let latestAwake = categories.last(where: { $0.value == HKCategoryValueSleepAnalysis.awake.rawValue })
+                let now = Date()
+                let sleepFreshnessWindow: TimeInterval = 15 * 60
+                let isSleeping =
+                    latestEpisode != nil &&
+                    latestEpisode!.endDate >= now.addingTimeInterval(-sleepFreshnessWindow) &&
+                    (latestAwake == nil || latestAwake!.endDate <= latestEpisode!.endDate)
+                let asleepAt = latestEpisode?.startDate
+                let awakeAt = isSleeping ? nil : latestEpisode?.endDate
+                let durationMinutes = latestEpisode?.durationMinutes
+                let stage = latestEpisode.map { episode in
+                    isSleeping ? Self.sleepStageName(for: episode.latestStageValue) : "awake"
+                } ?? "awake"
                 completion(
                     HealthCapture(
                         source: "healthkit",
                         screenTime: ScreenTimeSupport.buildStatus(),
-                        permissions: ["sleep": false, "biometrics": false],
+                        permissions: ["sleep": true, "biometrics": false],
                         sleep: [
-                            "available": false,
-                            "isSleeping": false,
-                            "asleepAt": NSNull(),
-                            "awakeAt": NSNull(),
-                            "durationMinutes": NSNull(),
-                            "stage": NSNull(),
+                            "available": true,
+                            "isSleeping": isSleeping,
+                            "asleepAt": asleepAt.map { Int64($0.timeIntervalSince1970 * 1000) } ?? NSNull(),
+                            "awakeAt": awakeAt.map { Int64($0.timeIntervalSince1970 * 1000) } ?? NSNull(),
+                            "durationMinutes": durationMinutes.map { Int64($0.rounded()) } ?? NSNull(),
+                            "stage": stage,
                         ],
                         biometrics: [
                             "sampleAt": NSNull(),
@@ -918,53 +1191,21 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                     ),
                     nil
                 )
-                return
             }
-
-            let latestEpisode = Self.latestSleepEpisode(from: categories)
-            let latestAwake = categories.last(where: { $0.value == HKCategoryValueSleepAnalysis.awake.rawValue })
-            let now = Date()
-            let sleepFreshnessWindow: TimeInterval = 15 * 60
-            let isSleeping =
-                latestEpisode != nil &&
-                latestEpisode!.endDate >= now.addingTimeInterval(-sleepFreshnessWindow) &&
-                (latestAwake == nil || latestAwake!.endDate <= latestEpisode!.endDate)
-            let asleepAt = latestEpisode?.startDate
-            let awakeAt = isSleeping ? nil : latestEpisode?.endDate
-            let durationMinutes = latestEpisode?.durationMinutes
-            let stage = latestEpisode.map { episode in
-                isSleeping ? Self.sleepStageName(for: episode.latestStageValue) : "awake"
-            } ?? "awake"
-            completion(
-                HealthCapture(
-                    source: "healthkit",
-                    screenTime: ScreenTimeSupport.buildStatus(),
-                    permissions: ["sleep": true, "biometrics": false],
-                    sleep: [
-                        "available": true,
-                        "isSleeping": isSleeping,
-                        "asleepAt": asleepAt.map { Int64($0.timeIntervalSince1970 * 1000) } ?? NSNull(),
-                        "awakeAt": awakeAt.map { Int64($0.timeIntervalSince1970 * 1000) } ?? NSNull(),
-                        "durationMinutes": durationMinutes.map { Int64($0.rounded()) } ?? NSNull(),
-                        "stage": stage,
-                    ],
-                    biometrics: [
-                        "sampleAt": NSNull(),
-                        "heartRateBpm": NSNull(),
-                        "restingHeartRateBpm": NSNull(),
-                        "heartRateVariabilityMs": NSNull(),
-                        "respiratoryRate": NSNull(),
-                        "bloodOxygenPercent": NSNull(),
-                    ],
-                    warnings: []
-                ),
-                nil
-            )
         }
-        healthStore.execute(query)
+        executeHealthQuery(
+            query,
+            monitoringGeneration: generation
+        ) {
+            guard completionGate.claim() else { return }
+            callbackQueue.async {
+                completion(nil, nil)
+            }
+        }
     }
 
     private func fetchBiometrics(
+        monitoringGeneration generation: UInt64?,
         completion: @escaping (HealthCapture?, String?) -> Void
     ) {
         let startDate = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date().addingTimeInterval(-7 * 24 * 60 * 60)
@@ -976,6 +1217,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
         )
 
         let group = DispatchGroup()
+        let callbackQueue = healthQueue
         var latestHeartRate: (value: Double, at: Date)?
         var latestRestingHeartRate: (value: Double, at: Date)?
         var latestHrv: (value: Double, at: Date)?
@@ -991,6 +1233,7 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
             group.enter()
+            let completionGate = OneShotCompletionGate()
             let query = HKSampleQuery(
                 sampleType: sampleType,
                 predicate: predicate,
@@ -998,15 +1241,30 @@ public class MobileSignalsPlugin: CAPPlugin, CAPBridgedPlugin {
                 sortDescriptors: [
                     NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
                 ]
-            ) { _, samples, error in
-                defer { group.leave() }
-                guard error == nil,
-                      let sample = samples?.first as? HKQuantitySample else {
-                    return
+            ) { [weak self] completedQuery, samples, error in
+                self?.completeHealthQuery(
+                    completedQuery,
+                    monitoringGeneration: generation
+                )
+                guard completionGate.claim() else { return }
+                callbackQueue.async {
+                    defer { group.leave() }
+                    guard error == nil,
+                          let sample = samples?.first as? HKQuantitySample else {
+                        return
+                    }
+                    assign(sample.quantity.doubleValue(for: unit), sample.startDate)
                 }
-                assign(sample.quantity.doubleValue(for: unit), sample.startDate)
             }
-            healthStore.execute(query)
+            executeHealthQuery(
+                query,
+                monitoringGeneration: generation
+            ) {
+                guard completionGate.claim() else { return }
+                callbackQueue.async {
+                    group.leave()
+                }
+            }
         }
 
         fetchLatest(identifier: .heartRate, unit: HKUnit(from: "count/min")) { value, at in

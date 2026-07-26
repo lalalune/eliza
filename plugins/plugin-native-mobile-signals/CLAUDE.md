@@ -16,10 +16,11 @@ This package registers one Capacitor plugin: **`MobileSignals`**.
 | `requestPermissions(options?)` | Triggers native permission request flows (health, screen time, notifications). |
 | `openSettings(options?)` | Opens a specific native settings page (app, health, battery optimization, etc.). |
 | `startMonitoring(options?)` | Starts event streaming; returns initial device + health snapshots. |
-| `stopMonitoring()` | Stops event streaming and removes all native listeners. |
+| `stopMonitoring()` | Stops event streaming and invalidates or cancels every monitoring-owned observer, event source, and native query before confirming the postcondition. A `getSnapshot()` read begun during monitoring joins that generation so teardown can settle it. |
+| `releaseSignalListeners()` | Clears the native Capacitor signal-listener registry and releases its bridge-saved keep-alive calls before confirming both ownership tables are empty. |
 | `getSnapshot()` | One-shot async read of current device + health state without streaming. |
 | `scheduleBackgroundRefresh()` | Background refresh is unavailable on the current native implementations (iOS uses foreground monitoring and routes background work elsewhere; web cannot schedule). Always resolves `scheduled: false` with a reason. |
-| `cancelBackgroundRefresh()` | No native background-refresh task is registered to cancel. Always resolves `cancelled: false` with a reason. |
+| `cancelBackgroundRefresh()` | Establishes the idempotent postcondition that no refresh job scheduled through this plugin remains. App-lifetime OS delivery registrations such as HealthKit background delivery are explicitly outside this job-scoped contract. |
 | `addListener("signal", fn)` | Subscribes to `MobileSignalsSignal` events (device snapshot or health snapshot). |
 | `removeAllListeners()` | Removes all registered event listeners. |
 
@@ -115,6 +116,9 @@ Extend `MobileSignalsSnapshot` or `MobileSignalsHealthSnapshot` in `src/definiti
 - **Instrumented test (issue #9967).** The `PACKAGE_USAGE_STATS` reads (AppOps `GET_USAGE_STATS` check + `UsageStatsManager.queryUsageStats`) live in `UsageStatsReader`; the plugin delegates to it (single source) so an on-device `androidTest` can drive the real provider. The permission is special-access, so the harness grants it host-side (`appops set <pkg> android:get_usage_stats allow`) and the usage tests `Assume`-skip when absent — verified positive on an API-34 emulator (real foreground-usage history).
 - This is a **Capacitor plugin**, not an elizaOS action/provider/service plugin. There is no `Plugin` object registered with `AgentRuntime`. It is consumed by a Capacitor-enabled mobile/web app.
 - The web fallback (`src/web.ts`) always returns `status: "not-applicable"` for `checkPermissions` and `false` for health capabilities. Do not add health data to the web path.
+- HealthKit does not disclose individual read grants. iOS uses `getRequestStatusForAuthorization` and reports `"determined"` only when another consent sheet is unnecessary; this is not `"granted"`, and the per-type permission booleans remain `false`.
+- A failed or unknown HealthKit request-status lookup rejects `checkPermissions()`; it must not be translated into a promptable or healthy permission state.
+- iOS HealthKit queries spawned by monitoring are generation-owned and synchronously stopped during `stopMonitoring()`; their one-shot completion gates release aggregation callbacks exactly once even when cancellation races the HealthKit callback. An explicit `getSnapshot()` begun while monitoring is active joins that generation so its bridge promise settles during teardown; a standalone snapshot remains request-owned.
 - `rawUsageExportAvailable` is permanently `false` in `MobileSignalsScreenTimeStatus` — this is intentional (Apple does not expose raw usage export).
 - On iOS, Screen Time features require Apple's restricted `com.apple.developer.family-controls` entitlement, which must be provisioned by Apple. The `validate:ios-screen-time` script is the canonical check.
 - `dist/` is committed for publishing but should be regenerated via `build` before any release.

@@ -6,7 +6,7 @@
  * bridge. Also hosts the permission-priming card.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PermissionId, PermissionState } from "../../api";
 import {
   getMobileSignalsPlugin,
@@ -22,8 +22,11 @@ import {
   platform as runtimePlatform,
 } from "../../platform";
 import {
+  checkMobileSignalsPermissions,
   createMobileSignalsPermissionsRegistry,
   openMobilePermissionSettings,
+  openMobileSignalsSettings,
+  requestMobileSignalsPermissions,
 } from "../../platform/mobile-permissions-client";
 import { useAppSelector } from "../../state";
 import { PermissionPrimingModal } from "../permissions/PermissionPrimingModal";
@@ -31,7 +34,11 @@ import { resolvePrimingSet } from "../permissions/permission-priming";
 import { StreamingPermissionsSettingsView } from "../permissions/StreamingPermissions";
 import { CapabilityToggle, PermissionRow } from "./permission-controls";
 import { useDesktopPermissionsState } from "./permission-controls.hooks";
-import { CAPABILITIES, SYSTEM_PERMISSIONS } from "./permission-types";
+import {
+  CAPABILITIES,
+  SYSTEM_PERMISSIONS,
+  translateWithFallback,
+} from "./permission-types";
 import { SettingsActionButton } from "./settings-agent-rows";
 import { SettingsGroup, SettingsRow, SettingsStack } from "./settings-layout";
 
@@ -110,7 +117,21 @@ function mobileSettingsPlatform(): "ios" | "android" | "web" {
   return "web";
 }
 
-function MobileSystemPermissionsPanel() {
+type MobilePermissionOperation = "check" | "request" | "settings";
+
+function mobilePermissionErrorMessage(
+  operation: MobilePermissionOperation,
+): string {
+  if (operation === "request") {
+    return "The permission request failed before the OS confirmed a result. Retry to read the current state.";
+  }
+  if (operation === "settings") {
+    return "Settings could not be opened. Retry or open the app's permission settings manually.";
+  }
+  return "The current permission state could not be read. Retry to check again.";
+}
+
+export function MobileSystemPermissionsPanel() {
   const t = useAppSelector((s) => s.t);
   const branding = useBranding();
   const mobilePlatform = mobileSettingsPlatform();
@@ -128,43 +149,67 @@ function MobileSystemPermissionsPanel() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<PermissionId | null>(null);
+  const [errors, setErrors] = useState<
+    Partial<Record<PermissionId, MobilePermissionOperation>>
+  >({});
+  const operationInFlightRef = useRef(false);
 
-  const refresh = useCallback(
-    async (showSpinner = false) => {
-      if (showSpinner) setRefreshing(true);
-      try {
-        const entries = await Promise.all(
-          permissionDefs.map(async (def) => {
-            try {
-              return [def.id, await registry.check(def.id)] as const;
-            } catch {
-              return [def.id, registry.get(def.id)] as const;
-            }
-          }),
-        );
-        setStates(Object.fromEntries(entries));
-      } finally {
-        if (showSpinner) setRefreshing(false);
+  const checkPermissions = useCallback(async () => {
+    const results = await Promise.all(
+      permissionDefs.map(async (def) => {
+        try {
+          return {
+            id: def.id,
+            state: await registry.check(def.id),
+          } as const;
+        } catch {
+          // error-policy:J4 a failed native probe is rendered as an error row;
+          // cached defaults must not masquerade as a promptable OS state.
+          return { id: def.id, error: "check" as const };
+        }
+      }),
+    );
+    const nextStates: Partial<Record<PermissionId, PermissionState>> = {};
+    const nextErrors: Partial<Record<PermissionId, MobilePermissionOperation>> =
+      {};
+    for (const result of results) {
+      if ("state" in result) {
+        nextStates[result.id] = result.state;
+      } else {
+        nextErrors[result.id] = result.error;
       }
-    },
-    [permissionDefs, registry],
-  );
+    }
+    return { states: nextStates, errors: nextErrors };
+  }, [permissionDefs, registry]);
+
+  const applyPermissionCheck = useCallback(async () => {
+    const next = await checkPermissions();
+    setStates(next.states);
+    setErrors(next.errors);
+  }, [checkPermissions]);
+
+  const refresh = useCallback(async () => {
+    if (operationInFlightRef.current) return;
+    operationInFlightRef.current = true;
+    setRefreshing(true);
+    try {
+      await applyPermissionCheck();
+    } finally {
+      operationInFlightRef.current = false;
+      setRefreshing(false);
+    }
+  }, [applyPermissionCheck]);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       setLoading(true);
       try {
-        const entries = await Promise.all(
-          permissionDefs.map(async (def) => {
-            try {
-              return [def.id, await registry.check(def.id)] as const;
-            } catch {
-              return [def.id, registry.get(def.id)] as const;
-            }
-          }),
-        );
-        if (!cancelled) setStates(Object.fromEntries(entries));
+        const next = await checkPermissions();
+        if (!cancelled) {
+          setStates(next.states);
+          setErrors(next.errors);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -172,35 +217,89 @@ function MobileSystemPermissionsPanel() {
     return () => {
       cancelled = true;
     };
-  }, [permissionDefs, registry]);
+  }, [checkPermissions]);
+
+  const recordError = useCallback(
+    (id: PermissionId, operation: MobilePermissionOperation) => {
+      setStates((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+      setErrors((current) => ({ ...current, [id]: operation }));
+    },
+    [],
+  );
 
   const requestPermission = useCallback(
     async (id: PermissionId) => {
+      if (operationInFlightRef.current) return;
+      operationInFlightRef.current = true;
       setBusyId(id);
       try {
         await registry.request(id, {
           reason: "Enable this permission from Settings.",
           feature: { app: "settings", action: `permissions.${id}` },
         });
-        await refresh();
+        await applyPermissionCheck();
+      } catch {
+        // error-policy:J4 request transport/native failures remain distinct
+        // from a denied permission result and expose the row's retry control.
+        recordError(id, "request");
       } finally {
+        operationInFlightRef.current = false;
         setBusyId(null);
       }
     },
-    [refresh, registry],
+    [applyPermissionCheck, recordError, registry],
   );
 
   const openSettings = useCallback(
     async (id: PermissionId) => {
+      if (operationInFlightRef.current) return;
+      operationInFlightRef.current = true;
       setBusyId(id);
       try {
-        await openMobilePermissionSettings(id);
-        await refresh();
+        const result = await openMobilePermissionSettings(id);
+        if (result?.opened !== true) {
+          recordError(id, "settings");
+          return;
+        }
+        await applyPermissionCheck();
+      } catch {
+        // error-policy:J4 settings-navigation failures are visible and
+        // retryable; they are not converted into a permission state.
+        recordError(id, "settings");
       } finally {
+        operationInFlightRef.current = false;
         setBusyId(null);
       }
     },
-    [refresh],
+    [applyPermissionCheck, recordError],
+  );
+
+  const retryPermission = useCallback(
+    async (id: PermissionId) => {
+      if (operationInFlightRef.current) return;
+      operationInFlightRef.current = true;
+      setBusyId(id);
+      try {
+        const next = await registry.check(id);
+        setStates((current) => ({ ...current, [id]: next }));
+        setErrors((current) => {
+          const updated = { ...current };
+          delete updated[id];
+          return updated;
+        });
+      } catch {
+        // error-policy:J4 preserve the explicit row error when a retry fails.
+        recordError(id, "check");
+      } finally {
+        operationInFlightRef.current = false;
+        setBusyId(null);
+      }
+    },
+    [recordError, registry],
   );
 
   if (permissionDefs.length === 0) return null;
@@ -229,8 +328,8 @@ function MobileSystemPermissionsPanel() {
           variant="outline"
           size="sm"
           className="h-9 rounded-sm px-3 text-xs font-semibold"
-          onClick={() => void refresh(true)}
-          disabled={refreshing}
+          onClick={() => void refresh()}
+          disabled={refreshing || busyId !== null}
         >
           {refreshing
             ? t("common.refreshing", { defaultValue: "Refreshing..." })
@@ -244,7 +343,47 @@ function MobileSystemPermissionsPanel() {
       })}
     >
       {permissionDefs.map((def) => {
-        const state = states[def.id] ?? registry.get(def.id);
+        const operationError = errors[def.id];
+        const state = states[def.id];
+        if (operationError || !state) {
+          const name = translateWithFallback(t, def.nameKey, def.name);
+          return (
+            <SettingsRow
+              key={def.id}
+              tone="danger"
+              label={
+                <span className="flex flex-wrap items-center gap-2">
+                  {name}
+                  <span className="rounded-full border border-danger/30 px-2 py-0.5 text-xs font-medium text-danger">
+                    Check failed
+                  </span>
+                </span>
+              }
+              description={
+                <span
+                  role="alert"
+                  data-testid={`mobile-permission-error-${def.id}`}
+                >
+                  {mobilePermissionErrorMessage(operationError ?? "check")}
+                </span>
+              }
+              control={
+                <SettingsActionButton
+                  agentId={`perm-mobile-system-retry-${def.id}`}
+                  agentLabel={`Retry ${name} permission check`}
+                  agentGroup="permissions"
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11 rounded-sm px-3 text-xs font-semibold"
+                  onClick={() => void retryPermission(def.id)}
+                  disabled={busyId !== null}
+                >
+                  {busyId === def.id ? "Checking..." : "Retry"}
+                </SettingsActionButton>
+              }
+            />
+          );
+        }
         return (
           <PermissionRow
             key={def.id}
@@ -255,6 +394,7 @@ function MobileSystemPermissionsPanel() {
             canRequest={state.canRequest}
             onRequest={() => void requestPermission(def.id)}
             onOpenSettings={() => void openSettings(def.id)}
+            disabled={busyId !== null}
             isShell={false}
             shellEnabled
           />
@@ -282,7 +422,25 @@ function mobileSetupRequestTarget(action: MobileSignalsSetupAction) {
   return "all";
 }
 
-function mobileSetupActionBadge(action: MobileSignalsSetupAction) {
+function mobileSetupPermissionId(
+  action: MobileSignalsSetupAction,
+): PermissionId {
+  if (action.id === "health_permissions") return "health";
+  if (action.id === "screen_time_authorization") return "screentime";
+  if (action.id === "android_usage_access") return "usage-access";
+  if (action.id === "notification_settings") return "notifications";
+  if (action.id === "battery_optimization") return "battery-optimization";
+  if (action.id === "local_network") return "local-network";
+  return "health";
+}
+
+function mobileSetupActionBadge(
+  action: MobileSignalsSetupAction,
+  choicesAreOpaque: boolean,
+) {
+  if (choicesAreOpaque) {
+    return { label: "Choices set", className: "border-border/50 text-muted" };
+  }
   if (action.status === "ready") {
     return { label: "Ready", className: "border-ok/30 text-ok" };
   }
@@ -304,17 +462,23 @@ export function MobileSignalsPermissionsPanel() {
   // error, not vanish like the designed "plugin not on this platform" degrade
   // (three-state rule: error vs designed-hidden must be distinguishable).
   const [error, setError] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const operationInFlightRef = useRef(false);
 
-  const refresh = useCallback(async () => {
+  const loadStatus = useCallback(async () => {
     const plugin = getMobileSignalsPlugin();
     if (typeof plugin.checkPermissions !== "function") {
       setStatus(null);
+      setError(false);
       return;
     }
     try {
-      setStatus(await plugin.checkPermissions());
+      const next = await checkMobileSignalsPermissions(plugin);
+      setStatus(next ?? null);
       setError(false);
+      setActionError(null);
     } catch {
       // error-policy:J4 bridge call failed — surface the explicit error row
       // below instead of silently hiding the whole panel.
@@ -322,6 +486,18 @@ export function MobileSignalsPermissionsPanel() {
       setError(true);
     }
   }, []);
+
+  const refresh = useCallback(async () => {
+    if (operationInFlightRef.current) return;
+    operationInFlightRef.current = true;
+    setRefreshing(true);
+    try {
+      await loadStatus();
+    } finally {
+      operationInFlightRef.current = false;
+      setRefreshing(false);
+    }
+  }, [loadStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -335,9 +511,9 @@ export function MobileSignalsPermissionsPanel() {
           if (!cancelled) setStatus(null);
           return;
         }
-        const next = await plugin.checkPermissions();
+        const next = await checkMobileSignalsPermissions(plugin);
         if (!cancelled) {
-          setStatus(next);
+          setStatus(next ?? null);
           setError(false);
         }
       } catch {
@@ -357,34 +533,61 @@ export function MobileSignalsPermissionsPanel() {
   }, []);
 
   const handleAction = useCallback(
-    async (action: MobileSignalsSetupAction) => {
+    async (action: MobileSignalsSetupAction, manageOpaqueChoices: boolean) => {
+      if (operationInFlightRef.current) return;
+      operationInFlightRef.current = true;
       const plugin = getMobileSignalsPlugin();
+      const permissionId = mobileSetupPermissionId(action);
       setBusyAction(action.id);
+      setActionError(null);
       try {
-        if (
+        if (manageOpaqueChoices && action.canOpenSettings) {
+          const result = await openMobileSignalsSettings(
+            permissionId,
+            mobileSetupActionTarget(action),
+            plugin,
+          );
+          if (result?.opened !== true) {
+            setActionError(action.label);
+            return;
+          }
+        } else if (
           action.canRequest &&
           (action.id === "health_permissions" ||
             action.id === "screen_time_authorization" ||
             action.id === "notification_settings") &&
           typeof plugin.requestPermissions === "function"
         ) {
-          await plugin.requestPermissions({
-            target: mobileSetupRequestTarget(action),
-          });
+          await requestMobileSignalsPermissions(
+            permissionId,
+            mobileSetupRequestTarget(action),
+            plugin,
+          );
         } else if (
           action.canOpenSettings &&
           typeof plugin.openSettings === "function"
         ) {
-          await plugin.openSettings({
-            target: mobileSetupActionTarget(action),
-          });
+          const result = await openMobileSignalsSettings(
+            permissionId,
+            mobileSetupActionTarget(action),
+            plugin,
+          );
+          if (result?.opened !== true) {
+            setActionError(action.label);
+            return;
+          }
         }
-        await refresh();
+        await loadStatus();
+      } catch {
+        // error-policy:J4 a failed request/settings action remains visible on
+        // the panel and can be retried from the unchanged action row.
+        setActionError(action.label);
       } finally {
+        operationInFlightRef.current = false;
         setBusyAction(null);
       }
     },
-    [refresh],
+    [loadStatus],
   );
 
   if (loading) {
@@ -400,14 +603,41 @@ export function MobileSignalsPermissionsPanel() {
   if (!status) {
     if (error) {
       return (
-        <p
-          data-testid="mobile-signals-permissions-error"
-          className="py-4 text-center text-xs text-danger"
-        >
-          {t("permissionssection.PermissionsError", {
-            defaultValue: "Could not read device permissions.",
+        <SettingsGroup
+          title={t("permissionssection.LifeOpsSignals", {
+            defaultValue: "LifeOps Signals",
           })}
-        </p>
+        >
+          <SettingsRow
+            tone="danger"
+            label={t("permissionssection.PermissionsUnavailable", {
+              defaultValue: "Device permissions unavailable",
+            })}
+            description={
+              <span role="alert" data-testid="mobile-signals-permissions-error">
+                {t("permissionssection.PermissionsError", {
+                  defaultValue: "Could not read device permissions.",
+                })}
+              </span>
+            }
+            control={
+              <SettingsActionButton
+                agentId="perm-mobile-signals-retry"
+                agentLabel="Retry mobile signals permission check"
+                agentGroup="permissions"
+                variant="outline"
+                size="sm"
+                className="min-h-11 rounded-sm px-3 text-xs font-semibold"
+                onClick={() => void refresh()}
+                disabled={refreshing}
+              >
+                {refreshing
+                  ? t("common.retrying", { defaultValue: "Retrying..." })
+                  : t("common.retry", { defaultValue: "Retry" })}
+              </SettingsActionButton>
+            }
+          />
+        </SettingsGroup>
       );
     }
     return null;
@@ -427,39 +657,62 @@ export function MobileSignalsPermissionsPanel() {
           size="sm"
           className="h-9 rounded-sm px-3 text-xs font-semibold"
           onClick={refresh}
+          disabled={refreshing || busyAction !== null}
         >
-          {t("common.refresh", { defaultValue: "Refresh" })}
+          {refreshing
+            ? t("common.refreshing", { defaultValue: "Refreshing..." })
+            : t("common.refresh", { defaultValue: "Refresh" })}
         </SettingsActionButton>
       }
     >
-      {status.setupActions.map((action) => (
-        <MobileSetupActionRow
-          key={action.id}
-          action={action}
-          busy={busyAction === action.id}
-          onAct={() => void handleAction(action)}
-        />
-      ))}
+      {actionError ? (
+        <p
+          role="alert"
+          data-testid="mobile-signals-action-error"
+          className="py-2 text-xs text-danger"
+        >
+          Could not update {actionError}. Try again.
+        </p>
+      ) : null}
+      {status.setupActions.map((action) => {
+        const choicesAreOpaque =
+          status.status === "determined" && action.id === "health_permissions";
+        return (
+          <MobileSetupActionRow
+            key={action.id}
+            action={action}
+            choicesAreOpaque={choicesAreOpaque}
+            busy={busyAction !== null || refreshing}
+            onAct={() => void handleAction(action, choicesAreOpaque)}
+          />
+        );
+      })}
     </SettingsGroup>
   );
 }
 
 function MobileSetupActionRow({
   action,
+  choicesAreOpaque,
   busy,
   onAct,
 }: {
   action: MobileSignalsSetupAction;
+  choicesAreOpaque: boolean;
   busy: boolean;
   onAct: () => void;
 }) {
   const t = useAppSelector((s) => s.t);
-  const badge = mobileSetupActionBadge(action);
-  const canAct =
-    action.status !== "ready" && (action.canRequest || action.canOpenSettings);
-  const actionLabel = action.canRequest
-    ? t("permissionssection.Grant", { defaultValue: "Grant" })
-    : t("permissionssection.OpenSettings", { defaultValue: "Open Settings" });
+  const badge = mobileSetupActionBadge(action, choicesAreOpaque);
+  const canAct = choicesAreOpaque
+    ? action.canOpenSettings
+    : action.status !== "ready" &&
+      (action.canRequest || action.canOpenSettings);
+  const actionLabel = choicesAreOpaque
+    ? t("permissionssection.Manage", { defaultValue: "Manage" })
+    : action.canRequest
+      ? t("permissionssection.Grant", { defaultValue: "Grant" })
+      : t("permissionssection.OpenSettings", { defaultValue: "Open Settings" });
   return (
     <SettingsRow
       label={
@@ -472,7 +725,11 @@ function MobileSetupActionRow({
           </span>
         </span>
       }
-      description={action.reason ?? undefined}
+      description={
+        choicesAreOpaque
+          ? "iOS keeps individual HealthKit read choices private. Monitoring can query only the data you allowed."
+          : (action.reason ?? undefined)
+      }
       control={
         canAct ? (
           <SettingsActionButton
@@ -569,6 +826,7 @@ function DesktopPermissionsView() {
   const { websiteBlockerSettingsCard: WebsiteBlockerSettingsCard } =
     useBootConfig();
   const {
+    busyPermissionId,
     handleOpenSettings,
     handleRequest,
     handleToggleShell,
@@ -645,6 +903,7 @@ function DesktopPermissionsView() {
               canRequest={state?.canRequest ?? false}
               onRequest={() => handleRequest(def.id)}
               onOpenSettings={() => handleOpenSettings(def.id)}
+              disabled={busyPermissionId !== null}
               isShell={def.id === "shell"}
               shellEnabled={shellEnabled}
               onToggleShell={def.id === "shell" ? handleToggleShell : undefined}

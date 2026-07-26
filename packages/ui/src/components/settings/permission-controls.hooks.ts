@@ -7,7 +7,7 @@
  */
 
 import { logger } from "@elizaos/logger";
-import { PERMISSION_IDS } from "@elizaos/shared";
+import { isPermissionStatus, PERMISSION_IDS } from "@elizaos/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type AllPermissionsState,
@@ -39,14 +39,6 @@ const RENDERER_PERMISSION_IDS: readonly RendererPermissionId[] = [
   "location",
   "notifications",
 ];
-const PERMISSION_STATUSES: readonly PermissionStatus[] = [
-  "granted",
-  "denied",
-  "not-determined",
-  "restricted",
-  "not-applicable",
-];
-
 function isRuntimePermissionId(id: PermissionId): boolean {
   return RUNTIME_PERMISSION_IDS.includes(id);
 }
@@ -62,13 +54,6 @@ function isRendererPermissionId(id: PermissionId): id is RendererPermissionId {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
-}
-
-function isPermissionStatus(value: unknown): value is PermissionStatus {
-  return (
-    typeof value === "string" &&
-    PERMISSION_STATUSES.includes(value as PermissionStatus)
-  );
 }
 
 function isPermissionState(
@@ -284,18 +269,12 @@ async function mergeRuntimePermissionsIntoSnapshot(
 
   await Promise.all(
     RUNTIME_PERMISSION_IDS.map(async (id) => {
-      try {
-        const permission = await client.getPermission(id);
-        if (!changed) {
-          nextPermissions = { ...snapshot.permissions };
-          changed = true;
-        }
-        nextPermissions[id] = permission;
-      } catch {
-        // Keep the bridged snapshot when the runtime-side permission route is
-        // unavailable. This avoids breaking the whole panel on transient API
-        // startup delays.
+      const permission = await client.getPermission(id);
+      if (!changed) {
+        nextPermissions = { ...snapshot.permissions };
+        changed = true;
       }
+      nextPermissions[id] = permission;
     }),
   );
 
@@ -319,7 +298,22 @@ export function useDesktopPermissionsState() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [shellEnabled, setShellEnabled] = useState(true);
+  const [busyPermissionId, setBusyPermissionId] = useState<PermissionId | null>(
+    null,
+  );
   const settingsRefreshTimersRef = useRef<number[]>([]);
+  const snapshotSequenceRef = useRef(0);
+  const lastAppliedSnapshotSequenceRef = useRef(0);
+  const operationInFlightRef = useRef<symbol | null>(null);
+  const passiveRefreshQueuedRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const applySnapshot = useCallback((snapshot: DesktopPermissionsSnapshot) => {
     setPermissions(snapshot.permissions);
@@ -385,11 +379,88 @@ export function useDesktopPermissionsState() {
 
   const replaceSnapshot = useCallback(
     async (forceRefresh = false): Promise<DesktopPermissionsSnapshot> => {
+      const sequence = ++snapshotSequenceRef.current;
       const snapshot = await loadPermissionsSnapshot(forceRefresh);
-      applySnapshot(snapshot);
+      if (
+        mountedRef.current &&
+        sequence > lastAppliedSnapshotSequenceRef.current
+      ) {
+        lastAppliedSnapshotSequenceRef.current = sequence;
+        applySnapshot(snapshot);
+      }
       return snapshot;
     },
     [applySnapshot, loadPermissionsSnapshot],
+  );
+
+  const requestPassiveSnapshotRefresh = useCallback(
+    async (forceRefresh = true): Promise<DesktopPermissionsSnapshot | null> => {
+      if (operationInFlightRef.current) {
+        passiveRefreshQueuedRef.current = true;
+        return null;
+      }
+      return replaceSnapshot(forceRefresh);
+    },
+    [replaceSnapshot],
+  );
+
+  const runPermissionOperation = useCallback(
+    async (id: PermissionId, operation: () => Promise<void>) => {
+      if (operationInFlightRef.current) {
+        return null;
+      }
+
+      const owner = Symbol(id);
+      operationInFlightRef.current = owner;
+      // Any snapshot admitted before the OS action began is stale by
+      // definition, even if its bridge response arrives after the action.
+      lastAppliedSnapshotSequenceRef.current = snapshotSequenceRef.current;
+      setBusyPermissionId(id);
+      try {
+        let operationFailed = false;
+        let operationError: unknown;
+        try {
+          await operation();
+        } catch (err) {
+          operationFailed = true;
+          operationError = err;
+        }
+
+        let snapshot: DesktopPermissionsSnapshot | null = null;
+        try {
+          // This is the single authoritative boundary read for every admitted
+          // mutation. It runs even when the native action changed OS state and
+          // then rejected its bridge promise.
+          snapshot = await replaceSnapshot(true);
+        } catch (err) {
+          // error-policy:J4 preserve the last confirmed UI state while making
+          // a failed post-mutation reconciliation independently observable.
+          logger.warn(
+            { err, id },
+            "[permission-controls] post-operation refresh failed",
+          );
+          if (!operationFailed) {
+            throw err;
+          }
+        }
+
+        if (operationFailed) {
+          throw operationError;
+        }
+        return snapshot;
+      } finally {
+        if (operationInFlightRef.current === owner) {
+          operationInFlightRef.current = null;
+          // Focus/bridge events admitted during the operation are represented
+          // by the boundary read above, so they must not launch a duplicate.
+          passiveRefreshQueuedRef.current = false;
+          if (mountedRef.current) {
+            setBusyPermissionId(null);
+          }
+        }
+      }
+    },
+    [replaceSnapshot],
   );
 
   const scheduleSettingsRefreshes = useCallback(() => {
@@ -406,11 +477,18 @@ export function useDesktopPermissionsState() {
           settingsRefreshTimersRef.current.filter(
             (currentTimerId) => currentTimerId !== timerId,
           );
-        void replaceSnapshot(true);
+        void requestPassiveSnapshotRefresh(true).catch((err) => {
+          // error-policy:J4 keep the last visible snapshot and surface the
+          // scheduled reconciliation failure for a later user retry.
+          logger.warn(
+            { err },
+            "[permission-controls] scheduled settings refresh failed",
+          );
+        });
       }, delayMs);
       settingsRefreshTimersRef.current.push(timerId);
     }
-  }, [clearScheduledSettingsRefreshes, replaceSnapshot]);
+  }, [clearScheduledSettingsRefreshes, requestPassiveSnapshotRefresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -418,10 +496,7 @@ export function useDesktopPermissionsState() {
     void (async () => {
       setLoading(true);
       try {
-        const snapshot = await loadPermissionsSnapshot();
-        if (!cancelled) {
-          applySnapshot(snapshot);
-        }
+        await replaceSnapshot();
       } catch (err) {
         // error-policy:J4 the panel renders its designed "unknown platform"
         // state (distinct from granted/denied); warn keeps a broken
@@ -444,7 +519,7 @@ export function useDesktopPermissionsState() {
     return () => {
       cancelled = true;
     };
-  }, [applySnapshot, loadPermissionsSnapshot]);
+  }, [replaceSnapshot]);
 
   useEffect(() => {
     return () => {
@@ -457,10 +532,17 @@ export function useDesktopPermissionsState() {
       rpcMessage: "permissionsChanged",
       ipcChannel: "permissions:changed",
       listener: () => {
-        void replaceSnapshot(true);
+        void requestPassiveSnapshotRefresh(true).catch((err) => {
+          // error-policy:J4 the last visible snapshot stays rendered while the
+          // bridge event failure remains observable and retryable on focus.
+          logger.warn(
+            { err },
+            "[permission-controls] permission-change refresh failed",
+          );
+        });
       },
     });
-  }, [replaceSnapshot]);
+  }, [requestPassiveSnapshotRefresh]);
 
   useEffect(() => {
     if (typeof document === "undefined" || typeof window === "undefined") {
@@ -471,7 +553,14 @@ export function useDesktopPermissionsState() {
       if (document.visibilityState === "hidden") {
         return;
       }
-      void replaceSnapshot(true);
+      void requestPassiveSnapshotRefresh(true).catch((err) => {
+        // error-policy:J4 focus reconciliation preserves the prior snapshot
+        // while logging the failed refresh for the next focus/manual retry.
+        logger.warn(
+          { err },
+          "[permission-controls] focus permission refresh failed",
+        );
+      });
     };
 
     window.addEventListener("focus", handleVisibilityOrFocus);
@@ -480,12 +569,16 @@ export function useDesktopPermissionsState() {
       window.removeEventListener("focus", handleVisibilityOrFocus);
       document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
     };
-  }, [replaceSnapshot]);
+  }, [requestPassiveSnapshotRefresh]);
 
   const handleRefresh = useCallback(async () => {
+    if (operationInFlightRef.current) {
+      passiveRefreshQueuedRef.current = true;
+      return null;
+    }
     setRefreshing(true);
     try {
-      return await replaceSnapshot(true);
+      return await requestPassiveSnapshotRefresh(true);
     } catch (err) {
       // error-policy:J4 a failed refresh keeps the last-rendered snapshot;
       // warn keeps the failure observable and the user can retry.
@@ -494,101 +587,113 @@ export function useDesktopPermissionsState() {
     } finally {
       setRefreshing(false);
     }
-  }, [replaceSnapshot]);
+  }, [requestPassiveSnapshotRefresh]);
 
   const handleRequest = useCallback(
     async (id: PermissionId) => {
       try {
-        if (isRuntimePermissionId(id)) {
-          await client.requestPermission(id);
-          const snapshot = await replaceSnapshot(true);
-          const status = snapshot.permissions[id]?.status;
-          if (status && status !== "granted" && status !== "not-applicable") {
-            scheduleSettingsRefreshes();
+        const snapshot = await runPermissionOperation(id, async () => {
+          if (isRuntimePermissionId(id)) {
+            await client.requestPermission(id);
+            return;
           }
-          return;
-        }
 
-        const bridged = await invokeDesktopBridgeRequest<PermissionState>({
-          rpcMethod: "permissionsRequest",
-          ipcChannel: "permissions:request",
-          params: { id },
-        });
-        if (isRendererPermissionId(id)) {
-          const rendererStatus = await requestRendererPermission(id);
-          if (!rendererStatus && bridged === null) {
+          const bridged = await invokeDesktopBridgeRequest<PermissionState>({
+            rpcMethod: "permissionsRequest",
+            ipcChannel: "permissions:request",
+            params: { id },
+          });
+          if (isRendererPermissionId(id)) {
+            const rendererStatus = await requestRendererPermission(id);
+            if (!rendererStatus && bridged === null) {
+              await client.requestPermission(id);
+            }
+          } else if (bridged === null) {
             await client.requestPermission(id);
           }
-        } else if (bridged === null) {
-          await client.requestPermission(id);
-        }
-        const snapshot = await replaceSnapshot(true);
-        const status = snapshot.permissions[id]?.status;
+        });
+        const status = snapshot?.permissions[id]?.status;
         if (status && status !== "granted" && status !== "not-applicable") {
           scheduleSettingsRefreshes();
         }
       } catch (err) {
-        // error-policy:J4 the snapshot re-render shows the unchanged state;
-        // warn keeps the failed request observable and the user can retry.
+        // error-policy:J4 the boundary snapshot re-renders the authoritative
+        // state while the failed request remains observable and retryable.
         logger.warn(
           { err, id },
           "[permission-controls] permission request failed",
         );
       }
     },
-    [replaceSnapshot, scheduleSettingsRefreshes],
+    [runPermissionOperation, scheduleSettingsRefreshes],
   );
 
   const handleOpenSettings = useCallback(
     async (id: PermissionId) => {
       try {
-        if (isRuntimePermissionId(id)) {
-          await client.openPermissionSettings(id);
-          await replaceSnapshot(true);
-          scheduleSettingsRefreshes();
-          return;
-        }
+        await runPermissionOperation(id, async () => {
+          if (isRuntimePermissionId(id)) {
+            await client.openPermissionSettings(id);
+            scheduleSettingsRefreshes();
+            return;
+          }
 
-        const opened = await invokeDesktopBridgeRequest({
-          rpcMethod: "permissionsOpenSettings",
-          ipcChannel: "permissions:openSettings",
-          params: { id },
+          const opened = await invokeDesktopBridgeRequest({
+            rpcMethod: "permissionsOpenSettings",
+            ipcChannel: "permissions:openSettings",
+            params: { id },
+          });
+          if (opened === null) {
+            await client.openPermissionSettings(id);
+          }
+          scheduleSettingsRefreshes();
         });
-        if (opened === null) {
-          await client.openPermissionSettings(id);
-        }
-        await replaceSnapshot(true);
-        scheduleSettingsRefreshes();
       } catch (err) {
-        // error-policy:J4 warn keeps the failed settings-open observable;
-        // the user can retry from the same button.
+        // error-policy:J4 the boundary snapshot stays authoritative while the
+        // failed settings-open remains observable and retryable.
         logger.warn({ err, id }, "[permission-controls] settings open failed");
       }
     },
-    [replaceSnapshot, scheduleSettingsRefreshes],
+    [runPermissionOperation, scheduleSettingsRefreshes],
   );
 
   const handleToggleShell = useCallback(
     async (enabled: boolean) => {
       try {
-        const bridgeToggle = invokeDesktopBridgeRequest<PermissionState>({
-          rpcMethod: "permissionsSetShellEnabled",
-          ipcChannel: "permissions:setShellEnabled",
-          params: { enabled },
+        await runPermissionOperation("shell", async () => {
+          const bridgeToggle = invokeDesktopBridgeRequest<PermissionState>({
+            rpcMethod: "permissionsSetShellEnabled",
+            ipcChannel: "permissions:setShellEnabled",
+            params: { enabled },
+          });
+          const outcomes = await Promise.allSettled([
+            bridgeToggle,
+            client.setShellEnabled(enabled),
+          ]);
+          const failures = outcomes.flatMap((outcome) =>
+            outcome.status === "rejected" ? [outcome.reason] : [],
+          );
+          if (failures.length > 0) {
+            throw new AggregateError(
+              failures,
+              "One or more shell permission mutations failed",
+            );
+          }
         });
-        await Promise.allSettled([
-          bridgeToggle,
-          client.setShellEnabled(enabled),
-        ]);
-        await replaceSnapshot(true);
-      } catch {
-        // shell toggle failed; user can retry
+      } catch (err) {
+        // error-policy:J4 the boundary refresh confirms the rendered switch
+        // while the failed mutation remains observable and retryable.
+        logger.warn(
+          { err, enabled },
+          "[permission-controls] shell permission toggle failed",
+        );
       }
     },
-    [replaceSnapshot],
+    [runPermissionOperation],
   );
 
   return {
+    busyPermissionId,
     handleOpenSettings,
     handleRefresh,
     handleRequest,

@@ -109,6 +109,7 @@ function PermissionPrimingModalView({
     done,
     request,
     skip,
+    openSettings,
     recheck,
     skipAll,
   } = controller;
@@ -182,9 +183,11 @@ function PermissionPrimingModalView({
             requesting={active.requesting}
             currentStep={currentStep}
             totalSteps={totalSteps}
-            onEnable={() => void request(active.id)}
+            error={active.error}
+            onEnable={() => request(active.id)}
             onSkip={() => skip(active.id)}
-            onRecheck={() => void recheck(active.id)}
+            onOpenSettings={() => openSettings(active.id)}
+            onRecheck={() => recheck(active.id)}
             onSkipAll={skipAll}
           />
         ) : (
@@ -205,11 +208,13 @@ interface PrimingCardProps {
   status: PermissionPrimingController["items"][number]["status"];
   canRequest: boolean;
   requesting: boolean;
+  error?: PermissionPrimingController["items"][number]["error"];
   currentStep: number;
   totalSteps: number;
-  onEnable: () => void;
+  onEnable: () => void | Promise<void>;
   onSkip: () => void;
-  onRecheck: () => void;
+  onOpenSettings: () => void | Promise<void>;
+  onRecheck: () => void | Promise<void>;
   onSkipAll: () => void;
 }
 
@@ -218,10 +223,12 @@ function PrimingCard({
   status,
   canRequest,
   requesting,
+  error,
   currentStep,
   totalSteps,
   onEnable,
   onSkip,
+  onOpenSettings,
   onRecheck,
   onSkipAll,
 }: PrimingCardProps): React.JSX.Element {
@@ -244,6 +251,42 @@ function PrimingCard({
       });
 
   const denied = status === "denied";
+  const errorAction =
+    error?.operation === "settings"
+      ? onOpenSettings
+      : error?.operation === "request" && canRequest
+        ? onEnable
+        : onRecheck;
+  const errorTitle =
+    error?.operation === "request"
+      ? t("permissionpriming.requestErrorTitle", {
+          defaultValue: "Permission request did not complete",
+        })
+      : error?.operation === "settings"
+        ? t("permissionpriming.settingsErrorTitle", {
+            defaultValue: "Settings could not be opened",
+          })
+        : t("permissionpriming.checkErrorTitle", {
+            defaultValue: "Permission status could not be checked",
+          });
+  const errorDescription =
+    error?.operation === "settings"
+      ? t("permissionpriming.settingsErrorDescription", {
+          defaultValue:
+            "Try opening Settings again. No permission choice was changed.",
+        })
+      : t("permissionpriming.checkErrorDescription", {
+          defaultValue:
+            "The device did not return a permission result. Try again before deciding whether to enable it.",
+        });
+  const errorRetryLabel =
+    error?.operation === "settings"
+      ? t("permissionpriming.retrySettings", {
+          defaultValue: "Try Settings again",
+        })
+      : error?.operation === "request" && canRequest
+        ? t("permissionpriming.tryAgain", { defaultValue: "Try again" })
+        : t("permissionpriming.checkAgain", { defaultValue: "Check again" });
 
   return (
     <div className="flex flex-col gap-4" data-testid={`priming-card-${id}`}>
@@ -257,7 +300,7 @@ function PrimingCard({
         </div>
       </div>
 
-      {denied ? (
+      {denied && !error ? (
         <PermissionRecoveryCallout
           permission={id}
           title={t("permissionpriming.deniedTitle", {
@@ -281,9 +324,25 @@ function PrimingCard({
                   defaultValue: "I've enabled it",
                 })
           }
+          onOpenSettings={onOpenSettings}
           onRetry={canRequest ? onEnable : onRecheck}
           testId={`priming-recovery-${id}`}
         />
+      ) : null}
+
+      {error ? (
+        <div
+          role="alert"
+          data-testid={`priming-error-${id}`}
+          className="rounded-sm border border-danger/30 bg-danger/10 p-3 text-left"
+        >
+          <div className="text-sm font-semibold text-txt-strong">
+            {errorTitle}
+          </div>
+          <p className="mt-1 text-sm leading-snug text-txt">
+            {errorDescription}
+          </p>
+        </div>
       ) : null}
 
       <div className="flex items-center justify-between gap-3">
@@ -295,7 +354,34 @@ function PrimingCard({
           })}
         </span>
         <div className="flex items-center gap-2">
-          {denied ? (
+          {error ? (
+            <>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={onSkip}
+                disabled={requesting}
+                data-testid={`priming-skip-${id}`}
+              >
+                {t("permissionpriming.notNow", { defaultValue: "Not now" })}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="default"
+                onClick={() => void errorAction()}
+                disabled={requesting}
+                data-testid={`priming-error-retry-${id}`}
+              >
+                {requesting
+                  ? t("permissionpriming.retrying", {
+                      defaultValue: "Trying…",
+                    })
+                  : errorRetryLabel}
+              </Button>
+            </>
+          ) : denied ? (
             <Button
               type="button"
               size="sm"
@@ -321,7 +407,7 @@ function PrimingCard({
                 type="button"
                 size="sm"
                 variant="default"
-                onClick={onEnable}
+                onClick={() => void onEnable()}
                 disabled={requesting}
                 data-testid={`priming-enable-${id}`}
               >

@@ -48,7 +48,7 @@ if (status.status === "not-determined") {
 // Start streaming signals
 await MobileSignals.startMonitoring({ emitInitial: true });
 
-await MobileSignals.addListener("signal", (signal) => {
+const signalListener = await MobileSignals.addListener("signal", (signal) => {
   if (signal.source === "mobile_device") {
     console.log("Device state:", signal.state); // "active" | "idle" | "background" | "locked" | "sleeping"
     console.log("On battery:", signal.onBattery);
@@ -64,6 +64,10 @@ const { snapshot, healthSnapshot } = await MobileSignals.getSnapshot();
 
 // Stop when done
 await MobileSignals.stopMonitoring();
+await signalListener.remove();
+// This package-owned fence clears native listeners and their bridge-saved
+// keep-alive callbacks, including a registration whose JS reply was lost.
+await MobileSignals.releaseSignalListeners();
 ```
 
 ## Permissions
@@ -76,6 +80,12 @@ Add to `Info.plist`:
 <key>NSHealthShareUsageDescription</key>
 <string>Used to read sleep and biometric data for your agent.</string>
 ```
+
+HealthKit does not reveal whether the user granted or denied individual read
+types. The iOS permission result therefore reports `status: "determined"` when
+HealthKit says another system consent sheet is unnecessary. That state is not a
+grant: `permissions.sleep` and `permissions.biometrics` remain `false`, and
+queries return only the data the user chose to authorize.
 
 Screen Time features additionally require:
 
@@ -117,4 +127,3 @@ await MobileSignals.openSettings({ target: "usageAccess" });
 - **iOS:** Full support. Requires Xcode target with correct entitlements for screen time features.
 - **Android:** Full support for device state and Health Connect. Usage stats require manual user grant via settings.
 - **Web:** Graceful fallback only. Health and screen-time capabilities are unavailable.
-

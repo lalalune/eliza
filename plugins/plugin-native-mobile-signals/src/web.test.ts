@@ -1,3 +1,7 @@
+/**
+ * Exercises the browser fallback's permission, snapshot, monitoring, and
+ * idempotent release contracts without standing in for either native bridge.
+ */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MobileSignalsWeb } from "./web";
@@ -135,5 +139,72 @@ describe("MobileSignalsWeb fallback", () => {
 
     await plugin.startMonitoring({ emitInitial: true });
     expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports release postconditions as satisfied when nothing remains", async () => {
+    const plugin = new MobileSignalsWeb();
+
+    await expect(plugin.stopMonitoring()).resolves.toEqual({ stopped: true });
+    await expect(plugin.stopMonitoring()).resolves.toEqual({ stopped: true });
+    await expect(plugin.releaseSignalListeners()).resolves.toEqual({
+      removed: true,
+    });
+    await expect(plugin.cancelBackgroundRefresh()).resolves.toMatchObject({
+      cancelled: true,
+    });
+    await expect(plugin.cancelBackgroundRefresh()).resolves.toMatchObject({
+      cancelled: true,
+    });
+  });
+
+  it("does not emit a stopped generation after its battery read resolves", async () => {
+    let resolveFirstBattery:
+      | ((battery: { charging: boolean; level: number }) => void)
+      | undefined;
+    const getBattery = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstBattery = resolve;
+          }),
+      )
+      .mockResolvedValue({ charging: false, level: 0.8 });
+    setNavigator({
+      userAgent: "Mozilla/5.0",
+      getBattery,
+    } as Partial<Navigator>);
+    setDocument({ visibilityState: "visible", hasFocus: vi.fn(() => true) });
+
+    const plugin = new MobileSignalsWeb();
+    const listener = vi.fn();
+    await plugin.addListener("signal", listener);
+
+    const firstStart = plugin.startMonitoring({ emitInitial: true });
+    await vi.waitFor(() => expect(getBattery).toHaveBeenCalledTimes(1));
+    await plugin.stopMonitoring();
+
+    const secondStart = plugin.startMonitoring({ emitInitial: true });
+    await secondStart;
+    expect(listener).toHaveBeenCalledTimes(2);
+
+    resolveFirstBattery?.({ charging: true, level: 0.4 });
+    await expect(firstStart).resolves.toMatchObject({ enabled: false });
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("confirms signal-listener removal before returning", async () => {
+    setNavigator({ userAgent: "Mozilla/5.0" });
+    setDocument({ visibilityState: "visible", hasFocus: vi.fn(() => true) });
+    const plugin = new MobileSignalsWeb();
+    const listener = vi.fn();
+    await plugin.addListener("signal", listener);
+
+    await expect(plugin.releaseSignalListeners()).resolves.toEqual({
+      removed: true,
+    });
+    await plugin.startMonitoring({ emitInitial: true });
+
+    expect(listener).not.toHaveBeenCalled();
   });
 });

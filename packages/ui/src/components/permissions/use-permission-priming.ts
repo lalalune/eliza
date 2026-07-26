@@ -29,19 +29,27 @@ import { createClientPermissionsRegistry } from "../composites/chat/permission-c
  * tap). Nothing here prompts on mount — mount only *checks* current status so
  * already-granted permissions are skipped and never re-prompted.
  *
- * Like `useMicrophonePermission`, no method throws — every path resolves to a
- * concrete, renderable state.
+ * Operations do not throw through click handlers. Transport/native failures
+ * are kept separate from permission status and rendered on the affected card.
  */
 
-export type PrimingItemStatus = PermissionStatus | "unknown";
+export type PrimingItemStatus = PermissionStatus | null;
+export type PrimingItemOperation = "check" | "request" | "settings" | "recheck";
+
+export interface PrimingItemError {
+  operation: PrimingItemOperation;
+}
 
 export interface PrimingItem {
   id: PermissionId;
+  /** Null only when the OS state could not be read. */
   status: PrimingItemStatus;
   /** Whether the OS request can still be (re)fired; false once hard-denied. */
   canRequest: boolean;
-  /** True while this item's OS request is in flight. */
+  /** True while this item's request, settings navigation, or probe is in flight. */
   requesting: boolean;
+  /** A transport/native failure, never a synthesized permission result. */
+  error?: PrimingItemError;
   /**
    * True once the user is done with this card — granted, or explicitly skipped.
    * A denied item is NOT resolved: it stays active so the recovery affordance
@@ -51,7 +59,7 @@ export interface PrimingItem {
 }
 
 export interface PermissionPrimingController {
-  /** Promptable items in order (already-granted/N-A ids are excluded). */
+  /** Unresolved items in order (terminal permission states are excluded). */
   items: PrimingItem[];
   /** Index into `items` of the first unresolved card, or `items.length`. */
   activeIndex: number;
@@ -86,7 +94,8 @@ function isSatisfied(status: PrimingItemStatus): boolean {
   return (
     status === "granted" ||
     status === "not-applicable" ||
-    status === "restricted"
+    status === "restricted" ||
+    status === "opaque"
   );
 }
 
@@ -96,12 +105,13 @@ function selectRegistry(): IPermissionsRegistry {
     : createClientPermissionsRegistry(client);
 }
 
-async function openSettingsFor(id: PermissionId): Promise<void> {
+async function openSettingsFor(id: PermissionId): Promise<boolean> {
   if (isNative && !isDesktopPlatform()) {
-    await openMobilePermissionSettings(id);
-    return;
+    const result = await openMobilePermissionSettings(id);
+    return result?.opened === true;
   }
   await client.openPermissionSettings(id);
+  return true;
 }
 
 export function usePermissionPriming(
@@ -112,15 +122,23 @@ export function usePermissionPriming(
 
   const [items, setItems] = React.useState<PrimingItem[]>([]);
   const [ready, setReady] = React.useState(false);
-  const requestingRef = React.useRef<Set<PermissionId>>(new Set());
+  const generationRef = React.useRef(0);
+  const inFlightRef = React.useRef<Map<PermissionId, symbol>>(new Map());
+  const ownsOperation = React.useCallback(
+    (id: PermissionId, token: symbol, generation: number) =>
+      generation === generationRef.current &&
+      inFlightRef.current.get(id) === token,
+    [],
+  );
 
   // Mount check: probe each id WITHOUT prompting, then keep only the ones that
-  // still need action. Already-granted / not-applicable / restricted ids are
-  // dropped so no card is shown for them.
+  // still need action. Terminal states, including privacy-opaque decisions,
+  // are dropped so no card can re-prompt them.
   // biome-ignore lint/correctness/useExhaustiveDependencies: `idsKey` is the stable string identity of `ids`; depending on the `ids` array itself would re-run the OS status check on every render for callers that pass a fresh array literal.
   React.useEffect(() => {
     let cancelled = false;
-    requestingRef.current = new Set();
+    const generation = ++generationRef.current;
+    inFlightRef.current = new Map();
     setReady(false);
     setItems([]);
     void (async () => {
@@ -128,19 +146,25 @@ export function usePermissionPriming(
         ids.map(async (id) => {
           try {
             const state = await registry.check(id);
-            return { id, status: state.status, canRequest: state.canRequest };
-          } catch {
-            // Treat an unknowable status as promptable — better to offer the
-            // card than to silently skip a real permission.
             return {
               id,
-              status: "unknown" as PrimingItemStatus,
-              canRequest: true,
+              status: state.status,
+              canRequest: state.canRequest,
+              error: undefined,
+            };
+          } catch {
+            // error-policy:J4 initial probe failures become explicit card
+            // errors; null is not a permission status and cannot prompt.
+            return {
+              id,
+              status: null,
+              canRequest: false,
+              error: { operation: "check" as const },
             };
           }
         }),
       );
-      if (cancelled) return;
+      if (cancelled || generation !== generationRef.current) return;
       setItems(
         checked
           .filter((entry) => !isSatisfied(entry.status))
@@ -150,12 +174,14 @@ export function usePermissionPriming(
             canRequest: entry.canRequest,
             requesting: false,
             resolved: false,
+            ...(entry.error ? { error: entry.error } : {}),
           })),
       );
       setReady(true);
     })();
     return () => {
       cancelled = true;
+      if (generation === generationRef.current) generationRef.current += 1;
     };
     // idsKey captures the id list identity; registry is stable (useMemo []).
   }, [idsKey, registry]);
@@ -171,64 +197,122 @@ export function usePermissionPriming(
 
   const request = React.useCallback(
     async (id: PermissionId) => {
-      if (requestingRef.current.has(id)) return;
-      requestingRef.current.add(id);
+      if (inFlightRef.current.has(id)) return;
+      const token = Symbol(id);
+      const generation = generationRef.current;
+      inFlightRef.current.set(id, token);
       patch(id, { requesting: true });
       try {
         const state = await registry.request(id, {
           reason: PRIMING_REASON,
           feature: PRIMING_FEATURE,
         });
+        if (!ownsOperation(id, token, generation)) return;
         patch(id, {
           status: state.status,
           canRequest: state.canRequest,
           requesting: false,
-          // Granting resolves the card; a denial keeps it active for recovery.
-          resolved: state.status === "granted",
+          error: undefined,
+          // Terminal states resolve the card; a denial remains active for recovery.
+          resolved: isSatisfied(state.status),
         });
       } catch {
-        // A thrown request is itself a soft failure — surface it as denied so
-        // the recovery affordance shows rather than a dead card.
-        patch(id, { status: "denied", canRequest: false, requesting: false });
+        // error-policy:J4 request failure is not an OS denial; preserve the
+        // last known status and expose a retry on the active card.
+        if (!ownsOperation(id, token, generation)) return;
+        patch(id, {
+          requesting: false,
+          error: { operation: "request" },
+        });
       } finally {
-        requestingRef.current.delete(id);
+        if (inFlightRef.current.get(id) === token) {
+          inFlightRef.current.delete(id);
+        }
       }
     },
-    [patch, registry],
+    [ownsOperation, patch, registry],
   );
 
   const skip = React.useCallback(
     (id: PermissionId) => {
+      inFlightRef.current.delete(id);
       patch(id, { resolved: true });
     },
     [patch],
   );
 
-  const openSettings = React.useCallback(async (id: PermissionId) => {
-    try {
-      await openSettingsFor(id);
-    } catch {
-      // Opening OS settings is best-effort; a failure must not wedge the flow.
-    }
-  }, []);
+  const openSettings = React.useCallback(
+    async (id: PermissionId) => {
+      if (inFlightRef.current.has(id)) return;
+      const token = Symbol(id);
+      const generation = generationRef.current;
+      inFlightRef.current.set(id, token);
+      patch(id, { requesting: true });
+      try {
+        const opened = await openSettingsFor(id);
+        if (!ownsOperation(id, token, generation)) return;
+        if (!opened) {
+          patch(id, {
+            requesting: false,
+            error: { operation: "settings" },
+          });
+          return;
+        }
+        patch(id, { requesting: false, error: undefined });
+      } catch {
+        // error-policy:J4 settings navigation failure is visible and retries
+        // the same operation; it is not translated into denial.
+        if (!ownsOperation(id, token, generation)) return;
+        patch(id, {
+          requesting: false,
+          error: { operation: "settings" },
+        });
+      } finally {
+        if (inFlightRef.current.get(id) === token) {
+          inFlightRef.current.delete(id);
+        }
+      }
+    },
+    [ownsOperation, patch],
+  );
 
   const recheck = React.useCallback(
     async (id: PermissionId) => {
+      if (inFlightRef.current.has(id)) return;
+      const token = Symbol(id);
+      const generation = generationRef.current;
+      inFlightRef.current.set(id, token);
+      patch(id, { requesting: true });
       try {
         const state = await registry.check(id);
+        if (!ownsOperation(id, token, generation)) return;
         patch(id, {
           status: state.status,
           canRequest: state.canRequest,
-          resolved: state.status === "granted",
+          requesting: false,
+          error: undefined,
+          resolved: isSatisfied(state.status),
         });
       } catch {
-        // Leave the current state untouched if the re-check can't resolve.
+        // error-policy:J4 a failed recheck is rendered separately while the
+        // last known permission state remains intact.
+        if (!ownsOperation(id, token, generation)) return;
+        patch(id, {
+          requesting: false,
+          error: { operation: "recheck" },
+        });
+      } finally {
+        if (inFlightRef.current.get(id) === token) {
+          inFlightRef.current.delete(id);
+        }
       }
     },
-    [patch, registry],
+    [ownsOperation, patch, registry],
   );
 
   const skipAll = React.useCallback(() => {
+    generationRef.current += 1;
+    inFlightRef.current = new Map();
     setItems((current) => current.map((item) => ({ ...item, resolved: true })));
   }, []);
 

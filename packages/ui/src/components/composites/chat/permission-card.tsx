@@ -14,7 +14,7 @@ import {
   type PermissionState,
 } from "@elizaos/shared";
 import type * as React from "react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useBranding } from "../../../config/branding";
 import { cn } from "../../../lib/utils";
@@ -49,10 +49,12 @@ export interface PermissionCardProps {
    *  retry the original action. */
   onGranted?: (state: PermissionState) => void;
   /** Opens OS settings for denied permissions that cannot be requested again. */
-  onOpenSettings?: (permission: PermissionId) => void | Promise<void>;
+  onOpenSettings?: (permission: PermissionId) => unknown | Promise<unknown>;
   labels?: PermissionCardLabels;
   className?: string;
 }
+
+type PermissionCardOperation = "check" | "request" | "settings";
 
 export function PermissionCard({
   permission,
@@ -75,53 +77,152 @@ export function PermissionCard({
   );
   const [requesting, setRequesting] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [openingSettings, setOpeningSettings] = useState(false);
   const [dismissed, setDismissed] = useState(false);
+  const [operationError, setOperationError] =
+    useState<PermissionCardOperation | null>(null);
+  const operationEpochRef = useRef(0);
+  const operationInFlightRef = useRef<symbol | null>(null);
+
+  useEffect(
+    () => () => {
+      operationEpochRef.current += 1;
+      operationInFlightRef.current = null;
+    },
+    [],
+  );
+
+  const beginOperation = useCallback((kind: PermissionCardOperation) => {
+    if (operationInFlightRef.current) return null;
+    const token = Symbol(kind);
+    operationInFlightRef.current = token;
+    const epoch = ++operationEpochRef.current;
+    if (kind === "request") setRequesting(true);
+    if (kind === "check") setChecking(true);
+    if (kind === "settings") setOpeningSettings(true);
+    setOperationError(null);
+    return { token, epoch };
+  }, []);
+
+  const ownsOperation = useCallback(
+    (operation: { token: symbol; epoch: number }) =>
+      operationInFlightRef.current === operation.token &&
+      operationEpochRef.current === operation.epoch,
+    [],
+  );
+
+  const finishOperation = useCallback(
+    (
+      operation: { token: symbol; epoch: number },
+      kind: PermissionCardOperation,
+    ) => {
+      if (operationInFlightRef.current !== operation.token) return;
+      operationInFlightRef.current = null;
+      if (kind === "request") setRequesting(false);
+      if (kind === "check") setChecking(false);
+      if (kind === "settings") setOpeningSettings(false);
+    },
+    [],
+  );
 
   const handleGrant = useCallback(async () => {
     if (!registry) return;
-    setRequesting(true);
+    const operation = beginOperation("request");
+    if (!operation) return;
     try {
       const next = await registry.request(permission, {
         reason,
         feature: parseFeatureRef(feature),
       });
+      if (!ownsOperation(operation)) return;
       setState(next);
       if (next.status === "granted") {
         onGranted?.(next);
       }
+    } catch {
+      // error-policy:J4 a failed request remains visible and retryable instead
+      // of leaving the card looking like the OS rejected the permission.
+      if (!ownsOperation(operation)) return;
+      setOperationError("request");
     } finally {
-      setRequesting(false);
+      finishOperation(operation, "request");
     }
-  }, [registry, permission, reason, feature, onGranted]);
+  }, [
+    beginOperation,
+    feature,
+    finishOperation,
+    onGranted,
+    ownsOperation,
+    permission,
+    reason,
+    registry,
+  ]);
 
   const handleCheckAgain = useCallback(async () => {
     if (!registry) return;
-    setChecking(true);
+    const operation = beginOperation("check");
+    if (!operation) return;
     try {
       const next = await registry.check(permission);
+      if (!ownsOperation(operation)) return;
       setState(next);
       if (next.status === "granted") {
         onGranted?.(next);
       }
+    } catch {
+      // error-policy:J4 a failed probe is a distinct user-facing error, not a
+      // permission result, and the same control can retry it.
+      if (!ownsOperation(operation)) return;
+      setOperationError("check");
     } finally {
-      setChecking(false);
+      finishOperation(operation, "check");
     }
-  }, [registry, permission, onGranted]);
+  }, [
+    beginOperation,
+    finishOperation,
+    onGranted,
+    ownsOperation,
+    permission,
+    registry,
+  ]);
 
-  const handleOpenSettings = useCallback(() => {
-    if (onOpenSettings) {
-      void onOpenSettings(permission);
-      return;
+  const handleOpenSettings = useCallback(async () => {
+    const operation = beginOperation("settings");
+    if (!operation) return;
+    try {
+      if (onOpenSettings) {
+        const result = await onOpenSettings(permission);
+        if (!ownsOperation(operation)) return;
+        if (settingsOpenFailed(result)) {
+          setOperationError("settings");
+        }
+        return;
+      }
+      await openPermissionSettings(permission);
+    } catch {
+      // error-policy:J4 settings navigation failures need a visible retry path
+      // because opening settings is the only recovery for some OS states.
+      if (!ownsOperation(operation)) return;
+      setOperationError("settings");
+    } finally {
+      finishOperation(operation, "settings");
     }
-    void openPermissionSettings(permission);
-  }, [onOpenSettings, permission]);
+  }, [
+    beginOperation,
+    finishOperation,
+    onOpenSettings,
+    ownsOperation,
+    permission,
+  ]);
 
   const handleDismiss = useCallback(() => {
+    operationEpochRef.current += 1;
     setDismissed(true);
     onDismiss?.();
   }, [onDismiss]);
 
   const handleFallback = useCallback(() => {
+    operationEpochRef.current += 1;
     onFallback?.({ type: "use_fallback", feature, permission });
     setDismissed(true);
   }, [onFallback, feature, permission]);
@@ -129,24 +230,45 @@ export function PermissionCard({
   useEffect(() => {
     if (!registry) return;
     let cancelled = false;
-    void registry
-      .check(permission)
-      .then((next) => {
-        if (!cancelled) setState(next);
-      })
-      // error-policy:J5 unhandled-rejection guard; the live permission state is
-      // ALSO delivered by registry.subscribe below, so a transient initial-check
-      // failure resolves as soon as the next subscription event arrives.
-      .catch(() => {});
+    const operation = beginOperation("check");
+    if (operation) {
+      void registry
+        .check(permission)
+        .then((next) => {
+          if (!cancelled && ownsOperation(operation)) {
+            setState(next);
+            setOperationError(null);
+          }
+        })
+        .catch(() => {
+          // error-policy:J4 an initial probe failure is not a permission state;
+          // keep the card visible with an explicit retry affordance.
+          if (!cancelled && ownsOperation(operation)) {
+            setOperationError("check");
+          }
+        })
+        .finally(() => {
+          finishOperation(operation, "check");
+        });
+    }
     const unsubscribe = registry.subscribe((states) => {
       const next = states.find((s) => s.id === permission);
-      if (next) setState(next);
+      if (next) {
+        if (!cancelled) {
+          setState(next);
+          setOperationError(null);
+        }
+      }
     });
     return () => {
       cancelled = true;
+      if (operation && operationInFlightRef.current === operation.token) {
+        operationInFlightRef.current = null;
+      }
+      operationEpochRef.current += 1;
       unsubscribe();
     };
-  }, [registry, permission]);
+  }, [beginOperation, finishOperation, ownsOperation, permission, registry]);
 
   if (dismissed) return null;
 
@@ -170,17 +292,24 @@ export function PermissionCard({
     state.restrictedReason === "entitlement_required";
 
   const isRestrictedUnavailable =
-    state.status === "restricted" && !isRestrictedEntitlement;
+    state.status === "restricted" &&
+    (state.restrictedReason === "platform_unsupported" ||
+      state.restrictedReason === undefined);
 
   const canOpenSettingsInstead =
-    state.canRequest === false &&
-    (state.status === "denied" || state.status === "not-determined");
+    state.status === "opaque" ||
+    (state.canRequest === false &&
+      (state.status === "denied" ||
+        state.status === "not-determined" ||
+        (state.status === "restricted" &&
+          state.restrictedReason === "os_policy")));
 
   const title = getPermissionLabel(permission);
   const guidance = permissionGuidance(permission, state, appName);
   const resolvedFallbackLabel =
     fallbackLabel ??
     (permission === "reminders" ? "Use internal reminder" : "Use fallback");
+  const operationPending = requesting || checking || openingSettings;
 
   return (
     <section
@@ -205,8 +334,27 @@ export function PermissionCard({
         <p className="font-medium text-txt">{guidance.primary}</p>
         <p className="mt-1">{guidance.secondary}</p>
       </div>
+      {operationError ? (
+        <p
+          role="alert"
+          data-testid="permission-card-error"
+          className="mb-3 rounded-sm border border-danger/30 bg-danger/10 p-2 text-xs leading-relaxed text-danger"
+        >
+          {permissionOperationErrorMessage(operationError)}
+        </p>
+      ) : null}
       <div className="flex flex-wrap items-center gap-2">
-        {isRestrictedEntitlement ? (
+        {operationError === "check" ? (
+          <Button
+            variant="default"
+            size="sm"
+            onClick={() => void handleCheckAgain()}
+            disabled={operationPending}
+            data-testid="permission-card-primary"
+          >
+            {checking ? "Checking..." : "Retry check"}
+          </Button>
+        ) : isRestrictedEntitlement ? (
           <Button
             variant="default"
             size="sm"
@@ -229,17 +377,23 @@ export function PermissionCard({
           <Button
             variant="default"
             size="sm"
-            onClick={handleOpenSettings}
+            onClick={() => void handleOpenSettings()}
+            disabled={operationPending}
             data-testid="permission-card-primary"
           >
-            {labels.openSettings ?? "Open System Settings"}
+            {openingSettings
+              ? "Opening Settings…"
+              : (labels.openSettings ??
+                (state.status === "opaque"
+                  ? "Manage access"
+                  : "Open System Settings"))}
           </Button>
         ) : (
           <Button
             variant="default"
             size="sm"
             onClick={() => void handleGrant()}
-            disabled={requesting || !registry}
+            disabled={operationPending || !registry}
             data-testid="permission-card-primary"
           >
             {requesting
@@ -247,12 +401,12 @@ export function PermissionCard({
               : (labels.grantAccess ?? "Grant access")}
           </Button>
         )}
-        {registry ? (
+        {registry && operationError !== "check" ? (
           <Button
             variant="outline"
             size="sm"
             onClick={() => void handleCheckAgain()}
-            disabled={checking || requesting}
+            disabled={operationPending}
             data-testid="permission-card-check-again"
           >
             {checking ? "Checking..." : "Check again"}
@@ -282,10 +436,33 @@ export function PermissionCard({
   );
 }
 
+function settingsOpenFailed(result: unknown): boolean {
+  return (
+    result === false ||
+    (typeof result === "object" &&
+      result !== null &&
+      "opened" in result &&
+      result.opened === false)
+  );
+}
+
 function statusLabel(state: PermissionState): string {
+  if (state.status === "opaque") return "Choices set";
   if (state.status === "not-determined") return "Not asked";
   if (state.status === "not-applicable") return "Unavailable";
   return state.status.replace(/-/g, " ");
+}
+
+function permissionOperationErrorMessage(
+  operation: "check" | "request" | "settings",
+): string {
+  if (operation === "request") {
+    return "The permission request failed before the OS confirmed a result. Try Grant access again or choose Check again.";
+  }
+  if (operation === "settings") {
+    return "System Settings could not be opened. Try again or open the app's permission settings manually.";
+  }
+  return "The current permission state could not be read. Choose Check again to retry.";
 }
 
 function platformSettingsLabel(
@@ -309,19 +486,16 @@ function permissionGuidance(
   const title = getPermissionLabel(permission);
   const settings = platformSettingsLabel(state.platform, appName);
 
-  if (state.status === "denied" || state.canRequest === false) {
+  if (state.status === "opaque") {
+    if (permission === "health") {
+      return {
+        primary: "Your Health data choices are set.",
+        secondary: `iOS keeps individual HealthKit read choices private. ${appName} can query only the data you allowed; use Manage access to review or change those choices.`,
+      };
+    }
     return {
-      primary: `Turn on ${title} in ${settings}.`,
-      secondary:
-        "After enabling it, return here and choose Check again. If you changed your mind, you can leave it off and use any offered fallback.",
-    };
-  }
-
-  if (state.status === "restricted") {
-    return {
-      primary: `${title} is blocked by the current OS policy or app entitlement.`,
-      secondary:
-        "This device may need a different build, entitlement, profile, or administrator setting before the feature can work.",
+      primary: `${title} choices are managed by the operating system.`,
+      secondary: `The OS does not reveal each individual choice. Use Manage access to review them in ${settings}.`,
     };
   }
 
@@ -330,6 +504,43 @@ function permissionGuidance(
       primary: `${title} is not available on this platform.`,
       secondary:
         "The agent can continue only if there is a fallback that does not use this device capability.",
+    };
+  }
+
+  if (
+    state.status === "restricted" &&
+    state.restrictedReason === "platform_unsupported"
+  ) {
+    return {
+      primary: `${title} is not available on this platform.`,
+      secondary:
+        "The agent can continue only if there is a fallback that does not use this device capability.",
+    };
+  }
+
+  if (
+    state.status === "restricted" &&
+    state.restrictedReason === "entitlement_required"
+  ) {
+    return {
+      primary: `${title} requires an app entitlement that is not available in this build.`,
+      secondary:
+        "A build signed with the required entitlement is needed before this feature can work.",
+    };
+  }
+
+  if (state.status === "restricted") {
+    return {
+      primary: `${title} is controlled by the current OS or administrator policy.`,
+      secondary: `Review ${settings}. A device profile or administrator policy may still prevent changes.`,
+    };
+  }
+
+  if (state.status === "denied" || state.canRequest === false) {
+    return {
+      primary: `Turn on ${title} in ${settings}.`,
+      secondary:
+        "After enabling it, return here and choose Check again. If you changed your mind, you can leave it off and use any offered fallback.",
     };
   }
 

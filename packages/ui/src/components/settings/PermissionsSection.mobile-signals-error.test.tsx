@@ -6,7 +6,14 @@
 // on this platform" degrade. The designed-hidden state (no checkPermissions
 // on this build) still renders nothing.
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileSignalsPermissionStatus } from "../../bridge/native-plugins";
 
@@ -66,6 +73,25 @@ const grantedStatus: MobileSignalsPermissionStatus = {
   permissions: { sleep: true, biometrics: true },
 };
 
+const determinedStatus: MobileSignalsPermissionStatus = {
+  ...grantedStatus,
+  status: "determined",
+  canRequest: false,
+  setupActions: [
+    {
+      id: "health_permissions",
+      label: "HealthKit",
+      status: "ready",
+      canRequest: true,
+      canOpenSettings: true,
+      settingsTarget: "health",
+      reason:
+        "iOS keeps individual HealthKit read grants private; monitoring queries return only authorized data.",
+    },
+  ],
+  permissions: { sleep: false, biometrics: false },
+};
+
 beforeEach(() => {
   pluginMock.value = {};
 });
@@ -89,8 +115,12 @@ describe("MobileSignalsPermissionsPanel three-state rendering", () => {
   });
 
   it("renders the explicit error row when the permissions probe throws", async () => {
+    const checkPermissions = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("bridge exploded"))
+      .mockResolvedValueOnce(grantedStatus);
     pluginMock.value = {
-      checkPermissions: vi.fn().mockRejectedValue(new Error("bridge exploded")),
+      checkPermissions,
     };
 
     render(<MobileSignalsPermissionsPanel />);
@@ -103,6 +133,15 @@ describe("MobileSignalsPermissionsPanel three-state rendering", () => {
     expect(
       screen.getByTestId("mobile-signals-permissions-error").textContent,
     ).toContain("Could not read device permissions.");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Retry mobile signals permission check",
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("LifeOps Signals")).not.toBeNull(),
+    );
+    expect(checkPermissions).toHaveBeenCalledTimes(2);
   });
 
   it("renders the panel when the probe resolves", async () => {
@@ -116,5 +155,90 @@ describe("MobileSignalsPermissionsPanel three-state rendering", () => {
       expect(screen.getByText("LifeOps Signals")).not.toBeNull(),
     );
     expect(screen.queryByTestId("mobile-signals-permissions-error")).toBeNull();
+  });
+
+  it("renders raw determined HealthKit choices as neutral and settings-managed", async () => {
+    const requestPermissions = vi.fn().mockResolvedValue(determinedStatus);
+    const openSettings = vi.fn().mockResolvedValue({ opened: true });
+    pluginMock.value = {
+      checkPermissions: vi.fn().mockResolvedValue(determinedStatus),
+      requestPermissions,
+      openSettings,
+    };
+
+    render(<MobileSignalsPermissionsPanel />);
+
+    await waitFor(() => expect(screen.getByText("Choices set")).toBeTruthy());
+    expect(screen.queryByText("Ready")).toBeNull();
+    expect(
+      screen.getByText(/iOS keeps individual HealthKit read choices private/),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage HealthKit" }));
+
+    await waitFor(() =>
+      expect(openSettings).toHaveBeenCalledWith({ target: "health" }),
+    );
+    expect(requestPermissions).not.toHaveBeenCalled();
+  });
+
+  it("renders opened false from the HealthKit settings action as retryable failure", async () => {
+    const requestPermissions = vi.fn().mockResolvedValue(determinedStatus);
+    const openSettings = vi.fn().mockResolvedValue({
+      opened: false,
+      target: "health",
+      actualTarget: "app",
+      reason: "Health settings could not be opened.",
+    });
+    pluginMock.value = {
+      checkPermissions: vi.fn().mockResolvedValue(determinedStatus),
+      requestPermissions,
+      openSettings,
+    };
+
+    render(<MobileSignalsPermissionsPanel />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Manage HealthKit" }),
+    );
+
+    const error = await screen.findByTestId("mobile-signals-action-error");
+    expect(error.textContent).toContain("Could not update HealthKit");
+    expect(openSettings).toHaveBeenCalledWith({ target: "health" });
+    expect(requestPermissions).not.toHaveBeenCalled();
+  });
+
+  it("does not open duplicate native settings sheets while Manage is pending", async () => {
+    let finishOpen: ((result: { opened: boolean }) => void) | undefined;
+    const openSettings = vi.fn(
+      () =>
+        new Promise<{ opened: boolean }>((resolve) => {
+          finishOpen = resolve;
+        }),
+    );
+    pluginMock.value = {
+      checkPermissions: vi.fn().mockResolvedValue(determinedStatus),
+      requestPermissions: vi.fn(),
+      openSettings,
+    };
+    render(<MobileSignalsPermissionsPanel />);
+
+    const manage = await screen.findByRole("button", {
+      name: "Manage HealthKit",
+    });
+    fireEvent.click(manage);
+    fireEvent.click(manage);
+
+    expect((manage as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => expect(openSettings).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      if (!finishOpen)
+        throw new Error("Native settings operation did not start");
+      finishOpen({ opened: true });
+    });
+    await waitFor(() =>
+      expect((manage as HTMLButtonElement).disabled).toBe(false),
+    );
   });
 });

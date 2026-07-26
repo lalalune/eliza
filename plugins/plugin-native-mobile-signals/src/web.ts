@@ -1,3 +1,7 @@
+/**
+ * Browser implementation of mobile signals using page state and the Battery
+ * Status API, with generation-scoped monitoring across asynchronous reads.
+ */
 import { WebPlugin } from "@capacitor/core";
 import type {
   MobileSignalsHealthSnapshot,
@@ -6,6 +10,7 @@ import type {
   MobileSignalsPermissionStatus,
   MobileSignalsPlatform,
   MobileSignalsPlugin,
+  MobileSignalsReleaseSignalListenersResult,
   MobileSignalsScreenTimeStatus,
   MobileSignalsSettingsTarget,
   MobileSignalsSetupAction,
@@ -233,6 +238,7 @@ function buildHealthSnapshot(reason: string): MobileSignalsHealthSnapshot {
 
 export class MobileSignalsWeb extends WebPlugin implements MobileSignalsPlugin {
   private monitoring = false;
+  private monitoringGeneration = 0;
   private cleanup: Cleanup[] = [];
 
   async checkPermissions(): Promise<MobileSignalsPermissionStatus> {
@@ -280,7 +286,11 @@ export class MobileSignalsWeb extends WebPlugin implements MobileSignalsPlugin {
 
   private emitSignal = async (reason: string): Promise<void> => {
     if (!this.monitoring) return;
+    const generation = this.monitoringGeneration;
     const snapshot = await buildSnapshot(reason);
+    if (!this.monitoring || generation !== this.monitoringGeneration) {
+      return;
+    }
     this.notifyListeners("signal", snapshot);
     this.notifyListeners("signal", buildHealthSnapshot(reason));
   };
@@ -333,17 +343,21 @@ export class MobileSignalsWeb extends WebPlugin implements MobileSignalsPlugin {
   ): Promise<MobileSignalsStartResult> {
     if (!this.monitoring) {
       this.monitoring = true;
+      this.monitoringGeneration += 1;
       this.attachListeners();
     }
 
+    const generation = this.monitoringGeneration;
     const snapshot = await buildSnapshot("start");
     const healthSnapshot = buildHealthSnapshot("start");
-    if (options.emitInitial ?? true) {
+    const generationIsActive =
+      this.monitoring && generation === this.monitoringGeneration;
+    if (generationIsActive && (options.emitInitial ?? true)) {
       this.notifyListeners("signal", snapshot);
       this.notifyListeners("signal", healthSnapshot);
     }
     return {
-      enabled: this.monitoring,
+      enabled: generationIsActive,
       supported: true,
       platform: snapshot.platform,
       snapshot,
@@ -353,8 +367,14 @@ export class MobileSignalsWeb extends WebPlugin implements MobileSignalsPlugin {
 
   async stopMonitoring(): Promise<MobileSignalsStopResult> {
     this.monitoring = false;
+    this.monitoringGeneration += 1;
     this.clearListeners();
     return { stopped: true };
+  }
+
+  async releaseSignalListeners(): Promise<MobileSignalsReleaseSignalListenersResult> {
+    await this.removeAllListeners();
+    return { removed: true };
   }
 
   async getSnapshot(): Promise<MobileSignalsSnapshotResult> {
@@ -381,8 +401,9 @@ export class MobileSignalsWeb extends WebPlugin implements MobileSignalsPlugin {
     reason: string;
   }> {
     return {
-      cancelled: false,
-      reason: "Web fallback has no native background refresh task to cancel.",
+      cancelled: true,
+      reason:
+        "Web fallback has no refresh job scheduled through this plugin remaining.",
     };
   }
 }

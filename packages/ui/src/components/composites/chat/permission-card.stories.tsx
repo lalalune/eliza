@@ -80,6 +80,22 @@ export const Denied: Story = {
   },
 };
 
+/** HealthKit choices are intentionally private, so access is managed in Settings. */
+export const HealthChoicesSet: Story = {
+  args: {
+    permission: "health",
+    reason:
+      "Apple Health can provide sleep and biometric signals you chose to share.",
+    feature: "health.read.signals",
+    initialState: stateFor({
+      id: "health",
+      status: "opaque",
+      canRequest: false,
+      platform: "ios",
+    }),
+  },
+};
+
 /** Restricted by a missing entitlement — primary action is a disabled "Coming soon". */
 export const ComingSoon: Story = {
   args: {

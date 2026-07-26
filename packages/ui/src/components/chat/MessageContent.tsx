@@ -1236,8 +1236,7 @@ export function MessagePermissionCard({
     registry: permissionRegistry,
     onOpenSettings: async (permission) => {
       if (isNative && !isDesktopPlatform()) {
-        await openMobilePermissionSettings(permission);
-        return;
+        return openMobilePermissionSettings(permission);
       }
       await client.openPermissionSettings(permission);
     },

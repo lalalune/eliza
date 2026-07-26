@@ -1,3 +1,8 @@
+/**
+ * Capacitor bridge for Android activity, device-state, and health snapshots.
+ * Dynamic broadcast ownership remains recorded until Android confirms the
+ * receiver is absent, so renderer generations cannot overlap after teardown.
+ */
 package ai.eliza.plugins.mobilesignals
 
 import android.Manifest
@@ -33,18 +38,32 @@ import com.getcapacitor.annotation.ActivityCallback
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONObject
 
 private const val HEALTH_CONNECT_PACKAGE = "com.google.android.apps.healthdata"
 private const val FAMILY_CONTROLS_ENTITLEMENT = "com.apple.developer.family-controls"
 private const val PACKAGE_USAGE_STATS_PERMISSION = "android.permission.PACKAGE_USAGE_STATS"
 private const val NOTIFICATION_PERMISSION_ALIAS = "notifications"
+
+internal fun unregisterReceiverOrConfirmAbsent(unregister: () -> Unit) {
+    try {
+        unregister()
+    } catch (_: IllegalArgumentException) {
+        // error-policy:J6 Android reserves IllegalArgumentException here for a
+        // receiver that was never registered or is already unregistered, so
+        // the desired teardown postcondition is already true.
+    }
+}
 
 @CapacitorPlugin(
     name = "MobileSignals",
@@ -58,9 +77,11 @@ private const val NOTIFICATION_PERMISSION_ALIAS = "notifications"
 class MobileSignalsPlugin : Plugin() {
     private val tag = "MobileSignalsPlugin"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val listenerCalls = NativeListenerCallRegistry<PluginCall>()
+    private val monitoringLifecycle =
+        MonitoringLifecycleCoordinator<BroadcastReceiver>()
+    private val rendererGeneration = AtomicLong(0)
     private val permissionRequest = PermissionController.createRequestPermissionResultContract()
-    private var monitoring = false
-    private var receiver: BroadcastReceiver? = null
 
     // The PACKAGE_USAGE_STATS reads (AppOps access check + UsageStatsManager query)
     // live in UsageStatsReader so they are exercisable by an instrumented
@@ -69,26 +90,7 @@ class MobileSignalsPlugin : Plugin() {
 
     @PluginMethod
     fun startMonitoring(call: PluginCall) {
-        if (monitoring) {
-            call.resolve(buildStartResult())
-            return
-        }
-
-        receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                val action = intent.action ?: return
-                if (!monitoring) return
-                emitSignal("broadcast:$action")
-                if (
-                    action == Intent.ACTION_SCREEN_ON ||
-                    action == Intent.ACTION_SCREEN_OFF ||
-                    action == Intent.ACTION_USER_PRESENT
-                ) {
-                    emitHealthSignal(action)
-                }
-            }
-        }
-
+        val callRendererGeneration = rendererGeneration.get()
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -101,25 +103,243 @@ class MobileSignalsPlugin : Plugin() {
         }
 
         try {
-            context.registerReceiver(receiver, filter)
-            monitoring = true
-            call.resolve(buildStartResult())
-            if (call.getBoolean("emitInitial") ?: true) {
-                emitSignal("start")
-                emitHealthSignal("start")
+            monitoringLifecycle.start(
+                createCandidate = { generation ->
+                    object : BroadcastReceiver() {
+                        override fun onReceive(context: Context, intent: Intent) {
+                            val action = intent.action ?: return
+                            val publication =
+                                monitoringLifecycle.acquireSignalPublication(generation)
+                                    ?: return
+                            publication.use {
+                                emitSignal(
+                                    "broadcast:$action",
+                                    generation,
+                                    publication,
+                                )
+                                if (
+                                    action == Intent.ACTION_SCREEN_ON ||
+                                    action == Intent.ACTION_SCREEN_OFF ||
+                                    action == Intent.ACTION_USER_PRESENT
+                                ) {
+                                    emitHealthSignal(action, generation)
+                                }
+                            }
+                        }
+                    }
+                },
+                register = { ownedReceiver ->
+                    context.registerReceiver(ownedReceiver, filter)
+                },
+                unregister = ::unregisterOwnedReceiver,
+            ) { generation, newlyAcquired ->
+                checkRendererGeneration(callRendererGeneration)
+                if (newlyAcquired && (call.getBoolean("emitInitial") ?: true)) {
+                    emitSignal(
+                        "start",
+                        generation,
+                        callRendererGeneration,
+                    )
+                    emitHealthSignal("start", generation)
+                }
+                val result = buildStartResult()
+                checkRendererGeneration(callRendererGeneration)
+                call.resolve(result)
             }
         } catch (error: Throwable) {
+            // error-policy:J1 Capacitor bridge boundary — registration failure
+            // must reject rather than fabricate an enabled monitor.
             Log.e(tag, "Failed to start monitoring", error)
-            call.reject("Failed to start monitoring: ${error.message}")
+            val drain = when (error) {
+                is MonitoringStartException -> error.drain
+                is MonitoringReleaseException -> error.drain
+                else -> null
+            }
+            if (drain == null) {
+                rejectIfRendererCurrent(
+                    call,
+                    callRendererGeneration,
+                    "Failed to start monitoring: ${error.message}",
+                )
+            } else {
+                val stopTransition =
+                    (error as? MonitoringStartException)?.stopTransition
+                scope.launch {
+                    drain.await()
+                    if (stopTransition != null) {
+                        monitoringLifecycle.finishStop(stopTransition)
+                    }
+                    rejectIfRendererCurrent(
+                        call,
+                        callRendererGeneration,
+                        "Failed to start monitoring: ${error.message}",
+                    )
+                }
+            }
         }
     }
 
     @PluginMethod
     fun stopMonitoring(call: PluginCall) {
-        stopInternal()
-        call.resolve(JSObject().apply {
-            put("stopped", true)
-        })
+        val callRendererGeneration = rendererGeneration.get()
+        try {
+            val stopTransition =
+                monitoringLifecycle.stop(::unregisterOwnedReceiver)
+            scope.launch {
+                stopTransition.drain.await()
+                monitoringLifecycle.finishStop(stopTransition)
+                resolveIfRendererCurrent(callRendererGeneration) {
+                    call.resolve(JSObject().apply {
+                        put("stopped", true)
+                    })
+                }
+            }
+        } catch (error: Exception) {
+            // error-policy:J1 Capacitor bridge boundary — callers need an
+            // explicit failed postcondition so they retain ownership and retry.
+            Log.e(tag, "Failed to stop monitoring", error)
+            val drain = (error as? MonitoringReleaseException)?.drain
+            scope.launch {
+                drain?.await()
+                resolveIfRendererCurrent(callRendererGeneration) {
+                    call.resolve(JSObject().apply {
+                        put("stopped", false)
+                    })
+                }
+            }
+        }
+    }
+
+    @PluginMethod
+    fun releaseSignalListeners(call: PluginCall) {
+        val callRendererGeneration = rendererGeneration.get()
+        try {
+            val release = monitoringLifecycle.beginSignalListenerRelease {
+                releaseAllSignalListeners(callRendererGeneration)
+            }
+            scope.launch {
+                release.drain.await()
+                if (monitoringLifecycle.finishSignalListenerRelease(release)) {
+                    resolveIfRendererCurrent(callRendererGeneration) {
+                        call.resolve(JSObject().apply {
+                            put("removed", true)
+                        })
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            // error-policy:J1 Capacitor bridge boundary — false keeps the
+            // renderer ownership ledger retryable instead of fabricating release.
+            Log.e(tag, "Failed to release signal listeners", error)
+            if (error is SignalListenerReleaseException) {
+                observeDrain(error.drain)
+            }
+            resolveIfRendererCurrent(callRendererGeneration) {
+                call.resolve(JSObject().apply {
+                    put("removed", false)
+                })
+            }
+        }
+    }
+
+    @PluginMethod(returnType = PluginMethod.RETURN_NONE)
+    override fun addListener(call: PluginCall) {
+        try {
+            monitoringLifecycle.addSignalListener {
+                super.addListener(call)
+                listenerCalls.track(call.callbackId, call)
+            }
+        } catch (error: Exception) {
+            // error-policy:J1 Capacitor listener boundary — a listener cannot
+            // enter while release ownership is incomplete or destroyed.
+            call.reject("Failed to add signal listener", null, error)
+        }
+    }
+
+    @PluginMethod(returnType = PluginMethod.RETURN_NONE)
+    override fun removeListener(call: PluginCall) {
+        try {
+            val drain = monitoringLifecycle.removeSignalListener(
+                remove = {
+                    super.removeListener(call)
+                    call.getString("callbackId")?.let(listenerCalls::forget)
+                },
+                hasListeners = {
+                    hasListeners("signal")
+                },
+            )
+            observeDrain(drain)
+        } catch (error: Exception) {
+            // error-policy:J1 Capacitor's listener boundary cannot acknowledge
+            // removal while an admitted callback still owns publication.
+            call.reject("Failed to remove signal listener", null, error)
+        }
+    }
+
+    @PluginMethod(returnType = PluginMethod.RETURN_PROMISE)
+    override fun removeAllListeners(call: PluginCall) {
+        val callRendererGeneration = rendererGeneration.get()
+        try {
+            val release = monitoringLifecycle.beginSignalListenerRelease {
+                releaseAllSignalListeners(callRendererGeneration)
+            }
+            scope.launch {
+                release.drain.await()
+                if (monitoringLifecycle.finishSignalListenerRelease(release)) {
+                    resolveIfRendererCurrent(callRendererGeneration) {
+                        call.resolve()
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            // error-policy:J1 Capacitor's generic listener boundary must reject
+            // unless both native registries released their ownership.
+            call.reject("Failed to release signal listeners", null, error)
+        }
+    }
+
+    override fun removeAllListeners() {
+        rendererGeneration.incrementAndGet()
+        val staleListenerCalls = mutableListOf<PluginCall>()
+        try {
+            monitoringLifecycle.resetSignalListeners {
+                try {
+                    super.removeAllListeners()
+                } finally {
+                    staleListenerCalls.addAll(listenerCalls.takeAll())
+                }
+            }
+        } finally {
+            scheduleStaleListenerCallCleanup(staleListenerCalls)
+        }
+    }
+
+    private fun releaseAllSignalListeners(expectedRendererGeneration: Long) {
+        // Capacitor's base remove-all method clears only eventListeners; saved
+        // keep-alive PluginCalls otherwise survive every renderer generation.
+        super.removeAllListeners()
+        listenerCalls.releaseAll { listenerCall ->
+            checkRendererGeneration(expectedRendererGeneration)
+            bridge.releaseCall(listenerCall)
+        }
+    }
+
+    private fun scheduleStaleListenerCallCleanup(
+        staleListenerCalls: List<PluginCall>,
+    ) {
+        if (staleListenerCalls.isEmpty()) return
+        // Bridge saves a keep-alive call immediately after addListener returns.
+        // Queueing cleanup on that same handler catches a call that raced reset
+        // or destruction; identity protects a successor that reuses its ID.
+        bridge.execute {
+            for (listenerCall in staleListenerCalls) {
+                if (
+                    bridge.getSavedCall(listenerCall.callbackId) === listenerCall
+                ) {
+                    bridge.releaseCall(listenerCall)
+                }
+            }
+        }
     }
 
     @PluginMethod
@@ -276,27 +496,52 @@ class MobileSignalsPlugin : Plugin() {
     @PluginMethod
     fun cancelBackgroundRefresh(call: PluginCall) {
         call.resolve(JSObject().apply {
-            put("cancelled", false)
-            put("reason", "Android mobile signals do not register a BGTaskScheduler background refresh task.")
+            put("cancelled", true)
+            put("reason", "Android mobile signals have no refresh job scheduled through this plugin remaining.")
         })
     }
 
-    private fun stopInternal() {
-        if (receiver != null) {
-            try {
-                context.unregisterReceiver(receiver)
-            } catch (_: Throwable) {
-                // best-effort cleanup
-            }
+    private fun unregisterOwnedReceiver(ownedReceiver: BroadcastReceiver) {
+        unregisterReceiverOrConfirmAbsent {
+            context.unregisterReceiver(ownedReceiver)
         }
-        receiver = null
-        monitoring = false
+    }
+
+    private fun observeDrain(drain: MonitoringDrain) {
+        scope.launch {
+            drain.await()
+        }
+    }
+
+    private fun checkRendererGeneration(expected: Long) {
+        check(rendererGeneration.get() == expected) {
+            "Renderer changed during native lifecycle transition"
+        }
+    }
+
+    private fun resolveIfRendererCurrent(
+        expected: Long,
+        resolve: () -> Unit,
+    ) {
+        if (rendererGeneration.get() == expected) {
+            resolve()
+        }
+    }
+
+    private fun rejectIfRendererCurrent(
+        call: PluginCall,
+        expected: Long,
+        message: String,
+    ) {
+        resolveIfRendererCurrent(expected) {
+            call.reject(message)
+        }
     }
 
     private fun buildStartResult(): JSObject {
         val snapshot = buildSnapshot("start")
         return JSObject().apply {
-            put("enabled", monitoring)
+            put("enabled", monitoringLifecycle.isActive())
             put("supported", true)
             put("platform", "android")
             put("snapshot", snapshot)
@@ -468,18 +713,59 @@ class MobileSignalsPlugin : Plugin() {
         }
     }
 
-    private fun emitSignal(reason: String) {
-        if (!monitoring) return
-        notifyListeners("signal", buildSnapshot(reason))
+    private fun emitSignal(
+        reason: String,
+        generation: Long,
+        expectedRendererGeneration: Long? = null,
+    ) {
+        val publication =
+            monitoringLifecycle.acquireSignalPublication(generation) ?: return
+        publication.use {
+            emitSignal(
+                reason,
+                generation,
+                publication,
+                expectedRendererGeneration,
+            )
+        }
     }
 
-    private fun emitHealthSignal(reason: String) {
-        if (!monitoring) return
-        scope.launch {
+    private fun emitSignal(
+        reason: String,
+        generation: Long,
+        publication: SignalPublicationLease,
+        expectedRendererGeneration: Long? = null,
+    ) {
+        val snapshot = buildSnapshot(reason)
+        if (expectedRendererGeneration != null) {
+            checkRendererGeneration(expectedRendererGeneration)
+        }
+        monitoringLifecycle.publishSignal(generation, publication) {
+            notifyListeners("signal", snapshot)
+        }
+    }
+
+    private fun emitHealthSignal(reason: String, generation: Long) {
+        if (!monitoringLifecycle.isActive(generation)) return
+        val publication =
+            monitoringLifecycle.acquireSignalPublication(generation) ?: return
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             val healthSnapshot = buildHealthSnapshot(reason)
-            if (monitoring) {
+            monitoringLifecycle.publishSignal(generation, publication) {
                 notifyListeners("signal", healthSnapshot)
             }
+        }
+        // A lazy coroutine can be cancelled before its body ever begins, so
+        // completion—not a body-level finally—owns the publication lease.
+        job.invokeOnCompletion {
+            publication.close()
+        }
+        val registered =
+            monitoringLifecycle.registerJob(job, generation)
+        if (registered) {
+            job.start()
+        } else {
+            job.cancel()
         }
     }
 
@@ -509,6 +795,7 @@ class MobileSignalsPlugin : Plugin() {
                 )
             ).records
         }.getOrElse {
+            if (it is CancellationException) throw it
             warnings.add("Sleep Connect query failed")
             emptyList()
         }
@@ -538,6 +825,7 @@ class MobileSignalsPlugin : Plugin() {
                 )
             ).records.flatMap { it.samples }
         }.getOrElse {
+            if (it is CancellationException) throw it
             warnings.add("Heart rate Connect query failed")
             emptyList()
         }
@@ -549,6 +837,7 @@ class MobileSignalsPlugin : Plugin() {
                 )
             ).records
         }.getOrElse {
+            if (it is CancellationException) throw it
             warnings.add("HRV Connect query failed")
             emptyList()
         }
@@ -922,7 +1211,39 @@ class MobileSignalsPlugin : Plugin() {
     }
 
     private fun handleOnDestroyInternal() {
-        stopInternal()
+        val destroyRendererGeneration = rendererGeneration.incrementAndGet()
+        val result = monitoringLifecycle.destroy(::unregisterOwnedReceiver)
+        if (result.releaseError != null) {
+            // error-policy:J6 Capacitor destruction cannot retry, but callback
+            // publication is quarantined before the native release attempt.
+            Log.e(
+                tag,
+                "Failed to release monitoring receiver during plugin destruction",
+                result.releaseError,
+            )
+        }
+        val staleListenerCalls = mutableListOf<PluginCall>()
+        try {
+            monitoringLifecycle.resetSignalListeners {
+                staleListenerCalls.addAll(listenerCalls.snapshot())
+                try {
+                    releaseAllSignalListeners(destroyRendererGeneration)
+                } finally {
+                    listenerCalls.discardAll()
+                }
+            }
+        } catch (error: Exception) {
+            // error-policy:J6 destruction cannot retry listener release, but
+            // signal admission is already closed by the destroyed lifecycle.
+            Log.e(
+                tag,
+                "Failed to release signal listeners during plugin destruction",
+                error,
+            )
+        } finally {
+            scheduleStaleListenerCallCleanup(staleListenerCalls)
+        }
+        scope.cancel()
         super.handleOnDestroy()
     }
 
