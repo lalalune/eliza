@@ -1000,22 +1000,22 @@ describe("SETTINGS action: set on an owned route section", () => {
 		expect(result?.success).toBe(true);
 	});
 
-	it.each([
-		"computerUse",
-		"computer-use",
-	])("accepts %s as the computer-use capability key", async (key) => {
-		const routeFetch = vi.fn<SettingsRouteFetch>(async () => ({ ok: true }));
-		const { result } = await invoke(
-			{ action: "set", section: "capabilities", key, value: "off" },
-			routeFetch,
-		);
-		expect(routeFetch).toHaveBeenCalledWith({
-			method: "PUT",
-			path: "/api/config",
-			body: { ui: { capabilities: { computerUse: false } } },
-		});
-		expect(result?.success).toBe(true);
-	});
+	it.each(["computerUse", "computer-use"])(
+		"accepts %s as the computer-use capability key",
+		async (key) => {
+			const routeFetch = vi.fn<SettingsRouteFetch>(async () => ({ ok: true }));
+			const { result } = await invoke(
+				{ action: "set", section: "capabilities", key, value: "off" },
+				routeFetch,
+			);
+			expect(routeFetch).toHaveBeenCalledWith({
+				method: "PUT",
+				path: "/api/config",
+				body: { ui: { capabilities: { computerUse: false } } },
+			});
+			expect(result?.success).toBe(true);
+		},
+	);
 
 	it("updates one wallet RPC provider through the wallet config route", async () => {
 		const routeFetch = vi.fn<SettingsRouteFetch>(async (request) => {
