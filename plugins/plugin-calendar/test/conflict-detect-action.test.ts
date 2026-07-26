@@ -117,6 +117,18 @@ function testAction(args?: {
 }
 
 describe("calendar-owned CONFLICT_DETECT action", () => {
+  it("declares both named and explicit scan ranges in its tool schema", () => {
+    const action = testAction();
+    const range = action.parameters?.find(
+      (parameter) => parameter.name === "range",
+    );
+
+    expect(range?.schema.oneOf).toEqual([
+      { type: "string", enum: ["today", "week"] },
+      { type: "object", additionalProperties: true },
+    ]);
+  });
+
   it("fails closed when the host authorization adapter denies access", async () => {
     const action = createConflictDetectAction({
       authorize: async () => false,
