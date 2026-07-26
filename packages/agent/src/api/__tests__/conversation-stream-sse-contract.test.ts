@@ -64,7 +64,6 @@ vi.mock("../chat-routes.ts", async () => {
         : {}),
     })),
     persistConversationMemory: vi.fn(async (_runtime, memory) => memory),
-<<<<<<< HEAD
     persistAssistantConversationMemory: vi.fn(
       async (
         runtime,
@@ -84,12 +83,6 @@ vi.mock("../chat-routes.ts", async () => {
           createdAt: Date.now(),
         }) as never,
     ),
-=======
-    persistAssistantConversationMemory: vi.fn(async () => ({
-      id: stringToUuid("stream-contract-assistant-msg"),
-    })),
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
-    hasRecentVisibleAssistantMemorySince: vi.fn(async () => false),
     resolveNoResponseFallback: () => "",
   };
 });
@@ -373,7 +366,6 @@ function createViewShortcutMessageService(): NonNullable<
   } satisfies NonNullable<AgentRuntime["messageService"]>;
 }
 
-<<<<<<< HEAD
 function createPersistedCallbackMessageService(
   messageId: UUID,
 ): NonNullable<AgentRuntime["messageService"]> {
@@ -394,7 +386,20 @@ function createPersistedCallbackMessageService(
             createdAt: Date.now(),
           },
         ],
-=======
+        persistedResponseMessageIds: [messageId],
+        mode: "actions" as const,
+      };
+    },
+    shouldRespond: () => ({
+      shouldRespond: true,
+      skipEvaluation: true,
+      reason: "persisted-callback-stream-contract-test",
+    }),
+    deleteMessage: async () => undefined,
+    clearChannel: async () => undefined,
+  } satisfies NonNullable<AgentRuntime["messageService"]>;
+}
+
 function createPersistedReplyMessageService(): NonNullable<
   AgentRuntime["messageService"]
 > {
@@ -415,24 +420,18 @@ function createPersistedReplyMessageService(): NonNullable<
         ],
         persistedResponseMessageIds: [id],
         mode: "simple" as const,
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
       };
     },
     shouldRespond: () => ({
       shouldRespond: true,
       skipEvaluation: true,
-<<<<<<< HEAD
-      reason: "persisted-callback-stream-contract-test",
-=======
       reason: "persisted-reply-stream-contract-test",
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
     }),
     deleteMessage: async () => undefined,
     clearChannel: async () => undefined,
   } satisfies NonNullable<AgentRuntime["messageService"]>;
 }
 
-<<<<<<< HEAD
 function createMixedPersistedTransientMessageService(
   persistedEarlyId: UUID,
   transientFinalId?: UUID,
@@ -461,7 +460,20 @@ function createMixedPersistedTransientMessageService(
             createdAt: Date.now(),
           },
         ],
-=======
+        persistedResponseMessageIds: [persistedEarlyId],
+        mode: "actions" as const,
+      };
+    },
+    shouldRespond: () => ({
+      shouldRespond: true,
+      skipEvaluation: true,
+      reason: "mixed-persistence-stream-contract-test",
+    }),
+    deleteMessage: async () => undefined,
+    clearChannel: async () => undefined,
+  } satisfies NonNullable<AgentRuntime["messageService"]>;
+}
+
 function createEphemeralReplyMessageService(): NonNullable<
   AgentRuntime["messageService"]
 > {
@@ -486,17 +498,12 @@ function createEphemeralReplyMessageService(): NonNullable<
           },
         ],
         mode: "simple" as const,
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
       };
     },
     shouldRespond: () => ({
       shouldRespond: true,
       skipEvaluation: true,
-<<<<<<< HEAD
-      reason: "mixed-persistence-stream-contract-test",
-=======
       reason: "ephemeral-reply-stream-contract-test",
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
     }),
     deleteMessage: async () => undefined,
     clearChannel: async () => undefined,
@@ -755,7 +762,7 @@ describe("conversation stream SSE contract (#10712)", () => {
     // the one returned by persistence; the user id is the already-committed
     // request memory.
     const doneMessageId = payloads[doneIndex].messageId;
-    expect(doneMessageId).toBe(stringToUuid("stream-contract-assistant-msg"));
+    expect(doneMessageId).toBe(stringToUuid("stream-contract-assistant"));
     expect(payloads[doneIndex].userMessageId).toBe(
       stringToUuid("stream-contract-user-msg-store"),
     );
@@ -971,7 +978,6 @@ describe("conversation stream SSE contract (#10712)", () => {
     });
   });
 
-<<<<<<< HEAD
   it("uses this turn's exact persisted response id instead of a room-latest guess", async () => {
     const responseId = stringToUuid("persisted-callback-response") as UUID;
     const { ctx, record, state } = createCtx(
@@ -991,10 +997,6 @@ describe("conversation stream SSE contract (#10712)", () => {
     ]);
     runtime.updateMemory = vi.fn(async () => true);
     vi.mocked(persistAssistantConversationMemory).mockClear();
-=======
-  it("reuses the exact message-service commit without a route read or write", async () => {
-    const { ctx, record } = createCtx(createPersistedReplyMessageService());
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
 
     await handleConversationRoutes(ctx);
 
@@ -1003,19 +1005,37 @@ describe("conversation stream SSE contract (#10712)", () => {
     );
     expect(done).toMatchObject({
       type: "done",
-<<<<<<< HEAD
       fullText: "Calendar is ready.",
       messageId: responseId,
-=======
-      fullText: "Already committed by message service.",
-      messageId: stringToUuid("message-service-persisted-assistant"),
       userMessageId: stringToUuid("stream-contract-user-msg-store"),
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
+      historyRefreshRequired: true,
     });
     expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
   });
 
-<<<<<<< HEAD
+  it("reuses the exact message-service commit without a route read or write", async () => {
+    const { ctx, record, state } = createCtx(
+      createPersistedReplyMessageService(),
+    );
+    if (!state.runtime) throw new Error("runtime fixture missing");
+    const getMemoriesByIds = vi.mocked(state.runtime.getMemoriesByIds);
+    getMemoriesByIds.mockClear();
+
+    await handleConversationRoutes(ctx);
+
+    const done = parseSsePayloads(record.writes).find(
+      (payload) => payload.type === "done",
+    );
+    expect(done).toMatchObject({
+      type: "done",
+      fullText: "Already committed by message service.",
+      messageId: stringToUuid("message-service-persisted-assistant"),
+      userMessageId: stringToUuid("stream-contract-user-msg-store"),
+    });
+    expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
+    expect(getMemoriesByIds).not.toHaveBeenCalled();
+  });
+
   it("emits an error instead of done when exact callback metadata cannot become durable", async () => {
     const responseId = stringToUuid("callback-write-failure-response") as UUID;
     const { ctx, record, state } = createCtx(
@@ -1051,7 +1071,7 @@ describe("conversation stream SSE contract (#10712)", () => {
     );
   });
 
-  it("does not advertise a transient responseMessages id that is absent from storage", async () => {
+  it("fails closed when callback durability metadata contradicts storage", async () => {
     const transientId = stringToUuid("transient-callback-response") as UUID;
     const { ctx, record, state } = createCtx(
       createPersistedCallbackMessageService(transientId),
@@ -1061,31 +1081,23 @@ describe("conversation stream SSE contract (#10712)", () => {
     vi.mocked(runtime.getMemoriesByIds).mockResolvedValueOnce([]);
     runtime.updateMemory = vi.fn(async () => true);
     vi.mocked(persistAssistantConversationMemory).mockClear();
-=======
-  it("marks intentionally transient replies without inventing a durable id", async () => {
-    const { ctx, record } = createCtx(createEphemeralReplyMessageService());
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
 
     await handleConversationRoutes(ctx);
 
-    const done = parseSsePayloads(record.writes).find(
-      (payload) => payload.type === "done",
+    const payloads = parseSsePayloads(record.writes);
+    expect(payloads.some((payload) => payload.type === "done")).toBe(false);
+    expect(payloads).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        message: expect.stringContaining(
+          "Failed to persist action callback history",
+        ),
+      }),
     );
-    expect(done).toMatchObject({
-      type: "done",
-<<<<<<< HEAD
-      fullText: "Calendar is ready.",
-    });
-    expect(done?.messageId).not.toBe(transientId);
-    expect(typeof done?.messageId).toBe("string");
-    expect(
-      vi
-        .mocked(persistAssistantConversationMemory)
-        .mock.calls.some((call) => call[5] === done?.messageId),
-    ).toBe(true);
+    expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
   });
 
-  it("does not reuse a stored response row owned by another agent id", async () => {
+  it("fails closed when the callback target is owned by another agent", async () => {
     const responseId = stringToUuid("wrong-agent-id-response") as UUID;
     const { ctx, record, state } = createCtx(
       createPersistedCallbackMessageService(responseId),
@@ -1107,19 +1119,17 @@ describe("conversation stream SSE contract (#10712)", () => {
 
     await handleConversationRoutes(ctx);
 
-    const done = parseSsePayloads(record.writes).find(
-      (payload) => payload.type === "done",
+    const payloads = parseSsePayloads(record.writes);
+    expect(payloads.some((payload) => payload.type === "done")).toBe(false);
+    expect(payloads).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        message: expect.stringContaining(
+          "Failed to persist action callback history",
+        ),
+      }),
     );
-    expect(done).toMatchObject({
-      type: "done",
-      fullText: "Calendar is ready.",
-    });
-    expect(done?.messageId).not.toBe(responseId);
-    expect(
-      vi
-        .mocked(persistAssistantConversationMemory)
-        .mock.calls.some((call) => call[5] === done?.messageId),
-    ).toBe(true);
+    expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1173,9 +1183,10 @@ describe("conversation stream SSE contract (#10712)", () => {
           _dedupeSinceMs,
           memoryId,
         ) => {
-          if (!memoryId) throw new Error("route-owned id missing");
+          const persistedId =
+            memoryId ?? stringToUuid(`route-persisted-${mode}`);
           routeOwnedMemory = {
-            id: memoryId,
+            id: persistedId,
             entityId: callbackRuntime.agentId,
             agentId: callbackRuntime.agentId,
             roomId,
@@ -1310,7 +1321,18 @@ describe("conversation stream SSE contract (#10712)", () => {
         targetId,
       ),
     ).rejects.toThrow("Failed to persist action callback history");
-=======
+  });
+
+  it("marks intentionally transient replies without inventing a durable id", async () => {
+    const { ctx, record } = createCtx(createEphemeralReplyMessageService());
+
+    await handleConversationRoutes(ctx);
+
+    const done = parseSsePayloads(record.writes).find(
+      (payload) => payload.type === "done",
+    );
+    expect(done).toMatchObject({
+      type: "done",
       fullText: "Temporary provider failure.",
       assistantEphemeral: true,
       userMessageId: stringToUuid("stream-contract-user-msg-store"),
@@ -1318,7 +1340,6 @@ describe("conversation stream SSE contract (#10712)", () => {
     });
     expect(done).not.toHaveProperty("messageId");
     expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
   });
 
   it("delivers a post-SSE-init failure as a structured SSE error frame, not an HTTP error", async () => {

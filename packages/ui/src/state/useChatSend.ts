@@ -1611,15 +1611,6 @@ export function useChatSend(deps: UseChatSendDeps) {
         // drop/complete/fail/interrupt — no streamed tokens may be lost.
         flushStreamingText();
 
-<<<<<<< HEAD
-        const interruptedPartial = reconcileTerminalStream(
-          convId,
-          assistantMsgId,
-          streamedAssistantText,
-          data,
-          { includeReasoning: true, includeAccountConnect: true },
-        );
-=======
         if (data.userMessageId) {
           applyStreamingModificationForConversation(convId, {
             messageId: userMsgId,
@@ -1628,63 +1619,13 @@ export function useChatSend(deps: UseChatSendDeps) {
             persistedMessageId: data.userMessageId,
           });
         }
-
-        if (!data.text.trim()) {
-          if (data.failureKind) {
-            // Empty reply but the server flagged a failure class — surface the
-            // gate UI (e.g. "Connect a provider") instead of silently dropping
-            // the turn. The failure branch below is an `else if`, unreachable
-            // once the text is empty, so it must be handled here.
-            applyStreamingModificationForConversation(convId, {
-              messageId: assistantMsgId,
-              mode: "fail",
-              failureKind: data.failureKind,
-            });
-          } else {
-            applyStreamingModificationForConversation(convId, {
-              messageId: assistantMsgId,
-              mode: "drop",
-            });
-          }
-        } else if (
-          shouldApplyFinalStreamText(streamedAssistantText, data.text) ||
-          data.reasoning ||
-          data.messageId
-        ) {
-          applyStreamingModificationForConversation(convId, {
-            messageId: assistantMsgId,
-            mode: "complete",
-            fullText: data.text,
-            ...(data.failureKind ? { failureKind: data.failureKind } : {}),
-            ...(data.accountConnect
-              ? { accountConnect: data.accountConnect }
-              : {}),
-            ...(data.reasoning ? { reasoning: data.reasoning } : {}),
-            ...(data.messageId ? { persistedMessageId: data.messageId } : {}),
-          });
-        } else if (data.failureKind) {
-          // Streaming text already matched but the server flagged a failure
-          // class — stamp it on the assistant turn so the renderer can swap
-          // in the gate UI (e.g. "Connect a provider").
-          applyStreamingModificationForConversation(convId, {
-            messageId: assistantMsgId,
-            mode: "fail",
-            failureKind: data.failureKind,
-          });
-        } else if (data.accountConnect) {
-          // Streaming text already matched but the server flagged a
-          // "connect another account" request — stamp it (via complete, which
-          // carries accountConnect) so the renderer swaps in the
-          // AccountConnectBlock while keeping the already-streamed text.
-          applyStreamingModificationForConversation(convId, {
-            messageId: assistantMsgId,
-            mode: "complete",
-            fullText: data.text,
-            accountConnect: data.accountConnect,
-            ...(data.messageId ? { persistedMessageId: data.messageId } : {}),
-          });
-        }
->>>>>>> 886255dadde (fix(chat): make streaming persistence and telemetry exact)
+        const interruptedPartial = reconcileTerminalStream(
+          convId,
+          assistantMsgId,
+          streamedAssistantText,
+          data,
+          { includeReasoning: true, includeAccountConnect: true },
+        );
         if (data.usage) {
           setChatLastUsage({
             promptTokens: data.usage.promptTokens,
