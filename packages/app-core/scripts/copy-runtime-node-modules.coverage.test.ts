@@ -236,6 +236,39 @@ describe("shouldKeepPackageRelativePath", () => {
     ).toBe(false);
   });
 
+  it("honors an explicit ffprobe cross-target regardless of the host platform", () => {
+    // Regression (#16715): the ffprobe branch used to call
+    // matchesRuntimeVariant(variant) WITHOUT forwarding the caller-supplied
+    // (targetOS, targetArch), silently falling back to process.platform/arch.
+    // No host is simultaneously win32-x64, darwin-arm64, and linux-arm64, so
+    // on the unfixed code at least two of these assertions fail on ANY host —
+    // this proves the forwarding fix without needing a Windows runner.
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/win32/x64/ffprobe.exe",
+        "win32",
+        "x64",
+        "ffprobe-static",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/darwin/arm64/ffprobe",
+        "darwin",
+        "arm64",
+        "ffprobe-static",
+      ),
+    ).toBe(true);
+    expect(
+      shouldKeepPackageRelativePath(
+        "bin/linux/arm64/ffprobe",
+        "linux",
+        "arm64",
+        "ffprobe-static",
+      ),
+    ).toBe(true);
+  });
+
   it("drops dist-mobile output for @elizaos/agent", () => {
     expect(
       shouldKeepPackageRelativePath(
