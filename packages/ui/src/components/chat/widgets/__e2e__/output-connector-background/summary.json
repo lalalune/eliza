@@ -1,0 +1,75 @@
+{
+  "generatedAt": "2026-07-06T07:48:46.225Z",
+  "url": "file:///Users/shawwalters/.codex/worktrees/b205/eliza/packages/ui/src/components/chat/widgets/__e2e__/output-connector-background/connector-background.html",
+  "states": [
+    {
+      "name": "desktop",
+      "width": 920,
+      "height": 980,
+      "screenshot": "/Users/shawwalters/.codex/worktrees/b205/eliza/packages/ui/src/components/chat/widgets/__e2e__/output-connector-background/connector-background-desktop.png",
+      "text": "CONNECTOR SETUP FROM CHAT Let's set Telegram up. T Telegram Configuration Inactive Cloud Gateway Bot Token Personal Account 0/1 required fields configured 0/3 total Bot Token Required 👁 Show Bot token from @BotFather ▶ ADVANCED 2 Save Enable plugin BACKGROUND PICKER FROM CHAT Here are your background options. 🎨 Background Make one with AI Misty Forest calm Desert Dusk warm Ocean Deep cool Alpine Dawn serene Ember Night cozy Aurora animated Lava animated Plasma animated Waves animated Nebula animated Orange Amber Rose Red Green Olive Stone Graphite Black Light Upload Color",
+      "metrics": {
+        "viewport": {
+          "width": 920,
+          "height": 980
+        },
+        "fixtureTextLength": 529,
+        "widgets": [
+          {
+            "testid": "inline-plugin-config",
+            "width": 576,
+            "height": 402,
+            "text": "TTelegram ConfigurationInactiveCloud GatewayBot TokenPersonal Account0/1 required fields configured0/3 totalBot TokenRequired👁 ShowBot token from @BotFather▶Advanced2SaveEnable plugin"
+          },
+          {
+            "testid": "inline-background",
+            "width": 576,
+            "height": 250,
+            "text": "🎨BackgroundMake one with AIMisty ForestcalmDesert DuskwarmOcean DeepcoolAlpine DawnsereneEmber NightcozyAuroraanimatedLavaanimatedPlasmaanimatedWavesanimatedNebulaanimatedOrangeAmberRoseRedGreenOliveStoneGraphiteBlackLightUploadColor"
+          }
+        ]
+      },
+      "color": {
+        "sampled": 225400,
+        "blueFraction": 0.0183,
+        "orangeFraction": 0.0358,
+        "neutralFraction": 0.8825
+      }
+    },
+    {
+      "name": "mobile",
+      "width": 390,
+      "height": 844,
+      "screenshot": "/Users/shawwalters/.codex/worktrees/b205/eliza/packages/ui/src/components/chat/widgets/__e2e__/output-connector-background/connector-background-mobile.png",
+      "text": "CONNECTOR SETUP FROM CHAT Let's set Telegram up. T Telegram Configuration Inactive Cloud Gateway Bot Token Personal Account 0/1 required fields configured 0/3 total Bot Token Required 👁 Show Bot token from @BotFather ▶ ADVANCED 2 Save Enable plugin BACKGROUND PICKER FROM CHAT Here are your background options. 🎨 Background Make one with AI Misty Forest calm Desert Dusk warm Ocean Deep cool Alpine Dawn serene Ember Night cozy Aurora animated Lava animated Plasma animated Waves animated Nebula animated Orange Amber Rose Red Green Olive Stone Graphite Black Light Upload Color",
+      "metrics": {
+        "viewport": {
+          "width": 390,
+          "height": 844
+        },
+        "fixtureTextLength": 529,
+        "widgets": [
+          {
+            "testid": "inline-plugin-config",
+            "width": 358,
+            "height": 436,
+            "text": "TTelegram ConfigurationInactiveCloud GatewayBot TokenPersonal Account0/1 required fields configured0/3 totalBot TokenRequired👁 ShowBot token from @BotFather▶Advanced2SaveEnable plugin"
+          },
+          {
+            "testid": "inline-background",
+            "width": 358,
+            "height": 250,
+            "text": "🎨BackgroundMake one with AIMisty ForestcalmDesert DuskwarmOcean DeepcoolAlpine DawnsereneEmber NightcozyAuroraanimatedLavaanimatedPlasmaanimatedWavesanimatedNebulaanimatedOrangeAmberRoseRedGreenOliveStoneGraphiteBlackLightUploadColor"
+          }
+        ]
+      },
+      "color": {
+        "sampled": 87945,
+        "blueFraction": 0.0037,
+        "orangeFraction": 0.0892,
+        "neutralFraction": 0.8
+      }
+    }
+  ],
+  "consoleErrors": []
+}

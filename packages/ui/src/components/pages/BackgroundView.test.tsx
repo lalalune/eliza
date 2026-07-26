@@ -55,6 +55,22 @@ afterEach(() => {
 });
 
 describe("BackgroundView", () => {
+  it("clips the gallery above the ambient chat composer", () => {
+    seed();
+    render(<BackgroundView />);
+
+    const viewport = screen.getByTestId("background-scroll-viewport");
+    expect(viewport.className).toContain("overflow-y-auto");
+    expect(viewport.style.height).toContain(
+      "var(--eliza-continuous-chat-clearance, 5.25rem)",
+    );
+    expect(
+      screen
+        .getByTestId("background-settings-controls")
+        .getAttribute("data-variant"),
+    ).toBe("filmstrip");
+  });
+
   it("selecting a swatch sets a shader config", () => {
     const setBackgroundConfig = vi.fn();
     seed({ setBackgroundConfig });
@@ -127,7 +143,7 @@ describe("BackgroundView", () => {
     render(<BackgroundView />);
 
     fireEvent.click(screen.getByLabelText("Generate a background image"));
-    fireEvent.change(screen.getByPlaceholderText("Describe a background..."), {
+    fireEvent.change(await screen.findByLabelText("Describe a background"), {
       target: { value: "a calm beach" },
     });
     fireEvent.click(screen.getByLabelText("Generate background from prompt"));
@@ -151,7 +167,7 @@ describe("BackgroundView", () => {
     render(<BackgroundView />);
 
     fireEvent.click(screen.getByLabelText("Generate a background image"));
-    fireEvent.change(screen.getByPlaceholderText("Describe a background..."), {
+    fireEvent.change(await screen.findByLabelText("Describe a background"), {
       target: { value: "anything" },
     });
     fireEvent.click(screen.getByLabelText("Generate background from prompt"));
