@@ -15,9 +15,9 @@ import {
 } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Capture the persistence promise so the test can resolve it on demand and
-// assert that the terminal frame stays behind the durable write.
+// Capture the persistence promise so tests control the commit boundary.
 let persistResolve: (() => void) | null = null;
+let persistReject: ((error: unknown) => void) | null = null;
 let persistCalledAt: number | null = null;
 let persistResolvedAt: number | null = null;
 let captureGenerateAbortSignal: AbortSignal | undefined;
@@ -66,16 +66,9 @@ vi.mock("../chat-routes.ts", async () => {
     })),
     persistConversationMemory: vi.fn(async () => undefined),
     persistAssistantConversationMemory: vi.fn(
-      async (
-        runtime,
-        roomId,
-        content,
-        _channelType,
-        _dedupeSinceMs,
-        memoryId,
-      ) => {
+      async (runtime, roomId, content, _channelType, memoryId) => {
         persistCalledAt = Date.now();
-        return new Promise<Memory>((resolve) => {
+        return new Promise<Memory>((resolve, reject) => {
           persistResolve = () => {
             persistResolvedAt = Date.now();
             resolve({
@@ -86,6 +79,10 @@ vi.mock("../chat-routes.ts", async () => {
               content:
                 typeof content === "string" ? { text: content } : content,
             });
+          };
+          persistReject = (error) => {
+            persistResolvedAt = Date.now();
+            reject(error);
           };
         });
       },
@@ -101,6 +98,14 @@ vi.mock("../chat-routes.ts", async () => {
         throw err;
       }
       if (generateThrowsTimeout) {
+        const incomingMessage: Memory = {
+          id: stringToUuid("user-msg-store"),
+          entityId: stringToUuid("admin-1"),
+          agentId: stringToUuid("agent-1"),
+          roomId: stringToUuid("room-1"),
+          content: { text: "hello" },
+        };
+        opts?.onIncomingMessagePersisted?.(incomingMessage);
         throw new Error("Chat generation timed out after 180000ms");
       }
       if (generateWaitsForAbort) {
@@ -112,23 +117,45 @@ vi.mock("../chat-routes.ts", async () => {
         throw new Error("aborted");
       }
       if (generateReturnsExactPersisted) {
+        const incomingMessage: Memory = {
+          id: stringToUuid("user-msg-store"),
+          entityId: stringToUuid("admin-1"),
+          agentId: stringToUuid("agent-1"),
+          roomId: stringToUuid("room-1"),
+          content: { text: "hello" },
+        };
+        const responseMessage: Memory = {
+          id: EXACT_PERSISTED_ID,
+          entityId: stringToUuid("agent-1"),
+          agentId: stringToUuid("agent-1"),
+          roomId: stringToUuid("room-1"),
+          content: { text: "Already durable." },
+        };
+        opts?.onIncomingMessagePersisted?.(incomingMessage);
+        opts?.onResponseMessagePersisted?.(responseMessage);
         return {
           text: "Already durable.",
           agentName,
           responseContent: { text: "Already durable." },
+          persistedRequestMessageId: incomingMessage.id,
+          persistedResponseMessageIds: [EXACT_PERSISTED_ID],
           actionCallbackHistory: exactPersistedCallbackHistory,
-          responseMessages: [
-            {
-              id: EXACT_PERSISTED_ID,
-              content: { text: "Already durable." },
-            },
-          ],
+          responseMessages: [responseMessage],
         };
       }
       if (generateReturnsExactInternal) {
+        const incomingMessage: Memory = {
+          id: stringToUuid("user-msg-store"),
+          entityId: stringToUuid("admin-1"),
+          agentId: stringToUuid("agent-1"),
+          roomId: stringToUuid("room-1"),
+          content: { text: "hello" },
+        };
+        opts?.onIncomingMessagePersisted?.(incomingMessage);
         return {
           text: "Internal diagnostic.",
           agentName,
+          persistedRequestMessageId: incomingMessage.id,
           transcriptVisibility: "internal" as const,
           responseContent: {
             text: "Internal diagnostic.",
@@ -147,9 +174,18 @@ vi.mock("../chat-routes.ts", async () => {
       }
       // Stream a single token so the SSE wire format mirrors a real turn.
       opts?.onChunk?.("ok");
+      const persistedRequestMessageId = stringToUuid("user-msg-store");
+      opts?.onIncomingMessagePersisted?.({
+        id: persistedRequestMessageId,
+        entityId: stringToUuid("admin-1"),
+        agentId: stringToUuid("agent-1"),
+        roomId: stringToUuid("room-1"),
+        content: { text: "hello" },
+      });
       return {
         text: "ok",
         agentName,
+        persistedRequestMessageId,
         usage: undefined,
         usedActionCallbacks: false,
         actionCallbackHistory: undefined,
@@ -389,6 +425,7 @@ function createCtx(): {
 describe("conversation-routes streaming persistence ordering", () => {
   beforeEach(() => {
     persistResolve = null;
+    persistReject = null;
     persistCalledAt = null;
     persistResolvedAt = null;
     captureGenerateAbortSignal = undefined;
@@ -406,7 +443,7 @@ describe("conversation-routes streaming persistence ordering", () => {
     vi.clearAllMocks();
   });
 
-  it("emits `done` only after the advertised assistant memory is durable", async () => {
+  it("emits `done` only after both advertised message IDs are durable", async () => {
     const { ctx, record } = createCtx();
 
     // Kick the handler off; do NOT await — persistence is hanging.
@@ -425,6 +462,12 @@ describe("conversation-routes streaming persistence ordering", () => {
     await handlerDone;
     expect(persistResolvedAt).not.toBeNull();
     expect(record.writes.some((w) => w.includes('"type":"done"'))).toBe(true);
+    expect(record.writes.join("")).toContain(
+      `"messageId":"${stringToUuid("persisted-assistant")}"`,
+    );
+    expect(record.writes.join("")).toContain(
+      `"userMessageId":"${stringToUuid("user-msg-store")}"`,
+    );
     expect(record.ended).toBe(true);
     expect(record.endedAt).not.toBeNull();
     expect(record.endedAt ?? Infinity).toBeGreaterThanOrEqual(
@@ -434,11 +477,12 @@ describe("conversation-routes streaming persistence ordering", () => {
 
   it("returns an SSE error instead of an orphan done id when persistence fails", async () => {
     const { ctx, record } = createCtx();
-    vi.mocked(persistAssistantConversationMemory).mockRejectedValue(
-      new Error("simulated db failure"),
-    );
 
-    await handleConversationRoutes(ctx);
+    const handlerDone = handleConversationRoutes(ctx);
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+    expect(record.ended).toBe(false);
+    persistReject?.(new Error("simulated db failure"));
+    await handlerDone;
     expect(record.ended).toBe(true);
     expect(record.writes.some((w) => w.includes('"type":"done"'))).toBe(false);
     expect(record.writes.some((w) => w.includes('"type":"error"'))).toBe(true);
@@ -562,14 +606,7 @@ describe("conversation-routes streaming persistence ordering", () => {
     generateReturnsExactInternal = true;
     normalizeThrowsAfterResult = true;
     vi.mocked(persistAssistantConversationMemory).mockImplementationOnce(
-      async (
-        runtime,
-        roomId,
-        content,
-        _channelType,
-        _dedupeSinceMs,
-        memoryId,
-      ) =>
+      async (runtime, roomId, content, _channelType, memoryId) =>
         ({
           id: memoryId ?? stringToUuid("visible-fallback"),
           entityId: runtime.agentId,

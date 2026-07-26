@@ -1,28 +1,7 @@
 /**
- * Route-level wiring coverage for the HTTP chat idempotency guard on the
- * dedicated-agent conversation endpoints (`POST /api/conversations/:id/messages`
- * and its `/stream` twin). The pure decision function is pinned in
- * `chat-idempotency.test.ts`; these tests prove the routes actually consult it:
- * a first send runs the LLM turn, a retry carrying the SAME `clientMessageId`
- * within the TTL is suppressed (no second turn, no second persisted memory) and
- * — when the first attempt's assistant reply already persisted — answers with
- * THAT reply instead of an empty ignored turn; a retry landing while the
- * original is still mid-turn (nothing persisted yet) keeps the empty ignored
- * shape; and a send WITHOUT an idempotency key behaves exactly as before (no
- * dedupe).
- *
- * Deliberately mock-free at the module level (no `vi.mock`): the real route
- * handlers, real `chat-routes` helpers, and the real dedupe cache run end to
- * end; only the runtime seam (message service + memory adapter) is stubbed, so
- * `messageService.handleMessage` call counts are the ground truth for "an LLM
- * turn ran" and `runtime.createMemory` counts for "a memory was persisted".
- *
- * The modules under test are loaded dynamically after `vi.resetModules()`
- * rather than via static imports: this package's vmForks pool shares the
- * module cache across test files in a worker, so a sibling suite that
- * `vi.mock`s `chat-routes.ts` would otherwise leak its mocked graph into this
- * file (and vice versa) depending on execution order. The fresh graph makes
- * this suite order-independent and guarantees the REAL guard + routes run.
+ * Exercises idempotency through the real conversation route handlers and
+ * cache. The runtime seam commits exact user and assistant IDs so completed
+ * retries replay their receipt while concurrent retries fail explicitly.
  */
 
 import http from "node:http";
@@ -77,6 +56,7 @@ const RECONNECT_SIGNAL_DEBOUNCE_MS = 400;
 interface MockResponseRecord {
   writes: string[];
   ended: boolean;
+  error?: { message: string; status?: number };
 }
 
 function createMockRes(): {
@@ -106,42 +86,104 @@ interface TestHarness {
   handleMessage: ReturnType<typeof vi.fn>;
   createMemory: ReturnType<typeof vi.fn>;
   storedMemories: Memory[];
+  persistIncoming: (
+    message: Memory,
+    options?: FixtureMessageOptions,
+  ) => Promise<Memory>;
+  persistAssistant: (
+    text: string,
+    options?: FixtureMessageOptions,
+  ) => Promise<Memory>;
 }
 
-/** Real-route harness: the runtime stub streams one "ok" chunk per turn via
- *  the message service, so the real `generateChatResponse` pipeline (status →
- *  token → done framing, persistence ordering) runs unmodified. Persisted
- *  memories are retained and served back through `getMemories`, so the dupe
- *  branches' persisted-first-reply lookup reads the real write path's output. */
+interface FixtureMessageOptions {
+  onStreamChunk?: (chunk: string) => Promise<void> | void;
+  incomingMessageForPersistence?: Memory;
+  onIncomingMessagePersisted?: (message: Memory) => void;
+  onResponseMessagePersisted?: (message: Memory) => void;
+}
+
+type PersistedMemory = Memory & { id: UUID };
+
+/** Real-route harness: MessageService is the sole normal-path persistence
+ * owner. Exact IDs are observed by the route and returned in its result. */
 function createHarness(): TestHarness {
+  const storedMemories: Memory[] = [];
+  const createMemory = vi.fn(async (memory: Memory): Promise<UUID> => {
+    const existing = memory.id
+      ? storedMemories.find((stored) => stored.id === memory.id)
+      : undefined;
+    if (existing) {
+      if (
+        existing.entityId !== memory.entityId ||
+        existing.agentId !== memory.agentId ||
+        existing.roomId !== memory.roomId ||
+        existing.content.text !== memory.content.text
+      ) {
+        throw new Error("duplicate id is bound to different message content");
+      }
+      return existing.id as UUID;
+    }
+    storedMemories.push(memory);
+    return (memory.id ?? stringToUuid("created-memory")) as UUID;
+  });
+  let responseSequence = 0;
+
+  async function persistIncoming(
+    message: Memory,
+    options?: FixtureMessageOptions,
+  ): Promise<PersistedMemory> {
+    const source = options?.incomingMessageForPersistence ?? message;
+    const incoming = {
+      ...source,
+      id: source.id ?? stringToUuid("incoming-message"),
+    } as PersistedMemory;
+    await createMemory(incoming);
+    options?.onIncomingMessagePersisted?.(incoming);
+    return incoming;
+  }
+
+  async function persistAssistant(
+    text: string,
+    options?: FixtureMessageOptions,
+  ): Promise<PersistedMemory> {
+    responseSequence += 1;
+    const response = {
+      id: stringToUuid(`assistant-message-${responseSequence}`),
+      agentId: AGENT_ID,
+      entityId: AGENT_ID,
+      roomId: ROOM_ID,
+      content: { text },
+    } satisfies PersistedMemory;
+    await createMemory(response);
+    options?.onResponseMessagePersisted?.(response);
+    return response;
+  }
+
   const handleMessage = vi.fn(
     async (
       _runtime: unknown,
-      _message: unknown,
+      message: Memory,
       _callback: unknown,
-      options?: { onStreamChunk?: (chunk: string) => Promise<void> | void },
+      options?: FixtureMessageOptions,
     ) => {
+      const incoming = await persistIncoming(message, options);
       await Promise.resolve();
       await options?.onStreamChunk?.("ok");
+      const response = await persistAssistant("ok", options);
       return {
         didRespond: true,
         responseContent: { text: "ok" },
-        responseMessages: [],
+        responseMessages: [response],
+        persistedRequestMessageId: incoming.id,
+        persistedResponseMessageIds: [response.id],
       };
     },
   );
-  const storedMemories: Memory[] = [];
   const worlds = new Map<
     UUID,
     { id: UUID; agentId: UUID; metadata: Record<string, unknown> }
   >();
-  const createMemory = vi.fn(async (memory: Memory) => {
-    if (memory.id && storedMemories.some((stored) => stored.id === memory.id)) {
-      throw new Error("duplicate unique constraint: messages.id");
-    }
-    storedMemories.push(memory);
-    return memory.id ?? stringToUuid("created-memory");
-  });
   const runtime = {
     agentId: AGENT_ID,
     character: {
@@ -212,7 +254,14 @@ function createHarness(): TestHarness {
     broadcastWs: null,
   } as unknown as ConversationRouteState;
 
-  return { state, handleMessage, createMemory, storedMemories };
+  return {
+    state,
+    handleMessage,
+    createMemory,
+    storedMemories,
+    persistIncoming,
+    persistAssistant,
+  };
 }
 
 function createReq(method: string, url: string): http.IncomingMessage {
@@ -248,6 +297,7 @@ async function runRoute(
     }),
     error: vi.fn(
       (response: http.ServerResponse, message: string, status?: number) => {
+        record.error = { message, status };
         response.write(`error ${status}: ${message}`);
         response.end();
       },
@@ -276,7 +326,9 @@ async function runRoute(
 function parseDataFrames(record: MockResponseRecord): Array<{
   type: string;
   fullText?: string;
+  message?: string;
   messageId?: string;
+  userMessageId?: string;
   agentName?: string;
   transcriptVisibility?: "internal";
   thought?: string;
@@ -296,7 +348,9 @@ function parseDataFrames(record: MockResponseRecord): Array<{
         JSON.parse(line.slice("data: ".length)) as {
           type: string;
           fullText?: string;
+          message?: string;
           messageId?: string;
+          userMessageId?: string;
           agentName?: string;
           transcriptVisibility?: "internal";
           thought?: string;
@@ -319,29 +373,35 @@ describe("conversation-route chat idempotency wiring", () => {
   });
 
   it("SSE: first send runs the turn; a retry after delivery returns the persisted first reply", async () => {
-    const { state, handleMessage, createMemory } = createHarness();
+    const { state, handleMessage, createMemory, storedMemories } =
+      createHarness();
     const body = { text: "hello", clientMessageId: "sse-retry-1" };
 
     const first = await runRoute("POST", STREAM_PATH, state, body);
     expect(handleMessage).toHaveBeenCalledTimes(1);
     const persistsAfterFirst = createMemory.mock.calls.length;
-    expect(persistsAfterFirst).toBeGreaterThan(0);
+    expect(persistsAfterFirst).toBe(2);
     const firstDone = parseDataFrames(first.record).find(
       (f) => f.type === "done",
     );
-    expect(firstDone?.fullText).toBe("ok");
+    expect(firstDone).toMatchObject({
+      fullText: "ok",
+      messageId: expect.any(String),
+      userMessageId: expect.any(String),
+    });
+    expect(
+      storedMemories.filter((memory) => memory.id === firstDone?.userMessageId),
+    ).toHaveLength(1);
+    expect(
+      storedMemories.filter((memory) => memory.id === firstDone?.messageId),
+    ).toHaveLength(1);
 
-    // Network-blip auto-retry: same conversation, same clientMessageId.
     const second = await runRoute("POST", STREAM_PATH, state, body);
-    // No second LLM turn, no additional persisted memories (user or assistant).
     expect(handleMessage).toHaveBeenCalledTimes(1);
     expect(createMemory).toHaveBeenCalledTimes(persistsAfterFirst);
-    // The first attempt's reply already persisted, so the retry's terminal
-    // frame carries IT — the retry delivers the original outcome instead of
-    // an empty turn the client must repair from history.
     const frames = parseDataFrames(second.record);
     expect(frames).toHaveLength(1);
-    expect(frames[0]).toMatchObject({ type: "done", fullText: "ok" });
+    expect(frames[0]).toEqual(firstDone);
     expect(second.record.ended).toBe(true);
   });
 
@@ -349,10 +409,13 @@ describe("conversation-route chat idempotency wiring", () => {
     const { state, handleMessage } = createHarness();
     const clientMessageId = "terminal-contract-retry";
     expect(markChatMessageSeen(ROOM_ID, clientMessageId)).toBe(false);
-    setChatOutcome(ROOM_ID, clientMessageId, {
+    const messageId = stringToUuid("terminal-contract-reply");
+    const userMessageId = stringToUuid("terminal-contract-user");
+    const outcome: Parameters<typeof setChatOutcome>[2] = {
       text: "",
       agentName: "Original Agent",
-      messageId: stringToUuid("terminal-contract-reply"),
+      messageId,
+      userMessageId,
       transcriptVisibility: "internal",
       thought: "private reasoning",
       usage: {
@@ -366,7 +429,8 @@ describe("conversation-route chat idempotency wiring", () => {
       failureKind: "no_provider",
       accountConnect: { providers: ["openai-codex"] },
       localInference: { status: "ready" },
-    });
+    };
+    setChatOutcome(ROOM_ID, clientMessageId, outcome);
 
     const stream = await runRoute("POST", STREAM_PATH, state, {
       text: "ignored retry payload",
@@ -377,7 +441,8 @@ describe("conversation-route chat idempotency wiring", () => {
         type: "done",
         fullText: "",
         agentName: "Original Agent",
-        messageId: stringToUuid("terminal-contract-reply"),
+        messageId,
+        userMessageId,
         transcriptVisibility: "internal",
         thought: "private reasoning",
         usage: expect.objectContaining({ totalTokens: 10 }),
@@ -395,7 +460,8 @@ describe("conversation-route chat idempotency wiring", () => {
     expect(jsonRetry.captured.payload).toEqual({
       text: "",
       agentName: "Original Agent",
-      messageId: stringToUuid("terminal-contract-reply"),
+      messageId,
+      userMessageId,
       transcriptVisibility: "internal",
       actionResults: [{ actionName: "VIEWS", success: true }],
       failureKind: "no_provider",
@@ -406,7 +472,13 @@ describe("conversation-route chat idempotency wiring", () => {
   });
 
   it("SSE: interleaved turns replay the outcome bound to the retried key", async () => {
-    const { state, handleMessage, storedMemories } = createHarness();
+    const {
+      state,
+      handleMessage,
+      storedMemories,
+      persistIncoming,
+      persistAssistant,
+    } = createHarness();
     let releaseA: (() => void) | undefined;
     let releaseB: (() => void) | undefined;
     const gateA = new Promise<void>((resolve) => {
@@ -418,19 +490,23 @@ describe("conversation-route chat idempotency wiring", () => {
     handleMessage.mockImplementation(
       async (
         _runtime: unknown,
-        message: { content?: { text?: string } },
+        message: Memory,
         _callback: unknown,
-        options?: { onStreamChunk?: (chunk: string) => Promise<void> | void },
+        options?: FixtureMessageOptions,
       ) => {
+        const incoming = await persistIncoming(message, options);
         const prompt = message.content?.text ?? "";
         const isA = prompt === "turn a";
         await (isA ? gateA : gateB);
         const text = isA ? "reply a" : "reply b";
         await options?.onStreamChunk?.(text);
+        const response = await persistAssistant(text, options);
         return {
           didRespond: true,
           responseContent: { text },
-          responseMessages: [],
+          responseMessages: [response],
+          persistedRequestMessageId: incoming.id,
+          persistedResponseMessageIds: [response.id],
         };
       },
     );
@@ -508,7 +584,7 @@ describe("conversation-route chat idempotency wiring", () => {
     }
   });
 
-  it("SSE: a dupe landing while the original is still mid-turn keeps the empty ignored shape", async () => {
+  it("SSE: a duplicate landing while the original is active fails explicitly", async () => {
     const { state, handleMessage } = createHarness();
     // Simulate the original request's arrival being recorded with its turn
     // still in flight: the idempotency key is seen, but no assistant reply has
@@ -523,7 +599,10 @@ describe("conversation-route chat idempotency wiring", () => {
     expect(handleMessage).not.toHaveBeenCalled();
     const frames = parseDataFrames(retry.record);
     expect(frames).toHaveLength(1);
-    expect(frames[0]).toMatchObject({ type: "done", fullText: "" });
+    expect(frames[0]).toMatchObject({
+      type: "error",
+      message: "This chat request is already in progress",
+    });
     expect(retry.record.ended).toBe(true);
   });
 
@@ -678,7 +757,7 @@ describe("conversation-route chat idempotency wiring", () => {
     expect(
       parseDataFrames(recovered.record).find((frame) => frame.type === "done"),
     ).toMatchObject({ fullText: "ok" });
-    expect(handleMessage).toHaveBeenCalledTimes(1);
+    expect(handleMessage).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed when a released key is retried with a different user payload", async () => {
@@ -715,7 +794,7 @@ describe("conversation-route chat idempotency wiring", () => {
         (frame) => frame.type === "error",
       ),
     ).toBe(true);
-    expect(handleMessage).toHaveBeenCalledTimes(1);
+    expect(handleMessage).toHaveBeenCalledTimes(2);
 
     const recovered = await runRoute("POST", STREAM_PATH, state, {
       text: "original payload",
@@ -724,14 +803,20 @@ describe("conversation-route chat idempotency wiring", () => {
     expect(
       parseDataFrames(recovered.record).find((frame) => frame.type === "done"),
     ).toMatchObject({ fullText: "ok" });
-    expect(handleMessage).toHaveBeenCalledTimes(2);
+    expect(handleMessage).toHaveBeenCalledTimes(3);
     expect(
       storedMemories.filter((memory) => memory.entityId === USER_ID),
     ).toHaveLength(1);
   });
 
   it("SSE: a neighboring successful turn cannot suppress this turn's failure fallback", async () => {
-    const { state, handleMessage, storedMemories } = createHarness();
+    const {
+      state,
+      handleMessage,
+      storedMemories,
+      persistIncoming,
+      persistAssistant,
+    } = createHarness();
     let releaseFailedTurn: (() => void) | undefined;
     const failedTurnGate = new Promise<void>((resolve) => {
       releaseFailedTurn = resolve;
@@ -739,19 +824,23 @@ describe("conversation-route chat idempotency wiring", () => {
     handleMessage.mockImplementation(
       async (
         _runtime: unknown,
-        message: { content?: { text?: string } },
+        message: Memory,
         _callback: unknown,
-        options?: { onStreamChunk?: (chunk: string) => Promise<void> | void },
+        options?: FixtureMessageOptions,
       ) => {
+        const incoming = await persistIncoming(message, options);
         if (message.content?.text === "turn a fails") {
           await failedTurnGate;
           throw new Error("turn a provider failure");
         }
         await options?.onStreamChunk?.("turn b reply");
+        const response = await persistAssistant("turn b reply", options);
         return {
           didRespond: true,
           responseContent: { text: "turn b reply" },
-          responseMessages: [],
+          responseMessages: [response],
+          persistedRequestMessageId: incoming.id,
+          persistedResponseMessageIds: [response.id],
         };
       },
     );
@@ -801,14 +890,16 @@ describe("conversation-route chat idempotency wiring", () => {
   });
 
   it("SSE: rapid identical post-token failures each persist and advertise their own row", async () => {
-    const { state, handleMessage, storedMemories } = createHarness();
+    const { state, handleMessage, storedMemories, persistIncoming } =
+      createHarness();
     handleMessage.mockImplementation(
       async (
         _runtime: unknown,
-        _message: unknown,
+        message: Memory,
         _callback: unknown,
-        options?: { onStreamChunk?: (chunk: string) => Promise<void> | void },
+        options?: FixtureMessageOptions,
       ) => {
+        await persistIncoming(message, options);
         await options?.onStreamChunk?.("partial reply");
         throw new Error("planner failed after token");
       },
@@ -907,23 +998,21 @@ describe("conversation-route chat idempotency wiring", () => {
     const first = await runRoute("POST", SEND_PATH, state, body);
     expect(handleMessage).toHaveBeenCalledTimes(1);
     const persistsAfterFirst = createMemory.mock.calls.length;
-    expect(persistsAfterFirst).toBeGreaterThan(0);
-    expect(first.captured.payload).toMatchObject({ text: "ok" });
+    expect(persistsAfterFirst).toBe(2);
+    expect(first.captured.payload).toMatchObject({
+      text: "ok",
+      agentName: "Test Agent",
+      messageId: expect.any(String),
+      userMessageId: expect.any(String),
+    });
 
     const second = await runRoute("POST", SEND_PATH, state, body);
     expect(handleMessage).toHaveBeenCalledTimes(1);
     expect(createMemory).toHaveBeenCalledTimes(persistsAfterFirst);
-    // The first attempt's reply already persisted — the retry answers with
-    // the normal success shape carrying that reply, not the empty ignored
-    // shape, so the already-delivered turn reads identically on both attempts.
-    expect(second.captured.payload).toMatchObject({
-      text: "ok",
-      agentName: "Test Agent",
-      messageId: expect.any(String),
-    });
+    expect(second.captured.payload).toEqual(first.captured.payload);
   });
 
-  it("non-stream: a dupe landing while the original is still mid-turn keeps the ignored shape", async () => {
+  it("non-stream: a duplicate landing while the original is active returns 409", async () => {
     const { state, handleMessage } = createHarness();
     expect(markChatMessageSeen(ROOM_ID, "json-mid-turn-1")).toBe(false);
 
@@ -933,10 +1022,10 @@ describe("conversation-route chat idempotency wiring", () => {
     });
 
     expect(handleMessage).not.toHaveBeenCalled();
-    expect(retry.captured.payload).toEqual({
-      text: "",
-      agentName: "Test Agent",
-      noResponseReason: "ignored",
+    expect(retry.captured.payload).toBeUndefined();
+    expect(retry.record.error).toEqual({
+      message: "This chat request is already in progress",
+      status: 409,
     });
   });
 
@@ -967,21 +1056,23 @@ describe("conversation-route chat idempotency wiring", () => {
     expect(handleMessage).toHaveBeenCalledTimes(2);
   });
 
-  it("a retry that lands on the non-stream twin of a streamed send is still suppressed", async () => {
-    // Both handlers consult the SAME cache scoped by conversation room id, so
-    // a duplicate is caught regardless of which endpoint the retry hits — and
-    // the delivered first reply is returned across the endpoint boundary too.
+  it("does not rerun a completed send through the other transport", async () => {
     const { state, handleMessage } = createHarness();
     const body = { text: "hello", clientMessageId: "cross-route-1" };
 
-    await runRoute("POST", STREAM_PATH, state, body);
+    const first = await runRoute("POST", STREAM_PATH, state, body);
     const retry = await runRoute("POST", SEND_PATH, state, body);
 
     expect(handleMessage).toHaveBeenCalledTimes(1);
-    expect(retry.captured.payload).toMatchObject({
-      text: "ok",
-      agentName: "Test Agent",
-      messageId: expect.any(String),
+    const done = parseDataFrames(first.record).find(
+      (frame) => frame.type === "done",
+    );
+    expect(retry.record.error).toBeUndefined();
+    expect(retry.captured.payload).toEqual({
+      text: done?.fullText,
+      agentName: done?.agentName,
+      messageId: done?.messageId,
+      userMessageId: done?.userMessageId,
     });
   });
 });

@@ -204,7 +204,10 @@ const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
 export interface ChatMessageIdOutcome {
   text: string;
   agentName: string;
+  userMessageId: UUID;
   messageId?: UUID;
+  assistantEphemeral?: true;
+  historyRefreshRequired?: true;
   transcriptVisibility?: "internal";
   thought?: string;
   usage?: ChatGenerationResult["usage"];
@@ -216,7 +219,8 @@ export interface ChatMessageIdOutcome {
 }
 
 interface ChatMessageIdEntry {
-  firstSeenAt: number;
+  startedAt: number;
+  completedAt?: number;
   outcome?: ChatMessageIdOutcome;
 }
 
@@ -260,17 +264,30 @@ export function isDuplicateChatMessage(
   if (!clientMessageId) return false;
   const key = `${scope}:${clientMessageId}`;
   const entry = chatSeenMessageIds.get(key);
-  if (entry !== undefined && now - entry.firstSeenAt <= CHAT_DEDUPE_TTL_MS) {
-    return true;
+  if (entry !== undefined) {
+    // Active turns never expire. Generation is caller-cancelled and may
+    // legitimately outlive the completed-receipt retention window; allowing
+    // the same key to restart while it is active would double-bill and race two
+    // durable replies.
+    if (
+      entry.completedAt === undefined ||
+      now - entry.completedAt <= CHAT_DEDUPE_TTL_MS
+    ) {
+      return true;
+    }
+    chatSeenMessageIds.delete(key);
   }
-  chatSeenMessageIds.set(key, { firstSeenAt: now });
+  chatSeenMessageIds.set(key, { startedAt: now });
   // Amortized eviction: sweep expired entries at most once per TTL window
   // rather than on every request, keeping the map bounded without a per-request
   // O(n) scan.
   if (now - chatSeenLastSweepAt > CHAT_DEDUPE_TTL_MS) {
     chatSeenLastSweepAt = now;
     for (const [seenKey, seenEntry] of chatSeenMessageIds) {
-      if (now - seenEntry.firstSeenAt > CHAT_DEDUPE_TTL_MS) {
+      if (
+        seenEntry.completedAt !== undefined &&
+        now - seenEntry.completedAt > CHAT_DEDUPE_TTL_MS
+      ) {
         chatSeenMessageIds.delete(seenKey);
       }
     }
@@ -312,7 +329,7 @@ export function getChatMessageIdFirstSeenAt(
 ): number | null {
   if (!clientMessageId) return null;
   return (
-    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.firstSeenAt ?? null
+    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.startedAt ?? null
   );
 }
 
@@ -328,12 +345,14 @@ export function setChatMessageIdOutcome(
   scope: string,
   clientMessageId: string | null,
   outcome: ChatMessageIdOutcome,
+  now: number = Date.now(),
 ): void {
   if (!clientMessageId) return;
   const key = `${scope}:${clientMessageId}`;
   const entry = chatSeenMessageIds.get(key);
   if (!entry) return;
   entry.outcome = structuredClone(outcome);
+  entry.completedAt = now;
 }
 
 /** Return the durable outcome bound to an exact idempotency key, if settled. */
@@ -886,6 +905,10 @@ export interface ChatGenerationResult {
     id?: string;
     content?: Content;
   }>;
+  /** Exact incoming-message ID durably committed during this turn. */
+  persistedRequestMessageId?: UUID;
+  /** Exact response IDs durably committed by the message service. */
+  persistedResponseMessageIds?: UUID[];
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -931,6 +954,9 @@ export interface ChatGenerateOptions {
   resolveNoResponseText?: () => string;
   preferredLanguage?: string;
   timeoutDuration?: number;
+  incomingMessageForPersistence?: ReturnType<typeof createMessageMemory>;
+  onIncomingMessagePersisted?: (message: Memory) => void;
+  onResponseMessagePersisted?: (message: Memory) => void;
 }
 
 // LogEntry is canonical in @elizaos/shared and re-exported above.
@@ -2127,26 +2153,12 @@ export function writeSseJson(
 // Persistence helpers
 // ---------------------------------------------------------------------------
 
-function isDuplicateMemoryError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const msg = err.message.toLowerCase();
-  return (
-    msg.includes("duplicate") ||
-    msg.includes("already exists") ||
-    msg.includes("unique constraint")
-  );
-}
-
 export async function persistConversationMemory(
   runtime: AgentRuntime,
   memory: ReturnType<typeof createMessageMemory>,
 ): Promise<ReturnType<typeof createMessageMemory>> {
-  try {
-    await runtime.createMemory(memory, "messages");
-  } catch (err) {
-    if (isDuplicateMemoryError(err)) return memory;
-    throw err;
-  }
+  const persistedId = await runtime.createMemory(memory, "messages");
+  memory.id = persistedId;
   return memory;
 }
 
@@ -2201,7 +2213,21 @@ export async function persistExactConversationMemory(
   if (existing) return assertExact(existing);
 
   try {
-    await runtime.createMemory(memory, "messages");
+    const persistedId = await runtime.createMemory(memory, "messages");
+    if (persistedId !== memory.id) {
+      throw new ElizaError(
+        "Exact conversation memory was committed under a different id",
+        {
+          code: "CONVERSATION_MEMORY_ID_MISMATCH",
+          context: {
+            expectedMemoryId: memory.id,
+            persistedMemoryId: persistedId,
+            roomId: memory.roomId,
+          },
+          severity: "fatal",
+        },
+      );
+    }
     return memory;
   } catch (cause) {
     const raced = await loadExisting();
@@ -2214,122 +2240,11 @@ export async function persistExactConversationMemory(
   }
 }
 
-async function hasRecentAssistantMemory(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  text: string,
-  sinceMs: number,
-): Promise<boolean> {
-  const trimmed = text.trim();
-  if (!trimmed) return false;
-
-  try {
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-
-    return recent.some((memory) => {
-      const contentText = (memory.content as { text?: string })?.text?.trim();
-      const createdAt = memory.createdAt ?? 0;
-      return (
-        memory.entityId === runtime.agentId &&
-        contentText === trimmed &&
-        createdAt >= sinceMs - 2000
-      );
-    });
-  } catch {
-    return false;
-  }
-}
-
-export async function hasRecentVisibleAssistantMemorySince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-): Promise<boolean> {
-  return Boolean(
-    await getRecentVisibleAssistantMemoryTextSince(runtime, roomId, sinceMs),
-  );
-}
-
-export async function getRecentVisibleAssistantMemoryTextSince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-  // Pre-arrival slack. The boolean suppression callers keep the conservative
-  // 2s default (over-matching is safe when the answer is only "suppress").
-  // The dupe-RETURN callers pass 0: `sinceMs` (dedupe first-seen) and memory
-  // `createdAt` come from the same process clock, so any reply persisted
-  // before arrival belongs to a PREVIOUS turn — returning it would ship the
-  // prior turn's answer to a rapid-fire retry.
-  slackMs: number = 2000,
-): Promise<string | null> {
-  return (
-    (
-      await getRecentVisibleAssistantMemorySince(
-        runtime,
-        roomId,
-        sinceMs,
-        slackMs,
-      )
-    )?.text ?? null
-  );
-}
-
-export async function getRecentVisibleAssistantMemorySince(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  sinceMs: number,
-  slackMs: number = 2000,
-): Promise<{ id: UUID; text: string } | null> {
-  try {
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-
-    const persistedAssistantTurn = recent
-      .filter((memory) => {
-        const content = memory.content as {
-          text?: string;
-          transcriptVisibility?: "internal";
-        };
-        const contentText = content.text?.trim();
-        const createdAt = memory.createdAt ?? 0;
-        return (
-          memory.entityId === runtime.agentId &&
-          content.transcriptVisibility !== "internal" &&
-          Boolean(contentText) &&
-          createdAt >= sinceMs - slackMs
-        );
-      })
-      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
-
-    const text = (
-      persistedAssistantTurn?.content as { text?: string } | undefined
-    )?.text?.trim();
-    return persistedAssistantTurn?.id && text
-      ? { id: persistedAssistantTurn.id as UUID, text }
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function persistAssistantConversationMemory(
   runtime: AgentRuntime,
   roomId: UUID,
   content: string | Content,
   channelType: ChannelType,
-  dedupeSinceMs?: number,
-  // Caller-supplied memory id. The streaming route pre-mints the id and stamps
-  // it on the SSE `done` frame BEFORE this (possibly deferred) persist runs,
-  // so the client can swap its optimistic temp-resp-* bubble to the durable id
-  // and the proactive-message WS echo reconciles by id instead of appending a
-  // duplicate bubble.
   memoryId?: UUID,
 ): Promise<Memory | null> {
   const persistedContent = markSyntheticChatFailureContent(
@@ -2354,16 +2269,6 @@ export async function persistAssistantConversationMemory(
   );
   const trimmed = persistedContent.text.trim();
   if (!trimmed) return null;
-
-  if (typeof dedupeSinceMs === "number" && !memoryId) {
-    const alreadyPersisted = await hasRecentAssistantMemory(
-      runtime,
-      roomId,
-      trimmed,
-      dedupeSinceMs,
-    );
-    if (alreadyPersisted) return null;
-  }
 
   const memory = createMessageMemory({
     id: memoryId ?? (crypto.randomUUID() as UUID),
@@ -2765,6 +2670,63 @@ async function generateChatResponseWithTiming(
       }
       replaceCallbackText(incoming);
     };
+    let persistedRequestMessageId: UUID | undefined;
+    const recordIncomingPersistence = (persistedMessage: Memory): void => {
+      if (persistedMessage.id) {
+        persistedRequestMessageId = persistedMessage.id;
+      }
+      try {
+        opts?.onIncomingMessagePersisted?.(persistedMessage);
+      } catch (error) {
+        // error-policy:J7 transport bookkeeping must not make a confirmed
+        // incoming-message commit look like a failed or uncertain write.
+        runtime.reportError("ChatRoutes.incomingPersistenceObserver", error, {
+          messageId: persistedMessage.id,
+          roomId: persistedMessage.roomId,
+        });
+      }
+    };
+    const persistIncomingForDirectResult = async (): Promise<UUID> => {
+      if (persistedRequestMessageId) return persistedRequestMessageId;
+      const persistenceMessage = opts?.incomingMessageForPersistence ?? message;
+      if (
+        persistenceMessage.id !== message.id ||
+        persistenceMessage.roomId !== message.roomId ||
+        persistenceMessage.entityId !== message.entityId ||
+        persistenceMessage.agentId !== message.agentId
+      ) {
+        throw new ElizaError(
+          "Direct chat persistence copy does not identify the processing message",
+          {
+            code: "CHAT_INCOMING_PERSISTENCE_IDENTITY_MISMATCH",
+            context: {
+              processingMessageId: message.id,
+              persistenceMessageId: persistenceMessage.id,
+              processingRoomId: message.roomId,
+              persistenceRoomId: persistenceMessage.roomId,
+            },
+            severity: "fatal",
+          },
+        );
+      }
+      const persistedMessage = await persistConversationMemory(
+        runtime,
+        persistenceMessage,
+      );
+      if (!persistedMessage.id) {
+        throw new ElizaError(
+          "Direct chat incoming persistence returned no message id",
+          {
+            code: "CHAT_INCOMING_PERSISTENCE_RECEIPT_MISSING",
+            context: { roomId: message.roomId },
+            severity: "fatal",
+          },
+        );
+      }
+      message.id = persistedMessage.id;
+      recordIncomingPersistence(persistedMessage);
+      return persistedMessage.id;
+    };
 
     // Emit inbound events so trajectory/session hooks run for API chat.
     try {
@@ -2803,6 +2765,7 @@ async function generateChatResponseWithTiming(
         }),
     );
     if (androidDirectResult) {
+      const incomingMessageId = await persistIncomingForDirectResult();
       try {
         if (
           androidDirectResult.responseContent &&
@@ -2833,7 +2796,10 @@ async function generateChatResponseWithTiming(
           "Failed to emit MESSAGE_SENT event",
         );
       }
-      return androidDirectResult;
+      return {
+        ...androidDirectResult,
+        persistedRequestMessageId: incomingMessageId,
+      };
     }
 
     let result:
@@ -2903,6 +2869,7 @@ async function generateChatResponseWithTiming(
               replaceText: emitSnapshot,
             });
             if (preHandlerResult) {
+              const incomingMessageId = await persistIncomingForDirectResult();
               const directText = preHandlerResult.responseText;
               const finalText = isClientVisibleNoResponse(directText)
                 ? directText || "(no response)"
@@ -2911,6 +2878,7 @@ async function generateChatResponseWithTiming(
                 didRespond: true,
                 responseContent: { text: finalText },
                 responseMessages: [],
+                persistedRequestMessageId: incomingMessageId,
               } as typeof result;
               responseText = finalText;
               forcedWalletExecutionText = isClientVisibleNoResponse(directText);
@@ -2970,10 +2938,13 @@ async function generateChatResponseWithTiming(
                   );
                   const finalText =
                     actionResponseText || responseText || "Task created.";
+                  const incomingMessageId =
+                    await persistIncomingForDirectResult();
                   result = {
                     didRespond: true,
                     responseContent: { text: finalText },
                     responseMessages: [],
+                    persistedRequestMessageId: incomingMessageId,
                   } as typeof result;
                   responseText = finalText;
                   return;
@@ -2995,6 +2966,7 @@ async function generateChatResponseWithTiming(
                 localInferenceIntent,
                 originalUserText,
               );
+              const incomingMessageId = await persistIncomingForDirectResult();
               emitSnapshot(localResult.text);
               result = {
                 didRespond: true,
@@ -3012,6 +2984,7 @@ async function generateChatResponseWithTiming(
                       : undefined,
                 } as Content,
                 responseMessages: [],
+                persistedRequestMessageId: incomingMessageId,
               } as typeof result;
               responseText = localResult.text;
               return;
@@ -3070,6 +3043,15 @@ async function generateChatResponseWithTiming(
                     timeoutDuration: generationTimeoutMs,
                     abortSignal: generationAbortController.signal,
                     keepExistingResponses: true,
+                    ...(opts?.incomingMessageForPersistence
+                      ? {
+                          incomingMessageForPersistence:
+                            opts.incomingMessageForPersistence,
+                        }
+                      : {}),
+                    onIncomingMessagePersisted: recordIncomingPersistence,
+                    onResponseMessagePersisted:
+                      opts?.onResponseMessagePersisted,
                     onStreamChunk: opts?.onChunk
                       ? async (
                           chunk: string,
@@ -3403,6 +3385,18 @@ async function generateChatResponseWithTiming(
           ...(entry.content ? { content: entry.content } : {}),
         }))
       : [];
+    const persistedResponseMessageIds = Array.isArray(
+      result?.persistedResponseMessageIds,
+    )
+      ? result.persistedResponseMessageIds.filter(
+          (id): id is UUID => typeof id === "string" && id.length > 0,
+        )
+      : [];
+    const exactPersistedRequestMessageId =
+      typeof result?.persistedRequestMessageId === "string" &&
+      result.persistedRequestMessageId.length > 0
+        ? result.persistedRequestMessageId
+        : persistedRequestMessageId;
     const responseContent: Content | null =
       result?.responseContent && typeof result.responseContent === "object"
         ? (() => {
@@ -3448,7 +3442,8 @@ async function generateChatResponseWithTiming(
       rawFailureKind === "insufficient_credits" ||
       rawFailureKind === "local_inference" ||
       rawFailureKind === "no_provider" ||
-      rawFailureKind === "provider_issue"
+      rawFailureKind === "provider_issue" ||
+      rawFailureKind === "rate_limited"
         ? rawFailureKind
         : undefined;
 
@@ -3483,6 +3478,12 @@ async function generateChatResponseWithTiming(
         : {}),
       ...(responseContent ? { responseContent } : {}),
       ...(responseMessages.length > 0 ? { responseMessages } : {}),
+      ...(exactPersistedRequestMessageId
+        ? { persistedRequestMessageId: exactPersistedRequestMessageId }
+        : {}),
+      ...(persistedResponseMessageIds.length > 0
+        ? { persistedResponseMessageIds }
+        : {}),
       usage: buildChatUsage(runtime, message, finalText, capturedUsage),
     };
   } finally {

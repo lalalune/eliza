@@ -19,6 +19,7 @@ import {
   MESSAGE_SOURCE_CLIENT_CHAT,
   type Media,
   sendJsonError,
+  stringToUuid,
   type UUID,
   validateUuid,
 } from "@elizaos/core";
@@ -665,6 +666,7 @@ export async function buildUserMessages(params: {
   agentId: UUID;
   roomId: UUID;
   channelType: ChannelType;
+  clientMessageId?: string;
   messageSource?: string;
   metadata?: Record<string, unknown>;
 }): Promise<{ userMessage: MessageMemory; messageToStore: MessageMemory }> {
@@ -675,13 +677,20 @@ export async function buildUserMessages(params: {
     agentId,
     roomId,
     channelType,
+    clientMessageId,
     messageSource,
     metadata,
   } = params;
   const source = messageSource?.trim() || MESSAGE_SOURCE_CLIENT_CHAT;
   const { attachments, compactAttachments } =
     await buildChatAttachments(images);
-  const id = crypto.randomUUID() as UUID;
+  // The idempotency key identifies one logical client turn. Deriving the
+  // incoming memory id from its room-scoped key makes a retry after a transport
+  // failure converge on the same durable row instead of inserting a second
+  // copy. Requests without a key retain a fresh random id.
+  const id = clientMessageId
+    ? stringToUuid(`client-chat:${roomId}:${clientMessageId}`)
+    : (crypto.randomUUID() as UUID);
   // Lift the client's reply target onto the canonical core reply field. The
   // dashboard reply affordance sends `metadata.replyToMessageId`;
   // `content.inReplyTo` is what the REPLY_CONTEXT provider and the GET

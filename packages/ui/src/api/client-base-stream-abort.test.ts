@@ -29,7 +29,7 @@ describe("streamChatEndpoint client abort", () => {
       }
       // The stream is now stalled between tokens. Simulate the user hitting Stop
       // while this read is pending — the abort must tear the loop down without
-      // waiting for this (never-resolving) read or the 60s idle timeout.
+      // waiting for this never-resolving read.
       queueMicrotask(() => controller.abort());
       return new Promise<never>(() => {});
     });
@@ -62,6 +62,51 @@ describe("streamChatEndpoint client abort", () => {
     // abort reason and no read was issued past the stalled second one.
     expect(cancel).toHaveBeenCalledWith("elizaos-sse-client-abort");
     expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("observes a pending reader rejection triggered by abort teardown", async () => {
+    const encoder = new TextEncoder();
+    const controller = new AbortController();
+    let rejectPendingRead = (_reason: unknown) => {};
+    const pendingRead = new Promise<never>((_resolve, reject) => {
+      rejectPendingRead = reject;
+    });
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce({
+        done: false,
+        value: encoder.encode(
+          'data: {"type":"token","text":"partial","fullText":"partial"}\n\n',
+        ),
+      })
+      .mockImplementationOnce(() => {
+        queueMicrotask(() => controller.abort());
+        return pendingRead;
+      });
+    const cancel = vi.fn(async () => {
+      rejectPendingRead(new Error("reader closed by cancellation"));
+    });
+    const request = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        body: { getReader: () => ({ read, cancel }) },
+      } as unknown as Response;
+    });
+    const client = new ElizaClient("http://agent.example:31337", "token");
+    client.setRequestTransport({ request });
+
+    const result = await client.streamChatEndpoint(
+      "/api/conversations/conv-1/messages/stream",
+      "hello",
+      vi.fn(),
+      "DM",
+      controller.signal,
+    );
+    await Promise.resolve();
+
+    expect(result).toMatchObject({ text: "partial", completed: false });
+    expect(cancel).toHaveBeenCalledWith("elizaos-sse-client-abort");
   });
 
   it("completes normally and never client-cancels when the signal is not aborted", async () => {

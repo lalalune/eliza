@@ -40,6 +40,16 @@ export interface MessageProcessingOptions {
 	 * @default resolved from runtime.getSetting("BASIC_CAPABILITIES_KEEP_RESP") if not set
 	 */
 	keepExistingResponses?: boolean;
+	/**
+	 * Storage-safe copy of the incoming message. The processing message may carry
+	 * inline attachment bytes or prompt-only augmentation that actions and models
+	 * need for this turn but that must not be written to durable chat history.
+	 */
+	incomingMessageForPersistence?: Memory;
+	/** Called after the incoming message has been durably committed. */
+	onIncomingMessagePersisted?: (message: Memory) => void;
+	/** Called after an assistant message has been durably committed. */
+	onResponseMessagePersisted?: (message: Memory) => void;
 }
 
 /**
@@ -49,6 +59,14 @@ export interface MessageProcessingResult {
 	didRespond: boolean;
 	responseContent?: Content | null;
 	responseMessages: Memory[];
+	/** Exact ID returned by the incoming-message persistence operation. */
+	persistedRequestMessageId?: UUID;
+	/**
+	 * IDs from `responseMessages` that this service durably committed before
+	 * returning. Transport layers use this instead of guessing persistence from
+	 * the strategy mode; transient replies may deliberately skip storage.
+	 */
+	persistedResponseMessageIds?: UUID[];
 	/** Results executed during this turn, preserved across planner/cache cleanup. */
 	actionResults?: ActionResult[];
 	state?: State;

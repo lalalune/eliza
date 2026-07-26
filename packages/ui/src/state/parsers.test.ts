@@ -327,11 +327,23 @@ describe("parseProactiveMessageEvent", () => {
     expect(
       parseProactiveMessageEvent({
         conversationId: "c1",
-        message: { id: "m1", role: "assistant", text: "hi", timestamp: 1 },
+        message: {
+          id: "m1",
+          clientMessageId: "turn-1",
+          role: "assistant",
+          text: "hi",
+          timestamp: 1,
+        },
       }),
     ).toEqual({
       conversationId: "c1",
-      message: { id: "m1", role: "assistant", text: "hi", timestamp: 1 },
+      message: {
+        id: "m1",
+        clientMessageId: "turn-1",
+        role: "assistant",
+        text: "hi",
+        timestamp: 1,
+      },
     });
   });
 

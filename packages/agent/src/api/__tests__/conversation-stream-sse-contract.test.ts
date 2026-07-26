@@ -28,6 +28,7 @@ import http from "node:http";
 import {
   type AgentRuntime,
   ChannelType,
+  type IAgentRuntime,
   logger,
   type Memory,
   ModelType,
@@ -64,25 +65,13 @@ vi.mock("../chat-routes.ts", async () => {
         : {}),
     })),
     persistConversationMemory: vi.fn(async (_runtime, memory) => memory),
-    persistAssistantConversationMemory: vi.fn(
-      async (
-        runtime,
-        roomId,
-        content,
-        _channelType,
-        _dedupeSinceMs,
-        memoryId,
-      ) =>
-        ({
-          id: memoryId ?? stringToUuid("stream-contract-assistant"),
-          entityId: runtime.agentId,
-          agentId: runtime.agentId,
-          roomId,
-          content:
-            typeof content === "string" ? { text: content } : { ...content },
-          createdAt: Date.now(),
-        }) as never,
-    ),
+    persistAssistantConversationMemory: vi.fn(async () => ({
+      id: stringToUuid("stream-contract-assistant-msg"),
+      entityId: AGENT_ID,
+      agentId: AGENT_ID,
+      roomId: ROOM_ID,
+      content: { text: FINAL_TEXT },
+    })),
     hasRecentVisibleAssistantMemorySince: vi.fn(async () => false),
     resolveNoResponseFallback: () => "",
   };
@@ -147,6 +136,34 @@ interface StreamingModelParams {
 interface StreamingModelResult {
   text: string;
   thought: string;
+}
+
+interface FixtureMessageOptions {
+  abortSignal?: AbortSignal;
+  incomingMessageForPersistence?: Memory;
+  onIncomingMessagePersisted?: (message: Memory) => void;
+  onResponseMessagePersisted?: (message: Memory) => void;
+  onStreamChunk?: (
+    chunk: string,
+    messageId?: string,
+    accumulated?: string,
+  ) => Promise<void> | void;
+}
+
+async function persistFixtureIncoming(
+  runtime: IAgentRuntime,
+  message: Memory,
+  options?: FixtureMessageOptions,
+): Promise<UUID> {
+  const persisted = await persistConversationMemory(
+    runtime as AgentRuntime,
+    options?.incomingMessageForPersistence ?? message,
+  );
+  options?.onIncomingMessagePersisted?.(persisted);
+  if (!persisted.id) {
+    throw new Error("fixture incoming persistence lost its id");
+  }
+  return persisted.id;
 }
 
 interface MockResponseRecord {
@@ -249,14 +266,16 @@ function createStreamingUseModelFixture() {
 function createModelBackedMessageService() {
   return {
     async handleMessage(
-      runtime: AgentRuntime,
-      message: { content?: { text?: unknown } },
+      runtime: IAgentRuntime,
+      message: Memory,
       _callback: unknown,
-      options?: {
-        abortSignal?: AbortSignal;
-        onStreamChunk?: (chunk: string) => Promise<void> | void;
-      },
+      options?: FixtureMessageOptions,
     ) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       const useStreamingModel = runtime.useModel as unknown as (
         modelType: typeof ModelType.TEXT_LARGE,
         params: StreamingModelParams,
@@ -269,6 +288,7 @@ function createModelBackedMessageService() {
       });
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: {
           text: modelResult.text,
           thought: modelResult.thought,
@@ -293,26 +313,29 @@ function createModelBackedMessageService() {
  * the delta writer emits for it.
  */
 function createChunkPlanMessageService(
-  chunks: string[],
+  chunks: Array<{ chunk: string; accumulated?: string }>,
   finalText: string,
   thought: string,
 ): NonNullable<AgentRuntime["messageService"]> {
   return {
     async handleMessage(
-      _runtime: AgentRuntime,
-      _message: { content?: { text?: unknown } },
+      runtime: IAgentRuntime,
+      message: Memory,
       _callback: unknown,
-      options?: {
-        abortSignal?: AbortSignal;
-        onStreamChunk?: (chunk: string) => Promise<void> | void;
-      },
+      options?: FixtureMessageOptions,
     ) {
-      for (const chunk of chunks) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
+      for (const { chunk, accumulated } of chunks) {
         await Promise.resolve();
-        await options?.onStreamChunk?.(chunk);
+        await options?.onStreamChunk?.(chunk, undefined, accumulated);
       }
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: finalText, thought },
         responseMessages: [],
       };
@@ -328,12 +351,18 @@ function createChunkPlanMessageService(
 }
 
 function createViewShortcutMessageService(): NonNullable<
-  AgentRuntime["messageService"]
+  IAgentRuntime["messageService"]
 > {
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: {
           text: "Navigated to Settings.",
           thought: "Shortcut: app-control:nl:view-navigation",
@@ -361,24 +390,41 @@ function createViewShortcutMessageService(): NonNullable<
 
 function createPersistedCallbackMessageService(
   messageId: UUID,
+  fixtureOptions: {
+    declarePersisted?: boolean;
+    fireCallback?: boolean;
+  } = {},
 ): NonNullable<AgentRuntime["messageService"]> {
   const text = "Calendar is ready.";
   return {
-    async handleMessage(_runtime, _message, callback) {
-      await callback?.({ text });
+    async handleMessage(runtime, message, callback, messageOptions) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        messageOptions,
+      );
+      if (fixtureOptions.fireCallback !== false) {
+        await callback?.({ text });
+      }
+      const response = {
+        id: messageId,
+        entityId: AGENT_ID,
+        agentId: AGENT_ID,
+        roomId: ROOM_ID,
+        content: { text },
+        createdAt: Date.now(),
+      };
+      if (fixtureOptions.declarePersisted !== false) {
+        messageOptions?.onResponseMessagePersisted?.(response);
+      }
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text },
-        responseMessages: [
-          {
-            id: messageId,
-            entityId: AGENT_ID,
-            agentId: AGENT_ID,
-            roomId: ROOM_ID,
-            content: { text },
-            createdAt: Date.now(),
-          },
-        ],
+        responseMessages: [response],
+        ...(fixtureOptions.declarePersisted !== false
+          ? { persistedResponseMessageIds: [messageId] }
+          : {}),
       };
     },
     shouldRespond: () => ({
@@ -396,10 +442,16 @@ function createMixedPersistedTransientMessageService(
   transientFinalId?: UUID,
 ): NonNullable<AgentRuntime["messageService"]> {
   return {
-    async handleMessage(_runtime, _message, callback) {
+    async handleMessage(runtime, message, callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       await callback?.({ text: "Final answer.", action: "VIEWS" });
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: "Final answer." },
         responseMessages: [
           {
@@ -604,11 +656,17 @@ function createGatedMessageService(
   gate: ReturnType<typeof createDeferred>,
 ): NonNullable<AgentRuntime["messageService"]> {
   return {
-    async handleMessage() {
+    async handleMessage(runtime, message, _callback, options) {
+      const persistedRequestMessageId = await persistFixtureIncoming(
+        runtime,
+        message,
+        options,
+      );
       started.resolve();
       await gate.promise;
       return {
         didRespond: true,
+        persistedRequestMessageId,
         responseContent: { text: FINAL_TEXT, thought: THOUGHT },
         responseMessages: [],
       };
@@ -679,20 +737,20 @@ describe("conversation stream SSE contract (#10712)", () => {
       agentName: "Streaming Agent",
       thought: THOUGHT,
     });
-    // The terminal `done` frame carries the persisted assistant message id
-    // (pre-minted before the deferred DB insert), and the SAME id is handed to
-    // the persistence layer — the contract the client relies on to swap its
-    // streamed temp-resp-* bubble so the proactive-message WS echo reconciles
-    // by id instead of appending a duplicate bubble.
+    // `done` is a commit receipt: both ids refer to the exact rows already
+    // acknowledged by their sole persistence owners.
     const doneMessageId = payloads[doneIndex].messageId;
-    expect(typeof doneMessageId).toBe("string");
-    const persistedCall = vi
-      .mocked(persistAssistantConversationMemory)
-      .mock.calls.find((call) => call[5] === doneMessageId);
-    expect(persistedCall).toBeDefined();
-    expect(persistedCall?.[1]).toBe(ROOM_ID);
-    expect(persistedCall?.[2]).toMatchObject({ text: FINAL_TEXT });
-    expect(persistedCall?.[3]).toBe(ChannelType.DM);
+    expect(doneMessageId).toBe(stringToUuid("stream-contract-assistant-msg"));
+    expect(payloads[doneIndex].userMessageId).toBe(
+      stringToUuid("stream-contract-user-msg-store"),
+    );
+    expect(persistConversationMemory).toHaveBeenCalledTimes(1);
+    expect(persistAssistantConversationMemory).toHaveBeenCalledWith(
+      expect.anything(),
+      ROOM_ID,
+      expect.objectContaining({ text: FINAL_TEXT }),
+      ChannelType.DM,
+    );
     // `done` is terminal — no token frames after it.
     expect(
       payloads.slice(doneIndex + 1).some((payload) => payload.type === "token"),
@@ -923,10 +981,14 @@ describe("conversation stream SSE contract (#10712)", () => {
     const done = parseSsePayloads(record.writes).find(
       (payload) => payload.type === "done",
     );
+    if (!done) {
+      throw new Error(JSON.stringify(parseSsePayloads(record.writes)));
+    }
     expect(done).toMatchObject({
       type: "done",
       fullText: "Calendar is ready.",
       messageId: responseId,
+      userMessageId: stringToUuid("stream-contract-user-msg-store"),
     });
     expect(persistAssistantConversationMemory).not.toHaveBeenCalled();
   });
@@ -969,7 +1031,10 @@ describe("conversation stream SSE contract (#10712)", () => {
   it("does not advertise a transient responseMessages id that is absent from storage", async () => {
     const transientId = stringToUuid("transient-callback-response") as UUID;
     const { ctx, record, state } = createCtx(
-      createPersistedCallbackMessageService(transientId),
+      createPersistedCallbackMessageService(transientId, {
+        declarePersisted: false,
+        fireCallback: false,
+      }),
     );
     const runtime = state.runtime;
     if (!runtime) throw new Error("runtime fixture missing");
@@ -987,18 +1052,17 @@ describe("conversation stream SSE contract (#10712)", () => {
       fullText: "Calendar is ready.",
     });
     expect(done?.messageId).not.toBe(transientId);
-    expect(typeof done?.messageId).toBe("string");
-    expect(
-      vi
-        .mocked(persistAssistantConversationMemory)
-        .mock.calls.some((call) => call[5] === done?.messageId),
-    ).toBe(true);
+    expect(done?.messageId).toBe(stringToUuid("stream-contract-assistant-msg"));
+    expect(persistAssistantConversationMemory).toHaveBeenCalledTimes(1);
   });
 
   it("does not reuse a stored response row owned by another agent id", async () => {
     const responseId = stringToUuid("wrong-agent-id-response") as UUID;
     const { ctx, record, state } = createCtx(
-      createPersistedCallbackMessageService(responseId),
+      createPersistedCallbackMessageService(responseId, {
+        declarePersisted: false,
+        fireCallback: false,
+      }),
     );
     const runtime = state.runtime;
     if (!runtime) throw new Error("runtime fixture missing");
@@ -1025,11 +1089,8 @@ describe("conversation stream SSE contract (#10712)", () => {
       fullText: "Calendar is ready.",
     });
     expect(done?.messageId).not.toBe(responseId);
-    expect(
-      vi
-        .mocked(persistAssistantConversationMemory)
-        .mock.calls.some((call) => call[5] === done?.messageId),
-    ).toBe(true);
+    expect(done?.messageId).toBe(stringToUuid("stream-contract-assistant-msg"));
+    expect(persistAssistantConversationMemory).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -1075,17 +1136,14 @@ describe("conversation stream SSE contract (#10712)", () => {
           }
         | undefined;
       vi.mocked(persistAssistantConversationMemory).mockImplementationOnce(
-        async (
-          callbackRuntime,
-          roomId,
-          content,
-          _channelType,
-          _dedupeSinceMs,
-          memoryId,
-        ) => {
-          if (!memoryId) throw new Error("route-owned id missing");
+        async (callbackRuntime, roomId, content, _channelType, memoryId) => {
+          const durableId =
+            memoryId ??
+            stringToUuid(
+              `route-owned-${mode}-${transientFinalId ?? "missing"}`,
+            );
           routeOwnedMemory = {
-            id: memoryId,
+            id: durableId,
             entityId: callbackRuntime.agentId,
             agentId: callbackRuntime.agentId,
             roomId,
@@ -1291,7 +1349,10 @@ describe("conversation stream SSE contract (#10712)", () => {
     // onStreamChunk → appendIncomingText resolves it to a snapshot replace, so
     // onSnapshot fires with the corrected text.
     const messageService = createChunkPlanMessageService(
-      ["Hello wrld", "Hello world"],
+      [
+        { chunk: "Hello wrld", accumulated: "Hello wrld" },
+        { chunk: "Hello world", accumulated: "Hello world" },
+      ],
       "Hello world",
       "corrected a typo mid-stream",
     );
@@ -1324,7 +1385,10 @@ describe("conversation stream SSE contract (#10712)", () => {
     requestStreamProtocol = undefined;
     const legacy = createCtx(
       createChunkPlanMessageService(
-        ["Hello wrld", "Hello world"],
+        [
+          { chunk: "Hello wrld", accumulated: "Hello wrld" },
+          { chunk: "Hello world", accumulated: "Hello world" },
+        ],
         "Hello world",
         "corrected a typo mid-stream",
       ),

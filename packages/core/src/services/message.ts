@@ -8,6 +8,7 @@
  * runtime message loop drives it; a host may swap in an alternate `IMessageService`
  * to replace it wholesale.
  */
+import { isDeepStrictEqual } from "node:util";
 import { v4 } from "uuid";
 import { formatActionNames, formatActions } from "../actions";
 import {
@@ -1356,6 +1357,9 @@ type ResolvedMessageOptions = {
 	keepExistingResponses: boolean;
 	onStreamChunk?: StreamChunkCallback;
 	shouldRespondModel: ShouldRespondModelType;
+	incomingMessageForPersistence?: Memory;
+	onIncomingMessagePersisted?: (message: Memory) => void;
+	onResponseMessagePersisted?: (message: Memory) => void;
 	/**
 	 * Per-turn abort signal threaded into the streaming context so
 	 * `runtime.useModel` and model handlers downstream can cancel
@@ -9475,6 +9479,25 @@ export function wrapSingleTurnVisibleCallback(
 	return wrapped;
 }
 
+function notifyPersistenceObserver(
+	runtime: IAgentRuntime,
+	scope: string,
+	observer: ((message: Memory) => void) | undefined,
+	message: Memory,
+): void {
+	if (!observer) return;
+	try {
+		observer(message);
+	} catch (error) {
+		// error-policy:J7 an observer is diagnostic transport state; its failure
+		// must not turn a confirmed database commit into an uncertain write.
+		runtime.reportError(scope, error, {
+			messageId: message.id,
+			roomId: message.roomId,
+		});
+	}
+}
+
 function resolveCallbackActionName(
 	response: Content,
 	actionName?: string,
@@ -10151,6 +10174,7 @@ export class DefaultMessageService implements IMessageService {
 							}
 						: undefined;
 
+				let persistedRequestMessageId: UUID | undefined;
 				const opts: ResolvedMessageOptions = {
 					maxRetries: options?.maxRetries ?? 3,
 					timeoutDuration: options?.timeoutDuration ?? 60 * 60 * 1000, // 1 hour
@@ -10167,6 +10191,31 @@ export class DefaultMessageService implements IMessageService {
 						),
 					shouldRespondModel: resolvedShouldRespondModel,
 					...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}),
+					...(options?.incomingMessageForPersistence
+						? {
+								incomingMessageForPersistence:
+									options.incomingMessageForPersistence,
+							}
+						: {}),
+					onIncomingMessagePersisted: (persistedMessage) => {
+						if (persistedMessage.id) {
+							persistedRequestMessageId = persistedMessage.id;
+						}
+						notifyPersistenceObserver(
+							runtime,
+							"MessageService.incomingMessagePersistedObserver",
+							options?.onIncomingMessagePersisted,
+							persistedMessage,
+						);
+					},
+					onResponseMessagePersisted: (persistedMessage) => {
+						notifyPersistenceObserver(
+							runtime,
+							"MessageService.responseMessagePersistedObserver",
+							options?.onResponseMessagePersisted,
+							persistedMessage,
+						);
+					},
 				};
 
 				const deliveredVisibleTexts = new Set<string>();
@@ -10457,7 +10506,10 @@ export class DefaultMessageService implements IMessageService {
 						}
 					}
 
-					return result;
+					return {
+						...result,
+						...(persistedRequestMessageId ? { persistedRequestMessageId } : {}),
+					};
 				} finally {
 					clearTimeout(timeoutId);
 
@@ -10571,11 +10623,54 @@ export class DefaultMessageService implements IMessageService {
 			// wrapper XML back into the user's chat bubble or re-enter context as
 			// history on later turns. `message` (used downstream this turn) keeps its
 			// wrap.
-			const persistableMessage = stripAugmentationForPersistence(message);
+			const persistenceSource = opts.incomingMessageForPersistence ?? message;
+			if (
+				persistenceSource.id !== message.id ||
+				persistenceSource.roomId !== message.roomId ||
+				persistenceSource.entityId !== message.entityId ||
+				persistenceSource.agentId !== message.agentId
+			) {
+				throw new ElizaError(
+					"Incoming persistence copy does not identify the processing message",
+					{
+						code: "INCOMING_MESSAGE_PERSISTENCE_IDENTITY_MISMATCH",
+						context: {
+							processingMessageId: message.id,
+							persistenceMessageId: persistenceSource.id,
+							processingRoomId: message.roomId,
+							persistenceRoomId: persistenceSource.roomId,
+						},
+						severity: "fatal",
+					},
+				);
+			}
+			const persistableMessage =
+				stripAugmentationForPersistence(persistenceSource);
 
 			if (message.id) {
 				const existingMemory = await runtime.getMemoryById(message.id);
 				if (existingMemory) {
+					if (
+						existingMemory.roomId !== persistableMessage.roomId ||
+						existingMemory.entityId !== persistableMessage.entityId ||
+						existingMemory.agentId !== persistableMessage.agentId ||
+						!isDeepStrictEqual(
+							existingMemory.content,
+							persistableMessage.content,
+						)
+					) {
+						throw new ElizaError(
+							"Incoming message id is already bound to different content",
+							{
+								code: "INCOMING_MESSAGE_ID_CONFLICT",
+								context: {
+									messageId: message.id,
+									roomId: message.roomId,
+								},
+								severity: "fatal",
+							},
+						);
+					}
 					runtime.logger.debug(
 						{ src: "service:message" },
 						"Memory already exists, skipping creation",
@@ -10588,6 +10683,8 @@ export class DefaultMessageService implements IMessageService {
 					);
 					memoryToQueue = { ...persistableMessage, id: createdMemoryId };
 				}
+				message.id = memoryToQueue.id;
+				opts.onIncomingMessagePersisted?.(memoryToQueue);
 				await runtime.queueEmbeddingGeneration(memoryToQueue, "high");
 			} else {
 				const memoryId = await runtime.createMemory(
@@ -10596,6 +10693,7 @@ export class DefaultMessageService implements IMessageService {
 				);
 				message.id = memoryId;
 				memoryToQueue = { ...persistableMessage, id: memoryId };
+				opts.onIncomingMessagePersisted?.(memoryToQueue);
 				await runtime.queueEmbeddingGeneration(memoryToQueue, "normal");
 			}
 		});
@@ -10945,14 +11043,19 @@ export class DefaultMessageService implements IMessageService {
 						roomId: message.roomId,
 						createdAt: Date.now(),
 					};
-					await runtime.createMemory(earlyMemory, "messages");
+					const persistedEarlyResponseId = await runtime.createMemory(
+						earlyMemory,
+						"messages",
+					);
+					earlyMemory.id = persistedEarlyResponseId;
+					opts.onResponseMessagePersisted?.(earlyMemory);
 					await this.emitMessageSent(
 						runtime,
 						earlyMemory,
 						message.content.source ?? "messageHandler",
 					);
 					earlyReplyMessages.push(earlyMemory);
-					persistedEarlyReplyIds.add(earlyResponseId);
+					persistedEarlyReplyIds.add(persistedEarlyResponseId);
 					if (callback) {
 						await callback(earlyContent);
 					}
@@ -11240,6 +11343,9 @@ export class DefaultMessageService implements IMessageService {
 
 		let responseContent: Content | null = null;
 		let responseMessages: Memory[] = [];
+		const persistedResponseMessageIds = new Set<UUID>(
+			Array.from(persistedEarlyReplyIds, (id) => id as UUID),
+		);
 		let actionResults: ActionResult[] | undefined;
 		let mode: StrategyMode = "none";
 
@@ -11348,9 +11454,13 @@ export class DefaultMessageService implements IMessageService {
 						{ src: "service:message", memoryId: responseMemory.id },
 						"Saving response to memory",
 					);
-					await timeInferenceSpan("message:delivery:persistence", () =>
-						runtime.createMemory(responseMemory, "messages"),
+					const persistedResponseId = await timeInferenceSpan(
+						"message:delivery:persistence",
+						() => runtime.createMemory(responseMemory, "messages"),
 					);
+					responseMemory.id = persistedResponseId;
+					persistedResponseMessageIds.add(persistedResponseId);
+					opts.onResponseMessagePersisted?.(responseMemory);
 
 					await timeInferenceSpan("message:delivery:event", () =>
 						this.emitMessageSent(
@@ -11439,9 +11549,13 @@ export class DefaultMessageService implements IMessageService {
 										{ src: "service:message", memoryId: responseMemory.id },
 										"Saving response to memory",
 									);
-									await timeInferenceSpan("message:delivery:persistence", () =>
-										runtime.createMemory(responseMemory, "messages"),
+									const persistedResponseId = await timeInferenceSpan(
+										"message:delivery:persistence",
+										() => runtime.createMemory(responseMemory, "messages"),
 									);
+									responseMemory.id = persistedResponseId;
+									persistedResponseMessageIds.add(persistedResponseId);
+									opts.onResponseMessagePersisted?.(responseMemory);
 
 									detachPostDeliverySideEffect(runtime, "MESSAGE_SENT", () =>
 										this.emitMessageSent(
@@ -11557,9 +11671,12 @@ export class DefaultMessageService implements IMessageService {
 				roomId: message.roomId,
 				createdAt: Date.now(),
 			};
-			await timeInferenceSpan("message:delivery:persistence", () =>
-				runtime.createMemory(terminalMemory, "messages"),
+			const persistedTerminalId = await timeInferenceSpan(
+				"message:delivery:persistence",
+				() => runtime.createMemory(terminalMemory, "messages"),
 			);
+			terminalMemory.id = persistedTerminalId;
+			opts.onResponseMessagePersisted?.(terminalMemory);
 			await timeInferenceSpan("message:delivery:event", () =>
 				this.emitMessageSent(
 					runtime,
@@ -11704,6 +11821,13 @@ export class DefaultMessageService implements IMessageService {
 			didRespond,
 			responseContent,
 			responseMessages,
+			...(persistedResponseMessageIds.size > 0
+				? {
+						persistedResponseMessageIds: Array.from(
+							persistedResponseMessageIds,
+						),
+					}
+				: {}),
 			...(actionResults ? { actionResults } : {}),
 			state,
 			mode,

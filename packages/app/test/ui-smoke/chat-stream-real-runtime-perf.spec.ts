@@ -16,8 +16,10 @@ const STREAM_PATH = /\/api\/conversations\/[^/]+\/messages\/stream$/;
 type StreamFrame = {
   atMs: number;
   fullText?: string;
+  messageId?: string;
   text?: string;
   type?: string;
+  userMessageId?: string;
 };
 
 type StreamRecord = {
@@ -163,8 +165,10 @@ async function installRealStreamInstrumentation(
                 try {
                   const parsed = JSON.parse(data) as {
                     fullText?: string;
+                    messageId?: string;
                     text?: string;
                     type?: string;
+                    userMessageId?: string;
                   };
                   if (parsed.type === "token") {
                     reconstructedText =
@@ -252,20 +256,30 @@ test.describe("real-runtime chat stream performance", () => {
     await seedAppStorage(page, {
       "eliza:chat:activeConversationId": conversationId ?? "",
     });
-    await openAppPath(page, "/chat");
-    await expect(page.getByTestId("chat-composer-textarea")).toBeVisible();
-
-    const firstHistoryReload = page.waitForResponse(
+    const initialHistoryLoad = page.waitForResponse(
       (response) =>
         response.request().method() === "GET" &&
         new URL(response.url()).pathname ===
           `/api/conversations/${conversationId}/messages` &&
         response.ok(),
     );
+    await openAppPath(page, "/chat");
+    await expect(page.getByTestId("chat-composer-textarea")).toBeVisible();
+    await initialHistoryLoad;
+
+    let postSendHistoryGets = 0;
+    page.on("request", (request) => {
+      if (
+        request.method() === "GET" &&
+        new URL(request.url()).pathname ===
+          `/api/conversations/${conversationId}/messages`
+      ) {
+        postSendHistoryGets += 1;
+      }
+    });
     await sendAndWaitForDone(page, "Establish the completed history row.", 1);
-    const firstReloadResponse = await firstHistoryReload;
-    await firstReloadResponse.finished();
     await page.waitForTimeout(500);
+    expect(postSendHistoryGets).toBe(0);
     await expect(
       page
         .locator('[data-testid="thread-line"][data-role="assistant"]')
@@ -327,15 +341,6 @@ test.describe("real-runtime chat stream performance", () => {
           historyObserver.disconnect();
           return;
         }
-        const measuredStream = state.__ELIZA_REAL_STREAM_PROBE__?.streams[1];
-        if (
-          renderProbe.identityRunning &&
-          measuredStream &&
-          measuredStream.doneAtMs !== null
-        ) {
-          renderProbe.identityRunning = false;
-          historyObserver.disconnect();
-        }
         const assistantRows = Array.from(
           document.querySelectorAll(
             '[data-testid="thread-line"][data-role="assistant"]',
@@ -369,16 +374,7 @@ test.describe("real-runtime chat stream performance", () => {
       renderProbe.frameHandle = requestAnimationFrame(sample);
     });
 
-    const secondHistoryReload = page.waitForResponse(
-      (response) =>
-        response.request().method() === "GET" &&
-        new URL(response.url()).pathname ===
-          `/api/conversations/${conversationId}/messages` &&
-        response.ok(),
-    );
     await sendAndWaitForDone(page, "Measure the real streaming surface.", 2);
-    const secondReloadResponse = await secondHistoryReload;
-    await secondReloadResponse.finished();
     const streamedRows = page
       .locator('[data-testid="thread-line"][data-role="assistant"]')
       .filter({ hasText: RESPONSE_MARKER });
@@ -403,6 +399,7 @@ test.describe("real-runtime chat stream performance", () => {
       renderProbe.running = false;
       cancelAnimationFrame(renderProbe.frameHandle);
       const stream = probe.streams[1];
+      const doneFrame = stream.frames.find((frame) => frame.type === "done");
       const rawTokenFrames = stream.frames.filter(
         (frame) => frame.type === "token" && frame.fullText,
       );
@@ -459,6 +456,8 @@ test.describe("real-runtime chat stream performance", () => {
           (renderProbe.paints.find((paint) =>
             paint.text.includes(responseMarker),
           )?.atMs ?? doneAtMs),
+        doneMessageId: doneFrame?.messageId ?? null,
+        doneUserMessageId: doneFrame?.userMessageId ?? null,
         droppedFrameRatio:
           frameDeltas.filter((delta) => delta > 25).length /
           Math.max(1, frameDeltas.length),
@@ -548,6 +547,9 @@ test.describe("real-runtime chat stream performance", () => {
     expect(metrics.layoutShiftObserverSupported).toBe(true);
     expect(metrics.outsideChatLayoutShifts).toBe(0);
     expect(metrics.composerMovementPx).toBeLessThanOrEqual(1);
+    expect(metrics.doneMessageId).toBeTruthy();
+    expect(metrics.doneUserMessageId).toBeTruthy();
+    expect(postSendHistoryGets).toBe(0);
     expect(persistedMarkerMessages).toHaveLength(2);
   });
 });

@@ -7,6 +7,8 @@
  * handleMessage boundary, and a same-room follow-up fired off the delivery
  * (the racy case: concurrent handleMessage, NOT sequential) is barred from
  * composing until the reply row is stored while other rooms stay unblocked.
+ * It also verifies that transport observers and result receipts expose the
+ * exact IDs returned by those real writes.
  * Real AgentRuntime + InMemoryDatabaseAdapter end to end; only the Stage-1
  * model surface is a deterministic registered handler (no live model, no
  * network). The adapter wrapper below observes/faults/holds the storage
@@ -239,16 +241,27 @@ describe("simple-path deliver-then-persist ordering", () => {
 	it("fires the delivery callback before the reply persist completes, then still persists it", async () => {
 		const h = await createHarness();
 		let repliesVisibleAtDelivery = -1;
+		const message = h.makeMessage();
+		const persistedIncoming: Memory[] = [];
+		const persistedResponses: Memory[] = [];
 
 		const result = await h.service.handleMessage(
 			h.runtime,
-			h.makeMessage(),
+			message,
 			async () => {
 				h.order.push("callback");
 				// Direct proof delivery precedes persistence: at delivery time the
 				// reply row is not yet readable from the real adapter.
 				repliesVisibleAtDelivery = (await h.storedReplies()).length;
 				return [];
+			},
+			{
+				onIncomingMessagePersisted: (memory) => {
+					persistedIncoming.push(memory);
+				},
+				onResponseMessagePersisted: (memory) => {
+					persistedResponses.push(memory);
+				},
 			},
 		);
 
@@ -264,6 +277,12 @@ describe("simple-path deliver-then-persist ordering", () => {
 		const replies = await h.storedReplies();
 		expect(replies).toHaveLength(1);
 		expect(replies[0].content.text).toBe(h.replyText);
+		expect(result.persistedRequestMessageId).toBe(message.id);
+		expect(result.persistedResponseMessageIds).toEqual([replies[0].id]);
+		expect(persistedIncoming.map((memory) => memory.id)).toEqual([message.id]);
+		expect(persistedResponses.map((memory) => memory.id)).toEqual([
+			replies[0].id,
+		]);
 	});
 
 	it("still persists the reply when the delivery callback throws, then rethrows that exact error", async () => {
