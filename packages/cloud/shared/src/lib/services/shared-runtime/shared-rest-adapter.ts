@@ -431,10 +431,7 @@ export async function sharedRestPostSignInActivation(
   const greeting = ensured.greeting;
   let projected = false;
   if (greeting.projected_at === null) {
-    const channelId = await sharedConversationChannelId(
-      agentId,
-      greeting.conversation_id,
-    );
+    const channelId = await sharedConversationChannelId(agentId, greeting.conversation_id);
     projected = await sharedRuntimeHistoryRepository.ensureMessage(agentId, channelId, {
       role: "assistant",
       content: greeting.text,
@@ -611,10 +608,7 @@ export async function sharedRestHandoffSnapshot(input: {
       activationGoal?: ActivationGoalHandoffEnvelope;
     }
 > {
-  const channelId = await sharedConversationChannelId(
-    input.agentId,
-    input.conversationId,
-  );
+  const channelId = await sharedConversationChannelId(input.agentId, input.conversationId);
   const snapshot = await sharedRuntimeTurnClaimsRepository.beginHandoffSnapshot({
     agentId: input.agentId,
     channelId,
@@ -637,10 +631,7 @@ export async function releaseSharedRestHandoffFence(input: {
   conversationId: string;
   fenceToken: string;
 }): Promise<boolean> {
-  const channelId = await sharedConversationChannelId(
-    input.agentId,
-    input.conversationId,
-  );
+  const channelId = await sharedConversationChannelId(input.agentId, input.conversationId);
   return await sharedRuntimeTurnClaimsRepository.releaseHandoffFence({
     agentId: input.agentId,
     channelId,

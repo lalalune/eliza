@@ -3456,10 +3456,7 @@ export class ElizaSandboxService {
                     output: extraction.output,
                     model: extraction.model,
                   };
-                  billableUsage = this.combineSharedTurnUsage(
-                    part.usage,
-                    extraction.usage,
-                  );
+                  billableUsage = this.combineSharedTurnUsage(part.usage, extraction.usage);
                 }
                 finalReply = await this.commitSharedTurn({
                   rec,
@@ -3489,18 +3486,12 @@ export class ElizaSandboxService {
                           estimatedInputTokens,
                         ),
                       );
-                      const settlement = await settleReservation(
-                        billing.totalCost,
-                      );
-                      const usageRecord = await recordUsageAnalytics(
-                        billingContext,
-                        billing,
-                        {
-                          type: "chat",
-                          content: finalReply,
-                          prompt: text,
-                        },
-                      );
+                      const settlement = await settleReservation(billing.totalCost);
+                      const usageRecord = await recordUsageAnalytics(billingContext, billing, {
+                        type: "chat",
+                        content: finalReply,
+                        prompt: text,
+                      });
                       if (usageRecord) {
                         await aiBillingRecordsService
                           .record({
@@ -3511,16 +3502,10 @@ export class ElizaSandboxService {
                             reconciliation: settlement,
                           })
                           .catch((error) => {
-                            logger.error(
-                              "[shared-runtime] AI billing audit record failed",
-                              {
-                                error:
-                                  error instanceof Error
-                                    ? error.message
-                                    : String(error),
-                                agentId: rec.id,
-                              },
-                            );
+                            logger.error("[shared-runtime] AI billing audit record failed", {
+                              error: error instanceof Error ? error.message : String(error),
+                              agentId: rec.id,
+                            });
                           });
                       }
                     } catch (error) {
@@ -3542,10 +3527,7 @@ export class ElizaSandboxService {
                         );
                       }
                       logger.error("[shared-runtime] billing failed", {
-                        error:
-                          error instanceof Error
-                            ? error.message
-                            : String(error),
+                        error: error instanceof Error ? error.message : String(error),
                         agentId: rec.id,
                       });
                     }

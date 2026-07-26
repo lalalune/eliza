@@ -127,12 +127,12 @@ async function revalidateCachedScope(
     null;
   if (!apiKey) return false;
   const validated = cacheOnly
-      ? await cache.get<{
-          is_active?: boolean;
-          organization_id?: string;
-          user_id?: string;
-          expires_at?: Date | string | null;
-        }>(
+    ? await cache.get<{
+        is_active?: boolean;
+        organization_id?: string;
+        user_id?: string;
+        expires_at?: Date | string | null;
+      }>(
         CacheKeys.apiKey.validation(
           createHash("sha256").update(apiKey).digest("hex").substring(0, 16),
         ),
