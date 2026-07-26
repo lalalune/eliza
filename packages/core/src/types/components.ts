@@ -235,7 +235,9 @@ export interface EvaluationResult {
 
 /**
  * Callback function type for handlers. actionName is optional so callers can attribute
- * the response to the action that produced it without parsing content (backward compatible).
+ * the response to the action that produced it without parsing content. Returned
+ * memories are delivery receipts: each entry identifies a response the transport
+ * durably committed while delivering the callback.
  */
 export type HandlerCallback = (
 	response: Content,

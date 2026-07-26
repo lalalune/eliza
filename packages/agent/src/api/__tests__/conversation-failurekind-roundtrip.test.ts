@@ -54,9 +54,13 @@ vi.mock("../chat-routes.ts", async () => {
       source: "api",
       metadata: undefined,
     })),
-    persistConversationMemory: vi.fn(async () => undefined),
-    persistAssistantConversationMemory: vi.fn(async () => undefined),
-    hasRecentVisibleAssistantMemorySince: vi.fn(async () => false),
+    persistAssistantConversationMemory: vi.fn(async (_runtime, roomId) => ({
+      id: stringToUuid("assistant-msg-store"),
+      entityId: AGENT_ID,
+      agentId: AGENT_ID,
+      roomId,
+      content: { text: "ok" },
+    })),
     generateChatResponse: vi.fn(
       async (
         _runtime,
@@ -68,6 +72,7 @@ vi.mock("../chat-routes.ts", async () => {
         return {
           text: "ok",
           agentName,
+          persistedRequestMessageId: stringToUuid("user-msg-store"),
           usage: undefined,
           usedActionCallbacks: false,
           actionCallbackHistory: undefined,
@@ -334,6 +339,42 @@ describe("conversation failureKind round-trip", () => {
     };
     const assistant = payload.messages.find((m) => m.role === "assistant");
     expect(assistant?.failureKind).toBeUndefined();
+  });
+
+  it("GET /messages round-trips one exact client turn id onto its user and assistant rows", async () => {
+    const userId = stringToUuid("user-mem");
+    const clientMessageId = "client-turn-exact";
+    const state = createState([
+      {
+        ...userMemory(),
+        content: {
+          text: "repeatable text",
+          source: "api",
+          metadata: { clientMessageId },
+        },
+      },
+      assistantMemory({
+        text: "repeatable reply",
+        inReplyTo: stringToUuid(`${userId}:${AGENT_ID}`),
+      }),
+    ]);
+    const { ctx, captured } = createCtx(
+      "GET",
+      "/api/conversations/conv-1/messages",
+      state,
+    );
+
+    await handleConversationRoutes(ctx);
+
+    const payload = captured.payload as {
+      messages: Array<{
+        role: string;
+        clientMessageId?: string;
+      }>;
+    };
+    expect(payload.messages).toHaveLength(2);
+    expect(payload.messages[0]?.clientMessageId).toBe(clientMessageId);
+    expect(payload.messages[1]?.clientMessageId).toBe(clientMessageId);
   });
 
   it("streaming `done` frame carries failureKind when the result carries one", async () => {

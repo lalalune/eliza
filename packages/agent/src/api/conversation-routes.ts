@@ -26,6 +26,7 @@ import {
   ChannelType,
   type Content,
   createMessageMemory,
+  createUniqueUuid,
   ElizaError,
   logger,
   MESSAGE_SOURCE_AGENT_GREETING,
@@ -34,6 +35,7 @@ import {
   type RolesWorldMetadata,
   recordOwnerGrant,
   recordRoleGrant,
+  shouldSkipResponseMemoryPersistence,
   stringToUuid,
   type UUID,
   validateUuid,
@@ -64,10 +66,7 @@ import {
   generateChatResponse,
   generateConversationTitle,
   getChatFailureReply,
-  getChatMessageIdFirstSeenAt,
-  getRecentVisibleAssistantMemorySince,
-  getRecentVisibleAssistantMemoryTextSince,
-  hasRecentVisibleAssistantMemorySince,
+  getChatMessageReceipt,
   initSse,
   isDuplicateChatMessage,
   normalizeAccountConnectRequest,
@@ -75,6 +74,7 @@ import {
   persistAssistantConversationMemory,
   persistConversationMemory,
   readChatRequestPayload,
+  recordChatMessageReceipt,
   releaseChatMessageId,
   resolveNoResponseFallback,
   writeChatStatusSse,
@@ -271,20 +271,11 @@ export interface ConversationRouteContext extends RouteRequestContext {
 }
 
 /**
- * How long a chat turn may HOLD waiting for first-turn capability during the
- * warming window (early API bind → runtime ready). Normal boots resolve in ~2s;
- * the cap bounds the hold so a genuinely-stuck boot still fails fast.
+ * How long a chat turn may hold for first-turn capability while the agent is
+ * actively warming. A stopped or errored agent still fails immediately.
  */
 const WARMING_TURN_HOLD_MS = 30_000;
 
-/**
- * Resolve the runtime for a chat turn, HOLDING through the warming window
- * instead of 503-dropping. Returns the live runtime immediately if present;
- * otherwise, only while the agent is actively warming up (`starting`/
- * `restarting`), waits up to WARMING_TURN_HOLD_MS for capability to come online.
- * A genuinely stopped/errored agent (or one with no gate wired) returns null so
- * the caller fails fast with the usual 503.
- */
 async function resolveRuntimeForChatTurn(
   state: ConversationRouteState,
 ): Promise<AgentRuntime | null> {
@@ -715,20 +706,158 @@ async function ensureWorldOwnershipAndRoles(
   }
 }
 
-async function shouldPersistFinalAssistantTurn(
+function findPersistedGeneratedAssistantTurn(
+  result: ChatGenerationResult,
+): { id: UUID; content: Content } | null {
+  if (
+    !Array.isArray(result.persistedResponseMessageIds) ||
+    !Array.isArray(result.responseMessages)
+  ) {
+    return null;
+  }
+  const persistedIds = new Set(result.persistedResponseMessageIds);
+  for (let index = result.responseMessages.length - 1; index >= 0; index -= 1) {
+    const candidate = result.responseMessages[index];
+    if (
+      typeof candidate?.id === "string" &&
+      candidate.id.length > 0 &&
+      persistedIds.has(candidate.id)
+    ) {
+      return {
+        id: candidate.id as UUID,
+        content:
+          candidate.content && typeof candidate.content === "object"
+            ? candidate.content
+            : {},
+      };
+    }
+  }
+  return null;
+}
+
+function isAssistantReplyPersistenceError(error: unknown): error is ElizaError {
+  return (
+    error instanceof ElizaError &&
+    (error.code === "CHAT_ASSISTANT_PERSISTENCE_FAILED" ||
+      error.code === "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_MISSING" ||
+      error.code === "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_INVALID")
+  );
+}
+
+async function resolvePersistedAssistantTurn(
   runtime: AgentRuntime,
   roomId: UUID,
-  turnStartedAt: number,
   result: ChatGenerationResult,
-): Promise<boolean> {
-  if (!result.usedActionCallbacks) {
-    return true;
+  text: string,
+  channelType: ChannelType,
+  clientMessageId?: string,
+): Promise<
+  | { kind: "durable"; id: UUID; text: string }
+  | { kind: "ephemeral"; text: string }
+> {
+  let content = buildPersistedAssistantContent(text, result);
+  const generatedTurn = findPersistedGeneratedAssistantTurn(result);
+  if (generatedTurn) {
+    const existingHistory = normalizeActionCallbackHistory(
+      (generatedTurn.content as Record<string, unknown>).actionCallbackHistory,
+    );
+    const finalHistory = normalizeActionCallbackHistory(
+      (content as Record<string, unknown>).actionCallbackHistory,
+    );
+    const existingText =
+      typeof generatedTurn.content.text === "string"
+        ? generatedTurn.content.text
+        : "";
+    if (
+      existingText !== text ||
+      existingHistory.length !== finalHistory.length ||
+      existingHistory.some((entry, index) => entry !== finalHistory[index])
+    ) {
+      await runtime.updateMemory({
+        id: generatedTurn.id,
+        content: {
+          ...generatedTurn.content,
+          ...content,
+        },
+      });
+    }
+    return { kind: "durable", id: generatedTurn.id, text };
   }
 
-  const alreadyPersistedVisibleAssistantTurn =
-    await hasRecentVisibleAssistantMemorySince(runtime, roomId, turnStartedAt);
+  if ((result.persistedResponseMessageIds?.length ?? 0) > 0) {
+    throw new ElizaError(
+      "Message service returned response IDs without their exact memories",
+      {
+        code: "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_INVALID",
+        context: {
+          roomId,
+          persistedResponseMessageIds: result.persistedResponseMessageIds,
+        },
+        severity: "fatal",
+      },
+    );
+  }
 
-  return !alreadyPersistedVisibleAssistantTurn;
+  if (
+    shouldSkipResponseMemoryPersistence({
+      content,
+      roomId,
+      entityId: runtime.agentId,
+    } as Memory)
+  ) {
+    return { kind: "ephemeral", text };
+  }
+
+  content = attachClientMessageId(content, clientMessageId);
+  let persisted: Memory | null;
+  try {
+    persisted = await persistAssistantConversationMemory(
+      runtime,
+      roomId,
+      content,
+      channelType,
+    );
+  } catch (cause) {
+    // error-policy:J2 attach the durable-turn boundary before the route
+    // translates this into a terminal SSE error.
+    throw new ElizaError("Failed to persist the assistant reply", {
+      code: "CHAT_ASSISTANT_PERSISTENCE_FAILED",
+      cause,
+      context: { roomId },
+      severity: "fatal",
+    });
+  }
+  if (!persisted?.id) {
+    throw new ElizaError(
+      "Assistant reply persistence returned no durable message id",
+      {
+        code: "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_MISSING",
+        context: { roomId },
+        severity: "fatal",
+      },
+    );
+  }
+  return { kind: "durable", id: persisted.id as UUID, text };
+}
+
+function requirePersistedRequestMessageId(
+  result: ChatGenerationResult,
+  roomId: UUID,
+): UUID {
+  if (
+    typeof result.persistedRequestMessageId === "string" &&
+    result.persistedRequestMessageId.length > 0
+  ) {
+    return result.persistedRequestMessageId as UUID;
+  }
+  throw new ElizaError(
+    "Message service returned without an incoming-message persistence receipt",
+    {
+      code: "CHAT_INCOMING_PERSISTENCE_RECEIPT_MISSING",
+      context: { roomId },
+      severity: "fatal",
+    },
+  );
 }
 
 function markConversationDeleted(
@@ -964,17 +1093,7 @@ async function waitForConversationRestore(
 ): Promise<void> {
   const pending = state.conversationRestorePromise;
   if (!pending) return;
-  try {
-    const timeout = new Promise<void>((_, reject) =>
-      setTimeout(
-        () => reject(new Error("Conversation restore timed out after 5000ms")),
-        5000,
-      ),
-    );
-    await Promise.race([pending, timeout]);
-  } catch {
-    // Restore failures are logged at the source.
-  }
+  await pending;
 }
 
 export function normalizeActionCallbackHistory(value: unknown): string[] {
@@ -998,13 +1117,6 @@ export function normalizeActionCallbackHistory(value: unknown): string[] {
   }
 
   return history;
-}
-
-function mergeActionCallbackHistory(
-  existing: readonly string[],
-  incoming: readonly string[],
-): string[] {
-  return normalizeActionCallbackHistory([...existing, ...incoming]);
 }
 
 export function formatConversationMessageText(
@@ -1065,79 +1177,22 @@ export function buildPersistedAssistantContent(
       };
 }
 
-export async function persistRecentAssistantActionCallbackHistory(
-  runtime: AgentRuntime,
-  roomId: UUID,
-  actionCallbackHistory: readonly string[],
-  sinceMs: number,
-): Promise<boolean> {
-  const normalizedHistory = normalizeActionCallbackHistory(
-    actionCallbackHistory,
-  );
-  if (normalizedHistory.length === 0) {
-    return false;
-  }
-
-  try {
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-
-    const target = recent
-      .filter((memory) => memory.entityId === runtime.agentId)
-      .filter((memory) => {
-        const content = memory.content as { text?: unknown } | undefined;
-        const createdAt = memory.createdAt ?? 0;
-        return (
-          typeof memory.id === "string" &&
-          typeof content?.text === "string" &&
-          content.text.trim().length > 0 &&
-          createdAt >= sinceMs - 2000
-        );
-      })
-      .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0))
-      .at(-1);
-
-    if (!target || typeof target.id !== "string") {
-      return false;
-    }
-
-    const content =
-      target.content && typeof target.content === "object"
-        ? (target.content as Content)
-        : ({ text: "" } satisfies Content);
-    const existingHistory = normalizeActionCallbackHistory(
-      (content as Record<string, unknown>).actionCallbackHistory,
-    );
-    const mergedHistory = mergeActionCallbackHistory(
-      existingHistory,
-      normalizedHistory,
-    );
-
-    if (
-      mergedHistory.length === existingHistory.length &&
-      mergedHistory.every((entry, index) => entry === existingHistory[index])
-    ) {
-      return true;
-    }
-
-    await runtime.updateMemory({
-      id: target.id as UUID,
-      content: {
-        ...content,
-        actionCallbackHistory: mergedHistory,
-      } as Content,
-    });
-
-    return true;
-  } catch (err) {
-    logger.debug(
-      `[conversations] Failed to persist action callback history: ${getErrorMessage(err)}`,
-    );
-    return false;
-  }
+function attachClientMessageId(
+  content: Content,
+  clientMessageId: string | undefined,
+): Content {
+  if (!clientMessageId) return content;
+  const metadata =
+    content.metadata && typeof content.metadata === "object"
+      ? (content.metadata as Record<string, unknown>)
+      : {};
+  return {
+    ...content,
+    metadata: {
+      ...metadata,
+      clientMessageId,
+    },
+  };
 }
 
 async function getConversationWithRestore(
@@ -1312,6 +1367,8 @@ type ConversationRouteMessageRecord = {
   role: "assistant" | "user";
   text: string;
   timestamp: number;
+  /** Exact logical client turn identity used for reload reconciliation. */
+  clientMessageId?: string;
   attachments?: SerializedMessageAttachment[];
   source?: string;
   actionName?: string;
@@ -2012,6 +2069,22 @@ export async function handleConversationRoutes(
       // Sort by createdAt ascending
       memories.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
       const agentId = runtime.agentId;
+      const clientMessageIdByReplyTarget = new Map<string, string>();
+      for (const memory of memories) {
+        if (!memory.id || memory.entityId === agentId) continue;
+        const content = memory.content as Record<string, unknown>;
+        const metadata =
+          content.metadata && typeof content.metadata === "object"
+            ? (content.metadata as Record<string, unknown>)
+            : undefined;
+        const clientMessageId = metadata?.clientMessageId;
+        if (typeof clientMessageId === "string" && clientMessageId.length > 0) {
+          clientMessageIdByReplyTarget.set(
+            createUniqueUuid(runtime, memory.id),
+            clientMessageId,
+          );
+        }
+      }
       // Per-viewer attachment disclosure (#14781): a boundary-role viewer
       // token (WaifuChat, artifact share-viewer) carries a principal; trunk
       // owner tokens match no resolver, so the local dashboard resolves no
@@ -2021,6 +2094,10 @@ export async function handleConversationRoutes(
         .map((m) => {
           const contentSource = (m.content as Record<string, unknown>)?.source;
           const content = m.content as Record<string, unknown>;
+          const contentMetadata =
+            content.metadata && typeof content.metadata === "object"
+              ? (content.metadata as Record<string, unknown>)
+              : undefined;
           const meta = m.metadata as Record<string, unknown> | undefined;
           const entityName = meta?.entityName;
           const replyToAuthor =
@@ -2066,6 +2143,16 @@ export async function handleConversationRoutes(
             content.accountConnect,
           );
           const role = m.entityId === agentId ? "assistant" : "user";
+          const directClientMessageId = contentMetadata?.clientMessageId;
+          const replyTarget =
+            typeof content.inReplyTo === "string" ? content.inReplyTo : "";
+          const clientMessageId =
+            typeof directClientMessageId === "string" &&
+            directClientMessageId.length > 0
+              ? directClientMessageId
+              : role === "assistant" && replyTarget
+                ? clientMessageIdByReplyTarget.get(replyTarget)
+                : undefined;
           const rawText = formatConversationMessageText(
             (m.content as { text?: string })?.text ?? "",
             actionCallbackHistory,
@@ -2090,6 +2177,7 @@ export async function handleConversationRoutes(
             role,
             text,
             timestamp: m.createdAt ?? 0,
+            ...(clientMessageId ? { clientMessageId } : {}),
             ...(attachments ? { attachments } : {}),
             ...(topics && topics.length > 0 ? { topics } : {}),
             source: normalizedSource,
@@ -2583,53 +2671,24 @@ export async function handleConversationRoutes(
       streamProtocol,
       clientMessageId,
     } = chatPayload;
-    // Idempotency contract (see `isDuplicateChatMessage`): the client stamps a
-    // stable `clientMessageId` per send and replays it verbatim on its single
-    // auto-retry after a network blip (`ui/src/api/client-base.ts`), expecting
-    // the server to de-dupe. A repeat within the TTL means the original request
-    // already started this turn — do NOT run a second one (duplicate persisted
-    // reply + double billing). When the FIRST attempt's reply already
-    // persisted, return IT in the terminal `done` frame — the retry then
-    // delivers the same outcome as the original instead of an empty turn the
-    // client must repair from history. Only while the original is still
-    // mid-turn (nothing persisted since its recorded arrival) does the retry
-    // fall back to the empty ignored shape: the client drops its optimistic
-    // placeholder on an empty completed turn and reconciles from history once
-    // the first attempt lands. Requests without a clientMessageId are never
-    // treated as duplicates.
+    // A completed retry replays only the receipt recorded for this exact client
+    // id. An in-flight retry fails explicitly; it must not claim an unrelated
+    // room message or fabricate an empty successful turn.
     if (isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)) {
-      const firstSeenAt = getChatMessageIdFirstSeenAt(
+      const receipt = getChatMessageReceipt(
         conv.roomId,
         clientMessageId ?? null,
+        "stream",
       );
-      const persistedFirstReply =
-        state.runtime && firstSeenAt !== null
-          ? await getRecentVisibleAssistantMemorySince(
-              state.runtime,
-              conv.roomId,
-              firstSeenAt,
-              // No pre-arrival slack: same-process clocks mean any reply
-              // persisted before this id's first arrival is a PRIOR turn's.
-              0,
-            )
-          : null;
       initSse(res);
-      writeSseJson(
-        res,
-        persistedFirstReply
-          ? {
-              type: "done",
-              fullText: persistedFirstReply.text,
-              agentName: state.agentName,
-              messageId: persistedFirstReply.id,
-            }
-          : {
-              type: "done",
-              fullText: "",
-              agentName: state.agentName,
-              noResponseReason: "ignored",
-            },
-      );
+      if (receipt) {
+        writeSseJson(res, receipt);
+      } else {
+        writeSse(res, {
+          type: "error",
+          message: "This chat request is already in progress",
+        });
+      }
       finishStreamResponse();
       return true;
     }
@@ -2640,16 +2699,11 @@ export async function handleConversationRoutes(
       { writeChatTokenSse, writeSse },
     );
 
-    // The SSE channel opens as soon as the request is validated — before
-    // runtime resolution, room setup, and user-message persistence — so the
-    // client sees headers, an immediate `thinking` status, and heartbeats
-    // during the pre-model work (runtime warming alone can take seconds; the
-    // pre-model DB steps add serial round-trips). Everything past this point
+    // The SSE channel opens as soon as the request is validated. Everything past this point
     // reports failure as a structured SSE `error` event (the client maps
     // `type:"error"` data lines to StreamGenerationError); only the validation
     // above may answer with plain HTTP status codes.
     initSse(res);
-    writeChatStatusSse(res, { kind: "thinking" });
     writeConversationStreamHeartbeat(res, disconnectTracker);
     const heartbeatInterval = setInterval(() => {
       if (disconnectTracker.checkConnectionClosed()) {
@@ -2664,28 +2718,39 @@ export async function handleConversationRoutes(
       return true;
     };
 
-    // Hold the streaming turn through the warming window instead of dropping it
-    // — the client already shows the optimistic bubble + typing indicator, and
-    // the response streams the instant first-turn capability comes online.
+    // The SSE channel is already open, so a warming timeout remains an explicit
+    // stream error rather than a late HTTP rewrite or a fabricated completion.
     const runtime = await resolveRuntimeForChatTurn(state);
     if (!runtime) {
+      releaseChatMessageId(conv.roomId, clientMessageId ?? null);
       return failStream("Agent is not running");
     }
 
     const caller = resolveConversationCaller(req, state, runtime);
     const userId = caller.entityId;
-    const turnStartedAt = Date.now();
-
-    const { userMessage, messageToStore } = await buildUserMessages({
-      images,
-      prompt,
-      userId,
-      agentId: runtime.agentId,
-      roomId: conv.roomId,
-      channelType,
-      messageSource: source,
-      metadata: chatMetadata,
-    });
+    let builtUserMessages: Awaited<ReturnType<typeof buildUserMessages>>;
+    try {
+      builtUserMessages = await buildUserMessages({
+        images,
+        prompt,
+        userId,
+        agentId: runtime.agentId,
+        roomId: conv.roomId,
+        channelType,
+        ...(clientMessageId ? { clientMessageId } : {}),
+        messageSource: source,
+        metadata: {
+          ...(chatMetadata ?? {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+        },
+      });
+    } catch (err) {
+      releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      return failStream(
+        `Failed to prepare chat message: ${getErrorMessage(err)}`,
+      );
+    }
+    const { userMessage, messageToStore } = builtUserMessages;
 
     const connectionDescriptor = captureConversationConnection(
       state,
@@ -2704,22 +2769,6 @@ export async function handleConversationRoutes(
         `Failed to initialize conversation room: ${getErrorMessage(err)}`,
       );
     }
-    try {
-      assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
-      await persistConversationMemory(runtime, messageToStore);
-      assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
-    } catch (err) {
-      if (isConversationConnectionError(err)) {
-        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-        return failStream(
-          `Failed to refresh conversation room: ${getErrorMessage(err)}`,
-        );
-      }
-      return failStream(
-        `Failed to store user message: ${getErrorMessage(err)}`,
-      );
-    }
-
     const walletModeGuidance = resolveWalletModeGuidanceReply(state, prompt);
     if (walletModeGuidance) {
       const endActiveChatTurn = beginActiveChatTurn(state);
@@ -2735,28 +2784,40 @@ export async function handleConversationRoutes(
               state.runtime,
               connectionDescriptor,
             );
+            const persistedUser = await persistConversationMemory(
+              runtime,
+              messageToStore,
+            );
             const persisted = await persistAssistantConversationMemory(
               runtime,
               conv.roomId,
-              walletModeGuidance,
+              attachClientMessageId(
+                { text: walletModeGuidance },
+                clientMessageId,
+              ),
               channelType,
-              turnStartedAt,
             );
             assertConversationConnectionRuntime(
               state.runtime,
               connectionDescriptor,
             );
             conv.updatedAt = new Date().toISOString();
-            writeSseJson(res, {
+            const terminalReceipt = {
               type: "done",
               fullText: walletModeGuidance,
               agentName: state.agentName,
               ...(persisted?.id ? { messageId: persisted.id } : {}),
-            });
+              ...(persistedUser.id ? { userMessageId: persistedUser.id } : {}),
+            };
+            recordChatMessageReceipt(
+              conv.roomId,
+              clientMessageId ?? null,
+              "stream",
+              terminalReceipt,
+            );
+            writeSseJson(res, terminalReceipt);
           } catch (persistErr) {
-            if (isConversationConnectionError(persistErr)) {
-              releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-            }
+            releaseChatMessageId(conv.roomId, clientMessageId ?? null);
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
@@ -2789,18 +2850,8 @@ export async function handleConversationRoutes(
     const endActiveChatTurn = beginActiveChatTurn(state);
 
     let streamedText = "";
-    // The route already wrote a `thinking` status when the SSE channel opened;
-    // collapse the identical opening status generateChatResponse re-emits so
-    // the wire carries each phase transition once. Distinct consecutive phases
-    // (thinking → running_action → thinking) still pass through.
-    let lastStatusSignature = "thinking::";
-    // The client needs the persisted assistant id in the terminal `done` frame
-    // so it can replace its streamed `temp-resp-*` bubble in place. Create the
-    // memory before `done`, but defer only the DB insert until after the socket
-    // closes so the latency optimization stays intact and the id is still the
-    // same one the later WS proactive-message broadcast carries.
-    let deferredPersistence: Promise<void> | null = null;
-
+    let persistedIncomingMessage: Memory | undefined;
+    let persistedAssistantMessage: Memory | undefined;
     try {
       const result = await generateChatResponse(
         runtime,
@@ -2816,17 +2867,6 @@ export async function handleConversationRoutes(
             ) {
               return;
             }
-            // Array.join renders absent optional fields as empty segments, so
-            // the dedup key is stable without nullish-coalescing each field.
-            const signature = [
-              status.kind,
-              status.actionName,
-              status.toolName,
-            ].join(":");
-            if (signature === lastStatusSignature) {
-              return;
-            }
-            lastStatusSignature = signature;
             writeChatStatusSse(res, status);
           },
           onToolEvent: (event) => {
@@ -2875,9 +2915,20 @@ export async function handleConversationRoutes(
           resolveNoResponseText: () =>
             resolveNoResponseFallback(state.logBuffer, runtime),
           preferredLanguage,
+          incomingMessageForPersistence: messageToStore,
+          onIncomingMessagePersisted: (message) => {
+            persistedIncomingMessage = message;
+          },
+          onResponseMessagePersisted: (message) => {
+            persistedAssistantMessage = message;
+          },
         },
       );
       assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
+      const persistedUserMessageId = requirePersistedRequestMessageId(
+        result,
+        conv.roomId,
+      );
 
       if (!disconnectTracker.isAborted()) {
         conv.updatedAt = new Date().toISOString();
@@ -2895,47 +2946,37 @@ export async function handleConversationRoutes(
               await new Promise((resolve) => setTimeout(resolve, 60));
             }
           }
-          // Resolve the durable assistant-memory id BEFORE emitting `done` so
-          // the client can swap its optimistic temp-resp-* bubble to the
-          // persisted id, and the proactive-message WS echo then reconciles by
-          // id instead of appending a duplicate bubble. Two topologies:
-          //  - action-callback turns may have ALREADY persisted (and WS-echoed)
-          //    the reply via the client_chat send handler — reuse that memory's
-          //    id and skip the route's own persist (same suppression
-          //    shouldPersistFinalAssistantTurn provided, but id-carrying);
-          //  - otherwise pre-mint the id here and defer only the DB insert.
-          let persistedAssistantId: UUID | null = null;
-          let shouldPersistAssistantTurn = false;
-          if (result.usedActionCallbacks) {
-            const existingAssistantTurn =
-              await getRecentVisibleAssistantMemorySince(
-                runtime,
-                conv.roomId,
-                turnStartedAt,
-              );
-            if (existingAssistantTurn) {
-              persistedAssistantId = existingAssistantTurn.id;
-            } else {
-              persistedAssistantId = crypto.randomUUID() as UUID;
-              shouldPersistAssistantTurn = true;
-            }
-          } else {
-            persistedAssistantId = crypto.randomUUID() as UUID;
-            shouldPersistAssistantTurn = true;
-          }
-          // Emit `done` before the DB insert so user-perceived end-of-turn
-          // latency excludes the memory write, but include the pre-minted
-          // persisted id so the client can reconcile its streamed temp bubble.
           assertConversationConnectionRuntime(
             state.runtime,
             connectionDescriptor,
           );
-          writeSseJson(res, {
+          // `done` is a commit boundary: both ids it carries already exist in
+          // storage. The common direct-reply path reuses the message service's
+          // committed response id without a second read or write; action
+          // callbacks reuse their independently committed turn; only synthetic
+          // route fallbacks need a new assistant insert.
+          const persistedAssistant = await resolvePersistedAssistantTurn(
+            runtime,
+            conv.roomId,
+            result,
+            resolvedText,
+            channelType,
+            clientMessageId,
+          );
+          assertConversationConnectionRuntime(
+            state.runtime,
+            connectionDescriptor,
+          );
+          const terminalReceipt = {
             type: "done",
             fullText: resolvedText,
             agentName: result.agentName,
-            ...(persistedAssistantId
-              ? { messageId: persistedAssistantId }
+            ...(persistedAssistant.kind === "durable"
+              ? { messageId: persistedAssistant.id }
+              : { assistantEphemeral: true }),
+            userMessageId: persistedUserMessageId,
+            ...(result.usedActionCallbacks
+              ? { historyRefreshRequired: true }
               : {}),
             ...(result.thought ? { thought: result.thought } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
@@ -2955,50 +2996,38 @@ export async function handleConversationRoutes(
             ...(result.localInference
               ? { localInference: result.localInference }
               : {}),
-          });
-          deferredPersistence = (async () => {
-            if (result.actionCallbackHistory?.length) {
-              assertConversationConnectionRuntime(
-                state.runtime,
-                connectionDescriptor,
-              );
-              await persistRecentAssistantActionCallbackHistory(
-                runtime,
-                conv.roomId,
-                result.actionCallbackHistory,
-                turnStartedAt,
-              );
-            }
-            if (shouldPersistAssistantTurn && persistedAssistantId) {
-              assertConversationConnectionRuntime(
-                state.runtime,
-                connectionDescriptor,
-              );
-              await persistAssistantConversationMemory(
-                runtime,
-                conv.roomId,
-                buildPersistedAssistantContent(resolvedText, result),
-                channelType,
-                turnStartedAt,
-                persistedAssistantId,
-              );
-            }
-          })();
+          };
+          recordChatMessageReceipt(
+            conv.roomId,
+            clientMessageId ?? null,
+            "stream",
+            terminalReceipt,
+          );
+          writeSseJson(res, terminalReceipt);
         } else {
           assertConversationConnectionRuntime(
             state.runtime,
             connectionDescriptor,
           );
-          writeSseJson(res, {
+          const terminalReceipt = {
             type: "done",
             fullText: "",
             agentName: result.agentName,
             noResponseReason: "ignored",
+            assistantEphemeral: true,
+            userMessageId: persistedUserMessageId,
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.actionResults?.length
               ? { actionResults: result.actionResults }
               : {}),
-          });
+          };
+          recordChatMessageReceipt(
+            conv.roomId,
+            clientMessageId ?? null,
+            "stream",
+            terminalReceipt,
+          );
+          writeSseJson(res, terminalReceipt);
         }
       }
     } catch (err) {
@@ -3038,7 +3067,26 @@ export async function handleConversationRoutes(
         // instead of being suppressed into dead air (the iOS-suspend →
         // disconnect-abort → retry-eaten scenario).
         releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      } else if (
+        isAssistantReplyPersistenceError(err) &&
+        !disconnectTracker.isAborted()
+      ) {
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+        writeSse(res, {
+          type: "error",
+          message: getErrorMessage(err.cause ?? err),
+        });
       } else if (!disconnectTracker.isAborted()) {
+        if (!persistedIncomingMessage?.id) {
+          releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+          writeSse(res, {
+            type: "error",
+            message: getErrorMessage(
+              err instanceof ElizaError ? (err.cause ?? err) : err,
+            ),
+          });
+          return true;
+        }
         // If text was already streamed to the client (e.g. the initial
         // response succeeded but planner follow-up failed), use the
         // streamed text as the final reply instead of replacing it with a
@@ -3056,28 +3104,54 @@ export async function handleConversationRoutes(
               state.runtime,
               connectionDescriptor,
             );
-            const persisted = await persistAssistantConversationMemory(
-              runtime,
-              conv.roomId,
-              streamedText,
-              channelType,
-              turnStartedAt,
-            );
+            let persisted = persistedAssistantMessage;
+            if (persisted?.id) {
+              await runtime.updateMemory({
+                id: persisted.id,
+                content: {
+                  ...persisted.content,
+                  text: streamedText,
+                },
+              });
+            } else {
+              const newlyPersisted = await persistAssistantConversationMemory(
+                runtime,
+                conv.roomId,
+                attachClientMessageId({ text: streamedText }, clientMessageId),
+                channelType,
+              );
+              if (!newlyPersisted) {
+                throw new ElizaError(
+                  "Cannot commit an empty streamed assistant reply",
+                  {
+                    code: "CHAT_EMPTY_STREAMED_REPLY",
+                    context: { roomId: conv.roomId },
+                  },
+                );
+              }
+              persisted = newlyPersisted;
+            }
             assertConversationConnectionRuntime(
               state.runtime,
               connectionDescriptor,
             );
             conv.updatedAt = new Date().toISOString();
-            writeSseJson(res, {
+            const terminalReceipt = {
               type: "done",
               fullText: streamedText,
               agentName: state.agentName,
               ...(persisted?.id ? { messageId: persisted.id } : {}),
-            });
+              userMessageId: persistedIncomingMessage.id,
+            };
+            recordChatMessageReceipt(
+              conv.roomId,
+              clientMessageId ?? null,
+              "stream",
+              terminalReceipt,
+            );
+            writeSseJson(res, terminalReceipt);
           } catch (persistErr) {
-            if (isConversationConnectionError(persistErr)) {
-              releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-            }
+            releaseChatMessageId(conv.roomId, clientMessageId ?? null);
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
@@ -3094,39 +3168,25 @@ export async function handleConversationRoutes(
             },
             "Chat generation failed with no streamed text",
           );
-          const alreadyPersistedVisibleAssistantTurn =
-            await hasRecentVisibleAssistantMemorySince(
-              runtime,
-              conv.roomId,
-              turnStartedAt,
-            );
-          if (alreadyPersistedVisibleAssistantTurn) {
-            logger.warn(
-              {
-                err: getErrorMessage(terminalError),
-                conversationId: conv.id,
-                roomId: conv.roomId,
-              },
-              "Chat generation failed after an assistant reply was already persisted — suppressing synthetic fallback",
-            );
-            try {
-              assertConversationConnectionRuntime(
-                state.runtime,
-                connectionDescriptor,
-              );
-            } catch (connectionErr) {
-              releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-              writeSse(res, {
-                type: "error",
-                message: getErrorMessage(connectionErr),
-              });
-              return true;
-            }
-            writeSseJson(res, {
+          const exactPersistedAssistantText =
+            typeof persistedAssistantMessage?.content?.text === "string"
+              ? persistedAssistantMessage.content.text.trim()
+              : "";
+          if (persistedAssistantMessage?.id && exactPersistedAssistantText) {
+            const terminalReceipt = {
               type: "done",
-              fullText: "",
+              fullText: exactPersistedAssistantText,
               agentName: state.agentName,
-            });
+              messageId: persistedAssistantMessage.id,
+              userMessageId: persistedIncomingMessage.id,
+            };
+            recordChatMessageReceipt(
+              conv.roomId,
+              clientMessageId ?? null,
+              "stream",
+              terminalReceipt,
+            );
+            writeSseJson(res, terminalReceipt);
             return true;
           }
           const providerIssueReply = getChatFailureReply(
@@ -3145,7 +3205,10 @@ export async function handleConversationRoutes(
             const persisted = await persistAssistantConversationMemory(
               runtime,
               conv.roomId,
-              providerIssueReply,
+              attachClientMessageId(
+                { text: providerIssueReply },
+                clientMessageId,
+              ),
               channelType,
             );
             assertConversationConnectionRuntime(
@@ -3153,19 +3216,25 @@ export async function handleConversationRoutes(
               connectionDescriptor,
             );
             conv.updatedAt = new Date().toISOString();
-            writeSse(res, {
+            const terminalReceipt = {
               type: "done",
               fullText: providerIssueReply,
               agentName: state.agentName,
               ...(persisted?.id ? { messageId: persisted.id } : {}),
+              userMessageId: persistedIncomingMessage.id,
               // See non-streaming branch — renderer gates chat input on
               // failureKind === "no_provider".
               failureKind,
-            });
+            };
+            recordChatMessageReceipt(
+              conv.roomId,
+              clientMessageId ?? null,
+              "stream",
+              terminalReceipt,
+            );
+            writeSse(res, terminalReceipt);
           } catch (persistErr) {
-            if (isConversationConnectionError(persistErr)) {
-              releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-            }
+            releaseChatMessageId(conv.roomId, clientMessageId ?? null);
             writeSse(res, {
               type: "error",
               message: getErrorMessage(persistErr),
@@ -3183,19 +3252,6 @@ export async function handleConversationRoutes(
       clearInterval(heartbeatInterval);
       finishStreamResponse();
       endActiveChatTurn();
-      // Persistence runs after the client has already received `done` + the
-      // socket is closed. Failures must still be observable — never swallow.
-      if (deferredPersistence !== null) {
-        deferredPersistence.catch((persistErr: unknown) => {
-          logger.error(
-            {
-              roomId: conv.roomId,
-              err: getErrorMessage(persistErr),
-            },
-            "[ConversationStream] persistence failed",
-          );
-        });
-      }
     }
     return true;
   }
@@ -3228,52 +3284,30 @@ export async function handleConversationRoutes(
       metadata: restMetadata,
       clientMessageId,
     } = chatPayload;
-    // Idempotency contract (see the streaming twin above / `isDuplicateChatMessage`):
-    // a retried send carrying the same clientMessageId within the TTL already
-    // ran this turn. When the first attempt's reply already persisted, answer
-    // 200 with THAT text (the normal success shape) so the retry delivers the
-    // original outcome; only while the original is still mid-turn does the
-    // retry answer with the ignored-turn shape — the client maps
-    // `noResponseReason: "ignored"` to an empty reply — so it still reads as
-    // success without starting a second LLM turn or persisting a duplicate
-    // assistant memory.
+    // Completed retries replay the exact stored outcome for this client id.
+    // An in-flight duplicate fails explicitly; it must not guess at a nearby
+    // room message or fabricate a successful ignored turn.
     if (isDuplicateChatMessage(conv.roomId, clientMessageId ?? null)) {
-      const firstSeenAt = getChatMessageIdFirstSeenAt(
+      const receipt = getChatMessageReceipt(
         conv.roomId,
         clientMessageId ?? null,
+        "json",
       );
-      const persistedFirstReply =
-        state.runtime && firstSeenAt !== null
-          ? await getRecentVisibleAssistantMemoryTextSince(
-              state.runtime,
-              conv.roomId,
-              firstSeenAt,
-              // No pre-arrival slack: same-process clocks mean any reply
-              // persisted before this id's first arrival is a PRIOR turn's.
-              0,
-            )
-          : null;
-      if (persistedFirstReply) {
-        json(res, { text: persistedFirstReply, agentName: state.agentName });
+      if (receipt) {
+        json(res, receipt);
       } else {
-        json(res, {
-          text: "",
-          agentName: state.agentName,
-          noResponseReason: "ignored",
-        });
+        error(res, "This chat request is already in progress", 409);
       }
       return true;
     }
-    // Hold the turn through the warming window (early API bind → runtime ready)
-    // instead of dropping it; the client already shows the optimistic bubble.
     const runtime = await resolveRuntimeForChatTurn(state);
     if (!runtime) {
+      releaseChatMessageId(conv.roomId, clientMessageId ?? null);
       error(res, "Agent is not running", 503);
       return true;
     }
     const caller = resolveConversationCaller(req, state, runtime);
     const userId = caller.entityId;
-    const turnStartedAt = Date.now();
 
     let connectionDescriptor: ConversationConnectionDescriptor;
     try {
@@ -3293,28 +3327,32 @@ export async function handleConversationRoutes(
       return true;
     }
 
-    const { userMessage, messageToStore } = await buildUserMessages({
-      images,
-      prompt,
-      userId,
-      agentId: runtime.agentId,
-      roomId: conv.roomId,
-      channelType,
-      messageSource: source,
-      metadata: restMetadata,
-    });
-
+    let builtUserMessages: Awaited<ReturnType<typeof buildUserMessages>>;
     try {
-      assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
-      await persistConversationMemory(runtime, messageToStore);
-      assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
+      builtUserMessages = await buildUserMessages({
+        images,
+        prompt,
+        userId,
+        agentId: runtime.agentId,
+        roomId: conv.roomId,
+        channelType,
+        ...(clientMessageId ? { clientMessageId } : {}),
+        messageSource: source,
+        metadata: {
+          ...(restMetadata ?? {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+        },
+      });
     } catch (err) {
-      if (isConversationConnectionError(err)) {
-        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-      }
-      error(res, `Failed to store user message: ${getErrorMessage(err)}`, 500);
+      releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+      error(
+        res,
+        `Failed to prepare chat message: ${getErrorMessage(err)}`,
+        500,
+      );
       return true;
     }
+    const { userMessage, messageToStore } = builtUserMessages;
 
     const walletModeGuidance = resolveWalletModeGuidanceReply(state, prompt);
     if (walletModeGuidance) {
@@ -3324,26 +3362,46 @@ export async function handleConversationRoutes(
           state.runtime,
           connectionDescriptor,
         );
-        await persistAssistantConversationMemory(
+        const persistedUser = await persistConversationMemory(
+          runtime,
+          messageToStore,
+        );
+        const persistedAssistant = await persistAssistantConversationMemory(
           runtime,
           conv.roomId,
-          walletModeGuidance,
+          attachClientMessageId({ text: walletModeGuidance }, clientMessageId),
           channelType,
-          turnStartedAt,
         );
+        if (!persistedAssistant?.id) {
+          throw new ElizaError(
+            "Wallet guidance persistence returned no assistant id",
+            {
+              code: "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_MISSING",
+              context: { roomId: conv.roomId },
+              severity: "fatal",
+            },
+          );
+        }
         assertConversationConnectionRuntime(
           state.runtime,
           connectionDescriptor,
         );
         conv.updatedAt = new Date().toISOString();
-        json(res, {
+        const terminalReceipt = {
           text: walletModeGuidance,
           agentName: state.agentName,
-        });
+          messageId: persistedAssistant.id,
+          userMessageId: persistedUser.id,
+        };
+        recordChatMessageReceipt(
+          conv.roomId,
+          clientMessageId ?? null,
+          "json",
+          terminalReceipt,
+        );
+        json(res, terminalReceipt);
       } catch (persistErr) {
-        if (isConversationConnectionError(persistErr)) {
-          releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-        }
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
         error(res, getErrorMessage(persistErr), 500);
       } finally {
         endActiveChatTurn();
@@ -3352,6 +3410,8 @@ export async function handleConversationRoutes(
     }
 
     const endActiveChatTurn = beginActiveChatTurn(state);
+    let persistedIncomingMessage: Memory | undefined;
+    let persistedAssistantMessage: Memory | undefined;
     try {
       const result = await generateChatResponse(
         runtime,
@@ -3361,9 +3421,20 @@ export async function handleConversationRoutes(
           resolveNoResponseText: () =>
             resolveNoResponseFallback(state.logBuffer, runtime),
           preferredLanguage,
+          incomingMessageForPersistence: messageToStore,
+          onIncomingMessagePersisted: (message) => {
+            persistedIncomingMessage = message;
+          },
+          onResponseMessagePersisted: (message) => {
+            persistedAssistantMessage = message;
+          },
         },
       );
       assertConversationConnectionRuntime(state.runtime, connectionDescriptor);
+      const persistedUserMessageId = requirePersistedRequestMessageId(
+        result,
+        conv.roomId,
+      );
 
       conv.updatedAt = new Date().toISOString();
       if (result.noResponseReason !== "ignored") {
@@ -3372,45 +3443,32 @@ export async function handleConversationRoutes(
           state.logBuffer,
           runtime,
         );
-        if (result.actionCallbackHistory?.length) {
-          assertConversationConnectionRuntime(
-            state.runtime,
-            connectionDescriptor,
-          );
-          await persistRecentAssistantActionCallbackHistory(
-            runtime,
-            conv.roomId,
-            result.actionCallbackHistory,
-            turnStartedAt,
-          );
-        }
-        if (
-          await shouldPersistFinalAssistantTurn(
-            runtime,
-            conv.roomId,
-            turnStartedAt,
-            result,
-          )
-        ) {
-          assertConversationConnectionRuntime(
-            state.runtime,
-            connectionDescriptor,
-          );
-          await persistAssistantConversationMemory(
-            runtime,
-            conv.roomId,
-            buildPersistedAssistantContent(resolvedText, result),
-            channelType,
-            turnStartedAt,
-          );
-        }
         assertConversationConnectionRuntime(
           state.runtime,
           connectionDescriptor,
         );
-        json(res, {
+        const persistedAssistant = await resolvePersistedAssistantTurn(
+          runtime,
+          conv.roomId,
+          result,
+          resolvedText,
+          channelType,
+          clientMessageId,
+        );
+        assertConversationConnectionRuntime(
+          state.runtime,
+          connectionDescriptor,
+        );
+        const terminalReceipt = {
           text: resolvedText,
           agentName: result.agentName,
+          ...(persistedAssistant.kind === "durable"
+            ? { messageId: persistedAssistant.id }
+            : { assistantEphemeral: true }),
+          userMessageId: persistedUserMessageId,
+          ...(result.usedActionCallbacks
+            ? { historyRefreshRequired: true }
+            : {}),
           ...(result.actionResults?.length
             ? { actionResults: result.actionResults }
             : {}),
@@ -3424,20 +3482,36 @@ export async function handleConversationRoutes(
           ...(result.localInference
             ? { localInference: result.localInference }
             : {}),
-        });
+        };
+        recordChatMessageReceipt(
+          conv.roomId,
+          clientMessageId ?? null,
+          "json",
+          terminalReceipt,
+        );
+        json(res, terminalReceipt);
       } else {
         assertConversationConnectionRuntime(
           state.runtime,
           connectionDescriptor,
         );
-        json(res, {
+        const terminalReceipt = {
           text: "",
           agentName: result.agentName,
           noResponseReason: "ignored",
+          assistantEphemeral: true,
+          userMessageId: persistedUserMessageId,
           ...(result.actionResults?.length
             ? { actionResults: result.actionResults }
             : {}),
-        });
+        };
+        recordChatMessageReceipt(
+          conv.roomId,
+          clientMessageId ?? null,
+          "json",
+          terminalReceipt,
+        );
+        json(res, terminalReceipt);
       }
     } catch (err) {
       logger.warn(
@@ -3452,6 +3526,35 @@ export async function handleConversationRoutes(
         );
         return true;
       }
+      if (!persistedIncomingMessage?.id) {
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
+        error(
+          res,
+          getErrorMessage(err instanceof ElizaError ? (err.cause ?? err) : err),
+          500,
+        );
+        return true;
+      }
+      const exactPersistedAssistantText =
+        typeof persistedAssistantMessage?.content?.text === "string"
+          ? persistedAssistantMessage.content.text.trim()
+          : "";
+      if (persistedAssistantMessage?.id && exactPersistedAssistantText) {
+        const terminalReceipt = {
+          text: exactPersistedAssistantText,
+          agentName: state.agentName,
+          messageId: persistedAssistantMessage.id,
+          userMessageId: persistedIncomingMessage.id,
+        };
+        recordChatMessageReceipt(
+          conv.roomId,
+          clientMessageId ?? null,
+          "json",
+          terminalReceipt,
+        );
+        json(res, terminalReceipt);
+        return true;
+      }
       const providerIssueReply = getChatFailureReply(err, state.logBuffer);
       const failureKind = classifyChatFailure(err, state.logBuffer);
       try {
@@ -3459,30 +3562,47 @@ export async function handleConversationRoutes(
           state.runtime,
           connectionDescriptor,
         );
-        await persistAssistantConversationMemory(
+        const persistedAssistant = await persistAssistantConversationMemory(
           runtime,
           conv.roomId,
-          providerIssueReply,
+          attachClientMessageId({ text: providerIssueReply }, clientMessageId),
           channelType,
         );
+        if (!persistedAssistant?.id) {
+          throw new ElizaError(
+            "Failure reply persistence returned no assistant id",
+            {
+              code: "CHAT_ASSISTANT_PERSISTENCE_RECEIPT_MISSING",
+              context: { roomId: conv.roomId },
+              severity: "fatal",
+            },
+          );
+        }
         assertConversationConnectionRuntime(
           state.runtime,
           connectionDescriptor,
         );
         conv.updatedAt = new Date().toISOString();
-        json(res, {
+        const terminalReceipt = {
           text: providerIssueReply,
           agentName: state.agentName,
+          messageId: persistedAssistant.id,
+          userMessageId: persistedIncomingMessage.id,
           // Renderer keys off this discriminator. "no_provider" means the
           // chat input should be gated with a "Connect a provider" CTA
           // instead of treating the message text as a normal assistant
           // reply (the user can't make progress without taking action).
           failureKind,
-        });
+        };
+        recordChatMessageReceipt(
+          conv.roomId,
+          clientMessageId ?? null,
+          "json",
+          terminalReceipt,
+        );
+        json(res, terminalReceipt);
       } catch (persistErr) {
-        if (isConversationConnectionError(persistErr)) {
-          releaseChatMessageId(conv.roomId, clientMessageId ?? null);
-        }
+        releaseChatMessageId(conv.roomId, clientMessageId ?? null);
         error(res, getErrorMessage(persistErr), 500);
       }
     } finally {

@@ -156,6 +156,7 @@ export function parseConversationMessageEvent(
 ): ConversationMessage | null {
   if (!isRecord(value)) return null;
   const id = value.id;
+  const clientMessageId = value.clientMessageId;
   const role = value.role;
   const text = value.text;
   const timestamp = value.timestamp;
@@ -178,6 +179,9 @@ export function parseConversationMessageEvent(
     return null;
   }
   const parsed: ConversationMessage = { id, role, text, timestamp };
+  if (typeof clientMessageId === "string" && clientMessageId.length > 0) {
+    parsed.clientMessageId = clientMessageId;
+  }
   if (typeof source === "string" && source.length > 0) {
     parsed.source = source;
   }

@@ -36,6 +36,50 @@ function makeToolEvent(callId: string): NativeToolCallEvent {
 }
 
 describe("ChatTranscript memoization", () => {
+  it("keeps optimistic user and assistant DOM nodes mounted while durable ids reconcile", () => {
+    const historical = makeMessage("history-1", "assistant", "earlier");
+    const user: ChatMessageData = {
+      ...makeMessage("temp-user-1", "user", "hello"),
+      renderId: "temp-user-1",
+    };
+    const assistant: ChatMessageData = {
+      ...makeMessage("temp-assistant-1", "assistant", "streamed answer"),
+      renderId: "temp-assistant-1",
+    };
+    const renderCounts = new Map<string, number>();
+    const renderMessageContent = vi.fn((message: ChatMessageData) => {
+      const renderId = message.renderId ?? message.id;
+      renderCounts.set(renderId, (renderCounts.get(renderId) ?? 0) + 1);
+      return <span>{message.text}</span>;
+    });
+    const rendered = render(
+      <ChatTranscript
+        messages={[historical, user, assistant]}
+        renderMessageContent={renderMessageContent}
+      />,
+    );
+    const mountedRows = screen.getAllByTestId("chat-message");
+
+    rendered.rerender(
+      <ChatTranscript
+        messages={[
+          { ...historical },
+          { ...user, id: "database-user-1" },
+          { ...assistant, id: "database-assistant-1" },
+        ]}
+        renderMessageContent={renderMessageContent}
+      />,
+    );
+
+    const reconciledRows = screen.getAllByTestId("chat-message");
+    expect(reconciledRows[0]).toBe(mountedRows[0]);
+    expect(reconciledRows[1]).toBe(mountedRows[1]);
+    expect(reconciledRows[2]).toBe(mountedRows[2]);
+    expect(renderCounts.get("history-1")).toBe(1);
+    expect(renderCounts.get("temp-user-1")).toBe(2);
+    expect(renderCounts.get("temp-assistant-1")).toBe(2);
+  });
+
   it("does not re-render unchanged historical rows during streamed updates", () => {
     const first = makeMessage("msg-1", "user", "hello");
     const second = makeMessage("msg-2", "assistant", "thinking");

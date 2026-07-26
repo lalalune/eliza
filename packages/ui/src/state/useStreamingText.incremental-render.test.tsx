@@ -315,6 +315,8 @@ function makeChatSendDeps() {
 describe("streaming → useChatSend rAF token-coalescing throttle", () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
   });
@@ -394,11 +396,95 @@ describe("streaming → useChatSend rAF token-coalescing throttle", () => {
         ?.text ?? "";
     expect(assistantText()).toBe("Hello there");
 
-    // Stream resolves → flushStreamingText commits the final text, no loss.
+    // Park the final snapshot without painting another frame. Since the terminal
+    // payload matches it, only the synchronous terminal drain can make it
+    // visible; a stale cancelled frame must not mutate it later.
+    act(() => {
+      onToken("", "Hello there, friend");
+    });
+    expect(assistantText()).toBe("Hello there");
     await act(async () => {
       resolveStream({ text: "Hello there, friend", completed: true });
       await sendPromise;
     });
     expect(assistantText()).toBe("Hello there, friend");
+    const commitsAfterTerminal = setConversationMessages.mock.calls.length;
+    act(() => {
+      flushFrame();
+    });
+    expect(setConversationMessages).toHaveBeenCalledTimes(commitsAfterTerminal);
   });
+
+  it.each([
+    { condition: "the document is hidden", hidden: true },
+    { condition: "requestAnimationFrame is unavailable", hidden: false },
+  ])(
+    "uses a bounded timer when $condition and still flushes the latest snapshot",
+    async ({ hidden }) => {
+      vi.useFakeTimers();
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue(
+        hidden ? "hidden" : "visible",
+      );
+      const requestFrame = vi.fn((_callback: FrameRequestCallback) => 1);
+      if (hidden) {
+        vi.stubGlobal("requestAnimationFrame", requestFrame);
+      } else {
+        vi.stubGlobal("requestAnimationFrame", undefined);
+      }
+
+      let onToken!: (token: string, accumulatedText?: string) => void;
+      let resolveStream!: (data: { text: string; completed: boolean }) => void;
+      apiMocks.client.sendConversationMessageStream.mockImplementation(
+        (
+          _id: string,
+          _text: string,
+          token: (value: string, accumulated?: string) => void,
+        ) => {
+          onToken = token;
+          return new Promise((resolve) => {
+            resolveStream = resolve;
+          });
+        },
+      );
+
+      const { deps, setConversationMessages, conversationMessagesRef } =
+        makeChatSendDeps();
+      const { result } = renderHook(() => useChatSend(deps));
+      let sendPromise: Promise<void> | undefined;
+      await act(async () => {
+        sendPromise = result.current.sendChatText("hi", {
+          conversationId: "conv-1",
+        });
+        await Promise.resolve();
+      });
+      setConversationMessages.mockClear();
+
+      act(() => {
+        onToken("", "one");
+        onToken("", "one two");
+        onToken("", "one two three");
+      });
+      expect(setConversationMessages).not.toHaveBeenCalled();
+      expect(requestFrame).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(15);
+      });
+      expect(setConversationMessages).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(setConversationMessages).toHaveBeenCalledTimes(1);
+      expect(
+        conversationMessagesRef.current.find(
+          (message) => message.role === "assistant",
+        )?.text,
+      ).toBe("one two three");
+
+      await act(async () => {
+        resolveStream({ text: "one two three", completed: true });
+        await sendPromise;
+      });
+    },
+  );
 });

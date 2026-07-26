@@ -135,6 +135,9 @@ function computeNextMessage(
       }
       const next: ConversationMessage = {
         ...message,
+        // `renderId` is intentionally retained from the optimistic turn while
+        // the durable database id changes. ChatTranscript keys by that immutable
+        // identity, so reconciliation updates the mounted row in place.
         ...(mod.persistedMessageId ? { id: mod.persistedMessageId } : {}),
         text: mod.fullText,
       };

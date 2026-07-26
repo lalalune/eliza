@@ -134,6 +134,7 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
       messages: [
         {
           ...userMsg("server-user"),
+          clientMessageId: "client-settled",
           text: "survives reload",
           timestamp: sentAt,
         },
@@ -149,6 +150,35 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
     });
 
     expect(listPendingChatTurns("conv-settled")).toHaveLength(0);
+  });
+
+  it("does not clear a repeated pending turn for a different exact client id", async () => {
+    const sentAt = Date.now();
+    persistPendingChatTurn({
+      conversationId: "conv-repeated",
+      clientMessageId: "client-new",
+      text: "same words",
+      sentAt,
+    });
+    mocks.client.getConversationMessages.mockResolvedValue({
+      messages: [
+        {
+          ...userMsg("server-old"),
+          clientMessageId: "client-old",
+          text: "same words",
+          timestamp: sentAt,
+        },
+      ],
+    });
+    const { deps, activeConversationIdRef } = makeDeps();
+    activeConversationIdRef.current = "conv-repeated";
+    const { result } = renderHook(() => useDataLoaders(deps));
+
+    await act(async () => {
+      await result.current.loadConversationMessages("conv-repeated");
+    });
+
+    expect(listPendingChatTurns("conv-repeated")).toHaveLength(1);
   });
 
   it("prefetch skips ids already cached or already in flight", async () => {
@@ -288,7 +318,7 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
     ).toEqual(["temp-user", "temp-resp-user"]);
   });
 
-  it("drops optimistic temp turns once the server reload carries the same user and assistant turn", async () => {
+  it("does not suppress optimistic turns by matching server role, text, and nearby time", async () => {
     mocks.client.getConversationMessages
       .mockResolvedValueOnce({ messages: [userMsg("persisted-1")] })
       .mockResolvedValueOnce({
@@ -331,15 +361,59 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
 
     expect(
       conversationMessagesRef.current.map((message) => message.id),
-    ).toEqual(["persisted-1", "server-user", "server-assistant"]);
-    expect(
-      conversationMessagesRef.current.some((message) =>
-        message.id.startsWith("temp-"),
-      ),
-    ).toBe(false);
+    ).toEqual([
+      "persisted-1",
+      "server-user",
+      "server-assistant",
+      "temp-100",
+      "temp-resp-100",
+    ]);
   });
 
-  it("keeps an in-flight temp assistant when the server has only persisted the user turn", async () => {
+  it("reconciles both optimistic rows by exact client turn identity", async () => {
+    const persistedUser = {
+      ...userMsg("server-user"),
+      clientMessageId: "turn-exact",
+    };
+    const persistedAssistant = {
+      ...assistantMsg("server-assistant"),
+      clientMessageId: "turn-exact",
+    };
+    mocks.client.getConversationMessages
+      .mockResolvedValueOnce({ messages: [userMsg("persisted-1")] })
+      .mockResolvedValueOnce({
+        messages: [userMsg("persisted-1"), persistedUser, persistedAssistant],
+      });
+    const { deps, conversationMessagesRef, activeConversationIdRef } =
+      makeDeps();
+    activeConversationIdRef.current = "conv-a";
+    const { result } = renderHook(() => useDataLoaders(deps));
+
+    await act(async () => {
+      await result.current.loadConversationMessages("conv-a");
+    });
+    conversationMessagesRef.current = [
+      userMsg("persisted-1"),
+      {
+        ...userMsg("temp-turn-exact"),
+        clientMessageId: "turn-exact",
+      },
+      {
+        ...assistantMsg("temp-resp-turn-exact"),
+        clientMessageId: "turn-exact",
+      },
+    ];
+
+    await act(async () => {
+      await result.current.loadConversationMessages("conv-a");
+    });
+
+    expect(
+      conversationMessagesRef.current.map((message) => message.id),
+    ).toEqual(["persisted-1", "server-user", "server-assistant"]);
+  });
+
+  it("keeps the whole unresolved optimistic turn when only a similar user row is persisted", async () => {
     mocks.client.getConversationMessages
       .mockResolvedValueOnce({ messages: [userMsg("persisted-1")] })
       .mockResolvedValueOnce({
@@ -377,7 +451,7 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
 
     expect(
       conversationMessagesRef.current.map((message) => message.id),
-    ).toEqual(["persisted-1", "server-user", "temp-resp-100"]);
+    ).toEqual(["persisted-1", "server-user", "temp-100", "temp-resp-100"]);
   });
 
   it("keeps a distinct repeated temp user message when only the earlier identical turn is persisted", async () => {
@@ -477,6 +551,7 @@ describe("useDataLoaders — conversation message prefetch cache", () => {
       "server-user-1",
       "server-assistant-1",
       "server-user-2",
+      "temp-21000",
       "temp-resp-21000",
     ]);
   });

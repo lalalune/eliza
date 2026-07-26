@@ -105,12 +105,10 @@ export function clearSettledPendingChatTurns(
   messages: readonly ConversationMessage[],
 ): void {
   for (const receipt of listPendingChatTurns(conversationId)) {
-    const text = receipt.text.trim();
     const settled = messages.some(
       (message) =>
         message.role === "user" &&
-        message.timestamp >= receipt.sentAt - 60_000 &&
-        message.text.trim() === text,
+        message.clientMessageId === receipt.clientMessageId,
     );
     if (settled) {
       clearPendingChatTurn(conversationId, receipt.clientMessageId);

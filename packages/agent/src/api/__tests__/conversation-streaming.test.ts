@@ -29,9 +29,7 @@ import {
   generateChatResponse,
   generateConversationTitle,
   getChatFailureReply,
-  getChatMessageIdFirstSeenAt,
-  getRecentVisibleAssistantMemoryTextSince,
-  hasRecentVisibleAssistantMemorySince,
+  getChatMessageReceipt,
   isDuplicateChatMessage,
   isLocalInferenceError,
   markSyntheticChatFailureContent,
@@ -40,6 +38,7 @@ import {
   normalizeClientMessageId,
   persistAssistantConversationMemory,
   readChatRequestPayload,
+  recordChatMessageReceipt,
   releaseChatMessageId,
   resolveNoResponseFallback,
   writeChatStatusSse,
@@ -85,6 +84,10 @@ function createRuntime(overrides: RuntimeOverrides = {}): AgentRuntime {
     },
     emitEvent: vi.fn(async () => undefined),
     reportError: vi.fn(),
+    createMemory: vi.fn(async (memory: Memory) => {
+      if (!memory.id) throw new Error("fixture memory is missing its id");
+      return memory.id;
+    }),
     getMemories: vi.fn(async () => []),
     getService: vi.fn(() => null),
     getServicesByType: vi.fn(() => []),
@@ -165,18 +168,36 @@ describe("chat route helper coverage", () => {
     expect(normalizeClientMessageId("x".repeat(129))).toBeNull();
 
     expect(isDuplicateChatMessage("room-a", "mobile-turn-1", now)).toBe(false);
-    expect(getChatMessageIdFirstSeenAt("room-a", "mobile-turn-1")).toBe(now);
     expect(isDuplicateChatMessage("room-a", "mobile-turn-1", now + 1)).toBe(
       true,
     );
+    expect(
+      isDuplicateChatMessage("room-a", "mobile-turn-1", now + ttl * 2),
+    ).toBe(true);
+    expect(
+      getChatMessageReceipt("room-a", "mobile-turn-1", "stream"),
+    ).toBeNull();
+    recordChatMessageReceipt(
+      "room-a",
+      "mobile-turn-1",
+      "stream",
+      { type: "done", messageId: "assistant-1" },
+      now + ttl * 2,
+    );
+    expect(getChatMessageReceipt("room-a", "mobile-turn-1", "stream")).toEqual({
+      type: "done",
+      messageId: "assistant-1",
+    });
     expect(isDuplicateChatMessage("room-b", "mobile-turn-1", now + 2)).toBe(
       false,
     );
 
     releaseChatMessageId("room-a", "mobile-turn-1");
-    expect(getChatMessageIdFirstSeenAt("room-a", "mobile-turn-1")).toBeNull();
     expect(
-      isDuplicateChatMessage("room-a", "mobile-turn-1", now + ttl + 1),
+      getChatMessageReceipt("room-a", "mobile-turn-1", "stream"),
+    ).toBeNull();
+    expect(
+      isDuplicateChatMessage("room-a", "mobile-turn-1", now + ttl * 3 + 1),
     ).toBe(false);
   });
 
@@ -466,7 +487,7 @@ describe("chat route helper coverage", () => {
     ).toBe("local_inference");
   });
 
-  it("persists assistant memory with source, channel, synthetic metadata, and dedupe", async () => {
+  it("persists distinct assistant turns even when their visible text is identical", async () => {
     const roomId = stringToUuid("persist-room");
     const created: Memory[] = [];
     const runtime = createRuntime({
@@ -476,22 +497,7 @@ describe("chat route helper coverage", () => {
         created.push(memory);
         return memory.id ?? stringToUuid(`created-${created.length}`);
       }),
-      getMemories: vi.fn(async () => [
-        createMessageMemory({
-          id: stringToUuid("recent-assistant"),
-          roomId,
-          entityId: stringToUuid("streaming-agent"),
-          content: { text: "Already persisted" },
-        }),
-      ]),
     });
-    const recent = await runtime.getMemories({
-      roomId,
-      tableName: "messages",
-      limit: 12,
-    });
-    recent[0].createdAt = 2_000;
-    (runtime.getMemories as ReturnType<typeof vi.fn>).mockResolvedValue(recent);
 
     await persistAssistantConversationMemory(
       runtime,
@@ -507,10 +513,10 @@ describe("chat route helper coverage", () => {
       roomId,
       "Already persisted",
       ChannelType.DM,
-      1_000,
+      stringToUuid("second-assistant"),
     );
 
-    expect(created).toHaveLength(1);
+    expect(created).toHaveLength(2);
     expect(created[0].content).toMatchObject({
       text: "Sorry, I'm having a provider issue",
       source: "direct",
@@ -520,12 +526,10 @@ describe("chat route helper coverage", () => {
         chatFailureKind: "provider_issue",
       },
     });
-    await expect(
-      hasRecentVisibleAssistantMemorySince(runtime, roomId, 1_000),
-    ).resolves.toBe(true);
-    await expect(
-      getRecentVisibleAssistantMemoryTextSince(runtime, roomId, 1_000),
-    ).resolves.toBe("Already persisted");
+    expect(created[1]).toMatchObject({
+      id: stringToUuid("second-assistant"),
+      content: { text: "Already persisted" },
+    });
   });
 });
 
@@ -683,21 +687,13 @@ describe("generateChatResponse token streaming", () => {
     expect(result.text).toBe("Navigated to Notes (gui).");
   });
 
-  it("routes a clean extension to onChunk but an in-place revision to onSnapshot", async () => {
-    // chat-routes' appendIncomingText() runs every onStreamChunk value through
-    // resolveStreamingUpdate(responseText, incoming):
-    //   - a clean extension of the buffer => append => onChunk(delta)
-    //   - an in-place revision that does NOT extend the buffer => replace =>
-    //     onSnapshot(full text)
-    // This locks that the route does not garble a corrected snapshot into the
-    // delta stream. "helo world" -> "hello world" is the canonical revision
-    // (fixes a typo in an already-streamed word) classified as a replacement.
+  it("uses authoritative accumulated text for an in-place stream revision", async () => {
     const service: MessageService = {
       async handleMessage(_runtime, _message, _callback, options) {
         await Promise.resolve();
-        await options?.onStreamChunk?.("helo world");
+        await options?.onStreamChunk?.("helo world", undefined, "helo world");
         await Promise.resolve();
-        await options?.onStreamChunk?.("hello world");
+        await options?.onStreamChunk?.("l", undefined, "hello world");
         return {
           didRespond: true,
           responseContent: { text: "hello world" },
@@ -774,6 +770,46 @@ describe("generateChatResponse token streaming", () => {
     expect(chunks.join("")).toBe(complete);
     expect(snapshots).toEqual([]);
     expect(result.text).toBe(complete);
+  });
+
+  it("preserves whitespace and repeated prefixes across genuine stream deltas", async () => {
+    const deltas = ["Fast ", "streaming ", "stays ", "smooth."];
+    const service: MessageService = {
+      async handleMessage(_runtime, _message, _callback, options) {
+        let accumulated = "";
+        for (const delta of deltas) {
+          accumulated += delta;
+          await options?.onStreamChunk?.(delta, undefined, accumulated);
+        }
+        return {
+          didRespond: true,
+          responseContent: { text: accumulated },
+          responseMessages: [],
+        };
+      },
+      shouldRespond: () => ({
+        shouldRespond: true,
+        skipEvaluation: true,
+        reason: "streaming-test",
+      }),
+      deleteMessage: async () => undefined,
+      clearChannel: async () => undefined,
+    };
+    const runtime = createRuntime({ messageService: service });
+    const chunks: string[] = [];
+
+    const result = await generateChatResponse(
+      runtime,
+      createChatMessage("preserve token boundaries"),
+      "Streaming Agent",
+      {
+        timeoutDuration: 5_000,
+        onChunk: (chunk) => chunks.push(chunk),
+      },
+    );
+
+    expect(chunks).toEqual(deltas);
+    expect(result.text).toBe("Fast streaming stays smooth.");
   });
 
   it("returns sanitized action result summaries for UI handoffs", async () => {

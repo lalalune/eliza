@@ -151,7 +151,9 @@ describe("applyStreamingTextModification", () => {
   it("complete swaps the streamed temp id to the persisted server id in place", () => {
     const initial = [
       userMsg("u1", "hi"),
-      assistantMsg("temp-resp-1", "hello there"),
+      assistantMsg("temp-resp-1", "hello there", {
+        renderId: "temp-resp-1",
+      }),
     ];
     const harness = makeSetter(initial);
 
@@ -167,6 +169,7 @@ describe("applyStreamingTextModification", () => {
       "server-assistant-1",
     ]);
     expect(harness.current[1].text).toBe("hello there");
+    expect(harness.current[1].renderId).toBe("temp-resp-1");
   });
 
   it("complete id-swap drops an already-appended WS echo bubble carrying the persisted id", () => {
@@ -175,7 +178,9 @@ describe("applyStreamingTextModification", () => {
     // must collapse the pair to one bubble at the streamed position.
     const initial = [
       userMsg("u1", "hi"),
-      assistantMsg("temp-resp-1", "hello there"),
+      assistantMsg("temp-resp-1", "hello there", {
+        renderId: "temp-resp-1",
+      }),
       assistantMsg("server-assistant-1", "hello there"),
     ];
     const harness = makeSetter(initial);
@@ -192,6 +197,7 @@ describe("applyStreamingTextModification", () => {
       "server-assistant-1",
     ]);
     expect(harness.current[1].text).toBe("hello there");
+    expect(harness.current[1].renderId).toBe("temp-resp-1");
   });
 
   it("complete without persistedMessageId leaves the message id untouched", () => {

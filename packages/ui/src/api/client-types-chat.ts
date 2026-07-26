@@ -302,6 +302,15 @@ export interface AccountConnectRequest {
 
 export interface ConversationMessage {
   id: string;
+  /** Exact logical client turn identity for reload/idempotency reconciliation. */
+  clientMessageId?: string;
+  /**
+   * Immutable client-side identity for the mounted React row. Optimistic turns
+   * keep this value when `id` is reconciled to the durable database id, so the
+   * visible bubble is updated in place instead of unmounted and recreated.
+   * Server-loaded history omits it and naturally falls back to `id`.
+   */
+  renderId?: string;
   role: "user" | "assistant";
   text: string;
   timestamp: number;
@@ -408,6 +417,8 @@ export function isConversationMessage(
   return (
     typeof m.id === "string" &&
     m.id.length > 0 &&
+    (m.renderId === undefined ||
+      (typeof m.renderId === "string" && m.renderId.length > 0)) &&
     (m.role === "user" || m.role === "assistant") &&
     typeof m.text === "string" &&
     typeof m.timestamp === "number" &&

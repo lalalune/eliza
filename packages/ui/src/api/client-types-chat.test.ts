@@ -36,6 +36,14 @@ describe("isConversationMessage", () => {
     expect(isConversationMessage({ ...valid, id: 1 })).toBe(false);
   });
 
+  it("accepts an immutable render id and rejects malformed render identities", () => {
+    expect(isConversationMessage({ ...valid, renderId: "optimistic-1" })).toBe(
+      true,
+    );
+    expect(isConversationMessage({ ...valid, renderId: "" })).toBe(false);
+    expect(isConversationMessage({ ...valid, renderId: 1 })).toBe(false);
+  });
+
   it("rejects an unexpected role", () => {
     expect(isConversationMessage({ ...valid, role: "system" })).toBe(false);
     expect(isConversationMessage({ ...valid, role: undefined })).toBe(false);

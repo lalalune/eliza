@@ -104,6 +104,11 @@ export interface ChatMessageData {
   from?: string;
   fromUserName?: string;
   id: string;
+  /**
+   * Immutable row identity retained while an optimistic id is replaced by its
+   * durable database id. History rows omit it and use `id` directly.
+   */
+  renderId?: string;
   interrupted?: boolean;
   reactions?: ChatMessageReaction[];
   replyToMessageId?: string;
