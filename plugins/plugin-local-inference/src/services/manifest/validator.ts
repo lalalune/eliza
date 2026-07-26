@@ -86,11 +86,16 @@ export function validateManifest(
 		allowVersionStaging: true,
 	});
 	// Ground-truth provenance: when the caller has the staged bundle on disk and
-	// the manifest claims a strict release, verify the text GGUF's architecture
-	// is actually Gemma-4. `lineage.text.base` (checked above) is operator-
+	// the manifest claims a production/default release, verify the text GGUF's
+	// architecture is actually Gemma-4. `lineage.text.base` (checked above) is operator-
 	// authored and can drift from the bytes shipped; the GGUF header cannot.
-	if (opts?.bundleRoot && isStrictReleaseManifest(parsed.data)) {
-		errors.push(...readBundleTextArchitectureBlockers(opts.bundleRoot));
+	if (opts?.bundleRoot && requiresStrictReleaseGates(parsed.data)) {
+		errors.push(
+			...readBundleTextArchitectureBlockers(
+				opts.bundleRoot,
+				parsed.data.files.text.map((entry) => entry.path),
+			),
+		);
 	}
 	if (errors.length > 0) {
 		return { ok: false, errors };
@@ -231,21 +236,28 @@ function isStagingManifestVersion(version: string): boolean {
 		.some((token) => STAGING_VERSION_TOKENS.has(token.toLowerCase()));
 }
 
-function collectContractErrors(
+function requiresStrictReleaseGates(
 	m: Eliza1Manifest,
 	options: { allowVersionStaging?: boolean } = {},
-): string[] {
-	const errors: string[] = [];
-
+): boolean {
 	const releaseState = m.provenance?.releaseState;
-	const strictRelease =
+	return (
 		m.defaultEligible === true ||
 		(releaseState === undefined &&
 			!(
 				options.allowVersionStaging === true &&
 				isStagingManifestVersion(m.version)
 			)) ||
-		(releaseState !== undefined && STRICT_RELEASE_STATES.has(releaseState));
+		(releaseState !== undefined && STRICT_RELEASE_STATES.has(releaseState))
+	);
+}
+
+function collectContractErrors(
+	m: Eliza1Manifest,
+	options: { allowVersionStaging?: boolean } = {},
+): string[] {
+	const errors: string[] = [];
+	const strictRelease = requiresStrictReleaseGates(m, options);
 
 	// Gemma 4 cutover: a release-shaped (strict/defaultEligible) bundle must be
 	// the real Gemma-4 base, never the Qwen3.5 / local-standin placeholder the

@@ -155,17 +155,24 @@ export function readGgufArchitecture(filePath: string): string | null {
 /**
  * Blocker if a text GGUF's on-disk architecture is not Gemma-4. Eliza-1 is a
  * Gemma-4 release; a Qwen (or any non-Gemma) text model shipped under the
- * eliza-1 name is rejected so it can never become the default. An unreadable
- * architecture is *not* a blocker (the reader fails closed) — pair this with the
- * existing `files.text` presence checks if a GGUF is required.
+ * eliza-1 name is rejected so it can never become the default. By default an
+ * unreadable architecture is not a blocker for loose/ad hoc scans; strict
+ * release validation must pass `requireReadable: true`.
  */
 export function collectTextArchitectureBlockers(
 	textGgufPath: string,
+	opts: { label?: string; requireReadable?: boolean } = {},
 ): string[] {
 	const arch = readGgufArchitecture(textGgufPath);
-	if (arch === null) return [];
+	const rel = opts.label ?? path.basename(textGgufPath);
+	if (arch === null) {
+		return opts.requireReadable === true
+			? [
+					`files.text (${rel}): a strict/defaultEligible Eliza-1 release must ship a GGUF that reports Gemma-4 provenance (general.architecture missing or unreadable)`,
+				]
+			: [];
+	}
 	if (GEMMA_TEXT_ARCHITECTURE_RE.test(arch)) return [];
-	const rel = path.basename(textGgufPath);
 	if (QWEN_PROVENANCE_RE.test(arch)) {
 		return [
 			`files.text (${rel}): a strict/defaultEligible Eliza-1 release must ship the Gemma-4 text model, not a Qwen stand-in (general.architecture=${arch})`,
@@ -189,14 +196,54 @@ function bundleTextGgufs(bundleRoot: string): string[] {
 		.map((name) => path.join(textDir, name));
 }
 
+function resolveBundleTextPath(
+	bundleRoot: string,
+	manifestPath: string,
+): { filePath?: string; blocker?: string } {
+	if (!manifestPath || path.isAbsolute(manifestPath)) {
+		return {
+			blocker: `files.text (${manifestPath || "<empty>"}): invalid bundle-relative path`,
+		};
+	}
+	const parts = manifestPath.split(/[\\/]+/);
+	if (parts[0] !== "text" || !manifestPath.toLowerCase().endsWith(".gguf")) {
+		return {
+			blocker: `files.text (${manifestPath}): strict/defaultEligible Eliza-1 text entries must point at text/*.gguf`,
+		};
+	}
+	const root = path.resolve(bundleRoot);
+	const textRoot = path.join(root, "text");
+	const filePath = path.resolve(root, manifestPath);
+	if (filePath !== textRoot && !filePath.startsWith(textRoot + path.sep)) {
+		return {
+			blocker: `files.text (${manifestPath}): bundle path escapes text/`,
+		};
+	}
+	return { filePath };
+}
+
 /**
  * Read every text GGUF staged under `<bundleRoot>/text/` and block any whose
  * architecture is not Gemma-4. The companion to `readBundleAsrProvenanceBlockers`
  * for the text model: the manifest's `lineage.text.base` is operator-authored,
  * this verifies the bytes that actually ship.
+ *
+ * When `manifestTextPaths` is provided, each manifest-declared text artifact is
+ * required to exist under `text/` and expose a readable Gemma architecture.
  */
 export function readBundleTextArchitectureBlockers(
 	bundleRoot: string,
+	manifestTextPaths?: ReadonlyArray<string>,
 ): string[] {
+	if (manifestTextPaths !== undefined) {
+		return manifestTextPaths.flatMap((manifestPath) => {
+			const resolved = resolveBundleTextPath(bundleRoot, manifestPath);
+			if (resolved.blocker) return [resolved.blocker];
+			return collectTextArchitectureBlockers(resolved.filePath as string, {
+				label: manifestPath,
+				requireReadable: true,
+			});
+		});
+	}
 	return bundleTextGgufs(bundleRoot).flatMap(collectTextArchitectureBlockers);
 }

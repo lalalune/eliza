@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	canSetAsDefault,
@@ -33,6 +36,46 @@ function passingBackends() {
 
 function textFileForTier(tier: Eliza1Tier): { path: string; ctx: number } {
 	return { path: `text/eliza-1-${tier}-128k.gguf`, ctx: 131072 };
+}
+
+function u32(n: number): Buffer {
+	const b = Buffer.alloc(4);
+	b.writeUInt32LE(n >>> 0);
+	return b;
+}
+
+function u64(n: number): Buffer {
+	const b = Buffer.alloc(8);
+	b.writeBigUInt64LE(BigInt(n));
+	return b;
+}
+
+function gstr(s: string): Buffer {
+	const bytes = Buffer.from(s, "utf8");
+	return Buffer.concat([u64(bytes.length), bytes]);
+}
+
+function ggufArchitecture(arch: string): Buffer {
+	return Buffer.concat([
+		u32(0x4655_4747),
+		u32(3),
+		u64(0),
+		u64(1),
+		gstr("general.architecture"),
+		u32(8),
+		gstr(arch),
+	]);
+}
+
+function bundleRootWithText(
+	rel: string,
+	contents: Buffer = ggufArchitecture("gemma4"),
+): string {
+	const root = mkdtempSync(path.join(tmpdir(), "manifest-bundle-"));
+	const file = path.join(root, rel);
+	mkdirSync(path.dirname(file), { recursive: true });
+	writeFileSync(file, contents);
+	return root;
 }
 
 function baseManifest(tier: Eliza1Tier = "9b"): Eliza1Manifest {
@@ -133,6 +176,70 @@ describe("validateManifest — valid input", () => {
 			expect(result.manifest.tier).toBe("9b");
 			expect(result.manifest.defaultEligible).toBe(true);
 			expect(result.manifest.evals.vadLatencyMs?.falseBargeInRate).toBe(0.01);
+		}
+	});
+
+	it("requires manifest-declared text bytes to prove Gemma architecture when bundleRoot is provided", () => {
+		const m = baseManifest("9b");
+		const textPath = m.files.text[0]?.path ?? "";
+		expect(textPath).toBe("text/eliza-1-9b-128k.gguf");
+
+		const ok = validateManifest(m, {
+			bundleRoot: bundleRootWithText(textPath),
+		});
+		expect(ok.ok).toBe(true);
+
+		const qwen = validateManifest(m, {
+			bundleRoot: bundleRootWithText(textPath, ggufArchitecture("qwen35")),
+		});
+		expect(qwen.ok).toBe(false);
+		if (!qwen.ok) {
+			expect(
+				qwen.errors.some((e) => e.includes("general.architecture=qwen35")),
+			).toBe(true);
+		}
+
+		const missing = validateManifest(m, {
+			bundleRoot: mkdtempSync(path.join(tmpdir(), "manifest-bundle-")),
+		});
+		expect(missing.ok).toBe(false);
+		if (!missing.ok) {
+			expect(
+				missing.errors.some((e) => e.includes("missing or unreadable")),
+			).toBe(true);
+		}
+	});
+
+	it("requires Gemma text bytes for base-v1 production manifests even when defaultEligible is false", () => {
+		const m = baseManifest("9b");
+		m.defaultEligible = false;
+		m.releaseChannel = "base-v1";
+		m.provenance = {
+			releaseState: "base-v1",
+			finetuned: false,
+			sourceModels: {
+				text: { repo: "unsloth/gemma-4-12B-GGUF", file: "text.gguf" },
+				voice: { repo: "Serveurperso/OmniVoice-GGUF" },
+				asr: { repo: "example/gemma-compatible-asr-gguf" },
+				vad: { repo: "ggml-org/whisper-vad" },
+				vision: { repo: "unsloth/gemma-4-12B-GGUF", file: "mmproj.gguf" },
+				drafter: {
+					repo: "elizaos/eliza-1",
+					file: "bundles/9b/mtp/drafter-9b.gguf",
+				},
+			},
+		};
+		const textPath = m.files.text[0]?.path ?? "";
+
+		const result = validateManifest(m, {
+			bundleRoot: bundleRootWithText(textPath, ggufArchitecture("qwen35")),
+		});
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(
+				result.errors.some((e) => e.includes("general.architecture=qwen35")),
+			).toBe(true);
 		}
 	});
 

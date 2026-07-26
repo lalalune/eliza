@@ -129,4 +129,34 @@ describe("readBundleTextArchitectureBlockers", () => {
 		const root = mkdtempSync(path.join(tmpdir(), "bundle-"));
 		expect(readBundleTextArchitectureBlockers(root)).toEqual([]);
 	});
+	it("strictly requires manifest-declared text files to report an architecture", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "bundle-"));
+		mkdirSync(path.join(root, "text"));
+		writeFileSync(
+			path.join(root, "text", "eliza-1-9b-128k.gguf"),
+			gguf([kvString("general.name", "missing architecture")]),
+		);
+
+		const blockers = readBundleTextArchitectureBlockers(root, [
+			"text/eliza-1-9b-128k.gguf",
+			"text/missing.gguf",
+		]);
+
+		expect(blockers).toHaveLength(2);
+		expect(blockers[0]).toMatch(/missing or unreadable/);
+		expect(blockers[1]).toMatch(/missing or unreadable/);
+	});
+	it("strict manifest-declared paths cannot escape text/*.gguf", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "bundle-"));
+
+		expect(
+			readBundleTextArchitectureBlockers(root, ["../text.gguf"])[0],
+		).toMatch(/escapes text\/|text\/\*\.gguf|invalid bundle-relative path/);
+		expect(
+			readBundleTextArchitectureBlockers(root, ["cache/foo.gguf"])[0],
+		).toMatch(/text\/\*\.gguf/);
+		expect(
+			readBundleTextArchitectureBlockers(root, ["text/../evil.gguf"])[0],
+		).toMatch(/escapes text\//);
+	});
 });
