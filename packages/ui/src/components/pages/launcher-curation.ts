@@ -47,7 +47,6 @@ export const LAUNCHER_APPS_ORDER: readonly string[] = [
   "documents",
   "character-skills",
   "experience",
-  "transcripts",
   "memories",
   "feed",
   "stream",
@@ -134,6 +133,14 @@ const LEGACY_ID_ALIAS_FALLBACK: ReadonlyMap<string, string> = new Map([
   // orchestrator surface (/apps/tasks); collapse to a single tile.
   ["task-coordinator", "tasks"],
   ["knowledge", "documents"],
+  // Transcripts fold into the one Knowledge multimedia hub (#13594): transcript
+  // records surface as the hub's Transcripts media-format facet over the shared
+  // knowledge store, so Transcripts is not a separate launcher tile. The
+  // `/apps/transcripts` route stays alive as the chrome-minimal live-meeting
+  // affordance, reached by deep link, not the launcher. (`files` is the AOSP
+  // native file-manager tile and is intentionally NOT folded here; its raw store
+  // also flows into the hub as image/audio/video/doc facets.)
+  ["transcripts", "documents"],
   ["plugins-page", "plugins"],
   ["trajectory-logger", "trajectories"],
   ["trajectory-viewer", "trajectories"],

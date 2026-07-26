@@ -388,6 +388,30 @@ describe("ContinuousChatOverlay", () => {
     expect(overlay.style.paddingBottom).toBe(initialPadding);
   });
 
+  it("seats the resting composer low: 40% of the gesture inset with a 0.5rem floor", () => {
+    // Lock-screen anchoring: at rest the overlay clears only what the home
+    // indicator occupies — 40% of the reported safe-area/gesture inset (≈13.6px
+    // of a 34px iOS inset) — not the whole inset (r3.3 hover) nor 60% (still
+    // ~20px up on device). The 0.5rem floor keeps breathing room on devices
+    // reporting no inset, and the nav offset still stacks on top.
+    render(<ContinuousChatOverlay controller={makeController()} />);
+    const overlay = screen.getByTestId("continuous-chat-overlay");
+    expect(overlay.style.paddingBottom).toBe(
+      "calc(var(--eliza-mobile-nav-offset, 0px) + max(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) * 0.4, 0.5rem))",
+    );
+  });
+
+  it("renders NO cosmetic bottom-floor strip under the composer (wallpaper owns the zone)", () => {
+    // The old continuous-chat-bottom-floor painted a --launch-bg gradient over
+    // the strip below the composer; with the app shell painting that zone
+    // (wallpaper on shared-background routes), the repaint band WAS the
+    // residual visible gap on the standalone home view. It must stay gone.
+    render(<ContinuousChatOverlay controller={makeController()} />);
+    expect(
+      screen.queryByTestId("continuous-chat-bottom-floor"),
+    ).toBeNull();
+  });
+
   it("blurs the focused composer when the active view leaves chat (drops the iOS accessory bar)", () => {
     const { rerender } = render(
       <ContinuousChatOverlay
@@ -490,6 +514,21 @@ describe("ContinuousChatOverlay", () => {
     fireEvent.pointerMove(grabber, { clientY: 280, pointerId: 1 });
     fireEvent.pointerUp(grabber, { clientY: 280, pointerId: 1 });
     expect(sheet.getAttribute("data-variant")).toBe("open");
+  });
+
+  it("spans a WIDE swipe-up grab zone across the composer top edge", () => {
+    // Lock-screen affordance: the grabber's hit zone must reach across the
+    // composer's width (inset-x-6, not a narrow centred px-16 stub) so a
+    // swipe-up begun anywhere near the bottom opens the chat — while still
+    // floating above the input row so it never eats taps meant for the
+    // textarea.
+    render(<ContinuousChatOverlay controller={makeController()} />);
+    const grabber = screen.getByTestId("chat-sheet-grabber");
+    expect(grabber.className).toContain("inset-x-6");
+    expect(grabber.className).not.toContain("px-16");
+    // The zone stops at the handle's own bottom (before:bottom-0) so it can't
+    // overlap the interactive composer controls beneath it.
+    expect(grabber.className).toContain("before:bottom-0");
   });
 
   it("toggles the sheet open and closed on repeated grabber taps", () => {
@@ -838,15 +877,17 @@ describe("ContinuousChatOverlay", () => {
     expect(user?.className).toContain("justify-end");
   });
 
-  it("anchors typing dots as an assistant-aligned transcript row", () => {
+  it("anchors the in-flight status row as an assistant-aligned transcript row", () => {
     render(
       <ContinuousChatOverlay
         controller={makeController({ phase: "responding", responding: true })}
       />,
     );
     fireEvent.focus(screen.getByLabelText("message"));
-    // The dots sit inside a left-aligned, full-width assistant row.
-    const row = screen.getByTestId("typing-dots").closest(".w-full");
+    // The status indicator sits inside a left-aligned, full-width assistant row.
+    const row = screen
+      .getByTestId("turn-status-indicator")
+      .closest(".w-full");
     expect(row?.className).toContain("w-full");
     expect(row?.className).toContain("justify-start");
   });
@@ -1099,7 +1140,10 @@ describe("ContinuousChatOverlay", () => {
     expect(screen.queryByTestId("chat-full-launcher")).toBeNull();
 
     const grabber = screen.getByTestId("chat-sheet-grabber");
-    expect(grabber.className).toContain("before:-top-4");
+    // The grab zone reaches a comfortable distance ABOVE the composer (so a
+    // swipe-up begun just over it opens the chat) but stays bounded — it never
+    // balloons up into the home widgets.
+    expect(grabber.className).toContain("before:-top-6");
     expect(grabber.className).not.toContain("before:-top-16");
   });
 
@@ -1579,9 +1623,10 @@ describe("ContinuousChatOverlay", () => {
 
   it("keeps the collapsed pill handle non-interactive while the input is formed", () => {
     // The pill handle is always mounted over the (faded) composer so it can
-    // crossfade pill→input. Its hit zone (px-16/pt-10) sits over the textarea, so
-    // while NOT pilled it must be pointer-events-none — otherwise it intercepts
-    // the tap meant for the composer and the mobile keyboard never opens.
+    // crossfade pill→input. Its hit zone (w-full/pt-10) sits over the textarea,
+    // so while NOT pilled it must be pointer-events-none — otherwise it
+    // intercepts the tap meant for the composer and the mobile keyboard never
+    // opens.
     render(<ContinuousChatOverlay controller={makeController()} />);
     const sheet = screen.getByTestId("chat-sheet");
     expect(sheet.getAttribute("data-detent")).toBe("collapsed");
@@ -1592,6 +1637,9 @@ describe("ContinuousChatOverlay", () => {
     // Kept out of the tab order / a11y tree while it's not the active handle.
     expect(pill.getAttribute("tabindex")).toBe("-1");
     expect(pill.getAttribute("aria-hidden")).toBe("true");
+    // The pill's swipe-up grab zone spans the full width (not a narrow centred
+    // px-16 stub) so a swipe-up from anywhere across the bottom opens.
+    expect(pill.className).toContain("w-full");
   });
 
   it("makes the pill handle interactive (drag-to-open) once collapsed to the pill", () => {
@@ -2057,7 +2105,7 @@ describe("ContinuousChatOverlay", () => {
 
   // ── Rich turn-status indicator (#8813) ──────────────────────────────────
   describe("turn status indicator", () => {
-    it("renders breathing dots without a text label while thinking", () => {
+    it("labels the thinking phase in the standalone status row", () => {
       render(
         <ContinuousChatOverlay
           controller={makeController({
@@ -2072,9 +2120,12 @@ describe("ContinuousChatOverlay", () => {
       expect(indicator.getAttribute("data-status-kind")).toBe("thinking");
       expect(indicator.getAttribute("role")).toBe("status");
       expect(indicator.getAttribute("aria-live")).toBe("polite");
-      expect(screen.queryByTestId("turn-status-label")).toBeNull();
-      // The dots still animate within the indicator.
-      expect(screen.getByTestId("typing-dots")).toBeTruthy();
+      // The standalone status row carries a word for every phase (including
+      // thinking) beside a spinner — the bare-dots variant is the in-bubble one.
+      expect(screen.getByTestId("turn-status-label").textContent).toContain(
+        "Thinking",
+      );
+      expect(screen.getByTestId("turn-status-spinner")).toBeTruthy();
     });
 
     it("humanizes the action name for a running_action phase", () => {
@@ -2183,9 +2234,12 @@ describe("ContinuousChatOverlay", () => {
           />,
         );
         fireEvent.focus(screen.getByLabelText("message"));
-        expect(screen.queryByTestId("turn-status-label")).toBeNull();
+        // The first phase already carries its word (thinking is labelled).
+        expect(screen.getByTestId("turn-status-label").textContent).toContain(
+          "Thinking",
+        );
         // A near-instant change to running_action must NOT flip the label yet —
-        // the thinking status is held for the min dwell so words don't strobe in.
+        // the first status is held for the min dwell so words don't strobe in.
         rerender(
           <ContinuousChatOverlay
             controller={makeController({
@@ -2198,12 +2252,14 @@ describe("ContinuousChatOverlay", () => {
             } as Partial<ShellController>)}
           />,
         );
-        expect(screen.queryByTestId("turn-status-label")).toBeNull();
+        expect(screen.getByTestId("turn-status-label").textContent).toContain(
+          "Thinking",
+        );
         // After the dwell window elapses the new phase is shown.
         act(() => {
           vi.advanceTimersByTime(400);
         });
-        expect(screen.getByTestId("turn-status-label").textContent).toBe(
+        expect(screen.getByTestId("turn-status-label").textContent).toContain(
           "Running Send message",
         );
       } finally {

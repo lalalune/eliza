@@ -29,13 +29,12 @@ import {
   type State,
   type ViewScopedAction,
   type ViewScopedActionStep,
-  type ViewType,
 } from "@elizaos/core";
+import { getView } from "../api/views-registry.ts";
 import {
   dispatchViewInteract,
   getViewsBroadcastWs,
 } from "../api/views-routes.ts";
-import { getView } from "../api/views-registry.ts";
 import { getActiveViewContext } from "./view-action-affinity.ts";
 
 /** How long a single agent-surface step waits for the frontend to resolve. */
@@ -49,9 +48,7 @@ const PARAM_TOKEN = /^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/;
  * params under `options.parameters` (the #10677 contract); fall back to the flat
  * `options` object for direct/test callers. Returns an empty object when absent.
  */
-function readActionParams(
-  options: unknown,
-): Record<string, unknown> {
+function readActionParams(options: unknown): Record<string, unknown> {
   if (!options || typeof options !== "object") return {};
   const record = options as Record<string, unknown>;
   const nested = record.parameters;
@@ -148,17 +145,6 @@ function unwrapInteractResult(result: unknown): unknown {
 }
 
 /**
- * Resolve the concrete view type the scoped action's view is registered under,
- * preferring the active view's type. Scoped actions only validate while their
- * view is active, so at handler time the active view IS the declaring view.
- */
-function resolveViewType(viewId: string): ViewType {
-  const active = getActiveViewContext();
-  if (active?.viewId === viewId) return active.viewType;
-  return getView(viewId)?.viewType ?? "gui";
-}
-
-/**
  * Build a runtime {@link Action} from a view's scoped-action declaration.
  *
  * @param viewId - the declaring view's id (the active-view gate).
@@ -236,7 +222,6 @@ export function buildViewScopedAction(
       }
 
       const params = readActionParams(options);
-      const viewType = resolveViewType(viewId);
       const driven: string[] = [];
 
       for (const step of decl.steps) {
@@ -313,10 +298,9 @@ export function buildViewScopedAction(
 export function scopedActionNames(
   scopedActions: readonly ViewScopedAction[] | undefined,
 ): string[] {
+  if (!scopedActions) return [];
   return [
-    ...new Set(
-      (scopedActions ?? []).map((a) => a.name.trim()).filter(Boolean),
-    ),
+    ...new Set(scopedActions.map((a) => a.name.trim()).filter(Boolean)),
   ];
 }
 
@@ -327,12 +311,55 @@ interface ScopedActionSourceView {
 }
 
 /**
- * Per-owner set of scoped-action names currently registered in the runtime, so
- * a reload/unload can remove exactly the previously-registered set without
+ * Per-owner action objects currently registered in the runtime, so a
+ * reload/unload can remove exactly the previously-registered set without
  * touching another owner's actions. Keyed by the owner passed to
  * {@link registerViewScopedActions} (plugin name, or "@elizaos/builtin").
  */
-const registeredByOwner = new Map<string, Set<string>>();
+const registeredByOwner = new Map<string, Map<string, Action>>();
+
+type ScopedActionRuntime = Pick<
+  IAgentRuntime,
+  "registerAction" | "unregisterAction"
+> &
+  Partial<Pick<IAgentRuntime, "actions">>;
+
+function findRuntimeAction(
+  runtime: Pick<IAgentRuntime, "actions">,
+  name: string,
+): Action | undefined {
+  return runtime.actions.find((action) => action.name === name);
+}
+
+function unregisterOwnedScopedActions(
+  runtime: ScopedActionRuntime,
+  owner: string,
+): void {
+  const previous = registeredByOwner.get(owner);
+  if (!previous) return;
+  if (!Array.isArray(runtime.actions)) {
+    logger.warn(
+      { src: "ViewScopedActions", owner },
+      `[ViewScopedActions] cannot prove scoped-action ownership for owner "${owner}" during unregister; leaving actions registered`,
+    );
+    registeredByOwner.delete(owner);
+    return;
+  }
+  for (const [name, action] of previous) {
+    if (
+      findRuntimeAction(runtime as Pick<IAgentRuntime, "actions">, name) !==
+      action
+    ) {
+      logger.warn(
+        { src: "ViewScopedActions", owner, actionName: name },
+        `[ViewScopedActions] scoped action "${name}" for owner "${owner}" is no longer installed by that owner; skipping unregister`,
+      );
+      continue;
+    }
+    runtime.unregisterAction(name);
+  }
+  registeredByOwner.delete(owner);
+}
 
 /**
  * Reconcile the runtime action registry with the scoped actions declared by
@@ -344,29 +371,50 @@ const registeredByOwner = new Map<string, Set<string>>();
  * @returns the scoped-action names now registered for this owner.
  */
 export function registerViewScopedActions(
-  runtime: Pick<IAgentRuntime, "registerAction" | "unregisterAction">,
+  runtime: ScopedActionRuntime,
   owner: string,
   views: readonly ScopedActionSourceView[],
 ): string[] {
-  const previous = registeredByOwner.get(owner);
-  if (previous) {
-    for (const name of previous) runtime.unregisterAction(name);
-  }
+  unregisterOwnedScopedActions(runtime, owner);
 
-  const registered = new Set<string>();
+  const registered = new Map<string, Action>();
   for (const view of views) {
-    for (const decl of view.scopedActions ?? []) {
+    const scopedActions = view.scopedActions;
+    if (!scopedActions) continue;
+    for (const decl of scopedActions) {
       const name = decl.name.trim();
       if (!name) continue;
       if (registered.has(name)) {
         logger.warn(
-          { src: "ViewScopedActions", owner, viewId: view.id, actionName: name },
+          {
+            src: "ViewScopedActions",
+            owner,
+            viewId: view.id,
+            actionName: name,
+          },
           `[ViewScopedActions] duplicate scoped-action name "${name}" for owner "${owner}" — keeping first`,
         );
         continue;
       }
-      runtime.registerAction(buildViewScopedAction(view.id, decl));
-      registered.add(name);
+      const action = buildViewScopedAction(view.id, decl);
+      runtime.registerAction(action);
+      if (
+        Array.isArray(runtime.actions) &&
+        findRuntimeAction(runtime as Pick<IAgentRuntime, "actions">, name) !==
+          action
+      ) {
+        logger.warn(
+          {
+            src: "ViewScopedActions",
+            owner,
+            viewId: view.id,
+            actionName: name,
+          },
+          `[ViewScopedActions] scoped-action name "${name}" for owner "${owner}" conflicts with an existing action — keeping incumbent`,
+        );
+        continue;
+      }
+      registered.set(name, action);
     }
   }
 
@@ -379,18 +427,15 @@ export function registerViewScopedActions(
   } else {
     registeredByOwner.delete(owner);
   }
-  return [...registered];
+  return [...registered.keys()];
 }
 
 /** Unregister all scoped actions registered for `owner` (plugin unload). */
 export function unregisterViewScopedActions(
-  runtime: Pick<IAgentRuntime, "unregisterAction">,
+  runtime: ScopedActionRuntime,
   owner: string,
 ): void {
-  const previous = registeredByOwner.get(owner);
-  if (!previous) return;
-  for (const name of previous) runtime.unregisterAction(name);
-  registeredByOwner.delete(owner);
+  unregisterOwnedScopedActions(runtime, owner);
 }
 
 /** Test-only: forget all owner→action bookkeeping (does not touch a runtime). */

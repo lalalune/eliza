@@ -1,18 +1,18 @@
 /**
- * Storybook layouts for the Documents page across full-page, modal, embedded,
- * compact, and controlled-selection surfaces.
+ * Storybook layouts for the Knowledge hub across full-page, modal, standalone,
+ * external-file-input, and controlled-selection surfaces.
  */
 import type { Meta, StoryObj } from "@storybook/react";
 import { withMockApp } from "../../storybook/mock-providers.helpers";
 import { DocumentsView } from "./DocumentsView";
 
 /**
- * `DocumentsView` is the knowledge/documents page: an upload zone plus a
- * searchable, scope-filterable list of documents alongside a detail viewer.
+ * `DocumentsView` is the Knowledge multimedia hub: a media-format facet control
+ * over a single-column list, with the reader opening as a pushed sub-view.
  *
- * In Storybook there is no backend, so `client.listDocuments` rejects/hangs
- * on mount — these stories render the loading skeleton and then settle into
- * the empty state, which is the realistic first-paint experience.
+ * In Storybook there is no backend, so the mount load rejects — these stories
+ * render the loading skeleton and settle into the empty state, the realistic
+ * first-paint experience.
  */
 const meta = {
   title: "Pages/DocumentsView",
@@ -35,9 +35,8 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 /**
- * Default page layout: upload zone, document list rail with search + scope
- * filters, and the detail viewer. Renders the empty/loading state without a
- * backend.
+ * Default page layout: the facet control over the single-column list. Renders
+ * the empty/loading state without a backend.
  */
 export const Default: Story = {};
 
@@ -52,23 +51,21 @@ export const InModal: Story = {
 };
 
 /**
- * Embedded variant uses the compact selector rail, suitable for narrower
- * surfaces that host the documents view inline.
+ * Standalone variant renders its own ViewHeader; the default (non-standalone)
+ * mode is headerless, embedded under another view's chrome.
  */
-export const Embedded: Story = {
+export const Standalone: Story = {
   args: {
-    embedded: true,
+    standalone: true,
   },
 };
 
 /**
- * With the selector rail hidden, the view collapses to a compact horizontal
- * strip of document chips above the detail viewer. An external file input id
- * surfaces the "Add Knowledge" trigger.
+ * An external file input id wires the hub's quiet "Add" intake to a host-owned
+ * `<input type="file">`, the only upload affordance once the side rail is gone.
  */
-export const CompactStrip: Story = {
+export const ExternalFileInput: Story = {
   args: {
-    showSelectorRail: false,
     fileInputId: "documents-file-input",
   },
 };

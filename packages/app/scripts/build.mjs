@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 // UI build: Capacitor plugins then Vite. Requires prior `bun install` (postinstall).
 // ELIZA_BUILD_FULL_SETUP=1 prepends install --ignore-scripts + run-repo-setup (CI-style).
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveElizaAssetBaseUrls } from "../../../packages/app-core/scripts/lib/asset-cdn.mjs";
 import { normalizeEnvPrefix } from "../src/env-prefix.js";
+import {
+  removePublicBuildStamp,
+  shouldSkipBuildStamp,
+} from "./build-stamp.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appDir = path.resolve(__dirname, "..");
@@ -95,22 +99,71 @@ function run(command, args, cwd) {
   });
 }
 
-if (fullSetup) {
-  await run(bunExecutable, ["install", "--ignore-scripts"], repoRoot);
-  await run(process.execPath, [repoSetupScript], repoRoot);
+function stampBuildInfo() {
+  if (shouldSkipBuildStamp()) {
+    removePublicBuildStamp(appDir);
+    return;
+  }
+  try {
+    const commit = execFileSync("git", ["rev-parse", "--short=10", "HEAD"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (!commit) return;
+    const now = new Date();
+    const builtAt = now.toISOString();
+    const stampDate = now.toLocaleString("en-US", {
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    const label = `${commit} \u00b7 ${stampDate}`;
+    const outDir = path.join(appDir, "public");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(outDir, "build-info.json"),
+      `${JSON.stringify({ commit, builtAt, label })}\n`,
+    );
+  } catch {
+    // git absent or non-repo build context — skip the stamp silently.
+  }
 }
 
-await run(process.execPath, [path.join(__dirname, "plugin-build.mjs")], appDir);
+async function main() {
+  if (fullSetup) {
+    await run(bunExecutable, ["install", "--ignore-scripts"], repoRoot);
+    await run(process.execPath, [repoSetupScript], repoRoot);
+  }
 
-if (fullSetup) {
-  await run(bunExecutable, ["install", "--ignore-scripts"], appDir);
+  stampBuildInfo();
+
+  await run(
+    process.execPath,
+    [path.join(__dirname, "plugin-build.mjs")],
+    appDir,
+  );
+
+  if (fullSetup) {
+    await run(bunExecutable, ["install", "--ignore-scripts"], appDir);
+  }
+
+  await run(
+    bunExecutable,
+    ["--bun", "vite", "build", "--configLoader", "runner"],
+    appDir,
+  );
+  if (resolveElizaAssetBaseUrls().appAssetBaseUrl) {
+    await run(process.execPath, [pruneCdnAssetsScript], repoRoot);
+  }
 }
 
-await run(
-  bunExecutable,
-  ["--bun", "vite", "build", "--configLoader", "runner"],
-  appDir,
-);
-if (resolveElizaAssetBaseUrls().appAssetBaseUrl) {
-  await run(process.execPath, [pruneCdnAssetsScript], repoRoot);
+const invokedPath = process.argv[1]
+  ? pathToFileURL(path.resolve(process.argv[1])).href
+  : "";
+if (import.meta.url === invokedPath) {
+  await main();
 }

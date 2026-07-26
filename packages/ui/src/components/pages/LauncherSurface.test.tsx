@@ -30,6 +30,7 @@ vi.mock("../../state/useViewKinds", () => ({
 
 vi.mock("../../platform/platform-guards", () => ({
   getActiveViewModality: () => "gui",
+  getFrontendPlatform: () => "web",
 }));
 
 vi.mock("../../navigation", async (importOriginal) => {

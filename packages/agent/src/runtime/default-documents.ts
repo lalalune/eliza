@@ -1,6 +1,7 @@
 /**
  * Seeds a fixed set of bundled knowledge documents (Eliza overview, ELIZA
- * history, Eliza Cloud basics/monetization) into the agent's `documents` and
+ * history, Eliza Cloud basics/monetization, and the per-topic help FAQ from
+ * default-help-documents.ts) into the agent's `documents` and
  * `document_fragments` memory tables so retrieval works before a user adds any
  * knowledge. Ids are derived deterministically from agentId + document key and
  * seeding is idempotent: documents and fragments are created, updated in place
@@ -16,6 +17,7 @@ import {
   stringToUuid,
   type UUID,
 } from "@elizaos/core";
+import { HELP_DOCUMENTS } from "./default-help-documents";
 
 const DOCUMENT_BATCH_SIZE = 100;
 const DEFAULT_DOCUMENTS_SOURCE = "eliza-default-documents";
@@ -138,6 +140,7 @@ export const DEFAULT_DOCUMENTS: readonly DefaultDocumentDefinition[] = [
       },
     ],
   },
+<<<<<<< HEAD
   // Help fold-in (#13377): former Help view content as help-tagged knowledge.
   {
     key: "help-getting-started",
@@ -220,6 +223,11 @@ export const DEFAULT_DOCUMENTS: readonly DefaultDocumentDefinition[] = [
     fragments: [{ text: HELP_TROUBLESHOOTING_TEXT }],
     metadata: { tags: [HELP_KNOWLEDGE_TAG], helpCategory: "Troubleshooting" },
   },
+=======
+  // The app help FAQ — the chat is the help surface, so "how do I…" answers
+  // ship as retrievable knowledge instead of a dedicated Help view.
+  ...HELP_DOCUMENTS,
+>>>>>>> origin/develop
 ];
 
 function getDocumentId(agentId: UUID, key: string): UUID {

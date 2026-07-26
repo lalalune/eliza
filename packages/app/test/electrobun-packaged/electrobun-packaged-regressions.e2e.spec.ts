@@ -9,6 +9,7 @@ import { expect, type TestInfo, test } from "@playwright/test";
 import { assertScreenshotNotBlank } from "../ui-smoke/helpers/screenshot-quality";
 import { type MockApiServer, startMockApiServer } from "./mock-api";
 import {
+  type DesktopNotificationDiagnostic,
   PackagedDesktopHarness,
   resolvePackagedLauncher,
 } from "./packaged-app-helpers";
@@ -29,6 +30,7 @@ const SETTINGS_ROUTE = "/settings";
 const SETTINGS_MEDIA_ROUTE = "/settings/voice";
 const PLUGINS_ROUTE = "/apps/plugins";
 const NAVIGATE_SETTINGS_EVENT = "eliza:navigate:settings";
+const NOTIFICATION_TEST_BRIDGE_SYMBOL = "elizaos.ui.notification-store-tests";
 
 test.describe.configure({ mode: "serial" });
 
@@ -159,6 +161,78 @@ async function waitForEval<T>(
   }
 
   return lastResult;
+}
+
+async function ingestPackagedNotification(
+  harness: PackagedDesktopHarness,
+  notification: {
+    id: string;
+    title: string;
+    body: string;
+    priority: "normal" | "high" | "urgent";
+  },
+): Promise<{ hasFocus: boolean; visibilityState: string }> {
+  const result = await waitForEval<
+    EvalResult<{ hasFocus: boolean; visibilityState: string }>
+  >(
+    harness,
+    `(() => {
+      try {
+        const bridge = globalThis[Symbol.for(${JSON.stringify(
+          NOTIFICATION_TEST_BRIDGE_SYMBOL,
+        )})];
+        if (!bridge?.ingestNotificationForTests) {
+          return { ok: false, error: "notification store test bridge unavailable" };
+        }
+        bridge.ingestNotificationForTests({
+          id: ${JSON.stringify(notification.id)},
+          title: ${JSON.stringify(notification.title)},
+          body: ${JSON.stringify(notification.body)},
+          category: "system",
+          priority: ${JSON.stringify(notification.priority)},
+          source: "packaged-e2e",
+          createdAt: Date.now(),
+          readAt: null,
+        }, 1);
+        return {
+          ok: true,
+          hasFocus: document.hasFocus(),
+          visibilityState: document.visibilityState,
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    })()`,
+    (value) => value.ok === true,
+    {
+      message:
+        "Expected packaged renderer notification store test bridge to ingest a notification.",
+      timeout: 30_000,
+    },
+  );
+  expect(result.ok, result.ok ? undefined : result.error).toBe(true);
+  return result;
+}
+
+async function waitForNativeNotification(
+  harness: PackagedDesktopHarness,
+  title: string,
+): Promise<DesktopNotificationDiagnostic> {
+  const startedAt = Date.now();
+  let lastNotifications: DesktopNotificationDiagnostic[] = [];
+  while (Date.now() - startedAt < 30_000) {
+    lastNotifications = await harness.readNotifications();
+    const match = lastNotifications.find(
+      (notification) => notification.title === title,
+    );
+    if (match) return match;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(
+    `Timed out waiting for native notification ${JSON.stringify(
+      title,
+    )}.\nLast notifications: ${JSON.stringify(lastNotifications, null, 2)}`,
+  );
 }
 
 async function writeHarnessScreenshot(
@@ -1215,6 +1289,72 @@ test("packaged desktop shortcut bridge summons the main window", async ({
       "Expected shortcut bridge press to summon and focus the main window.",
       30_000,
     );
+  });
+});
+
+test("packaged desktop notification store reaches native OS notifications", async ({
+  browserName: _browserName,
+}) => {
+  void _browserName;
+  test.skip(
+    !isPackagedPlatform(),
+    "Packaged desktop notification regressions require a macOS, Windows, or Linux launcher.",
+  );
+
+  await withPackagedHarness(async ({ harness }) => {
+    await harness.clearNotifications();
+    await harness.focusMainWindow();
+    await harness.waitForState(
+      (state) => state.mainWindow.present && state.shell.windowFocused,
+      "Expected the packaged main window to be focused before urgent notification injection.",
+      30_000,
+    );
+
+    const urgentFocus = await ingestPackagedNotification(harness, {
+      id: "packaged-focused-urgent",
+      title: "Focused urgent packaged alert",
+      body: "The focused urgent notification should still reach the OS bridge.",
+      priority: "urgent",
+    });
+    expect(urgentFocus).toMatchObject({
+      hasFocus: true,
+      visibilityState: "visible",
+    });
+
+    expect(
+      await waitForNativeNotification(harness, "Focused urgent packaged alert"),
+    ).toMatchObject({
+      title: "Focused urgent packaged alert",
+      body: "The focused urgent notification should still reach the OS bridge.",
+      silent: false,
+    });
+
+    await harness.clearNotifications();
+    await harness.minimizeMainWindow();
+    await harness.waitForState(
+      (state) => state.mainWindow.present && !state.shell.windowFocused,
+      "Expected the packaged main window to lose focus before background notification injection.",
+      30_000,
+    );
+
+    const backgroundFocus = await ingestPackagedNotification(harness, {
+      id: "packaged-background-normal",
+      title: "Background normal packaged alert",
+      body: "The minimized normal notification should reach the OS bridge.",
+      priority: "normal",
+    });
+    expect(backgroundFocus.hasFocus).toBe(false);
+
+    expect(
+      await waitForNativeNotification(
+        harness,
+        "Background normal packaged alert",
+      ),
+    ).toMatchObject({
+      title: "Background normal packaged alert",
+      body: "The minimized normal notification should reach the OS bridge.",
+      silent: false,
+    });
   });
 });
 

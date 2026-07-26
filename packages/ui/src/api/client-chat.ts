@@ -27,6 +27,7 @@ import type {
   DatabaseStatus,
   DocumentBulkUploadResult,
   DocumentDetail,
+  DocumentFacetCountsResponse,
   DocumentFragmentsResponse,
   DocumentScope,
   DocumentSearchResponse,
@@ -89,8 +90,21 @@ type DocumentListOptions = {
   timeRangeStart?: string;
   timeRangeEnd?: string;
   tags?: string[];
+<<<<<<< HEAD
   roomId?: string;
   mediaFormat?: string;
+=======
+  /** Media-format facet (#13594): image | audio | video | pdf | text |
+   *  transcript | file. Matched server-side against `metadata.mediaFormat` or
+   *  the `media-format:<format>` tag (#13593). */
+  mediaFormat?: string;
+  /** Source-room filter (#13593): scope the list to one chat/room. */
+  roomId?: string;
+  /** Knowledge-hub display facet (#13594): all | doc | image | audio | video |
+   *  transcript. Server-side coarse bucket so the list is drawn from the whole
+   *  store, not the client's first page. `doc` groups pdf/text/file. */
+  knowledgeFacet?: string;
+>>>>>>> origin/develop
 };
 
 type DocumentUploadRequest = {
@@ -101,6 +115,7 @@ type DocumentUploadRequest = {
   entityId?: string;
   scope?: DocumentScope;
   scopedToEntityId?: string;
+  addedFrom?: string;
 };
 
 type DocumentUrlUploadOptions = {
@@ -123,9 +138,15 @@ type DocumentSearchOptions = {
   timeRangeStart?: string;
   timeRangeEnd?: string;
   tags?: string[];
+<<<<<<< HEAD
   roomId?: string;
   mediaFormat?: string;
   searchMode?: DocumentSearchMode;
+=======
+  mediaFormat?: string;
+  roomId?: string;
+  knowledgeFacet?: string;
+>>>>>>> origin/develop
 };
 
 type InboxMessagesOptions = {
@@ -239,8 +260,14 @@ function appendDocumentFilterParams(
   setTruthyStringParam(params, "addedBy", options?.addedBy);
   setTruthyStringParam(params, "timeRangeStart", options?.timeRangeStart);
   setTruthyStringParam(params, "timeRangeEnd", options?.timeRangeEnd);
+<<<<<<< HEAD
   setTruthyStringParam(params, "roomId", options?.roomId);
   setTruthyStringParam(params, "mediaFormat", options?.mediaFormat);
+=======
+  setTruthyStringParam(params, "mediaFormat", options?.mediaFormat);
+  setTruthyStringParam(params, "roomId", options?.roomId);
+  setTruthyStringParam(params, "knowledgeFacet", options?.knowledgeFacet);
+>>>>>>> origin/develop
   appendTagsParam(params, options?.tags);
 }
 
@@ -538,6 +565,9 @@ declare module "./client-base" {
       keepId?: string;
     }): Promise<{ deleted: string[] }>;
     getDocumentStats(): Promise<DocumentStats>;
+    getDocumentFacetCounts(
+      options?: DocumentListOptions,
+    ): Promise<DocumentFacetCountsResponse>;
     listDocuments(options?: DocumentListOptions): Promise<DocumentsResponse>;
     getDocument(documentId: string): Promise<{ document: DocumentDetail }>;
     updateDocument(
@@ -1390,6 +1420,21 @@ ElizaClient.prototype.listDocuments = async function (
   const params = buildDocumentListParams(options);
   const query = params.toString();
   return this.fetch(`/api/documents${query ? `?${query}` : ""}`);
+};
+
+ElizaClient.prototype.getDocumentFacetCounts = async function (
+  this: ElizaClient,
+  options?,
+) {
+  // Whole-store facet counts for the hub segmented control (#13594). Reuses the
+  // list filter params minus paging so the counts honor the same
+  // scope/room/search narrowing as the visible list; the facet param itself is
+  // ignored server-side so every bucket is counted.
+  const params = new URLSearchParams();
+  if (options?.query) params.set("q", options.query);
+  appendDocumentFilterParams(params, options);
+  const query = params.toString();
+  return this.fetch(`/api/documents/facets${query ? `?${query}` : ""}`);
 };
 
 ElizaClient.prototype.getDocument = async function (

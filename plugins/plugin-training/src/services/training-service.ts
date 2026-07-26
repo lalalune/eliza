@@ -35,6 +35,7 @@ interface TrajectoryServiceLike {
     limit?: number;
     offset?: number;
     runId?: string;
+    traceId?: string;
   }) => Promise<TrajectoryListResult>;
   getTrajectoryDetail: (id: string) => Promise<Trajectory | null>;
 }
@@ -96,6 +97,7 @@ export class TrainingService implements TrainingServiceWithRuntime {
     limit?: number;
     offset?: number;
     runId?: string;
+    traceId?: string;
   }): Promise<TrajectoryListResult> {
     return await this.trajectoryService().listTrajectories(options);
   }

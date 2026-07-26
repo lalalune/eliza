@@ -36,8 +36,12 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readDevicectlDeviceList } from "./ios-device-devicectl.mjs";
 import {
+  readDevicectlDeviceList,
+  readDevicectlDeviceLockState,
+} from "./ios-device-devicectl.mjs";
+import {
+  assertDeviceUnlocked,
   BOOT_TRACE_SIBLING_CONTAINER_PATHS,
   classifyConsoleExit,
   DEFAULT_APP_BUNDLE_ID,
@@ -56,12 +60,27 @@ const fail = (message) => {
   process.exit(1);
 };
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function resolveDevice(deviceId) {
   const payload = readDevicectlDeviceList();
   const record = findDeviceRecord(payload, deviceId);
   if (!record)
     fail(`device "${deviceId}" not found. xcrun devicectl list devices`);
   return record;
+}
+
+async function waitForDeviceUnlocked(device, phase) {
+  await assertDeviceUnlocked({
+    device,
+    probeLockState: () => readDevicectlDeviceLockState(device.identifier),
+    sleep,
+    waitSeconds: process.env.ELIZA_IOS_DEVICE_UNLOCK_WAIT_SECONDS ?? 120,
+    pollIntervalSeconds: process.env.ELIZA_IOS_DEVICE_UNLOCK_POLL_SECONDS ?? 5,
+    notify: (message) => log(`${phase}: ${message}`),
+  });
 }
 
 function captureConsole({ device, bundleId, durationSeconds, outputFile }) {
@@ -211,6 +230,7 @@ async function main() {
   }
   const device = resolveDevice(deviceId);
   log(`device: ${device.name} (identifier ${device.identifier})`);
+  await waitForDeviceUnlocked(device, "preflight");
 
   const bundleId = args["bundle-id"] || DEFAULT_APP_BUNDLE_ID;
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");

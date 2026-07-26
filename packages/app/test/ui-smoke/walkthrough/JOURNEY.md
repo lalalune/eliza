@@ -10,7 +10,7 @@ many of these flows in isolation; the walkthrough joins them into one continuous
 journey.
 
 > **Built (#10198 / #10204).** The asked-for narrative — cold launch →
-> onboarding → tutorial → help → settings → wallet → real chat → view-switch →
+> onboarding → chat-native tutorial → typed tutorial commands → settings → wallet → real chat → view-switch →
 > settings-edit → dashboard — is the **Extended Journey** table at the bottom of
 > this file (25 steps), which supersedes the original 22-state table (kept for
 > history). Drive + capture + review + record it with one command:
@@ -48,7 +48,7 @@ journey.
     completion gate remains
     `[data-testid="choice-__first_run__:tutorial:start|skip"]`
   - Tutorial: `/tutorial` route → `[data-testid="tutorial-launcher"]` →
-    `[data-testid="tutorial-start"]` → `[data-testid="tutorial-card"]`
+    seeded tour turns in the transcript (`choice-__tutorial__:<verb>:<step>`)
   - Launcher: `[data-testid="launcher"]`
   - Launcher tiles: `[data-testid^="launcher-tile-"]`
   - Character editor: `[data-testid="character-editor-view"]`
@@ -136,7 +136,7 @@ and named in the final evidence.
 (1440×1000) **and** mobile (390×844) viewports. Each row maps 1:1 to a captured
 `NN-<step>.png` and a `NN-<step>.json` manifest (URL, viewport, DOM markers,
 per-step console/network diagnostics, the assertions that passed). This table
-extends the original 22 states with the asked-for **tutorial / help / settings /
+extends the original 22 states with the asked-for **tutorial / settings /
 wallet / settings-edit** rows so no captured state is accepted "on sight."
 
 Lanes: the **mock** lane (default, keyless) page-mocks the conversation store so
@@ -152,8 +152,8 @@ the real backend agent + model and writes the trajectory to
 | 01 | Cold app launch | `/` loads with first-run incomplete; the chat transcript renders first-run choices over the app shell. | No page error / no `console.error` / no 5xx; `continuous-chat-overlay` + transcript choices visible ≤20s; removed `first-run-chat`/`startup-first-run-background` absent. | `01-cold-launch.png` |
 | 02 | Onboarding runtime choice | The chat transcript asks how the agent should run. | Runtime prompt visible; `choice-__first_run__:runtime:cloud` / `:local` / `:remote` visible (no `:other`). | `02-onboarding-runtime.png` |
 | 03 | Choose runtime → tutorial → ready | Picking Local advances to the provider step, then provisioning, then the tutorial-or-skip CHOICE flips first-run complete. | `choice-__first_run__:runtime:local` → `choice-__first_run__:provider:on-device` → `choice-__first_run__:tutorial:skip`; first-run flips complete; `continuous-chat-overlay` + `chat-composer-textarea` reachable. | `03-provisioning-ready.png` |
-| 04 | Interactive tutorial | The `/tutorial` launcher starts the tour spotlight. | `tutorial-launcher` → `tutorial-start` → `tutorial-card`; "Meet Eliza" text visible; tour dismissed via `tutorial-skip`. | `04-tutorial.png` |
-| 05 | Help search | The Help view searches the KB. | `help-view` visible; search "change the model" → `help-entry-change-model` references "AI Model". | `05-help.png` |
+| 04 | Chat-native tutorial | The `/tutorial` launcher starts the in-chat tour. | `tutorial-launcher` visible; welcome turn + `choice-__tutorial__:next:welcome` in the transcript; all six steps walked (send-message via a real composer send). | `04-tutorial.png` |
+| 05 | Typed tutorial commands | "restart tutorial" / "stop tutorial" typed in the composer drive the tour. | fresh welcome turn after restart; `Tutorial stopped` acknowledgment after stop. | `05-tutorial-commands.png` |
 | 06 | Open settings | The Settings shell opens. | `settings-shell` visible; "Models & Providers" section opened. | `06-settings-open.png` |
 | 07 | Wallet view | The Wallet view renders. | `wallet-shell` (or Wallet heading) visible at `/wallet`. | `07-wallet.png` |
 | 08 | Chat a conversation | A real round-trip: user line + assistant reply. | user `thread-line` visible; assistant `thread-line` visible & non-empty; **live**: reply from the real model (trajectory captured). | `08-chat-round-trip.png` |

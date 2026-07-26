@@ -25,9 +25,12 @@
  * Bundle ids are resolved from (in precedence order): explicit `--bundle-id`
  * flags, then the appexes discovered inside `--product <App.app>/PlugIns/*.appex`
  * (their `CFBundleIdentifier`) plus the app itself. Idempotent — an already
- * registered device / existing bundle id is reused; a same-named profile is
- * refreshed (dev profiles are immutable, so it is deleted + recreated). Minted
- * profiles are written into the profiles dir where `discoverProfiles()` looks.
+ * registered device / existing bundle id is reused; each device gets its own
+ * stable profile name, so provisioning one device never removes another
+ * device's working profile. Existing valid profiles are reused; an invalid
+ * same-name profile fails the run instead of being deleted before replacement.
+ * Minted profiles are written into the profiles dir where `discoverProfiles()`
+ * looks.
  *
  * The API-flow, JWT construction, and credential handling are exported as pure
  * functions with an injectable `fetchImpl` so the contract is unit-tested
@@ -218,20 +221,93 @@ export async function ensureBundleId(
 }
 
 /**
- * Mint (or refresh) a development profile for a bundle id. Development profiles
- * are immutable, so a same-named profile is deleted and recreated with the
- * current device + certificate set.
+ * Keep development profile names stable per bundle+device without embedding the
+ * full UDID in ASC-visible names.
  */
+export function developmentProfileName(identifier, deviceId) {
+  const suffix = crypto
+    .createHash("sha256")
+    .update(String(deviceId))
+    .digest("hex")
+    .slice(0, 12);
+  return `Eliza Dev - ${identifier} - ${suffix}`;
+}
+
+/**
+ * Mint a development profile for a bundle id, or reuse a same-named profile
+ * that already covers this bundle/device/certificate set. Development profiles
+ * are immutable and ASC profile names are unique, so an invalid same-name
+ * profile fails closed instead of deleting the last usable profile before a
+ * replacement exists.
+ */
+function relationshipIds(resource, relationship) {
+  const data = resource?.relationships?.[relationship]?.data;
+  if (Array.isArray(data)) return data.map((entry) => entry.id);
+  if (data?.id) return [data.id];
+  return [];
+}
+
+export function profileCoversRequest(
+  profile,
+  { bundleIdRef, deviceIds, certificateIds },
+) {
+  const bundleIds = relationshipIds(profile, "bundleId");
+  const profileDeviceIds = relationshipIds(profile, "devices");
+  const profileCertificateIds = relationshipIds(profile, "certificates");
+  return (
+    bundleIds.includes(bundleIdRef) &&
+    deviceIds.every((id) => profileDeviceIds.includes(id)) &&
+    certificateIds.every((id) => profileCertificateIds.includes(id))
+  );
+}
+
+export function profileIsUsable(profile, now = new Date()) {
+  const state = profile?.attributes?.profileState;
+  if (state && state !== "ACTIVE") return false;
+  const expiration = profile?.attributes?.expirationDate;
+  if (expiration && new Date(expiration).getTime() <= now.getTime()) {
+    return false;
+  }
+  return true;
+}
+
 export async function mintDevelopmentProfile(
   asc,
   { name, bundleIdRef, deviceIds, certificateIds },
 ) {
   const existing = await asc(
     "GET",
-    `/v1/profiles?filter[name]=${encodeURIComponent(name)}&limit=1`,
+    `/v1/profiles?filter[name]=${encodeURIComponent(name)}&include=bundleId,devices,certificates&limit=1`,
   );
   if (existing.data && existing.data.length > 0) {
-    await asc("DELETE", `/v1/profiles/${existing.data[0].id}`);
+    const profile = existing.data[0];
+    if (
+      profileCoversRequest(profile, { bundleIdRef, deviceIds, certificateIds })
+    ) {
+      if (!profileIsUsable(profile)) {
+        throw new Error(
+          `Existing development profile "${name}" covers the requested bundle/device/certificate set, ` +
+            "but is expired or inactive. Remove or rename that profile in ASC, then rerun.",
+        );
+      }
+      if (profile.attributes?.profileContent) return profile;
+      const fetched = await asc("GET", `/v1/profiles/${profile.id}`);
+      if (!profileIsUsable(fetched.data)) {
+        throw new Error(
+          `Existing development profile "${name}" covers the requested bundle/device/certificate set, ` +
+            "but is expired or inactive. Remove or rename that profile in ASC, then rerun.",
+        );
+      }
+      if (fetched.data?.attributes?.profileContent) return fetched.data;
+      throw new Error(
+        `Existing development profile "${name}" covers the requested bundle/device/certificate set, ` +
+          "but App Store Connect did not return profileContent. Download it in ASC or remove the stale profile before rerunning.",
+      );
+    }
+    throw new Error(
+      `Existing development profile "${name}" does not cover the requested bundle/device/certificate set. ` +
+        "Refusing to delete it before a replacement exists; remove or rename that profile in ASC, then rerun.",
+    );
   }
   const created = await asc("POST", "/v1/profiles", {
     data: {
@@ -313,6 +389,19 @@ export function discoverAppBundleIds(productAppDir, { runPlutil } = {}) {
   });
 }
 
+export function validateBundleIds(bundleIds, source = "provision") {
+  if (!bundleIds || bundleIds.length === 0) {
+    throw new Error(
+      `${source}: no bundle ids resolved (pass --bundle-id or --product with appexes).`,
+    );
+  }
+  for (const bid of bundleIds) {
+    if (!bid?.identifier?.trim()) {
+      throw new Error(`${source}: resolved an empty bundle identifier.`);
+    }
+  }
+}
+
 /**
  * Full provisioning flow. Idempotent. Returns a per-bundle-id result table.
  * `fetchImpl`, `dir`, and `now` are injectable for tests.
@@ -327,11 +416,7 @@ export async function provision({
   now,
 }) {
   if (!udid) throw new Error("provision: a device UDID is required.");
-  if (!bundleIds || bundleIds.length === 0) {
-    throw new Error(
-      "provision: no bundle ids resolved (pass --bundle-id or --product with appexes).",
-    );
-  }
+  validateBundleIds(bundleIds);
   const jwt = createAscJwt(creds, now);
   const asc = makeAscClient({ jwt, fetchImpl });
   const device = await ensureDeviceRegistered(asc, { udid, name: deviceName });
@@ -342,7 +427,7 @@ export async function provision({
       identifier: bid.identifier,
       name: bid.name,
     });
-    const profileName = `Eliza Dev - ${bid.identifier}`;
+    const profileName = developmentProfileName(bid.identifier, device.id);
     const profile = await mintDevelopmentProfile(asc, {
       name: profileName,
       bundleIdRef: bundle.id,
@@ -386,6 +471,7 @@ async function main() {
   if (bundleIds.length === 0 && args.product) {
     bundleIds = discoverAppBundleIds(args.product);
   }
+  validateBundleIds(bundleIds, "ios:device:provision");
   if (args.dryRun) {
     // Prove the JWT + resolution without mutating the ASC team.
     createAscJwt(creds);

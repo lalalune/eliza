@@ -65,38 +65,14 @@ const CORE_VIEW_INTERACTIONS: Readonly<Record<string, CoreViewInteraction>> = {
     owners: [
       SHELL_AGENT_BRIDGE_OWNER,
       {
-        spec: "packages/app/test/ui-smoke/tutorial-help-views.spec.ts",
+        spec: "packages/app/test/ui-smoke/tutorial-chat.spec.ts",
         proves:
-          "Opens Tutorial from the home tile, starts the tour, and dismisses the spotlight card.",
-        signals: ["tutorial-start", "tutorial-card", "tutorial-skip"],
-      },
-      {
-        spec: "packages/app/test/ui-smoke/tutorial-help-walkthrough.spec.ts",
-        proves: "Walks the interactive tutorial states beyond the launcher.",
+          "Runs the chat-native tour end to end: seeded turns in the live transcript, Next/Stop choices, typed start/stop/restart commands, auto-advance on a real send, and narration through the voice engine.",
         signals: [
-          "Full, real-interaction verification",
-          "the tour runs end to end with real gestures and real voice",
-          "tutorial-card",
-        ],
-      },
-    ],
-  },
-  help: {
-    owners: [
-      SHELL_AGENT_BRIDGE_OWNER,
-      {
-        spec: "packages/app/test/ui-smoke/tutorial-help-views.spec.ts",
-        proves:
-          "Opens Help and drives its chat-backed search to reveal a matching entry.",
-        signals: ["help-view", "help-entry-change-model", "change the model"],
-      },
-      {
-        spec: "packages/app/test/ui-smoke/tutorial-help-walkthrough.spec.ts",
-        proves: "Exercises the deeper help walkthrough/search states.",
-        signals: [
-          "Help is searched through the floating chat",
-          "help-view",
-          "help-entry-change-model",
+          "the chat-native tour runs end to end in the live transcript",
+          "tutorial-start",
+          "stop tutorial",
+          "__ttsSpoken",
         ],
       },
     ],
@@ -460,11 +436,6 @@ const SHELL_PROVIDER_BOUNDARY_SEGMENTS: readonly {
     file: "packages/ui/src/components/pages/tutorial/TutorialView.tsx",
     start: "export function TutorialView(",
     end: "function TutorialViewBody(",
-  },
-  {
-    file: "packages/ui/src/components/pages/help/HelpView.tsx",
-    start: "export function HelpView(",
-    end: "function HelpViewBody(",
   },
   {
     file: "packages/ui/src/components/character/CharacterEditor.tsx",

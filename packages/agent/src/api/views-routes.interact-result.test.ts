@@ -9,6 +9,7 @@
 import type http from "node:http";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setActiveViewContext } from "../runtime/view-action-affinity.ts";
 import {
   registerBuiltinViews,
   registerPluginViews,
@@ -41,14 +42,17 @@ function makeCtx(
   json: ReturnType<typeof vi.fn>;
   error: ReturnType<typeof vi.fn>;
   broadcastWs: ReturnType<typeof vi.fn>;
+  broadcastWsToClientId: ReturnType<typeof vi.fn>;
 } {
   const req = Readable.from(
     body === null ? [] : [Buffer.from(JSON.stringify(body))],
   ) as unknown as http.IncomingMessage;
+  req.headers = {};
   const res = {} as http.ServerResponse;
   const json = vi.fn();
   const error = vi.fn();
   const broadcastWs = vi.fn();
+  const broadcastWsToClientId = vi.fn(() => 1);
   const ctx: ViewsRouteContext = {
     req,
     res,
@@ -58,8 +62,9 @@ function makeCtx(
     json,
     error,
     broadcastWs,
+    broadcastWsToClientId,
   };
-  return { ctx, json, error, broadcastWs };
+  return { ctx, json, error, broadcastWs, broadcastWsToClientId };
 }
 
 describe("POST /api/views/interact-result resolves a pending interact", () => {
@@ -99,8 +104,10 @@ describe("POST /api/views/interact-result resolves a pending interact", () => {
       ctx: interactCtx,
       json: interactJson,
       broadcastWs,
+      broadcastWsToClientId,
     } = makeCtx("POST", "/api/views/frontend-only/interact", {
       capability: "get-state",
+      clientId: "client-one",
       timeoutMs: 5_000,
     });
     const interactPromise = handleViewsRoutes(interactCtx);
@@ -109,8 +116,9 @@ describe("POST /api/views/interact-result resolves a pending interact", () => {
     // until that frame lands (the body read + waitFor registration are async).
     let requestId: string | undefined;
     for (let i = 0; i < 50 && !requestId; i++) {
-      const frame = broadcastWs.mock.calls
-        .map((c) => c[0] as Record<string, unknown>)
+      const frame = broadcastWsToClientId.mock.calls
+        .filter(([clientId]) => clientId === "client-one")
+        .map((c) => c[1] as Record<string, unknown>)
         .find((p) => p.type === "view:interact");
       if (frame && typeof frame.requestId === "string") {
         requestId = frame.requestId;
@@ -119,6 +127,9 @@ describe("POST /api/views/interact-result resolves a pending interact", () => {
       await new Promise((r) => setImmediate(r));
     }
     expect(requestId).toBeTruthy();
+    expect(broadcastWs).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "view:interact" }),
+    );
 
     // Now resolve it via the interact-result route with a matching requestId.
     const { ctx: resultCtx, json: resultJson } = makeCtx(
@@ -143,6 +154,91 @@ describe("POST /api/views/interact-result resolves a pending interact", () => {
         requestId,
         success: true,
         result: { text: "state was read", value: 42 },
+      }),
+    );
+  });
+
+  it("rejects frontend interact dispatch without global broadcast when client id is missing", async () => {
+    const { ctx, json, broadcastWs, broadcastWsToClientId } = makeCtx(
+      "POST",
+      "/api/views/frontend-only/interact",
+      {
+        capability: "get-state",
+        timeoutMs: 5_000,
+      },
+    );
+
+    await expect(handleViewsRoutes(ctx)).resolves.toBe(true);
+
+    expect(broadcastWs).not.toHaveBeenCalled();
+    expect(broadcastWsToClientId).not.toHaveBeenCalled();
+    expect(json).toHaveBeenCalledWith(
+      ctx.res,
+      expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("Missing client id"),
+      }),
+    );
+  });
+
+  it("targets the mounted active-view owner when interact has no explicit client id", async () => {
+    setActiveViewContext({
+      viewId: "frontend-only",
+      viewLabel: "Frontend Only",
+      viewType: "gui",
+      viewPath: "/frontend-only",
+    });
+    const { ctx: elementsCtx } = makeCtx(
+      "POST",
+      "/api/views/frontend-only/elements",
+      {
+        clientId: "mounted-shell",
+        elements: [{ id: "refresh", role: "button", label: "Refresh" }],
+      },
+    );
+    await expect(handleViewsRoutes(elementsCtx)).resolves.toBe(true);
+
+    const { ctx, broadcastWs, broadcastWsToClientId, json } = makeCtx(
+      "POST",
+      "/api/views/frontend-only/interact",
+      {
+        capability: "get-state",
+        timeoutMs: 5_000,
+      },
+    );
+    const interactPromise = handleViewsRoutes(ctx);
+
+    let requestId: string | undefined;
+    for (let i = 0; i < 50 && !requestId; i++) {
+      const frame = broadcastWsToClientId.mock.calls
+        .filter(([clientId]) => clientId === "mounted-shell")
+        .map((c) => c[1] as Record<string, unknown>)
+        .find((p) => p.type === "view:interact");
+      if (frame && typeof frame.requestId === "string") {
+        requestId = frame.requestId;
+        break;
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+
+    expect(requestId).toBeTruthy();
+    expect(broadcastWs).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "view:interact" }),
+    );
+
+    const { ctx: resultCtx } = makeCtx("POST", "/api/views/interact-result", {
+      requestId,
+      success: true,
+      result: { text: "mounted owner handled it" },
+    });
+    await expect(handleViewsRoutes(resultCtx)).resolves.toBe(true);
+    await expect(interactPromise).resolves.toBe(true);
+    expect(json).toHaveBeenCalledWith(
+      ctx.res,
+      expect.objectContaining({
+        requestId,
+        success: true,
+        result: { text: "mounted owner handled it" },
       }),
     );
   });

@@ -987,13 +987,31 @@ function appendApiBaseParam(rendererUrl: string, apiBase: string): string {
   }
 }
 
+function appendRuntimeChooserTestParam(rendererUrl: string): string {
+  if (process.env.ELIZA_DESKTOP_TEST_ENABLE_RUNTIME_CHOOSER !== "1") {
+    return rendererUrl;
+  }
+
+  try {
+    const url = new URL(rendererUrl);
+    url.searchParams.set("enableRuntimeChooser", "1");
+    return url.toString();
+  } catch {
+    return rendererUrl;
+  }
+}
+
 async function resolveRendererUrlForCurrentRuntime(): Promise<string> {
   const rendererUrl = await resolveRendererUrl();
   const runtime = resolveDesktopRuntime();
   if (runtime.mode === "external" && runtime.externalApi.base) {
-    return appendApiBaseParam(rendererUrl, runtime.externalApi.base);
+    const externalRendererUrl = appendApiBaseParam(
+      rendererUrl,
+      runtime.externalApi.base,
+    );
+    return appendRuntimeChooserTestParam(externalRendererUrl);
   }
-  return rendererUrl;
+  return appendRuntimeChooserTestParam(rendererUrl);
 }
 
 /**

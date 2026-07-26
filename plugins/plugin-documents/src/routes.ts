@@ -37,6 +37,7 @@ import {
 } from "@elizaos/core";
 import { parseClampedFloat, parsePositiveInteger } from "@elizaos/shared";
 import {
+  getDocumentContentType,
   getDocumentDeleteability,
   getDocumentEditability,
   getDocumentProvenance,
@@ -44,6 +45,11 @@ import {
   presentDocument,
 } from "./document-presenter.js";
 import {
+<<<<<<< HEAD
+=======
+  type DocumentAddedByRole,
+  type DocumentAddedFrom,
+>>>>>>> origin/develop
   type DocumentSearchMode,
   type DocumentsServiceLike,
   type DocumentVisibilityScope,
@@ -68,6 +74,83 @@ const FRAGMENT_BATCH_SIZE = 500;
 const DOCUMENT_UPLOAD_MAX_BODY_BYTES = 32 * 1_048_576; // 32 MB
 const MAX_BULK_DOCUMENTS = 100;
 
+<<<<<<< HEAD
+=======
+const DOCUMENT_SCOPE_VALUES = new Set<DocumentVisibilityScope>([
+  "global",
+  "owner-private",
+  "user-private",
+  "agent-private",
+]);
+
+type DocumentFilter = {
+  scope?: DocumentVisibilityScope;
+  scopedToEntityId?: UUID;
+  query?: string;
+  addedBy?: UUID;
+  timeRangeStart?: number;
+  timeRangeEnd?: number;
+  tags?: string[];
+  /** First-class source-room filter (#13593). */
+  roomId?: UUID;
+  /**
+   * Media-format facet (#13593): image | audio | video | pdf | text |
+   * transcript | file. Matched against `metadata.mediaFormat` or the
+   * `media-format:<format>` tag, so both explicitly-tagged records and
+   * mime-derived ones compose.
+   */
+  mediaFormat?: string;
+  /**
+   * Hub display facet (#13594): the coarse client-facing bucket the Knowledge
+   * hub's segmented control filters by — all | doc | image | audio | video |
+   * transcript. Unlike {@link mediaFormat} (an exact fine-grained match), `doc`
+   * groups the pdf/text/file document subtypes, so the hub's facet rows and
+   * counts come from the whole readable store, not just the first page.
+   */
+  knowledgeFacet?: KnowledgeHubFacet;
+};
+
+/** The Knowledge hub's coarse display facets (#13594); `all` is the no-op. */
+type KnowledgeHubFacet =
+  | "all"
+  | "doc"
+  | "image"
+  | "audio"
+  | "video"
+  | "transcript";
+
+const KNOWLEDGE_HUB_FACETS: readonly KnowledgeHubFacet[] = [
+  "all",
+  "doc",
+  "image",
+  "audio",
+  "video",
+  "transcript",
+];
+
+function parseKnowledgeFacet(
+  value: string | null,
+): KnowledgeHubFacet | undefined {
+  const normalized = trimString(value)?.toLowerCase();
+  if (!normalized) return undefined;
+  return (KNOWLEDGE_HUB_FACETS as readonly string[]).includes(normalized)
+    ? (normalized as KnowledgeHubFacet)
+    : undefined;
+}
+
+/** Namespaced tag prefix carrying the media-format facet on knowledge records. */
+const MEDIA_FORMAT_TAG_PREFIX = "media-format:";
+
+type DocumentReadableMemory = {
+  id?: UUID;
+  agentId?: UUID;
+  entityId?: UUID;
+  createdAt?: number;
+  content?: { text?: string };
+  metadata?: unknown;
+};
+
+>>>>>>> origin/develop
 type DocumentUploadBody = {
   content: string;
   filename: string;
@@ -78,6 +161,7 @@ type DocumentUploadBody = {
   entityId?: string;
   scope?: string;
   scopedToEntityId?: string;
+  addedFrom?: string;
 };
 
 function isTextBackedContentType(
@@ -193,6 +277,9 @@ function filtersFromSearchParams(
   const mediaFormat = trimString(
     url.searchParams.get("mediaFormat") ?? url.searchParams.get("format"),
   )?.toLowerCase();
+  const knowledgeFacet = parseKnowledgeFacet(
+    url.searchParams.get("knowledgeFacet") ?? url.searchParams.get("facet"),
+  );
   return {
     ...(scope ? { scope } : {}),
     ...(scopedToEntityId ? { scopedToEntityId } : {}),
@@ -203,6 +290,7 @@ function filtersFromSearchParams(
     ...(tags.length > 0 ? { tags } : {}),
     ...(roomId ? { roomId } : {}),
     ...(mediaFormat ? { mediaFormat } : {}),
+    ...(knowledgeFacet ? { knowledgeFacet } : {}),
   };
 }
 
@@ -281,6 +369,203 @@ function isDocumentMemory(memory: Memory, agentId: UUID): boolean {
   );
 }
 
+<<<<<<< HEAD
+=======
+function matchesDocumentFilter(
+  memory: DocumentReadableMemory,
+  filters: DocumentFilter,
+): boolean {
+  const metadata = asRecord(memory.metadata);
+  if (filters.scope && getDocumentVisibilityScope(metadata) !== filters.scope) {
+    return false;
+  }
+  if (
+    filters.scopedToEntityId &&
+    documentScopedEntityId(memory) !== filters.scopedToEntityId
+  ) {
+    return false;
+  }
+  if (filters.addedBy && metadata?.addedBy !== filters.addedBy) {
+    return false;
+  }
+  const documentTags = Array.isArray(metadata?.tags)
+    ? metadata.tags.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  if (filters.tags && filters.tags.length > 0) {
+    if (!filters.tags.every((tag) => documentTags.includes(tag))) {
+      return false;
+    }
+  }
+  if (filters.roomId && documentRoomId(metadata) !== filters.roomId) {
+    return false;
+  }
+  if (
+    filters.mediaFormat &&
+    documentMediaFormat(metadata, documentTags) !== filters.mediaFormat
+  ) {
+    return false;
+  }
+  if (
+    filters.knowledgeFacet &&
+    filters.knowledgeFacet !== "all" &&
+    documentHubFacet(metadata, documentTags) !== filters.knowledgeFacet
+  ) {
+    return false;
+  }
+
+  const timestamp =
+    typeof metadata?.timestamp === "number"
+      ? metadata.timestamp
+      : typeof metadata?.addedAt === "number"
+        ? metadata.addedAt
+        : typeof memory.createdAt === "number"
+          ? memory.createdAt
+          : undefined;
+  if (
+    typeof filters.timeRangeStart === "number" &&
+    (typeof timestamp !== "number" || timestamp < filters.timeRangeStart)
+  ) {
+    return false;
+  }
+  if (
+    typeof filters.timeRangeEnd === "number" &&
+    (typeof timestamp !== "number" || timestamp > filters.timeRangeEnd)
+  ) {
+    return false;
+  }
+  if (filters.query) {
+    const query = filters.query.toLowerCase();
+    const haystack = [
+      memory.content?.text,
+      getDocumentTitleFromMetadata(metadata, memory.content?.text),
+      metadata?.title,
+      metadata?.filename,
+      metadata?.originalFilename,
+      metadata?.source,
+      metadata?.url,
+    ]
+      .filter((value): value is string => typeof value === "string")
+      .join("\n")
+      .toLowerCase();
+    if (!haystack.includes(query)) return false;
+  }
+  return true;
+}
+
+function documentScopedEntityId(
+  memory: DocumentReadableMemory,
+): UUID | undefined {
+  const metadata = asRecord(memory.metadata);
+  return (
+    asUuid(metadata?.scopedToEntityId) ??
+    asUuid(metadata?.addedBy) ??
+    asUuid(memory.entityId)
+  );
+}
+
+/** Source-room id recorded on a knowledge record (#13593), if any. */
+function documentRoomId(
+  metadata: Record<string, unknown> | undefined,
+): UUID | undefined {
+  return asUuid(metadata?.roomId);
+}
+
+/**
+ * Media-format facet for a knowledge record (#13593). Prefer an explicit
+ * `metadata.mediaFormat`; fall back to the `media-format:<format>` tag so
+ * records tagged by the ingest pipeline (or backfill) still match without a
+ * dedicated column.
+ */
+function documentMediaFormat(
+  metadata: Record<string, unknown> | undefined,
+  tags: string[],
+): string | undefined {
+  const explicit = trimString(metadata?.mediaFormat)?.toLowerCase();
+  if (explicit) return explicit;
+  const tagged = tags.find((tag) => tag.startsWith(MEDIA_FORMAT_TAG_PREFIX));
+  return tagged ? tagged.slice(MEDIA_FORMAT_TAG_PREFIX.length) : undefined;
+}
+
+/**
+ * Coarse Knowledge-hub facet for a record (#13594). Collapses the fine
+ * media-format vocabulary into the hub's display buckets: image/audio/video and
+ * transcript pass through; pdf/text/file (and any non-media document) group as
+ * `doc`. Falls back to the record's mime type when the format tag is absent, so
+ * legacy/un-backfilled records still bucket correctly and the whole store is
+ * counted — not just the tagged first page. Transcript-backed records
+ * (`transcriptId`) are always the `transcript` bucket, mirroring the client.
+ */
+function documentHubFacet(
+  metadata: Record<string, unknown> | undefined,
+  tags: string[],
+): Exclude<KnowledgeHubFacet, "all"> {
+  if (trimString(metadata?.transcriptId)) return "transcript";
+  const format = documentMediaFormat(metadata, tags);
+  switch (format) {
+    case "image":
+    case "audio":
+    case "video":
+    case "transcript":
+      return format;
+    case "pdf":
+    case "text":
+    case "file":
+      return "doc";
+    default:
+      break;
+  }
+  const mime = getDocumentContentType(metadata).toLowerCase();
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime.startsWith("video/")) return "video";
+  return "doc";
+}
+
+function canReadDocumentMemory(
+  memory: DocumentReadableMemory,
+  actor: RouteActor,
+  filters: DocumentFilter = {},
+): boolean {
+  const metadata = asRecord(memory.metadata);
+  const scope = getDocumentVisibilityScope(metadata);
+
+  if (scope === "global") return true;
+  if (scope === "owner-private") return actorCanManageOwnerDocuments(actor);
+  if (scope === "agent-private") return actorCanManageAgentDocuments(actor);
+
+  const scopedEntityId = documentScopedEntityId(memory);
+  if (!scopedEntityId) return false;
+
+  if (actor.role === "AGENT" || actor.role === "RUNTIME") return true;
+  if (actor.role === "OWNER") {
+    return filters.scopedToEntityId
+      ? scopedEntityId === filters.scopedToEntityId
+      : scopedEntityId === actor.entityId;
+  }
+  return scopedEntityId === actor.entityId;
+}
+
+function canMutateDocumentMemory(memory: Memory, actor: RouteActor): boolean {
+  const metadata = asRecord(memory.metadata);
+  const scope = getDocumentVisibilityScope(metadata);
+
+  if (scope === "global" || scope === "owner-private") {
+    return actorCanManageOwnerDocuments(actor);
+  }
+  if (scope === "agent-private") {
+    return actorCanManageAgentDocuments(actor);
+  }
+
+  const scopedEntityId = documentScopedEntityId(memory);
+  return (
+    actorCanManageAgentDocuments(actor) ||
+    (Boolean(scopedEntityId) && scopedEntityId === actor.entityId)
+  );
+}
+
+>>>>>>> origin/develop
 function buildRouteMessage({
   agentId,
   text,
@@ -493,6 +778,71 @@ async function listDocumentMemories({
   return { documents, total };
 }
 
+/**
+ * Per-facet counts for the Knowledge hub (#13594), computed over the WHOLE
+ * readable store in one scan — not a page slice — so the hub's segmented control
+ * shows true totals and no facet goes missing/miscounted once its records fall
+ * outside the first page (the review blocker). Honors every filter EXCEPT the
+ * hub facet itself (so the counts describe what each facet would show under the
+ * current scope/room/tag/search narrowing).
+ */
+async function countDocumentFacets({
+  documentsService,
+  agentId,
+  actor,
+  filters,
+}: {
+  documentsService: DocumentsServiceLike;
+  agentId: UUID;
+  actor: RouteActor;
+  filters: DocumentFilter;
+}): Promise<Record<KnowledgeHubFacet, number>> {
+  const counts: Record<KnowledgeHubFacet, number> = {
+    all: 0,
+    doc: 0,
+    image: 0,
+    audio: 0,
+    video: 0,
+    transcript: 0,
+  };
+  // Drop the hub facet so the scan sees every bucket; keep the rest of the
+  // narrowing (scope/room/tag/search) so counts match the visible list.
+  const { knowledgeFacet: _ignored, ...baseFilters } = filters;
+  let scanOffset = 0;
+
+  while (true) {
+    const batch = await documentsService.getMemories({
+      tableName: DOCUMENTS_TABLE,
+      count: FRAGMENT_BATCH_SIZE,
+      offset: scanOffset,
+    });
+    if (batch.length === 0) break;
+
+    for (const memory of batch) {
+      if (
+        !isDocumentMemory(memory, agentId) ||
+        !matchesDocumentFilter(memory, baseFilters) ||
+        !canReadDocumentMemory(memory, actor, baseFilters)
+      ) {
+        continue;
+      }
+      const metadata = asRecord(memory.metadata);
+      const documentTags = Array.isArray(metadata?.tags)
+        ? metadata.tags.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [];
+      counts[documentHubFacet(metadata, documentTags)] += 1;
+      counts.all += 1;
+    }
+
+    if (batch.length < FRAGMENT_BATCH_SIZE) break;
+    scanOffset += FRAGMENT_BATCH_SIZE;
+  }
+
+  return counts;
+}
+
 export const __setDocumentFetchImplForTests = __setDocumentUrlFetchImplForTests;
 
 export async function handleDocumentsRoutes(
@@ -554,6 +904,27 @@ export async function handleDocumentsRoutes(
       documentCount,
       fragmentCount,
       agentId,
+    });
+    return true;
+  }
+
+  if (method === "GET" && pathname === "/api/documents/facets") {
+    // Whole-store facet counts for the Knowledge hub segmented control
+    // (#13594). The facet param itself is dropped inside countDocumentFacets so
+    // every bucket is counted; the remaining scope/room/tag/search filters are
+    // honored so the counts describe the current narrowing.
+    const filters = filtersFromSearchParams(url, { includeTextQuery: true });
+    const counts = await countDocumentFacets({
+      documentsService,
+      agentId,
+      actor: routeActor,
+      filters,
+    });
+    json(res, {
+      ok: true,
+      available: true,
+      agentId,
+      counts,
     });
     return true;
   }
@@ -939,6 +1310,16 @@ export async function handleDocumentsRoutes(
         ? (scopedToEntityId ?? actor.entityId)
         : actor.entityId;
     const metadata = asRecord(document.metadata);
+    const requestedAddedFrom =
+      typeof document.addedFrom === "string" && document.addedFrom.trim()
+        ? document.addedFrom.trim()
+        : typeof metadata?.addedFrom === "string" && metadata.addedFrom.trim()
+          ? metadata.addedFrom.trim()
+          : "upload";
+    const addedFrom = (
+      requestedAddedFrom === "import" ? "import" : "upload"
+    ) as DocumentAddedFrom;
+    const source = addedFrom;
 
     // Persist the ORIGINAL uploaded bytes (content-addressed) and link them on
     // the document record so it stays downloadable/previewable. Best-effort: a
@@ -989,10 +1370,10 @@ export async function handleDocumentsRoutes(
       scopedToEntityId,
       addedBy: actor.entityId,
       addedByRole: routeActorAddedByRole(actor),
-      addedFrom: "upload",
+      addedFrom,
       metadata: {
         ...metadata,
-        source: "upload",
+        source,
         filename: document.filename,
         originalFilename: document.filename,
         fileType: originalContentType,
@@ -1002,6 +1383,7 @@ export async function handleDocumentsRoutes(
         ...(scopedToEntityId ? { scopedToEntityId } : {}),
         addedBy: actor.entityId,
         addedByRole: routeActorAddedByRole(actor),
+        addedFrom,
         ...(mediaLink ?? {}),
       },
     });

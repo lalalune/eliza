@@ -46,8 +46,6 @@ import {
   CHAT_PREFILL_EVENT,
   type ChatPrefillEventDetail,
   ELIZA_BACK_INTENT_EVENT,
-  TUTORIAL_CHAT_CONTROL_EVENT,
-  type TutorialChatControlDetail,
 } from "../../events";
 import {
   TOUCH_TAP_MOVE_SLOP as OUTSIDE_SHEET_TAP_SLOP,
@@ -72,6 +70,7 @@ import {
 import { useConversationMessages } from "../../state/ConversationMessagesContext.hooks";
 import { goHome, goLauncher } from "../../state/shell-surface-store";
 import { useViewChatBinding } from "../../state/view-chat-binding";
+import { tryHandleTutorialText } from "../../tutorial/tutorial-action-channel";
 import { copyTextToClipboard } from "../../utils/clipboard";
 import {
   CHAT_UPLOAD_ACCEPT,
@@ -86,17 +85,18 @@ import { SensitiveRequestBlock } from "../chat/MessageContent";
 import { findChoiceRegions } from "../chat/message-choice-parser";
 import { ThinkingBlock } from "../chat/ThinkingBlock";
 import { withTranscriptMarker } from "../chat/TranscriptViewerOverlay";
-import { ToolCallEventLog } from "../tool-events/ToolCallEventLog";
 import { ChatMessage } from "../composites/chat/chat-message";
 import type {
   ChatMessageData,
   ChatMessageRenderContext,
 } from "../composites/chat/chat-types";
 import { TurnStatus } from "../composites/chat/chat-typing-indicator";
+import { ToolCallEventLog } from "../tool-events/ToolCallEventLog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
 import {
+  isShortLandscapeViewport,
   measureSafeAreaInsetTop,
   resolveChatPanelLayout,
 } from "./chat-panel-layout";
@@ -487,14 +487,17 @@ function SheetGrabber({
         "appearance-none border-0 bg-transparent text-left",
         // ABSOLUTELY positioned over the panel top (zero layout height — it
         // floats slightly on top of the input row, so collapsed height == the
-        // input bar). Keep the invisible hit target local to the visible handle:
-        // it should be forgiving, not register drags far above the bar.
+        // input bar). The grab target is WIDE (a swipe-up from anywhere across
+        // the composer's top edge opens the chat — the lock-screen "swipe up to
+        // open" affordance) but STAYS ABOVE the input row so it never steals
+        // taps meant for the textarea / +/mic controls below it.
         // z-20 keeps it above the input row (z-10) so it always wins the drag.
-        "absolute left-1/2 top-0.5 z-20 -translate-x-1/2 flex cursor-grab touch-none select-none items-center justify-center px-16 py-2 active:cursor-grabbing",
-        // The hit zone reaches only a small distance above the panel and stops
-        // at the handle's own bottom, so the handle does not steal taps intended
-        // for the composer or feel like it starts in empty space.
-        "before:absolute before:-inset-x-4 before:-top-4 before:bottom-0 before:content-['']",
+        "absolute inset-x-6 top-0.5 z-20 flex cursor-grab touch-none select-none items-center justify-center py-2 active:cursor-grabbing",
+        // The invisible hit target reaches a comfortable distance ABOVE the
+        // panel (a swipe-up begun in the empty field just over the composer is
+        // caught) and STOPS at the handle's own bottom, so it never overlaps the
+        // interactive composer row beneath — taps fall through to the input.
+        "before:absolute before:-inset-x-2 before:-top-6 before:bottom-0 before:content-['']",
         "   ",
       )}
     >
@@ -562,8 +565,11 @@ function PillHandle({
       aria-hidden={pilled ? undefined : true}
       className={cn(
         // The bar hugs the BOTTOM (small pb) where the collapsed input sat — not
-        // floating mid-air; the tall pt keeps a generous upward grab/flick zone.
-        "h-auto w-auto cursor-grab touch-none select-none items-end rounded-none bg-transparent px-16 pb-1.5 pt-10 hover:bg-transparent active:cursor-grabbing",
+        // floating mid-air; the tall pt + full width keep a generous upward grab/
+        // flick zone so a swipe-up from anywhere across the bottom opens the chat
+        // (the lock-screen affordance). Flex-center keeps the capsule centred
+        // while the invisible hit area spans wide.
+        "flex h-auto w-full cursor-grab touch-none select-none items-end justify-center rounded-none bg-transparent px-8 pb-1.5 pt-10 hover:bg-transparent active:cursor-grabbing",
         // Interactive only while pilled. When NOT pilled the (faded) handle must
         // let taps fall through to the composer textarea below it — otherwise its
         // tall hit zone steals the tap and the keyboard never opens.
@@ -630,9 +636,12 @@ function TurnStatusIndicator({
   );
 }
 
-// After this long still booting, the banner escalates to a "taking longer than
-// usual" state with a settings escape, so a stuck boot never reads as a silent
-// hang. Exported for the unit test (see the __-seam note below).
+// After this long WITHOUT OBSERVED PROGRESS still booting, the banner escalates
+// to a "taking longer than usual" state with a settings escape, so a truly
+// stuck boot never reads as a silent hang — but a slow-yet-progressing boot
+// does NOT trip it (#14040 sub-defect 3): the escalation keys off
+// absence-of-progress, not raw elapsed wall-clock. Exported for the unit test
+// (see the __-seam note below).
 export const BOOT_SLOW_AFTER_MS = 90_000;
 
 // Grace before the banner appears: a warm agent leaves the "booting" phase
@@ -653,19 +662,36 @@ export function BootStatusIndicator({
   agentName,
   onOpenSettings,
   reduce,
+  progressSignal,
 }: {
   agentName: string;
   onOpenSettings?: () => void;
   reduce?: boolean;
+  /**
+   * A token that changes whenever fresh boot progress is observed (#14040
+   * sub-defect 3). The slow-boot escalation restarts its timer on each change,
+   * so a slow-but-progressing boot never trips "taking longer than usual" while
+   * a genuinely stalled boot still escalates. When `undefined` (no progress
+   * channel available) the timer falls back to raw-elapsed escalation — the
+   * prior behaviour — by keying off a stable token.
+   */
+  progressSignal?: string;
 }): React.JSX.Element {
-  // Local elapsed timing is the only boot signal the overlay has (agentStatus
-  // carries no boot-start timestamp), and it suffices: the parent unmounts this
-  // the instant readiness flips, so the timer never outlives the boot.
+  // Escalate on ABSENCE of progress, not raw elapsed time (#14040 sub-defect
+  // 3): the timer is (re)armed on mount AND whenever `progressSignal` changes,
+  // so each fresh progress observation pushes the "taking longer than usual"
+  // threshold out by another window. A boot that keeps reporting progress never
+  // trips it; a stalled boot (token stable for BOOT_SLOW_AFTER_MS) still does.
+  // The parent unmounts this the instant readiness flips, so the timer never
+  // outlives the boot.
   const [slow, setSlow] = React.useState(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: progressSignal is the RESET trigger, not read in the body — re-running the effect on each change restarts the escalation window (that IS the fix for #14040 sub-defect 3). Removing it would revert to raw-elapsed escalation.
   React.useEffect(() => {
+    // Fresh progress clears any prior escalation and restarts the window.
+    setSlow(false);
     const id = window.setTimeout(() => setSlow(true), BOOT_SLOW_AFTER_MS);
     return () => window.clearTimeout(id);
-  }, []);
+  }, [progressSignal]);
   return (
     <div
       role="status"
@@ -926,6 +952,7 @@ export function ContinuousChatOverlay({
   const {
     messages,
     phase,
+    bootProgressSignal,
     responding,
     turnStatus,
     send,
@@ -1172,6 +1199,12 @@ export function ContinuousChatOverlay({
   // Invariant: only true while at FULL (sheetOpen && expanded && !pilled); every
   // leave-full transition resets it.
   const [maximized, setMaximized] = React.useState(false);
+  // Reactive composer-focus flag. Only the short-landscape compact resting
+  // affordance reads it (#14173): focusing the field lifts the compact treatment
+  // so the composer widens to full BEFORE the first keystroke, and blurring an
+  // empty composer settles it back to compact. Elsewhere focus is tracked via
+  // refs (composerFocusedAtPressRef) that must not trigger a re-render.
+  const [composerFocused, setComposerFocused] = React.useState(false);
   // Whether the sheet was collapsed when the composer last gained focus — so
   // dismissing the keyboard (tap the handle, tap the scrim, tap outside) returns
   // to the prior resting state (collapsed → input) instead of leaving the sheet
@@ -1580,14 +1613,30 @@ export function ContinuousChatOverlay({
       const trimmed = text.trim();
       // An image-only turn is valid; only bail when there's nothing to send.
       if (!trimmed && images.length === 0) return;
-      // During onboarding the composer is unlocked (#12178) but free text is
-      // answered locally by the in-chat conductor and NEVER reaches the server.
-      // Route it through the shared action funnel (classify → "conductor" →
-      // conductor text handler) — `controller.send` is never called here, so
-      // "no server send pre-completion" holds. Attach is disabled during
-      // onboarding, so any images are dropped (text-only echo).
+      // During onboarding the composer is unlocked (#12178). Route free text
+      // through the shared action funnel: before a runtime is chosen it is
+      // answered locally by the in-chat conductor (classify → "conductor") and
+      // does not reach the server; once a Cloud agent is provisioning behind a
+      // ready bootstrap bridge the funnel classifies it as "send" so the first
+      // real message reaches the bootstrap-bridge agent (#14103). Either way
+      // `controller.send` is never called here — the funnel owns the decision.
+      // Attach is disabled during onboarding, so any images are dropped.
       if (firstRunOpen) {
         if (trimmed) void sendActionMessage(trimmed);
+        setDraft("");
+        setSlashDismissed(false);
+        setPendingImages([]);
+        setImageError(null);
+        inputRef.current?.focus();
+        return;
+      }
+      // Explicit tutorial commands ("start/stop/restart tutorial") drive the
+      // chat-native tour locally — never an agent turn. Text-only: a turn
+      // carrying images is a real message, not a command. Sits BEFORE the
+      // canSend gate because the tour is fully client-side and must work with
+      // the agent stopped.
+      if (trimmed && images.length === 0 && tryHandleTutorialText(trimmed)) {
+        clearChatDraft(activeConversationIdRef.current);
         setDraft("");
         setSlashDismissed(false);
         setPendingImages([]);
@@ -1777,7 +1826,12 @@ export function ContinuousChatOverlay({
   // reserved when bounding the panel height.
   const readViewport = React.useCallback(() => {
     if (typeof window === "undefined")
-      return { height: 800, keyboardInset: 0, innerHeight: 800 };
+      return {
+        height: 800,
+        keyboardInset: 0,
+        innerHeight: 800,
+        innerWidth: 1280,
+      };
     const vv = window.visualViewport;
     const innerHeight = window.innerHeight;
     const height = vv?.height ?? innerHeight;
@@ -1786,8 +1840,15 @@ export function ContinuousChatOverlay({
       : 0;
     // innerHeight is the LAYOUT viewport: on Android it shrinks (adjustResize)
     // when the keyboard opens, on iOS (`resize: "body"`) it does not. The lift
-    // math below uses that to avoid double-counting the keyboard.
-    return { height, keyboardInset, innerHeight };
+    // math below uses that to avoid double-counting the keyboard. innerWidth +
+    // innerHeight also drive the short-landscape compact treatment (#14173) —
+    // the LAYOUT viewport so a raised keyboard never flips the orientation read.
+    return {
+      height,
+      keyboardInset,
+      innerHeight,
+      innerWidth: window.innerWidth,
+    };
   }, []);
   const [viewport, setViewport] = React.useState(readViewport);
   const [bottomPad, setBottomPad] = React.useState(0);
@@ -1818,7 +1879,8 @@ export function ContinuousChatOverlay({
       const next = readViewport();
       return prev.height === next.height &&
         prev.keyboardInset === next.keyboardInset &&
-        prev.innerHeight === next.innerHeight
+        prev.innerHeight === next.innerHeight &&
+        prev.innerWidth === next.innerWidth
         ? prev
         : next;
     });
@@ -1936,6 +1998,29 @@ export function ContinuousChatOverlay({
   // a stale flag can never leak into half/collapsed/pill. Drives the edge-to-edge
   // panel styles + a zero top margin.
   const fullBleed = maximized && expanded && sheetOpen && !pilled;
+
+  // #14173: on a wide-but-short landscape viewport the bottom-anchored composer
+  // spans nearly the full width (max-w-3xl, centered) as a ~full-width band, and
+  // in the short height that band sits on top of the view's own controls (the
+  // audit's `overlayClearanceIssues`, e.g. builtin-browser). Shrink the RESTING
+  // overlay to a compact bottom-corner affordance so it clears them; the moment
+  // it is opened, focused, composing, or working, the normal centered composer
+  // returns (so the reading/typing surface is never cramped). Portrait phones
+  // and desktop/tablet never satisfy `shortLandscape`, so they are untouched.
+  const shortLandscape = isShortLandscapeViewport(
+    viewport.innerWidth,
+    viewport.innerHeight,
+  );
+  const compactLanding =
+    shortLandscape &&
+    !sheetOpen &&
+    !fullBleed &&
+    !composerFocused &&
+    !hasDraft &&
+    !hasImages &&
+    !recording &&
+    !responding &&
+    !firstRunOpen;
 
   // Top clearance + max height come from the pure, unit-tested layout solver.
   // It reserves the real measured notch inset (`safeAreaTop`) above the panel,
@@ -2477,59 +2562,6 @@ export function ContinuousChatOverlay({
     expand();
   }, [hasRevealableThread, expand]);
 
-  // Interactive tour control: the tutorial drives the chat into a clean, known
-  // state at the start of each frame (so the spotlight always lands on the right
-  // control) and pre-fills the composer for the guided "ask to navigate" demo.
-  // Decoupled via a window event so the tour never reaches into these internals.
-  React.useEffect(() => {
-    if (typeof window === "undefined") return undefined;
-    const onControl = (event: Event) => {
-      const detail = (event as CustomEvent<TutorialChatControlDetail>).detail;
-      if (!detail) return;
-      // Defense-in-depth for the onboarding lock: while first-run pins the sheet
-      // at FULL, a stray/adversarial tutorial-control event (rest/reset →
-      // collapse, prefill → un-pill) must not move it. The tour only starts
-      // AFTER completeFirstRun, so this never fires in the real flow — it just
-      // closes the one collapse seam outside the gated funnel.
-      if (firstRunOpen) return;
-      switch (detail.action) {
-        case "pill":
-          setMode("pill");
-          // Leaving FULL without goToDetent: drop full-bleed with it, or the
-          // stale `maximized` re-applies on the NEXT return to full (surprise
-          // edge-to-edge). Only the FULL detent may be maximized.
-          setMaximized(false);
-          inputRef.current?.blur();
-          break;
-        case "rest":
-          // goToDetent("collapsed") → input mode, which un-pills.
-          goToDetent("collapsed");
-          break;
-        case "expand":
-          goToDetent("full");
-          break;
-        case "prefill":
-          setMode((m) => (m === "pill" ? "input" : m));
-          setDraft(detail.text ?? "");
-          requestAnimationFrame(() => inputRef.current?.focus());
-          break;
-        case "reset":
-          // Tour ended (cancel / complete): restore a normal interactive chat.
-          // A frame may have collapsed it to the pill, where the composer is
-          // `inert` — clear inert imperatively (React clears it only on the next
-          // render, too late for the stranded input), drop the tour's prefilled
-          // draft, and goToDetent("collapsed") un-pills back to the input bar.
-          contentRef.current?.removeAttribute("inert");
-          setDraft("");
-          goToDetent("collapsed");
-          break;
-      }
-    };
-    window.addEventListener(TUTORIAL_CHAT_CONTROL_EVENT, onControl);
-    return () =>
-      window.removeEventListener(TUTORIAL_CHAT_CONTROL_EVENT, onControl);
-  }, [goToDetent, firstRunOpen, setDraft]);
-
   React.useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const onPrefill = (event: Event) => {
@@ -2954,10 +2986,10 @@ export function ContinuousChatOverlay({
       return undefined;
     }
 
-    // Surfaces painted ABOVE the chat glass (tutorial at Z_TUTORIAL, any open
-    // Radix dialog) must win the tap — the swallower otherwise eats their first
-    // tap AND collapses the chat under them. "Tap outside collapses" is only
-    // for the background view.
+    // Surfaces painted ABOVE the chat glass (notification sheet/panel at
+    // Z_NOTIFICATION_OVERLAY, any open Radix dialog) must win the tap — the
+    // swallower otherwise eats their first tap AND collapses the chat under
+    // them. "Tap outside collapses" is only for the background view.
     const isAboveShellOverlay = (target: EventTarget | null): boolean =>
       target instanceof Element &&
       !!target.closest('[data-above-shell-overlay], [role="dialog"]');
@@ -3496,7 +3528,13 @@ export function ContinuousChatOverlay({
     <div
       ref={overlayRef}
       className={cn(
-        "pointer-events-none fixed inset-x-0 bottom-0 flex w-full min-w-0 flex-col items-center",
+        "pointer-events-none fixed inset-x-0 bottom-0 flex w-full min-w-0 flex-col",
+        // Resting on a landscape phone, the compact composer hugs the trailing
+        // (inline-end) bottom corner — the conventional compose slot views leave
+        // free — instead of centering a wide band over their controls (#14173).
+        // Direction-aware: `items-end` is inline-end, so it lands bottom-left in
+        // RTL. Full-width children (banners) are unaffected (they stay `w-full`).
+        compactLanding ? "items-end" : "items-center",
         // Full-bleed (maximized) removes the side inset so the chat is edge-to-edge.
         fullBleed ? "px-0" : "px-3 sm:px-4",
       )}
@@ -3512,41 +3550,41 @@ export function ContinuousChatOverlay({
         // Full-bleed fills the screen edge-to-edge: NO overlay bottom padding,
         // so the glass panel reaches the true bottom (no orange gap). The
         // gesture-zone clearance moves INSIDE the composer row (below) so the
-        // input still sits above the home-gesture bar. Non-full-bleed anchors the
-        // composer down: it clears the home-gesture inset (max safe-area /
-        // android inset) and nothing more, so it sits low with no dead gap
-        // beneath. The floor layer below paints that inset zone with the home
-        // surface so it reads continuous, not as a black bar.
+        // input still sits above the home-gesture bar. Non-full-bleed anchors
+        // the composer LOW, lock-screen style. The OS reports a ~34px bottom
+        // safe-area on a home-indicator phone, but the indicator itself is a
+        // thin (~5px) bar whose TOP edge sits only ~13px off the true bottom
+        // (5px bar + ~8px own margin) — clearing the WHOLE safe-area floats
+        // the pill ~34px up over a dead band, and 60% (device round: still
+        // reads too high) leaves it hovering ~20px up. So clear exactly what
+        // the indicator occupies: 40% of the reported inset (34px * 0.4 ≈
+        // 13.6px — the pill seats right on the indicator's top edge without
+        // ever overlapping the bar or the OS gesture zone), with a 0.5rem
+        // floor so a device with NO inset still keeps a hair of breathing
+        // room. The same factor holds for Android gesture pills (their inset
+        // reports similarly padded). Everything below the composer is the
+        // full-bleed wallpaper / app floor — no cosmetic strip repaints it.
         paddingBottom: fullBleed
           ? 0
           : keyboardLiftActive
             ? "0.75rem"
-            : "calc(var(--eliza-mobile-nav-offset, 0px) + max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)))",
+            : "calc(var(--eliza-mobile-nav-offset, 0px) + max(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) * 0.4, 0.5rem))",
       }}
       data-testid="continuous-chat-overlay"
       data-open={sheetOpen ? "true" : undefined}
     >
-      {/* RECLAIMED BOTTOM FLOOR: the composer is lifted off the home-gesture
-          inset, so the strip between the composer and the true screen bottom
-          used to be an unpainted, transparent zone that read as a DEAD BLACK
-          BAR under the composer. This layer fills the reclaimed zone (and a
-          hair above, so it seats behind the composer with no seam) with the
-          same warm home-surface tone (--launch-bg). Purely cosmetic
-          (pointer-events-none, aria-hidden), back of the overlay stack, only
-          needed at rest. Soft top fade blends it into the field. */}
-      {!fullBleed && !keyboardLiftActive ? (
-        <div
-          aria-hidden="true"
-          data-testid="continuous-chat-bottom-floor"
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-0"
-          style={{
-            height:
-              "calc(max(var(--safe-area-bottom, 0px), var(--android-gesture-inset-bottom, 0px)) + 1.5rem)",
-            backgroundImage:
-              "linear-gradient(to bottom, transparent 0%, var(--launch-bg) 55%)",
-          }}
-        />
-      ) : null}
+      {/* NO reclaimed-bottom-floor element here (removed): it used to paint a
+          transparent→var(--launch-bg) gradient over the strip below the
+          composer, from when that strip was an UNPAINTED void that read as a
+          dead black bar. The app shell now guarantees that zone is always
+          painted underneath this overlay — the full-bleed wallpaper on
+          shared-background routes (the transparent app-safe-area-floor lets it
+          own the screen to the true bottom edge) and the dark `bg-bg` floor on
+          opaque routes. Repainting it here with --launch-bg (a HOST-seeded
+          launch color, orange on web) drew a visible tinted band over the
+          wallpaper under the floating composer — the residual "gap" on the
+          standalone home view. Everything below the composer must simply show
+          whatever the shell paints: wallpaper, lockscreen-style. */}
       {/* Visual dimming scrim behind the open chat. It fades in WITH the reveal
           but never captures pointer events; outside taps are handled by the
           document-level detector above, and outside drags pass through to the
@@ -3653,6 +3691,7 @@ export function ContinuousChatOverlay({
           agentName={agentName}
           onOpenSettings={openSettings}
           reduce={reduce}
+          progressSignal={bootProgressSignal}
         />
       ) : null}
 
@@ -3700,7 +3739,15 @@ export function ContinuousChatOverlay({
       <div
         className={cn(
           "pointer-events-none relative flex w-full flex-col items-center",
-          fullBleed ? "max-w-none" : "max-w-3xl",
+          // Compact resting affordance on a landscape phone (#14173): a narrow
+          // 13rem composer whose overlap with view controls stays under the
+          // audit's clearance threshold. The grabber + pill are positioned
+          // relative to THIS wrapper, so they shrink and re-corner with it.
+          fullBleed
+            ? "max-w-none"
+            : compactLanding
+              ? "max-w-[13rem]"
+              : "max-w-3xl",
         )}
       >
         {!fullBleed ? (
@@ -4293,6 +4340,9 @@ export function ContinuousChatOverlay({
                   if (e.target.value.trim().length > 0) expand();
                 }}
                 onFocus={() => {
+                  // Widen out of the short-landscape compact affordance (#14173)
+                  // on focus, before the first keystroke.
+                  setComposerFocused(true);
                   // A pill-open focus only raises the keyboard; it must not
                   // expand a history thread (see suppressExpandOnFocusRef).
                   if (suppressExpandOnFocusRef.current) {
@@ -4301,6 +4351,7 @@ export function ContinuousChatOverlay({
                     expand();
                   }
                 }}
+                onBlur={() => setComposerFocused(false)}
                 onPaste={handleComposerPaste}
                 onKeyDown={handleComposerKeyDown}
                 // The composer is unlocked during onboarding (#12178): typing is

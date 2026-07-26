@@ -74,6 +74,9 @@ const character = {
       ELEVENLABS_STT_NUM_SPEAKERS: process.env.ELEVENLABS_STT_NUM_SPEAKERS,
     }),
     ELEVENLABS_STT_TAG_AUDIO_EVENTS: process.env.ELEVENLABS_STT_TAG_AUDIO_EVENTS || "false",
+    // Eliza Cloud Apps: enables plugin-cloud-apps (create/host/monetize apps) on the
+    // default cloud-hosted agent — gate read by isCloudAppsPluginEnabled() in agent-loader.ts
+    CLOUD_APPS_PLUGIN_ENABLED: "true",
     avatarUrl:
       "https://raw.githubusercontent.com/elizaOS/eliza-avatars/refs/heads/master/Eliza/portrait.png",
     // Note: MCP servers are injected dynamically at runtime based on user's OAuth connections

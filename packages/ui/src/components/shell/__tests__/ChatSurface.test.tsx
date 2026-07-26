@@ -7,10 +7,35 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const inlineWidgetMock = vi.hoisted(() => ({
+  sendActionMessage: vi.fn(),
+}));
+
+vi.mock("../../chat/InlineWidgetText", async () => {
+  const React = await import("react");
+  return {
+    InlineWidgetText({ content }: { content: string }) {
+      const match = content.match(/(__first_run__:runtime:cloud)=([^\n]+)/);
+      if (!match) return content;
+      return React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => void inlineWidgetMock.sendActionMessage(match[1]),
+        },
+        match[2],
+      );
+    },
+  };
+});
+
 import { ChatSurface } from "../ChatSurface";
 import type { ShellMessage } from "../shell-state";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  inlineWidgetMock.sendActionMessage.mockReset();
+});
 
 describe("ChatSurface", () => {
   it("renders the greeting when there are no messages", () => {
@@ -47,6 +72,38 @@ describe("ChatSurface", () => {
     );
     expect(screen.getByText("Remind me to call Alex at 3pm")).toBeTruthy();
     expect(screen.getByText(/Done — reminder set/)).toBeTruthy();
+  });
+
+  it("renders first-run sign-in choices as clickable buttons", () => {
+    const messages: ShellMessage[] = [
+      {
+        id: "first-run:greeting",
+        role: "assistant",
+        content: [
+          "Hi — I'm Eliza. Sign in to Eliza Cloud and I'll get you set up.",
+          "",
+          "[CHOICE:first-run id=runtime]",
+          "__first_run__:runtime:cloud=Sign in to Eliza Cloud",
+          "[/CHOICE]",
+        ].join("\n"),
+        createdAt: 0,
+      },
+    ];
+
+    render(
+      <ChatSurface messages={messages} onSend={() => {}} canSend={true} />,
+    );
+
+    const signIn = screen.getByRole("button", {
+      name: "Sign in to Eliza Cloud",
+    });
+    expect(signIn.tagName).toBe("BUTTON");
+    expect(screen.queryByText("[CHOICE:first-run id=runtime]")).toBeNull();
+
+    fireEvent.click(signIn);
+    expect(inlineWidgetMock.sendActionMessage).toHaveBeenCalledWith(
+      "__first_run__:runtime:cloud",
+    );
   });
 
   it("disables send when input is empty", () => {

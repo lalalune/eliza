@@ -6,7 +6,12 @@ import {
   evaluateInCurrentMainWindow,
   getCurrentMainWindowSnapshot,
 } from "./main-window-runtime";
-import { getDesktopManager } from "./native/desktop";
+import {
+  clearDesktopNotificationTestRecords,
+  getDesktopManager,
+  installDesktopNotificationTestRecorder,
+  readDesktopNotificationTestRecords,
+} from "./native/desktop";
 import { findFirstAvailableLoopbackPort } from "./native/loopback-port";
 import { getScreenCaptureManager } from "./native/screencapture";
 import type { WindowBounds } from "./rpc-schema";
@@ -112,6 +117,7 @@ export async function startDesktopTestBridgeServer(): Promise<
 
   process.env.ELIZA_DESKTOP_TEST_BRIDGE_URL = baseUrl;
   process.env.ELIZA_DESKTOP_TEST_BRIDGE_TOKEN = token;
+  installDesktopNotificationTestRecorder();
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -139,6 +145,19 @@ export async function startDesktopTestBridgeServer(): Promise<
           mainWindow: getCurrentMainWindowSnapshot(),
           shell: shellState,
         });
+        return;
+      }
+
+      if (pathname === "/notifications" && method === "GET") {
+        json(res, 200, {
+          notifications: readDesktopNotificationTestRecords(),
+        });
+        return;
+      }
+
+      if (pathname === "/notifications" && method === "DELETE") {
+        clearDesktopNotificationTestRecords();
+        json(res, 200, { ok: true });
         return;
       }
 
@@ -174,6 +193,12 @@ export async function startDesktopTestBridgeServer(): Promise<
 
       if (pathname === "/main-window/focus" && method === "POST") {
         await getDesktopManager().focusWindow();
+        json(res, 200, { ok: true });
+        return;
+      }
+
+      if (pathname === "/main-window/minimize" && method === "POST") {
+        await getDesktopManager().minimizeWindow();
         json(res, 200, { ok: true });
         return;
       }
@@ -273,6 +298,19 @@ export async function startDesktopTestBridgeServer(): Promise<
           invoked ? 200 : 404,
           invoked ? { ok: true, id } : { error: "shortcut is not registered" },
         );
+        return;
+      }
+
+      if (pathname === "/notifications" && method === "GET") {
+        json(res, 200, {
+          notifications: getDesktopManager().getNotificationDiagnostics(),
+        });
+        return;
+      }
+
+      if (pathname === "/notifications" && method === "DELETE") {
+        getDesktopManager().clearNotificationDiagnostics();
+        json(res, 200, { ok: true });
         return;
       }
 

@@ -279,6 +279,69 @@ describe("trajectory routes", () => {
     });
   });
 
+  it("passes traceId through list and export filters", async () => {
+    const listTrajectories = vi.fn(async () => ({
+      trajectories: [],
+      total: 0,
+      offset: 0,
+      limit: 20,
+    }));
+    const exportTrajectories = vi.fn(async () => ({
+      data: "[]",
+      filename: "trajectories.json",
+      mimeType: "application/json",
+    }));
+    const exportTrajectoriesZip = vi.fn(async () => ({
+      filename: "trajectories.zip",
+      entries: [],
+    }));
+    const logger = createLogger({
+      listTrajectories,
+      exportTrajectories,
+      exportTrajectoriesZip,
+    });
+
+    const listRequest = createRequest() as http.IncomingMessage & {
+      url?: string;
+      headers: Record<string, string>;
+    };
+    listRequest.url = "/api/trajectories?traceId=trace-1&limit=20";
+    listRequest.headers = { host: "localhost" };
+
+    await handleTrajectoryRoute(
+      listRequest,
+      createResponse(),
+      createRuntime(logger),
+      "/api/trajectories",
+      "GET",
+    );
+    expect(listTrajectories).toHaveBeenCalledWith(
+      expect.objectContaining({ traceId: "trace-1" }),
+    );
+
+    await handleTrajectoryRoute(
+      createRequest({ format: "json", traceId: "trace-1" }),
+      createResponse(),
+      createRuntime(logger),
+      "/api/trajectories/export",
+      "POST",
+    );
+    expect(exportTrajectories).toHaveBeenCalledWith(
+      expect.objectContaining({ traceId: "trace-1" }),
+    );
+
+    await handleTrajectoryRoute(
+      createRequest({ format: "zip", traceId: "trace-1" }),
+      createResponse(),
+      createRuntime(logger),
+      "/api/trajectories/export",
+      "POST",
+    );
+    expect(exportTrajectoriesZip).toHaveBeenCalledWith(
+      expect.objectContaining({ traceId: "trace-1" }),
+    );
+  });
+
   it("delegates search to the SQL reader so matches past the first 500 rows are returned with a DB-wide total", async () => {
     // Seed 600 list items; only one (at index 550) carries the needle.
     // The old route re-fetched limit:500/offset:0 then filtered in memory,

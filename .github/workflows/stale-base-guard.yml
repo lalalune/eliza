@@ -57,6 +57,16 @@ jobs:
           fetch-depth: 1
           submodules: false
 
+      # The guard steps below invoke `node` directly, but self-hosted
+      # (hetzner-robot) runners are not guaranteed to have Node on PATH, so
+      # the self-test step fails with "node: command not found". Set up Node
+      # explicitly; this workflow does not use setup-bun-workspace.
+      - name: Setup Node.js
+        # actions/setup-node@v4 (48b55a0)
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+
       - name: Fetch PR head + bounded history (blobless)
         run: |
           set -euo pipefail

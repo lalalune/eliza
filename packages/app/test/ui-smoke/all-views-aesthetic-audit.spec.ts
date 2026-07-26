@@ -125,7 +125,6 @@ const BUILTIN_TAB_PATHS: Record<string, string> = {
   desktop: "/desktop",
   settings: "/settings",
   tutorial: "/tutorial",
-  help: "/help",
   logs: "/apps/logs",
   background: "/background",
 };

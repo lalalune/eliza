@@ -102,13 +102,6 @@ const SHELL_VIEW_TARGETS: readonly {
     requiredIds: ["tutorial-start"],
   },
   {
-    label: "Help",
-    path: "/help",
-    viewId: "help",
-    readyTestId: "help-view",
-    requiredIds: ["help-entry-change-model"],
-  },
-  {
     label: "Knowledge",
     path: "/character/documents",
     viewId: "documents",

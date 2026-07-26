@@ -3,7 +3,8 @@
  * full-journey walkthrough JOURNEY.md promised and #10198 / #10204 asked for.
  *
  * One ordered flow (see `walkthrough/journey.ts` for the step list) drives the
- * REAL app surface from cold launch through onboarding, tutorial, help,
+ * REAL app surface from cold launch through onboarding, the chat-native
+ * tutorial, typed tutorial commands,
  * settings, wallet, a real chat conversation, view switching, a settings edit,
  * and back to the dashboard — at BOTH a desktop and a mobile viewport. Each step
  * captures a `NN-<step>.png` screenshot plus a per-step manifest (URL, viewport,

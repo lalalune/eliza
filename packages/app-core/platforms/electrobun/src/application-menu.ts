@@ -110,7 +110,6 @@ export interface ViewMenuEntry {
 
 const VIEW_MENU_ENTRIES: readonly ViewMenuEntry[] = [
   { id: "tutorial", label: "Tutorial", path: "/tutorial" },
-  { id: "help", label: "Help", path: "/help" },
   { id: "chat", label: "Messages", path: "/chat" },
   { id: "character", label: "Character", path: "/character" },
   { id: "documents", label: "Knowledge", path: "/character/documents" },

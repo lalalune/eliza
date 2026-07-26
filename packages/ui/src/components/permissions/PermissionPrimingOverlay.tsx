@@ -5,7 +5,7 @@
 import * as React from "react";
 import { useIsAuthenticated } from "../../hooks/useAuthStatus";
 import { useAppSelector } from "../../state";
-import { useTutorial } from "../pages/tutorial/tutorial-controller";
+import { useTutorial } from "../../tutorial/tutorial-service";
 import { PermissionPrimingModal } from "./PermissionPrimingModal";
 import {
   hasPrimedPermissions,
@@ -17,13 +17,13 @@ import {
  * Mounts the permission-priming modal exactly once, right after onboarding.
  *
  * Mounted as a shell-root sibling (next to FirstRunConductorMount /
- * TutorialOverlay) and self-gates — it renders `null` unless:
+ * TutorialConductorMount) and self-gates — it renders `null` unless:
  *  - the user is authenticated (post-login; local resolves silently, cloud
  *    clears LoginView),
  *  - first-run has completed (`firstRunComplete !== false`), so the in-chat
  *    onboarding lock is already released and there is nothing to collide with,
- *  - the tutorial is not active (never stack two full-screen surfaces — a chosen
- *    tour runs first, then priming),
+ *  - the tutorial is not active (the chat-native tour owns the conversation
+ *    right after onboarding — priming waits its turn instead of covering it),
  *  - the platform has a non-empty priming set (web is intentionally empty), and
  *  - it hasn't already been shown (persisted flag; re-trigger lives in Settings).
  */

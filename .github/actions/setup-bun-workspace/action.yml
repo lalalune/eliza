@@ -46,10 +46,37 @@ inputs:
     description: "Run `git submodule update --init --recursive` before install"
     required: false
     default: "false"
+  setup-node:
+    description: >-
+      Whether to set up Node.js. Self-hosted runners are not guaranteed to have
+      `node` on PATH, and this action's very first step (turbo-cache-key) shells
+      out to `node`, so leave this on unless the caller already ran
+      actions/setup-node in the same job.
+    required: false
+    default: "true"
+  node-version:
+    description: "Node.js version to set up when setup-node is true"
+    required: false
+    default: "24"
 
 runs:
   using: "composite"
   steps:
+    # Self-hosted (hetzner-robot) runners are not guaranteed to expose `node`
+    # on the step PATH, and the very next step (turbo-cache-github ->
+    # turbo-cache-key.mjs) invokes `node` directly. Without this, jobs that
+    # rely solely on this composite for their toolchain (coverage-gate,
+    # feed-env-audit, scenario-matrix, voice-workbench) fail with
+    # "node: command not found" on runners missing a system Node. setup-node is
+    # idempotent, so callers that already ran it (keyless-harness, the audits)
+    # just re-select the same version. Toggle off via setup-node: "false".
+    - name: Setup Node.js
+      if: ${{ inputs.setup-node == 'true' }}
+      # actions/setup-node@v4 (48b55a0)
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: ${{ inputs.node-version }}
+
     # Persist Turbo's local filesystem cache (.turbo) through the pinned
     # GitHub-native shim (#12341) — the single Turbo cache regime, replacing the
     # Vercel SaaS remote cache. The shim keys on the deterministic

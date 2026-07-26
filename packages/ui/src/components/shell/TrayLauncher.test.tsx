@@ -64,10 +64,14 @@ describe("TrayLauncher", () => {
 
   it("reads the registered catalog when no entries prop is given", () => {
     setDesktopLauncherEntries([
-      { itemId: "tray-open-view-help", label: "Help", icon: "help" },
+      {
+        itemId: "tray-open-view-documents",
+        label: "Knowledge",
+        icon: "documents",
+      },
     ]);
     render(<TrayLauncher />);
-    expect(screen.getByText("Help")).toBeTruthy();
+    expect(screen.getByText("Knowledge")).toBeTruthy();
   });
 
   it("renders nothing when there are no rows", () => {

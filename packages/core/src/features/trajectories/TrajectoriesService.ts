@@ -2659,6 +2659,7 @@ export class TrajectoriesService extends Service {
 				startDate: options.startDate,
 				endDate: options.endDate,
 				scenarioId: options.scenarioId,
+				traceId: options.traceId,
 				batchId: options.batchId,
 			});
 			targetIds = list.trajectories.map((trajectory) => trajectory.id);

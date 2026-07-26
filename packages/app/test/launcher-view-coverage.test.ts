@@ -109,11 +109,7 @@ const BUILTIN_VIEWS_VISUAL_SPEC_REL = path.relative(
  * Human-readable table + evidence-lane notes: docs/LAUNCHER_VIEW_COVERAGE.md.
  */
 const LAUNCHER_VIEW_COVERAGE: Record<string, LauncherViewCoverage> = {
-  tutorial: {
-    smokeSpec: BUILTIN_VIEWS_VISUAL_SPEC_REL,
-    e2e: "packages/ui/src/components/pages/tutorial/__e2e__/run-tutorial-e2e.mjs",
-  },
-  help: { smokeSpec: BUILTIN_VIEWS_VISUAL_SPEC_REL },
+  tutorial: { smokeSpec: BUILTIN_VIEWS_VISUAL_SPEC_REL },
   chat: {
     smokeSpec: BUILTIN_VIEWS_VISUAL_SPEC_REL,
     e2e: "packages/ui/src/components/shell/__e2e__/run-chat-sheet-e2e.mjs",
@@ -251,7 +247,6 @@ describe("launcher view coverage gate", () => {
         "chat",
         "database",
         "documents",
-        "help",
         "logs",
         "memories",
         "plugins-page",

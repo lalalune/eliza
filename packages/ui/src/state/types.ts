@@ -901,6 +901,7 @@ export interface AppActions {
   handleCloudDisconnect: (opts?: {
     skipConfirmation?: boolean;
   }) => Promise<void>;
+  handleCloudSignOut: () => Promise<void>;
 
   // Multi-agent
   switchAgentProfile: (profileId: string) => void;

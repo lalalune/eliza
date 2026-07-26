@@ -56,8 +56,7 @@ video evidence that only the manual/CI lane produces.
 
 | View id | Path | Kind | Smoke | Dedicated e2e | Manual capture lane |
 | --- | --- | --- | --- | --- | --- |
-| `tutorial` | `/tutorial` | system | ✅ smoke | `packages/ui/src/components/pages/tutorial/__e2e__/run-tutorial-e2e.mjs` | `audit:app` + video |
-| `help` | `/help` | system | ✅ smoke | smoke-only | `audit:app` |
+| `tutorial` | `/tutorial` | system | ✅ smoke | `test/ui-smoke/tutorial-chat.spec.ts` (chat-native tour) | `audit:app` + video |
 | `chat` | `/chat` | system | ✅ smoke | `packages/ui/src/components/shell/__e2e__/run-chat-sheet-e2e.mjs` | `audit:app` + video + on-device |
 | `character` | `/character` | system | ✅ smoke | smoke-only | `audit:app` |
 | `documents` | `/character/documents` | system | ✅ smoke | smoke-only | `audit:app` |
@@ -75,9 +74,10 @@ video evidence that only the manual/CI lane produces.
 
 **None.** Every default-launcher view has automated smoke coverage (cross-checked
 by the gate: each view's `path` is asserted present in
-`builtin-views-visual.spec.ts`'s `BUILTIN_VIEW_CASES`). Four views additionally
-have dedicated interaction e2e runners (`tutorial`, `chat`, `background`, and —
-via the shell chat-sheet runner — the `chat` surface). The remaining views are
+`builtin-views-visual.spec.ts`'s `BUILTIN_VIEW_CASES`). `chat` and `background`
+additionally have dedicated interaction e2e runners, and the chat-native
+tutorial is interaction-covered by `test/ui-smoke/tutorial-chat.spec.ts` (the
+tour is transcript turns, not a view of its own). The remaining views are
 `smoke-only`: boot-smoke is their automated floor, and the manual/CI capture lane
 (`audit:app` + on-device captures) supplies the full-page-screenshot / video /
 device evidence per `PR_EVIDENCE.md`.

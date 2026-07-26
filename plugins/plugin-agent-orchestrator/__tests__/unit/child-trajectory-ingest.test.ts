@@ -213,4 +213,147 @@ describe("ingestChildTrajectories", () => {
     const doc = await store.getTask(taskId);
     expect(doc?.artifacts ?? []).toEqual([]);
   });
+
+  // #14110: the trajectory dir is per-TASK but `task_complete` fires per
+  // SESSION-completion. Re-completions and respawned sessions re-scan the same
+  // files; without dedupe each pass duplicates artifacts and mis-stamps
+  // correlation.
+  function ingest(svc: OrchestratorTaskService, t: string, s: string) {
+    return (
+      svc as unknown as {
+        ingestChildTrajectories: (t: string, s: string) => Promise<string[]>;
+      }
+    ).ingestChildTrajectories(t, s);
+  }
+
+  async function writeTrajectoryFile(
+    taskId: string,
+    name: string,
+    traceId: string,
+  ): Promise<void> {
+    const dir = join(
+      stateDir,
+      "orchestrator",
+      "child-trajectories",
+      taskId,
+      "child-agent",
+    );
+    await mkdir(dir, { recursive: true });
+    writeFileSync(join(dir, name), JSON.stringify({ traceId }));
+  }
+
+  it("does not duplicate artifacts or ids when the same session re-completes", async () => {
+    const store = new InMemoryTaskStore();
+    const { taskId, sessionId } = await seedTaskWithSession(store, {
+      traceId: "trace-parent",
+    });
+    const svc = new OrchestratorTaskService(makeRuntime(), { store });
+    await writeTrajectoryFile(taskId, "tj-aaa.json", "trace-parent");
+    await writeTrajectoryFile(taskId, "tj-bbb.json", "trace-parent");
+
+    const first = await ingest(svc, taskId, sessionId);
+    expect(first.sort()).toEqual(["tj-aaa", "tj-bbb"]);
+
+    // Second `task_complete` for the SAME session (follow-up prompt re-completes)
+    // must re-scan and skip — REVERSION: the pre-fix code re-attached both files
+    // as brand-new artifacts with fresh ids.
+    const second = await ingest(svc, taskId, sessionId);
+    expect(second).toEqual([]);
+
+    const doc = await store.getTask(taskId);
+    const artifacts = doc?.artifacts ?? [];
+    expect(artifacts.length).toBe(2);
+    // Exactly one artifact per file path — no duplicate rows.
+    expect(new Set(artifacts.map((a) => a.path)).size).toBe(2);
+
+    const updated = (await store.findSession(sessionId))?.session;
+    // No duplicate ids accumulated on the session.
+    expect((updated?.childTrajectoryIds ?? []).sort()).toEqual([
+      "tj-aaa",
+      "tj-bbb",
+    ]);
+  });
+
+  it("a respawned session does not re-ingest session A's files or overwrite A's correlation", async () => {
+    const store = new InMemoryTaskStore();
+    const { taskId, sessionId: sessA } = await seedTaskWithSession(store, {
+      traceId: "trace-A",
+      parentTrajectoryStepId: "step-A",
+    });
+    const svc = new OrchestratorTaskService(makeRuntime(), { store });
+    await writeTrajectoryFile(taskId, "tj-from-A.json", "trace-A");
+
+    const fromA = await ingest(svc, taskId, sessA);
+    expect(fromA).toEqual(["tj-from-A"]);
+
+    // A respawned session B on the same task ingests. Session A's file is still
+    // on disk (per-task dir) — B must NOT re-attach it under B's correlation.
+    const now = new Date().toISOString();
+    const sessB = "sess-B";
+    await store.addSession({
+      id: "row-B",
+      taskId,
+      sessionId: sessB,
+      framework: "elizaos",
+      label: "worker-B",
+      originalTask: "do the thing",
+      workdir: "/tmp/wd",
+      status: "completed",
+      decisionCount: 0,
+      autoResolvedCount: 0,
+      registeredAt: Date.now(),
+      lastActivityAt: Date.now(),
+      idleCheckCount: 0,
+      taskDelivered: true,
+      lastSeenDecisionIndex: 0,
+      spawnedAt: Date.now(),
+      retryCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheTokens: 0,
+      costUsd: 0,
+      usageState: "unavailable",
+      traceId: "trace-B",
+      parentTrajectoryStepId: "step-B",
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Session B also records a genuinely-new file.
+    await writeTrajectoryFile(taskId, "tj-from-B.json", "trace-B");
+
+    const fromB = await ingest(svc, taskId, sessB);
+    // Only B's own new file is ingested; A's file is skipped.
+    expect(fromB).toEqual(["tj-from-B"]);
+
+    const doc = await store.getTask(taskId);
+    const artifacts = doc?.artifacts ?? [];
+    expect(artifacts.length).toBe(2);
+
+    const byId = (id: string) =>
+      artifacts.find(
+        (a) =>
+          (a.metadata.correlation as { childTrajectoryId?: string })
+            ?.childTrajectoryId === id,
+      );
+    // A's file keeps A's correlation (session + traceId), NOT re-stamped to B.
+    const aCorr = byId("tj-from-A")?.metadata.correlation as {
+      traceId?: string;
+      sessionId?: string;
+      parentStepId?: string;
+    };
+    expect(aCorr.traceId).toBe("trace-A");
+    expect(aCorr.sessionId).toBe(sessA);
+    expect(aCorr.parentStepId).toBe("step-A");
+    // B's file carries B's correlation.
+    const bCorr = byId("tj-from-B")?.metadata.correlation as {
+      traceId?: string;
+      sessionId?: string;
+      parentStepId?: string;
+    };
+    expect(bCorr.traceId).toBe("trace-B");
+    expect(bCorr.sessionId).toBe(sessB);
+    expect(bCorr.parentStepId).toBe("step-B");
+  });
 });

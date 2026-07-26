@@ -384,3 +384,23 @@ export function __setHydratedForTests(value: boolean): void {
 export function __getStateForTests(): NotificationState {
   return state;
 }
+
+type NotificationStoreTestBridge = {
+  ingestNotificationForTests: (
+    notification: AgentNotification,
+    unreadCount?: number,
+  ) => void;
+  resetNotificationStoreForTests: () => void;
+  getStateForTests: () => NotificationState;
+};
+
+function publishNotificationStoreTestBridge(): void {
+  const g = globalThis as Record<PropertyKey, unknown>;
+  g[Symbol.for("elizaos.ui.notification-store-tests")] = {
+    ingestNotificationForTests: __ingestNotificationForTests,
+    resetNotificationStoreForTests: __resetNotificationStoreForTests,
+    getStateForTests: __getStateForTests,
+  } satisfies NotificationStoreTestBridge;
+}
+
+publishNotificationStoreTestBridge();

@@ -29,6 +29,50 @@ function readEnvValue(
   return undefined;
 }
 
+// --- ElizaError: worker-safe mirror of @elizaos/core/errors (pure-JS Error
+// subclass, no I/O). Cloud Worker services (active-billing-numeric, user-mcps,
+// twap-price-oracle, cloudflare-registrar, …) import + extend it, so the shim
+// must provide the real class, not a throwing stub. Mirrors packages/core/src/errors.ts. ---
+export type ElizaErrorSeverity = "ephemeral" | "fatal";
+export interface ElizaErrorOptions {
+  code: string;
+  cause?: unknown;
+  context?: Record<string, unknown>;
+  severity?: ElizaErrorSeverity;
+}
+export class ElizaError extends Error {
+  override readonly name: string = "ElizaError";
+  readonly code: string;
+  readonly context?: Record<string, unknown>;
+  readonly severity?: ElizaErrorSeverity;
+  constructor(message: string, options: ElizaErrorOptions) {
+    super(
+      message,
+      options.cause !== undefined ? { cause: options.cause } : undefined,
+    );
+    this.code = options.code;
+    this.context = options.context;
+    this.severity = options.severity;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+export function isElizaError(value: unknown): value is ElizaError {
+  return value instanceof ElizaError;
+}
+export function toElizaError(
+  value: unknown,
+  fallbackCode = "UNCLASSIFIED",
+): ElizaError {
+  if (value instanceof ElizaError) return value;
+  if (value instanceof Error) {
+    return new ElizaError(value.message, { code: fallbackCode, cause: value });
+  }
+  return new ElizaError(typeof value === "string" ? value : String(value), {
+    code: fallbackCode,
+    cause: value,
+  });
+}
+
 /** Structural shape of a runtime that can resolve a per-agent setting. */
 export interface SettingReader {
   getSetting(key: string): string | boolean | number | null | undefined;

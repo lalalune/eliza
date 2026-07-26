@@ -10,6 +10,8 @@ import {
   type AppShellBackgroundPolicy,
   type EnabledViewKinds,
   isViewVisible,
+  resolveSurfaceBackgroundPolicy,
+  type SurfaceManifestBearer,
   type ViewKind,
 } from "@elizaos/core";
 import { X } from "lucide-react";
@@ -51,11 +53,11 @@ import { SaveCommandModal } from "./components/chat/SaveCommandModal";
 import { CustomActionEditor } from "./components/custom-actions/CustomActionEditor";
 import { CustomActionsPanel } from "./components/custom-actions/CustomActionsPanel";
 import { AppsPageView } from "./components/pages/AppsPageView";
-import { TutorialOverlay } from "./components/pages/tutorial/TutorialOverlay";
 import { PermissionPrimingOverlay } from "./components/permissions/PermissionPrimingOverlay";
 import { ActionBanner } from "./components/shell/ActionBanner";
 import { AssistantOverlay } from "./components/shell/AssistantOverlay";
 import { BugReportModal } from "./components/shell/BugReportModal";
+import { BuildBadge } from "./components/shell/BuildBadge";
 import { ChatSurface } from "./components/shell/ChatSurface";
 import { CloudHandoffBanner } from "./components/shell/CloudHandoffBanner";
 import { ConnectionFailedBanner } from "./components/shell/ConnectionFailedBanner";
@@ -96,6 +98,7 @@ import { useAuthStatus } from "./hooks/useAuthStatus";
 import { useRole } from "./hooks/useRole";
 import { useSecretsManagerModalState } from "./hooks/useSecretsManagerModal";
 import { useSecretsManagerShortcut } from "./hooks/useSecretsManagerShortcut";
+import { cn } from "./lib/utils";
 import {
   APPS_ENABLED,
   getAppSlugFromPath,
@@ -122,6 +125,7 @@ import {
 import { isShellPaintable } from "./state/startup-coordinator";
 import { firstRunOwnsLoginSurface } from "./state/top-level-auth-gate";
 import { isLoopbackGatewayHost } from "./state/use-startup-shell-controller";
+import { TutorialConductorMount } from "./tutorial/TutorialConductor";
 import { confirmDesktopAction } from "./utils/desktop-dialogs";
 import { VoiceSelfTestShell } from "./voice/voice-selftest/VoiceSelfTestShell";
 import { VoiceWorkbenchShell } from "./voice/voice-selftest/VoiceWorkbenchShell";
@@ -184,6 +188,10 @@ import {
 // eagerly elsewhere in the app graph (plugin-loader / boot-config), so a
 // lazy() boundary here would only fold back into main. The remaining page
 // views are lazy-split below.
+import {
+  CharacterSectionNav,
+  isCharacterSectionPath,
+} from "./components/character/CharacterSectionNav";
 import { DesktopTabBar } from "./components/desktop/DesktopTabBar";
 import { LauncherSurface } from "./components/pages/LauncherSurface";
 import {
@@ -217,9 +225,12 @@ const BrowserWorkspaceView = lazyNamedView(
   () => import("./components/pages/BrowserWorkspaceView"),
   "BrowserWorkspaceView",
 );
-const TranscriptsPageView = lazyNamedView(
-  () => import("./components/transcripts/TranscriptsPage"),
-  "TranscriptsPage",
+// #13594: `/apps/transcripts` is now the chrome-minimal LIVE-meeting affordance
+// only — recordings were folded into the Knowledge hub. The full recordings
+// browser (TranscriptsPage) is no longer routed.
+const LiveMeetingPageView = lazyNamedView(
+  () => import("./components/transcripts/LiveMeetingPage"),
+  "LiveMeetingPage",
 );
 const CameraPageView = lazyNamedView(
   () => import("./components/pages/CameraPageView"),
@@ -248,10 +259,6 @@ const SettingsView = lazyNamedView(
 const TutorialView = lazyNamedView(
   () => import("./components/pages/tutorial/TutorialView"),
   "TutorialView",
-);
-const HelpView = lazyNamedView(
-  () => import("./components/pages/help/HelpView"),
-  "HelpView",
 );
 const StreamView = lazyNamedView(
   () => import("./components/pages/StreamView"),
@@ -802,10 +809,18 @@ function useCurrentNavigationPath(): string {
   return navigationPath;
 }
 
-function normalizeBackgroundPolicy(
-  policy: AppShellBackgroundPolicy | undefined,
+/**
+ * The resolved screen-background policy for a single view registration — the
+ * ONE seam the shell derives every view's background from (#13452). Reads the
+ * declared surface manifest first (`surface.background` gated by the `wallpaper`
+ * grant), then the legacy standalone `backgroundPolicy`, then defaults to
+ * opaque. A view that declares `shared` without the `wallpaper` grant resolves
+ * to opaque — the wallpaper cannot be opted into by accident.
+ */
+function viewRegistrationBackgroundPolicy(
+  decl: SurfaceManifestBearer | null | undefined,
 ): AppShellBackgroundPolicy {
-  return policy === "shared" ? "shared" : "opaque";
+  return resolveSurfaceBackgroundPolicy(decl);
 }
 
 function builtinRouteBackgroundPolicy(
@@ -836,7 +851,7 @@ function resolveActiveScreenBackgroundPolicy({
 
   const appShellPageForRoute = findAppShellPageForRoute(navigationPath);
   if (appShellPageForRoute) {
-    return normalizeBackgroundPolicy(appShellPageForRoute.backgroundPolicy);
+    return viewRegistrationBackgroundPolicy(appShellPageForRoute);
   }
 
   const appSlug =
@@ -849,13 +864,13 @@ function resolveActiveScreenBackgroundPolicy({
     tab,
     appSlug,
   );
-  if (remoteView) return normalizeBackgroundPolicy(remoteView.backgroundPolicy);
+  if (remoteView) return viewRegistrationBackgroundPolicy(remoteView);
 
   const appShellPageForTab = listAppShellPages().find(
     (entry) => entry.id === tab,
   );
   if (appShellPageForTab) {
-    return normalizeBackgroundPolicy(appShellPageForTab.backgroundPolicy);
+    return viewRegistrationBackgroundPolicy(appShellPageForTab);
   }
 
   const builtinPolicy = builtinRouteBackgroundPolicy(tab, navigationPath);
@@ -869,7 +884,7 @@ function resolveActiveScreenBackgroundPolicy({
         view.path === trimmedNavigationPath(navigationPath)),
   );
   if (registeredView) {
-    return normalizeBackgroundPolicy(registeredView.backgroundPolicy);
+    return viewRegistrationBackgroundPolicy(registeredView);
   }
 
   return "opaque";
@@ -976,6 +991,7 @@ function renderRemoteView(view: ViewRegistryEntry, nav?: ReactNode): ReactNode {
         componentExport={view.componentExport}
         viewId={view.id}
         viewType={view.viewType}
+        surface={view.surface}
       />
     </TabContentView>
   );
@@ -1090,6 +1106,7 @@ function ViewLayoutSurface({
                       componentExport={view.componentExport}
                       viewId={view.id}
                       viewType={view.viewType}
+                      surface={view.surface}
                     />
                   ) : (
                     <ViewRouter routeOverride={routeOverrideForView(view)} />
@@ -1149,6 +1166,7 @@ interface StaticTabRenderContext {
   navigationPath: string;
   settingsInitialSection?: string | null;
   walletNav?: ReactNode;
+  characterNav?: ReactNode;
 }
 
 /**
@@ -1176,7 +1194,6 @@ function buildStaticTabRenderers(): Record<
   );
   return {
     tutorial: wrap(<TutorialView />),
-    help: wrap(<HelpView />),
     chat: () => <ViewUnavailableFallback />,
     browser: () => <BrowserWorkspaceView />,
     stream: () => <StreamView />,
@@ -1185,11 +1202,26 @@ function buildStaticTabRenderers(): Record<
     plugins: wrap(<PluginsPageView />),
     skills: wrap(<SkillsView />),
     trajectories: wrap(<TrajectoriesView />),
-    transcripts: wrap(<TranscriptsPageView />),
-    relationships: wrap(<RelationshipsView />),
+    transcripts: wrap(<LiveMeetingPageView />),
+    // Relationships is a Character-family section: the shared CharacterSectionNav
+    // (passed as `nav`) owns the "Character" header + strip, so the view renders
+    // headerless.
+    relationships: ({ characterNav }) => (
+      <TabContentView nav={characterNav}>
+        <RelationshipsView hideHeader={Boolean(characterNav)} />
+      </TabContentView>
+    ),
     documents: wrap(<KnowledgeView />),
-    experience: wrap(<CharacterExperienceView />),
-    "character-skills": wrap(<CharacterSkillsView />),
+    experience: ({ characterNav }) => (
+      <TabContentView nav={characterNav}>
+        <CharacterExperienceView />
+      </TabContentView>
+    ),
+    "character-skills": ({ characterNav }) => (
+      <TabContentView nav={characterNav}>
+        <CharacterSkillsView />
+      </TabContentView>
+    ),
     memories: wrap(<MemoryViewerView />),
     files: () => (
       <TabScrollView>
@@ -1223,13 +1255,13 @@ function buildStaticTabRenderers(): Record<
     // Rendered directly (no opaque TabContentView chrome) so the live app
     // background shows through behind the controls.
     background: () => <BackgroundView />,
-    character: () => (
-      <TabContentView>
+    character: ({ characterNav }) => (
+      <TabContentView nav={characterNav}>
         <CharacterEditor />
       </TabContentView>
     ),
-    "character-select": () => (
-      <TabContentView>
+    "character-select": ({ characterNav }) => (
+      <TabContentView nav={characterNav}>
         <CharacterEditor />
       </TabContentView>
     ),
@@ -1248,12 +1280,14 @@ function renderStaticViewRouterTab({
   navigationPath,
   settingsInitialSection,
   walletNav,
+  characterNav,
 }: {
   tab: string;
   nativeOsSurfaceEnabled: boolean;
   navigationPath: string;
   settingsInitialSection?: string | null;
   walletNav?: ReactNode;
+  characterNav?: ReactNode;
 }): ReactNode {
   // Resolve legacy alias ids (e.g. `triggers` -> `automations`, `advanced` ->
   // `fine-tuning`) onto their canonical builtin id via the shared registry, so
@@ -1266,6 +1300,7 @@ function renderStaticViewRouterTab({
       navigationPath,
       settingsInitialSection,
       walletNav,
+      characterNav,
     });
   }
   return <ViewUnavailableFallback />;
@@ -1312,6 +1347,13 @@ function renderViewRouterContent({
     <WalletSectionNav activePath={navigationPath} />
   ) : undefined;
 
+  // Character-family routes (Personality/Relationships/Skills/Experience) share
+  // one "Character" header + section strip in the same nav slot (#13591). Unlike
+  // Wallet, the members are a fixed host-owned set, so the strip is static.
+  const characterNav = isCharacterSectionPath(navigationPath) ? (
+    <CharacterSectionNav activePath={navigationPath} />
+  ) : undefined;
+
   const appShellPageForRoute = findAppShellPageForRoute(navigationPath);
   if (
     appShellPageForRoute &&
@@ -1336,6 +1378,7 @@ function renderViewRouterContent({
     navigationPath,
     settingsInitialSection,
     walletNav,
+    characterNav,
   });
 }
 
@@ -2427,21 +2470,35 @@ export function App() {
           }}
         >
           {/* BOTTOM-BAR / SAFE-AREA FLOOR (do not remove): a viewport-filling
-              dark background-token floor mounted on EVERY route, behind the
-              shader (z-0) and every other layer. html/body/#root paint the
-              orange launch guard (--launch-bg #ef5a1f) as a FOUC color, and on
-              shared-background routes (home/chat) the AppBackground shader was
-              the ONLY thing hiding it. On iOS the composer overlay is anchored
-              by the visualViewport-derived `bottom`, so in the home-indicator
-              safe-area the shader coverage can fall short and the orange host
-              color bled through as a band under the composer. This floor makes
-              the bottom inset (and every unpainted zone) the dark BACKGROUND
-              token — never accent — regardless of route or shader state. The
-              shader/wallpaper renders on top of it unchanged on shared routes. */}
+              floor mounted on EVERY route, behind the shader (z-0) and every
+              other layer. html/body/#root paint the orange launch guard
+              (--launch-bg #ef5a1f) as a FOUC color; this floor guarantees the
+              bottom inset (and every unpainted zone) reads as the BACKGROUND
+              token, never the accent, regardless of route or shader state.
+
+              Standalone-PWA bottom-bar fix: on SHARED-background routes
+              (home/chat) this floor must be TRANSPARENT, not an opaque `bg-bg`
+              slab. The wallpaper (`AppBackground` -> `ImageBackground`, a
+              `fixed inset-0` full-bleed layer that reaches the true viewport
+              bottom incl. the home-indicator safe-area) is what should show
+              beneath the floating composer, edge-to-edge (lockscreen/iMessage
+              style). An opaque floor here painted a dark near-black band in the
+              home-indicator zone under the floating composer even though the
+              wallpaper sits above it. Going transparent on wallpaper routes
+              lets the full-bleed wallpaper own the whole screen down to the
+              bottom edge; the FOUC/orange guard is still covered because the
+              wallpaper layer is opaque cover-fit. On OPAQUE/overlay routes (no
+              wallpaper) the floor keeps `bg-bg` so the orange guard never
+              shows. */}
           <div
             aria-hidden="true"
             data-testid="app-safe-area-floor"
-            className="pointer-events-none fixed inset-0 z-[-1] bg-bg"
+            className={cn(
+              "pointer-events-none fixed inset-0 z-[-1]",
+              // Transparent under the full-bleed wallpaper so it shows to the
+              // very bottom edge; opaque dark elsewhere as the FOUC guard.
+              renderSharedAppBackground ? "bg-transparent" : "bg-bg",
+            )}
           />
           {/* The unified app background, mounted once here so it persists
               seamlessly across shared-background routes. It keeps the
@@ -2520,11 +2577,12 @@ export function App() {
             downloading/loading/missing/errored it seeds ONE live status turn
             with cancel / switch-to-cloud / retry controls. Renders null. */}
         <ModelStatusConductorMount />
-        {/* Interactive tutorial: a persistent spotlight overlay that survives
-            navigation (it sends the user to Settings, back home, …). Renders
-            only when the tutorial is active (launched from the home Tutorial
-            tile or the Help view). */}
-        <TutorialOverlay />
+        {/* In-chat tutorial conductor (headless) — while the tour is active it
+            seeds one conversational turn per step into the SAME live transcript
+            the overlay renders, narrates through the real voice engine, and
+            auto-advances on the user's real actions. No locks, no spotlight:
+            the user can ignore it freely. */}
+        <TutorialConductorMount />
         {/* Post-login permission priming: a one-time soft-ask modal that walks
             the user through the platform's onboarding permission set (voice,
             location, notifications) BEFORE any OS prompt. Self-gates on
@@ -2538,6 +2596,11 @@ export function App() {
             to the dashboard, where NotificationsHomeCenter is the one
             notification surface. Renders null. */}
         <NotificationsShellBoot />
+        {/* Tiny dismissible build stamp (bottom-left) so testers can verify
+            PWA cache freshness at a glance. Best-effort: hidden when
+            /build-info.json is absent (production builds without the
+            build-time stamp render nothing). */}
+        <BuildBadge />
         <ShellOverlays actionNotice={actionNotice} />
         <SaveCommandModal
           open={contextMenu.saveCommandModalOpen}

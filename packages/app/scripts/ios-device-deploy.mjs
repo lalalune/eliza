@@ -38,8 +38,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readDevicectlDeviceList } from "./ios-device-devicectl.mjs";
 import {
+  readDevicectlDeviceList,
+  readDevicectlDeviceLockState,
+} from "./ios-device-devicectl.mjs";
+import {
+  assertDeviceUnlocked,
   buildCodesignPlan,
   buildPlistXml,
   DEFAULT_APP_BUNDLE_ID,
@@ -73,6 +77,21 @@ function runInherit(command, args, options = {}) {
   if (result.status !== 0) {
     fail(`${command} ${args.join(" ")} exited with ${result.status}`);
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDeviceUnlocked(device, phase) {
+  await assertDeviceUnlocked({
+    device,
+    probeLockState: () => readDevicectlDeviceLockState(device.identifier),
+    sleep,
+    waitSeconds: process.env.ELIZA_IOS_DEVICE_UNLOCK_WAIT_SECONDS ?? 120,
+    pollIntervalSeconds: process.env.ELIZA_IOS_DEVICE_UNLOCK_POLL_SECONDS ?? 5,
+    notify: (message) => log(`${phase}: ${message}`),
+  });
 }
 
 // ── Device resolution ───────────────────────────────────────────────────
@@ -451,6 +470,7 @@ async function main() {
   });
 
   // 5. Install.
+  await waitForDeviceUnlocked(device, "preflight");
   log("installing via devicectl…");
   runInherit("xcrun", [
     "devicectl",

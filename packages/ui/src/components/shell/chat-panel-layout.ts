@@ -121,6 +121,35 @@ export function resolveChatPanelLayout(
   return { topMargin, panelMaxH };
 }
 
+// Ceiling (px) for the "short landscape" (landscape-phone) treatment: a viewport
+// wider than tall and no taller than this reads as a landscape phone. 480 clears
+// a landscape iPhone (~390–430 tall) while staying well below every portrait
+// phone (≥667 tall), tablet, and desktop height — so only the cramped
+// landscape-phone case trips it (#14173).
+export const SHORT_LANDSCAPE_MAX_HEIGHT = 480;
+
+/**
+ * True for a wide-but-short viewport (a landscape phone): wider than tall AND no
+ * taller than {@link SHORT_LANDSCAPE_MAX_HEIGHT}. The continuous-chat overlay
+ * shrinks its RESTING footprint to a compact bottom-corner affordance here, so
+ * its otherwise ~full-width composer band stops overlapping the view controls
+ * that pack into the short height (#14173). Portrait phones (taller than wide)
+ * and desktop / tablet (taller than the ceiling) return false and keep the
+ * normal centered composer. Takes the LAYOUT viewport (`window.innerWidth/
+ * innerHeight`), not the keyboard-shrunk visual viewport, so a raised keyboard
+ * never toggles the treatment.
+ */
+export function isShortLandscapeViewport(
+  innerWidth: number,
+  innerHeight: number,
+): boolean {
+  return (
+    innerHeight > 0 &&
+    innerWidth > innerHeight &&
+    innerHeight <= SHORT_LANDSCAPE_MAX_HEIGHT
+  );
+}
+
 /**
  * Measure the resolved `env(safe-area-inset-top)` in CSS px via a throwaway
  * probe. `env()` can't be read off a custom property as a number, so this reads

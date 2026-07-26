@@ -34,3 +34,34 @@ export function readDevicectlDeviceList() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
+
+/**
+ * Run `xcrun devicectl device info lockState` for one physical device.
+ *
+ * @param {string} deviceIdentifier devicectl identifier, not the hardware UDID
+ * @returns {Record<string, unknown>}
+ */
+export function readDevicectlDeviceLockState(deviceIdentifier) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "eliza-devicectl-"));
+  const jsonPath = path.join(tmpDir, "lock-state.json");
+  try {
+    execFileSync(
+      "xcrun",
+      [
+        "devicectl",
+        "device",
+        "info",
+        "lockState",
+        "--device",
+        deviceIdentifier,
+        "--json-output",
+        jsonPath,
+        "--quiet",
+      ],
+      { stdio: ["ignore", "ignore", "inherit"] },
+    );
+    return JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}

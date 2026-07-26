@@ -5,8 +5,10 @@
 import { describe, expect, it } from "vitest";
 import {
   type ChatPanelLayoutInput,
+  isShortLandscapeViewport,
   resolveChatPanelLayout,
   SHEET_TOP_MARGIN,
+  SHORT_LANDSCAPE_MAX_HEIGHT,
 } from "./chat-panel-layout";
 
 // The overlay is a bottom-anchored fixed element lifted by
@@ -225,5 +227,37 @@ describe("resolveChatPanelLayout", () => {
       fullBleed: false,
     });
     expect(topMargin).toBe(SHEET_TOP_MARGIN);
+  });
+});
+
+describe("isShortLandscapeViewport (#14173)", () => {
+  it("flags the audited landscape-phone viewport (844x390)", () => {
+    // The exact `mobile-landscape` case where the overlay's ~full-width composer
+    // band overlaps view controls in the audit; the compact treatment applies.
+    expect(isShortLandscapeViewport(844, 390)).toBe(true);
+  });
+
+  it("does NOT flag the portrait phone (390x844) — taller than wide", () => {
+    expect(isShortLandscapeViewport(390, 844)).toBe(false);
+  });
+
+  it("does NOT flag desktop (1440x900) or tablet portrait (820x1180)", () => {
+    // Wide but far taller than the ceiling → the normal centered composer stays.
+    expect(isShortLandscapeViewport(1440, 900)).toBe(false);
+    expect(isShortLandscapeViewport(820, 1180)).toBe(false);
+  });
+
+  it("is bounded by the ceiling: at it true, one past it false", () => {
+    expect(isShortLandscapeViewport(900, SHORT_LANDSCAPE_MAX_HEIGHT)).toBe(
+      true,
+    );
+    expect(isShortLandscapeViewport(900, SHORT_LANDSCAPE_MAX_HEIGHT + 1)).toBe(
+      false,
+    );
+  });
+
+  it("rejects degenerate/zero-height viewports", () => {
+    expect(isShortLandscapeViewport(0, 0)).toBe(false);
+    expect(isShortLandscapeViewport(800, 0)).toBe(false);
   });
 });

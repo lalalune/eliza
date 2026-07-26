@@ -1,21 +1,28 @@
 /**
- * The knowledge-documents surface: lists, searches, uploads, and deletes the
- * agent's knowledge documents, scoped by ownership (agent / user / shared).
+ * The folded Knowledge multimedia hub (#13594): one surface over every ingested
+ * knowledge record — documents, images, audio, video, and transcript mirrors —
+ * instead of the old three views (Knowledge + Transcripts + Files). A top-bar
+ * media-format facet control and a scope filter narrow a single-column list; a
+ * row opens the record in a pushed reader sub-view (its own header, back → list)
+ * that renders per-mimeType (prose / pdf / image / word-synced or plain audio /
+ * video) via {@link DocumentViewer}.
  *
- * Rendered inside `KnowledgeView` (the `/documents` route) and also reusable in
- * embedded/modal form. Reads/writes through the `client` documents API, seeds
- * from `resource-cache` for instant revisits, and binds the floating chat
- * composer as its search box via `useRegisterViewChatBinding`. Upload compresses
- * large images (`documents-upload-image`) before sending.
+ * Reads/writes through the `client` documents API, seeds from `resource-cache`
+ * for instant revisits, and binds the floating chat composer as its search box
+ * via `useRegisterViewChatBinding`. Records flow in from the slice-1 ingest
+ * pipeline (#13593) tagged by room/sender/role/media-format; there is no second
+ * store (#8876) — format is derived from mime at read time. Rendered by
+ * `KnowledgeView` (the `/documents` route) and, controlled, inside the character
+ * hub. Upload compresses large images before sending.
  */
 import {
   BadgeCheck,
   Bot,
   FileSearch,
-  FileText,
   Globe2,
   Layers,
   Lock,
+  Plus,
   Shield,
   User,
 } from "lucide-react";
@@ -23,6 +30,7 @@ import {
   type ChangeEvent,
   type DragEvent,
   memo,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -47,9 +55,10 @@ import {
   maybeCompressDocumentUploadImage,
 } from "../../utils/documents-upload-image";
 import { formatByteSize } from "../../utils/format";
-import { ChatEmptyStateWithRecommendations } from "../composites/chat";
 import { PagePanel } from "../composites/page-panel";
 import { ConfirmDeleteControl } from "../shared/confirm-delete-control";
+import { SectionTabStrip } from "../shared/SectionNav";
+import { ViewHeader } from "../shared/ViewHeader";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { ListSkeleton } from "../ui/skeleton-layouts";
@@ -58,7 +67,6 @@ import {
   getDocumentSummary,
   getDocumentTypeLabel,
 } from "./documents-detail.helpers";
-import { UploadZone } from "./documents-upload";
 import {
   BULK_UPLOAD_TARGET_BYTES,
   DEFAULT_DOCUMENT_UPLOAD_SCOPE,
@@ -72,6 +80,15 @@ import {
   MAX_UPLOAD_REQUEST_BYTES,
   shouldReadDocumentFileAsText,
 } from "./documents-upload.helpers";
+import {
+  documentMatchesFacet,
+  documentMediaFormat,
+  KNOWLEDGE_FACETS,
+  type KnowledgeFacet,
+  knowledgeFacetCounts,
+  knowledgeFacetIcon,
+  knowledgeFacetLabel,
+} from "./knowledge-media-format";
 
 export type { DocumentUploadFile } from "./documents-upload.helpers";
 
@@ -115,61 +132,13 @@ const SCOPE_FILTER_OPTIONS: ReadonlyArray<{
   },
 ];
 
-/* ── Scope Filter Chip ──────────────────────────────────────────────── */
-
-function ScopeFilterChip({
-  value,
-  label,
-  Icon,
-  active,
-  onSelect,
-}: {
-  value: DocumentScopeFilter;
-  label: string;
-  Icon: typeof Globe2;
-  active: boolean;
-  onSelect: (value: DocumentScopeFilter) => void;
-}) {
-  const { ref, agentProps } = useAgentElement<HTMLButtonElement>({
-    id: `scope-${value}`,
-    role: "tab",
-    label,
-    group: "documents-scope",
-    status: active ? "active" : "inactive",
-    description: `Filter documents to the ${label} scope`,
-    onActivate: () => onSelect(value),
-  });
-  return (
-    <Button
-      ref={ref}
-      {...agentProps}
-      aria-pressed={active}
-      aria-current={active ? "page" : undefined}
-      onClick={() => onSelect(value)}
-      variant="ghost"
-      size="sm"
-      // Borderless text tab (#10710): active = accent text on a faint wash.
-      className={`h-auto gap-1 rounded-full px-2 py-0.5 text-2xs font-semibold transition-colors ${
-        active
-          ? "bg-accent/12 text-accent"
-          : "text-muted hover:bg-bg-muted/30 hover:text-txt"
-      }`}
-    >
-      <Icon className="h-3 w-3" aria-hidden />
-      {label}
-    </Button>
-  );
-}
-
 /* ── Search Result Item ─────────────────────────────────────────────── */
 
 const SearchResultListItem = memo(function SearchResultListItem({
   result,
-  active,
   onSelect,
 }: {
   result: DocumentSearchResult;
-  active: boolean;
   onSelect: (documentId: string) => void;
 }) {
   const { t } = useTranslation();
@@ -184,7 +153,6 @@ const SearchResultListItem = memo(function SearchResultListItem({
     role: "list-item",
     label: title,
     group: "documents-results",
-    status: active ? "active" : "inactive",
     description: `Open search result "${title}"`,
     onActivate: () => onSelect(documentId),
   });
@@ -194,17 +162,10 @@ const SearchResultListItem = memo(function SearchResultListItem({
       ref={ref}
       {...agentProps}
       onClick={() => onSelect(documentId)}
-      aria-current={active ? "page" : undefined}
       variant="ghost"
-      className={`group flex h-auto w-full items-start justify-start whitespace-normal rounded-none px-0 py-3 text-left font-normal transition-colors ${
-        active ? "bg-transparent" : "bg-transparent hover:bg-bg-hover"
-      }`}
+      className="group flex h-auto w-full items-start justify-start whitespace-normal rounded-none px-0 py-3 text-left font-normal transition-colors hover:bg-bg-hover"
     >
-      <span
-        className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center text-2xs font-bold ${
-          active ? "text-accent" : "text-muted-strong"
-        }`}
-      >
+      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center text-2xs font-bold text-muted-strong">
         {(result.similarity * 100).toFixed(0)}%
       </span>
       <div className="min-w-0 flex-1">
@@ -220,17 +181,15 @@ const SearchResultListItem = memo(function SearchResultListItem({
   );
 });
 
-/* ── Document Card ──────────────────────────────────────────────────── */
+/* ── Knowledge Row ──────────────────────────────────────────────────── */
 
-const DocumentListItem = memo(function DocumentListItem({
+const KnowledgeListItem = memo(function KnowledgeListItem({
   doc,
-  active,
   onSelect,
   onDelete,
   deleting,
 }: {
   doc: DocumentRecord;
-  active: boolean;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   deleting: boolean;
@@ -252,21 +211,19 @@ const DocumentListItem = memo(function DocumentListItem({
         : doc.scope === "agent-private"
           ? Bot
           : Globe2;
+  // Row leading icon follows the media format so the list reads as mixed media
+  // at a glance (audio/video/image/transcript are distinct from a plain doc).
+  const FormatIcon = knowledgeFacetIcon(documentMediaFormat(doc));
   const { ref, agentProps } = useAgentElement<HTMLButtonElement>({
     id: `document-${doc.id}`,
     role: "list-item",
     label: doc.filename,
     group: "documents-list",
-    status: active ? "active" : "inactive",
-    description: `Open document "${doc.filename}"`,
+    description: `Open "${doc.filename}"`,
     onActivate: () => onSelect(doc.id),
   });
   return (
-    <div
-      className={`group relative flex w-full transition-colors ${
-        active ? "bg-transparent" : "bg-transparent hover:bg-bg-hover"
-      }`}
-    >
+    <div className="group relative flex w-full transition-colors hover:bg-bg-hover">
       <Button
         ref={ref}
         {...agentProps}
@@ -275,15 +232,11 @@ const DocumentListItem = memo(function DocumentListItem({
           defaultValue: "Open {{filename}}",
           filename: doc.filename,
         })}
-        aria-current={active ? "page" : undefined}
         title={doc.filename}
         variant="ghost"
         className="flex h-auto min-w-0 flex-1 items-center justify-start gap-3 whitespace-normal rounded-none px-3.5 py-3 text-left font-normal hover:bg-transparent"
       >
-        <FileText
-          className={`h-4 w-4 shrink-0 ${active ? "text-accent" : "text-muted"}`}
-          aria-hidden
-        />
+        <FormatIcon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold leading-snug text-txt">
             {doc.filename}
@@ -298,6 +251,12 @@ const DocumentListItem = memo(function DocumentListItem({
             </span>
             <span aria-hidden>·</span>
             <span>{getDocumentTypeLabel(doc.contentType)}</span>
+            {doc.addedFrom ? (
+              <>
+                <span aria-hidden>·</span>
+                <span className="truncate">{doc.addedFrom}</span>
+              </>
+            ) : null}
             {doc.canEditText ? (
               <>
                 <span aria-hidden>·</span>
@@ -333,109 +292,24 @@ const DocumentListItem = memo(function DocumentListItem({
   );
 });
 
-/* ── Compact strip chips ────────────────────────────────────────────── */
-
-const CompactSearchChip = memo(function CompactSearchChip({
-  result,
-  active,
-  onSelect,
-}: {
-  result: DocumentSearchResult;
-  active: boolean;
-  onSelect: (documentId: string) => void;
-}) {
-  const { t } = useTranslation();
-  const id = result.documentId || result.id;
-  const title =
-    result.documentTitle ||
-    t("documentsview.UnknownDocument", {
-      defaultValue: "Unknown Document",
-    });
-  const { ref, agentProps } = useAgentElement<HTMLButtonElement>({
-    id: `result-${result.id}`,
-    role: "list-item",
-    label: title,
-    group: "documents-results",
-    status: active ? "active" : "inactive",
-    description: `Open search result "${title}"`,
-    onActivate: () => onSelect(id),
-  });
-  return (
-    <Button
-      ref={ref}
-      {...agentProps}
-      onClick={() => onSelect(id)}
-      variant="ghost"
-      size="sm"
-      // Borderless selector pill (#10710): selection = accent text on a wash.
-      className={`h-auto max-w-[16rem] shrink-0 gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition ${
-        active
-          ? "bg-accent/12 text-accent"
-          : "text-muted hover:bg-bg-muted/30 hover:text-txt"
-      }`}
-    >
-      <FileSearch className="h-3.5 w-3.5" aria-hidden />
-      <span className="truncate">{title}</span>
-    </Button>
-  );
-});
-
-function CompactDocChip({
-  doc,
-  active,
-  onSelect,
-}: {
-  doc: DocumentRecord;
-  active: boolean;
-  onSelect: (id: string) => void;
-}) {
-  const { ref, agentProps } = useAgentElement<HTMLButtonElement>({
-    id: `document-${doc.id}`,
-    role: "list-item",
-    label: doc.filename,
-    group: "documents-list",
-    status: active ? "active" : "inactive",
-    description: `Open document "${doc.filename}"`,
-    onActivate: () => onSelect(doc.id),
-  });
-  return (
-    <Button
-      ref={ref}
-      {...agentProps}
-      onClick={() => onSelect(doc.id)}
-      variant="ghost"
-      size="sm"
-      // Borderless selector pill (#10710): selection = accent text on a wash.
-      className={`h-auto max-w-[16rem] shrink-0 gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition ${
-        active
-          ? "bg-accent/12 text-accent"
-          : "text-muted hover:bg-bg-muted/30 hover:text-txt"
-      }`}
-    >
-      <FileText className="h-3.5 w-3.5" aria-hidden />
-      <span className="truncate">{doc.filename}</span>
-    </Button>
-  );
-}
-
-/* ── Main DocumentsView Component ───────────────────────────────────── */
+/* ── Main hub component ─────────────────────────────────────────────── */
 
 export function DocumentsView({
   fileInputId,
   inModal,
-  embedded = false,
+  standalone = false,
   onDocumentsChange,
   onSelectedDocumentIdChange,
   selectedDocumentId,
-  showSelectorRail,
 }: {
   fileInputId?: string;
   inModal?: boolean;
-  embedded?: boolean;
+  /** Own the top-level "Knowledge" header in list state (the `/documents`
+   *  route). Off when the hub is embedded under another view's chrome. */
+  standalone?: boolean;
   onDocumentsChange?: (documents: DocumentRecord[]) => void;
   onSelectedDocumentIdChange?: (documentId: string | null) => void;
   selectedDocumentId?: string | null;
-  showSelectorRail?: boolean;
 } = {}) {
   const t = useAppSelector((s) => s.t);
   const setActionNotice = useAppSelector((s) => s.setActionNotice);
@@ -445,6 +319,7 @@ export function DocumentsView({
   setActionNoticeRef.current = setActionNotice;
   const [searchQuery, setSearchQuery] = useState("");
   const [scopeFilter, setScopeFilter] = useState<DocumentScopeFilter>("all");
+  const [facet, setFacet] = useState<KnowledgeFacet>("all");
   // The active view drives the one floating chat composer as its search box:
   // each keystroke flows in via onQuery, filtering documents in place.
   const handleSearchQuery = useCallback((value: string) => {
@@ -461,22 +336,55 @@ export function DocumentsView({
   );
   useRegisterViewChatBinding(searchBinding);
   // Seed from the shared cache so a revisit paints the last-known documents
-  // instantly and revalidates silently, instead of flashing a spinner.
-  const documentsCacheKey = `documents:list:${scopeFilter}`;
+  // instantly and revalidates silently, instead of flashing a spinner. Keyed by
+  // scope AND facet (#13594): the server now draws the list per facet from the
+  // whole store, so each facet's page is cached independently.
+  const documentsCacheKey = `documents:list:${scopeFilter}:${facet}`;
   const cachedDocuments = getCached<DocumentRecord[]>(documentsCacheKey);
   const [documents, setDocuments] = useState<DocumentRecord[]>(
     cachedDocuments?.data ?? [],
   );
+  // Whole-store per-facet counts for the segmented control (#13594). Fetched
+  // server-side so a facet is never missing/miscounted once its records fall
+  // outside the list page (the review blocker); seeded from the local slice as
+  // a first-paint estimate, then overwritten by the server truth.
+  const [serverFacetCounts, setServerFacetCounts] = useState<Record<
+    KnowledgeFacet,
+    number
+  > | null>(
+    getCached<Record<KnowledgeFacet, number>>(`documents:facets:${scopeFilter}`)
+      ?.data ?? null,
+  );
+  // Mirror the latest server counts into a ref so loadData (a stable callback)
+  // can tell "never had server counts" from "have stale server counts" without
+  // re-binding on every count change.
+  const serverFacetCountsRef = useRef(serverFacetCounts);
+  serverFacetCountsRef.current = serverFacetCounts;
+  // True when the segmented control is showing first-page-derived counts
+  // because the whole-store count fetch failed and no server truth exists yet
+  // (codex P2). Rendered as an approximate marker so the numbers aren't passed
+  // off as authoritative.
+  const [facetCountsApproximate, setFacetCountsApproximate] = useState(false);
+  // Counts are scope-specific: on a scope change, drop the previous scope's
+  // server counts and reseed from THAT scope's cache (or null) so a subsequent
+  // count-fetch failure can never leave the control showing another scope's
+  // stale counts as authoritative (codex P2). Skips the first render since the
+  // initial state already seeded from the mount scope's cache.
+  const previousScopeRef = useRef(scopeFilter);
+  useEffect(() => {
+    if (previousScopeRef.current === scopeFilter) return;
+    previousScopeRef.current = scopeFilter;
+    const cached = getCached<Record<KnowledgeFacet, number>>(
+      `documents:facets:${scopeFilter}`,
+    )?.data;
+    setServerFacetCounts(cached ?? null);
+    setFacetCountsApproximate(false);
+  }, [scopeFilter]);
   const [searchResults, setSearchResults] = useState<
     DocumentSearchResult[] | null
   >(null);
   const [loading, setLoading] = useState(!cachedDocuments);
   const [uploading, setUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState<{
-    current: number;
-    total: number;
-    filename: string;
-  } | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [internalSelectedDocId, setInternalSelectedDocId] = useState<
     string | null
@@ -484,7 +392,7 @@ export function DocumentsView({
   const [loadError, setLoadError] = useState<string | null>(null);
   // Set when GET /api/documents 404s — the documents plugin isn't mounted on
   // this surface (e.g. the mobile/Android agent). Degrade to a calm
-  // "unavailable here" panel instead of a red error + Retry loop.
+  // "unavailable here" panel instead of a red error + Retry loop (J4).
   const [documentsUnavailable, setDocumentsUnavailable] = useState(false);
   const [isServiceLoading, setIsServiceLoading] = useState(false);
   const serviceRetryRef = useRef(0);
@@ -498,28 +406,54 @@ export function DocumentsView({
     },
     [onSelectedDocumentIdChange, selectedDocumentId],
   );
-  const shouldRenderSelectorRail = showSelectorRail !== false;
-  const useCompactSelectorRail = embedded;
 
   const loadData = useCallback(
     async (options?: { silent?: boolean }) => {
       if (!options?.silent) setLoading(true);
       setLoadError(null);
       try {
-        const docsRes = await client.listDocuments({
-          limit: 100,
-          ...(scopeFilter !== "all" ? { scope: scopeFilter } : {}),
-        });
+        const scopeParam = scopeFilter !== "all" ? { scope: scopeFilter } : {};
+        // Drive the list off the server facet so its rows come from the whole
+        // store, not the client's first page (#13594 review blocker). The
+        // facet-count fetch runs in parallel and describes the whole store
+        // under the current scope, so counts stay correct across pages.
+        const facetParam = facet !== "all" ? { knowledgeFacet: facet } : {};
+        const [docsRes, facetsRes] = await Promise.all([
+          client.listDocuments({
+            limit: 100,
+            ...scopeParam,
+            ...facetParam,
+          }),
+          client.getDocumentFacetCounts(scopeParam).catch(() => null),
+        ]);
         setDocuments(docsRes.documents);
-        setCached(`documents:list:${scopeFilter}`, docsRes.documents);
-        onDocumentsChange?.(docsRes.documents);
+        setCached(`documents:list:${scopeFilter}:${facet}`, docsRes.documents);
+        if (facetsRes?.counts) {
+          setServerFacetCounts(facetsRes.counts);
+          setFacetCountsApproximate(false);
+          setCached(`documents:facets:${scopeFilter}`, facetsRes.counts);
+        } else {
+          // The whole-store count fetch failed while the list succeeded
+          // (codex P2). Rather than silently pass off first-page counts as the
+          // truth, mark them approximate so the segmented control can flag it;
+          // any prior server counts stay on screen (never reset to null).
+          setFacetCountsApproximate(serverFacetCountsRef.current === null);
+        }
+        // Only surface the WHOLE list to an embedder's shared cache (e.g.
+        // CharacterHubView). When a facet is active the rows are server-filtered
+        // to that facet, so publishing them would overwrite the embedder's full
+        // list with a partial one (codex P2). The `all` facet holds the whole
+        // store, so the embedder stays whole across facet switches.
+        if (facet === "all") {
+          onDocumentsChange?.(docsRes.documents);
+        }
         setIsServiceLoading(false);
         setDocumentsUnavailable(false);
         serviceRetryRef.current = 0;
       } catch (err) {
-        // A 404 means the documents plugin isn't mounted on this surface
-        // (the mobile/Android agent omits it). Treat it as "unavailable here"
-        // — a calm panel, not a red error + Retry loop.
+        // error-policy:J4 — a 404 means the documents plugin isn't mounted on
+        // this surface (the mobile/Android agent omits it); degrade to a calm
+        // "unavailable here" panel, not a red error + Retry loop.
         if (isApiError(err) && err.status === 404) {
           setIsServiceLoading(false);
           setDocumentsUnavailable(true);
@@ -543,18 +477,19 @@ export function DocumentsView({
         setLoading(false);
       }
     },
-    [onDocumentsChange, scopeFilter],
+    [onDocumentsChange, scopeFilter, facet],
   );
 
   useEffect(() => {
     // Revalidate silently when cached documents are already on screen.
     loadData({
       silent:
-        getCached<DocumentRecord[]>(`documents:list:${scopeFilter}`) != null,
+        getCached<DocumentRecord[]>(`documents:list:${scopeFilter}:${facet}`) !=
+        null,
     }).catch(() => {
       setLoading(false);
     });
-  }, [loadData, scopeFilter]);
+  }, [loadData, scopeFilter, facet]);
   useEffect(() => {
     if (!isServiceLoading) {
       serviceRetryRef.current = 0;
@@ -747,13 +682,6 @@ export function DocumentsView({
       };
 
       setUploading(true);
-      setUploadStatus({
-        current: 0,
-        total: uploadQueue.length,
-        filename: t("documentsview.Preparing", {
-          defaultValue: "Preparing...",
-        }),
-      });
 
       try {
         type PreparedUpload = {
@@ -780,18 +708,6 @@ export function DocumentsView({
           const batchToUpload = currentBatch;
           currentBatch = [];
           currentBatchBytes = 0;
-
-          const batchLabel =
-            batchToUpload[0]?.filename ||
-            t("documentsview.Batch", { defaultValue: "batch" });
-          setUploadStatus({
-            current: successful + failures.length,
-            total: uploadQueue.length,
-            filename: t("documentsview.UploadingBatchStartingWith", {
-              defaultValue: "Uploading batch starting with {{label}}",
-              label: batchLabel,
-            }),
-          });
 
           try {
             const result = await client.uploadDocumentsBulk({
@@ -830,17 +746,8 @@ export function DocumentsView({
           }
         };
 
-        for (const [index, file] of uploadQueue.entries()) {
+        for (const file of uploadQueue) {
           const uploadFilename = getDocumentUploadFilename(file);
-          setUploadStatus({
-            current: index + 1,
-            total: uploadQueue.length,
-            filename: t("documentsview.PreparingFile", {
-              defaultValue: "Preparing: {{filename}}",
-              filename: uploadFilename,
-            }),
-          });
-
           try {
             const prepared = await buildDocumentUploadRequest(file, options);
             if (
@@ -914,109 +821,9 @@ export function DocumentsView({
         );
       } finally {
         setUploading(false);
-        setUploadStatus(null);
       }
     },
     [buildDocumentUploadRequest, loadData, setActionNotice, t],
-  );
-
-  const handleUrlUpload = useCallback(
-    async (url: string, options: DocumentUploadOptions) => {
-      setUploading(true);
-      try {
-        const result = await client.uploadDocumentFromUrl(url, {
-          includeImageDescriptions: options.includeImageDescriptions,
-          scope: options.scope,
-        });
-
-        const baseMessage = result.isYouTubeTranscript
-          ? `Imported YouTube transcript (${result.fragmentCount} fragments)`
-          : `Imported "${result.filename}" (${result.fragmentCount} fragments)`;
-        if (result.warnings && result.warnings.length > 0) {
-          setActionNotice(
-            `${baseMessage}. ${result.warnings[0]}`,
-            "info",
-            6000,
-          );
-        } else {
-          setActionNotice(baseMessage, "success", 3000);
-        }
-        loadData();
-      } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : t("documentsview.UnknownImportError", {
-                defaultValue: "Unknown import error",
-              });
-        setActionNotice(
-          t("documentsview.FailedToImportFromUrl", {
-            defaultValue: "Failed to import from URL: {{message}}",
-            message,
-          }),
-          "error",
-          5000,
-        );
-      } finally {
-        setUploading(false);
-      }
-    },
-    [loadData, setActionNotice, t],
-  );
-
-  const handleTextUpload = useCallback(
-    async (
-      text: string,
-      title: string | undefined,
-      options: DocumentUploadOptions,
-    ) => {
-      setUploading(true);
-      try {
-        const normalizedTitle = title?.trim();
-        const filenameStem =
-          normalizedTitle
-            ?.toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "")
-            .slice(0, 80) || "document-note";
-        const filename = `${filenameStem}.txt`;
-        const result = await client.uploadDocument({
-          content: text,
-          filename,
-          contentType: "text/plain",
-          scope: options.scope,
-          metadata: {
-            source: "upload",
-            title: normalizedTitle,
-            textBacked: true,
-          },
-        });
-        setActionNotice(
-          `Saved "${normalizedTitle || filename}" (${result.fragmentCount} fragments)`,
-          "success",
-          3000,
-        );
-        await loadData();
-      } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : t("documentsview.UnknownUploadError", {
-                defaultValue: "Unknown upload error",
-              });
-        setActionNotice(
-          t("documentsview.UploadFailedWithMessage", {
-            defaultValue: "Upload failed: {{message}}",
-            message,
-          }),
-          "error",
-          5000,
-        );
-      } finally {
-        setUploading(false);
-      }
-    },
-    [loadData, setActionNotice, t],
   );
 
   const handleExternalFileInputChange = useCallback(
@@ -1033,14 +840,9 @@ export function DocumentsView({
     [handleFilesUpload, uploading],
   );
 
-  // Root-level file-drop intake (#10722). The only shipped documents surface
-  // (CharacterHubView → /character/documents) hides the selector rail, so the
-  // UploadZone fieldset — and with it the ONLY drag-drop upload affordance —
-  // never mounts. Accepting file drops on the whole view root restores
-  // drag-drop upload on every variant, with the same default options as the
-  // embedded "Add Knowledge" file input above. When the rail IS mounted, the
-  // UploadZone's own drop handler stops propagation so a drop inside it keeps
-  // its scoped options and never double-uploads.
+  // Root-level file-drop intake (#10722): accepting file drops on the whole
+  // view root is the hub's only drag-drop upload affordance — no CTA cluster,
+  // just quiet intake. The keyboard-accessible path is the "Add" file input.
   const handleRootDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
     if (event.dataTransfer?.types?.includes("Files")) {
       event.preventDefault();
@@ -1071,6 +873,7 @@ export function DocumentsView({
           threshold: 0.3,
           limit: 20,
           ...(scopeFilter !== "all" ? { scope: scopeFilter } : {}),
+          ...(facet !== "all" ? { knowledgeFacet: facet } : {}),
         });
         setSearchResults(result.results);
       } catch (err) {
@@ -1091,7 +894,7 @@ export function DocumentsView({
         setSearchResults([]);
       }
     },
-    [scopeFilter, setActionNotice, t],
+    [facet, scopeFilter, setActionNotice, t],
   );
 
   const handleDelete = useCallback(
@@ -1110,6 +913,7 @@ export function DocumentsView({
             "success",
             3000,
           );
+          if (selectedDocId === documentId) setSelectedDocId(null);
           await loadData();
         } else {
           setActionNotice(
@@ -1139,36 +943,53 @@ export function DocumentsView({
         setDeleting(null);
       }
     },
-    [loadData, setActionNotice, t],
+    [loadData, selectedDocId, setActionNotice, setSelectedDocId, t],
   );
 
   const isShowingSearchResults = searchResults !== null;
   const visibleSearchResults = searchResults ?? [];
+  // The segmented control shows the whole-store counts the server returns; the
+  // local slice is only a first-paint estimate until they arrive (#13594). When
+  // a facet is active the list is already narrowed server-side, so the local
+  // slice can't recount the other facets — the server counts are the truth.
+  const localFacetCounts = useMemo(
+    () => knowledgeFacetCounts(documents),
+    [documents],
+  );
+  const facetCounts = serverFacetCounts ?? localFacetCounts;
+  // Only the fall-through-to-local case is approximate; once server counts land
+  // they're exact and the marker drops.
+  const facetCountsAreApproximate =
+    facetCountsApproximate && serverFacetCounts === null;
+  // Facet + free-text narrowing over the plain list (semantic search results
+  // are cross-format by relevance, so the facet control hides while they show).
   const filteredDocuments = useMemo(() => {
+    // The facet is applied server-side now (#13594): `documents` already holds
+    // the whole-store rows for the active facet, so only the instant free-text
+    // narrowing runs here. `documentMatchesFacet` stays a cheap belt-and-braces
+    // guard so a stale cached slice from another facet can't leak through on
+    // first paint before the revalidation lands.
     const query = searchQuery.trim().toLowerCase();
-    if (!query || isShowingSearchResults) {
-      return documents;
-    }
-    return documents.filter(
-      (doc) =>
+    return documents.filter((doc) => {
+      if (!documentMatchesFacet(doc, facet)) return false;
+      if (!query) return true;
+      return (
         doc.filename.toLowerCase().includes(query) ||
-        doc.contentType?.toLowerCase().includes(query),
-    );
-  }, [documents, isShowingSearchResults, searchQuery]);
+        doc.contentType?.toLowerCase().includes(query)
+      );
+    });
+  }, [documents, facet, searchQuery]);
 
+  // Reader-as-pushed-sub-view: a selected id replaces the list with the reader
+  // rather than a side pane (#13594). Persisting a selection across an empty
+  // list would strand the user in a reader for a deleted item, so clear it.
   useEffect(() => {
-    if (documents.length === 0) {
-      if (selectedDocId !== null) {
-        setSelectedDocId(null);
-      }
-      return;
-    }
-
-    const hasSelectedDocument = documents.some(
-      (doc) => doc.id === selectedDocId,
-    );
-    if (!hasSelectedDocument) {
-      setSelectedDocId(documents[0]?.id ?? null);
+    if (
+      selectedDocId &&
+      documents.length > 0 &&
+      !documents.some((doc) => doc.id === selectedDocId)
+    ) {
+      setSelectedDocId(null);
     }
   }, [documents, selectedDocId, setSelectedDocId]);
 
@@ -1188,224 +1009,204 @@ export function DocumentsView({
     return () => window.clearTimeout(timer);
   }, [handleSearch, searchQuery, searchResults]);
 
-  /* ── Scope filter chips ────────────────────────────────────────── */
-
-  const scopeFilterStrip = (
-    <div className="flex flex-wrap items-center gap-1">
-      {SCOPE_FILTER_OPTIONS.map(({ value, labelKey, defaultLabel, Icon }) => (
-        <ScopeFilterChip
-          key={value}
-          value={value}
-          label={t(labelKey, { defaultValue: defaultLabel })}
-          Icon={Icon}
-          active={scopeFilter === value}
-          onSelect={setScopeFilter}
-        />
-      ))}
-    </div>
+  const facetStrip = (
+    <SectionTabStrip
+      testId="knowledge-facets"
+      ariaLabel={t("knowledgehub.facetsLabel", {
+        defaultValue: "Filter knowledge by media type",
+      })}
+      activeId={facet}
+      onSelect={(id) => setFacet(id as KnowledgeFacet)}
+      entries={KNOWLEDGE_FACETS.map((value) => {
+        const Icon = knowledgeFacetIcon(value);
+        return {
+          id: value,
+          label: (
+            <span
+              className="inline-flex items-center gap-1.5"
+              data-testid={`knowledge-facet-${value}`}
+            >
+              <Icon className="h-3.5 w-3.5" aria-hidden />
+              {knowledgeFacetLabel(value, t)}
+              <span
+                className="text-muted/70"
+                title={
+                  facetCountsAreApproximate
+                    ? t("knowledgehub.approxCountHint", {
+                        defaultValue:
+                          "Approximate — whole-store counts are unavailable.",
+                      })
+                    : undefined
+                }
+              >
+                {facetCountsAreApproximate ? "~" : ""}
+                {facetCounts[value]}
+              </span>
+            </span>
+          ),
+        };
+      })}
+    />
   );
 
-  const documentContent = (
-    <div className="order-2 flex min-w-0 flex-1 md:order-1">
-      <DocumentViewer
-        documentId={selectedDocId}
-        onUpdated={() => {
-          void loadData();
-        }}
-      />
-    </div>
+  const scopeStrip = (
+    <SectionTabStrip
+      testId="knowledge-scope"
+      ariaLabel={t("knowledgehub.scopeLabel", {
+        defaultValue: "Filter knowledge by scope",
+      })}
+      activeId={scopeFilter}
+      onSelect={(id) => setScopeFilter(id as DocumentScopeFilter)}
+      className="py-1"
+      entries={SCOPE_FILTER_OPTIONS.map(
+        ({ value, labelKey, defaultLabel }) => ({
+          id: value,
+          label: t(labelKey, { defaultValue: defaultLabel }),
+        }),
+      )}
+    />
   );
 
-  const selectorRail = (
-    <div
-      className={`order-1 flex w-full shrink-0 flex-col gap-3 md:order-2 ${
-        useCompactSelectorRail
-          ? "md:w-[16rem] lg:w-[18.5rem] xl:w-[20rem]"
-          : "md:w-[18rem] lg:w-[22rem] xl:w-[24rem]"
-      }`}
-    >
-      {/* Flat — no card/border. The shell owns the page's horizontal padding. */}
-      <PagePanel
-        variant="inset"
-        className={useCompactSelectorRail ? "p-2" : "p-3"}
-      >
-        <UploadZone
-          fileInputId={fileInputId}
-          onFilesUpload={handleFilesUpload}
-          onTextUpload={handleTextUpload}
-          onUrlUpload={handleUrlUpload}
-          uploading={uploading}
-          uploadStatus={uploadStatus}
-        />
-      </PagePanel>
-
-      {/* Flat — no card/border. The shell owns the page's horizontal padding. */}
-      <PagePanel
-        variant="inset"
-        className={`flex flex-1 flex-col overflow-hidden p-2.5 ${
-          useCompactSelectorRail ? "min-h-[14rem]" : "min-h-[18rem]"
-        }`}
-      >
-        <div className="px-1">{scopeFilterStrip}</div>
-
-        <div className="custom-scrollbar mt-2 flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto px-0.5 py-0.5">
-          {loading && !isShowingSearchResults && documents.length === 0 && (
-            <ListSkeleton rows={6} />
-          )}
-
-          {!loading && !isShowingSearchResults && documents.length === 0 && (
-            <ChatEmptyStateWithRecommendations
-              icon={FileText}
-              title={t("documentsview.NoDocumentsYet", {
-                defaultValue: "No documents yet",
-              })}
-              recommendations={[
-                {
-                  label: t("documentsview.RecImportUrl", {
-                    defaultValue: "Import a document from a URL",
-                  }),
-                  prompt: t("documentsview.RecImportUrlPrompt", {
-                    defaultValue:
-                      "Import a document into my knowledge base from this URL: ",
-                  }),
-                },
-                {
-                  label: t("documentsview.RecCreateNote", {
-                    defaultValue: "Create a text note",
-                  }),
-                  prompt: t("documentsview.RecCreateNotePrompt", {
-                    defaultValue:
-                      "Create a text knowledge document for me to remember: ",
-                  }),
-                },
-                {
-                  label: t("documentsview.RecWhatToAdd", {
-                    defaultValue: "What should I add to Knowledge?",
-                  }),
-                },
-              ]}
-            />
-          )}
-
-          {!loading &&
-            !isShowingSearchResults &&
-            documents.length > 0 &&
-            filteredDocuments.length === 0 && (
-              <PagePanel.Empty
-                variant="inset"
-                className="min-h-[12rem] px-0 py-8"
-                description={t("documentsview.SearchTips", {
-                  defaultValue:
-                    "Try a filename, topic, or phrase from the document body.",
-                })}
-                title={t("documentsview.NoMatchingDocuments", {
-                  defaultValue: "No matching documents",
-                })}
-              />
-            )}
-
-          {isShowingSearchResults && visibleSearchResults.length === 0 && (
-            <PagePanel.Empty
-              variant="inset"
-              className="min-h-[12rem] px-0 py-8"
-              description={t("documentsview.SearchTips", {
-                defaultValue:
-                  "Try a filename, topic, or phrase from the document body.",
-              })}
-              title={t("documentsview.NoResultsFound")}
-            />
-          )}
-
-          {isShowingSearchResults
-            ? visibleSearchResults.map((result) => (
-                <SearchResultListItem
-                  key={result.id}
-                  result={result}
-                  active={selectedDocId === (result.documentId || result.id)}
-                  onSelect={setSelectedDocId}
-                />
-              ))
-            : filteredDocuments.map((doc) => (
-                <DocumentListItem
-                  key={doc.id}
-                  doc={doc}
-                  active={selectedDocId === doc.id}
-                  onSelect={setSelectedDocId}
-                  onDelete={handleDelete}
-                  deleting={deleting === doc.id}
-                />
-              ))}
-        </div>
-      </PagePanel>
-    </div>
-  );
-
-  const compactDocumentStrip = !shouldRenderSelectorRail ? (
-    /* Flat — no card/border. The shell owns the page's horizontal padding. */
-    <PagePanel
-      variant="inset"
-      className="flex shrink-0 flex-col gap-2 px-0 py-0"
-    >
-      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-end">
-        {fileInputId ? (
-          <label
-            htmlFor={fileInputId}
-            // Borderless accent action (#10710); text-accent (not accent-fg,
-            // which is near-white and illegible on a 10% wash).
-            className={`inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-sm bg-accent/10 px-3 text-xs font-semibold text-accent transition hover:bg-accent/20 ${
-              uploading ? "pointer-events-none opacity-60" : ""
-            }`}
-          >
-            <FileText className="h-3.5 w-3.5" aria-hidden />
-            {uploading
-              ? t("documentsview.Uploading", { defaultValue: "Uploading" })
-              : t("documentsview.AddKnowledge", {
-                  defaultValue: "Add Knowledge",
-                })}
-          </label>
-        ) : null}
-      </div>
-      <div>{scopeFilterStrip}</div>
-      <div className="custom-scrollbar flex gap-2 overflow-x-auto pb-1">
-        {isShowingSearchResults
-          ? visibleSearchResults.map((result) => (
-              <CompactSearchChip
-                key={result.id}
-                result={result}
-                active={selectedDocId === (result.documentId || result.id)}
-                onSelect={setSelectedDocId}
-              />
-            ))
-          : filteredDocuments.map((doc) => (
-              <CompactDocChip
-                key={doc.id}
-                doc={doc}
-                active={selectedDocId === doc.id}
-                onSelect={setSelectedDocId}
-              />
-            ))}
-      </div>
-    </PagePanel>
+  const hiddenFileInput = fileInputId ? (
+    <Input
+      id={fileInputId}
+      type="file"
+      className="hidden"
+      multiple
+      accept={DOCUMENT_UPLOAD_ACCEPT}
+      onChange={handleExternalFileInputChange}
+    />
   ) : null;
 
+  let listBody: ReactNode;
+  if (isShowingSearchResults) {
+    listBody =
+      visibleSearchResults.length === 0 ? (
+        <PagePanel.Empty
+          variant="inset"
+          className="min-h-[12rem] px-0 py-8"
+          description={t("documentsview.SearchTips", {
+            defaultValue:
+              "Try a filename, topic, or phrase from the document body.",
+          })}
+          title={t("documentsview.NoResultsFound")}
+        />
+      ) : (
+        visibleSearchResults.map((result) => (
+          <SearchResultListItem
+            key={result.id}
+            result={result}
+            onSelect={setSelectedDocId}
+          />
+        ))
+      );
+  } else if (loading && documents.length === 0) {
+    listBody = <ListSkeleton rows={6} />;
+  } else if (documents.length === 0 && facet !== "all") {
+    // Facet-empty (#13594): the list is server-filtered to this facet, so an
+    // empty page here means "no items of THIS media type" — not an empty
+    // store. Showing the global "No knowledge yet" would be misleading when
+    // other facets are populated, so render a per-facet no-matches state.
+    listBody = (
+      <PagePanel.Empty
+        variant="inset"
+        className="min-h-[12rem] px-0 py-10"
+        title={t("knowledgehub.facetEmptyTitle", {
+          defaultValue: "No {{facet}} here",
+          facet: knowledgeFacetLabel(facet, t).toLowerCase(),
+        })}
+        description={t("knowledgehub.facetEmptyHint", {
+          defaultValue:
+            "Switch facets above, or drop a file / ask in chat to add one.",
+        })}
+      />
+    );
+  } else if (documents.length === 0) {
+    // Calm designed-empty (#13594): no recommendation chips — the agent
+    // proposes next steps in chat. Quiet drag-drop/paste + the "Add" input
+    // remain the only intake.
+    listBody = (
+      <PagePanel.Empty
+        variant="inset"
+        className="min-h-[12rem] px-0 py-10"
+        title={t("documentsview.NoDocumentsYet", {
+          defaultValue: "No knowledge yet",
+        })}
+        description={t("knowledgehub.emptyHint", {
+          defaultValue:
+            "Drop a file here, or ask in chat to import a URL or save a note.",
+        })}
+      />
+    );
+  } else if (filteredDocuments.length === 0) {
+    listBody = (
+      <PagePanel.Empty
+        variant="inset"
+        className="min-h-[12rem] px-0 py-8"
+        description={t("documentsview.SearchTips", {
+          defaultValue:
+            "Try a filename, topic, or phrase from the document body.",
+        })}
+        title={t("documentsview.NoMatchingDocuments", {
+          defaultValue: "No matching items",
+        })}
+      />
+    );
+  } else {
+    listBody = filteredDocuments.map((doc) => (
+      <KnowledgeListItem
+        key={doc.id}
+        doc={doc}
+        onSelect={setSelectedDocId}
+        onDelete={handleDelete}
+        deleting={deleting === doc.id}
+      />
+    ));
+  }
+
+  // The reader replaces the list entirely (pushed sub-view). Its own back
+  // control returns to the list; the shell/character-hub header stays above.
+  if (selectedDocId) {
+    return (
+      <div
+        className={`flex min-h-0 flex-1 flex-col ${inModal ? "min-h-0" : ""}`}
+        data-testid="documents-view"
+      >
+        <ViewHeader
+          title={t("knowledgehub.readerTitle", { defaultValue: "Knowledge" })}
+          onBack={() => setSelectedDocId(null)}
+          backLabel={t("knowledgehub.backToList", {
+            defaultValue: "Back to Knowledge",
+          })}
+          className="px-0"
+        />
+        <div className="flex min-h-0 flex-1 flex-col">
+          <DocumentViewer
+            documentId={selectedDocId}
+            onUpdated={() => {
+              void loadData();
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: file-drop target only; the keyboard-accessible upload path is the "Add Knowledge" file input rendered below.
+    // biome-ignore lint/a11y/noStaticElementInteractions: file-drop target only; the keyboard-accessible upload path is the "Add" file input.
     <div
-      className={`flex flex-1 min-h-0 flex-col gap-4 ${inModal ? "min-h-0" : ""}`}
+      className={`flex min-h-0 flex-1 flex-col gap-3 ${inModal ? "min-h-0" : ""}`}
       data-testid="documents-view"
       onDragOver={handleRootDragOver}
       onDrop={handleRootDrop}
     >
-      {!shouldRenderSelectorRail && fileInputId ? (
-        <Input
-          id={fileInputId}
-          type="file"
-          className="hidden"
-          multiple
-          accept={DOCUMENT_UPLOAD_ACCEPT}
-          onChange={handleExternalFileInputChange}
+      {standalone ? (
+        <ViewHeader
+          title={t("knowledgehub.title", { defaultValue: "Knowledge" })}
+          className="px-0"
         />
       ) : null}
+      {hiddenFileInput}
 
       {isServiceLoading && (
         <PagePanel
@@ -1446,11 +1247,33 @@ export function DocumentsView({
         </PagePanel.Notice>
       )}
 
-      {compactDocumentStrip}
+      {!documentsUnavailable && (
+        <div className="flex shrink-0 flex-col gap-0.5">
+          <div className="flex items-center justify-between gap-2">
+            {isShowingSearchResults ? <span aria-hidden /> : facetStrip}
+            {fileInputId ? (
+              <label
+                htmlFor={fileInputId}
+                data-testid="knowledge-add"
+                // Borderless accent action (#10710): text-accent on a faint
+                // wash, darkens on hover — the sole, quiet intake affordance.
+                className={`inline-flex h-8 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-sm bg-accent/10 px-3 text-xs font-semibold text-accent transition hover:bg-accent/20 ${
+                  uploading ? "pointer-events-none opacity-60" : ""
+                }`}
+              >
+                <Plus className="h-3.5 w-3.5" aria-hidden />
+                {uploading
+                  ? t("documentsview.Uploading", { defaultValue: "Uploading" })
+                  : t("common.add", { defaultValue: "Add" })}
+              </label>
+            ) : null}
+          </div>
+          {!isShowingSearchResults && scopeStrip}
+        </div>
+      )}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-4 md:flex-row">
-        {documentContent}
-        {shouldRenderSelectorRail ? selectorRail : null}
+      <div className="custom-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {listBody}
       </div>
     </div>
   );
