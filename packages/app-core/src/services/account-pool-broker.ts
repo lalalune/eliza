@@ -6,6 +6,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { getAccessToken } from "@elizaos/auth/credentials";
+import { logger } from "@elizaos/core";
 import type {
   AccountPoolBrokerAccountSnapshot,
   AccountPoolBrokerFailoverSnapshot,
@@ -13,7 +14,6 @@ import type {
   AccountPoolBrokerProviderSnapshot,
   AccountPoolBrokerSnapshot,
 } from "@elizaos/core";
-import { logger } from "@elizaos/core";
 import type { LinkedAccountUsage } from "@elizaos/shared/contracts/service-routing";
 import { isLinkedAccountProviderId } from "@elizaos/shared/contracts/service-routing";
 import {
@@ -232,16 +232,9 @@ function reportIsAuthFailure(report: AccountPoolBrokerReportRequest): boolean {
   return report.errorCode ? isAuthFailure(report.errorCode) : false;
 }
 
-function reportErrorCodeMatches(
-  report: AccountPoolBrokerReportRequest,
-  pattern: RegExp,
-): boolean {
-  return report.errorCode !== undefined && pattern.test(report.errorCode);
-}
-
 function reportIsRateLimit(report: AccountPoolBrokerReportRequest): boolean {
   if (report.httpStatus === 429) return true;
-  return reportErrorCodeMatches(report, /rate.?limit|quota|subscription/i);
+  return /rate.?limit|quota|subscription/i.test(report.errorCode ?? "");
 }
 
 function reportIsTransient(report: AccountPoolBrokerReportRequest): boolean {
@@ -252,9 +245,8 @@ function reportIsTransient(report: AccountPoolBrokerReportRequest): boolean {
   ) {
     return true;
   }
-  return reportErrorCodeMatches(
-    report,
-    /\b(timeout|timed.?out|overload|unavailable|reset|network)\b/i,
+  return /\b(timeout|timed.?out|overload|unavailable|reset|network)\b/i.test(
+    report.errorCode ?? "",
   );
 }
 
@@ -287,9 +279,9 @@ function normalizeReportCause(
       reason:
         typeof status === "number" && status >= 500 && status <= 599
           ? "http_5xx"
-          : reportErrorCodeMatches(report, /\b(timeout|timed.?out)\b/i)
+          : /\b(timeout|timed.?out)\b/i.test(report.errorCode ?? "")
             ? "timeout"
-            : reportErrorCodeMatches(report, /\b(network|reset)\b/i)
+            : /\b(network|reset)\b/i.test(report.errorCode ?? "")
               ? "network"
               : "transient_error",
     };
@@ -388,7 +380,7 @@ export class AccountPoolBroker {
   ): Promise<AccountPoolBrokerLeaseResponse | null> {
     this.pruneExpired();
     const now = this.now();
-    const exclude = new Set(request.exclude);
+    const exclude = new Set(request.exclude ?? []);
     const pinned = this.resolveSessionPin(request.sessionKey);
     const configured = selectionForProvider(request.providerId);
     const account =
@@ -632,20 +624,15 @@ export class AccountPoolBroker {
     const activeCounts = new Map<string, number>();
     for (const lease of this.byLeaseId.values()) {
       const key = observabilityAccountKey(lease.providerId, lease.accountId);
-      const current = activeCounts.get(key);
-      activeCounts.set(key, current === undefined ? 1 : current + 1);
+      activeCounts.set(key, (activeCounts.get(key) ?? 0) + 1);
     }
-    const activeLeaseCount = (key: string): number => {
-      const count = activeCounts.get(key);
-      return count === undefined ? 0 : count;
-    };
 
     const accounts: AccountPoolBrokerSnapshot["accounts"] = {};
     for (const account of this.pool.list()) {
       const key = observabilityAccountKey(account.providerId, account.id);
       const state = this.accountObservability.get(key);
       accounts[key] = {
-        activeLeaseCount: activeLeaseCount(key),
+        activeLeaseCount: activeCounts.get(key) ?? 0,
         lastLease: state?.lastLease ?? null,
         lastLeaseAt: state?.lastLease?.atMs ?? null,
         lastReportedStatus: state?.lastReportedStatus ?? null,
@@ -653,7 +640,7 @@ export class AccountPoolBroker {
     }
     for (const [key, state] of this.accountObservability) {
       accounts[key] ??= {
-        activeLeaseCount: activeLeaseCount(key),
+        activeLeaseCount: activeCounts.get(key) ?? 0,
         lastLease: state.lastLease,
         lastLeaseAt: state.lastLease?.atMs ?? null,
         lastReportedStatus: state.lastReportedStatus,
@@ -667,10 +654,11 @@ export class AccountPoolBroker {
     ]);
     const providers: AccountPoolBrokerSnapshot["providers"] = {};
     for (const providerId of providerIds) {
-      const recentFailovers = this.recentFailoversByProvider.get(providerId);
       providers[providerId] = {
         lastSelection: this.lastSelectionByProvider.get(providerId) ?? null,
-        recentFailovers: recentFailovers ? [...recentFailovers] : [],
+        recentFailovers: [
+          ...(this.recentFailoversByProvider.get(providerId) ?? []),
+        ],
       };
     }
     return { accounts, providers };
@@ -715,11 +703,11 @@ export class AccountPoolBroker {
       cause: pending.cause,
       ...(pending.model ? { model: pending.model } : {}),
     };
-    const recent = this.recentFailoversByProvider.get(lease.providerId);
-    const next = recent ? [...recent, failover] : [failover];
+    const recent = this.recentFailoversByProvider.get(lease.providerId) ?? [];
+    recent.push(failover);
     this.recentFailoversByProvider.set(
       lease.providerId,
-      next.slice(-MAX_RECENT_FAILOVERS),
+      recent.slice(-MAX_RECENT_FAILOVERS),
     );
   }
 
