@@ -2300,11 +2300,11 @@ describe("ChatOverlay", () => {
     expect(pill.getAttribute("tabindex")).toBeNull();
   });
 
-  it("opens the chat to HALF on a SINGLE pill tap (not the bare input bar)", () => {
-    // Regression: a tap on the pill used to land on the bare input bar (the
-    // chat "blinked" without opening) and needed a SECOND tap to reach half.
-    // With a conversation to show, ONE tap must open straight to half — exactly
-    // like a flick-up.
+  it("forms the input bar on a pill tap — no keyboard, no half detent", () => {
+    // A tap on the resting capsule QUIETLY reveals the bare input bar: never
+    // the soft keyboard (the composer is not focused — typing is an explicit
+    // second tap on the composer itself) and never a detent jump, even with a
+    // conversation to show (opening the thread stays on flick/drag/grabber).
     render(<ChatOverlay controller={makeController()} />);
     const sheet = screen.getByTestId("chat-sheet");
     const grabber = screen.getByTestId("chat-sheet-grabber");
@@ -2316,21 +2316,21 @@ describe("ChatOverlay", () => {
     // pull-gesture binding is the single tap authority (onPointerUp → onTap).
     fireEvent.pointerDown(pill, { clientY: 400, pointerId: 1 });
     fireEvent.pointerUp(pill, { clientY: 400, pointerId: 1 });
-    expect(sheet.getAttribute("data-detent")).toBe("half");
+    expect(sheet.getAttribute("data-detent")).toBe("collapsed");
+    expect(sheet.getAttribute("data-chat-state")).toBe("INPUT");
     const textarea = screen.getByTestId("chat-composer-textarea");
     expect(textarea).toBeTruthy();
-    // The pill tap must focus the composer (so iOS raises the keyboard on the
-    // first tap) and clear the `inert` it carried while pilled — without that,
-    // the composer silently refuses keyboard input until a second tap.
-    expect(document.activeElement).toBe(textarea);
+    expect(document.activeElement).not.toBe(textarea);
+    // The un-pilled render clears the `inert` the content carried while pilled,
+    // so the NEXT tap lands directly on the live composer.
     expect(screen.getByTestId("chat-content").hasAttribute("inert")).toBe(
       false,
     );
   });
 
-  it("opens a thread-less pill tap to the bare input bar (nothing to open into)", () => {
-    // With no conversation yet there's no thread to reveal, so a pill tap forms
-    // the input bar (and raises the keyboard) rather than an empty half sheet.
+  it("opens a thread-less pill tap to the bare input bar without the keyboard", () => {
+    // No conversation, same contract: the tap forms the input bar and leaves
+    // the keyboard down — raising it is the composer's own tap.
     render(<ChatOverlay controller={makeController({ messages: [] })} />);
     const sheet = screen.getByTestId("chat-sheet");
     const grabber = screen.getByTestId("chat-sheet-grabber");
@@ -2341,14 +2341,17 @@ describe("ChatOverlay", () => {
     fireEvent.pointerDown(pill, { clientY: 400, pointerId: 1 });
     fireEvent.pointerUp(pill, { clientY: 400, pointerId: 1 });
     expect(sheet.getAttribute("data-detent")).toBe("collapsed");
-    expect(document.activeElement).toBe(
+    expect(document.activeElement).not.toBe(
       screen.getByTestId("chat-composer-textarea"),
     );
   });
 
-  it("opens the pill on keyboard activation (Enter)", () => {
+  it("opens the pill on keyboard activation (Enter) and focuses the composer", () => {
     // Keyboard users still open the pill via onKeyDown even though the native
-    // onClick was removed in favour of the gesture binding.
+    // onClick was removed in favour of the gesture binding. Unlike a pointer
+    // tap, activation MUST move focus into the composer: the pill leaves the
+    // a11y tree (aria-hidden + tabindex −1) the moment it opens, and focus may
+    // not strand on a hidden control.
     render(<ChatOverlay controller={makeController()} />);
     const sheet = screen.getByTestId("chat-sheet");
     const grabber = screen.getByTestId("chat-sheet-grabber");
@@ -2357,7 +2360,10 @@ describe("ChatOverlay", () => {
     fireEvent.pointerUp(grabber, { clientY: 380, pointerId: 1 });
     expect(sheet.getAttribute("data-detent")).toBe("pill");
     fireEvent.keyDown(screen.getByTestId("chat-pill"), { key: "Enter" });
-    expect(sheet.getAttribute("data-detent")).toBe("half");
+    expect(sheet.getAttribute("data-detent")).toBe("collapsed");
+    expect(document.activeElement).toBe(
+      screen.getByTestId("chat-composer-textarea"),
+    );
   });
 
   it("flicks UP from the pill to recover the input", () => {

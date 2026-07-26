@@ -32,7 +32,7 @@ Continuous motion values: `threadHeight` (px, finger-tracked), `openProgress`
 ### From PILL
 | Gesture | Result |
 | --- | --- |
-| Tap | HALF when a thread exists (single tap always opens the chat), else INPUT + keyboard. |
+| Tap | INPUT — the input bar forms quietly: no soft keyboard (the composer is not focused; typing is an explicit tap on the composer itself) and no detent jump, even with a thread to show (opening the thread stays on flick/drag/grabber-tap). Keyboard activation (Enter/Space on the pill) also lands INPUT but moves focus into the composer — activation may not strand focus on the hidden pill. |
 | Flick up (short) | HALF when a thread exists, else INPUT. |
 | Held drag up, released anywhere | One continuum: first 120px morphs pill→input (`openProgress`), excess flows into the thread height. Release: < 64px of thread → INPUT; ≥ half+64 → FULL; between → HALF or free rest; a long haul (≥ 80% of the screen) → **MAXIMIZED**. |
 | Slow drag up < half the pill morph (`openProgress` < 0.5) | springs back to PILL. |

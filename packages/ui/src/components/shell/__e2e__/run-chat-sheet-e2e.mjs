@@ -15,7 +15,8 @@
  *       the PILL, with per-step geometry sampling (monotonic height, pill
  *       crossfade, edge-to-edge box, fixed-width text column). Detent rules:
  *       pill nudge springs back · pill drag past half-morph rests at INPUT ·
- *       short input pull springs back · pill tap → HALF · grabber tap → INPUT.
+ *       short input pull springs back · pill tap → INPUT (quiet: no keyboard,
+ *       no detent) · grabber tap toggles HALF ↔ INPUT.
  *       Full matrix: CHAT_SHEET_STATE_MATRIX.md.
  *   - AUTOSCROLL, per input type: tail follows at bottom, a single >80px
  *       streamed growth remains pinned, reading-scrollback is not yanked, and
@@ -963,7 +964,7 @@ async function runContinuumSuite(p, pointer, tag) {
   );
   await snap(p, `${tag}-continuum-back-to-pill`);
 
-  // -- Detent rules: pill tap → HALF; open + grabber tap → INPUT -------------
+  // -- Detent rules: pill tap → INPUT (quiet); grabber tap toggles HALF ↔ INPUT
   if (pointer === "mouse") {
     await p.getByTestId("chat-pill").click();
   } else {
@@ -971,12 +972,19 @@ async function runContinuumSuite(p, pointer, tag) {
   }
   await p.waitForTimeout(SETTLE);
   assert(
-    (await detent(p)) === "half",
-    `[${tag}-continuum] pill tap opens straight to HALF`,
+    (await detent(p)) === "collapsed" && (await variant(p)) === "closed",
+    `[${tag}-continuum] pill tap quietly forms the input bar (no detent jump)`,
   );
-  // The pill tap also focused the composer (keyboard up), so the FIRST grabber
-  // tap dismisses the keyboard and keeps the sheet at its detent; the SECOND
-  // collapses to the input bar — the designed two-step.
+  // The quiet open must NOT raise the keyboard: the composer stays unfocused
+  // until the user explicitly taps it.
+  assert(
+    (await p.evaluate(
+      () => document.activeElement?.getAttribute("data-testid"),
+    )) !== "chat-composer-textarea",
+    `[${tag}-continuum] pill tap leaves the composer unfocused (keyboard down)`,
+  );
+  // From the formed input bar the grabber is the disclosure toggle: one tap
+  // opens the thread to HALF, the next collapses back to the input bar.
   const grabberTap = async () => {
     if (pointer === "mouse") await p.getByTestId("chat-sheet-grabber").click();
     else await touchTap(p, testIdSelector("chat-sheet-grabber"));
@@ -985,7 +993,7 @@ async function runContinuumSuite(p, pointer, tag) {
   await grabberTap();
   assert(
     (await detent(p)) === "half",
-    `[${tag}-continuum] first grabber tap (keyboard up) dismisses the keyboard, stays HALF`,
+    `[${tag}-continuum] grabber tap from INPUT opens the thread to HALF`,
   );
   await grabberTap();
   assert(
