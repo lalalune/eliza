@@ -12,6 +12,7 @@ import {
   AgentRuntime,
   createCharacter,
   type Plugin,
+  type Service,
   ServiceType,
   stringToUuid,
   type Task,
@@ -20,7 +21,6 @@ import {
 import { NotificationService } from '@elizaos/core/node';
 import { eq } from 'drizzle-orm';
 import { registerTriggerTaskWorker } from '../../../../packages/agent/src/triggers/runtime.ts';
-import { TaskService } from '../../../../packages/core/src/services/task.ts';
 import { plugin as sqlPlugin } from '../../../plugin-sql/src/index.ts';
 import { DatabaseMigrationService } from '../../../plugin-sql/src/migration-service.ts';
 import { PgliteDatabaseAdapter } from '../../../plugin-sql/src/pglite/adapter.ts';
@@ -145,9 +145,30 @@ async function getEmbedded(runtime: AgentRuntime): Promise<EmbeddedWorkflowServi
   return service;
 }
 
-async function getTaskService(runtime: AgentRuntime): Promise<TaskService> {
+/**
+ * The one TaskService capability this test drives. The runtime registers its
+ * own TaskService class — under canonical dist resolution that is a different
+ * module instance from this package's raw-src imports — so an `instanceof`
+ * check against a src-imported TaskService fails on module identity alone.
+ * The service is identified structurally instead: class-level serviceType
+ * plus this capability.
+ */
+interface DueTaskRunner {
+  runDueTasks(): Promise<void>;
+}
+
+function isDueTaskRunner(service: Service): service is Service & DueTaskRunner {
+  const serviceClass = service.constructor as { serviceType?: string };
+  return (
+    serviceClass.serviceType === ServiceType.TASK &&
+    'runDueTasks' in service &&
+    typeof service.runDueTasks === 'function'
+  );
+}
+
+async function getTaskService(runtime: AgentRuntime): Promise<Service & DueTaskRunner> {
   const service = await runtime.getServiceLoadPromise(ServiceType.TASK);
-  if (!(service instanceof TaskService)) {
+  if (!isDueTaskRunner(service)) {
     throw new Error('Task service did not start');
   }
   return service;
