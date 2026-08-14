@@ -6,3 +6,13 @@ after upstream-502: HTTP 502 retry-after=60
 after timeout-abort: HTTP 503 retry-after=60
 after unexpected-404: HTTP 502 retry-after=(none)
 after malformed-2xx: HTTP 502 retry-after=(none)
+
+Exact repaired head: 418f443bf6f6081cda033dff07221c819019d3ea
+Focused route suite: 20 passed, 0 failed
+Root verify: 350/350 Turbo tasks and all repository audits passed
+
+The repaired timeout regression keeps the fetch pending for 14,999 ms,
+observes the real AbortSignal at 15,000 ms, and models the upstream claim
+completing after caller abort. Both the timeout and 5xx pages therefore say
+that sign-in completion could not be confirmed; neither asserts that the
+one-time token was accepted or rejected.
