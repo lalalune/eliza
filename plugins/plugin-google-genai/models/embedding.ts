@@ -3,11 +3,11 @@
  * `gemini-embedding-001`; overridable via `GOOGLE_EMBEDDING_MODEL`).
  * A `null`/empty-object input is treated as an initialization probe and answered
  * with a fixed 768-length marker vector so the runtime can size its embedding
- * column without a network call; real text is truncated to the model's
- * documented input token limit (2,048 for the default `gemini-embedding-001`,
- * 8,192 for the larger-window `gemini-embedding-2`) via
- * `getEmbeddingInputTokenLimit`, embedded, and reported via
- * `emitModelUsageEvent`. Real requests
+ * column without a network call; real text is counted with the provider's own
+ * tokenizer and, when necessary, reduced on Unicode code-point boundaries to
+ * the model's documented input token limit (2,048 for the default
+ * `gemini-embedding-001`, 8,192 for `gemini-embedding-2`). Real requests are
+ * embedded and reported via `emitModelUsageEvent`, and
  * pin `outputDimensionality` to the same 768 width as the probe and L2-normalize
  * the result, because the default `gemini-embedding-001` otherwise emits its
  * 3072-dim default and every write would fail the probe-sized column (#22010).
@@ -30,7 +30,6 @@ import {
   getEmbeddingModel,
 } from "../utils/config";
 import { emitModelUsageEvent } from "../utils/events";
-import { countTokens } from "../utils/tokenization";
 
 const TEXT_EMBEDDING_MODEL_TYPE = ((
   ElizaCore as { ModelType?: Record<string, string> }
@@ -45,6 +44,103 @@ const TEXT_EMBEDDING_MODEL_TYPE = ((
  * reduced width.
  */
 const EMBEDDING_DIMENSIONS = 768;
+
+type GoogleGenAIClient = NonNullable<ReturnType<typeof createGoogleGenAI>>;
+
+interface PreparedEmbeddingInput {
+  text: string;
+  tokenCount: number;
+}
+
+async function countEmbeddingTokens(
+  genAI: GoogleGenAIClient,
+  model: string,
+  text: string,
+): Promise<number> {
+  try {
+    const response = await genAI.models.countTokens({ model, contents: text });
+    const tokenCount = response.totalTokens;
+    if (
+      typeof tokenCount !== "number" ||
+      !Number.isSafeInteger(tokenCount) ||
+      tokenCount <= 0
+    ) {
+      throw new ElizaError(
+        "Google GenAI token counter returned an invalid token count",
+        {
+          code: "EMBEDDING_TOKEN_COUNT_INVALID",
+          context: { model, tokenCount },
+        },
+      );
+    }
+    return tokenCount;
+  } catch (error) {
+    // error-policy:J2 context-adding rethrow — token counting is the provider
+    // correctness boundary, so preserve the cause and never continue to embed.
+    if (error instanceof ElizaError) {
+      throw error;
+    }
+    throw new ElizaError(
+      `Google GenAI could not count embedding input tokens for model "${model}"`,
+      {
+        code: "EMBEDDING_TOKEN_COUNT_FAILED",
+        context: { model },
+        cause: error,
+      },
+    );
+  }
+}
+
+/**
+ * Count with the same provider/model boundary used by `embedContent`, then
+ * shrink only when the provider says the input is oversized. The proportional
+ * step is merely a search optimization: every candidate is counted again and
+ * only a provider-verified prefix can escape. `Array.from` prevents slicing a
+ * UTF-16 surrogate pair while reducing emoji and other non-BMP input.
+ */
+async function prepareEmbeddingInput(
+  genAI: GoogleGenAIClient,
+  model: string,
+  text: string,
+  tokenLimit: number,
+): Promise<PreparedEmbeddingInput> {
+  const originalTokenCount = await countEmbeddingTokens(genAI, model, text);
+  if (originalTokenCount <= tokenLimit) {
+    return { text, tokenCount: originalTokenCount };
+  }
+
+  const codePoints = Array.from(text);
+  let candidateLength = Math.max(
+    1,
+    Math.floor((codePoints.length * tokenLimit) / originalTokenCount),
+  );
+
+  while (candidateLength > 0) {
+    const candidate = codePoints.slice(0, candidateLength).join("");
+    const candidateTokenCount = await countEmbeddingTokens(
+      genAI,
+      model,
+      candidate,
+    );
+    if (candidateTokenCount <= tokenLimit) {
+      return { text: candidate, tokenCount: candidateTokenCount };
+    }
+
+    const nextLength = Math.floor(
+      (candidateLength * tokenLimit) / candidateTokenCount,
+    );
+    candidateLength =
+      nextLength < candidateLength ? nextLength : candidateLength - 1;
+  }
+
+  throw new ElizaError(
+    `Google embedding model "${model}" cannot accept any non-empty prefix within its ${tokenLimit}-token input limit`,
+    {
+      code: "EMBEDDING_INPUT_UNREPRESENTABLE",
+      context: { model, tokenLimit },
+    },
+  );
+}
 
 function createInitProbeVector(): number[] {
   const vector = Array(EMBEDDING_DIMENSIONS).fill(0);
@@ -146,21 +242,22 @@ export async function handleTextEmbedding(
   const embeddingModelName = getEmbeddingModel(runtime);
   logger.debug(`[TEXT_EMBEDDING] Using model: ${embeddingModelName}`);
 
-  // Truncate to stay within the model's documented input token limit. The limit
-  // is model-aware (gemini-embedding-001 -> 2048, gemini-embedding-2 -> 8192,
-  // safe 2048 default for unmapped overrides); the ~4 chars/token factor only
-  // converts that token limit to a character slice. This boundary is a real
-  // provider constraint, not the telemetry-only `length / 4` estimate.
   const tokenLimit = getEmbeddingInputTokenLimit(embeddingModelName);
-  const maxChars = tokenLimit * 4;
-  if (text.length > maxChars) {
-    logger.warn(
-      `[Google GenAI] Embedding input too long (~${Math.ceil(text.length / 4)} tokens) for model "${embeddingModelName}", truncating to its ${tokenLimit}-token (~${maxChars}-char) input limit`,
-    );
-    text = text.slice(0, maxChars);
-  }
 
   try {
+    const prepared = await prepareEmbeddingInput(
+      genAI,
+      embeddingModelName,
+      text,
+      tokenLimit,
+    );
+    if (prepared.text !== text) {
+      logger.warn(
+        `[Google GenAI] Embedding input has more than ${tokenLimit} provider-counted tokens for model "${embeddingModelName}"; truncating on a Unicode code-point boundary to ${prepared.tokenCount} tokens`,
+      );
+      text = prepared.text;
+    }
+
     const response = await genAI.models.embedContent({
       model: embeddingModelName,
       contents: text,
@@ -198,12 +295,10 @@ export async function handleTextEmbedding(
     // is unit-length and cosine-comparable like the native 768-dim model.
     const embedding = l2Normalize(rawEmbedding);
 
-    const promptTokens = await countTokens(text);
-
     emitModelUsageEvent(runtime, TEXT_EMBEDDING_MODEL_TYPE, text, {
-      promptTokens,
+      promptTokens: prepared.tokenCount,
       completionTokens: 0,
-      totalTokens: promptTokens,
+      totalTokens: prepared.tokenCount,
     });
 
     logger.log(`Got embedding with length ${embedding.length}`);

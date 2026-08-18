@@ -49,6 +49,12 @@ Or register it explicitly in your agent character file:
 
 Generic fallbacks (`SMALL_MODEL`, `LARGE_MODEL`, `IMAGE_MODEL`, etc.) are also respected when the `GOOGLE_*` prefix variants are not set.
 
+Embedding input limits are enforced with Google's `models.countTokens` result,
+not a character-length estimate. Oversized input is truncated on Unicode
+code-point boundaries and counted again before `embedContent` is called; the
+default model uses its documented 2,048-token limit, while
+`gemini-embedding-2` uses 8,192 tokens.
+
 ## Usage
 
 Once the plugin is loaded, use any Gemini model through the standard elizaOS runtime interface:

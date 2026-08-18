@@ -6,15 +6,19 @@
  * response, width mismatch, zero-magnitude, non-finite components, and a norm
  * that overflows to a non-finite value). The real `ElizaError` is used via
  * `importActual` so the typed `code`/`context` contract is asserted against the
- * class the handler actually throws; the config, events, tokenization, and
- * `@google/genai` layers are mocked — no live call.
+ * class the handler actually throws. Most cases mock the provider, while one
+ * deterministic local-HTTP case drives the real `@google/genai` SDK through
+ * both `countTokens` and `embedContent`; no external network or credential.
  */
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { IAgentRuntime } from "@elizaos/core";
+import { GoogleGenAI } from "@google/genai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  countTokens: vi.fn(),
   createGoogleGenAI: vi.fn(),
+  countEmbeddingTokens: vi.fn(),
   embedContent: vi.fn(),
   emitModelUsageEvent: vi.fn(),
   getEmbeddingModel: vi.fn(() => "gemini-embedding-001"),
@@ -56,10 +60,6 @@ vi.mock("../utils/events", () => ({
   emitModelUsageEvent: mocks.emitModelUsageEvent,
 }));
 
-vi.mock("../utils/tokenization", () => ({
-  countTokens: mocks.countTokens,
-}));
-
 import { handleTextEmbedding } from "../models/embedding";
 
 function createRuntime(): IAgentRuntime {
@@ -73,7 +73,7 @@ describe("Google GenAI embeddings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getEmbeddingModel.mockReturnValue("gemini-embedding-001");
-    mocks.countTokens.mockResolvedValue(5);
+    mocks.countEmbeddingTokens.mockResolvedValue({ totalTokens: 5 });
     // gemini-embedding-001 honours outputDimensionality:768 and returns a
     // 768-length (un-normalized) vector for that request.
     mocks.embedContent.mockResolvedValue({
@@ -81,6 +81,7 @@ describe("Google GenAI embeddings", () => {
     });
     mocks.createGoogleGenAI.mockReturnValue({
       models: {
+        countTokens: mocks.countEmbeddingTokens,
         embedContent: mocks.embedContent,
       },
     });
@@ -249,11 +250,17 @@ describe("Google GenAI embeddings", () => {
     });
   });
 
-  it("truncates an oversized input to the default model's 2,048-token (~8,192-char) limit before the embedContent call", async () => {
-    // gemini-embedding-001 documents a 2,048-token input limit. The handler must
-    // slice the text to ~4 chars/token = 8,192 chars BEFORE the SDK call, so the
-    // mocked embedContent never sees more than 8,192 characters for this model.
+  it("truncates provider-counted oversized ASCII input at the default model's 2,048-token limit", async () => {
+    // This deterministic provider fixture tokenizes ASCII at four characters
+    // per token. The handler must use its reported counts and verify the prefix
+    // before embedContent sees it; the ratio is fixture behavior, not product
+    // correctness logic.
     mocks.getEmbeddingModel.mockReturnValue("gemini-embedding-001");
+    mocks.countEmbeddingTokens.mockImplementation(
+      async ({ contents }: { contents: string }) => ({
+        totalTokens: Math.ceil(Array.from(contents).length / 4),
+      }),
+    );
     const oversized = "a".repeat(20_000);
 
     await handleTextEmbedding(createRuntime(), oversized);
@@ -268,12 +275,16 @@ describe("Google GenAI embeddings", () => {
     expect(passed.contents).toBe("a".repeat(8_192));
   });
 
-  it("does NOT truncate a gemini-embedding-2 override to the smaller 2,048 limit for the same input", async () => {
-    // gemini-embedding-2 supports an 8,192-token window (~32,768 chars). The
-    // same 20,000-char input that is cut to 8,192 chars under the default model
-    // must pass through untouched here, proving the limit is model-aware and not
-    // pinned to the old hardcoded boundary.
+  it("does not truncate a gemini-embedding-2 override to the smaller 2,048-token limit", async () => {
+    // The fixture counts this input at 5,000 tokens. It exceeds the default
+    // model's 2,048-token limit but fits gemini-embedding-2's 8,192-token limit,
+    // proving the decision is model-aware and based on the provider count.
     mocks.getEmbeddingModel.mockReturnValue("gemini-embedding-2");
+    mocks.countEmbeddingTokens.mockImplementation(
+      async ({ contents }: { contents: string }) => ({
+        totalTokens: Math.ceil(Array.from(contents).length / 4),
+      }),
+    );
     const input = "a".repeat(20_000);
 
     await handleTextEmbedding(createRuntime(), input);
@@ -289,14 +300,142 @@ describe("Google GenAI embeddings", () => {
 
   it("truncates an unmapped override to the safe 2,048-token default limit", async () => {
     // An override id not present in the limit map falls back to the safe 2,048
-    // limit (never the larger 8,192 window), so it is cut to 8,192 chars.
+    // limit (never the larger 8,192 window). The fixture reports the selected
+    // 8,192-character prefix as exactly 2,048 tokens.
     mocks.getEmbeddingModel.mockReturnValue("some-unknown-embedding-model");
+    mocks.countEmbeddingTokens.mockImplementation(
+      async ({ contents }: { contents: string }) => ({
+        totalTokens: Math.ceil(Array.from(contents).length / 4),
+      }),
+    );
     const oversized = "b".repeat(40_000);
 
     await handleTextEmbedding(createRuntime(), oversized);
 
     const passed = mocks.embedContent.mock.calls[0][0] as { contents: string };
     expect(passed.contents.length).toBe(8_192);
+  });
+
+  it("uses the provider tokenizer for token-dense Unicode and never splits a surrogate pair", async () => {
+    mocks.getEmbeddingModel.mockReturnValue("gemini-embedding-001");
+    mocks.countEmbeddingTokens.mockImplementation(
+      async ({ contents }: { contents: string }) => ({
+        // Model a token-dense input where each non-BMP code point consumes two
+        // provider tokens. Its UTF-16 length remains far below the PR's former
+        // 8,192-character boundary, so a character heuristic would miss it.
+        totalTokens: Array.from(contents).length * 2,
+      }),
+    );
+    const oversized = "😀".repeat(1_500);
+    expect(oversized.length).toBe(3_000);
+
+    await handleTextEmbedding(createRuntime(), oversized);
+
+    const passed = mocks.embedContent.mock.calls[0][0] as { contents: string };
+    expect(Array.from(passed.contents)).toHaveLength(1_024);
+    expect(passed.contents).toBe("😀".repeat(1_024));
+    expect(Array.from(passed.contents).length * 2).toBeLessThanOrEqual(2_048);
+    expect(mocks.countEmbeddingTokens).toHaveBeenCalledWith({
+      model: "gemini-embedding-001",
+      contents: passed.contents,
+    });
+  });
+
+  it("drives the real Google SDK countTokens boundary before embedding token-dense Unicode", async () => {
+    const requests: Array<{ path: string; text: string }> = [];
+    const server = createServer(async (request, response) => {
+      let rawBody = "";
+      for await (const chunk of request) {
+        rawBody += String(chunk);
+      }
+      const body = JSON.parse(rawBody) as {
+        content?: { parts?: Array<{ text?: string }> };
+        contents?: Array<{ parts?: Array<{ text?: string }> }>;
+        requests?: Array<{
+          content?: { parts?: Array<{ text?: string }> };
+        }>;
+      };
+      const requestContent =
+        body.contents?.[0] ?? body.content ?? body.requests?.[0]?.content;
+      const requestText = requestContent?.parts?.[0]?.text ?? "";
+      const path = request.url ?? "";
+      requests.push({ path, text: requestText });
+      response.setHeader("content-type", "application/json");
+      if (path.includes(":countTokens")) {
+        response.end(
+          JSON.stringify({ totalTokens: Array.from(requestText).length * 2 }),
+        );
+        return;
+      }
+      if (path.includes(":batchEmbedContents")) {
+        response.end(
+          JSON.stringify({
+            embeddings: [{ values: Array(768).fill(0.5) }],
+          }),
+        );
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: "unexpected path" }));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+
+    try {
+      const address = server.address() as AddressInfo;
+      const realClient = new GoogleGenAI({
+        apiKey: "deterministic-local-test-key",
+        httpOptions: { baseUrl: `http://127.0.0.1:${address.port}` },
+      });
+      mocks.createGoogleGenAI.mockReturnValue(realClient);
+      const oversized = "😀".repeat(1_500);
+
+      const embedding = await handleTextEmbedding(createRuntime(), oversized);
+
+      expect(embedding).toHaveLength(768);
+      expect(requests.map(({ path }) => path)).toEqual([
+        expect.stringContaining(":countTokens"),
+        expect.stringContaining(":countTokens"),
+        expect.stringContaining(":batchEmbedContents"),
+      ]);
+      expect(requests[0].text).toBe(oversized);
+      expect(requests[1].text).toBe("😀".repeat(1_024));
+      expect(requests[2].text).toBe(requests[1].text);
+      expect(Array.from(requests[2].text).length * 2).toBeLessThanOrEqual(
+        2_048,
+      );
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("fails closed before embedContent when provider token counting fails", async () => {
+    mocks.countEmbeddingTokens.mockRejectedValue(
+      new Error("countTokens unavailable"),
+    );
+
+    await expect(
+      handleTextEmbedding(createRuntime(), "hello"),
+    ).rejects.toMatchObject({
+      code: "EMBEDDING_TOKEN_COUNT_FAILED",
+      context: { model: "gemini-embedding-001" },
+    });
+    expect(mocks.embedContent).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before embedContent when the provider omits a valid token count", async () => {
+    mocks.countEmbeddingTokens.mockResolvedValue({ totalTokens: undefined });
+
+    await expect(
+      handleTextEmbedding(createRuntime(), "hello"),
+    ).rejects.toMatchObject({
+      code: "EMBEDDING_TOKEN_COUNT_INVALID",
+      context: { model: "gemini-embedding-001" },
+    });
+    expect(mocks.embedContent).not.toHaveBeenCalled();
   });
 
   it("throws for empty embedding input before creating a client", async () => {

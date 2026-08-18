@@ -174,6 +174,19 @@ describe("Google GenAI config", () => {
         GOOGLE_EMBEDDING_MODEL: { default: string; placeholder: string };
       };
     };
+    const generated = readPluginJson(
+      "../../packages/registry/src/first-party/generated.json",
+    ) as {
+      entries: Array<{
+        npmName: string;
+        config: {
+          GOOGLE_EMBEDDING_MODEL: { default: string; placeholder: string };
+        };
+      }>;
+    };
+    const generatedEntry = generated.entries.find(
+      ({ npmName }) => npmName === "@elizaos/plugin-google-genai",
+    );
 
     expect(
       pkg.agentConfig.pluginParameters.GOOGLE_EMBEDDING_MODEL.default,
@@ -185,5 +198,8 @@ describe("Google GenAI config", () => {
     const placeholder = registry.config.GOOGLE_EMBEDDING_MODEL.placeholder;
     expect(placeholder).toContain("gemini-embedding");
     expect(placeholder).not.toMatch(/text-embedding-3|gpt-|openai/i);
+    expect(generatedEntry?.config.GOOGLE_EMBEDDING_MODEL).toEqual(
+      registry.config.GOOGLE_EMBEDDING_MODEL,
+    );
   });
 });
