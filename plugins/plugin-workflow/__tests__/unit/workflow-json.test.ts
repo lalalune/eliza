@@ -2,6 +2,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   cloneJson,
+  MAX_WORKFLOW_JSON_BYTES,
   MAX_WORKFLOW_JSON_DEPTH,
   MAX_WORKFLOW_JSON_NODES,
   WORKFLOW_JSON_UNBOUNDED,
@@ -166,5 +167,20 @@ describe('cloneJson', () => {
       date: '2026-08-20T00:00:00.000Z',
       array: [null, null, 0],
     });
+  });
+
+  test('enforces the exact serialized UTF-8 byte ceiling', () => {
+    const exact = 'x'.repeat(MAX_WORKFLOW_JSON_BYTES - 2);
+    expect(cloneJson(exact)).toBe(exact);
+    expect(new TextEncoder().encode(JSON.stringify(cloneJson(exact))).byteLength).toBe(
+      MAX_WORKFLOW_JSON_BYTES
+    );
+    expectUnbounded(() => cloneJson(`${exact}x`));
+
+    const utf8 = '😀'.repeat(Math.floor(MAX_WORKFLOW_JSON_BYTES / 4));
+    expectUnbounded(() => cloneJson(utf8));
+
+    const oversizedKey = 'k'.repeat(MAX_WORKFLOW_JSON_BYTES);
+    expectUnbounded(() => cloneJson({ [oversizedKey]: null }));
   });
 });
