@@ -144,18 +144,100 @@ describe("onboardingFetch — bounded hops fail closed and keep caller signals",
     expect(Date.now() - start).toBeLessThan(5_000);
   });
 
-  test("preserves a caller-provided abort signal", async () => {
+  test("keeps the deadline when a caller signal never aborts", async () => {
+    let seen: AbortSignal | undefined;
+    const stub = {
+      fetch: (_input: RequestInfo | URL, init?: RequestInit) => {
+        seen = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        });
+      },
+    };
+    const controller = new AbortController();
+    await expect(
+      onboardingFetch(
+        stub,
+        "https://onboarding.internal/resolve",
+        { signal: controller.signal },
+        100,
+      ),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(seen).not.toBe(controller.signal);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  test("propagates caller cancellation through the composed signal", async () => {
+    let seen: AbortSignal | undefined;
+    const stub = {
+      fetch: (_input: RequestInfo | URL, init?: RequestInit) => {
+        seen = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        });
+      },
+    };
+    const controller = new AbortController();
+    const pending = onboardingFetch(stub, "https://onboarding.internal/resolve", {
+      signal: controller.signal,
+    });
+    controller.abort(new DOMException("caller stopped", "AbortError"));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(seen?.aborted).toBe(true);
+  });
+
+  test("bounds a response body that never completes", async () => {
+    const stub = {
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("{"));
+            },
+          }),
+        ),
+    };
+    await expect(
+      onboardingFetch(stub, "https://onboarding.internal/resolve", undefined, 100),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  test("clears the deadline after a successful bounded body read", async () => {
     let seen: AbortSignal | undefined;
     const stub = {
       fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
         seen = init?.signal;
-        return new Response("{}", { status: 200 });
+        return new Response("{}");
       },
     };
-    const controller = new AbortController();
-    await onboardingFetch(stub, "https://onboarding.internal/resolve", {
-      signal: controller.signal,
-    });
-    expect(seen).toBe(controller.signal);
+    const response = await onboardingFetch(
+      stub,
+      "https://onboarding.internal/resolve",
+      undefined,
+      50,
+    );
+    expect(await response.json()).toEqual({});
+    await Bun.sleep(100);
+    expect(seen?.aborted).toBe(false);
+  });
+
+  test("rejects an oversized body before returning it to a JSON caller", async () => {
+    const stub = {
+      fetch: async () =>
+        new Response(new Uint8Array(1024 * 1024 + 1), {
+          headers: { "content-type": "application/json" },
+        }),
+    };
+    await expect(
+      onboardingFetch(stub, "https://onboarding.internal/resolve"),
+    ).rejects.toMatchObject({ code: "ONBOARDING_RESPONSE_TOO_LARGE" });
+  });
+
+  test("rejects an invalid deadline before dispatch", async () => {
+    const fetch = mock(async () => new Response("{}"));
+    await expect(
+      onboardingFetch({ fetch }, "https://onboarding.internal/resolve", undefined, 0),
+    ).rejects.toMatchObject({ code: "INVALID_ONBOARDING_TIMEOUT" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
