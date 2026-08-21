@@ -28,20 +28,180 @@ const LINKEDIN_OAUTH_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 const LINKEDIN_WORLDWIDE_GEO = "urn:li:geo:92000000";
 
 const LINKEDIN_REQUEST_TIMEOUT_MS = 30_000;
+const LINKEDIN_RESPONSE_MAX_BYTES = 1024 * 1024;
+const LINKEDIN_VIDEO_MAX_UPLOAD_PARTS = 16;
+
+async function bufferLinkedInResponse(response: Response, signal: AbortSignal): Promise<Response> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength)) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > LINKEDIN_RESPONSE_MAX_BYTES) {
+      throw new ElizaError("LinkedIn response exceeds the byte limit", {
+        code: "LINKEDIN_RESPONSE_TOO_LARGE",
+        context: { declaredBytes, maxBytes: LINKEDIN_RESPONSE_MAX_BYTES },
+      });
+    }
+  }
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let receivedBytes = 0;
+  const cancelBody = (): void => {
+    // error-policy:J6 The hop already failed; cancellation only releases its response stream.
+    reader.cancel(signal.reason).catch((cause: unknown) => {
+      logger.debug("[LinkedInAds] Failed to cancel aborted response body", { cause });
+    });
+  };
+  signal.addEventListener("abort", cancelBody, { once: true });
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      receivedBytes += next.value.byteLength;
+      if (receivedBytes > LINKEDIN_RESPONSE_MAX_BYTES) {
+        const error = new ElizaError("LinkedIn response exceeds the byte limit", {
+          code: "LINKEDIN_RESPONSE_TOO_LARGE",
+          context: { receivedBytes, maxBytes: LINKEDIN_RESPONSE_MAX_BYTES },
+        });
+        try {
+          await reader.cancel(error);
+        } catch (cause) {
+          // error-policy:J6 The bounded read already failed; cancellation only releases the stream.
+          logger.debug("[LinkedInAds] Failed to cancel oversized response body", { cause });
+        }
+        throw error;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    signal.removeEventListener("abort", cancelBody);
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(receivedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new Response(body.buffer, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
 
 /**
  * Bound every LinkedIn REST hop so a hung or rate-limited API cannot pin the
- * ad-provider worker indefinitely. A caller-provided abort signal wins.
+ * ad-provider worker indefinitely. The clearable deadline covers headers and
+ * a bounded body read and composes with caller cancellation.
  */
-export function linkedinFetch(
+export async function linkedinFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
   timeoutMs: number = LINKEDIN_REQUEST_TIMEOUT_MS,
 ): Promise<Response> {
-  return fetch(input, {
-    ...init,
-    signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+    throw new ElizaError("LinkedIn timeout must be a positive timer-safe integer", {
+      code: "INVALID_LINKEDIN_TIMEOUT",
+      context: { timeoutMs },
+    });
+  }
+  const controller = new AbortController();
+  let rejectAbort!: (reason: unknown) => void;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
   });
+  const abort = (reason: unknown): void => {
+    if (controller.signal.aborted) return;
+    controller.abort(reason);
+    rejectAbort(reason);
+  };
+  const onCallerAbort = (): void =>
+    abort(
+      init?.signal?.reason ?? new DOMException("The LinkedIn request was aborted.", "AbortError"),
+    );
+  init?.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  if (init?.signal?.aborted) onCallerAbort();
+  const timeout = setTimeout(
+    () => abort(new DOMException("The LinkedIn request deadline expired.", "TimeoutError")),
+    timeoutMs,
+  );
+  try {
+    const response = await Promise.race([
+      fetch(input, { ...init, signal: controller.signal }),
+      abortPromise,
+    ]);
+    return await Promise.race([bufferLinkedInResponse(response, controller.signal), abortPromise]);
+  } finally {
+    clearTimeout(timeout);
+    init?.signal?.removeEventListener("abort", onCallerAbort);
+  }
+}
+
+function linkedinUploadUrl(rawUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (cause) {
+    throw new ElizaError("LinkedIn returned an invalid upload URL", {
+      code: "INVALID_LINKEDIN_UPLOAD_URL",
+      cause,
+    });
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const trustedHostname = ["linkedin.com", "linkedin-ei.com", "licdn.com", "licdn-ei.com"].some(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
+  if (
+    parsed.protocol !== "https:" ||
+    !trustedHostname ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.port !== "" && parsed.port !== "443")
+  ) {
+    throw new ElizaError("LinkedIn returned an untrusted upload URL", {
+      code: "INVALID_LINKEDIN_UPLOAD_URL",
+      context: { protocol: parsed.protocol, hostname, port: parsed.port },
+    });
+  }
+  return parsed.toString();
+}
+
+function validateVideoUploadInstructions(
+  instructions: Array<{ uploadUrl: string; firstByte: number; lastByte: number }>,
+  byteLength: number,
+): Array<{ uploadUrl: string; firstByte: number; lastByte: number }> {
+  if (instructions.length === 0 || instructions.length > LINKEDIN_VIDEO_MAX_UPLOAD_PARTS) {
+    throw new ElizaError("LinkedIn returned an invalid video upload part count", {
+      code: "INVALID_LINKEDIN_UPLOAD_INSTRUCTIONS",
+      context: { count: instructions.length, maxParts: LINKEDIN_VIDEO_MAX_UPLOAD_PARTS },
+    });
+  }
+  let expectedFirstByte = 0;
+  const validated = instructions.map((instruction) => {
+    const { firstByte, lastByte } = instruction;
+    if (
+      !Number.isSafeInteger(firstByte) ||
+      !Number.isSafeInteger(lastByte) ||
+      firstByte !== expectedFirstByte ||
+      lastByte < firstByte ||
+      lastByte >= byteLength
+    ) {
+      throw new ElizaError("LinkedIn returned invalid video upload byte ranges", {
+        code: "INVALID_LINKEDIN_UPLOAD_INSTRUCTIONS",
+        context: { firstByte, lastByte, expectedFirstByte, byteLength },
+      });
+    }
+    expectedFirstByte = lastByte + 1;
+    return { ...instruction, uploadUrl: linkedinUploadUrl(instruction.uploadUrl) };
+  });
+  if (expectedFirstByte !== byteLength) {
+    throw new ElizaError("LinkedIn video upload instructions do not cover the file", {
+      code: "INVALID_LINKEDIN_UPLOAD_INSTRUCTIONS",
+      context: { coveredBytes: expectedFirstByte, byteLength },
+    });
+  }
+  return validated;
 }
 
 function linkedinVersion(): string {
@@ -774,7 +934,7 @@ export const linkedinAdsProvider: AdProvider = {
         if (!uploadUrl || !imageUrn) {
           throw new Error("LinkedIn image upload initialization returned no upload URL");
         }
-        const upload = await linkedinFetch(uploadUrl, {
+        const upload = await linkedinFetch(linkedinUploadUrl(uploadUrl), {
           method: "PUT",
           headers: { Authorization: `Bearer ${credentials.accessToken}` },
           body: bytes,
@@ -803,15 +963,16 @@ export const linkedinAdsProvider: AdProvider = {
       });
       const videoUrn = init.body.value?.video;
       const uploadToken = init.body.value?.uploadToken ?? "";
-      const instructions = init.body.value?.uploadInstructions ?? [];
-      if (!videoUrn || instructions.length === 0) {
+      const rawInstructions = init.body.value?.uploadInstructions ?? [];
+      if (!videoUrn || rawInstructions.length === 0) {
         throw new Error("LinkedIn video upload initialization returned no upload instructions");
       }
+      const instructions = validateVideoUploadInstructions(rawInstructions, bytes.byteLength);
       const uploadedPartIds: string[] = [];
       for (const instruction of instructions) {
         const part = await linkedinFetch(instruction.uploadUrl, {
           method: "PUT",
-          headers: { Authorization: `Bearer ${credentials.accessToken}` },
+          headers: { "Content-Type": "application/octet-stream" },
           body: bytes.slice(instruction.firstByte, instruction.lastByte + 1),
         });
         if (!part.ok) throw new Error(`LinkedIn video part upload failed: ${part.status}`);
