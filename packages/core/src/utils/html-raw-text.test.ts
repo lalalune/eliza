@@ -25,6 +25,28 @@ describe("stripHtmlRawTextElements", () => {
 		).toBe("before after");
 	});
 
+	it.each([":", "=", "!", "?", ".", "-"])(
+		"keeps a %s-delimited end-tag lookalike inside raw text",
+		(punctuation) => {
+			expect(
+				stripHtmlRawTextElements(
+					`before<script>first</script${punctuation}lookalike>second</sCrIpT data-x=1>after`,
+				),
+			).toBe("before after");
+		},
+	);
+
+	it.each(["text<script", "text<style"])(
+		"treats end of input as an opening tag-name delimiter, matching eof-in-tag",
+		(markup) => {
+			expect(stripHtmlRawTextElements(markup)).toBe("text ");
+		},
+	);
+
+	it("strips through EOF when a closing tag name abuts end of input", () => {
+		expect(stripHtmlRawTextElements("a<script>bad</script")).toBe("a ");
+	});
+
 	it.each(["<script>hidden", "<style data-x='>' hidden"])(
 		"removes an unclosed raw-text element through EOF",
 		(markup) => {

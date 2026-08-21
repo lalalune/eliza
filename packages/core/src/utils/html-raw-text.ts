@@ -1,9 +1,13 @@
 /**
  * Removes HTML script and style elements with a bounded tokenizer pass.
  *
- * HTML end tags accept whitespace, a slash, or attributes after the tag name.
- * Regex-based filters routinely miss those parser-accepted forms and expose
- * raw script/style bodies as visible text after a later generic tag strip.
+ * An appropriate HTML raw-text end-tag name transitions only on ASCII
+ * whitespace, a slash, `>`, or end of input. Regex-based filters routinely
+ * accept broader punctuation lookalikes or miss parser-accepted trailing
+ * material, exposing raw script/style bodies as visible text after a later
+ * generic tag strip. End of input stays a delimiter: the WHATWG tokenizer's
+ * eof-in-tag path emits nothing for a buffered `<script` at EOF, so treating
+ * EOF as a delimiter (and stripping through end of input) matches browsers.
  */
 
 const RAW_TEXT_TAGS = ["script", "style"] as const;
